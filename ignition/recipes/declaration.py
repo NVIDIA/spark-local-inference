@@ -67,6 +67,40 @@ class SamplingDefaults:
 
 
 @dataclass(frozen=True)
+class RopeScaling:
+    """Declared rope interpolation extending serving context beyond the checkpoint's native context.
+
+    `original_max_position_embeddings` is the checkpoint's trained context: the anchor
+    the recipe's `context` declares for it. Serving context extends by `factor` through
+    the interpolation `ignition.components.rotary.interpolated_frequencies` applies, with
+    no attention-temperature change. A checkpoint that declares rope scaling also declares
+    its extended serving `context`; recipes without a declaration serve the native context.
+    """
+
+    factor: float
+    original_max_position_embeddings: int
+    beta_fast: float = 32.
+    beta_slow: float = 1.
+
+    def __post_init__(self):
+        if (type(self.factor) not in (int, float) or not math.isfinite(self.factor) or self.factor <= 1
+                or type(self.original_max_position_embeddings) is not int
+                or not 64 <= self.original_max_position_embeddings or self.original_max_position_embeddings % 64
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                       for value in (self.beta_fast, self.beta_slow))
+                or not self.beta_slow < self.beta_fast):
+            raise ValueError("invalid rope scaling declaration")
+
+    @property
+    def context(self) -> int:
+        """The largest 64-aligned context the interpolation covers without extrapolating."""
+        context = int(self.original_max_position_embeddings * self.factor)
+        if context % 64:
+            raise ValueError("rope scaling factor must extend the original context in whole pages")
+        return context
+
+
+@dataclass(frozen=True)
 class Checkpoint:
     """One qualified checkpoint revision and where its stored tensors reside."""
 
@@ -92,6 +126,10 @@ class Checkpoint:
     # contract without the value, and dashboards then show no weight bandwidth.
     decode_weight_bytes: int = 0
     plain_ranks: Mapping[int, "RankCosts"] | None = None
+    # Serving context ceiling and rope interpolation this checkpoint declares beyond the
+    # recipe's native `context`; both absent serves the native context.
+    context: int | None = None
+    rope_scaling: RopeScaling | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +311,16 @@ class Recipe:
             if any(costs is not None and set(costs) != set(self.ranks)
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
                 raise ValueError(f"{checkpoint.alias} declares costs for other tensor-parallel sizes than its recipe")
+            if (checkpoint.context is None) != (checkpoint.rope_scaling is None):
+                raise ValueError(f"{checkpoint.alias} declares a context or rope scaling but not both")
+            if checkpoint.rope_scaling is not None:
+                scaling = checkpoint.rope_scaling
+                if (scaling.original_max_position_embeddings != self.context
+                        or not self.context < checkpoint.context <= scaling.context
+                        or checkpoint.context % 64 or checkpoint.context >= 2**31):
+                    raise ValueError(
+                        f"{checkpoint.alias} must extend the recipe's {self.context:,}-token context"
+                        " by declared rope scaling within 64-aligned positive int32 positions")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:

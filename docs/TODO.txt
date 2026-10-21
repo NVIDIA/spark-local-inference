@@ -47,6 +47,14 @@
     reductions, and MoE calibration. These paths narrow IDs before range
     checks; add captured replay coverage for IDs outside the INT32 range.
 
+[ ] Qualify qwen3.8-flash-yarn4 long-context serving: prepare and export the
+    rope-scaled package, measure the extended score-workspace chunking and graph
+    bytes, and validate needle/passkey retrieval, image requests, and speculation
+    past the native 262,144-token context against native-quality baselines.
+    The fork served the DFlash2 variant of this scaling
+    (qwen3.8-flash-dflash2-yarn4) at 1,048,576 tokens with a probe past
+    262,144; this MTP package is not yet served.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.

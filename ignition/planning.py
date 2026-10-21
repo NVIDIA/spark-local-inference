@@ -290,7 +290,7 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        return self.concurrency * (self.declared_context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -328,14 +328,19 @@ class Plan:
         return self.pages * self.page_tokens
 
     @property
+    def declared_context(self) -> int:
+        """The serving context ceiling the checkpoint's declaration admits, before page limits."""
+        return self.checkpoint.context or self.recipe.context
+
+    @property
     def context(self) -> int:
         """The longest sequence one request may reach."""
-        return min(self.recipe.context, self.tokens)
+        return min(self.declared_context, self.tokens)
 
     @property
     def guaranteed_tokens(self) -> int:
         """Tokens every request can hold while all admitted requests are active."""
-        return min(self.recipe.context, self.pages // self.concurrency * self.page_tokens)
+        return min(self.declared_context, self.pages // self.concurrency * self.page_tokens)
 
     @property
     def snapshots(self) -> int:
@@ -384,6 +389,10 @@ class Plan:
                    if self.speculation.graph_budget is not None else {})},
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context, "checkpoint_context": self.recipe.context,
+            "declared_context": self.declared_context,
+            "rope_scaling": None if self.checkpoint.rope_scaling is None else {
+                "factor": self.checkpoint.rope_scaling.factor,
+                "original_max_position_embeddings": self.checkpoint.rope_scaling.original_max_position_embeddings},
             "weights_bytes": self.weights_bytes, "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
             "mixed_shapes": self.mixed_shapes,
@@ -547,9 +556,10 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if language_model_only and image_concurrency is not None:
         raise UsageError("--image-concurrency requires the vision encoder that --language-model-only leaves unloaded")
     chunk = recipe.prefill_chunk if prefill_chunk is None else prefill_chunk
-    if chunk % 64 or not 64 <= chunk <= recipe.context:
+    declared = checkpoint.context or recipe.context
+    if chunk % 64 or not 64 <= chunk <= declared:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
-                         f" from 64 through {recipe.context:,}")
+                         f" from 64 through {declared:,}")
     world_sizes = recipe.tensor_parallel
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
