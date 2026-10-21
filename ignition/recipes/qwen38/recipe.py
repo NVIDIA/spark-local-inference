@@ -9,7 +9,8 @@ from pathlib import Path
 
 from ignition.preparation.qwen38 import ARCHITECTURE, MODEL_ID, REVISION
 from .draft_config import WEIGHT_BYTES
-from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation, SpeculativeMethod
+from ignition.recipes.declaration import (Checkpoint, RopeScaling, RankCosts, RankUsage, Recipe,
+    SamplingDefaults, SamplingRange, Speculation, SpeculativeMethod)
 
 # Twelve target sparse-attention layers each store one page; learned drafts add the draft layer's.
 _TARGET_PAGE_LAYERS = 12
@@ -17,6 +18,17 @@ _TARGET_PAGE_LAYERS = 12
 # pages: prepared weight layouts, replicated tensors, operator scratch, graphs, and
 # the CUDA context. They serve every speculation setting.
 _GRAPH_BYTES = {1: 7168 << 20, 2: 8000 << 20, 4: 8576 << 20}
+
+# The pinned checkpoint's stored tensors, shared by every qualified variant.
+_CHECKPOINT = dict(repository=MODEL_ID, revision=REVISION, architecture=ARCHITECTURE,
+    stored_bytes=102_329_644_144,
+    # Decoder, vision, and draft tensors; PLE rows are delivered through compact inputs.
+    device_bytes=73_529_505_900,
+    # The MTP module's tensors.
+    draft_bytes=1_596_720_640,
+    # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
+    # 48 layers x 512 experts x 307,200 bytes.
+    expansion_bytes=3_393_142_636)
 
 
 def _costs(state_row_bytes, page_layer_bytes, graph_bytes, *, speculating):
@@ -59,7 +71,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, stream_overlap=plan.stream_overlap,
-        context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk, mixed_prefill=plan.mixed_prefill,
+        context=plan.declared_context, prefill_chunk_size=plan.prefill_chunk, mixed_prefill=plan.mixed_prefill,
+        rope_scaling=plan.checkpoint.rope_scaling,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
         mtp=speculation is not None, **drafting)
@@ -84,16 +97,14 @@ RECIPE = Recipe(
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=20,
         ranges={"temperature": SamplingRange(.7, 1.), "top_p": SamplingRange(.8, .95),
                 "presence_penalty": SamplingRange(0., 2.)}),
-    checkpoints=(Checkpoint(
-        alias="qwen3.8-flash", repository=MODEL_ID, revision=REVISION, architecture=ARCHITECTURE,
-        stored_bytes=102_329_644_144,
-        # Decoder, vision, and draft tensors; PLE rows are delivered through compact inputs.
-        device_bytes=73_529_505_900,
-        # The MTP module's tensors.
-        draft_bytes=1_596_720_640,
-        # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
-        # 48 layers x 512 experts x 307,200 bytes.
-        expansion_bytes=3_393_142_636),),
+    checkpoints=(
+        Checkpoint(alias="qwen3.8-flash", **_CHECKPOINT),
+        Checkpoint(alias="qwen3.8-flash-yarn4", **_CHECKPOINT,
+            # Rope interpolation extends the trained 262,144-token context by four; sparse
+            # selection chunks beyond the native single-pass score workspace. Frequency-only
+            # interpolation, without YaRN's attention temperature, matching the DeepSeek path.
+            context=1_048_576, rope_scaling=RopeScaling(4., 262144)),
+    ),
     context=262144, page_tokens=64, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     # Rounds adapt among zero through five drafts, up to seven. Verification records
     # corrections and commits accepted tokens into the live state row, so it keeps

@@ -61,12 +61,13 @@ def _keep_reserve(plan, usage) -> None:
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
+    declared_context = checkpoint.context or recipe.context
     return {
         "model_id": model.model_id, "served_names": [recipe.served_model_name],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
-        "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
+        "max_body_bytes": plan.max_images * recipe.image_bytes + declared_context * _BODY_BYTES_PER_TOKEN,
         "context_hint": "context is limited by the checkpoint and available cache capacity",
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),

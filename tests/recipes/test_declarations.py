@@ -402,3 +402,33 @@ def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, o
     assert all(batch <= packed <= min(128, batch * width) for batch, width, packed in shapes)
     assert config.decode_tokens == 128
     assert config.decode_samples == 32 * (selected.draft_tokens + 1)
+
+
+def test_qwen_yarn_variant_extends_the_declared_serving_context(monkeypatch, tmp_path):
+    from ignition.recipes.qwen38.bootstrap import PreparationConfig
+
+    native = resolve("qwen3.8-flash")
+    scaled = resolve("qwen3.8-flash-yarn4")
+    assert scaled.recipe is native.recipe
+    assert scaled.checkpoint.rope_scaling.original_max_position_embeddings == native.recipe.context
+    assert scaled.checkpoint.context == native.recipe.context * 4
+    # Repository resolution names the native declaration first.
+    assert resolve(scaled.checkpoint.repository).checkpoint is native.checkpoint
+
+    plain = fitted(native, 1)
+    extended = fitted(scaled, 1)
+    assert plain.declared_context == native.recipe.context == 262_144
+    assert extended.declared_context == 1_048_576 and extended.recipe.context == 262_144
+    assert extended.demand_pages == 4 * plain.demand_pages
+    assert extended.to_dict()["rope_scaling"]["factor"] == 4.
+    with pytest.raises(planning.UsageError, match="64 through 1,048,576"):
+        planning.plan(scaled.recipe, scaled.checkpoint, plain.gpus, selected=(0,), concurrency=4,
+                      reserve_bytes=0, speculation=scaled.recipe.speculation, prefill_chunk=1_048_640)
+
+    seen = []
+    monkeypatch.setattr("ignition.recipes.qwen38.bootstrap.prepare_model",
+                        lambda snapshot, config, *, progress, compile_decoder: seen.append(config))
+    scaled.recipe.prepare(tmp_path, extended, compile_forwards=True, kernel_cache=None, progress=None)
+    config = seen.pop()
+    assert isinstance(config, PreparationConfig)
+    assert config.context == 1_048_576 and config.rope_scaling is scaled.checkpoint.rope_scaling
