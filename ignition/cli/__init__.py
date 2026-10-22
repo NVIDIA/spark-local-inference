@@ -5,6 +5,7 @@
 """The `ignition` preparation and diagnostic command line."""
 
 import argparse
+import json
 from pathlib import Path
 
 from ignition.errors import FlareError
@@ -139,6 +140,21 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                          help="maximum simultaneously active requests (default: defaults.max_concurrency,"
                               " else the recipe default)")
     running.add_argument("--verbose", action="store_true", help="per-phase detail on stderr")
+
+    def rope_parameters(value):
+        try:
+            parameters = json.loads(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"not JSON: {error}") from error
+        if not isinstance(parameters, dict):
+            raise argparse.ArgumentTypeError("expected a JSON object")
+        return parameters
+
+    running.add_argument("--rope-parameters", type=rope_parameters, metavar="JSON",
+                         help="extend the context with YaRN frequency interpolation, as a Hugging Face"
+                              " rope_parameters object: factor (required), original_max_position_embeddings,"
+                              " beta_fast, beta_slow, max_position_embeddings (serving context, default"
+                              " factor x original); no attention temperature")
     running.add_argument("--image-concurrency", type=int, metavar="N",
                          help="maximum active image requests; excess requests queue independently of text"
                               " (default: smaller of 4 and max concurrency)")

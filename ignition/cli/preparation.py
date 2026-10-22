@@ -33,13 +33,58 @@ class Host:
         return cls(gpus, restriction)
 
 
-def resolve_model(configuration: Configuration, name: str | None) -> ResolvedModel:
+def resolve_model(configuration: Configuration, name: str | None,
+                  rope_parameters: dict | None = None) -> ResolvedModel:
     name = configuration.model if name is None else name
     if name is None:
         raise UsageError("no MODEL given and defaults.model is not set in the configuration file")
     model = resolve(name, configuration.directory("hub_cache"))
     model.verify(configuration.directory("hub_cache"))
+    if rope_parameters is not None:
+        model = replace(model, checkpoint=rope_scaled(model, rope_parameters))
     return model
+
+
+ROPE_PARAMETER_KEYS = ("rope_type", "factor", "original_max_position_embeddings", "beta_fast", "beta_slow",
+                       "max_position_embeddings")
+
+
+def rope_scaled(model: ResolvedModel, parameters: dict):
+    """The resolved checkpoint served at an extended context through YaRN frequency interpolation.
+
+    `parameters` takes the keys of a Hugging Face / vLLM YaRN `rope_parameters` object.
+    `max_position_embeddings` is the serving context (default: factor times the original).
+    Attention temperature (`mscale`, `attention_factor`) is refused: sparse attention has
+    no logit scale, so the interpolation is frequency-only.
+    """
+    from ignition.recipes.declaration import RopeScaling
+
+    flag = "--rope-parameters"
+    if not any(checkpoint.rope_scaling for checkpoint in model.recipe.checkpoints):
+        raise UsageError(f"{flag}: {model.checkpoint.alias} declares no rope scaling")
+    unknown = sorted(set(parameters) - set(ROPE_PARAMETER_KEYS))
+    if unknown:
+        temperature = {"mscale", "mscale_all_dim", "attention_factor"} & set(unknown)
+        raise UsageError(f"{flag}: {', '.join(unknown)} " + (
+            "not supported; interpolation is frequency-only (sparse attention has no logit scale)" if temperature
+            else f"unknown; expected {', '.join(ROPE_PARAMETER_KEYS)}"))
+    if parameters.get("rope_type", "yarn") != "yarn":
+        raise UsageError(f"{flag}: rope_type must be yarn")
+    if "factor" not in parameters:
+        raise UsageError(f"{flag}: factor is required")
+    # JSON editors may type a whole context as a float (262144.0); a fractional one stays refused.
+    parameters = {key: int(value) if key in ("original_max_position_embeddings", "max_position_embeddings")
+                  and type(value) is float and value.is_integer() else value for key, value in parameters.items()}
+    try:
+        scaling = RopeScaling(parameters["factor"],
+            parameters.get("original_max_position_embeddings", model.recipe.context),
+            parameters.get("beta_fast", 32.), parameters.get("beta_slow", 1.))
+        context = parameters.get("max_position_embeddings", scaling.context)
+        checkpoint = replace(model.checkpoint, context=context, rope_scaling=scaling)
+        model.recipe.check_rope_scaling(checkpoint)
+    except (TypeError, ValueError) as error:
+        raise UsageError(f"{flag}: {error}") from error
+    return checkpoint
 
 
 def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gpus: str | None,

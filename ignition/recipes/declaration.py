@@ -311,16 +311,20 @@ class Recipe:
             if any(costs is not None and set(costs) != set(self.ranks)
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
                 raise ValueError(f"{checkpoint.alias} declares costs for other tensor-parallel sizes than its recipe")
-            if (checkpoint.context is None) != (checkpoint.rope_scaling is None):
-                raise ValueError(f"{checkpoint.alias} declares a context or rope scaling but not both")
-            if checkpoint.rope_scaling is not None:
-                scaling = checkpoint.rope_scaling
-                if (scaling.original_max_position_embeddings != self.context
-                        or not self.context < checkpoint.context <= scaling.context
-                        or checkpoint.context % 64 or checkpoint.context >= 2**31):
-                    raise ValueError(
-                        f"{checkpoint.alias} must extend the recipe's {self.context:,}-token context"
-                        " by declared rope scaling within 64-aligned positive int32 positions")
+            self.check_rope_scaling(checkpoint)
+
+    def check_rope_scaling(self, checkpoint: Checkpoint):
+        """Refuse a context or rope scaling that does not extend this recipe's native context."""
+        if (checkpoint.context is None) != (checkpoint.rope_scaling is None):
+            raise ValueError(f"{checkpoint.alias} declares a context or rope scaling but not both")
+        if checkpoint.rope_scaling is not None:
+            scaling = checkpoint.rope_scaling
+            if (scaling.original_max_position_embeddings != self.context
+                    or not self.context < checkpoint.context <= scaling.context
+                    or checkpoint.context % 64 or checkpoint.context >= 2**31):
+                raise ValueError(
+                    f"{checkpoint.alias} must extend the recipe's {self.context:,}-token context"
+                    " by declared rope scaling within 64-aligned positive int32 positions")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:
