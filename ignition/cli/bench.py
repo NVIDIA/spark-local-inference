@@ -131,7 +131,7 @@ def table(result):
 def run(args):
     settings = Settings.from_args(args)
     configuration = Configuration.load(args.config)
-    model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b")
+    model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b", getattr(args, "rope_parameters", None))
     if model.recipe.name != "qwen38_dense":
         raise UsageError("ignition bench supports only the Qwen3.8-27B DFlash2 recipe")
     from ignition.preparation.selection import BenchmarkSelection
