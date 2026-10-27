@@ -17,7 +17,7 @@ from ignition import runtime_patches
 
 from . import host_memory
 from .compilation import _OPTIONS, _defer_full_collection
-from .host_memory import cpu_workers, device_memory_info
+from .host_memory import COMPILE_HEADROOM_BYTES, cpu_workers, device_memory_info
 
 # Device memory one compiler worker can hold: its CUDA context plus Inductor's constant folding.
 _WORKER_DEVICE_BYTES = 2 << 30
@@ -34,10 +34,17 @@ class CompilerResources:
     headroom: int
 
 
-def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None):
-    """Sample a rank's device capacity and its host's compiler memory budget."""
+def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None,
+                       compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+    """Sample a rank's device capacity and its host's compiler memory budget.
+
+    Host admission leaves the greater of `compile_headroom_bytes` and, on integrated GPUs,
+    `headroom_bytes` free.
+    """
     if type(headroom_bytes) is not int or headroom_bytes < 0:
         raise ValueError("headroom_bytes must be a nonnegative byte count")
+    if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
+        raise ValueError("compile_headroom_bytes must be a nonnegative byte count")
     options = _OPTIONS if options is None else options
     limit = min(cpu_workers(compile_workers), cpu_workers())
     if compile_workers is None:
@@ -53,7 +60,7 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
         available = min(available, free)
     return CompilerResources(capacity, available, limit,
         host_memory.FORWARD_WORKER_BYTES + (device_bytes if shared else 0),
-        max(host_memory._HEADROOM_BYTES, headroom_bytes if shared else 0))
+        max(compile_headroom_bytes, headroom_bytes if shared else 0))
 
 
 def allocate_workers(resources, counts, hosts):
@@ -116,14 +123,16 @@ def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
 
 
 class CompilePool:
-    def __init__(self, device, *, headroom_bytes=0, options=None, compile_workers=None, workers=None):
+    def __init__(self, device, *, headroom_bytes=0, options=None, compile_workers=None, workers=None,
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
         """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
         options = dict(_OPTIONS if options is None else options)
         if workers is None:
             resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
-                                           compile_workers=compile_workers)
+                                           compile_workers=compile_workers,
+                                           compile_headroom_bytes=compile_headroom_bytes)
             workers = allocate_workers([resources], [resources.limit], ["local"])[0]
         if type(workers) is not int or workers < 1:
             raise ValueError("forward compiler pool requires a positive admitted worker count")

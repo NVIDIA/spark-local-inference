@@ -15,6 +15,7 @@ from .aot import ForwardCache
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+from .host_memory import COMPILE_HEADROOM_BYTES
 
 
 def _capture_order(names, compiled, coordinator):
@@ -73,7 +74,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              compile_workers=getattr(session, "requested_compile_workers", None),
-                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
+                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune,
+                             compile_headroom_bytes=getattr(session, "compile_headroom_bytes", COMPILE_HEADROOM_BYTES))
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
         if compile_group is not None:

@@ -464,6 +464,7 @@ explicit flags take precedence.
 | `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime uses the required ladder file for final compiled geometry and captures runtime submode/active-CTA selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
+| `--compile-headroom SIZE` | System memory that compiler processes and kernel-tuning races leave free on each host, such as `6G`; binary size suffixes as in `[memory] reserve`. On unified-memory GPUs, a larger preparation headroom from the plan and `[memory] reserve` still applies. Lowering it lets admission start compiler workers and tuning jobs in less free memory, which matters most on unified-memory GPUs such as DGX Spark, at the risk of exhausting host memory. Recorded in the plan, the tuning report and the `bench` result. Overrides `[preparation] compile_headroom`. | `8G` |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--force-moe-decode-a16` / `--no-force-moe-decode-a16` | Prepare Qwen3.8 Flash NVFP4 target routed experts as one packed weight owner: decode and speculative verification use W4A16 at every token-row count, and separate prefill graphs use calibrated A4. Requires SM120/121, checkpoint activation scales, and rank-local expert intermediate width divisible by 64 (TP1/2). Mixed prefill and other recipes/precisions reject the flag. Shared experts and stored A16 MTP experts retain their precision. Overrides `[preparation] force_moe_decode_a16`; the resolved value is recorded in the plan and core rebuild metadata. | off |
@@ -1295,6 +1296,7 @@ max_concurrency = 4
 [preparation]
 # force_moe_decode_a16 = false    # Qwen Flash NVFP4: A16 decode/verify, calibrated A4 prefill.
 # compile_workers = 24           # Optional CPU process budget per host.
+# compile_headroom = "8G"        # System memory compiler and tuning pools leave free per host.
 # autotune_effort = "default"     # off, default, audit.
 # collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
 # checkpoint_token_file = "~/.config/flare/agent.token"  # Shared token for multi-host preparation.
@@ -1392,6 +1394,7 @@ Configuration assigns each decision to one owner:
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
 | Collective selection | `--collective-tuning`, then `[preparation] collective_tuning`, otherwise the recipe default (`static`) |
+| Compiler memory headroom | 8 GiB of system memory per host; `[preparation] compile_headroom` or `--compile-headroom` overrides |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
