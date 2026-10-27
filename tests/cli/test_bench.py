@@ -128,6 +128,23 @@ def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):
     assert "supports only the Qwen3.8-27B DFlash2 recipe" in capsys.readouterr().err
 
 
+def test_compile_headroom_flag_reaches_the_plan(tmp_path, monkeypatch):
+    from ignition.cli import bench
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    received = {}
+
+    def derive(*args, **kwargs):
+        received.update(kwargs)
+        raise UsageError("stop before preparation")
+
+    monkeypatch.setattr(bench, "derive", derive)
+    monkeypatch.setattr(bench.Host, "discover", staticmethod(lambda: None))
+    assert main(["bench", "qwen3.8-27b", "--config", str(config), "--compile-headroom", "6G"]) == 2
+    assert received["compile_headroom"] == "6G"
+
+
 def test_report_keeps_case_latency_and_equal_weight_score_separate(tmp_path, capsys):
     result = {"device": {"name": "NVIDIA RTX PRO 6000 Blackwell", "capability": [12, 0]},
         "aggregate_ms": 3.5,

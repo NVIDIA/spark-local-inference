@@ -51,6 +51,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors")))
     config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        compile_headroom_bytes=plan.compile_headroom_bytes,
         native_dense_activations=plan.native_dense_activations,
         online_mxfp8=plan.online_mxfp8,
         force_moe_decode_a16=plan.force_moe_decode_a16,
