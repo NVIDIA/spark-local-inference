@@ -2776,7 +2776,7 @@ mod tests {
     fn store_with(scanned: Vec<Scanned>, limit: u64) -> (DiskStore, Rc<RefCell<Log>>) {
         let log = Rc::new(RefCell::new(Log::default()));
         let store = DiskStore::new(
-            record::DirectoryLock::acquire(&directory()).unwrap(),
+            crate::testing::directory_lock(&directory()).unwrap(),
             IDENTITY,
             FINGERPRINT,
             limit,
@@ -2920,12 +2920,12 @@ mod tests {
     #[test]
     fn disk_store_keeps_exclusive_directory_ownership_until_drop() {
         let (mut store, _) = store_with(Vec::new(), 1 << 30);
-        assert!(record::DirectoryLock::acquire(store.directory()).is_err());
+        assert!(crate::testing::directory_lock(store.directory()).is_err());
         store.close().unwrap();
-        assert!(record::DirectoryLock::acquire(store.directory()).is_err());
+        assert!(crate::testing::directory_lock(store.directory()).is_err());
         let path = store.directory().to_owned();
         drop(store);
-        let reopened = record::DirectoryLock::acquire(&path).unwrap();
+        let reopened = crate::testing::directory_lock(&path).unwrap();
         drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
@@ -4393,7 +4393,7 @@ mod tests {
             &transport_events(&mut staged, 1)[0],
             TransportEvent::Truncated { result: Ok(_), .. }
         ));
-        let guard = record::DirectoryLock::acquire(&directory).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         let mut store = DiskStore::new(
             guard,
@@ -4456,22 +4456,7 @@ mod tests {
         );
         store.close().unwrap();
         drop(store);
-        // Parallel subprocess tests can inherit the flock until their exec completes.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let guard = loop {
-            match record::DirectoryLock::acquire(&directory) {
-                Ok(guard) => break guard,
-                Err(error) => {
-                    let busy = error.cause().is_some_and(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                    });
-                    assert!(busy && Instant::now() < deadline, "{error}");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-        };
+        let guard = crate::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         assert_eq!(scanned.len(), 2);
         assert!(scanned.iter().all(|record| record.row));
@@ -4605,7 +4590,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), header.length_with_row());
         assert!(!temporary.exists());
         let scanned = record::scan(
-            &record::DirectoryLock::acquire(&directory).unwrap(),
+            &crate::testing::directory_lock(&directory).unwrap(),
             &IDENTITY,
             &FINGERPRINT,
             geometry[0].page_tokens,
@@ -4994,7 +4979,7 @@ mod tests {
         assert_eq!(free(&staged), all);
         assert_eq!(
             record::scan(
-                &record::DirectoryLock::acquire(&directory).unwrap(),
+                &crate::testing::directory_lock(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
                 geometry[0].page_tokens,
@@ -5098,7 +5083,7 @@ mod tests {
         assert!(settled(&staged));
         assert_eq!(
             record::scan(
-                &record::DirectoryLock::acquire(&directory).unwrap(),
+                &crate::testing::directory_lock(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
                 geometry[0].page_tokens,
