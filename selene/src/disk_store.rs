@@ -38,6 +38,7 @@ use crate::{
         Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
         pins::{FileSpan, host_chain_kept},
     },
+    shared::SliceSums,
 };
 
 use super::{
@@ -232,8 +233,12 @@ enum Source {
         pages: Vec<PageId>,
         slot: StateSlotId,
     },
-    /// Caller-owned registered buffers already holding every record.
-    Host { pages: Vec<usize>, row: Vec<usize> },
+    /// Caller-owned registered buffers already holding every record, and their checksums if known.
+    Host {
+        pages: Vec<usize>,
+        row: Vec<usize>,
+        sums: Option<SliceSums>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -375,6 +380,10 @@ impl OutboundRecord {
                 id: self.disk,
                 temporary: self.temporary.clone(),
                 header: self.header.clone(),
+                sums: match &self.source {
+                    Source::Host { sums, .. } => sums.clone(),
+                    Source::Device { .. } => None,
+                },
             };
             match resources.submit_disk(job) {
                 Ok(()) => {
@@ -477,7 +486,7 @@ impl OutboundRecord {
                 self.outstanding += 1;
                 (buffers, OutPhase::Transferring, 1)
             }
-            Source::Host { pages, row } => (
+            Source::Host { pages, row, .. } => (
                 Buffers {
                     pages: pages[first..first + count].to_vec(),
                     row: last.then(|| row.clone()),
@@ -1007,6 +1016,7 @@ impl Staged {
 
     /// Write a record whose page and row bytes already sit in caller-owned
     /// registered buffers (host addresses in record order).
+    #[allow(clippy::too_many_arguments)]
     pub fn write_from(
         &mut self,
         id: super::JobId,
@@ -1015,6 +1025,7 @@ impl Staged {
         path: PathBuf,
         pages: Vec<usize>,
         row: Option<Vec<usize>>,
+        sums: Option<SliceSums>,
     ) -> Result<()> {
         self.accept(id)?;
         if pages.len() != header.tail_pages as usize {
@@ -1028,7 +1039,8 @@ impl Staged {
         let Some(row) = row else {
             return Err(invalid("a record cannot be written without its row"));
         };
-        self.start_outbound(id, header, temporary, path, Source::Host { pages, row });
+        let source = Source::Host { pages, row, sums };
+        self.start_outbound(id, header, temporary, path, source);
         Ok(())
     }
 
@@ -4373,6 +4385,7 @@ mod tests {
                     directory.join(record::file_name(&header.key)),
                     addresses(&pool, &source),
                     Some(vec![pool.slot_address(row)]),
+                    None,
                 )
                 .unwrap();
             assert!(matches!(
@@ -4423,6 +4436,7 @@ mod tests {
                 path.clone(),
                 addresses(&pool, &source),
                 Some(vec![pool.slot_address(row)]),
+                None,
             )
             .unwrap();
         assert!(matches!(
@@ -4530,7 +4544,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses[..PAGES - 1].to_vec(),
-                    Some(vec![pool.slot_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)]),
+                    None,
                 )
                 .is_err()
         );
@@ -4542,7 +4557,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    None
+                    None,
+                    None,
                 )
                 .is_err()
         );
@@ -4563,6 +4579,7 @@ mod tests {
                 path.clone(),
                 source_addresses.clone(),
                 Some(vec![pool.slot_address(source_row)]),
+                None,
             )
             .unwrap();
         assert!(
@@ -4573,7 +4590,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(vec![pool.slot_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)]),
+                    None,
                 )
                 .is_err()
         );
@@ -4759,7 +4777,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(vec![pool.slot_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)]),
+                    None,
                 )
                 .is_err()
         );
@@ -4815,6 +4834,7 @@ mod tests {
                 path.clone(),
                 source_addresses.clone(),
                 Some(vec![host.slot_address(source_row)]),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4953,6 +4973,7 @@ mod tests {
                 missing.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
                 Some(vec![host.slot_address(source_row)]),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4972,6 +4993,7 @@ mod tests {
                 directory.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
                 Some(vec![host.slot_address(source_row)]),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -5032,6 +5054,7 @@ mod tests {
                     directory.join(record::file_name(&header.key)),
                     source_addresses.clone(),
                     Some(vec![host.slot_address(source_row)]),
+                    None,
                 )
                 .unwrap();
         }
