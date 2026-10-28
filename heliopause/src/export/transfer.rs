@@ -741,9 +741,11 @@ fn verify_cached_payload(
 
 /// Adopt a received cache payload object under its signed payload identity.
 ///
-/// The staged file is a complete companion container; its payload bytes are
-/// verified against the declared identity by the cache insertion path, so a
-/// corrupt or mislabelled object never enters the cache.
+/// The staged file is a complete, synced companion container; its payload bytes
+/// are verified against the declared identity by the cache insertion path, so a
+/// corrupt or mislabelled object never enters the cache. A canonical wrapper is
+/// linked into the cache as is; otherwise, or when the filesystem refuses the
+/// link, the slice is copied.
 fn install_payload_object(
     cache: &Path,
     id: helios_core::core::PayloadId,
@@ -758,7 +760,10 @@ fn install_payload_object(
             "received payload object length differs from its declared group",
         ));
     }
-    let object = root.store_slice(Some(id), &slice)?;
+    let object = match root.adopt_companion(id, &slice, &partial.display().to_string())? {
+        Some(object) => object,
+        None => root.store_slice(Some(id), &slice)?,
+    };
     if object.length() != length {
         return Err(invalid("received payload object has the wrong length"));
     }
@@ -1038,6 +1043,9 @@ fn receive_rank(
                         fs::Permissions::from_mode(0o444)
                     })?;
                 }
+                // The synced file may become a cache object itself: close the
+                // writable descriptor before it is published.
+                drop(file);
                 if info.payload.is_some() {
                     let id = helios_core::core::PayloadId::parse(
                         info.payload.as_deref().unwrap_or_default(),
@@ -1442,6 +1450,59 @@ mod tests {
         });
         output.payload_leases = crate::export::PayloadLeases(vec![object]);
         (output, id)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn received_canonical_wrapper_is_adopted_and_others_are_copied() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 97) as u8).collect();
+        let (_, id) = cache_backed_output(&directory, &payload);
+        let sent = directory.0.join("sender-cache").join("blobs").join(id.file_name());
+        let cache = directory.0.join("cache");
+        helios_core::core::cache::Root::open(&cache).unwrap();
+
+        // The receiver writes the sender's object file under the cache's blobs directory.
+        let partial = cache.join("blobs").join(".rank-blob-canonical");
+        fs::copy(&sent, &partial).unwrap();
+        let object = install_payload_object(&cache, id, payload.len() as u64, &partial).unwrap();
+        assert_eq!(
+            fs::metadata(object.path()).unwrap().ino(),
+            fs::metadata(&partial).unwrap().ino(),
+            "a canonical received wrapper was copied instead of adopted"
+        );
+        drop(object);
+
+        // Another framing of the same payload is stored through its slice in a new file.
+        let other = directory.0.join("other-cache");
+        helios_core::core::cache::Root::open(&other).unwrap();
+        let framed = other.join("blobs").join(".rank-blob-framed");
+        let slice = helios_core::core::container::Container::open(&sent)
+            .unwrap()
+            .tensor(helios_core::core::container::COMPANION_TENSOR)
+            .unwrap();
+        let mut writer = helios_core::core::container::Writer::new(
+            fs::File::create(&framed).unwrap(),
+            helios_core::core::container::PAYLOAD_FORMAT,
+        )
+        .unwrap();
+        writer
+            .add(
+                helios_core::core::container::COMPANION_TENSOR,
+                slice.len(),
+                helios_core::core::container::Source::Slice(slice),
+            )
+            .unwrap();
+        writer
+            .add("extra.tail", 3, helios_core::core::container::Source::Bytes(vec![1, 2, 3]))
+            .unwrap();
+        writer.finish().unwrap();
+        let copied = install_payload_object(&other, id, payload.len() as u64, &framed).unwrap();
+        assert_ne!(
+            fs::metadata(copied.path()).unwrap().ino(),
+            fs::metadata(&framed).unwrap().ino()
+        );
     }
 
     #[test]
