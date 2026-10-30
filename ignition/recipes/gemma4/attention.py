@@ -157,6 +157,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention",
                 workspace=workspace,
+                tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
             )
@@ -208,6 +209,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention_lo",
                 workspace=workspace,
+                tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
             )
@@ -225,6 +227,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention_hi",
                 workspace=workspace,
+                tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
             )
