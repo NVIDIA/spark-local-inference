@@ -73,7 +73,7 @@ impl PrefixCacheOffload {
         }
         let memory = self.memory_bytes.unwrap_or(0);
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
-        let staging = if disk {
+        let staging = if disk && memory == 0 {
             layout
                 .page_record_bytes
                 .checked_mul(
@@ -198,7 +198,6 @@ pub struct Prepared {
     /// Each rank's CUDA context handle and local device ordinal.
     pub contexts: Vec<(usize, i32)>,
     pub memory_pool: Option<slab::SlabPool>,
-    pub staging_pool: Option<slab::SlabPool>,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
@@ -237,7 +236,8 @@ impl Preparation {
 
 impl Prepared {
     pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
-        let rows = self.memory_pool.as_ref()?.page_count() / self.layout.row_slots();
+        let pool = self.memory_pool.as_ref().filter(|pool| pool.retain())?;
+        let rows = pool.page_count() / self.layout.row_slots();
         let recommended = max_concurrency.saturating_mul(2);
         (rows < max_concurrency).then(|| {
             format!(
@@ -252,7 +252,8 @@ impl Prepared {
         let mut parts = Vec::new();
         if let Some(pool) = &self.memory_pool {
             parts.push(format!(
-                "memory {} ({} slots{})",
+                "{} {} ({} slots{})",
+                if pool.retain() { "memory" } else { "staging" },
                 gibibytes(pool.bytes()),
                 pool.page_count(),
                 if pool.rank_parts().is_some() {
@@ -268,9 +269,6 @@ impl Prepared {
                 gibibytes(inputs.stats().memory_limit),
                 gibibytes(inputs.stats().staging_limit)
             ));
-        }
-        if let Some(pool) = &self.staging_pool {
-            parts.push(format!("staging {}", gibibytes(pool.bytes())));
         }
         if let Some(directory) = &self.resolved.directory {
             parts.push(format!(
@@ -449,7 +447,7 @@ pub fn prepare_with_inputs(
         .0;
     let input_memory = input_memory_bytes(memory_bytes, 0, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
-    let memory_pool = (checkpoint_memory != 0)
+    let memory_pool = (checkpoint_memory != 0 || directory.is_some())
         .then(|| {
             // A pool shares what the CPU can read, so its memory is never split by rank.
             if directory.is_none() && options.pool.is_none() {
@@ -460,15 +458,11 @@ pub fn prepare_with_inputs(
                     registrar,
                 )?);
             }
-            let mut pool = slab::SlabPool::sized(&layout, checkpoint_memory)?;
-            pool.register(registrar, context)?;
-            Ok::<_, crate::Error>(pool)
-        })
-        .transpose()?;
-    let staging_pool = directory
-        .is_some()
-        .then(|| {
-            let mut pool = slab::SlabPool::staging(&layout)?;
+            let mut pool = if checkpoint_memory != 0 {
+                slab::SlabPool::sized(&layout, checkpoint_memory)?
+            } else {
+                slab::SlabPool::staging(&layout)?
+            };
             pool.register(registrar, context)?;
             Ok::<_, crate::Error>(pool)
         })
@@ -507,7 +501,6 @@ pub fn prepare_with_inputs(
         layout,
         contexts,
         memory_pool,
-        staging_pool,
         scanned,
         directory_lock,
         shards: Vec::new(),
@@ -544,7 +537,6 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         layout: _,
         contexts,
         memory_pool,
-        staging_pool,
         scanned,
         directory_lock,
         shards,
@@ -555,7 +547,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     }
     let transfers: Option<crate::SharedCopier> = memory_pool
         .as_ref()
-        .or(staging_pool.as_ref())
+        .filter(|slabs| slabs.retain())
         .map(|slabs| factory.mapped(&contexts, geometry.clone(), slabs))
         .transpose()?;
     let tier_transfers = || {
@@ -565,27 +557,23 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     };
     let disk = directory_lock
         .map(|directory| {
-            let disk_transfers: crate::SharedCopier = if memory_pool.is_some() {
-                factory.mapped(
-                    &contexts,
-                    geometry.clone(),
-                    staging_pool
-                        .as_ref()
-                        .ok_or("disk transfers require a staging pool")?,
-                )?
-            } else {
-                tier_transfers()?
-            };
+            let disk_transfers = factory.mapped(
+                &contexts,
+                geometry.clone(),
+                memory_pool
+                    .as_ref()
+                    .ok_or("disk transfers require a slab pool")?,
+            )?;
             let transport: Box<dyn disk_store::DiskTransport> = if !shards.is_empty() {
-                if memory_pool.is_some() {
+                if resolved.memory_bytes != 0 {
                     return Err(
                         "a multi-host package keeps host prefix records on disk only".into(),
                     );
                 }
-                shard::transport(staging_pool, disk_transfers, shards)?
+                shard::transport(memory_pool.clone(), disk_transfers, shards)?
             } else {
                 Box::new(disk_store::Staged::new(
-                    staging_pool,
+                    memory_pool.clone(),
                     disk_transfers,
                     disk::DiskThread::start("flare-offload-disk")?,
                 ))
@@ -606,6 +594,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         .transpose()?;
     // Inside a composite the disk index owns the tree; memory nodes are flat.
     let memory = memory_pool
+        .filter(|pool| pool.retain())
         .map(|pool| {
             let mut store = if disk.is_some() {
                 memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)?

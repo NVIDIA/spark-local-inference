@@ -1376,8 +1376,12 @@ impl DiskTransport for Staged {
             Some(_) => lock(&self.resources.transfers).close(),
             None => Ok(()),
         };
-        disk?;
-        transfers?;
+        if (disk.is_err() || transfers.is_err())
+            && let Some(pool) = &self.resources.pool
+        {
+            pool.leak();
+        }
+        disk.and(transfers)?;
         if abandoned > 0 {
             return Err(invalid(format!(
                 "{abandoned} disk transport jobs did not complete within {:?}",

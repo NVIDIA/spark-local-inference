@@ -281,12 +281,18 @@ fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
         ((8u64 << 30) / 512 + STORE_DEVICE_MARGIN_BYTES, 16 << 30)
     );
     options.disk = Some("records".into());
-    let staging = 260 * (32u64 << 20);
-    let host = (16u64 << 30) + staging;
+    let host = 16u64 << 30;
     assert_eq!(
         options.headroom_bytes(2, &layout).unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
+    options.memory_bytes = Some(0);
+    let staging = 260 * (32u64 << 20);
+    assert_eq!(
+        options.headroom_bytes(2, &layout).unwrap(),
+        (staging.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, staging)
+    );
+    options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
     assert_eq!(options.headroom_bytes(2, &layout).unwrap().1, 16 << 30);
 }
@@ -348,4 +354,131 @@ fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
     assert!(warning.contains("publications may wait for spills"));
     options.memory_bytes = Some(0);
     assert!(build(&options).pool_row_warning(32).is_none());
+}
+
+struct RecordingFactory {
+    maps: std::cell::RefCell<Vec<usize>>,
+    closed: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    fail: Option<usize>,
+}
+struct ClosingCopier {
+    layout: Layout,
+    id: usize,
+    closed: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    fail: bool,
+}
+impl crate::PageCopier for ClosingCopier {
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+    fn submit(&mut self, _: crate::Job) -> Result<()> {
+        Err("no copies expected".into())
+    }
+    fn poll(&mut self, _: &mut Vec<crate::Reply>) {}
+    fn in_flight(&self) -> usize {
+        0
+    }
+    fn close(&mut self) -> Result<()> {
+        self.closed.lock().unwrap().push(self.id);
+        if self.fail {
+            Err("copier failed to drain".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl CopierFactory for RecordingFactory {
+    fn mapped(
+        &self,
+        _: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        pool: &slab::SlabPool,
+    ) -> Result<crate::SharedCopier> {
+        let mut maps = self.maps.borrow_mut();
+        let id = maps.len();
+        maps.push(pool.page_address(slab::Slot(0)));
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(ClosingCopier {
+            layout: Layout::new(&geometry)?,
+            id,
+            closed: self.closed.clone(),
+            fail: self.fail == Some(id),
+        })))
+    }
+    fn unmapped(
+        &self,
+        _: &[(usize, i32)],
+        _: Vec<CacheGeometry>,
+    ) -> Result<Box<dyn crate::PageCopier>> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_close() {
+    for warm in [0, 16 * 4096] {
+        for fail in [None, Some(0), Some(1)]
+            .into_iter()
+            .filter(|fail| warm != 0 || *fail != Some(1))
+        {
+            let directory = test_directory();
+            let registrar = crate::testing::TrackingRegistrar::default();
+            let options = PrefixCacheOffload {
+                memory_bytes: Some(warm),
+                disk: Some(directory.clone()),
+                disk_limit: Some(1 << 30),
+                ..Default::default()
+            };
+            let Preparation::Store(prepared) = super::prepare(
+                &options,
+                std::path::Path::new("model.safetensors"),
+                [0; 32],
+                vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)],
+                vec![(0, 0)],
+                &registrar,
+            )
+            .unwrap() else {
+                panic!("no store")
+            };
+            assert_eq!(registrar.calls.lock().unwrap().len(), 1);
+            let mut pool = prepared.memory_pool.as_ref().unwrap().clone();
+            let slot = pool.allocate_page().unwrap();
+            let factory = RecordingFactory {
+                maps: Default::default(),
+                closed: Default::default(),
+                fail,
+            };
+            let mut store = open(*prepared, &factory).unwrap();
+            let maps = factory.maps.borrow();
+            assert_eq!(maps.len(), if warm == 0 { 1 } else { 2 });
+            assert!(
+                maps.iter()
+                    .all(|&address| address == pool.page_address(slab::Slot(0)))
+            );
+            assert_eq!(store.close().is_err(), fail.is_some());
+            let order = factory.closed.lock().unwrap().clone();
+            assert_eq!(
+                order,
+                if warm == 0 {
+                    vec![0]
+                } else if fail == Some(1) {
+                    vec![1]
+                } else {
+                    vec![1, 0]
+                }
+            );
+            drop(store);
+            assert_eq!(*registrar.drops.lock().unwrap(), 0);
+            pool.release_page(slot);
+            if fail.is_some() {
+                assert_eq!(pool.free_pages(), 0);
+                assert_eq!(pool.allocate_page(), None);
+            }
+            drop(pool);
+            assert_eq!(
+                *registrar.drops.lock().unwrap(),
+                usize::from(fail.is_none())
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }

@@ -21,7 +21,14 @@
 //! free, released twice, or outside the pool is ignored instead of duplicating
 //! a free-list entry. The free lists are sized at construction and never grow.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    mem::ManuallyDrop,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::{HostRegistrar, Registration, Result, SplitMapping};
 
@@ -37,53 +44,16 @@ pub use crate::shared::WINDOW_PAGES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Slot(pub u32);
 
-struct SubPool {
-    base: usize,
-    slab_bytes: usize,
-    count: usize,
+struct Slots {
     free: VecDeque<u32>,
     allocated: Vec<bool>,
 }
 
-impl SubPool {
-    fn new(base: usize, slab_bytes: usize, count: usize) -> Self {
-        let mut free = VecDeque::with_capacity(count);
-        free.extend(0..count as u32);
+impl Slots {
+    fn new(count: usize) -> Self {
         Self {
-            base,
-            slab_bytes,
-            count,
-            free,
+            free: (0..count as u32).collect(),
             allocated: vec![false; count],
-        }
-    }
-
-    /// Slab indices are produced only by `allocate`, so an index outside the
-    /// pool is a caller defect; the panic keeps `page` and `row` inside the mapping.
-    fn address(&self, index: u32) -> usize {
-        assert!(
-            (index as usize) < self.count,
-            "slab index {index} outside a pool of {} slabs",
-            self.count
-        );
-        self.base + index as usize * self.slab_bytes
-    }
-
-    fn allocate(&mut self) -> Option<u32> {
-        let index = self.free.pop_front()?;
-        self.allocated[index as usize] = true;
-        Some(index)
-    }
-
-    /// Return `index` to the back of the free list. A slab that is not
-    /// allocated, including one released twice or an index outside the pool,
-    /// is ignored so the free list never holds a slab twice.
-    fn release(&mut self, index: u32) {
-        if let Some(allocated) = self.allocated.get_mut(index as usize)
-            && *allocated
-        {
-            *allocated = false;
-            self.free.push_back(index);
         }
     }
 }
@@ -171,19 +141,23 @@ struct Split {
     _memory: Box<dyn SplitMapping>,
 }
 
-/// Equal slots inside one registered mapping, or split by rank.
+/// Shared slots with immutable mapping geometry and resource ownership.
+#[derive(Clone)]
 pub struct SlabPool {
-    mapping: usize,
-    mapping_bytes: usize,
-    pages: SubPool,
-    retain: bool,
-    registration: Option<Box<dyn Registration>>,
-    split: Option<Split>,
+    memory: Arc<Memory>,
+    slots: Arc<Mutex<Slots>>,
 }
 
-// SAFETY: The mapping is plain process memory; the pool is used from one thread
-// at a time and slab addresses handed to other threads outlive their transfers.
-unsafe impl Send for SlabPool {}
+struct Memory {
+    mapping: usize,
+    mapping_bytes: usize,
+    page_bytes: usize,
+    page_count: usize,
+    retain: bool,
+    registration: ManuallyDrop<Option<Box<dyn Registration>>>,
+    split: ManuallyDrop<Option<Split>>,
+    leaked: AtomicBool,
+}
 
 impl SlabPool {
     /// Map equal, page-record-sized slots.
@@ -195,12 +169,17 @@ impl SlabPool {
         let base = flare_eos::map_host(mapping_bytes)
             .map_err(|error| invalid(format!("allocate host slots: {error}")))?;
         Ok(Self {
-            mapping: base,
-            mapping_bytes,
-            pages: SubPool::new(base, page_bytes as usize, count),
-            retain,
-            registration: None,
-            split: None,
+            memory: Arc::new(Memory {
+                mapping: base,
+                mapping_bytes,
+                page_bytes: page_bytes as usize,
+                page_count: count,
+                retain,
+                registration: ManuallyDrop::new(None),
+                split: ManuallyDrop::new(None),
+                leaked: AtomicBool::new(false),
+            }),
+            slots: Arc::new(Mutex::new(Slots::new(count))),
         })
     }
 
@@ -274,21 +253,26 @@ impl SlabPool {
             })
             .collect();
         Ok(Self {
-            mapping: base,
-            mapping_bytes: memory.nbytes(),
-            pages: SubPool::new(base, layout.page_record_bytes as usize, page_count),
-            retain: true,
-            registration: None,
-            split: Some(Split {
-                parts,
-                _memory: memory,
+            memory: Arc::new(Memory {
+                mapping: base,
+                mapping_bytes: memory.nbytes(),
+                page_bytes: layout.page_record_bytes as usize,
+                page_count,
+                retain: true,
+                registration: ManuallyDrop::new(None),
+                split: ManuallyDrop::new(Some(Split {
+                    parts,
+                    _memory: memory,
+                })),
+                leaked: AtomicBool::new(false),
             }),
+            slots: Arc::new(Mutex::new(Slots::new(page_count))),
         })
     }
 
     /// Each rank's part of the slabs, in rank order, for a pool split by rank.
     pub fn rank_parts(&self) -> Option<Vec<RankPart>> {
-        self.split.as_ref().map(|split| split.parts.clone())
+        self.memory.split.as_ref().map(|split| split.parts.clone())
     }
 
     /// Resolve GPU copy addresses once at startup. Disk I/O and CPU slices
@@ -306,6 +290,7 @@ impl SlabPool {
             return Ok(parts);
         }
         let registration = self
+            .memory
             .registration
             .as_ref()
             .ok_or_else(|| invalid("transfer slabs must be registered with CUDA"))?;
@@ -317,9 +302,9 @@ impl SlabPool {
             .ranks
             .iter()
             .map(|rank| RankPart {
-                range: self.mapping..self.mapping + self.mapping_bytes,
+                range: self.memory.mapping..self.memory.mapping + self.memory.mapping_bytes,
                 pages: PartRegion {
-                    identity: self.pages.base,
+                    identity: self.memory.mapping,
                     record_bytes: self.page_bytes(),
                     count: self.page_count(),
                     base: (device + rank.page_offset) as usize,
@@ -349,85 +334,105 @@ impl SlabPool {
         }
         // The mapping is page aligned and stays mapped at this size for the
         // pool's lifetime; `Drop` releases the registration before unmapping.
-        let registration = registrar.register(context, self.mapping, self.mapping_bytes)?;
-        self.registration = Some(registration);
-        Ok(())
-    }
-
-    /// Release the driver registration; a pool that is not registered is unchanged.
-    pub fn unregister(&mut self) -> Result<()> {
-        self.registration.take();
+        let memory = Arc::get_mut(&mut self.memory)
+            .ok_or_else(|| invalid("cannot register a shared slab pool"))?;
+        *memory.registration =
+            Some(registrar.register(context, memory.mapping, memory.mapping_bytes)?);
         Ok(())
     }
 
     /// Whether the driver can copy the slabs: after `register`, and always for a pool split by rank.
     pub fn registered(&self) -> bool {
-        self.registration.is_some() || self.split.is_some()
+        self.memory.registration.is_some() || self.memory.split.is_some()
     }
 
     pub fn retain(&self) -> bool {
-        self.retain
+        self.memory.retain
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.pages.slab_bytes
+        self.memory.page_bytes
     }
     pub fn page_count(&self) -> usize {
-        self.pages.count
+        self.memory.page_count
     }
     pub fn free_pages(&self) -> usize {
-        self.pages.free.len()
+        self.lock().free.len()
     }
     pub fn bytes(&self) -> u64 {
-        self.mapping_bytes as u64
+        self.memory.mapping_bytes as u64
     }
 
     pub fn allocate_page(&mut self) -> Option<Slot> {
-        self.pages.allocate().map(Slot)
+        let mut slots = self.lock();
+        let index = slots.free.pop_front()?;
+        slots.allocated[index as usize] = true;
+        Some(Slot(index))
     }
-    /// Returns `slab` to the free list; a slab that is not allocated is ignored.
+    /// Return an allocated slot once; ignore free, repeated and out-of-range slots.
     pub fn release_page(&mut self, slab: Slot) {
-        self.pages.release(slab.0);
+        let mut slots = self.lock();
+        if let Some(allocated) = slots.allocated.get_mut(slab.0 as usize)
+            && *allocated
+        {
+            *allocated = false;
+            slots.free.push_back(slab.0);
+        }
     }
     pub fn page_address(&self, slab: Slot) -> usize {
-        self.pages.address(slab.0)
+        assert!(
+            (slab.0 as usize) < self.page_count(),
+            "slab index outside the pool"
+        );
+        self.memory.mapping + slab.0 as usize * self.page_bytes()
     }
-    /// The record bytes of a pool that is not split by rank; a split pool has
-    /// no contiguous record, so asking for one is a caller defect.
+    /// Failed drain: retain the mapping permanently and prevent slot reuse.
+    pub(crate) fn leak(&self) {
+        let mut slots = self.lock();
+        slots.free.clear();
+        slots.allocated.fill(false);
+        self.memory.leaked.store(true, Ordering::Relaxed);
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The caller owns the slot and keeps it pinned through every reader.
     pub fn page(&self, slab: Slot) -> &[u8] {
         self.assert_contiguous();
         // SAFETY: The mapping outlives the pool and the slab lies inside it.
         unsafe {
-            std::slice::from_raw_parts(self.page_address(slab) as *const u8, self.pages.slab_bytes)
+            std::slice::from_raw_parts(self.page_address(slab) as *const u8, self.page_bytes())
         }
     }
     pub fn page_mut(&mut self, slab: Slot) -> &mut [u8] {
         self.assert_contiguous();
-        // SAFETY: As above, with exclusive access through `&mut self`.
+        // SAFETY: The caller owns the slot exclusively while mutating its bytes.
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.page_address(slab) as *mut u8,
-                self.pages.slab_bytes,
-            )
+            std::slice::from_raw_parts_mut(self.page_address(slab) as *mut u8, self.page_bytes())
         }
     }
     fn assert_contiguous(&self) {
         assert!(
-            self.split.is_none(),
+            self.memory.split.is_none(),
             "the slabs of a pool split by rank hold no contiguous record"
         );
     }
 }
 
-impl Drop for SlabPool {
+impl Drop for Memory {
     fn drop(&mut self) {
-        self.registration.take();
-        // A split pool's memory releases its own mappings and reservation.
-        if self.split.take().is_none() && self.mapping != 0 {
-            // SAFETY: The mapping was created by this pool and is no longer registered.
-            unsafe {
+        if self.leaked.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: The last handle dropped and both copiers drained; unregister before unmapping.
+        unsafe {
+            ManuallyDrop::drop(&mut self.registration);
+            if self.split.is_none() {
                 flare_eos::unmap_host(self.mapping, self.mapping_bytes);
             }
+            ManuallyDrop::drop(&mut self.split);
         }
     }
 }
@@ -501,6 +506,80 @@ mod tests {
         pool.release_page(Slot(99));
         assert_eq!(pool.free_pages(), 4);
         assert_eq!(pool.allocate_page(), Some(slots[0]));
+    }
+
+    #[test]
+    fn shared_handles_use_one_free_list_and_retain_the_registration() {
+        let registrar = crate::testing::TrackingRegistrar::default();
+        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        pool.register(&registrar, 0).unwrap();
+        let mut other = pool.clone();
+        let first = pool.allocate_page().unwrap();
+        let second = other.allocate_page().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(pool.allocate_page(), None);
+        other.release_page(first);
+        assert_eq!(pool.allocate_page(), Some(first));
+        pool.page_mut(first).fill(42);
+        drop(pool);
+        assert_eq!(registrar.calls.lock().unwrap().len(), 1);
+        assert_eq!(*registrar.drops.lock().unwrap(), 0);
+        assert!(other.page(first).iter().all(|&byte| byte == 42));
+        drop(other);
+        assert_eq!(*registrar.drops.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn copy_addresses_and_slices_do_not_wait_for_the_free_list() {
+        let layout = Layout::new(&[geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+        let registrar = crate::testing::TrackingRegistrar::default();
+        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        pool.register(&registrar, 0).unwrap();
+        let slot = pool.allocate_page().unwrap();
+        let other = pool.clone();
+        let locked = other.slots.lock().unwrap();
+        let (done, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let address = pool.page_address(slot);
+            pool.page_mut(slot).fill(42);
+            assert!(pool.page(slot).iter().all(|&byte| byte == 42));
+            assert_eq!(pool.page_bytes(), 4096);
+            assert_eq!(pool.page_count(), 2);
+            assert_eq!(pool.bytes(), 8192);
+            assert!(pool.retain() && pool.registered());
+            assert!(pool.rank_parts().is_none());
+            assert_eq!(
+                pool.registered_parts(&layout, address as u64)[0]
+                    .page(address)
+                    .unwrap(),
+                Some(address as u64)
+            );
+            assert_eq!(
+                pool.device_parts(&layout).unwrap()[0]
+                    .page(address)
+                    .unwrap(),
+                Some(address as u64)
+            );
+            done.send(()).unwrap();
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(5));
+        drop(locked);
+        worker.join().unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn registration_is_frozen_while_the_mapping_is_shared() {
+        let registrar = crate::testing::TrackingRegistrar::default();
+        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        let other = pool.clone();
+        assert!(pool.register(&registrar, 0).is_err());
+        assert!(registrar.calls.lock().unwrap().is_empty());
+        assert!(!other.registered());
+        drop(other);
+        pool.register(&registrar, 0).unwrap();
+        assert!(pool.register(&registrar, 0).is_err());
+        assert_eq!(registrar.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -592,7 +671,7 @@ mod tests {
                         part.page(slot).unwrap(),
                         Some(
                             0x1000_0000
-                                + (slot - pool.mapping) as u64
+                                + (slot - pool.memory.mapping) as u64
                                 + layout.ranks[rank].page_offset
                         )
                     );

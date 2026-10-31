@@ -1524,10 +1524,10 @@ mod tests {
             true,
         )
         .unwrap();
+        let shared_pool = pool.clone();
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let directory_lock = crate::testing::directory_lock(directory).unwrap();
         let scanned = record::scan(&directory_lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
-        let layout = Layout::new(&geometry).unwrap();
         let disk_transfers = StoppedCopier::shared(&geometry).unwrap();
         let disk = DiskStore::new(
             directory_lock,
@@ -1537,7 +1537,7 @@ mod tests {
             geometry,
             scanned,
             Box::new(Staged::new(
-                Some(SlabPool::staging(&layout).unwrap()),
+                Some(shared_pool),
                 disk_transfers,
                 DiskThread::start_with_faults("flare-offload-disk", faults).unwrap(),
             )),
@@ -1697,19 +1697,19 @@ mod tests {
         let Some(directory) = test_directory("composite", "oversized-chain") else {
             return;
         };
-        let full = history(2000);
+        let full = history(10000);
         let mut ids = Ids::new();
-        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        let root = checkpoint(&mut ids, &full, 70 * PAGE_TOKENS, None, pages(0..70), 70, StateSlotId(1));
         let child = checkpoint(
             &mut ids,
             &full,
-            1300,
-            Some(700),
-            pages(0..20),
-            10,
+            140 * PAGE_TOKENS,
+            Some(70 * PAGE_TOKENS),
+            pages(0..140),
+            70,
             StateSlotId(2),
         );
-        let mut store = composite(&directory, 32, 4, 1 << 30);
+        let mut store = composite(&directory, 192, 4, 1 << 30);
         written(&mut store, &root, None, 1);
         written(&mut store, &child, Some(root.key), 2);
         store.close().unwrap();
@@ -1717,7 +1717,7 @@ mod tests {
 
         // Both an oversized record and individually fitting records whose
         // combined chain exceeds retention must use the streaming path.
-        for capacity in [4, 15] {
+        for capacity in [66, 100] {
             let mut store = composite(&directory, capacity, 2, 1 << 30);
             let useful_record =
                 checkpoint(&mut ids, &full, 100, None, pages(0..1), 1, StateSlotId(1));
@@ -1726,14 +1726,14 @@ mod tests {
             let retained = landed(&mut store, useful, useful_record.bucket, 1, 3);
             let bytes = record_bytes(&store, &retained);
             let hit = store.lookup(&full, 0, u64::MAX).unwrap();
-            assert_eq!((hit.key, hit.tier, hit.pages), (child.key, Tier::Nvme, 20));
+            assert_eq!((hit.key, hit.tier, hit.pages), (child.key, Tier::Nvme, 140));
             assert!(!store.retains_chain(&hit.chain));
             store
                 .fetch(
                     hit,
                     InboundTicket {
                         key: child.key,
-                        pages: pages(30..50),
+                        pages: pages(200..340),
                         slot: StateSlotId(3),
                     },
                 )
@@ -1768,23 +1768,23 @@ mod tests {
         let Some(directory) = test_directory("composite", "streamed-failure") else {
             return;
         };
-        let mut store = composite(&directory, 4, 2, 1 << 30);
-        let full = history(2000);
+        let mut store = composite(&directory, 66, 2, 1 << 30);
+        let full = history(5000);
         let mut ids = Ids::new();
-        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        let root = checkpoint(&mut ids, &full, 70 * PAGE_TOKENS, None, pages(0..70), 70, StateSlotId(1));
         let child = checkpoint(
             &mut ids,
             &full,
-            800,
-            Some(700),
-            pages(0..12),
+            72 * PAGE_TOKENS,
+            Some(70 * PAGE_TOKENS),
+            pages(0..72),
             2,
             StateSlotId(2),
         );
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
-        assert_eq!(store.memory.pool().free_pages(), 6);
+        assert_eq!(store.memory.pool().free_pages(), 68);
         assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
         let parent_pins = store.disk.index().node(&root.key).unwrap().pins();
@@ -1813,7 +1813,7 @@ mod tests {
         assert_eq!(store.stats().store_failed, 2);
         assert!(store.memory.index().is_empty());
         assert!(store.disk.index().is_empty());
-        assert_eq!((store.memory.pool().free_pages()), 6);
+        assert_eq!((store.memory.pool().free_pages()), 68);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
@@ -2774,6 +2774,87 @@ mod tests {
                 );
             }
         }
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staged_starvation_does_not_block_memory_spill_or_eviction() {
+        let Some(directory) = test_directory("composite", "staged-starvation") else {
+            return;
+        };
+        let mut store = composite(&directory, 12, 4, 1 << 30);
+        let full = history(2000);
+        let mut ids = Ids::new();
+        let root = checkpoint(
+            &mut ids,
+            &full,
+            15 * PAGE_TOKENS,
+            None,
+            pages(0..15),
+            15,
+            StateSlotId(1),
+        );
+        let (record, bytes) = copy_landed(&mut store, &root, None, 1);
+        let expected = record_bytes(&store, &record);
+        let mut events = Vec::new();
+        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        assert_eq!(store.memory.pool().free_pages(), 0);
+        assert_eq!(store.staged().unwrap().pool().unwrap().free_pages(), 0);
+
+        let blocked = full.key_at(128).unwrap();
+        let header = Header::new(
+            &geometry(),
+            IDENTITY,
+            FINGERPRINT,
+            blocked,
+            None,
+            full.bucket_at(128).unwrap(),
+            2,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        store
+            .staged()
+            .unwrap()
+            .store_pages(
+                JobId(u64::MAX),
+                header,
+                directory.join(record::temporary_name(&blocked)),
+                directory.join(record::file_name(&blocked)),
+                pages(100..102),
+                StateSlotId(2),
+            )
+            .unwrap();
+        assert_eq!(store.staged().unwrap().in_flight(), (1, 0));
+        // Spill reads the resident record directly, even with staging out of slots.
+        store.spill(root.key);
+        poll_until(&mut store, &mut events, |store| store.jobs.is_empty());
+        assert!(store.memory.record(&root.key).unwrap().durable);
+        assert_eq!(store.staged().unwrap().in_flight(), (1, 0));
+        let file = fs::read(directory.join(record::file_name(&root.key))).unwrap();
+        let header = &store.disk.index().node(&root.key).unwrap().location.header;
+        for (index, page) in expected[..15].iter().enumerate() {
+            let start = header.page_segment as usize + index * PAGE_RECORD as usize;
+            assert_eq!(&file[start..start + PAGE_RECORD as usize], page);
+        }
+        let start = header.row_segment as usize;
+        assert_eq!(
+            &file[start..start + ROW_RECORD as usize],
+            expected.last().unwrap()
+        );
+        // On-demand eviction can release memory without advancing the staged job.
+        let next = full.key_at(64).unwrap();
+        assert!(
+            store
+                .memory
+                .allocate_record(next, full.bucket_at(64).unwrap(), 1, true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.memory.record(&root.key).is_none());
+        store.memory.complete_record(&next, false).unwrap();
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();

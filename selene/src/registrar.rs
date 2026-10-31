@@ -29,13 +29,13 @@ pub trait HostRegistrar {
 /// An owned registration. Dropping it unregisters the range; the caller
 /// unmaps the range only afterwards. A failed drain keeps the handle, and so
 /// the registered range, alive.
-pub trait Registration: Send {
+pub trait Registration: Send + Sync {
     /// The address devices use for the start of the registered range.
     fn device_address(&self) -> u64;
 }
 
 /// An owned split mapping. Dropping it unmaps the parts and releases the range.
-pub trait SplitMapping: Send {
+pub trait SplitMapping: Send + Sync {
     /// First address of the reserved range.
     fn address(&self) -> usize;
     /// Bytes of the reserved range, including each part's rounding.

@@ -1450,7 +1450,8 @@ impl HostStore for MemoryStore {
         self.transfers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .close()?;
+            .close()
+            .inspect_err(|_| self.core.pool.leak())?;
         self.core.abandon();
         self.events.clear();
         Ok(())
