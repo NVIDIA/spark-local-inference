@@ -53,6 +53,7 @@ class ModelConfig:
     text: dict
     quantization: dict
     vision: dict | None = None
+    trellismx: bool = False
 
     @classmethod
     def load(cls, snapshot):
@@ -77,10 +78,25 @@ class ModelConfig:
         }.items():
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
-        if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
+        if (quant.get("quant_method") == "ds41_trellismx"):
+            # The TrellisMX pack stores attention, shared experts, MTP, vision
+            # and Engram rows as in the official release; only the 40 decoder
+            # layers' routed experts move to sidecar trellis streams.
+            for key, value in {
+                "format_version": 1, "checkpoint_root": ".", "sidecar_dir": ".",
+                "manifest": "trellismx/manifest.json", "scale_compression": "sidecar-csf",
+                "activation_scheme": "dynamic", "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0",
+            }.items():
+                if quant.get(key) != value:
+                    raise ValueError(f"TrellisMX quantization_config.{key} requires {value!r}")
+            trellismx = True
+        elif (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
                 or quant.get("scale_fmt") != "ue8m0" or quant.get("expert_dtype") != "fp4"
                 or quant.get("activation_scheme") != "dynamic"):
             raise ValueError("DeepSeek V4.1 requires block-32 FP8 weights and native MXFP4 experts")
+        else:
+            trellismx = False
         vision = config.get("vision_config")
         if vision is not None:
             for key, expected in {"num_hidden_layers": 32, "hidden_size": 1024,
@@ -91,7 +107,7 @@ class ModelConfig:
                     raise ValueError(f"unsupported DeepSeek V4.1 vision {key}: {vision.get(key)}")
             if config.get("image_token_id") != 129264:
                 raise ValueError("DeepSeek V4.1 image placeholder requires token 129264")
-        result = cls(text, quant, vision)
+        result = cls(text, quant, vision, trellismx)
         ratios = text["compress_ratios"]
         if len(ratios) < result.layers or any(r not in (0, 1, 2) for r in ratios):
             raise ValueError("unsupported DeepSeek compression schedule")
