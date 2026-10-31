@@ -170,7 +170,11 @@ impl Layout {
         (0..self.ranks.len())
             .map(|rank| self.row_share(rank).div_ceil(self.page_share(rank)) as usize)
             .max()
-            .unwrap_or(0)
+            .unwrap()
+    }
+
+    pub fn record_slots(&self, pages: usize, row: bool) -> usize {
+        pages + usize::from(row) * self.row_slots()
     }
 
     /// Bytes a record with `pages` tail pages and a row occupies.

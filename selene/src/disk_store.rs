@@ -195,36 +195,20 @@ impl Resources {
     /// `None` leaves the pool unchanged when it cannot supply all of them.
     fn allocate(&mut self, pages: usize, row: bool) -> Option<Buffers> {
         let pool = self.pool.as_mut()?;
-        let row_slots = lock(&self.transfers).layout().row_slots();
-        let needed = pages + usize::from(row) * row_slots;
-        if pool.free_pages() < needed {
-            return None;
-        }
-        let slabs: Vec<_> = (0..pages).map(|_| pool.allocate_page().unwrap()).collect();
-        let row_slabs: Option<Vec<_>> = row.then(|| {
-            (0..row_slots)
-                .map(|_| pool.allocate_page().unwrap())
-                .collect()
-        });
+        let needed = lock(&self.transfers).layout().record_slots(pages, row);
+        let mut slots = pool.allocate(needed)?;
+        let row_slots = slots.split_off(pages);
+        let row = row.then_some(row_slots);
         Some(Buffers {
-            pages: slabs.iter().map(|&slab| pool.page_address(slab)).collect(),
-            row: row_slabs
-                .as_ref()
-                .map(|slabs| slabs.iter().map(|&slab| pool.page_address(slab)).collect()),
-            slabs: Some((slabs, row_slabs)),
+            pages: pool.addresses(&slots),
+            row: row.as_ref().map(|slots| pool.addresses(slots)),
+            slabs: Some((slots, row)),
         })
     }
 
     fn release(&mut self, buffers: &mut Buffers) {
-        if let (Some(pool), Some((pages, row))) = (self.pool.as_mut(), buffers.slabs.take()) {
-            for slab in pages {
-                pool.release_page(slab);
-            }
-            if let Some(slab) = row {
-                for slot in slab {
-                    pool.release_page(slot);
-                }
-            }
+        if let (Some(pool), Some((pages, row))) = (self.pool.as_ref(), buffers.slabs.take()) {
+            pool.release(pages.into_iter().chain(row.into_iter().flatten()));
         }
     }
 }
@@ -4267,7 +4251,6 @@ mod tests {
                 let mut pool = SlabPool::new(
                     PAGE_RECORD,
                     (4) + (2) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
-                    true,
                 )
                 .unwrap();
                 for index in 0..4 {

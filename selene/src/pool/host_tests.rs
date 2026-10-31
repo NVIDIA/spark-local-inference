@@ -38,7 +38,7 @@ fn rig(pages: usize) -> Rig {
     let layout = Layout::new(std::slice::from_ref(&geometry)).unwrap();
     assert_eq!(layout.page_record_bytes as usize, PAGE);
     let (copier, gpu) = SimulatedGpu::shared_mapped(std::slice::from_ref(&geometry)).unwrap();
-    let pool = SlabPool::new(PAGE as u64, pages + 1, true).unwrap();
+    let pool = SlabPool::new(PAGE as u64, pages + 1).unwrap();
     let mut store = MemoryStore::new([7; 32], pool, copier).unwrap();
     let announcer = Announcer::new(Arc::new(Notify::new()));
     announcer.begin_session();
@@ -232,7 +232,6 @@ fn a_store_that_was_never_attached_announces_nothing_and_exports_nothing() {
     let pool = SlabPool::new(
         PAGE as u64,
         (4) + (2) * (ROW as u64).div_ceil(PAGE as u64) as usize,
-        true,
     )
     .unwrap();
     let mut store = MemoryStore::new([7; 32], pool, copier).unwrap();

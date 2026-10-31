@@ -702,7 +702,6 @@ mod tests {
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
             (3) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            false,
         )
         .unwrap();
         assert!(pool.device_parts(&layout).is_err());
@@ -867,7 +866,7 @@ mod tests {
         let error = expand(&ranks[1], rank, Some(&part), &inside, &mut descriptors)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("page slabs"), "{error}");
+        assert!(error.contains("not a slot"), "{error}");
         let mut crossed = job.clone();
         crossed.row = Some((StateSlotId(3), vec![start + 3 * page_record]));
         let error = expand(&ranks[1], rank, Some(&part), &crossed, &mut descriptors)
@@ -1287,7 +1286,6 @@ mod tests {
             layout.page_record_bytes,
             (pages as usize)
                 + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            false,
         )
         .unwrap();
         pool.register(&crate::offload::registrar::CudaRegistrar, context)
@@ -1625,7 +1623,7 @@ mod tests {
             fill(&mut bytes, seed(rank, row_plane, 1));
             write(context, rank_geometry.row.unit_address(1), &bytes);
         }
-        let mut pool = pool;
+        let pool = pool;
         let slabs: Vec<usize> = sources
             .iter()
             .map(|_| {
@@ -1776,7 +1774,7 @@ mod tests {
             geometry(64, &[("kv", 8192)], 3 * 4096 - 3),
         ];
         let layout = Layout::new(&ranks).unwrap();
-        let mut pool = SlabPool::new(layout.page_record_bytes, 7, true).unwrap();
+        let pool = SlabPool::new(layout.page_record_bytes, 7).unwrap();
         let slots: Vec<_> = (0..layout.row_slots())
             .map(|_| {
                 let slot = pool.allocate_page().unwrap();

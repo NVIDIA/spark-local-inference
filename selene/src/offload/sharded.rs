@@ -139,7 +139,7 @@ fn retain(prepared: &mut Prepared, agreed: &HashMap<PrefixKey, bool>) -> Result<
 /// Whether this rank serves a disk store its peers can mirror; a memory tier keeps records in
 /// one process's memory, which other hosts cannot reach.
 fn mirrored(prepared: &Prepared) -> Result<bool> {
-    if prepared.resolved.memory_bytes != 0 {
+    if prepared.warm_bytes != 0 {
         return Err(invalid(
             "a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0",
         ));

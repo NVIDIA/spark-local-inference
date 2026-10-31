@@ -47,7 +47,7 @@ use crate::{Error, Result};
 
 use super::{
     JobId,
-    geometry::{BLOCK_BYTES, invalid},
+    geometry::{BLOCK_BYTES, Layout, invalid},
     record::{HEADER_BYTES, Header, checksum, io_failure},
 };
 
@@ -669,17 +669,7 @@ impl Worker {
 
     fn write_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let writing = writing(&mut self.records, id)?;
-        let layout = writing.header.layout()?;
-        if buffers.len() != layout.row_slots() {
-            return Err(invalid("row buffer count disagrees with record layout"));
-        }
-        let spans: Vec<_> = crate::slab::row_pieces(&layout, buffers)
-            .map(|(address, offset, length)| Span {
-                address,
-                offset: writing.header.row_segment + offset,
-                length,
-            })
-            .collect();
+        let (layout, spans) = row_spans(&writing.header, buffers)?;
         let moved = self.ring.transfer(&writing.file, &spans, true)?;
         writing.header.row_checksum = crate::record::row_checksum(&layout, buffers);
         writing.row_written = true;
@@ -869,17 +859,7 @@ impl Worker {
 
     fn read_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let reading = reading(&mut self.records, id)?;
-        let layout = reading.header.layout()?;
-        if buffers.len() != layout.row_slots() {
-            return Err(invalid("row buffer count disagrees with record layout"));
-        }
-        let spans: Vec<_> = crate::slab::row_pieces(&layout, buffers)
-            .map(|(address, offset, length)| Span {
-                address,
-                offset: reading.header.row_segment + offset,
-                length,
-            })
-            .collect();
+        let (layout, spans) = row_spans(&reading.header, buffers)?;
         let moved = self.ring.transfer(&reading.file, &spans, false)?;
         if crate::record::row_checksum(&layout, buffers) != reading.header.row_checksum {
             return Err(invalid(format!(
@@ -895,6 +875,21 @@ impl Worker {
         self.records.remove(&id);
         Ok(0)
     }
+}
+
+fn row_spans(header: &Header, buffers: &[usize]) -> Result<(Layout, Vec<Span>)> {
+    let layout = header.layout()?;
+    if buffers.len() != layout.row_slots() {
+        return Err(invalid("row buffer count disagrees with record layout"));
+    }
+    let spans = crate::slab::row_pieces(&layout, buffers)
+        .map(|(address, offset, length)| Span {
+            address,
+            offset: header.row_segment + offset,
+            length,
+        })
+        .collect();
+    Ok((layout, spans))
 }
 
 fn reply(id: JobId, operation: Operation, window: u32, outcome: Result<u64>) -> Reply {

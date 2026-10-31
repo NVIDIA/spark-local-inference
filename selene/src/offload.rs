@@ -87,7 +87,7 @@ impl PrefixCacheOffload {
         let host = memory
             .checked_add(staging)
             .ok_or("prefix cache host memory overflows the device budget")?;
-        let ordinary = input_memory_bytes(memory, 0, inputs);
+        let ordinary = input_memory_bytes(memory, inputs);
         let pinned = memory - ordinary;
         let mapped = if disk {
             pinned + staging
@@ -198,6 +198,7 @@ pub struct Prepared {
     /// Each rank's CUDA context handle and local device ordinal.
     pub contexts: Vec<(usize, i32)>,
     pub memory_pool: Option<slab::SlabPool>,
+    pub warm_bytes: u64,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
@@ -236,7 +237,7 @@ impl Preparation {
 
 impl Prepared {
     pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
-        let pool = self.memory_pool.as_ref().filter(|pool| pool.retain())?;
+        let pool = self.memory_pool.as_ref().filter(|_| self.warm_bytes != 0)?;
         let rows = pool.page_count() / self.layout.row_slots();
         let recommended = max_concurrency.saturating_mul(2);
         (rows < max_concurrency).then(|| {
@@ -253,7 +254,11 @@ impl Prepared {
         if let Some(pool) = &self.memory_pool {
             parts.push(format!(
                 "{} {} ({} slots{})",
-                if pool.retain() { "memory" } else { "staging" },
+                if self.warm_bytes != 0 {
+                    "memory"
+                } else {
+                    "staging"
+                },
                 gibibytes(pool.bytes()),
                 pool.page_count(),
                 if pool.rank_parts().is_some() {
@@ -445,7 +450,7 @@ pub fn prepare_with_inputs(
         .first()
         .ok_or("the host prefix store requires at least one rank")?
         .0;
-    let input_memory = input_memory_bytes(memory_bytes, 0, input_staging != 0);
+    let input_memory = input_memory_bytes(memory_bytes, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
     let memory_pool = (checkpoint_memory != 0 || directory.is_some())
         .then(|| {
@@ -501,6 +506,7 @@ pub fn prepare_with_inputs(
         layout,
         contexts,
         memory_pool,
+        warm_bytes: checkpoint_memory,
         scanned,
         directory_lock,
         shards: Vec::new(),
@@ -509,11 +515,11 @@ pub fn prepare_with_inputs(
 }
 
 /// Ordinary CPU retention leaves enough registered memory for checkpoint transfers.
-pub fn input_memory_bytes(memory: u64, checkpoint_minimum: u64, enabled: bool) -> u64 {
+pub fn input_memory_bytes(memory: u64, enabled: bool) -> u64 {
     if !enabled {
         return 0;
     }
-    (memory / 8).min(memory.saturating_sub(checkpoint_minimum)) / 4096 * 4096
+    (memory / 8) / 4096 * 4096
 }
 
 /// Free bytes on the filesystem holding `path`.
@@ -537,6 +543,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         layout: _,
         contexts,
         memory_pool,
+        warm_bytes,
         scanned,
         directory_lock,
         shards,
@@ -545,16 +552,21 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     if let Some(pool) = &pool {
         pool.start_copies(&contexts, geometry.clone(), factory)?;
     }
-    let transfers: Option<crate::SharedCopier> = memory_pool
+    // Inside a composite the disk index owns the tree; memory nodes are flat.
+    let memory = memory_pool
         .as_ref()
-        .filter(|slabs| slabs.retain())
-        .map(|slabs| factory.mapped(&contexts, geometry.clone(), slabs))
+        .filter(|_| warm_bytes != 0)
+        .map(|pool| {
+            let transfers = factory.mapped(&contexts, geometry.clone(), pool)?;
+            let mut store = if directory_lock.is_some() {
+                memory::MemoryStore::new_flat(identity, pool.clone(), transfers)?
+            } else {
+                memory::MemoryStore::new(identity, pool.clone(), transfers)?
+            };
+            store.index_mut().max_age = max_age;
+            Ok::<_, crate::Error>(store)
+        })
         .transpose()?;
-    let tier_transfers = || {
-        transfers
-            .clone()
-            .ok_or_else(|| crate::Error::new("prefix transfers require a slab pool"))
-    };
     let disk = directory_lock
         .map(|directory| {
             let disk_transfers = factory.mapped(
@@ -565,11 +577,6 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
                     .ok_or("disk transfers require a slab pool")?,
             )?;
             let transport: Box<dyn disk_store::DiskTransport> = if !shards.is_empty() {
-                if resolved.memory_bytes != 0 {
-                    return Err(
-                        "a multi-host package keeps host prefix records on disk only".into(),
-                    );
-                }
                 shard::transport(memory_pool.clone(), disk_transfers, shards)?
             } else {
                 Box::new(disk_store::Staged::new(
@@ -589,19 +596,6 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
             )?;
             store.index_mut().max_age = max_age;
             store.share_budget(disk_budget.clone());
-            Ok::<_, crate::Error>(store)
-        })
-        .transpose()?;
-    // Inside a composite the disk index owns the tree; memory nodes are flat.
-    let memory = memory_pool
-        .filter(|pool| pool.retain())
-        .map(|pool| {
-            let mut store = if disk.is_some() {
-                memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)?
-            } else {
-                memory::MemoryStore::new(identity, pool, tier_transfers()?)?
-            };
-            store.index_mut().max_age = max_age;
             Ok::<_, crate::Error>(store)
         })
         .transpose()?;

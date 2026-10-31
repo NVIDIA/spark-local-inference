@@ -1132,7 +1132,7 @@ fn restore_salted(
 /// own simulated device.
 fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
     let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 2 * pages, true).unwrap();
+    let pool = SlabPool::new(PAGE as u64, 2 * pages).unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
     let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
     let store =
@@ -1207,11 +1207,10 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let mut requester = instance(&manager, 2);
     requester.ready();
     let geometry: Vec<CacheGeometry> = geo();
-    let layout = Layout::new(&geometry).unwrap();
     let fingerprint = fingerprint(&geometry);
     // Memory holds two records of two pages; the disk tier, two files.
     let (memory_transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 8, true).unwrap();
+    let pool = SlabPool::new(PAGE as u64, 8).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
     let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1236,7 +1235,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
         geometry,
         scanned,
         Box::new(Staged::new(
-            Some(SlabPool::staging(&layout).unwrap()),
+            Some(memory.pool().clone()),
             disk_transfers,
             DiskThread::start("cascade-test-disk").unwrap(),
         )),
@@ -1284,7 +1283,6 @@ fn drained_records_are_announced_and_claimable_after_restart() {
     requester.ready();
     let open = || {
         let geometry = geo();
-        let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
         let lock = flare_selene::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(
@@ -1298,7 +1296,7 @@ fn drained_records_are_announced_and_claimable_after_restart() {
         let (memory_copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let memory = MemoryStore::new_flat(
             [7; 32],
-            SlabPool::new(PAGE as u64, 20, true).unwrap(),
+            SlabPool::new(PAGE as u64, 20).unwrap(),
             memory_copier,
         )
         .unwrap();
@@ -1311,7 +1309,7 @@ fn drained_records_are_announced_and_claimable_after_restart() {
             geometry,
             scanned,
             Box::new(Staged::new(
-                Some(SlabPool::staging(&layout).unwrap()),
+                Some(memory.pool().clone()),
                 disk_copier,
                 DiskThread::start("drained-restart").unwrap(),
             )),

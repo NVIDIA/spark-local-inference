@@ -444,7 +444,6 @@ mod memory {
         let mut small = SlabPool::new(
             layout.page_record_bytes,
             (3) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            true,
         )
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
@@ -563,9 +562,12 @@ mod composite {
         }
     }
 
-    fn gpu_transport(context: usize, device: i32, geometry: &[CacheGeometry]) -> Staged {
-        let mut pool = SlabPool::staging(&Layout::new(geometry).unwrap()).unwrap();
-        pool.register(&CudaRegistrar, context).unwrap();
+    fn gpu_transport(
+        context: usize,
+        device: i32,
+        geometry: &[CacheGeometry],
+        pool: SlabPool,
+    ) -> Staged {
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.to_vec(), &pool).unwrap(),
         ));
@@ -624,14 +626,13 @@ mod composite {
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
             (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            true,
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
             flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
@@ -639,7 +640,7 @@ mod composite {
             1 << 40,
             geometry.clone(),
             Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -825,14 +826,13 @@ mod composite {
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
             (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            true,
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
             directory_lock,
             IDENTITY,
@@ -840,7 +840,7 @@ mod composite {
             1 << 40,
             geometry.clone(),
             scanned,
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -973,14 +973,13 @@ mod composite {
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
             (7) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-            true,
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
             flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
@@ -988,7 +987,7 @@ mod composite {
             1 << 40,
             geometry.clone(),
             Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -1234,7 +1233,6 @@ mod composite {
             let mut pool = SlabPool::new(
                 layout.page_record_bytes,
                 (1) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-                true,
             )
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
@@ -1242,13 +1240,7 @@ mod composite {
                 Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
             ));
             let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
-            let mut staging_pool = SlabPool::new(
-                layout.page_record_bytes,
-                (3) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-                true,
-            )
-            .unwrap();
-            staging_pool.register(&CudaRegistrar, context).unwrap();
+            let staging_pool = memory.pool().clone();
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
             ));

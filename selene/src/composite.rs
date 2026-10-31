@@ -19,6 +19,7 @@ use crate::store::TierStore;
 use std::{
     collections::{BinaryHeap, HashMap},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -164,10 +165,12 @@ impl CompositeStore {
                     "the composite store requires the staged disk transport",
                 ));
             }
-            Some(staged) if staged.pool().is_none() => {
-                return Err(invalid(
-                    "the composite disk transport requires a bounded staging pool",
-                ));
+            Some(staged)
+                if !staged
+                    .pool()
+                    .is_some_and(|pool| Arc::ptr_eq(&pool.memory, &memory.pool().memory)) =>
+            {
+                return Err(invalid("composite tiers must share one memory pool"));
             }
             Some(staged) if staged.shares_transfers(memory.transfers()) => {
                 return Err(invalid("composite tiers require separate transfer queues"));
@@ -245,15 +248,8 @@ impl CompositeStore {
             .ok_or_else(|| invalid("the record has no complete memory copy"))?;
         let pool = self.memory.pool();
         Ok((
-            record
-                .pages
-                .iter()
-                .map(|slab| pool.page_address(*slab))
-                .collect(),
-            record
-                .row
-                .as_ref()
-                .map(|slots| slots.iter().map(|&slot| pool.page_address(slot)).collect()),
+            pool.addresses(&record.pages),
+            record.row.as_ref().map(|slots| pool.addresses(slots)),
         ))
     }
 
@@ -644,13 +640,12 @@ impl CompositeStore {
     }
 
     /// Write cold parked records until their slabs can cover the demand.
-    fn spill_parked(&mut self, need_pages: usize, need_rows: usize) {
-        let waiting = self.waiting_spills(need_pages == 0 && need_rows == 0);
+    fn spill_parked(&mut self, need_slots: usize) {
+        let waiting = self.waiting_spills(need_slots == 0);
         let pages_of = |store: &Self, key: &PrefixKey| {
-            store
-                .memory
-                .record(key)
-                .map_or(0, |record| record.pages.len())
+            store.memory.record(key).map_or(0, |record| {
+                record.pages.len() + record.row.as_ref().map_or(0, Vec::len)
+            })
         };
         let mut writing = self.parked.values().filter(|parked| parked.writing).count();
         let mut covered: usize = self
@@ -659,9 +654,8 @@ impl CompositeStore {
             .filter(|(_, parked)| parked.writing)
             .map(|(key, _)| pages_of(self, key))
             .sum();
-        let mut rows = writing;
         for key in waiting {
-            if covered >= need_pages && rows >= need_rows && self.parked[&key].reserved {
+            if covered >= need_slots && self.parked[&key].reserved {
                 continue;
             }
             let pages = pages_of(self, &key);
@@ -670,11 +664,10 @@ impl CompositeStore {
                 if self.parked.get(&key).is_some_and(|parked| parked.writing) {
                     writing += 1;
                     covered += pages;
-                    rows += 1;
                 }
             }
         }
-        if writing == MAX_SPILLS && (covered < need_pages || rows < need_rows) {
+        if writing == MAX_SPILLS && covered < need_slots {
             self.stats.held[0] += self.parked.len().saturating_sub(writing) as u64;
         }
     }
@@ -699,15 +692,8 @@ impl CompositeStore {
             .allocate_record(key, bucket, tail_pages, row)?
             .ok_or_else(|| invalid("no host memory slabs could be freed for the record"))?;
         let pool = self.memory.pool();
-        let pages = record
-            .pages
-            .iter()
-            .map(|slab| pool.page_address(*slab))
-            .collect();
-        let row = record
-            .row
-            .as_ref()
-            .map(|slots| slots.iter().map(|&slot| pool.page_address(slot)).collect());
+        let pages = pool.addresses(&record.pages);
+        let row = record.row.as_ref().map(|slots| pool.addresses(slots));
         let id = self.disk.next_job();
         let submitted = self
             .staged()
@@ -1015,7 +1001,7 @@ impl HostStore for CompositeStore {
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
         let slots = self.memory.reclaimable_slabs() + self.spillable_slabs();
-        if tail.len() + self.memory.layout().row_slots() > slots {
+        if self.memory.layout().record_slots(tail.len(), true) > slots {
             let result = self.disk.store(checkpoint);
             match &result {
                 Ok(outcome) if *outcome != StoreOutcome::Queued => self.stats.store_skipped += 1,
@@ -1040,7 +1026,7 @@ impl HostStore for CompositeStore {
                     let _ = self.disk.index_mut().unpin(parent);
                 }
                 self.stats.store_skipped += 1;
-                self.spill_parked(tail.len(), 1);
+                self.spill_parked(self.memory.layout().record_slots(tail.len(), true));
                 return Ok(StoreOutcome::Retry(StoreReason::Slabs));
             }
             Err(error) => {
@@ -1262,13 +1248,13 @@ impl HostStore for CompositeStore {
             }
             self.maintenance_progress = progress;
             if !retry {
-                let (pages, rows) = self.memory.headroom();
                 self.spill_parked(
-                    pages.saturating_sub(self.memory.pool().free_pages()),
-                    rows.saturating_sub(0),
+                    self.memory
+                        .headroom()
+                        .saturating_sub(self.memory.pool().free_pages()),
                 );
             } else {
-                self.spill_parked(usize::MAX, usize::MAX);
+                self.spill_parked(usize::MAX);
             }
             self.disk.maintain();
         }
@@ -1476,11 +1462,11 @@ mod tests {
     const PAGE_TOKENS: u64 = 64;
     /// Page record bytes of the test geometry: two 8 KiB planes.
     const PAGE_RECORD: u64 = 16384;
-    /// Row record bytes of the test geometry: one 4 KiB row.
-    const ROW_RECORD: u64 = 4096;
+    /// Row record bytes of the test geometry: three slots.
+    const ROW_RECORD: u64 = 3 * PAGE_RECORD;
 
     fn geometry() -> Vec<CacheGeometry> {
-        vec![rank(PAGE_TOKENS, &[("k", 8192), ("v", 8192)], 4096)]
+        vec![rank(PAGE_TOKENS, &[("k", 8192), ("v", 8192)], ROW_RECORD)]
     }
 
     fn history(tokens: u64) -> PrefixHistory {
@@ -1521,7 +1507,6 @@ mod tests {
         let pool = SlabPool::new(
             PAGE_RECORD,
             (pages) + (rows) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
-            true,
         )
         .unwrap();
         let shared_pool = pool.clone();
@@ -1555,11 +1540,14 @@ mod tests {
         pattern(bytes, seed);
     }
 
-    fn fill_row(pool: &SlabPool, slab: Slot, seed: u64) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(pool.page_address(slab) as *mut u8, ROW_RECORD as usize)
-        };
-        pattern(bytes, seed);
+    fn fill_row(pool: &SlabPool, slots: &[Slot], seed: u64) {
+        let mut bytes = vec![0; ROW_RECORD as usize];
+        pattern(&mut bytes, seed);
+        let layout = Layout::new(&geometry()).unwrap();
+        for (address, offset, length) in crate::slab::row_pieces(&layout, &pool.addresses(slots)) {
+            let target = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) };
+            target.copy_from_slice(&bytes[offset as usize..offset as usize + length]);
+        }
     }
 
     /// A complete memory copy of `tail` pages and a row for `key`, as a landed
@@ -1581,7 +1569,7 @@ mod tests {
         }
         fill_row(
             store.memory.pool(),
-            record.row.as_ref().unwrap()[0],
+            record.row.as_ref().unwrap(),
             seed + 1000,
         );
         store.memory.complete_record(&key, true).unwrap();
@@ -1597,7 +1585,14 @@ mod tests {
             .map(|slab| pool.page(*slab).to_vec())
             .collect();
         if let Some(row) = &record.row {
-            bytes.push(pool.page(row[0])[..ROW_RECORD as usize].to_vec());
+            let mut gathered = vec![0; ROW_RECORD as usize];
+            for (address, offset, length) in
+                crate::slab::row_pieces(store.memory.layout(), &pool.addresses(row))
+            {
+                let piece = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
+                gathered[offset as usize..offset as usize + length].copy_from_slice(piece);
+            }
+            bytes.push(gathered);
         }
         bytes
     }
@@ -1784,7 +1779,7 @@ mod tests {
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
-        assert_eq!(store.memory.pool().free_pages(), 68);
+        assert_eq!(store.memory.pool().free_pages(), 72);
         assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
         let parent_pins = store.disk.index().node(&root.key).unwrap().pins();
@@ -1813,7 +1808,7 @@ mod tests {
         assert_eq!(store.stats().store_failed, 2);
         assert!(store.memory.index().is_empty());
         assert!(store.disk.index().is_empty());
-        assert_eq!((store.memory.pool().free_pages()), 68);
+        assert_eq!(store.memory.pool().free_pages(), 72);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
@@ -1862,17 +1857,8 @@ mod tests {
             return;
         };
         let geometry = geometry();
-        let layout = Layout::new(&geometry).unwrap();
         let transfers = StoppedCopier::shared(&geometry).unwrap();
-        let pool = || {
-            SlabPool::new(
-                PAGE_RECORD,
-                (4) + (2) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
-                true,
-            )
-            .unwrap()
-        };
-        let staging = || Some(SlabPool::staging(&layout).unwrap());
+        let pool = SlabPool::new(PAGE_RECORD, 4 + 2 * 3).unwrap();
         let disk = |identity: [u8; 32], staging: Option<SlabPool>, shared: bool| {
             let disk_transfers = if shared {
                 transfers.clone()
@@ -1894,17 +1880,29 @@ mod tests {
             )
             .unwrap()
         };
-        let flat = || MemoryStore::new_flat(IDENTITY, pool(), transfers.clone()).unwrap();
-        let tree = MemoryStore::new(IDENTITY, pool(), transfers.clone()).unwrap();
-        assert!(CompositeStore::new(tree, disk(IDENTITY, staging(), false)).is_err());
-        assert!(CompositeStore::new(flat(), disk([1; 32], staging(), false)).is_err());
+        let flat = || MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
+        let tree = MemoryStore::new(IDENTITY, pool.clone(), transfers.clone()).unwrap();
+        assert!(CompositeStore::new(tree, disk(IDENTITY, Some(pool.clone()), false)).is_err());
+        assert!(CompositeStore::new(flat(), disk([1; 32], Some(pool.clone()), false)).is_err());
         assert!(CompositeStore::new(flat(), disk(IDENTITY, None, false)).is_err());
-        assert!(CompositeStore::new(flat(), disk(IDENTITY, staging(), true)).is_err());
-        let mut store = CompositeStore::new(flat(), disk(IDENTITY, staging(), false)).unwrap();
+        assert!(
+            CompositeStore::new(
+                flat(),
+                disk(
+                    IDENTITY,
+                    Some(SlabPool::new(PAGE_RECORD, 10).unwrap()),
+                    false
+                )
+            )
+            .is_err()
+        );
+        assert!(CompositeStore::new(flat(), disk(IDENTITY, Some(pool.clone()), true)).is_err());
+        let mut store =
+            CompositeStore::new(flat(), disk(IDENTITY, Some(pool.clone()), false)).unwrap();
         assert_eq!(
             store.stats(),
             StoreStats {
-                rows_total: 6,
+                rows_total: 3,
                 outbound_rate: INITIAL_MEMORY_RATE,
                 inbound_rate: INITIAL_MEMORY_RATE,
                 ..StoreStats::default()
@@ -2078,7 +2076,7 @@ mod tests {
             (1, bytes, 0)
         );
         assert_eq!((stats.memory_records, stats.disk_records), (1, 1));
-        assert_eq!(stats.memory_bytes, 11 * PAGE_RECORD);
+        assert_eq!(stats.memory_bytes, 13 * PAGE_RECORD);
         assert_eq!(stats.disk_bytes, header.length_with_row());
         assert_eq!(stats.outbound_in_flight, 0);
 
@@ -2550,7 +2548,7 @@ mod tests {
         // Record files of 10, 20, 31, and 15 pages: a header block, a checksum
         // block, the page records, and the row record.
         let file_bytes = |pages: u64| 2 * 4096 + pages * PAGE_RECORD + ROW_RECORD;
-        let limit = 900_000;
+        let limit = 900_000 + 2 * (ROW_RECORD - 4096);
         assert!(file_bytes(10) + file_bytes(20) <= limit);
         assert!(file_bytes(10) + file_bytes(20) + file_bytes(31) > limit);
         assert!(file_bytes(20) + file_bytes(31) <= limit);
@@ -2784,7 +2782,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "staged-starvation") else {
             return;
         };
-        let mut store = composite(&directory, 12, 4, 1 << 30);
+        let mut store = composite(&directory, 6, 4, 1 << 30);
         let full = history(2000);
         let mut ids = Ids::new();
         let root = checkpoint(
@@ -3029,7 +3027,7 @@ mod tests {
             let mut store = composite_with_faults(&directory, pages, 4, 1 << 30, faults);
             fs::write(&flag, []).unwrap();
             let root = parked_root(&mut store, &mut Ids::new(), 1, 640);
-            store.spill_parked(10, 1);
+            store.spill_parked(store.memory.layout().record_slots(10, true));
             poll_until(&mut store, &mut Vec::new(), |s| s.retry_after.is_some());
             let deadline = Instant::now() + Duration::from_millis(120);
             while Instant::now() < deadline {
@@ -3213,7 +3211,7 @@ mod tests {
         store.set_spill(true);
         store.disk.maintain();
         assert!(store.take_retiring().is_empty());
-        store.spill_parked(10, 1);
+        store.spill_parked(store.memory.layout().record_slots(10, true));
         poll_until(&mut store, &mut Vec::new(), |s| {
             s.disk
                 .index()
@@ -3234,7 +3232,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "headroom") else {
             return;
         };
-        let mut store = composite(&directory, 11, 4, 1 << 30);
+        let mut store = composite(&directory, 3, 4, 1 << 30);
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
         assert!(store.jobs.is_empty());
@@ -3252,12 +3250,12 @@ mod tests {
         let Some(directory) = test_directory("composite", "large-record-headroom") else {
             return;
         };
-        let mut store = composite(&directory, 84, 16, 1 << 30);
+        let mut store = composite(&directory, 60, 16, 1 << 30);
         let mut ids = Ids::new();
         for salt in 1..=4 {
             parked_root(&mut store, &mut ids, salt, 22 * PAGE_TOKENS);
         }
-        assert_eq!(store.memory.headroom().0, 22);
+        assert_eq!(store.memory.headroom(), 22);
         assert_eq!(store.memory.pool().free_pages(), 8);
         assert!(store.jobs.is_empty());
         store.poll(&mut Vec::new()).unwrap();
@@ -3286,7 +3284,7 @@ mod tests {
         let mut store = composite(&directory, 80, 16, 1 << 30);
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
-        store.spill_parked(10, 0);
+        store.spill_parked(10);
         let mut events = Vec::new();
         poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
         store.disk.set_limit(store.disk.used());
@@ -3307,15 +3305,16 @@ mod tests {
         assert_eq!(store.lookup(&history, 0, u64::MAX).unwrap().key, held.key);
         assert_eq!(store.store(&held).unwrap(), StoreOutcome::Present);
         store.disk.index_mut().unpin(&root.key).unwrap();
-        store.spill_parked(10, 0);
+        store.spill_parked(10);
         poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
         assert!(store.disk.index().node(&held.key).unwrap().ready);
         assert!(store.memory.record(&held.key).unwrap().durable);
         let disk = store.disk.record(&held.key).unwrap();
         let mut expected = disk.header.clone();
         let memory = store.memory.record(&held.key).unwrap();
-        expected.row_checksum = record::checksum(
-            &store.memory.pool().page(memory.row.as_ref().unwrap()[0])[..ROW_RECORD as usize],
+        expected.row_checksum = record::row_checksum(
+            store.memory.layout(),
+            &store.memory.pool().addresses(memory.row.as_ref().unwrap()),
         );
         assert_eq!(
             Header::decode(&fs::read(&disk.path).unwrap()).unwrap(),
@@ -3355,7 +3354,7 @@ mod tests {
         assert!(store.memory.remove_record(&root.key).is_err());
         assert_eq!(store.lookup(&full, 0, u64::MAX).unwrap().key, child.key);
         store.disk.set_limit(1 << 30);
-        store.spill_parked(10, 0);
+        store.spill_parked(10);
         assert!(!store.memory.index().node(&root.key).unwrap().pinned());
         store.close().unwrap();
         drop(store);
@@ -3375,7 +3374,7 @@ mod tests {
             let mut store = composite(directory, 24, 4, 1 << 30);
             let mut ids = Ids::new();
             let committed = parked_root(&mut store, &mut ids, 1, 640);
-            store.spill_parked(10, 0);
+            store.spill_parked(10);
             let mut events = Vec::new();
             poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
             assert!(directory.join(record::file_name(&committed.key)).exists());
@@ -3699,7 +3698,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "pooled-parked") else {
             return;
         };
-        let mut store = composite(&directory, 16, 4, 1 << 30);
+        let mut store = composite(&directory, 12, 4, 1 << 30);
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
 
@@ -3778,7 +3777,7 @@ mod tests {
 
             // The directory disappears under the first write.
             fs::remove_dir_all(&directory).unwrap();
-            store.spill_parked(10, 0);
+            store.spill_parked(10);
             let deadline = Instant::now() + Duration::from_secs(10);
             while store.parked[&root.key].writing {
                 assert!(Instant::now() < deadline);
@@ -3802,7 +3801,7 @@ mod tests {
             if recovers {
                 fs::create_dir_all(&directory).unwrap();
             }
-            store.spill_parked(10, 0);
+            store.spill_parked(10);
             poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
             if recovers {
                 assert!(store.disk.index().node(&root.key).unwrap().ready);
@@ -3824,6 +3823,23 @@ mod tests {
     }
 
     #[test]
+    fn spill_demand_counts_every_row_slot() {
+        let Some(directory) = test_directory("composite", "spill-slots") else {
+            return;
+        };
+        let mut store = composite(&directory, 16, 4, 1 << 30);
+        let mut ids = Ids::new();
+        for salt in 1..=3 {
+            parked_root(&mut store, &mut ids, salt, PAGE_TOKENS);
+        }
+        store.spill_parked(5);
+        assert_eq!(store.parked.values().filter(|record| record.writing).count(), 2);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn a_full_write_queue_keeps_the_coldest_parked_leaves() {
         let Some(directory) = test_directory("composite", "pooled-queue-full") else {
             return;
@@ -3834,7 +3850,7 @@ mod tests {
             .map(|salt| parked_root(&mut store, &mut ids, salt, 64))
             .collect();
         // Warm the most recent two so the coldest are the first ten.
-        store.spill_parked(roots.len(), 0);
+        store.spill_parked(roots.len() * store.memory.layout().record_slots(1, true));
         let writing = store.parked.values().filter(|p| p.writing).count();
         assert_eq!(writing, MAX_SPILLS);
         assert!(
@@ -3872,17 +3888,8 @@ mod tests {
         let limit = 2 * (record_bytes + 4096 * 3);
         let mut store = composite(&directory, 16, 16, limit);
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry()).unwrap();
-        store.memory = MemoryStore::new_flat(
-            IDENTITY,
-            SlabPool::new(
-                PAGE_RECORD,
-                (16) + (16) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
-                true,
-            )
-            .unwrap(),
-            copier,
-        )
-        .unwrap();
+        store.memory =
+            MemoryStore::new_flat(IDENTITY, store.memory.pool().clone(), copier).unwrap();
         let announcer =
             crate::pool::Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
@@ -3892,7 +3899,7 @@ mod tests {
         let mut roots = Vec::new();
         for salt in 1..=2u32 {
             roots.push(parked_root(&mut store, &mut ids, salt, 64));
-            store.spill_parked(1, 0);
+            store.spill_parked(1);
             poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
         }
         store.set_spill(true);
@@ -3952,7 +3959,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "pooled-spill-notice") else {
             return;
         };
-        let mut store = composite(&directory, 30, 4, 1 << 30);
+        let mut store = composite(&directory, 26, 4, 1 << 30);
         let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
         store.announce_to(announcer.clone());

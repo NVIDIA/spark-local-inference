@@ -23,11 +23,7 @@
 
 use std::{
     collections::VecDeque,
-    mem::ManuallyDrop,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use crate::{HostRegistrar, Registration, Result, SplitMapping};
@@ -58,26 +54,27 @@ impl Slots {
     }
 }
 
-/// Bytes a region of `count` slabs of `slab_bytes` occupies. A zero count
-/// occupies nothing and ignores the slab size; otherwise the size must be a
-/// nonzero multiple of [`BLOCK_BYTES`] and the region must fit the address space.
-fn region_bytes(kind: &str, slab_bytes: u64, count: usize) -> Result<usize> {
+fn region_bytes(slot_bytes: u64, count: usize) -> Result<usize> {
     if count == 0 {
-        return Ok(0);
+        return Err(invalid("a slot pool requires at least one slot"));
     }
-    if slab_bytes == 0 || !slab_bytes.is_multiple_of(BLOCK_BYTES) {
+    if slot_bytes == 0 || !slot_bytes.is_multiple_of(BLOCK_BYTES) {
         return Err(invalid(format!(
-            "{kind} slab size of {slab_bytes} bytes is not a nonzero multiple of {BLOCK_BYTES}"
+            "slot size of {slot_bytes} bytes is not a nonzero multiple of {BLOCK_BYTES}"
         )));
     }
     u32::try_from(count)
         .ok()
-        .and_then(|_| usize::try_from(slab_bytes).ok()?.checked_mul(count))
+        .and_then(|_| usize::try_from(slot_bytes).ok()?.checked_mul(count))
         .ok_or_else(|| {
             invalid(format!(
-                "{count} {kind} slabs of {slab_bytes} bytes exceed the addressable pool size"
+                "{count} slots of {slot_bytes} bytes exceed the addressable pool size"
             ))
         })
+}
+
+fn slot_count(layout: &Layout, bytes: u64) -> usize {
+    (bytes / layout.page_record_bytes) as usize
 }
 
 /// Device addresses of one rank's part of every slab.
@@ -92,11 +89,6 @@ fn region_bytes(kind: &str, slab_bytes: u64, count: usize) -> Result<usize> {
 pub struct RankPart {
     /// The pool's reserved range.
     range: std::ops::Range<usize>,
-    pages: PartRegion,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PartRegion {
     /// Identity of slab 0; identities advance by one cross-rank record.
     identity: usize,
     record_bytes: usize,
@@ -106,32 +98,21 @@ struct PartRegion {
     part_bytes: usize,
 }
 
-impl PartRegion {
-    fn locate(&self, slab: usize) -> Option<u64> {
-        let offset = slab.checked_sub(self.identity)?;
-        let index = offset / self.record_bytes;
-        (offset.is_multiple_of(self.record_bytes) && index < self.count)
-            .then(|| (self.base + index * self.part_bytes) as u64)
-    }
-}
-
 impl RankPart {
-    /// This rank's part of the page slab at `slab`, or `None` when `slab` lies
-    /// outside the pool. An address inside the pool that is not one of its page
-    /// slabs is rejected.
-    pub fn page(&self, slab: usize) -> Result<Option<u64>> {
-        self.locate(&self.pages, slab, "page")
-    }
-
-    fn locate(&self, region: &PartRegion, slab: usize, kind: &str) -> Result<Option<u64>> {
-        if !self.range.contains(&slab) {
+    /// Resolve this rank's part of a slot, rejecting misaligned identities.
+    pub fn page(&self, slot: usize) -> Result<Option<u64>> {
+        if !self.range.contains(&slot) {
             return Ok(None);
         }
-        region.locate(slab).map(Some).ok_or_else(|| {
-            invalid(format!(
-                "address {slab:#x} inside a slab pool is not one of its {kind} slabs"
-            ))
-        })
+        let offset = slot - self.identity;
+        let index = offset / self.record_bytes;
+        if offset.is_multiple_of(self.record_bytes) && index < self.count {
+            Ok(Some((self.base + index * self.part_bytes) as u64))
+        } else {
+            Err(invalid(format!(
+                "address {slot:#x} is not a slot in the pool"
+            )))
+        }
     }
 }
 
@@ -144,28 +125,23 @@ struct Split {
 /// Shared slots with immutable mapping geometry and resource ownership.
 #[derive(Clone)]
 pub struct SlabPool {
-    memory: Arc<Memory>,
+    pub(crate) memory: Arc<Memory>,
     slots: Arc<Mutex<Slots>>,
 }
 
-struct Memory {
+pub(crate) struct Memory {
     mapping: usize,
     mapping_bytes: usize,
     page_bytes: usize,
     page_count: usize,
-    retain: bool,
-    registration: ManuallyDrop<Option<Box<dyn Registration>>>,
-    split: ManuallyDrop<Option<Split>>,
-    leaked: AtomicBool,
+    registration: Option<Box<dyn Registration>>,
+    split: Option<Split>,
 }
 
 impl SlabPool {
     /// Map equal, page-record-sized slots.
-    pub fn new(page_bytes: u64, count: usize, retain: bool) -> Result<Self> {
-        let mapping_bytes = region_bytes("slot", page_bytes, count)?;
-        if mapping_bytes == 0 {
-            return Err(invalid("a slot pool requires at least one slot"));
-        }
+    pub fn new(page_bytes: u64, count: usize) -> Result<Self> {
+        let mapping_bytes = region_bytes(page_bytes, count)?;
         let base = flare_eos::map_host(mapping_bytes)
             .map_err(|error| invalid(format!("allocate host slots: {error}")))?;
         Ok(Self {
@@ -174,10 +150,8 @@ impl SlabPool {
                 mapping_bytes,
                 page_bytes: page_bytes as usize,
                 page_count: count,
-                retain,
-                registration: ManuallyDrop::new(None),
-                split: ManuallyDrop::new(None),
-                leaked: AtomicBool::new(false),
+                registration: None,
+                split: None,
             }),
             slots: Arc::new(Mutex::new(Slots::new(count))),
         })
@@ -185,15 +159,7 @@ impl SlabPool {
 
     /// Round a warm budget down to whole slots.
     pub fn sized(layout: &Layout, bytes: u64) -> Result<Self> {
-        Self::new(
-            layout.page_record_bytes,
-            (bytes
-                .checked_div(layout.page_record_bytes)
-                .filter(|_| layout.row_record_bytes != 0)
-                .ok_or_else(|| invalid("record layout declares zero-byte page or row records"))?)
-                as usize,
-            true,
-        )
+        Self::new(layout.page_record_bytes, slot_count(layout, bytes))
     }
 
     /// A retaining pool with the slab counts of [`SlabPool::sized`], split by
@@ -216,12 +182,8 @@ impl SlabPool {
                 layout.ranks.len()
             )));
         }
-        let page_count = (bytes
-            .checked_div(layout.page_record_bytes)
-            .filter(|_| layout.row_record_bytes != 0)
-            .ok_or_else(|| invalid("record layout declares zero-byte page or row records"))?)
-            as usize;
-        let page_region = region_bytes("page", layout.page_record_bytes, page_count)?;
+        let page_count = slot_count(layout, bytes);
+        let page_region = region_bytes(layout.page_record_bytes, page_count)?;
         let shares: Vec<usize> = (0..layout.ranks.len())
             .map(|rank| layout.page_share(rank) as usize)
             .collect();
@@ -243,13 +205,11 @@ impl SlabPool {
             .enumerate()
             .map(|(rank, &page)| RankPart {
                 range: range.clone(),
-                pages: PartRegion {
-                    identity: base,
-                    record_bytes: layout.page_record_bytes as usize,
-                    count: page_count,
-                    base: memory.part_address(rank),
-                    part_bytes: page,
-                },
+                identity: base,
+                record_bytes: layout.page_record_bytes as usize,
+                count: page_count,
+                base: memory.part_address(rank),
+                part_bytes: page,
             })
             .collect();
         Ok(Self {
@@ -258,13 +218,11 @@ impl SlabPool {
                 mapping_bytes: memory.nbytes(),
                 page_bytes: layout.page_record_bytes as usize,
                 page_count,
-                retain: true,
-                registration: ManuallyDrop::new(None),
-                split: ManuallyDrop::new(Some(Split {
+                registration: None,
+                split: Some(Split {
                     parts,
                     _memory: memory,
-                })),
-                leaked: AtomicBool::new(false),
+                }),
             }),
             slots: Arc::new(Mutex::new(Slots::new(page_count))),
         })
@@ -303,13 +261,11 @@ impl SlabPool {
             .iter()
             .map(|rank| RankPart {
                 range: self.memory.mapping..self.memory.mapping + self.memory.mapping_bytes,
-                pages: PartRegion {
-                    identity: self.memory.mapping,
-                    record_bytes: self.page_bytes(),
-                    count: self.page_count(),
-                    base: (device + rank.page_offset) as usize,
-                    part_bytes: self.page_bytes(),
-                },
+                identity: self.memory.mapping,
+                record_bytes: self.page_bytes(),
+                count: self.page_count(),
+                base: (device + rank.page_offset) as usize,
+                part_bytes: self.page_bytes(),
             })
             .collect()
     }
@@ -319,7 +275,6 @@ impl SlabPool {
         Self::new(
             layout.page_record_bytes,
             STAGING_PAGE_SLABS + STAGING_ROW_SLABS * layout.row_slots(),
-            false,
         )
     }
 
@@ -336,7 +291,7 @@ impl SlabPool {
         // pool's lifetime; `Drop` releases the registration before unmapping.
         let memory = Arc::get_mut(&mut self.memory)
             .ok_or_else(|| invalid("cannot register a shared slab pool"))?;
-        *memory.registration =
+        memory.registration =
             Some(registrar.register(context, memory.mapping, memory.mapping_bytes)?);
         Ok(())
     }
@@ -344,10 +299,6 @@ impl SlabPool {
     /// Whether the driver can copy the slabs: after `register`, and always for a pool split by rank.
     pub fn registered(&self) -> bool {
         self.memory.registration.is_some() || self.memory.split.is_some()
-    }
-
-    pub fn retain(&self) -> bool {
-        self.memory.retain
     }
 
     pub fn page_bytes(&self) -> usize {
@@ -363,21 +314,47 @@ impl SlabPool {
         self.memory.mapping_bytes as u64
     }
 
-    pub fn allocate_page(&mut self) -> Option<Slot> {
+    pub fn allocate(&self, count: usize) -> Option<Vec<Slot>> {
         let mut slots = self.lock();
-        let index = slots.free.pop_front()?;
-        slots.allocated[index as usize] = true;
-        Some(Slot(index))
-    }
-    /// Return an allocated slot once; ignore free, repeated and out-of-range slots.
-    pub fn release_page(&mut self, slab: Slot) {
-        let mut slots = self.lock();
-        if let Some(allocated) = slots.allocated.get_mut(slab.0 as usize)
-            && *allocated
-        {
-            *allocated = false;
-            slots.free.push_back(slab.0);
+        if slots.free.len() < count {
+            return None;
         }
+        Some(
+            (0..count)
+                .map(|_| {
+                    let index = slots.free.pop_front().unwrap();
+                    slots.allocated[index as usize] = true;
+                    Slot(index)
+                })
+                .collect(),
+        )
+    }
+
+    /// Return allocated slots once; ignore free, repeated and out-of-range slots.
+    pub fn release(&self, released: impl IntoIterator<Item = Slot>) {
+        let mut slots = self.lock();
+        for slot in released {
+            if let Some(allocated) = slots.allocated.get_mut(slot.0 as usize)
+                && *allocated
+            {
+                *allocated = false;
+                slots.free.push_back(slot.0);
+            }
+        }
+    }
+
+    pub fn addresses(&self, slots: &[Slot]) -> Vec<usize> {
+        slots.iter().map(|&slot| self.page_address(slot)).collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn allocate_page(&self) -> Option<Slot> {
+        self.allocate(1).map(|slots| slots[0])
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn release_page(&self, slot: Slot) {
+        self.release([slot]);
     }
     pub fn page_address(&self, slab: Slot) -> usize {
         assert!(
@@ -391,7 +368,7 @@ impl SlabPool {
         let mut slots = self.lock();
         slots.free.clear();
         slots.allocated.fill(false);
-        self.memory.leaked.store(true, Ordering::Relaxed);
+        std::mem::forget(Arc::clone(&self.memory));
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
         self.slots
@@ -423,16 +400,10 @@ impl SlabPool {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        if self.leaked.load(Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: The last handle dropped and both copiers drained; unregister before unmapping.
-        unsafe {
-            ManuallyDrop::drop(&mut self.registration);
-            if self.split.is_none() {
-                flare_eos::unmap_host(self.mapping, self.mapping_bytes);
-            }
-            ManuallyDrop::drop(&mut self.split);
+        self.registration.take();
+        if self.split.take().is_none() {
+            // SAFETY: The last owner dropped after both copiers drained.
+            unsafe { flare_eos::unmap_host(self.mapping, self.mapping_bytes) };
         }
     }
 }
@@ -444,13 +415,11 @@ pub fn rank_part(
     (record_bytes, count, base, part_bytes): (usize, usize, usize, usize),
 ) -> RankPart {
     RankPart {
-        pages: PartRegion {
-            identity: range.start,
-            record_bytes,
-            count,
-            base,
-            part_bytes,
-        },
+        identity: range.start,
+        record_bytes,
+        count,
+        base,
+        part_bytes,
         range,
     }
 }
@@ -487,7 +456,7 @@ mod tests {
 
     #[test]
     fn slots_are_aligned_disjoint_and_reused_in_release_order() {
-        let mut pool = SlabPool::new(8192, 4, true).unwrap();
+        let mut pool = SlabPool::new(8192, 4).unwrap();
         let slots: Vec<_> = (0..4).map(|_| pool.allocate_page().unwrap()).collect();
         assert_eq!(pool.allocate_page(), None);
         for (index, &slot) in slots.iter().enumerate() {
@@ -511,9 +480,9 @@ mod tests {
     #[test]
     fn shared_handles_use_one_free_list_and_retain_the_registration() {
         let registrar = crate::testing::TrackingRegistrar::default();
-        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        let mut pool = SlabPool::new(4096, 2).unwrap();
         pool.register(&registrar, 0).unwrap();
-        let mut other = pool.clone();
+        let other = pool.clone();
         let first = pool.allocate_page().unwrap();
         let second = other.allocate_page().unwrap();
         assert_ne!(first, second);
@@ -533,7 +502,7 @@ mod tests {
     fn copy_addresses_and_slices_do_not_wait_for_the_free_list() {
         let layout = Layout::new(&[geometry(64, &[("kv", 4096)], 4096)]).unwrap();
         let registrar = crate::testing::TrackingRegistrar::default();
-        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        let mut pool = SlabPool::new(4096, 2).unwrap();
         pool.register(&registrar, 0).unwrap();
         let slot = pool.allocate_page().unwrap();
         let other = pool.clone();
@@ -546,7 +515,7 @@ mod tests {
             assert_eq!(pool.page_bytes(), 4096);
             assert_eq!(pool.page_count(), 2);
             assert_eq!(pool.bytes(), 8192);
-            assert!(pool.retain() && pool.registered());
+            assert!(pool.registered());
             assert!(pool.rank_parts().is_none());
             assert_eq!(
                 pool.registered_parts(&layout, address as u64)[0]
@@ -571,7 +540,7 @@ mod tests {
     #[test]
     fn registration_is_frozen_while_the_mapping_is_shared() {
         let registrar = crate::testing::TrackingRegistrar::default();
-        let mut pool = SlabPool::new(4096, 2, true).unwrap();
+        let mut pool = SlabPool::new(4096, 2).unwrap();
         let other = pool.clone();
         assert!(pool.register(&registrar, 0).is_err());
         assert!(registrar.calls.lock().unwrap().is_empty());
@@ -584,19 +553,27 @@ mod tests {
 
     #[test]
     fn allocation_and_release_preserve_total_and_unique_ownership() {
-        let mut pool = SlabPool::new(4096, 37, true).unwrap();
+        let pool = SlabPool::new(4096, 37).unwrap();
         let mut owned = Vec::new();
         let mut seed = 71u64;
         for _ in 0..10_000 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             if seed & 8 != 0 {
-                if let Some(slot) = pool.allocate_page() {
-                    assert!(!owned.contains(&slot));
-                    owned.push(slot);
+                let count = (seed as usize % 8) + 1;
+                let free = pool.free_pages();
+                match pool.allocate(count) {
+                    Some(slots) => {
+                        assert_eq!(slots.len(), count);
+                        for slot in slots {
+                            assert!(!owned.contains(&slot));
+                            owned.push(slot);
+                        }
+                    }
+                    None => assert_eq!(pool.free_pages(), free),
                 }
             } else if !owned.is_empty() {
-                let slot = owned.swap_remove(seed as usize % owned.len());
-                pool.release_page(slot);
+                let count = (seed as usize % owned.len()) + 1;
+                pool.release(owned.drain(..count));
             }
             assert_eq!(pool.free_pages() + owned.len(), pool.page_count());
         }
@@ -608,14 +585,20 @@ mod tests {
         let pool = SlabPool::sized(&layout, 3 * 8192 + 4095).unwrap();
         assert_eq!(pool.bytes(), 3 * 8192);
         assert_eq!(pool.page_count(), 3);
-        assert!(SlabPool::new(4000, 1, true).is_err());
-        assert!(SlabPool::new(0, 1, true).is_err());
-        assert!(SlabPool::new(8192, usize::MAX, true).is_err());
-        let mut invalid = layout.clone();
-        invalid.row_record_bytes = 0;
-        assert!(SlabPool::sized(&invalid, 8192).is_err());
-        invalid.page_record_bytes = 0;
-        assert!(SlabPool::sized(&invalid, 8192).is_err());
+        assert!(SlabPool::new(8192, 0).is_err());
+        assert!(SlabPool::sized(&layout, 4096).is_err());
+        assert!(
+            SlabPool::sized_by_rank(
+                &layout,
+                4096,
+                &[(0, 0)],
+                &crate::testing::TrackingRegistrar::default()
+            )
+            .is_err()
+        );
+        assert!(SlabPool::new(4000, 1).is_err());
+        assert!(SlabPool::new(0, 1).is_err());
+        assert!(SlabPool::new(8192, usize::MAX).is_err());
     }
 
     #[test]
@@ -635,7 +618,7 @@ mod tests {
             ];
             let layout = Layout::new(&ranks).unwrap();
             assert_eq!(layout.row_slots(), 4);
-            let mut pool = SlabPool::new(layout.page_record_bytes, 8, true).unwrap();
+            let pool = SlabPool::new(layout.page_record_bytes, 8).unwrap();
             let slots: Vec<_> = (0..4)
                 .map(|_| {
                     let slot = pool.allocate_page().unwrap();

@@ -167,9 +167,8 @@ struct Core {
     spill: bool,
     /// Records chosen for the manager and not yet taken by the pool store.
     retiring: Vec<Retiring>,
-    /// Records held in place until their move ends: their pages and whether
-    /// they hold a row slab.
-    held: HashMap<PrefixKey, (usize, bool)>,
+    /// Slot counts of records held until their moves end.
+    held: HashMap<PrefixKey, usize>,
     /// Records whose moves ended and that leave once nothing reads them.
     finishing: Vec<PrefixKey>,
     largest_pages: usize,
@@ -334,12 +333,7 @@ impl Core {
             .iter()
             .zip(&record.pages)
             .map(|(page, slab)| (*page, self.pool.page_address(*slab)));
-        let row = Some((
-            checkpoint.slot,
-            row.iter()
-                .map(|&slot| self.pool.page_address(slot))
-                .collect(),
-        ));
+        let row = Some((checkpoint.slot, self.pool.addresses(row)));
         let queued = windows(id, Direction::Out, pages, row);
         self.outbound.insert(
             id,
@@ -364,16 +358,15 @@ impl Core {
         row: bool,
         durable: bool,
     ) -> Result<Option<MemoryRecord>> {
-        let needed = tail_pages + usize::from(row) * self.layout.row_slots();
+        let needed = self.layout.record_slots(tail_pages, row);
         if needed > self.pool.page_count() {
             return Ok(None);
         }
-        if self.spill && self.retire_for(tail_pages, usize::from(row)) {
+        if self.spill && self.retire_for(needed) {
             return Ok(None);
         }
         while self.pool.free_pages() < needed {
-            let need_row = row;
-            match self.index.evict(need_row, |node| node.location.durable) {
+            match self.index.evict(row, |node| node.location.durable) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
                     for node in &nodes {
@@ -387,35 +380,21 @@ impl Core {
                         .node_mut(&compacted)
                         .and_then(|node| node.location.row.take());
                     if let Some(slab) = slab {
-                        for slot in slab {
-                            self.pool.release_page(slot);
-                        }
+                        self.pool.release(slab);
                     }
                 }
                 None => return Ok(None),
             }
         }
-        let mut record = MemoryRecord {
-            pages: Vec::with_capacity(tail_pages),
-            row: None,
+        let Some(mut slots) = self.pool.allocate(needed) else {
+            return Ok(None);
+        };
+        let row_slots = slots.split_off(tail_pages);
+        let record = MemoryRecord {
+            pages: slots,
+            row: row.then_some(row_slots),
             durable,
         };
-        for _ in 0..tail_pages {
-            match self.pool.allocate_page() {
-                Some(slab) => record.pages.push(slab),
-                None => {
-                    self.release(&record);
-                    return Ok(None);
-                }
-            }
-        }
-        if row {
-            record.row = Some(
-                (0..self.layout.row_slots())
-                    .map(|_| self.pool.allocate_page().expect("record slots reserved"))
-                    .collect(),
-            );
-        }
         // The index requires a root's tail to cover its whole chain; a flat
         // store's roots hold only their checkpoint's tail, so their count is
         // the chain's and `fetch_chain` reads page counts from the slabs.
@@ -436,19 +415,14 @@ impl Core {
         Ok(Some(record))
     }
 
-    /// Hold bounded cold leaves until they cover the missing page and row slabs.
+    /// Hold bounded cold leaves until they cover the missing slots.
     /// A full tier waits while any such records remain held.
-    fn retire_for(&mut self, tail_pages: usize, row_count: usize) -> bool {
-        let want_pages = (tail_pages + row_count * self.layout.row_slots())
-            .saturating_sub(self.pool.free_pages());
+    fn retire_for(&mut self, slots: usize) -> bool {
+        let want_pages = slots.saturating_sub(self.pool.free_pages());
         if want_pages == 0 {
             return false;
         }
-        let mut pages: usize = self
-            .held
-            .values()
-            .map(|(pages, row)| pages + usize::from(*row) * self.layout.row_slots())
-            .sum();
+        let mut pages: usize = self.held.values().sum();
         for _ in 0..crate::pool::cascade::MOVES_MAX {
             if pages >= want_pages || self.held.len() >= crate::pool::cascade::MOVES_MAX {
                 break;
@@ -462,7 +436,9 @@ impl Core {
             let Some(node) = self.index.node(&key) else {
                 break;
             };
-            let (held_pages, held_row) = (node.location.pages.len(), node.location.row.is_some());
+            let held_slots = self
+                .layout
+                .record_slots(node.location.pages.len(), node.location.row.is_some());
             let retiring = Retiring {
                 tier: PoolTier::Dram,
                 key,
@@ -474,19 +450,15 @@ impl Core {
             if self.index.pin(&key).is_err() {
                 break;
             }
-            pages += held_pages + usize::from(held_row) * self.layout.row_slots();
-            self.held.insert(key, (held_pages, held_row));
+            pages += held_slots;
+            self.held.insert(key, held_slots);
             self.retiring.push(retiring);
         }
         !self.held.is_empty()
     }
 
-    fn headroom(&self) -> (usize, usize) {
-        (
-            crate::store::headroom(self.pool.page_count() as u64, self.largest_pages as u64)
-                as usize,
-            0,
-        )
+    fn headroom(&self) -> usize {
+        crate::store::headroom(self.pool.page_count() as u64, self.largest_pages as u64) as usize
     }
 
     /// The move of a held record ended: drop it, or let it be offered again.
@@ -521,14 +493,13 @@ impl Core {
 
     fn release(&mut self, record: &MemoryRecord) {
         self.stats.progress += 1;
-        for slab in &record.pages {
-            self.pool.release_page(*slab);
-        }
-        if let Some(slab) = &record.row {
-            for &slot in slab {
-                self.pool.release_page(slot);
-            }
-        }
+        self.pool.release(
+            record
+                .pages
+                .iter()
+                .chain(record.row.iter().flatten())
+                .copied(),
+        );
     }
 
     fn allocate_record(
@@ -636,22 +607,13 @@ impl Core {
                     record.pages.len()
                 )));
             }
-            slabs.extend(
-                record.pages[skip..]
-                    .iter()
-                    .map(|slab| self.pool.page_address(*slab)),
-            );
+            slabs.extend(self.pool.addresses(&record.pages[skip..]));
             if key == last {
                 let slab = record
                     .row
                     .as_ref()
                     .ok_or_else(|| invalid("host chain endpoint has no row"))?;
-                row = Some((
-                    ticket.slot,
-                    slab.iter()
-                        .map(|&slot| self.pool.page_address(slot))
-                        .collect(),
-                ));
+                row = Some((ticket.slot, self.pool.addresses(slab)));
             }
         }
         if slabs.len() != ticket.pages.len() || slabs.len() != chain.pages {
@@ -1024,9 +986,8 @@ impl MemoryStore {
             })
     }
 
-    pub(crate) fn headroom(&self) -> (usize, usize) {
-        let (pages, rows) = self.core.headroom();
-        (pages.max(self.largest_pages()), rows)
+    pub(crate) fn headroom(&self) -> usize {
+        self.core.headroom().max(self.largest_pages())
     }
 
     pub(crate) fn largest_pages(&self) -> usize {
@@ -1198,16 +1159,13 @@ impl MemoryStore {
                     let pool = &self.core.pool;
                     let job = HashJob {
                         key,
-                        pages: node
-                            .location
-                            .pages
-                            .iter()
-                            .map(|slab| pool.page_address(*slab))
-                            .collect(),
+                        pages: pool.addresses(&node.location.pages),
                         page_bytes: pool.page_bytes(),
-                        row: node.location.row.as_ref().map(|slots| {
-                            slots.iter().map(|&slot| pool.page_address(slot)).collect()
-                        }),
+                        row: node
+                            .location
+                            .row
+                            .as_ref()
+                            .map(|slots| pool.addresses(slots)),
                         layout: self.core.layout.clone(),
                     };
                     if self.core.index.pin(&key).is_ok() {
@@ -1269,17 +1227,12 @@ impl MemoryStore {
             }
             nodes.push((*key, node.location.pages.len()));
             spans.push(MemorySpan {
-                pages: node
-                    .location
-                    .pages
-                    .iter()
-                    .map(|slab| pool.page_address(*slab))
-                    .collect(),
+                pages: pool.addresses(&node.location.pages),
                 row: node
                     .location
                     .row
                     .as_ref()
-                    .map(|slots| slots.iter().map(|&slot| pool.page_address(slot)).collect()),
+                    .map(|slots| pool.addresses(slots)),
                 sums: sums.clone(),
             });
         }
@@ -1379,7 +1332,7 @@ impl HostStore for MemoryStore {
             self.core.remove_record(&checkpoint.key)?;
         }
         let (_, tail) = self.core.shape(checkpoint);
-        if tail.len() + self.core.layout.row_slots() > self.core.pool.page_count() {
+        if self.core.layout.record_slots(tail.len(), true) > self.core.pool.page_count() {
             self.core.stats.store_skipped += 1;
             self.core.stats.dropped[1] += 1;
             return Ok(StoreOutcome::Oversize);
@@ -1420,8 +1373,7 @@ impl HostStore for MemoryStore {
             }
             self.flush_announcements(&|_, parent| parent, &|_| None);
             if self.core.spill {
-                let (pages, rows) = self.headroom();
-                self.core.retire_for(pages, rows);
+                self.core.retire_for(self.headroom());
             }
         }
         Ok(())
@@ -1509,8 +1461,7 @@ mod tests {
     }
 
     fn store_core(pages: usize, rows: usize, flat: bool) -> Core {
-        let pool =
-            SlabPool::new(PAGE, (pages) + (rows) * (ROW).div_ceil(PAGE) as usize, true).unwrap();
+        let pool = SlabPool::new(PAGE, (pages) + (rows) * (ROW).div_ceil(PAGE) as usize).unwrap();
         Core::new(IDENTITY, pool, layout(), flat)
     }
 
@@ -1612,7 +1563,7 @@ mod tests {
     fn releasing_a_host_pin_notifies_capacity_waiters() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE, (1) + (1) * (ROW).div_ceil(PAGE) as usize, true).unwrap();
+        let pool = SlabPool::new(PAGE, (1) + (1) * (ROW).div_ceil(PAGE) as usize).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
@@ -1631,7 +1582,7 @@ mod tests {
     fn published_prompt_copy_survives_reply_and_gpu_storage_reuse() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize, true).unwrap();
+        let pool = SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         let full = history(128, 1);
         let prompt = published(&full, 64, None, 0, 1);
@@ -2066,7 +2017,7 @@ mod tests {
     #[test]
     fn row_compaction_reuses_every_piece_of_the_coldest_interior_row() {
         let layout = Layout::new(&[geometry(PT, &[("kv", 4096)], 12288)]).unwrap();
-        let pool = SlabPool::new(layout.page_record_bytes, 12, true).unwrap();
+        let pool = SlabPool::new(layout.page_record_bytes, 12).unwrap();
         let mut core = Core::new(IDENTITY, pool, layout, false);
         let full = history(128, 1);
         let root = full.key_at(64).unwrap();
@@ -2519,15 +2470,15 @@ mod tests {
             assert!(core.store(&published(&h, 128, None, 0, salt)).unwrap());
             finish(&mut core);
         }
-        assert_eq!(core.headroom(), (5, 0));
+        assert_eq!(core.headroom(), 5);
         announce_all(&mut core);
         core.spill = true;
-        assert!(core.retire_for(100, 0));
+        assert!(core.retire_for(100));
         assert_eq!(core.held.len(), 2);
         let h = history(600, 4);
         assert!(core.store(&published(&h, 128, None, 0, 4)).unwrap());
         core.largest_pages = 90;
-        assert_eq!(core.headroom(), (11, 0));
+        assert_eq!(core.headroom(), 11);
     }
 
     #[test]
@@ -2536,7 +2487,7 @@ mod tests {
 
         let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE, 100, true).unwrap();
+        let pool = SlabPool::new(PAGE, 100).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
         for salt in 1..=4 {
@@ -2550,7 +2501,7 @@ mod tests {
             store.poll(&mut Vec::new()).unwrap();
             std::thread::yield_now();
         }
-        assert_eq!(store.core.headroom().0, 10);
+        assert_eq!(store.core.headroom(), 10);
         assert_eq!(store.pool().free_pages(), 8);
         store.set_spill(true);
         store.poll(&mut Vec::new()).unwrap();
@@ -2619,7 +2570,7 @@ mod tests {
         }
         announce_all(&mut core);
         core.spill = true;
-        assert!(core.retire_for(2, 1));
+        assert!(core.retire_for(core.layout.record_slots(2, true)));
         for r in std::mem::take(&mut core.retiring) {
             core.retired(&r.key, Retirement::Failed);
         }
@@ -2677,7 +2628,7 @@ mod tests {
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
         let mut store = MemoryStore::new(
             IDENTITY,
-            SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize, true).unwrap(),
+            SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize).unwrap(),
             copier,
         )
         .unwrap();

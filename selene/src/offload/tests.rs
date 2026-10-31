@@ -298,12 +298,11 @@ fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
 }
 
 #[test]
-fn ordinary_input_share_preserves_checkpoint_minimum_and_mapping() {
-    assert_eq!(input_memory_bytes(0, 4096, true), 0);
-    assert_eq!(input_memory_bytes(8192, 4096, true), 0);
-    assert_eq!(input_memory_bytes(1 << 30, 128 << 20, true), 128 << 20);
-    assert_eq!(input_memory_bytes(1 << 30, 1000 << 20, true), 24 << 20);
-    assert_eq!(input_memory_bytes(1 << 30, 128 << 20, false), 0);
+fn ordinary_input_share_preserves_mapping() {
+    assert_eq!(input_memory_bytes(0, true), 0);
+    assert_eq!(input_memory_bytes(8192, true), 0);
+    assert_eq!(input_memory_bytes(1 << 30, true), 128 << 20);
+    assert_eq!(input_memory_bytes(1 << 30, false), 0);
     let layout = Layout {
         page_tokens: 64,
         ranks: Vec::new(),
@@ -314,7 +313,7 @@ fn ordinary_input_share_preserves_checkpoint_minimum_and_mapping() {
         memory_bytes: Some(1 << 30),
         ..Default::default()
     };
-    let ordinary = input_memory_bytes(1 << 30, layout.page_record_bytes * 128, true);
+    let ordinary = input_memory_bytes(1 << 30, true);
     let (device, host) = options.headroom_with_inputs(2, &layout, true).unwrap();
     assert_eq!(host, 1 << 30);
     assert_eq!(
@@ -440,7 +439,7 @@ fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_clos
                 panic!("no store")
             };
             assert_eq!(registrar.calls.lock().unwrap().len(), 1);
-            let mut pool = prepared.memory_pool.as_ref().unwrap().clone();
+            let pool = prepared.memory_pool.as_ref().unwrap().clone();
             let slot = pool.allocate_page().unwrap();
             let factory = RecordingFactory {
                 maps: Default::default(),
