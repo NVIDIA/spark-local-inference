@@ -205,7 +205,7 @@ pub struct GpuMemory {
     pub rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
 }
 
-/// A copier that moves bytes between host slabs and an in-memory stand-in for
+/// A copier that moves bytes between host slots and an in-memory stand-in for
 /// the GPU as soon as a job is submitted, and reports the job on the next poll.
 pub struct SimulatedGpu {
     layout: Layout,
@@ -255,7 +255,7 @@ impl PageCopier for SimulatedGpu {
             self.memory.rows.lock().unwrap(),
         );
         for (id, address) in &job.pages {
-            // The host address names a slab the caller keeps mapped for the job.
+            // The host address names a slot the caller keeps mapped for the job.
             let host = unsafe { std::slice::from_raw_parts_mut(*address as *mut u8, page) };
             match job.direction {
                 crate::Direction::Out => {

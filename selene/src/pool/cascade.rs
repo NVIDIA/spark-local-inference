@@ -261,8 +261,7 @@ mod tests {
                     }),
                 },
             ],
-            page_bytes: PAGE,
-            layout: crate::Layout {
+            layout: Arc::new(crate::Layout {
                 page_tokens: 16,
                 page_record_bytes: PAGE as u64,
                 row_record_bytes: ROW as u64,
@@ -271,7 +270,7 @@ mod tests {
                     plane_offsets: vec![0],
                     row_offset: 0,
                 }],
-            },
+            }),
             keys: vec![key(48, 1), key(80, 2)],
             releases: releases.clone(),
         };

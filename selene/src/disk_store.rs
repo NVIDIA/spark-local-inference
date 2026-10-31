@@ -12,12 +12,12 @@
 //! the least recently used single-child ancestor is compacted by truncating its
 //! file at the row segment. Every byte movement goes through a [`DiskTransport`].
 //! [`Staged`] streams records between GPU ids and files through a registered
-//! staging pool, the shared transfer threads, and the disk thread, in windows of
+//! shared slot pool, the shared transfer threads, and the disk thread, in windows of
 //! at most [`WINDOW_PAGES`] pages with at most [`WINDOWS_IN_FLIGHT`] windows of
 //! one record staged at a time. It also moves records between files and
 //! caller-owned registered buffers retained by the composite's memory tier.
 //! Nothing here waits: `store`, `fetch`, `truncate`, and `unlink`
-//! enqueue, and `poll` advances every pipeline as far as free slabs and queue
+//! enqueue, and `poll` advances every pipeline as far as free slots and queue
 //! space allow before reporting completions.
 
 #[cfg(test)]
@@ -121,11 +121,11 @@ pub trait DiskTransport {
     /// than reuse the ids that job holds.
     fn poll(&mut self, events: &mut Vec<TransportEvent>) -> Result<()>;
     fn close(&mut self) -> Result<()>;
-    fn pool(&self) -> Option<&SlabPool> {
+    fn staged(&self) -> Option<&Staged> {
         None
     }
     /// The staged transport behind this handle, for the composite store's
-    /// transfers between files and its memory slabs.
+    /// transfers between files and its memory slots.
     fn staged_mut(&mut self) -> Option<&mut Staged> {
         None
     }
@@ -150,17 +150,17 @@ fn lock<'a>(
 }
 
 /// Host addresses of one window's page and row records, with the staging
-/// slabs behind them when the transport allocated them.
+/// slots behind them when the transport allocated them.
 struct Buffers {
     pages: Vec<usize>,
     row: Option<Vec<usize>>,
-    slabs: Option<(Vec<Slot>, Option<Vec<Slot>>)>,
+    slots: Option<(Vec<Slot>, Option<Vec<Slot>>)>,
 }
 
 /// The threads and pool every pipeline draws on, with the counters that keep
 /// submissions within the queues' depths so a refusal is a failure, not backpressure.
 struct Resources {
-    /// Non-retaining buffers for device transfers; host-buffer-only users may omit them.
+    /// Shared slots for device transfers; host-buffer-only users may omit them.
     pool: Option<SlabPool>,
     transfers: SharedCopier,
     disk: DiskThread,
@@ -194,7 +194,7 @@ impl Resources {
         lock(&self.transfers).submit(job)
     }
 
-    /// Staging slabs for `pages` page records and, when `row`, one row record;
+    /// Slots for `pages` page records and, when `row`, all row pieces;
     /// `None` leaves the pool unchanged when it cannot supply all of them.
     fn allocate(&mut self, pages: usize, row: bool) -> Option<Buffers> {
         let pool = self.pool.as_mut()?;
@@ -205,12 +205,12 @@ impl Resources {
         Some(Buffers {
             pages: pool.addresses(&slots),
             row: row.as_ref().map(|slots| pool.addresses(slots)),
-            slabs: Some((slots, row)),
+            slots: Some((slots, row)),
         })
     }
 
     fn release(&mut self, buffers: &mut Buffers) {
-        if let (Some(pool), Some((pages, row))) = (self.pool.as_ref(), buffers.slabs.take()) {
+        if let (Some(pool), Some((pages, row))) = (self.pool.as_ref(), buffers.slots.take()) {
             pool.release(pages.into_iter().chain(row.into_iter().flatten()));
         }
     }
@@ -361,7 +361,7 @@ impl OutboundRecord {
         }
     }
 
-    /// Advance as far as slabs and queue space allow; `Some` when the record
+    /// Advance as far as slots and queue space allow; `Some` when the record
     /// is finished and nothing references its buffers or its temporary file.
     fn pump(&mut self, id: JobId, resources: &mut Resources) -> Option<Result<u64>> {
         if let Some(bytes) = self.committed {
@@ -443,8 +443,8 @@ impl OutboundRecord {
         None
     }
 
-    /// Stage the next window: allocate its slabs and copy it out of the GPU,
-    /// or take the caller's buffers. `Ok(false)` holds the window until slabs
+    /// Stage the next window: allocate its slots and copy it out of the GPU,
+    /// or take the caller's buffers. `Ok(false)` holds the window until slots
     /// or queue space free up.
     fn start_window(&mut self, id: JobId, resources: &mut Resources) -> Result<bool> {
         let index = self.next_window;
@@ -481,7 +481,7 @@ impl OutboundRecord {
                 Buffers {
                     pages: pages[first..first + count].to_vec(),
                     row: last.then(|| row.clone()),
-                    slabs: None,
+                    slots: None,
                 },
                 OutPhase::Transferred,
                 0,
@@ -844,7 +844,7 @@ impl InboundRecord {
             Destination::Host { pages, row } => Buffers {
                 pages: pages[plan.offset..plan.offset + plan.count].to_vec(),
                 row: if plan.row { row.clone() } else { None },
-                slabs: None,
+                slots: None,
             },
         };
         self.active.push(InWindow {
@@ -955,7 +955,7 @@ impl InboundRecord {
     }
 }
 
-/// The staged transport: record files move through a non-retaining staging
+/// The staged transport: record files move through a shared slot
 /// pool and the shared transfer threads. It also moves records between files
 /// and caller-owned registered buffers for the composite store.
 ///
@@ -975,7 +975,6 @@ pub struct Staged {
 
 impl Staged {
     pub fn new(pool: Option<SlabPool>, transfers: SharedCopier, disk: DiskThread) -> Self {
-        let pool = pool.map(|pool| pool.with_intake(lock(&transfers).layout()));
         Self {
             resources: Resources {
                 pool,
@@ -1082,7 +1081,7 @@ impl Staged {
         self.accept(id)?;
         if self.resources.pool.is_none() {
             return Err(invalid(
-                "the staged transport has no staging pool; records move only through caller-owned buffers",
+                "the staged transport has no slot pool; records move only through caller-owned buffers",
             ));
         }
         if pages.len() != header.tail_pages as usize {
@@ -1231,8 +1230,8 @@ impl Staged {
 }
 
 impl DiskTransport for Staged {
-    fn pool(&self) -> Option<&SlabPool> {
-        self.pool()
+    fn staged(&self) -> Option<&Staged> {
+        Some(self)
     }
 
     fn store(
@@ -1270,7 +1269,7 @@ impl DiskTransport for Staged {
         self.accept(id)?;
         if self.resources.pool.is_none() {
             return Err(invalid(
-                "the staged transport has no staging pool; records move only through caller-owned buffers",
+                "the staged transport has no slot pool; records move only through caller-owned buffers",
             ));
         }
         let pages: usize = plan.iter().map(|segment| segment.pages as usize).sum();
@@ -1349,7 +1348,7 @@ impl DiskTransport for Staged {
     }
 
     /// Finish outstanding pipelines within [`copier::CLOSE_TIMEOUT`], then
-    /// stop the disk thread and, when this transport owns the staging pool,
+    /// stop the disk thread and, when this transport owns the slot pool,
     /// the transfer threads. Completions reached before the deadline remain
     /// available through `poll`.
     fn close(&mut self) -> Result<()> {
@@ -2513,11 +2512,11 @@ impl HostStore for DiskStore {
     }
 
     fn stats(&self) -> StoreStats {
-        let pool = self.transport.pool();
+        let pool = self.transport.staged().and_then(Staged::pool);
         StoreStats {
-            slots_used: pool.map_or(0, |pool| pool.page_count() - pool.free_pages()),
-            slots_total: pool.map_or(0, SlabPool::page_count),
-            intake_slots: pool.map_or(0, |pool| pool.intake_slots),
+            slots_used: pool.map_or(0, |pool| pool.slot_count() - pool.free_slots()),
+            slots_total: pool.map_or(0, SlabPool::slot_count),
+            intake_slots: pool.map_or(0, |pool| pool.intake_slots()),
             outbound_in_flight: self.outbound.len(),
             inbound_in_flight: self.inbound.len(),
             disk_records: self.index.len(),
@@ -4167,11 +4166,12 @@ mod tests {
         StoppedCopier::shared(&geometry()).unwrap()
     }
 
-    /// Caller-owned aligned buffers: the slabs of an unregistered pool.
+    /// Caller-owned aligned buffers: the slots of an unregistered pool.
     fn host_pool() -> SlabPool {
         let layout = Layout::new(&geometry()).unwrap();
         SlabPool::new(
             layout.page_record_bytes,
+            crate::offload::intake_slots(&layout, 1),
             crate::offload::intake_slots(&layout, 1),
         )
         .unwrap()
@@ -4180,21 +4180,21 @@ mod tests {
     fn page_slabs(pool: &mut SlabPool, count: usize, seed: u64) -> Vec<Slot> {
         (0..count as u64)
             .map(|index| {
-                let slab = pool.allocate_page().unwrap();
-                pattern(pool.page_mut(slab), seed + index);
-                slab
+                let slot = pool.allocate_page().unwrap();
+                pattern(pool.page_mut(slot), seed + index);
+                slot
             })
             .collect()
     }
 
     fn row_slab(pool: &mut SlabPool, seed: u64) -> Slot {
-        let slab = pool.allocate_page().unwrap();
-        pattern(pool.page_mut(slab), seed);
-        slab
+        let slot = pool.allocate_page().unwrap();
+        pattern(pool.page_mut(slot), seed);
+        slot
     }
 
-    fn addresses(pool: &SlabPool, slabs: &[Slot]) -> Vec<usize> {
-        slabs.iter().map(|slab| pool.page_address(*slab)).collect()
+    fn addresses(pool: &SlabPool, slots: &[Slot]) -> Vec<usize> {
+        slots.iter().map(|slot| pool.slot_address(*slot)).collect()
     }
 
     fn transport_events(staged: &mut Staged, count: usize) -> Vec<TransportEvent> {
@@ -4240,6 +4240,7 @@ mod tests {
             return;
         };
         let geometry = geometry();
+        let layout = Layout::new(&geometry).unwrap();
         let expected = header(&geometry, &history(200), 200, None);
         let mut variants = Vec::new();
         let mut changed = expected.clone();
@@ -4263,7 +4264,8 @@ mod tests {
             for device in [false, true] {
                 let mut pool = SlabPool::new(
                     PAGE_RECORD,
-                    (4) + (2) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
+                    layout.record_slots(4, true) + layout.row_slots(),
+                    0,
                 )
                 .unwrap();
                 for index in 0..4 {
@@ -4272,8 +4274,8 @@ mod tests {
                 for index in 0..2 {
                     pool.page_mut(Slot(index)).fill(0xee);
                 }
-                let page = pool.page_address(Slot(0));
-                let row = pool.page_address(Slot(0));
+                let page = pool.slot_address(Slot(0));
+                let row = pool.slot_address(Slot(0));
                 let (host, staging) = if device {
                     (None, Some(pool))
                 } else {
@@ -4369,7 +4371,7 @@ mod tests {
                     directory.join(record::temporary_name(&header.key)),
                     directory.join(record::file_name(&header.key)),
                     addresses(&pool, &source),
-                    Some(vec![pool.page_address(row)]),
+                    Some(vec![pool.slot_address(row)]),
                 )
                 .unwrap();
             assert!(matches!(
@@ -4405,8 +4407,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!store.index.complete(&child.key));
-        for slab in &source {
-            pool.page_mut(*slab).fill(0x87);
+        for slot in &source {
+            pool.page_mut(*slot).fill(0x87);
         }
         pool.page_mut(row).fill(0x91);
         store
@@ -4419,7 +4421,7 @@ mod tests {
                 temporary,
                 path.clone(),
                 addresses(&pool, &source),
-                Some(vec![pool.page_address(row)]),
+                Some(vec![pool.slot_address(row)]),
             )
             .unwrap();
         assert!(matches!(
@@ -4467,7 +4469,7 @@ mod tests {
         let geometry = geometry();
         let layout = Layout::new(&geometry).unwrap();
         const PAGES: usize = WINDOW_PAGES + 6;
-        let mut pool = SlabPool::new(PAGE_RECORD, 2 * layout.record_slots(PAGES, true)).unwrap();
+        let mut pool = SlabPool::new(PAGE_RECORD, 2 * layout.record_slots(PAGES, true), 0).unwrap();
         let mut staged = Staged::new(
             None,
             stopped_transfers(),
@@ -4527,7 +4529,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses[..PAGES - 1].to_vec(),
-                    Some(vec![pool.page_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)])
                 )
                 .is_err()
         );
@@ -4559,7 +4561,7 @@ mod tests {
                 temporary.clone(),
                 path.clone(),
                 source_addresses.clone(),
-                Some(vec![pool.page_address(source_row)]),
+                Some(vec![pool.slot_address(source_row)]),
             )
             .unwrap();
         assert!(
@@ -4570,7 +4572,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(vec![pool.page_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)])
                 )
                 .is_err()
         );
@@ -4609,7 +4611,7 @@ mod tests {
                 header.clone(),
                 SKIP as u32,
                 addresses(&pool, &targets[..PAGES - SKIP]),
-                Some(vec![pool.page_address(target_row)]),
+                Some(vec![pool.slot_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4681,7 +4683,7 @@ mod tests {
                 header.clone(),
                 0,
                 addresses(&pool, &targets),
-                Some(vec![pool.page_address(target_row)]),
+                Some(vec![pool.slot_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4719,7 +4721,7 @@ mod tests {
                 header.clone(),
                 WINDOW_PAGES as u32,
                 addresses(&pool, &targets[..PAGES - WINDOW_PAGES]),
-                Some(vec![pool.page_address(target_row)]),
+                Some(vec![pool.slot_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4756,7 +4758,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(vec![pool.page_address(source_row)])
+                    Some(vec![pool.slot_address(source_row)])
                 )
                 .is_err()
         );
@@ -4781,6 +4783,7 @@ mod tests {
                 SlabPool::new(
                     layout.page_record_bytes,
                     crate::offload::intake_slots(&layout, 1),
+                    crate::offload::intake_slots(&layout, 1),
                 )
                 .unwrap(),
             ),
@@ -4791,10 +4794,10 @@ mod tests {
         let mut ids = Ids::new();
         let free = |staged: &Staged| {
             let pool = staged.pool().unwrap();
-            (pool.free_pages(), pool.free_pages())
+            pool.free_slots()
         };
         let count = crate::offload::intake_slots(&layout, 1);
-        let all = (count, count);
+        let all = count;
         assert_eq!(free(&staged), all);
 
         // A record written from caller buffers gives the fetches below a file.
@@ -4810,7 +4813,7 @@ mod tests {
                 directory.join(record::temporary_name(&stored.key)),
                 path.clone(),
                 source_addresses.clone(),
-                Some(vec![host.page_address(source_row)]),
+                Some(vec![host.slot_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4822,7 +4825,7 @@ mod tests {
         }
 
         // Without transfer threads a store fails at its first window: the
-        // slabs return to the pool at once, the temporary file is aborted once
+        // slots return to the pool at once, the temporary file is aborted once
         // its create reply arrives, and the failure is reported once.
         let device = header(&geometry, &full, 3 * PAGE_TOKENS + 2, None);
         let checkpoint = checkpoint(
@@ -4866,7 +4869,7 @@ mod tests {
         assert_eq!(free(&staged), all);
 
         // A fetch reads its window from the file into staging and fails at
-        // the upload: the slabs are released after the read replies and the
+        // the upload: the slots are released after the read replies and the
         // file is closed.
         let ticket = InboundTicket {
             key: stored.key,
@@ -4883,7 +4886,7 @@ mod tests {
         staged
             .fetch(JobId(3), vec![segment.clone()], &ticket)
             .unwrap();
-        assert_eq!(free(&staged), (count - 4, count - 4));
+        assert_eq!(free(&staged), count - 4);
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(3));
@@ -4948,7 +4951,7 @@ mod tests {
                 lost_temporary.clone(),
                 missing.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
-                Some(vec![host.page_address(source_row)]),
+                Some(vec![host.slot_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4967,7 +4970,7 @@ mod tests {
                 missing.join(record::temporary_name(&lost.key)),
                 directory.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
-                Some(vec![host.page_address(source_row)]),
+                Some(vec![host.slot_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -5027,7 +5030,7 @@ mod tests {
                     directory.join(record::temporary_name(&header.key)),
                     directory.join(record::file_name(&header.key)),
                     source_addresses.clone(),
-                    Some(vec![host.page_address(source_row)]),
+                    Some(vec![host.slot_address(source_row)]),
                 )
                 .unwrap();
         }

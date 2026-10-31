@@ -172,7 +172,7 @@ pub enum Operation {
     Unlink,
 }
 
-/// Work for the disk thread. Buffers are host addresses of page or row slabs.
+/// Work for the disk thread. Buffers are host addresses of page or row slots.
 /// `Create` through `Commit` or `Abort` share one id and run in submission
 /// order; `Open` through `Close` likewise. A buffer must stay valid and
 /// untouched until the job's reply arrives.
@@ -656,7 +656,7 @@ impl Worker {
         let moved = self.ring.transfer(&writing.file, &spans, true)?;
         for (page, address) in pages.zip(buffers) {
             // SAFETY: The transfer checked the span's alignment and completed;
-            // the caller keeps the slab at `address` valid and unchanged for
+            // the caller keeps the slot at `address` valid and unchanged for
             // `page_bytes` until this job's reply.
             let bytes =
                 unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
@@ -843,7 +843,7 @@ impl Worker {
             .collect();
         let moved = self.ring.transfer(&reading.file, &spans, false)?;
         for (page, address) in pages.zip(buffers) {
-            // SAFETY: The caller keeps the slab at `address` valid for
+            // SAFETY: The caller keeps the slot at `address` valid for
             // `page_bytes` until this job's reply, and the read into it completed.
             let bytes =
                 unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
@@ -2706,88 +2706,101 @@ mod tests {
         let Some(directory) = test_directory("legacy-slots") else {
             return;
         };
-        // Written by the pre-slot disk engine: one page and a three-piece row.
-        let golden = include_bytes!("../tests/data/legacy-record.bin");
-        let header = Header::decode(&golden[..HEADER_BYTES]).unwrap();
-        let layout = header.layout().unwrap();
-        let path = directory.join(file_name(&header.key));
-        fs::write(&path, golden).unwrap();
-        let guard = crate::testing::directory_lock(&directory).unwrap();
-        let scanned = crate::record::scan(
-            &guard,
-            &header.identity,
-            &header.fingerprint,
-            header.page_tokens,
-            &header.ranks,
-        )
-        .unwrap();
-        assert_eq!(scanned.len(), 1);
-        let page = buffer(4096, 0);
-        let pieces: Vec<_> = (0..layout.row_slots()).map(|_| buffer(4096, 0)).collect();
-        let addresses: Vec<_> = pieces.iter().map(AlignedBuffer::address).collect();
-        let mut disk = DiskThread::start("legacy-slots").unwrap();
-        disk.submit(Job::Open {
-            id: JobId(1),
-            path: path.clone(),
-            expected: header.clone(),
-        })
-        .unwrap();
-        disk.submit(Job::ReadPages {
-            id: JobId(1),
-            window: 0,
-            first: 0,
-            buffers: vec![page.address()],
-        })
-        .unwrap();
-        disk.submit(Job::ReadRow {
-            id: JobId(1),
-            buffers: addresses.clone(),
-        })
-        .unwrap();
-        for reply in wait(&disk, 3) {
-            succeeded(&reply);
+        // The two-rank fixture was written by the 67752e55 DiskThread (Create,
+        // WritePages, contiguous WriteRow, Commit). The two-rank fixture uses
+        // page shares 4096/8192 and row shares 12288/4096, with byte i set to
+        // (i * 11 + i / 4096 * 37 + seed) as u8: page seed 7, row seed 19.
+        for golden in [
+            include_bytes!("../tests/data/legacy-record.bin").as_slice(),
+            include_bytes!("../tests/data/legacy-two-rank-record.bin").as_slice(),
+        ] {
+            let header = Header::decode(&golden[..HEADER_BYTES]).unwrap();
+            let layout = header.layout().unwrap();
+            let path = directory.join(file_name(&header.key));
+            fs::write(&path, golden).unwrap();
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned = crate::record::scan(
+                &guard,
+                &header.identity,
+                &header.fingerprint,
+                header.page_tokens,
+                &header.ranks,
+            )
+            .unwrap();
+            assert_eq!(scanned.len(), 1);
+            let page = buffer(layout.page_record_bytes as usize, 0);
+            let pieces: Vec<_> = (0..layout.row_slots())
+                .map(|_| buffer(layout.page_record_bytes as usize, 0))
+                .collect();
+            let addresses: Vec<_> = pieces.iter().map(AlignedBuffer::address).collect();
+            let mut disk = DiskThread::start("legacy-slots").unwrap();
+            disk.submit(Job::Open {
+                id: JobId(1),
+                path: path.clone(),
+                expected: header.clone(),
+            })
+            .unwrap();
+            disk.submit(Job::ReadPages {
+                id: JobId(1),
+                window: 0,
+                first: 0,
+                buffers: vec![page.address()],
+            })
+            .unwrap();
+            disk.submit(Job::ReadRow {
+                id: JobId(1),
+                buffers: addresses.clone(),
+            })
+            .unwrap();
+            for reply in wait(&disk, 3) {
+                succeeded(&reply);
+            }
+            assert_eq!(
+                page.as_slice(),
+                &golden[header.page_segment as usize..header.row_segment as usize]
+            );
+            let row: Vec<u8> = crate::slab::row_pieces(&layout, &addresses)
+                .flat_map(|(address, _, len)| {
+                    unsafe { std::slice::from_raw_parts(address as *const u8, len) }
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(row, golden[header.row_segment as usize..]);
+            disk.submit(Job::Close { id: JobId(1) }).unwrap();
+            succeeded(&wait(&disk, 1)[0]);
+            disk.submit(Job::Create {
+                id: JobId(2),
+                temporary: directory.join(temporary_name(&header.key)),
+                header: header.clone(),
+            })
+            .unwrap();
+            disk.submit(Job::WritePages {
+                id: JobId(2),
+                window: 0,
+                first: 0,
+                buffers: vec![page.address()],
+            })
+            .unwrap();
+            disk.submit(Job::WriteRow {
+                id: JobId(2),
+                buffers: addresses,
+            })
+            .unwrap();
+            disk.submit(Job::Commit {
+                id: JobId(2),
+                path: path.clone(),
+                sync: false,
+            })
+            .unwrap();
+            for reply in wait(&disk, 4) {
+                succeeded(&reply);
+            }
+            disk.close().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), golden);
+            drop(guard);
+            fs::remove_file(path).unwrap();
         }
-        assert_eq!(
-            page.as_slice(),
-            &golden[header.page_segment as usize..header.row_segment as usize]
-        );
-        let row: Vec<u8> = pieces
-            .iter()
-            .flat_map(|piece| piece.as_slice().iter().copied())
-            .collect();
-        assert_eq!(row, golden[header.row_segment as usize..]);
-        disk.submit(Job::Close { id: JobId(1) }).unwrap();
-        succeeded(&wait(&disk, 1)[0]);
-        disk.submit(Job::Create {
-            id: JobId(2),
-            temporary: directory.join(temporary_name(&header.key)),
-            header: header.clone(),
-        })
-        .unwrap();
-        disk.submit(Job::WritePages {
-            id: JobId(2),
-            window: 0,
-            first: 0,
-            buffers: vec![page.address()],
-        })
-        .unwrap();
-        disk.submit(Job::WriteRow {
-            id: JobId(2),
-            buffers: addresses,
-        })
-        .unwrap();
-        disk.submit(Job::Commit {
-            id: JobId(2),
-            path: path.clone(),
-            sync: false,
-        })
-        .unwrap();
-        for reply in wait(&disk, 4) {
-            succeeded(&reply);
-        }
-        disk.close().unwrap();
-        assert_eq!(fs::read(path).unwrap(), golden);
-        drop(guard);
         fs::remove_dir_all(directory).unwrap();
     }
 }

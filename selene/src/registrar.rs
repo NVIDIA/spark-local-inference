@@ -22,7 +22,7 @@ pub trait HostRegistrar {
     /// Reserve one range of pinned host memory made of one part per
     /// `(context, device, bytes)` request, in request order, each accessible
     /// to its own device and the host only. The host cannot address a record
-    /// across parts, so slab addresses in such a pool are identities.
+    /// across parts, so slot addresses in such a pool are identities.
     fn map_split(&self, requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>>;
 }
 

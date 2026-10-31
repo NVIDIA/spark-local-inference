@@ -1134,7 +1134,12 @@ fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>
     let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
     let layout = Layout::new(&geo()).unwrap();
     let intake = flare_selene::offload::intake_slots(&layout, 1);
-    let pool = SlabPool::new(PAGE as u64, 2 * intake + pages + 2 * layout.row_slots()).unwrap();
+    let pool = SlabPool::new(
+        PAGE as u64,
+        2 * intake + pages + 2 * layout.row_slots(),
+        intake,
+    )
+    .unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
     let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
     let store =
@@ -1213,7 +1218,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     // Memory holds two records of two pages; the disk tier, two files.
     let (memory_transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
     let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
-    let pool = SlabPool::new(PAGE as u64, intake + 8).unwrap();
+    let pool = SlabPool::new(PAGE as u64, intake + 8, intake).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
     let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1304,6 +1309,7 @@ fn drained_records_are_announced_and_claimable_after_restart() {
             SlabPool::new(
                 PAGE as u64,
                 20 + 2 * flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
+                flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
             )
             .unwrap(),
             memory_copier,
@@ -1429,6 +1435,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
                 Some(
                     SlabPool::new(
                         layout.page_record_bytes,
+                        flare_selene::offload::intake_slots(&layout, 1),
                         flare_selene::offload::intake_slots(&layout, 1),
                     )
                     .unwrap(),
@@ -1991,7 +1998,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
     struct Split(SlabPool);
     impl SplitMapping for Split {
         fn address(&self) -> usize {
-            self.0.page_address(flare_selene::slab::Slot(0))
+            self.0.slot_address(flare_selene::slab::Slot(0))
         }
         fn nbytes(&self) -> usize {
             self.0.bytes() as usize
@@ -2015,6 +2022,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
             Ok(Box::new(Split(SlabPool::new(
                 PAGE as u64,
                 requests[0].2 / PAGE,
+                0,
             )?)))
         }
     }
@@ -2042,6 +2050,8 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
         }
     }
 
+    let mut geometry = geo();
+    geometry[0].row.unit_bytes = 3 * PAGE as u64;
     let manager = Manager::start();
     for warm in [false, true] {
         for disk in [false, true] {
@@ -2069,7 +2079,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                             PoolBuilder {
                                 options: options.pool.as_ref().unwrap(),
                                 identity: [7; 32],
-                                geometry: &geo(),
+                                geometry: &geometry,
                                 gpu_uuids: vec![[1; 16]],
                                 registration_context: 0,
                                 budget: Budget {
@@ -2091,7 +2101,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                     &options,
                     std::path::Path::new("unused"),
                     [7; 32],
-                    geo(),
+                    geometry.clone(),
                     vec![(0, 0)],
                     8,
                     0,
@@ -2114,7 +2124,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 assert_eq!(prepared.memory_pool.is_some(), warm || disk);
                 if let Some(pool) = &prepared.memory_pool {
                     assert_eq!(
-                        pool.page_count(),
+                        pool.slot_count(),
                         intake_slots(&prepared.layout, 8) + usize::from(warm) * 512
                     );
                     assert_eq!(pool.rank_parts().is_some(), warm && !disk && !pooled);
@@ -2129,7 +2139,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                     open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();
                 let stats = store.stats();
                 let intake = if warm || disk {
-                    intake_slots(&Layout::new(&geo()).unwrap(), 8)
+                    intake_slots(&Layout::new(&geometry).unwrap(), 8)
                 } else {
                     0
                 };
@@ -2138,8 +2148,12 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 assert_eq!(stats.intake_slots, intake, "{name}");
                 let salt = 1 + u32::from(warm) * 4 + u32::from(disk) * 2 + u32::from(pooled);
                 let (checkpoint, history) = publication(&factory.0.borrow()[0], salt, 2);
-                for gpu in factory.0.borrow().iter().skip(1) {
+                let row: Vec<u8> = (0..3 * PAGE)
+                    .map(|i| ((i * 11 + salt as usize * 17 + 3) % 251) as u8)
+                    .collect();
+                for gpu in factory.0.borrow().iter() {
                     publication(gpu, salt, 2);
+                    gpu.rows.lock().unwrap().insert(salt, row.clone());
                 }
                 store_and_wait(store.as_mut(), &checkpoint);
                 if warm || disk {
@@ -2165,7 +2179,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                         {
                             assert_eq!(
                                 result.map_err(|error| error.to_string()),
-                                Ok((2 * PAGE + ROW) as u64),
+                                Ok((2 * PAGE + row.len()) as u64),
                                 "{name}"
                             );
                             break;
@@ -2184,10 +2198,25 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                             salted_page(salt, page)
                         );
                     }
-                    assert_eq!(restored.rows.lock().unwrap()[&9], salted_row(salt));
+                    assert_eq!(restored.rows.lock().unwrap()[&9], row);
                 }
                 if pooled {
-                    let mut requester = instance(&manager, 2);
+                    let mut options = config(&manager, 2);
+                    options.scope = Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap();
+                    let (copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
+                    let mut requester = Instance {
+                        client: PoolClient::start(
+                            options,
+                            None,
+                            copier,
+                            Arc::new(OkRegistrar),
+                            flare_selene::pool::Roots::System,
+                            STARTUP_WAIT,
+                        )
+                        .unwrap(),
+                        gpu,
+                        events: Vec::new(),
+                    };
                     requester.ready();
                     drive(store.as_mut(), "the published record", |_| {
                         let ticket = requester.client.begin_lookup(&history, 0);
@@ -2235,7 +2264,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                             };
                             assert_eq!(
                                 result.map_err(|error| error.error.to_string()),
-                                Ok((2 * PAGE + ROW) as u64),
+                                Ok((2 * PAGE + row.len()) as u64),
                                 "{name}"
                             );
                             break;
@@ -2249,7 +2278,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                             salted_page(salt, page)
                         );
                     }
-                    assert_eq!(requester.gpu.rows.lock().unwrap()[&9], salted_row(salt));
+                    assert_eq!(requester.gpu.rows.lock().unwrap()[&9], row);
                     requester.client.close().unwrap();
                 }
                 store.evicted(checkpoint.key, None);

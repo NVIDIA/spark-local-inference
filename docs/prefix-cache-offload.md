@@ -264,7 +264,7 @@ The deferred direct transport requirements are in section 2.6.
 trait by orchestrating them:
 
 - `store` with the staged transport runs `memory.store`; when the copy-out
-  lands, both modes park the record until headroom or allocation pressure
+  lands, both modes park the record until the clean floor or allocation pressure
   needs its slabs. `write_from` writes those same memory slabs.
   Completion makes the memory copy durable. If disk reservation fails, the
   complete record stays parked in DRAM, restorable and announced there, with
@@ -321,7 +321,8 @@ contiguous. CPU readers traverse pieces in rank order, preserving disk bytes
 and streaming xxh3 checksum values. Existing records still recover.
 
 Memory allocation keeps at least `intake_slots` free slots by evicting the
-coldest ready, unpinned, durable records on demand. Maintenance starts writes of
+coldest ready, unpinned, durable records that, in pool mode, are not announced.
+Maintenance starts writes of
 the coldest dirty records, or retirements to the pool, when `free + clean` falls
 below `2 × intake_slots`. Memory-only records are already durable. Maintenance
 never waits for `Staged`; independent memory and disk copier queues share the
@@ -960,9 +961,8 @@ same completion events the store produces.
 - **Eviction below the instance.** Host records move from DRAM to local NVMe,
   then to the manager, with source retention until acceptance. In pooled mode,
   DRAM demotes cold records to disk, and the last local tier to the manager,
-  before they fill. Headroom is
-  `min(max(capacity / 20, 2 * largest_admitted_record), ceil(capacity / 10))`;
-  DRAM computes page and row slab reserves separately. Disk headroom includes
+  before they fill. DRAM follows the free and clean floors described above;
+  disk uses byte-based headroom. Disk headroom includes
   pending unlink and truncate bytes, which stay charged until completion.
   Store, eviction, spill completion, handover completion, reconnect and hashing
   progress trigger one coalesced maintenance pass per model-thread poll.

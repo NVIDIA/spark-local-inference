@@ -111,7 +111,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
     assert_eq!(
         PrefixCacheOffload::default()
-            .headroom_bytes(1, &layout)
+            .headroom_with_inputs(1, &layout, 1, false)
             .unwrap(),
         (0, 0)
     );
@@ -123,16 +123,16 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
         pool: Some(pool("host:7000")),
         ..tiers.clone()
     };
-    let (device, host) = tiers.headroom_bytes(1, &layout).unwrap();
+    let (device, host) = tiers.headroom_with_inputs(1, &layout, 1, false).unwrap();
     // Static headroom covers the copier; Hello's regions are budgeted at startup.
     assert_eq!(
-        pooled.headroom_bytes(1, &layout).unwrap(),
+        pooled.headroom_with_inputs(1, &layout, 1, false).unwrap(),
         (device + STORE_DEVICE_MARGIN_BYTES, host)
     );
     // A pool shares what the CPU reads, so its memory is mapped whole by the device
     // instead of split across ranks.
-    let split = tiers.headroom_bytes(2, &layout).unwrap().0;
-    let whole = pooled.headroom_bytes(2, &layout).unwrap().0;
+    let split = tiers.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
+    let whole = pooled.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
     assert!(whole > split + STORE_DEVICE_MARGIN_BYTES, "{whole} {split}");
     let alone = PrefixCacheOffload {
         pool: Some(pool("host:7000")),
@@ -140,7 +140,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     };
     assert!(alone.enabled());
     assert_eq!(
-        alone.headroom_bytes(1, &layout).unwrap(),
+        alone.headroom_with_inputs(1, &layout, 1, false).unwrap(),
         (STORE_DEVICE_MARGIN_BYTES, 0)
     );
 }
@@ -291,11 +291,14 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
         row_record_bytes: 8 << 20,
     };
     let mut options = PrefixCacheOffload::default();
-    assert_eq!(options.headroom_bytes(2, &layout).unwrap(), (0, 0));
+    assert_eq!(
+        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        (0, 0)
+    );
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     options.memory_bytes = Some(16 << 30);
     assert_eq!(
-        options.headroom_bytes(2, &layout).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
         (
             ((16u64 << 30) + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES,
             (16 << 30) + intake
@@ -304,19 +307,21 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     options.disk = Some("records".into());
     let host = (16u64 << 30) + intake;
     assert_eq!(
-        options.headroom_bytes(2, &layout).unwrap(),
+        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
     options.memory_bytes = Some(0);
-    let staging = intake;
     assert_eq!(
-        options.headroom_bytes(2, &layout).unwrap(),
-        (staging.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, staging)
+        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        (intake.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, intake)
     );
     options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
     assert_eq!(
-        options.headroom_bytes(2, &layout).unwrap().1,
+        options
+            .headroom_with_inputs(2, &layout, 1, false)
+            .unwrap()
+            .1,
         (16 << 30) + intake
     );
 }
@@ -384,7 +389,10 @@ fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
             required,
             required + 1,
         ] {
-            prepared.memory_pool.as_mut().unwrap().intake_slots = allocated;
+            prepared.memory_pool = Some(
+                crate::slab::SlabPool::new(layout.page_record_bytes, 128 + allocated, allocated)
+                    .unwrap(),
+            );
             let warning = prepared.intake_warning(32);
             if allocated >= required {
                 assert!(warning.is_none());
@@ -444,7 +452,7 @@ impl CopierFactory for RecordingFactory {
     ) -> Result<crate::SharedCopier> {
         let mut maps = self.maps.borrow_mut();
         let id = maps.len();
-        maps.push(pool.page_address(slab::Slot(0)));
+        maps.push(pool.slot_address(slab::Slot(0)));
         Ok(std::sync::Arc::new(std::sync::Mutex::new(ClosingCopier {
             layout: Layout::new(&geometry)?,
             id,
@@ -500,7 +508,7 @@ fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_clos
             assert_eq!(maps.len(), if warm == 0 { 1 } else { 2 });
             assert!(
                 maps.iter()
-                    .all(|&address| address == pool.page_address(slab::Slot(0)))
+                    .all(|&address| address == pool.slot_address(slab::Slot(0)))
             );
             assert_eq!(store.close().is_err(), fail.is_some());
             let order = factory.closed.lock().unwrap().clone();
@@ -518,7 +526,7 @@ fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_clos
             assert_eq!(*registrar.drops.lock().unwrap(), 0);
             pool.release_page(slot);
             if fail.is_some() {
-                assert_eq!(pool.free_pages(), 0);
+                assert_eq!(pool.free_slots(), 0);
                 assert_eq!(pool.allocate_page(), None);
             }
             drop(pool);
@@ -561,8 +569,8 @@ fn intake_sizes_active_rows_and_rounds_warm_memory_down() {
     };
     assert!(prepared.intake_warning(active).is_none());
     let pool = prepared.memory_pool.unwrap();
-    assert_eq!(pool.intake_slots, intake_slots(&layout, active));
-    assert_eq!(pool.page_count(), 17 + pool.intake_slots);
+    assert_eq!(pool.intake_slots(), intake_slots(&layout, active));
+    assert_eq!(pool.slot_count(), 17 + pool.intake_slots());
 }
 
 #[test]

@@ -49,10 +49,10 @@ impl CopierFactory for Copiers {
         pool: &crate::slab::SlabPool,
     ) -> Result<crate::SharedCopier> {
         assert_eq!(
-            pool.intake_slots,
+            pool.intake_slots(),
             offload::intake_slots(&crate::Layout::new(&geometry)?, 8)
         );
-        assert_eq!(pool.page_count(), pool.intake_slots);
+        assert_eq!(pool.slot_count(), pool.intake_slots());
         let (copier, memory) = SimulatedGpu::shared_mapped(&geometry)?;
         let rank = contexts[0].0;
         for page in 1..=2 {

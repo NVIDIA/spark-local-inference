@@ -18,7 +18,7 @@ pub trait CopierFactory {
         &self,
         contexts: &[(usize, i32)],
         geometry: Vec<CacheGeometry>,
-        slabs: &slab::SlabPool,
+        slots: &slab::SlabPool,
     ) -> Result<crate::SharedCopier>;
     fn unmapped(
         &self,
@@ -53,13 +53,6 @@ impl PrefixCacheOffload {
         self.memory_bytes.unwrap_or(0) != 0
             || (self.disk.is_some() && self.disk_limit != Some(0))
             || self.pool.is_some()
-    }
-
-    /// Future device and host bytes, sized from the actual record layout. A registered host
-    /// pool costs each device about 2 MiB per GiB, plus transfer streams and events. Without
-    /// a disk tier the retaining pool is split by rank; disk staging is shared by all ranks.
-    pub fn headroom_bytes(&self, ranks: usize, layout: &Layout) -> Result<(u64, u64)> {
-        self.headroom_with_inputs(ranks, layout, 1, false)
     }
 
     pub fn headroom_with_inputs(
@@ -240,12 +233,12 @@ impl Prepared {
     pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
         let pool = self.memory_pool.as_ref()?;
         let required = intake_slots(&self.layout, max_concurrency);
-        (pool.intake_slots < required).then(|| {
+        (pool.intake_slots() < required).then(|| {
             let bytes = required as u64 * self.layout.page_record_bytes;
             format!(
                 "host prefix intake shrunk to {} slots to fit the host budget; \
                  full intake at max concurrency {max_concurrency} needs {bytes} bytes ({}) of host memory",
-                pool.intake_slots, gibibytes(bytes)
+                pool.intake_slots(), gibibytes(bytes)
             )
         })
     }
@@ -258,10 +251,10 @@ impl Prepared {
                 if self.warm_bytes != 0 {
                     "memory"
                 } else {
-                    "staging"
+                    "intake"
                 },
                 gibibytes(pool.bytes()),
-                pool.page_count(),
+                pool.slot_count(),
                 if pool.rank_parts().is_some() {
                     ", split by rank"
                 } else {
@@ -466,14 +459,13 @@ pub fn prepare_with_inputs(
             let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
                 * layout.page_record_bytes;
             // Shared records must be readable by the CPU.
-            let mut pool = if directory.is_none() && options.pool.is_none() {
-                slab::SlabPool::sized_by_rank(&layout, bytes, &contexts, registrar)?
+            let pool = if directory.is_none() && options.pool.is_none() {
+                slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
             } else {
-                let mut pool = slab::SlabPool::sized(&layout, bytes)?;
+                let mut pool = slab::SlabPool::sized(&layout, bytes, intake)?;
                 pool.register(registrar, context)?;
                 pool
             };
-            pool.intake_slots = intake;
             Ok::<_, crate::Error>(pool)
         })
         .transpose()?;
@@ -579,7 +571,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
                 geometry.clone(),
                 memory_pool
                     .as_ref()
-                    .ok_or("disk transfers require a slab pool")?,
+                    .ok_or("disk transfers require a slot pool")?,
             )?;
             let transport: Box<dyn disk_store::DiskTransport> = if !shards.is_empty() {
                 shard::transport(memory_pool.clone(), disk_transfers, shards)?
@@ -661,7 +653,7 @@ pub fn host_pool_budget(future: u64) -> Result<u64> {
                 (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
             })
             .ok_or_else(|| {
-                crate::Error::new("Linux MemTotal is required to budget pool host memory")
+                crate::Error::new("Linux MemTotal is required to budget local intake memory")
             })?;
         (available_memory(&info, usize::MAX)? as u64, total)
     };

@@ -26,7 +26,7 @@ pub use limits::{
 };
 pub use slice::{RankSlice, SliceLayout, SliceSums};
 
-/// Pages per slab transfer window.
+/// Pages per slot transfer window.
 pub const WINDOW_PAGES: usize = 64;
 pub const MAX_WINDOW_PAGES: u32 = WINDOW_PAGES as u32;
 

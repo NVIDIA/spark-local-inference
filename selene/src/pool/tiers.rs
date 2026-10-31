@@ -117,9 +117,8 @@ impl TierView {
 pub(crate) struct HashJob {
     pub key: PrefixKey,
     pub pages: Vec<usize>,
-    pub page_bytes: usize,
     pub row: Option<Vec<usize>>,
-    pub layout: crate::Layout,
+    pub layout: Arc<crate::Layout>,
 }
 
 impl super::engine::hostfill::HostFiller<PrefixKey> {
@@ -128,7 +127,7 @@ impl super::engine::hostfill::HostFiller<PrefixKey> {
             owner: job.key,
             window: 0,
             work: Box::new(move || {
-                // The owner pins these slabs until it collects the result or joins the worker.
+                // The owner pins these slots until it collects the result or joins the worker.
                 let read = |address: usize, len: usize| unsafe {
                     std::slice::from_raw_parts(address as *const u8, len)
                 };
@@ -136,7 +135,9 @@ impl super::engine::hostfill::HostFiller<PrefixKey> {
                     pages: job
                         .pages
                         .iter()
-                        .map(|address| checksum(read(*address, job.page_bytes)))
+                        .map(|address| {
+                            checksum(read(*address, job.layout.page_record_bytes as usize))
+                        })
                         .collect(),
                     row: job
                         .row
@@ -212,9 +213,8 @@ mod tests {
         assert!(hasher.submit_hash(HashJob {
             key: key(1),
             pages: vec![base, base + 64],
-            page_bytes: 64,
             row: Some(vec![base + 128]),
-            layout: crate::Layout {
+            layout: Arc::new(crate::Layout {
                 page_tokens: 16,
                 page_record_bytes: 64,
                 row_record_bytes: 64,
@@ -223,7 +223,7 @@ mod tests {
                     plane_offsets: vec![0],
                     row_offset: 0
                 }]
-            },
+            }),
         }));
         let done = loop {
             let mut done = Vec::new();

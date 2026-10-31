@@ -41,6 +41,7 @@ fn rig(pages: usize) -> Rig {
     let pool = SlabPool::new(
         PAGE as u64,
         pages + 1 + crate::offload::intake_slots(&layout, 1),
+        crate::offload::intake_slots(&layout, 1),
     )
     .unwrap();
     let mut store = MemoryStore::new([7; 32], pool, copier).unwrap();
@@ -236,6 +237,7 @@ fn a_store_that_was_never_attached_announces_nothing_and_exports_nothing() {
     let pool = SlabPool::new(
         PAGE as u64,
         4 + 2 + crate::offload::intake_slots(&Layout::new(&[geometry.clone()]).unwrap(), 1),
+        crate::offload::intake_slots(&Layout::new(&[geometry.clone()]).unwrap(), 1),
     )
     .unwrap();
     let mut store = MemoryStore::new([7; 32], pool, copier).unwrap();
@@ -253,7 +255,7 @@ fn a_store_that_was_never_attached_announces_nothing_and_exports_nothing() {
 
 #[test]
 fn a_store_dropped_while_its_records_are_being_hashed_frees_no_slab_under_the_hasher() {
-    // The checksum thread reads a record's slabs; the store joins it before
+    // The checksum thread reads a record's slots; the store joins it before
     // it frees them.
     for _ in 0..300 {
         let mut rig = rig(8);

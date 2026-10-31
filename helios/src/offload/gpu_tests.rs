@@ -118,6 +118,7 @@ mod memory {
             &layout,
             4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
                 * layout.page_record_bytes,
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -276,6 +277,7 @@ mod memory {
             &layout,
             4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
                 * layout.page_record_bytes,
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -344,7 +346,7 @@ mod memory {
                 .as_ref()
                 .unwrap()
                 .iter()
-                .map(|&slot| pool.page_address(slot))
+                .map(|&slot| pool.slot_address(slot))
                 .collect();
             let actual: Vec<u8> = flare_selene::slab::row_pieces(&layout, &slots)
                 .flat_map(|(address, _, len)| {
@@ -443,8 +445,8 @@ mod memory {
         // A pool holding one record evicts it when a second key is stored.
         let mut small = SlabPool::new(
             layout.page_record_bytes,
-            (3) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
-                + flare_selene::offload::intake_slots(&layout, 1),
+            layout.record_slots(3, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
@@ -458,11 +460,11 @@ mod memory {
             StoreEvent::Stored { result: Ok(_), .. }
         ));
         assert_eq!(
-            store.pool().free_pages(),
+            store.pool().free_slots(),
             flare_selene::offload::intake_slots(&layout, 1)
         );
         assert_eq!(
-            store.pool().free_pages(),
+            store.pool().free_slots(),
             flare_selene::offload::intake_slots(&layout, 1)
         );
         let mut other = PrefixHistory::new(IDENTITY);
@@ -483,7 +485,7 @@ mod memory {
         assert!(!store.index().contains(&checkpoint.key));
         assert!(store.index().contains(&second.key));
         assert_eq!(
-            store.pool().free_pages(),
+            store.pool().free_slots(),
             flare_selene::offload::intake_slots(&layout, 1)
         );
         match super::wait_event(&mut store, 60) {
@@ -635,8 +637,8 @@ mod composite {
         }
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
-                + flare_selene::offload::intake_slots(&layout, 1),
+            4 * layout.record_slots(4, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -836,8 +838,8 @@ mod composite {
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
-                + flare_selene::offload::intake_slots(&layout, 1),
+            4 * layout.record_slots(4, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -984,8 +986,8 @@ mod composite {
         // one page to spare; a third record evicts the least recently used.
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (7) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
-                + flare_selene::offload::intake_slots(&layout, 1),
+            2 * layout.record_slots(3, true) + 1 + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -1245,8 +1247,8 @@ mod composite {
         let open_small = || {
             let mut pool = SlabPool::new(
                 layout.page_record_bytes,
-                (1) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
-                    + flare_selene::offload::intake_slots(&layout, 1),
+                layout.record_slots(1, true) + flare_selene::offload::intake_slots(&layout, 1),
+                flare_selene::offload::intake_slots(&layout, 1),
             )
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
@@ -1312,7 +1314,7 @@ mod composite {
         assert_eq!(store.outbound_records(), 1);
         assert_eq!(store.disk().stats().outbound_in_flight, 1);
         assert_eq!(
-            store.memory().pool().free_pages(),
+            store.memory().pool().free_slots(),
             flare_selene::offload::intake_slots(&layout, 1)
         );
         let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
@@ -1535,7 +1537,12 @@ mod disk_store {
 
         let intake = flare_selene::offload::intake_slots(&layout, 1);
         let open = |scanned: Vec<Scanned>, limit: u64| -> DiskStore {
-            let mut pool = SlabPool::new(layout.page_record_bytes, intake).unwrap();
+            let mut pool = SlabPool::new(
+                layout.page_record_bytes,
+                intake,
+                intake,
+            )
+            .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -1555,7 +1562,7 @@ mod disk_store {
 
         fn staging_free(store: &mut DiskStore) -> usize {
             let pool = store.transport_mut().staged_mut().unwrap().pool().unwrap();
-            pool.free_pages()
+            pool.free_slots()
         }
         let scan = |lock: &record::DirectoryLock| {
             record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()

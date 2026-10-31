@@ -813,8 +813,8 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
 }
 
 impl DiskTransport for Sharded {
-    fn pool(&self) -> Option<&crate::slab::SlabPool> {
-        self.local.pool()
+    fn staged(&self) -> Option<&Staged> {
+        Some(&self.local)
     }
 
     fn store(

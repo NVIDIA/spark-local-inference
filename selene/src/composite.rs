@@ -9,7 +9,7 @@
 //! The disk index also holds uncharged parked metadata; DRAM links are flat.
 //! Only committed files make DRAM copies evictable; disk LRU removes both.
 //!
-//! Restores pin slabs and files and use bounded staging for larger chains.
+//! Restores pin slots and files and use bounded staging for larger chains.
 //! Filesystem pressure retries with backoff. Other I/O errors may discard a
 //! record after one retry. Storage outlives every transfer.
 
@@ -54,7 +54,7 @@ struct Outbound {
 }
 
 enum NodeState {
-    /// Pinned in the memory index; its slabs supply the upload.
+    /// Pinned in the memory index; its slots supply the upload.
     Resident,
     /// Allocated in the memory index and being filled from its file.
     Reading,
@@ -84,7 +84,7 @@ struct Inbound {
     disk_started: Option<Instant>,
     disk_bytes: u64,
     error: Option<Error>,
-    /// The upload from memory slabs has been handed to the memory store.
+    /// The upload from memory slots has been handed to the memory store.
     uploading: bool,
 }
 
@@ -240,8 +240,8 @@ impl CompositeStore {
             .ok_or_else(|| invalid("the composite store requires the staged disk transport"))
     }
 
-    /// Host addresses of a ready memory record's page slabs and row slab.
-    fn slab_addresses(&self, key: &PrefixKey) -> Result<(Vec<usize>, Option<Vec<usize>>)> {
+    /// Host addresses of a ready memory record's page slots and row pieces.
+    fn slot_addresses(&self, key: &PrefixKey) -> Result<(Vec<usize>, Option<Vec<usize>>)> {
         let record = self
             .memory
             .record(key)
@@ -254,13 +254,13 @@ impl CompositeStore {
     }
 
     pub fn retains_chain(&self, chain: &Match) -> bool {
-        let mut pages = 0;
-        let mut rows = 1;
+        let layout = self.memory.layout();
+        let mut slots = self.memory.held_slots() + layout.row_slots();
         for (position, key) in chain.nodes.iter().enumerate() {
             let Some(node) = self.disk.index().node(key) else {
                 return false;
             };
-            pages += node.tail_pages;
+            slots += node.tail_pages;
             let row = position + 1 == chain.nodes.len();
             if let Some(memory) = self.memory.index().node(key) {
                 if memory.pinned()
@@ -270,21 +270,16 @@ impl CompositeStore {
                 {
                     return false;
                 }
+                if memory.pinned() || !memory.ready || !memory.location.durable {
+                    slots -= layout.record_slots(
+                        memory.location.pages.len(), memory.location.row.is_some());
+                }
                 if !row && memory.location.row.is_some() {
-                    rows += 1;
+                    slots += layout.row_slots();
                 }
             }
         }
-        for node in self.memory.index().nodes() {
-            if !chain.nodes.contains(&node.key)
-                && (node.pinned() || !node.ready || !node.location.durable)
-            {
-                pages += node.location.pages.len();
-                rows += usize::from(node.location.row.is_some());
-            }
-        }
-        pages + rows * self.memory.layout().row_slots() + self.memory.pool().intake_slots
-            <= self.memory.pool().page_count()
+        self.memory.fits(slots)
     }
 
     fn fail_children(&mut self, key: PrefixKey) {
@@ -482,7 +477,7 @@ impl CompositeStore {
         });
     }
 
-    /// Write the memory record's slabs through to its reserved file.
+    /// Write the memory record's slots through to its reserved file.
     fn start_write(
         &mut self,
         key: PrefixKey,
@@ -490,8 +485,8 @@ impl CompositeStore {
         temporary: PathBuf,
         path: PathBuf,
     ) -> Result<JobId> {
-        let (pages, row) = self.slab_addresses(&key)?;
-        let row = row.ok_or_else(|| invalid("the memory copy of the record has no row slab"))?;
+        let (pages, row) = self.slot_addresses(&key)?;
+        let row = row.ok_or_else(|| invalid("the memory copy of the record has no row pieces"))?;
         let id = self.disk.next_job();
         self.staged()?
             .write_from(id, header, temporary, path, pages, Some(row))?;
@@ -562,9 +557,9 @@ impl CompositeStore {
         }
     }
 
-    /// Memory slabs the parked and writing records give back once their files
+    /// Memory slots the parked and writing records give back once their files
     /// commit.
-    fn spillable_slabs(&self) -> usize {
+    fn spillable_slots(&self) -> usize {
         self.parked
             .keys()
             .filter_map(|key| self.memory.record(key))
@@ -639,10 +634,13 @@ impl CompositeStore {
             .collect()
     }
 
-    /// Write cold parked records until their slabs can cover the demand.
+    /// Write cold parked records until their slots can cover the demand.
     fn spill_parked(&mut self, need_slots: usize) {
+        if need_slots == 0 {
+            return;
+        }
         let waiting = self.waiting_spills();
-        let pages_of = |store: &Self, key: &PrefixKey| {
+        let slots_of = |store: &Self, key: &PrefixKey| {
             store.memory.record(key).map_or(0, |record| {
                 record.pages.len() + record.row.as_ref().map_or(0, Vec::len)
             })
@@ -652,18 +650,18 @@ impl CompositeStore {
             .parked
             .iter()
             .filter(|(_, parked)| parked.writing)
-            .map(|(key, _)| pages_of(self, key))
+            .map(|(key, _)| slots_of(self, key))
             .sum();
         for key in waiting {
             if covered >= need_slots {
                 break;
             }
-            let pages = pages_of(self, &key);
+            let slots = slots_of(self, &key);
             if writing < MAX_SPILLS {
                 self.spill(key);
                 if self.parked.get(&key).is_some_and(|parked| parked.writing) {
                     writing += 1;
-                    covered += pages;
+                    covered += slots;
                 }
             }
         }
@@ -672,7 +670,7 @@ impl CompositeStore {
         }
     }
 
-    /// Read a chain node's file into freshly allocated memory slabs.
+    /// Read a chain node's file into freshly allocated memory slots.
     fn start_read(
         &mut self,
         fetch: PrefixKey,
@@ -690,7 +688,7 @@ impl CompositeStore {
         let record = self
             .memory
             .allocate_record(key, bucket, tail_pages, row)?
-            .ok_or_else(|| invalid("no host memory slabs could be freed for the record"))?;
+            .ok_or_else(|| invalid("no host memory slots could be freed for the record"))?;
         let pool = self.memory.pool();
         let pages = pool.addresses(&record.pages);
         let row = record.row.as_ref().map(|slots| pool.addresses(slots));
@@ -844,14 +842,14 @@ impl CompositeStore {
         self.inbound.insert(fetch, inbound);
     }
 
-    /// A read of one chain node's file into memory slabs has finished.
+    /// A read of one chain node's file into memory slots has finished.
     fn disk_read(&mut self, id: JobId, result: Result<u64>, events: &mut Vec<StoreEvent>) {
         let Some(DiskJob::Read { fetch, node }) = self.jobs.get(&id).copied() else {
             return;
         };
         self.jobs.remove(&id);
         let Some(mut inbound) = self.inbound.remove(&fetch) else {
-            // The fetch is gone: the slabs allocated for the read are released.
+            // The fetch is gone: the slots allocated for the read are released.
             let _ = self.memory.complete_record(&node, false);
             return;
         };
@@ -1000,9 +998,9 @@ impl HostStore for CompositeStore {
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
-        let slots = (self.memory.reclaimable_slots() + self.spillable_slabs())
-            .saturating_sub(self.memory.pool().intake_slots);
-        if self.memory.layout().record_slots(tail.len(), true) > slots {
+        let needed = self.memory.layout().record_slots(tail.len(), true);
+        let short = self.memory.shortfall(needed);
+        if short > 0 && short > self.spillable_slots() {
             let result = self.disk.store(checkpoint);
             match &result {
                 Ok(outcome) if *outcome != StoreOutcome::Queued => self.stats.store_skipped += 1,
@@ -1027,10 +1025,7 @@ impl HostStore for CompositeStore {
                     let _ = self.disk.index_mut().unpin(parent);
                 }
                 self.stats.store_skipped += 1;
-                self.spill_parked(self.memory.reserve(
-                    self.memory.layout().record_slots(tail.len(), true)
-                        + self.memory.pool().intake_slots,
-                ));
+                self.spill_parked(self.memory.shortfall(needed));
                 return Ok(StoreOutcome::Retry(StoreReason::Slabs));
             }
             Err(error) => {
@@ -1251,7 +1246,7 @@ impl HostStore for CompositeStore {
                 self.retry_after = None;
             }
             self.maintenance_progress = progress;
-            self.spill_parked(self.memory.reserve(2 * self.memory.pool().intake_slots));
+            self.spill_parked(self.memory.reserve(2 * self.memory.pool().intake_slots()));
             self.disk.maintain();
         }
         polled
@@ -1479,7 +1474,7 @@ mod tests {
         range.map(PageId).collect()
     }
 
-    /// A composite over `pages` page slabs and `rows` row slabs of
+    /// A composite over `pages` page slots and `rows` row slots of
     /// unregistered memory, transfer threads that accept nothing, and a disk
     /// store under `directory` with `limit` bytes.
     fn composite(directory: &Path, pages: usize, rows: usize, limit: u64) -> CompositeStore {
@@ -1513,15 +1508,16 @@ mod tests {
     ) -> CompositeStore {
         let geometry = geometry();
         let transfers = StoppedCopier::shared(&geometry).unwrap();
-        let minimum = crate::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
-        let mut pool = SlabPool::new(
+        let layout = Layout::new(&geometry).unwrap();
+        let minimum = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(
             PAGE_RECORD,
             pages
-                + rows * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize
+                + rows * layout.row_slots()
                 + minimum.saturating_sub(intake),
+            intake.max(minimum),
         )
         .unwrap();
-        pool.intake_slots = intake;
         let shared_pool = pool.clone();
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let directory_lock = crate::testing::directory_lock(directory).unwrap();
@@ -1551,11 +1547,11 @@ mod tests {
         CompositeStore::new(memory, disk).unwrap()
     }
 
-    /// Fill a slab through its address. The pool's mapping is valid for its
-    /// lifetime and the test touches a slab only while no job references it.
-    fn fill_page(pool: &SlabPool, slab: Slot, seed: u64) {
+    /// Fill a slot through its address. The pool's mapping is valid for its
+    /// lifetime and the test touches a slot only while no job references it.
+    fn fill_page(pool: &SlabPool, slot: Slot, seed: u64) {
         let bytes = unsafe {
-            std::slice::from_raw_parts_mut(pool.page_address(slab) as *mut u8, pool.page_bytes())
+            std::slice::from_raw_parts_mut(pool.slot_address(slot) as *mut u8, pool.page_bytes())
         };
         pattern(bytes, seed);
     }
@@ -1584,8 +1580,8 @@ mod tests {
             .allocate_record(key, bucket, tail, true)
             .unwrap()
             .unwrap();
-        for (index, slab) in record.pages.iter().enumerate() {
-            fill_page(store.memory.pool(), *slab, seed + index as u64);
+        for (index, slot) in record.pages.iter().enumerate() {
+            fill_page(store.memory.pool(), *slot, seed + index as u64);
         }
         fill_row(
             store.memory.pool(),
@@ -1596,13 +1592,13 @@ mod tests {
         record
     }
 
-    /// The bytes of a memory record's slabs, pages then row.
+    /// The bytes of a memory record's slots, pages then row.
     fn record_bytes(store: &CompositeStore, record: &MemoryRecord) -> Vec<Vec<u8>> {
         let pool = store.memory.pool();
         let mut bytes: Vec<Vec<u8>> = record
             .pages
             .iter()
-            .map(|slab| pool.page(*slab).to_vec())
+            .map(|slot| pool.page(*slot).to_vec())
             .collect();
         if let Some(row) = &record.row {
             let mut gathered = vec![0; ROW_RECORD as usize];
@@ -1764,7 +1760,7 @@ mod tests {
                 store.stats().inbound_in_flight == 0
             });
             // Stopped CUDA workers fail the upload after disk I/O; the record
-            // remains retriable and no retained slab was borrowed or evicted.
+            // remains retriable and no retained slot was borrowed or evicted.
             assert_eq!(fetched(&events), [(child.key, false)]);
             assert_eq!(store.stats().fetch_failed, 1);
             assert_eq!(
@@ -1800,8 +1796,8 @@ mod tests {
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
         assert_eq!(
-            store.memory.pool().free_pages(),
-            store.memory.pool().intake_slots + 72
+            store.memory.pool().free_slots(),
+            store.memory.pool().intake_slots() + 72
         );
         assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
@@ -1832,8 +1828,8 @@ mod tests {
         assert!(store.memory.index().is_empty());
         assert!(store.disk.index().is_empty());
         assert_eq!(
-            store.memory.pool().free_pages(),
-            store.memory.pool().intake_slots + 72
+            store.memory.pool().free_slots(),
+            store.memory.pool().intake_slots() + 72
         );
         store.close().unwrap();
         drop(store);
@@ -1887,6 +1883,7 @@ mod tests {
         let pool = SlabPool::new(
             PAGE_RECORD,
             4 + 2 * 3 + crate::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
+            crate::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
         )
         .unwrap();
         let disk = |identity: [u8; 32], staging: Option<SlabPool>, shared: bool| {
@@ -1920,7 +1917,7 @@ mod tests {
                 flat(),
                 disk(
                     IDENTITY,
-                    Some(SlabPool::new(PAGE_RECORD, 10).unwrap()),
+                    Some(SlabPool::new(PAGE_RECORD, 10, 0).unwrap()),
                     false
                 )
             )
@@ -1932,8 +1929,8 @@ mod tests {
         assert_eq!(
             store.stats(),
             StoreStats {
-                slots_total: store.memory.pool().page_count(),
-                intake_slots: store.memory.pool().intake_slots,
+                slots_total: store.memory.pool().slot_count(),
+                intake_slots: store.memory.pool().intake_slots(),
                 outbound_rate: INITIAL_MEMORY_RATE,
                 inbound_rate: INITIAL_MEMORY_RATE,
                 ..StoreStats::default()
@@ -2111,10 +2108,10 @@ mod tests {
         assert_eq!(stats.disk_bytes, header.length_with_row());
         assert_eq!(stats.outbound_in_flight, 0);
 
-        // The file holds the slab bytes: every page record and the row.
+        // The file holds the slot bytes: every page record and the row.
         let file = fs::read(&path).unwrap();
-        let slabs = record_bytes(&store, &record);
-        for (index, page) in slabs[..10].iter().enumerate() {
+        let slots = record_bytes(&store, &record);
+        for (index, page) in slots[..10].iter().enumerate() {
             let start = (header.page_segment + index as u64 * PAGE_RECORD) as usize;
             assert!(
                 file[start..start + PAGE_RECORD as usize] == page[..],
@@ -2122,7 +2119,7 @@ mod tests {
             );
         }
         let row = header.row_segment as usize;
-        assert!(file[row..row + ROW_RECORD as usize] == slabs[10][..]);
+        assert!(file[row..row + ROW_RECORD as usize] == slots[10][..]);
 
         // An infeasible record is refused before copying.
         let small_directory = directory.join("small");
@@ -2332,7 +2329,7 @@ mod tests {
         assert!(!store.memory.index().contains(&root.key));
         assert!(store.inbound.is_empty());
 
-        // The fetch pins the file, allocates slabs, and reads the record.
+        // The fetch pins the file, allocates slots, and reads the record.
         store.fetch(hit.clone(), ticket(10, 2)).unwrap();
         assert!(store.fetch(hit.clone(), ticket(10, 3)).is_err());
         assert_eq!(store.stats().inbound_in_flight, 1);
@@ -2832,10 +2829,10 @@ mod tests {
         let staging = store
             .memory
             .pool()
-            .allocate(store.memory.pool().intake_slots)
+            .allocate(store.memory.pool().intake_slots())
             .unwrap();
-        assert_eq!(store.memory.pool().free_pages(), 0);
-        assert_eq!(store.staged().unwrap().pool().unwrap().free_pages(), 0);
+        assert_eq!(store.memory.pool().free_slots(), 0);
+        assert_eq!(store.staged().unwrap().pool().unwrap().free_slots(), 0);
 
         let blocked = full.key_at(128).unwrap();
         let header = Header::new(
@@ -2925,12 +2922,12 @@ mod tests {
         }
         assert!(store.memory.record(&warm[0]).is_none());
         assert_eq!(
-            store.memory.pool().free_pages(),
-            store.memory.pool().intake_slots
+            store.memory.pool().free_slots(),
+            store.memory.pool().intake_slots()
         );
         assert_eq!(
-            store.memory.reclaimable_slots(),
-            store.memory.pool().intake_slots + 10
+            store.memory.pool().slot_count() - store.memory.held_slots(),
+            store.memory.pool().intake_slots() + 10
         );
         let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         // Bypass memory admission, as an oversized chain does.
@@ -2960,8 +2957,8 @@ mod tests {
                 .all(|key| store.memory.record(key).is_some())
         );
         assert_eq!(
-            store.memory.pool().free_pages(),
-            store.memory.pool().intake_slots
+            store.memory.pool().free_slots(),
+            store.memory.pool().intake_slots()
         );
         store.close().unwrap();
         drop(store);
@@ -3209,7 +3206,7 @@ mod tests {
 
     #[test]
     fn a_durable_parent_can_release_its_dram_slabs_for_a_child_copy() {
-        let Some(directory) = test_directory("composite", "parent-slabs") else {
+        let Some(directory) = test_directory("composite", "parent-slots") else {
             return;
         };
         let mut store = composite(&directory, 12, 4, 1 << 30);
@@ -3409,7 +3406,7 @@ mod tests {
             parked_root(&mut store, &mut ids, salt, 22 * PAGE_TOKENS);
         }
         assert_eq!(store.memory.reserve(2 * intake), 2);
-        assert_eq!(store.memory.pool().free_pages(), 2 * intake - 2);
+        assert_eq!(store.memory.pool().free_slots(), 2 * intake - 2);
         assert!(store.jobs.is_empty());
         store.poll(&mut Vec::new()).unwrap();
         assert!(store.parked.values().any(|record| record.writing));

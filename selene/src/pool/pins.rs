@@ -4,7 +4,7 @@
  */
 
 //! Exports of host-tier holdings: pinned record chains that fill windows from
-//! slabs in memory or from record files.
+//! slots in memory or from record files.
 
 use std::{fs::File, path::PathBuf, sync::Arc};
 
@@ -104,8 +104,7 @@ pub(crate) struct MemorySpan {
 pub struct MemoryPin {
     pub(crate) chain: HostChain,
     pub(crate) spans: Vec<MemorySpan>,
-    pub(crate) page_bytes: usize,
-    pub(crate) layout: crate::Layout,
+    pub(crate) layout: Arc<crate::Layout>,
     pub(crate) keys: Vec<PrefixKey>,
     pub(crate) releases: Releases,
 }
@@ -120,18 +119,19 @@ impl HostPin for MemoryPin {
             &self.chain,
             window,
             dst,
-            self.page_bytes as u64,
+            self.layout.page_record_bytes,
             self.layout.row_record_bytes,
         )?;
+        let page_bytes = self.layout.page_record_bytes as usize;
         let span = &self.spans[window.record as usize];
         let mut offset = 0;
         let mut pages = Vec::with_capacity(window.page_count as usize);
         for page in window.first_page..window.first_page + window.page_count {
             let source = span.pages[page as usize];
-            // The record is pinned, so its slab is mapped and unchanged.
-            let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, self.page_bytes) };
-            dst[offset..offset + self.page_bytes].copy_from_slice(bytes);
-            offset += self.page_bytes;
+            // The record is pinned, so its slot is mapped and unchanged.
+            let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, page_bytes) };
+            dst[offset..offset + page_bytes].copy_from_slice(bytes);
+            offset += page_bytes;
             pages.push(span.sums.pages[page as usize]);
         }
         let row = if window.row {
@@ -376,8 +376,7 @@ mod tests {
                 row: Some(vec![base + 3 * page]),
                 sums,
             }],
-            page_bytes: page,
-            layout: crate::Layout {
+            layout: Arc::new(crate::Layout {
                 page_tokens: 16,
                 page_record_bytes: page as u64,
                 row_record_bytes: 32,
@@ -386,7 +385,7 @@ mod tests {
                     plane_offsets: vec![0],
                     row_offset: 0,
                 }],
-            },
+            }),
             keys: vec![key(48, 1)],
             releases: releases.clone(),
         };

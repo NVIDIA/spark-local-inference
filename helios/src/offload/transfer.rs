@@ -149,17 +149,15 @@ pub(crate) fn expand(
         }
         if let Some(part) = part {
             let share = geometry.page_record_bytes();
-            if slots.len() * (share as usize) < geometry.row.padded_bytes() as usize {
+            let pieces = geometry.row.unit_bytes.div_ceil(share) as usize;
+            if slots.len() < pieces {
                 return Err(invalid("row slots do not cover the row"));
             }
-            for (piece, &slot) in slots.iter().enumerate() {
+            for (piece, &slot) in slots.iter().take(pieces).enumerate() {
                 let row = part
                     .page(slot)?
                     .ok_or_else(|| invalid("row slot is outside the transfer pool"))?;
                 let offset = piece as u64 * share;
-                if offset >= geometry.row.unit_bytes {
-                    continue;
-                }
                 push_unit(
                     job.direction,
                     geometry.row.unit_address(index) + offset,
@@ -187,7 +185,7 @@ pub(crate) fn expand(
 /// A page id or a slab address named twice would place two copies of one
 /// range in a batch whose entries execute in no defined order.
 fn reject_repeats(job: &Job) -> Result<()> {
-    for (index, (page, slab)) in job.pages.iter().enumerate() {
+    for (index, (page, _)) in job.pages.iter().enumerate() {
         if job.pages[..index]
             .iter()
             .any(|(earlier, _)| earlier == page)
@@ -197,21 +195,18 @@ fn reject_repeats(job: &Job) -> Result<()> {
                 job.id.0, job.window, page.0
             )));
         }
-        if job.pages[..index]
-            .iter()
-            .any(|(_, earlier)| earlier == slab)
-        {
+    }
+    let slots = job
+        .pages
+        .iter()
+        .map(|(_, slot)| slot)
+        .chain(job.row.iter().flat_map(|(_, slots)| slots));
+    for (index, slot) in slots.clone().enumerate() {
+        if slots.clone().take(index).any(|earlier| earlier == slot) {
             return Err(invalid(format!(
-                "transfer job {} window {} names slab {slab:#x} twice",
+                "transfer job {} window {} names slot {slot:#x} twice",
                 job.id.0, job.window
             )));
-        }
-    }
-    if let Some((_, slots)) = &job.row {
-        for (i, slot) in slots.iter().enumerate() {
-            if slots[..i].contains(slot) || job.pages.iter().any(|(_, page)| page == slot) {
-                return Err(invalid(format!("transfer job names slab {slot:#x} twice")));
-            }
         }
     }
     Ok(())
@@ -699,11 +694,8 @@ mod tests {
             geometry(64, &[("kv", 4096), ("selector", 200)], 5000),
         ];
         let layout = Layout::new(&ranks).unwrap();
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            (3) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
-        )
-        .unwrap();
+        let mut pool =
+            SlabPool::new(layout.page_record_bytes, layout.record_slots(3, true) + layout.row_slots(), 0).unwrap();
         assert!(pool.device_parts(&layout).is_err());
         let device = 0x2_0420_0000;
         let parts = pool.registered_parts(&layout, device);
@@ -714,8 +706,8 @@ mod tests {
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
-                pages: vec![(PageId(5), pool.page_address(pages[2]))],
-                row: Some((StateSlotId(3), vec![pool.page_address(rows[1])])),
+                pages: vec![(PageId(5), pool.slot_address(pages[2]))],
+                row: Some((StateSlotId(3), vec![pool.slot_address(rows[1])])),
             };
             let mut outbound = Vec::new();
             expand(
@@ -954,11 +946,11 @@ mod tests {
             let mut repeated_slab = job(direction);
             repeated_slab.pages[1].1 = repeated_slab.pages[0].1;
             let error = check(&repeated_slab).unwrap_err();
-            assert!(error.contains("slab 0x10000 twice"), "{error}");
+            assert!(error.contains("transfer job 9 window 2 names slot 0x10000 twice"), "{error}");
             let mut row_on_page_slab = job(direction);
             row_on_page_slab.row = Some((StateSlotId(3), vec![0x20000]));
             let error = check(&row_on_page_slab).unwrap_err();
-            assert!(error.contains("twice"), "{error}");
+            assert!(error.contains("transfer job 9 window 2 names slot 0x20000 twice"), "{error}");
             check(&job(direction)).unwrap();
         }
     }
@@ -1284,8 +1276,8 @@ mod tests {
         let bytes = (pages * layout.page_record_bytes + layout.row_record_bytes) as usize;
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (pages as usize)
-                + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+            layout.record_slots(pages as usize, true),
+            0,
         )
         .unwrap();
         pool.register(&crate::offload::registrar::CudaRegistrar, context)
@@ -1293,11 +1285,11 @@ mod tests {
         let page_slabs: Vec<usize> = (0..pages)
             .map(|_| {
                 let slab = pool.allocate_page().unwrap();
-                pool.page_address(slab)
+                pool.slot_address(slab)
             })
             .collect();
         let row = pool.allocate_page().unwrap();
-        let row_slab = pool.page_address(row);
+        let row_slab = pool.slot_address(row);
         let host = page_slabs[0];
 
         let mut transfers =
@@ -1452,8 +1444,8 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices"]
     fn split_pools_cost_each_device_its_part_and_round_trip_units() {
-        use flare_selene::{Plane, slab::SlabPool};
         use crate::runtime_package::driver::Driver as Loader;
+        use flare_selene::{Plane, slab::SlabPool};
         const PAGES: u64 = 80;
         const ROWS: u64 = 4;
         const ROW_BYTES: u64 = 10_000;
@@ -1534,7 +1526,7 @@ mod tests {
         };
         let layout = Layout::new(&geometry).unwrap();
         let before = free();
-        let mut registered = SlabPool::sized(&layout, POOL_BYTES).unwrap();
+        let mut registered = SlabPool::sized(&layout, POOL_BYTES, 0).unwrap();
         registered
             .register(&crate::offload::registrar::CudaRegistrar, contexts[0].0)
             .unwrap();
@@ -1544,6 +1536,7 @@ mod tests {
         let pool = SlabPool::sized_by_rank(
             &layout,
             POOL_BYTES,
+            0,
             &contexts,
             &crate::offload::registrar::CudaRegistrar,
         )
@@ -1628,11 +1621,11 @@ mod tests {
             .iter()
             .map(|_| {
                 let slab = pool.allocate_page().unwrap();
-                pool.page_address(slab)
+                pool.slot_address(slab)
             })
             .collect();
         let row = pool.allocate_page().unwrap();
-        let row_slab = pool.page_address(row);
+        let row_slab = pool.slot_address(row);
         let mut transfers = Transfers::start(&contexts, geometry.clone(), &pool).unwrap();
         let wait = |transfers: &mut Transfers| -> Reply {
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -1774,11 +1767,11 @@ mod tests {
             geometry(64, &[("kv", 8192)], 3 * 4096 - 3),
         ];
         let layout = Layout::new(&ranks).unwrap();
-        let pool = SlabPool::new(layout.page_record_bytes, 7).unwrap();
+        let pool = SlabPool::new(layout.page_record_bytes, 7, 0).unwrap();
         let slots: Vec<_> = (0..layout.row_slots())
             .map(|_| {
                 let slot = pool.allocate_page().unwrap();
-                pool.page_address(slot)
+                pool.slot_address(slot)
             })
             .collect();
         let registered = pool.registered_parts(&layout, 0x2000_0000);

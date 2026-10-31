@@ -6,8 +6,8 @@
 
 //! Records retained in registered host memory.
 //!
-//! A record is the page slabs and row slab of one checkpoint inside a retaining
-//! [`SlabPool`]. `store` allocates slabs, evicting under the tree policy of the
+//! A record holds a checkpoint's pages and row pieces in a shared [`SlabPool`].
+//! `store` allocates slots, evicting under the tree policy of the
 //! [`Index`] when the pool is full, and copies the published GPU checkpoint out
 //! through the shared [`PageCopier`](super::PageCopier) in windows of at most
 //! [`WINDOW_PAGES`] pages; the record stays resident until evicted. `fetch`
@@ -21,7 +21,7 @@
 //! held-back checkpoint that cannot start reports Deferred and releases
 //! the checkpoints held back behind it the same way. Index edges therefore
 //! only ever point at ready records, so a failed copy-out can always remove
-//! its node, and a parent is pinned while its child's slabs are allocated so
+//! its node, and a parent is pinned while its child's slots are allocated so
 //! eviction cannot remove the record the child extends.
 //!
 //! Restores are submitted before copy-outs whenever the queue has room, and
@@ -29,8 +29,8 @@
 //! stopping the threads.
 //!
 //! Inside a composite store the memory index holds no tree: every node is a
-//! root whose slabs hold only the checkpoint's tail pages, the disk index
-//! supplies chains, and `fetch_chain` reads page counts from the slabs. Such a
+//! root whose slots hold only the checkpoint's tail pages, the disk index
+//! supplies chains, and `fetch_chain` reads page counts from the slots. Such a
 //! store answers no lookups of its own.
 
 use std::{
@@ -153,7 +153,7 @@ struct Core {
     pool: SlabPool,
     /// Ready, unpinned, durable slots eligible for local eviction.
     clean_slots: usize,
-    layout: Layout,
+    layout: Arc<Layout>,
     identity: [u8; 32],
     /// Every node is a root; the composite's disk index owns the tree.
     flat: bool,
@@ -177,18 +177,21 @@ struct Core {
     announced: std::collections::HashSet<PrefixKey>,
 }
 
+fn evictable(node: &Node<MemoryRecord>, spill: bool, announced: bool) -> bool {
+    node.location.durable && !(spill && announced)
+}
+
 impl Core {
     fn reused(&mut self, key: &PrefixKey) {
         self.index.touch(key);
     }
 
     fn new(identity: [u8; 32], pool: SlabPool, layout: Layout, flat: bool) -> Self {
-        let pool = pool.with_intake(&layout);
         Self {
             index: Index::new(layout.page_tokens),
             pool,
             clean_slots: 0,
-            layout,
+            layout: Arc::new(layout),
             identity,
             flat,
             outbound: BTreeMap::new(),
@@ -295,7 +298,7 @@ impl Core {
     }
 
     /// Allocate and index the record and queue its windows. `Ok(false)` when
-    /// the key is known or no slabs could be freed.
+    /// the key is known or no slots could be freed.
     fn start_record(
         &mut self,
         checkpoint: &PublishedCheckpoint,
@@ -327,14 +330,12 @@ impl Core {
         let Some(record) = allocated? else {
             return Ok(false);
         };
-        let Some(row) = record.row.as_ref() else {
-            return Err(invalid("host record was allocated without a row slab"));
-        };
+        let row = record.row.as_ref().expect("allocated with a row");
         let id = self.next_job();
         let pages = tail
             .iter()
             .zip(&record.pages)
-            .map(|(page, slab)| (*page, self.pool.page_address(*slab)));
+            .map(|(page, slot)| (*page, self.pool.slot_address(*slot)));
         let row = Some((checkpoint.slot, self.pool.addresses(row)));
         let queued = windows(id, Direction::Out, pages, row);
         self.outbound.insert(
@@ -348,7 +349,7 @@ impl Core {
         Ok(true)
     }
 
-    /// Allocate slabs for a record, evicting durable unpinned records until
+    /// Allocate slots for a record, evicting durable unpinned records until
     /// they fit, and index it unready and pinned. `Ok(None)` when the pool
     /// cannot hold the record or nothing evictable remains.
     fn allocate(
@@ -361,18 +362,17 @@ impl Core {
         durable: bool,
     ) -> Result<Option<MemoryRecord>> {
         let needed = self.layout.record_slots(tail_pages, row);
-        let required = needed + self.pool.intake_slots;
-        if required > self.pool.page_count() {
+        if !self.fits(needed) {
             return Ok(None);
         }
-        if self.spill && self.retire_for(self.reserve(required)) {
+        if self.spill && self.retire_for(self.shortfall(needed)) {
             return Ok(None);
         }
-        while self.pool.free_pages() < required {
+        while self.pool.free_slots() < needed + self.pool.intake_slots() {
             let announced = &self.announced;
             let spill = self.spill;
             match self.index.evict(row, |node| {
-                node.location.durable && !(spill && announced.contains(&node.key))
+                evictable(node, spill, announced.contains(&node.key))
             }) {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
@@ -383,13 +383,13 @@ impl Core {
                 }
                 Some(Eviction::Compacted(compacted)) => {
                     self.stats.dropped[0] += u64::from(!self.flat);
-                    let slab = self
+                    let slot = self
                         .index
                         .node_mut(&compacted)
                         .and_then(|node| node.location.row.take());
-                    if let Some(slab) = slab {
-                        self.clean_slots -= slab.len();
-                        self.pool.release(slab);
+                    if let Some(slot) = slot {
+                        self.clean_slots -= slot.len();
+                        self.pool.release(slot);
                     }
                 }
                 None => return Ok(None),
@@ -406,7 +406,7 @@ impl Core {
         };
         // The index requires a root's tail to cover its whole chain; a flat
         // store's roots hold only their checkpoint's tail, so their count is
-        // the chain's and `fetch_chain` reads page counts from the slabs.
+        // the chain's and `fetch_chain` reads page counts from the slots.
         let index_pages = if self.flat {
             (key.consumed_tokens / self.layout.page_tokens) as usize
         } else {
@@ -425,13 +425,13 @@ impl Core {
 
     /// Hold bounded cold leaves until they cover the missing slots.
     /// A full tier waits while any such records remain held.
-    fn retire_for(&mut self, slots: usize) -> bool {
-        if slots == 0 {
+    fn retire_for(&mut self, need_slots: usize) -> bool {
+        if need_slots == 0 {
             return false;
         }
-        let mut pages: usize = self.held.values().sum();
+        let mut slots: usize = self.held.values().sum();
         for _ in 0..crate::pool::cascade::MOVES_MAX {
-            if pages >= slots || self.held.len() >= crate::pool::cascade::MOVES_MAX {
+            if slots >= need_slots || self.held.len() >= crate::pool::cascade::MOVES_MAX {
                 break;
             }
             let announced = &self.announced;
@@ -457,7 +457,7 @@ impl Core {
             if self.pin_record(&key).is_err() {
                 break;
             }
-            pages += held_slots;
+            slots += held_slots;
             self.held.insert(key, held_slots);
             self.retiring.push(retiring);
         }
@@ -467,8 +467,7 @@ impl Core {
     fn clean_slots(&self, node: &Node<MemoryRecord>) -> usize {
         if node.ready
             && !node.pinned()
-            && node.location.durable
-            && !(self.spill && self.announced.contains(&node.key))
+            && evictable(node, self.spill, self.announced.contains(&node.key))
         {
             self.layout
                 .record_slots(node.location.pages.len(), node.location.row.is_some())
@@ -497,33 +496,28 @@ impl Core {
         if self.spill == enabled {
             return;
         }
-        let slots: usize = self
-            .announced
-            .iter()
-            .filter_map(|key| self.index.node(key))
-            .filter(|node| node.ready && !node.pinned() && node.location.durable)
-            .map(|node| {
-                self.layout
-                    .record_slots(node.location.pages.len(), node.location.row.is_some())
-            })
-            .sum();
-        if enabled {
-            self.clean_slots -= slots;
-        } else {
-            self.clean_slots += slots;
-        }
+        let clean = |core: &Self| -> usize {
+            core.announced
+                .iter()
+                .filter_map(|key| core.index.node(key))
+                .map(|node| core.clean_slots(node))
+                .sum()
+        };
+        self.clean_slots -= clean(self);
         self.spill = enabled;
+        self.clean_slots += clean(self);
     }
 
-    fn reclaimable_slots(&self) -> usize {
-        self.pool.free_pages() + self.clean_slots
+    fn fits(&self, slots: usize) -> bool {
+        slots + self.pool.intake_slots() <= self.pool.slot_count()
+    }
+
+    fn shortfall(&self, slots: usize) -> usize {
+        self.reserve(slots + self.pool.intake_slots())
     }
 
     fn reserve(&self, slots: usize) -> usize {
-        if self.pool.free_pages() >= slots {
-            return 0;
-        }
-        slots.saturating_sub(self.reclaimable_slots())
+        slots.saturating_sub(self.pool.free_slots() + self.clean_slots)
     }
 
     /// The move of a held record ended: drop it, or let it be offered again.
@@ -656,7 +650,7 @@ impl Core {
         {
             return Err(invalid("an inbound transfer for this key is in flight"));
         }
-        let mut slabs = Vec::with_capacity(chain.pages);
+        let mut slots = Vec::with_capacity(chain.pages);
         let mut row = None;
         for (position, key) in chain.nodes.iter().enumerate() {
             let node = self
@@ -676,19 +670,19 @@ impl Core {
                     record.pages.len()
                 )));
             }
-            slabs.extend(self.pool.addresses(&record.pages[skip..]));
+            slots.extend(self.pool.addresses(&record.pages[skip..]));
             if key == last {
-                let slab = record
+                let slot = record
                     .row
                     .as_ref()
                     .ok_or_else(|| invalid("host chain endpoint has no row"))?;
-                row = Some((ticket.slot, self.pool.addresses(slab)));
+                row = Some((ticket.slot, self.pool.addresses(slot)));
             }
         }
-        if slabs.len() != ticket.pages.len() || slabs.len() != chain.pages {
+        if slots.len() != ticket.pages.len() || slots.len() != chain.pages {
             return Err(invalid(format!(
                 "host chain supplies {} pages for a ticket of {} and a match of {}",
-                slabs.len(),
+                slots.len(),
                 ticket.pages.len(),
                 chain.pages
             )));
@@ -702,7 +696,7 @@ impl Core {
             }
         }
         let id = self.next_job();
-        let pages = ticket.pages.iter().copied().zip(slabs);
+        let pages = ticket.pages.iter().copied().zip(slots);
         let queued = windows(id, Direction::In, pages, row);
         self.inbound.insert(
             id,
@@ -909,7 +903,7 @@ impl Core {
     }
 
     fn resident_bytes(&self) -> u64 {
-        let pages = (self.pool.page_count() - self.pool.free_pages()) as u64;
+        let pages = (self.pool.slot_count() - self.pool.free_slots()) as u64;
         pages * self.pool.page_bytes() as u64
     }
 
@@ -918,9 +912,9 @@ impl Core {
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
-            slots_used: self.pool.page_count() - self.pool.free_pages(),
-            slots_total: self.pool.page_count(),
-            intake_slots: self.pool.intake_slots,
+            slots_used: self.pool.slot_count() - self.pool.free_slots(),
+            slots_total: self.pool.slot_count(),
+            intake_slots: self.pool.intake_slots(),
             memory_bytes: self.resident_bytes(),
             outbound_rate: self.outbound_rate.0,
             inbound_rate: self.inbound_rate.0,
@@ -981,7 +975,7 @@ impl Drop for Announce {
 }
 
 pub struct MemoryStore {
-    // Dropped first: the checksum thread reads slabs the core frees.
+    // Dropped first: the checksum thread reads slots the core frees.
     announce: Option<Announce>,
     core: Core,
     transfers: SharedCopier,
@@ -1030,7 +1024,7 @@ impl MemoryStore {
         self.core.flat
     }
 
-    pub fn index_mut(&mut self) -> &mut Index<MemoryRecord> {
+    pub(crate) fn index_mut(&mut self) -> &mut Index<MemoryRecord> {
         &mut self.core.index
     }
 
@@ -1042,8 +1036,16 @@ impl MemoryStore {
         &self.transfers
     }
 
-    pub fn reclaimable_slots(&self) -> usize {
-        self.core.reclaimable_slots()
+    pub(crate) fn fits(&self, slots: usize) -> bool {
+        self.core.fits(slots)
+    }
+
+    pub(crate) fn shortfall(&self, slots: usize) -> usize {
+        self.core.shortfall(slots)
+    }
+
+    pub(crate) fn held_slots(&self) -> usize {
+        self.core.pool.slot_count() - self.core.pool.free_slots() - self.core.clean_slots
     }
 
     pub(crate) fn reserve(&self, slots: usize) -> usize {
@@ -1079,8 +1081,8 @@ impl MemoryStore {
         Ok(accepted)
     }
 
-    /// Allocate slabs for a record read in from elsewhere, evicting under the
-    /// policy, and index it unready and pinned; `None` when no slabs can be
+    /// Allocate slots for a record read in from elsewhere, evicting under the
+    /// policy, and index it unready and pinned; `None` when no slots can be
     /// freed. The record is durable: it exists outside this store already.
     pub fn allocate_record(
         &mut self,
@@ -1093,7 +1095,7 @@ impl MemoryStore {
     }
 
     /// Finish a record from `allocate_record`: on success it becomes ready and
-    /// unpinned; on failure it is unpinned, removed, and its slabs released.
+    /// unpinned; on failure it is unpinned, removed, and its slots released.
     pub fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.core.complete_record(key, success)
     }
@@ -1112,18 +1114,18 @@ impl MemoryStore {
         }
     }
 
-    /// The slabs of a ready record.
+    /// The slots of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
     }
 
-    /// Remove an unpinned childless record and release its slabs.
+    /// Remove an unpinned childless record and release its slots.
     pub fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.remove_record(key)
     }
 
     /// Hold a record in place while a job outside this store references its
-    /// slabs: eviction and removal refuse pinned records.
+    /// slots: eviction and removal refuse pinned records.
     pub fn pin_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.pin_record(key)
     }
@@ -1195,7 +1197,7 @@ impl MemoryStore {
             if self.core.index.node(&done.owner).is_some_and(|n| n.ready) {
                 a.sums.insert(
                     done.owner,
-                    Arc::new(done.result.expect("hashing pinned slabs cannot fail")),
+                    Arc::new(done.result.expect("hashing pinned slots cannot fail")),
                 );
                 a.view
                     .announce(&notice, parent_of(&notice.key, notice.parent));
@@ -1217,7 +1219,6 @@ impl MemoryStore {
                     let job = HashJob {
                         key,
                         pages: pool.addresses(&node.location.pages),
-                        page_bytes: pool.page_bytes(),
                         row: node
                             .location
                             .row
@@ -1307,7 +1308,6 @@ impl MemoryStore {
         // Windows name records by their place in the chain, which leaves out nodes with no page.
         let mut spans: Vec<Option<MemorySpan>> = spans.into_iter().map(Some).collect();
         let spans: Vec<MemorySpan> = kept.iter().filter_map(|&i| spans[i].take()).collect();
-        let page_bytes = pool.page_bytes();
         for (position, key) in keys.iter().enumerate() {
             if self.core.pin_record(key).is_err() {
                 for pinned in &keys[..position] {
@@ -1319,7 +1319,6 @@ impl MemoryStore {
         Ok(Box::new(MemoryPin {
             chain,
             spans,
-            page_bytes,
             layout: self.core.layout.clone(),
             keys: keys.to_vec(),
             releases: a.releases.clone(),
@@ -1394,7 +1393,10 @@ impl HostStore for MemoryStore {
             self.core.remove_record(&checkpoint.key)?;
         }
         let (_, tail) = self.core.shape(checkpoint);
-        if self.core.layout.record_slots(tail.len(), true) > self.core.pool.page_count() {
+        if !self
+            .core
+            .fits(self.core.layout.record_slots(tail.len(), true))
+        {
             self.core.stats.store_skipped += 1;
             self.core.stats.dropped[1] += 1;
             return Ok(StoreOutcome::Oversize);
@@ -1436,7 +1438,7 @@ impl HostStore for MemoryStore {
             self.flush_announcements(&|_, parent| parent, &|_| None);
             if self.core.spill {
                 self.core
-                    .retire_for(self.reserve(2 * self.core.pool.intake_slots));
+                    .retire_for(self.reserve(2 * self.core.pool.intake_slots()));
             }
         }
         Ok(())
@@ -1524,7 +1526,12 @@ mod tests {
     }
 
     fn host_pool(warm: usize) -> SlabPool {
-        SlabPool::new(PAGE, warm + crate::offload::intake_slots(&layout(), 1)).unwrap()
+        SlabPool::new(
+            PAGE,
+            warm + crate::offload::intake_slots(&layout(), 1),
+            crate::offload::intake_slots(&layout(), 1),
+        )
+        .unwrap()
     }
 
     fn store_core(pages: usize, rows: usize, flat: bool) -> Core {
@@ -1628,6 +1635,16 @@ mod tests {
     }
 
     #[test]
+    fn a_record_one_slot_larger_than_warm_is_oversize() {
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(1), copier).unwrap();
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Oversize);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn releasing_a_host_pin_notifies_capacity_waiters() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
@@ -1639,10 +1656,16 @@ mod tests {
         store.poll(&mut events).unwrap();
         store.pin_record(&checkpoint.key).unwrap();
         let progress = store.stats().progress;
-        assert_eq!(store.reclaimable_slots(), store.pool().intake_slots);
+        assert_eq!(
+            store.pool().free_slots() + store.core.clean_slots,
+            store.pool().intake_slots()
+        );
         store.unpin_record(&checkpoint.key).unwrap();
         assert!(store.stats().progress > progress);
-        assert_eq!(store.reclaimable_slots(), store.pool().intake_slots + 2);
+        assert_eq!(
+            store.pool().free_slots() + store.core.clean_slots,
+            store.pool().intake_slots() + 2
+        );
         store.close().unwrap();
     }
 
@@ -1751,7 +1774,7 @@ mod tests {
         assert_eq!(node.location.pages.len(), 3);
         assert!(node.location.row.is_some());
         assert!(node.location.durable);
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 32);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 32);
 
         // The child arrives while the root's copy-out is in flight: it waits.
         let child = published(&full, 400, Some(200), 10, 2);
@@ -1774,13 +1797,13 @@ mod tests {
             [PageId(10), PageId(11), PageId(12)]
         );
         assert_eq!(job.row.clone().map(|(slot, _)| slot), Some(StateSlotId(1)));
-        let slabs = &core.index.node(&root.key).unwrap().location;
-        for ((_, address), slab) in job.pages.iter().zip(&slabs.pages) {
-            assert_eq!(*address, core.pool.page_address(*slab));
+        let slots = &core.index.node(&root.key).unwrap().location;
+        for ((_, address), slot) in job.pages.iter().zip(&slots.pages) {
+            assert_eq!(*address, core.pool.slot_address(*slot));
         }
         assert_eq!(
             job.row.as_ref().unwrap().1[0],
-            core.pool.page_address(slabs.row.as_ref().unwrap()[0])
+            core.pool.slot_address(slots.row.as_ref().unwrap()[0])
         );
 
         let mut events = Vec::new();
@@ -1877,12 +1900,12 @@ mod tests {
         let node = core.index.node(&child.key).unwrap();
         assert_eq!(node.parent, None);
         assert_eq!(node.location.pages.len(), 6);
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 29);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 29);
         assert_eq!(
             stored(&finish(&mut core)),
             [(child.key, Some(6 * PAGE + ROW))]
         );
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 29);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 29);
         assert_eq!(core.stats().stored, 1);
     }
 
@@ -1991,16 +2014,16 @@ mod tests {
         core.settle(&mut events);
         assert_eq!(stored(&events), [(second.key, Some(4 * PAGE + ROW))]);
 
-        // With nothing in flight a refusal fails the record and frees its slabs.
+        // With nothing in flight a refusal fails the record and frees its slots.
         let third = published(&full, 500, None, 20, 3);
-        let free = (core.pool.free_pages(), core.pool.free_pages());
+        let free = core.pool.free_slots();
         assert!(core.store(&third).unwrap());
         events.clear();
         core.pump(&mut |_| Err(invalid("offload thread for rank 0 has stopped")));
         core.settle(&mut events);
         assert_eq!(stored(&events), [(third.key, None)]);
         assert!(!core.index.contains(&third.key));
-        assert_eq!((core.pool.free_pages(), core.pool.free_pages()), free);
+        assert_eq!(core.pool.free_slots(), free);
         assert_eq!(core.stats().store_failed, 1);
         assert_eq!(core.stats().stored, 2);
     }
@@ -2015,7 +2038,7 @@ mod tests {
         assert!(core.store(&root).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 3);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 3);
 
         // The child is in flight and the root has that child: no leaf
         // qualifies, so the root's row is compacted away for the stranger.
@@ -2026,7 +2049,7 @@ mod tests {
         assert_eq!(root_node.location.row, None);
         assert_eq!(root_node.location.pages.len(), 3);
         assert!(core.index.contains(&child.key));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
 
         // Nothing is evictable for the pages a further record needs: it is skipped.
         let late = published(&other, 64, None, 30, 4);
@@ -2046,7 +2069,7 @@ mod tests {
         assert!(!core.index.contains(&stranger.key));
         assert!(core.index.contains(&child.key));
         assert!(core.index.contains(&root.key));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
         finish(&mut core);
 
         // Removing the child leaves the page-only root childless: both go.
@@ -2056,7 +2079,7 @@ mod tests {
         assert!(!core.index.contains(&child.key));
         assert!(!core.index.contains(&root.key));
         assert!(core.index.contains(&late.key));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 4);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 4);
         finish(&mut core);
 
         // Records that are not durable are never evicted.
@@ -2079,7 +2102,7 @@ mod tests {
         let huge = published(&full, 1200, None, 0, 2);
         assert!(!core.store(&huge).unwrap());
         assert!(core.index.contains(&stranger.key));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
     }
 
     #[test]
@@ -2088,6 +2111,7 @@ mod tests {
         let pool = SlabPool::new(
             layout.page_record_bytes,
             12 + crate::offload::intake_slots(&layout, 1),
+            crate::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         let mut core = Core::new(IDENTITY, pool, layout, false);
@@ -2108,7 +2132,7 @@ mod tests {
             .unwrap()
             .unwrap();
         core.complete_record(&fresh, true).unwrap();
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
         let next = history(1, 3).key_at(1).unwrap();
         let allocated = core
             .allocate(next, None, [3; 16], 0, true, true)
@@ -2116,7 +2140,7 @@ mod tests {
             .unwrap();
         assert_eq!(old.row.as_ref().unwrap().len(), 3);
         assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
-        let free = core.pool.allocate(core.pool.free_pages()).unwrap();
+        let free = core.pool.allocate(core.pool.free_slots()).unwrap();
         assert!(
             old.row
                 .as_ref()
@@ -2129,7 +2153,7 @@ mod tests {
         assert!(core.index.node(&root).unwrap().location.row.is_none());
         assert!(core.index.contains(&fresh));
         assert!(core.index.contains(&child));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
     }
 
     #[test]
@@ -2156,7 +2180,7 @@ mod tests {
         assert_eq!(core.record(&key), Some(&record));
         core.remove_record(&key).unwrap();
         assert!(core.remove_record(&key).is_err());
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 20);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 20);
 
         let paged = core
             .allocate_record(key, bucket, 3, false)
@@ -2166,7 +2190,7 @@ mod tests {
         assert!(!core.index.node(&key).unwrap().row);
         core.complete_record(&key, false).unwrap();
         assert!(!core.index.contains(&key));
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 20);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 20);
         assert!(core.complete_record(&key, false).is_err());
         assert!(core.mark_durable(&key).is_err());
 
@@ -2272,7 +2296,7 @@ mod tests {
                 root_slabs.pages[1..]
                     .iter()
                     .chain(&child_slabs.pages)
-                    .map(|slab| core.pool.page_address(*slab)),
+                    .map(|slot| core.pool.slot_address(*slot)),
             )
             .collect();
         assert_eq!(job.pages, expected);
@@ -2280,7 +2304,7 @@ mod tests {
             job.row,
             Some((
                 StateSlotId(7),
-                vec![core.pool.page_address(child_slabs.row.as_ref().unwrap()[0])]
+                vec![core.pool.slot_address(child_slabs.row.as_ref().unwrap()[0])]
             ))
         );
         // While the chain is pinned, eviction cannot take it.
@@ -2338,7 +2362,7 @@ mod tests {
         assert!(core.outbound.is_empty());
         assert!(!core.index.contains(&late.key));
         assert!(!core.index.node(&child.key).unwrap().pinned());
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 28);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 28);
     }
 
     #[test]
@@ -2379,7 +2403,7 @@ mod tests {
         assert_eq!(stats.stored, 1);
         assert_eq!(stats.store_failed, 0);
         assert_eq!(stats.store_skipped, 0);
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 1);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
         let node = core.index.node(&root.key).unwrap();
         assert!(node.ready);
         assert!(!node.pinned());
@@ -2410,7 +2434,7 @@ mod tests {
             assert!(core.store(checkpoint).unwrap());
             finish(&mut core);
         }
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots());
 
         // The child is the least recently used leaf, but it is the parent the
         // grandchild extends: the stranger is evicted instead.
@@ -2441,7 +2465,7 @@ mod tests {
         assert!(core.index.contains(&grandchild.key));
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
-        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
     }
 
     #[test]
@@ -2549,10 +2573,24 @@ mod tests {
     fn assert_clean_slots(core: &Core) {
         let scanned: usize = core.index.nodes().map(|node| core.clean_slots(node)).sum();
         assert_eq!(core.clean_slots, scanned);
-        for slots in [0, core.pool.free_pages(), core.pool.page_count()] {
+        let held: usize = core
+            .index
+            .nodes()
+            .filter(|node| node.pinned() || !node.ready || !node.location.durable
+                || (core.spill && core.announced.contains(&node.key)))
+            .map(|node| {
+                core.layout
+                    .record_slots(node.location.pages.len(), node.location.row.is_some())
+            })
+            .sum();
+        assert_eq!(
+            core.pool.slot_count() - core.pool.free_slots() - scanned,
+            held
+        );
+        for slots in [0, core.pool.free_slots(), core.pool.slot_count()] {
             assert_eq!(
                 core.reserve(slots),
-                slots.saturating_sub(core.pool.free_pages() + scanned)
+                slots.saturating_sub(core.pool.free_slots() + scanned)
             );
         }
     }
@@ -2565,6 +2603,7 @@ mod tests {
                 let pool = SlabPool::new(
                     layout.page_record_bytes,
                     48 + crate::offload::intake_slots(&layout, 1),
+                    crate::offload::intake_slots(&layout, 1),
                 )
                 .unwrap();
                 let mut core = Core::new(IDENTITY, pool, layout, flat);
@@ -2635,8 +2674,8 @@ mod tests {
                     }
                     assert_clean_slots(&core);
                     let stats = core.stats();
-                    assert_eq!(stats.slots_total, core.pool.page_count());
-                    assert_eq!(stats.intake_slots, core.pool.intake_slots);
+                    assert_eq!(stats.slots_total, core.pool.slot_count());
+                    assert_eq!(stats.intake_slots, core.pool.intake_slots());
                     assert_eq!(
                         stats.slots_used,
                         core.index
@@ -2653,10 +2692,34 @@ mod tests {
     }
 
     #[test]
+    fn gone_notices_remove_announced_records_from_the_clean_set() {
+        use crate::store::TierStore;
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(2), copier).unwrap();
+        store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !store.core.announced.contains(&checkpoint.key) {
+            assert!(Instant::now() < deadline, "record was not announced");
+            store.poll(&mut Vec::new()).unwrap();
+            std::thread::yield_now();
+        }
+        store.core.set_spill(true);
+        assert_clean_slots(&store.core);
+        store.core.remove_record(&checkpoint.key).unwrap();
+        store.flush_announcements(&|_, parent| parent, &|_| None);
+        assert!(!store.core.announced.contains(&checkpoint.key));
+        assert_clean_slots(&store.core);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn allocation_preserves_intake_by_evicting_only_cold_clean_records() {
         let mut core = store_core(8, 4, true);
         assert_eq!(
-            core.pool.intake_slots,
+            core.pool.intake_slots(),
             2 * (WINDOW_PAGES + core.layout.row_slots())
         );
         let mut records = Vec::new();
@@ -2680,12 +2743,13 @@ mod tests {
         assert!(core.index.contains(&records[1]));
         assert!(!core.index.contains(&records[2]));
         assert!(core.index.contains(&records[3]));
-        assert!(core.pool.free_pages() >= core.pool.intake_slots);
+        assert!(core.pool.free_slots() >= core.pool.intake_slots());
     }
 
     #[test]
     fn one_tib_fill_patterns_bound_clean_slack_to_two_intakes_plus_one_record() {
-        // Scale MiB slots to 4 KiB; only slot counts affect reserve decisions.
+        // Only slot counts affect reserve decisions. This models writes; the real
+        // spill path and its cap are covered by progress_spills_only_enough_to_cover_the_clean_floor.
         fn write_cold(core: &mut Core, target: usize) -> usize {
             let mut written = 0;
             while core.reserve(target) != 0 {
@@ -2702,18 +2766,17 @@ mod tests {
             }
             written
         }
-        const WARM: usize = 1 << 20;
+        const WARM: usize = 1 << 16;
         for seed in 1..=8u64 {
             let geometry = [geometry(PT, &[("kv", 4096)], 23 * 4096)];
             let layout = Layout::new(&geometry).unwrap();
             let intake = crate::offload::intake_slots(&layout, 32);
-            let mut pool = SlabPool::new(4096, WARM + intake).unwrap();
-            pool.intake_slots = intake;
+            let pool = SlabPool::new(4096, WARM + intake, intake).unwrap();
             let mut core = Core::new(IDENTITY, pool, layout, true);
             let (mut random, mut arrived, mut written, mut largest) = (seed, 0, 0, 0);
             for serial in 1..=200u64 {
                 random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let pages = 1 + (random >> 32) as usize % 16384;
+                let pages = 1 + (random >> 32) as usize % 1024;
                 let slots = core.layout.record_slots(pages, true);
                 let mut digest = [0; 16];
                 digest[..8].copy_from_slice(&serial.to_le_bytes());
@@ -2731,9 +2794,9 @@ mod tests {
                 arrived += slots;
                 largest = largest.max(slots);
                 written += write_cold(&mut core, 2 * intake);
-                assert!(core.pool.free_pages() >= intake);
+                assert!(core.pool.free_slots() >= intake);
                 assert!(written <= arrived.saturating_sub(WARM) + 2 * intake + largest);
-                assert!(core.reclaimable_slots() - core.pool.free_pages() <= 2 * intake + largest);
+                assert!(core.clean_slots <= 2 * intake + largest);
                 if arrived <= WARM - intake {
                     assert_eq!(written, 0);
                 }
@@ -2776,7 +2839,7 @@ mod tests {
             store.poll(&mut Vec::new()).unwrap();
             std::thread::yield_now();
         }
-        assert_eq!(store.pool().free_pages(), 2 * intake - 2);
+        assert_eq!(store.pool().free_slots(), 2 * intake - 2);
         assert_eq!(store.reserve(2 * intake), 0);
         store.poll(&mut Vec::new()).unwrap();
         assert!(store.take_retiring().is_empty());
@@ -2829,7 +2892,7 @@ mod tests {
         assert_eq!(core.retiring.len(), 1);
         core.retiring.clear();
 
-        // Once moved, its slabs are free for the new record.
+        // Once moved, its slots are free for the new record.
         core.retired(&cold.key, Retirement::Moved);
         assert!(!core.index.contains(&cold.key));
         assert!(core.index.contains(&warm.key));
@@ -2892,7 +2955,7 @@ mod tests {
         core.set_spill(true);
         assert!(!core.store(&published(&three, 128, None, 20, 3)).unwrap());
         assert!(core.held.contains_key(&cold.key));
-        // An export reads the slabs.
+        // An export reads the slots.
         core.pin_record(&cold.key).unwrap();
         core.retired(&cold.key, Retirement::Moved);
         assert!(core.index.contains(&cold.key));
@@ -2905,13 +2968,13 @@ mod tests {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
         let mut store = MemoryStore::new(IDENTITY, host_pool(4), copier).unwrap();
-        assert_eq!(store.stats().intake_slots, store.pool().intake_slots);
+        assert_eq!(store.stats().intake_slots, store.pool().intake_slots());
         store.index_mut().max_age = std::time::Duration::from_secs(7200);
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         store.store(&checkpoint).unwrap();
         assert_eq!(
             (store.stats().slots_used, store.stats().slots_total),
-            (2, store.pool().page_count())
+            (2, store.pool().slot_count())
         );
         store
             .index_mut()
@@ -2922,9 +2985,9 @@ mod tests {
         assert_eq!(store.stats().expired, [1, 0]);
         assert_eq!(
             (store.stats().slots_used, store.stats().slots_total),
-            (0, store.pool().page_count())
+            (0, store.pool().slot_count())
         );
-        assert_eq!(store.pool().free_pages(), store.pool().page_count());
+        assert_eq!(store.pool().free_slots(), store.pool().slot_count());
         store.close().unwrap();
     }
 }
