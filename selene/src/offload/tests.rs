@@ -352,7 +352,7 @@ fn ordinary_input_share_preserves_mapping() {
 }
 
 #[test]
-fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
+fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
     let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let layout = Layout::new(&geometry).unwrap();
     let mut options = PrefixCacheOffload {
@@ -373,15 +373,35 @@ fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
         };
         prepared
     };
-    let prepared = build(&options);
-    let rows = prepared.memory_pool.as_ref().unwrap().page_count();
-    assert!(prepared.pool_row_warning(rows).is_none());
-    let warning = prepared.pool_row_warning(rows + 1).unwrap();
-    assert!(warning.contains(&format!("{rows} record rows for max concurrency {}", rows + 1)));
-    assert!(warning.contains(&format!("({} recommended)", (rows + 1) * 2)));
-    assert!(warning.contains("publications may wait for spills"));
+    let mut prepared = build(&options);
+    let required = intake_slots(&layout, 32);
+    let bytes = required as u64 * layout.page_record_bytes;
+    for warm in [0, prepared.warm_bytes] {
+        prepared.warm_bytes = warm;
+        for allocated in [
+            required - 1,
+            intake_slots(&layout, 1),
+            required,
+            required + 1,
+        ] {
+            prepared.memory_pool.as_mut().unwrap().intake_slots = allocated;
+            let warning = prepared.intake_warning(32);
+            if allocated >= required {
+                assert!(warning.is_none());
+            } else {
+                assert_eq!(
+                    warning.unwrap(),
+                    format!(
+                        "host prefix intake shrunk to {allocated} slots to fit the host budget; \
+                     full intake at max concurrency 32 needs {bytes} bytes ({}) of host memory",
+                        gibibytes(bytes)
+                    )
+                );
+            }
+        }
+    }
     options.memory_bytes = Some(0);
-    assert!(build(&options).pool_row_warning(32).is_none());
+    assert!(build(&options).intake_warning(32).is_none());
 }
 
 struct RecordingFactory {
@@ -539,6 +559,7 @@ fn intake_sizes_active_rows_and_rounds_warm_memory_down() {
     .unwrap() else {
         panic!("no store")
     };
+    assert!(prepared.intake_warning(active).is_none());
     let pool = prepared.memory_pool.unwrap();
     assert_eq!(pool.intake_slots, intake_slots(&layout, active));
     assert_eq!(pool.page_count(), 17 + pool.intake_slots);

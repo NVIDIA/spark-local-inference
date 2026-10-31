@@ -548,7 +548,7 @@ impl ModelRuntime {
                     .and_then(|binding| binding.take())
                     .map(|prepared| {
                         if let Some(warning) =
-                            prepared.pool_row_warning(worker_config.limits.max_active)
+                            prepared.intake_warning(worker_config.limits.max_active)
                         {
                             eprintln!("warning: {warning}");
                         }

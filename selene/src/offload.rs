@@ -237,15 +237,15 @@ impl Preparation {
 }
 
 impl Prepared {
-    pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
-        let pool = self.memory_pool.as_ref().filter(|_| self.warm_bytes != 0)?;
-        let rows = pool.page_count() / self.layout.row_slots();
-        let recommended = max_concurrency.saturating_mul(2);
-        (rows < max_concurrency).then(|| {
+    pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
+        let pool = self.memory_pool.as_ref()?;
+        let required = intake_slots(&self.layout, max_concurrency);
+        (pool.intake_slots < required).then(|| {
+            let bytes = required as u64 * self.layout.page_record_bytes;
             format!(
-                "host memory holds {rows} record rows for max concurrency {max_concurrency} ({recommended} recommended); \
-             publications may wait for spills; \
-             increase --prefix-cache-memory or reduce --max-concurrency"
+                "host prefix intake shrunk to {} slots to fit the host budget; \
+                 full intake at max concurrency {max_concurrency} needs {bytes} bytes ({}) of host memory",
+                pool.intake_slots, gibibytes(bytes)
             )
         })
     }
