@@ -1132,7 +1132,9 @@ fn restore_salted(
 /// own simulated device.
 fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
     let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 2 * pages).unwrap();
+    let layout = Layout::new(&geo()).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let pool = SlabPool::new(PAGE as u64, 2 * intake + pages + 2 * layout.row_slots()).unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
     let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
     let store =
@@ -1210,7 +1212,8 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let fingerprint = fingerprint(&geometry);
     // Memory holds two records of two pages; the disk tier, two files.
     let (memory_transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 8).unwrap();
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 8).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
     let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1256,12 +1259,14 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let (second, _) = publication(&gpu, 2, 2);
     let (third, _) = publication(&gpu, 3, 2);
     let (fourth, _) = publication(&gpu, 4, 2);
-    // Memory and the disk tier fill: nothing is written until memory needs room.
+    // The small warm tier is below the clean floor, so landed copies spill.
     publish(&mut store, &first);
     publish(&mut store, &second);
-    assert!(!directory.join(record::file_name(&first.key)).exists());
-    // The third pushes the first to disk; the fourth finds the disk tier full
-    // and pushes the coldest file on to the manager.
+    drive(&mut store, "the first record to commit on disk", |_| {
+        directory.join(record::file_name(&first.key)).exists()
+    });
+    // Further publications fill the disk tier and push the coldest file
+    // to the manager, releasing its memory copy too.
     publish(&mut store, &third);
     publish(&mut store, &fourth);
     drive(&mut store, "the first record's file to go", |_| {
@@ -1296,7 +1301,11 @@ fn drained_records_are_announced_and_claimable_after_restart() {
         let (memory_copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let memory = MemoryStore::new_flat(
             [7; 32],
-            SlabPool::new(PAGE as u64, 20).unwrap(),
+            SlabPool::new(
+                PAGE as u64,
+                20 + 2 * flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
+            )
+            .unwrap(),
             memory_copier,
         )
         .unwrap();
@@ -1337,11 +1346,11 @@ fn drained_records_are_announced_and_claimable_after_restart() {
             .iter()
             .all(|(_, history)| offered(&requester, history))
     });
-    assert!(
+    drive(&mut source, "the cold record to commit on disk", |_| {
         directory
             .join(record::file_name(&records[0].0.key))
             .exists()
-    );
+    });
     let last_file = directory.join(record::file_name(&records[2].0.key));
     assert!(!last_file.exists(), "the last record is DRAM-only");
     source.close().unwrap();

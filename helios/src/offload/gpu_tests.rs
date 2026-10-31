@@ -116,7 +116,7 @@ mod memory {
 
         let mut pool = SlabPool::sized(
             &layout,
-            2 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+            4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
                 * layout.page_record_bytes,
         )
         .unwrap();
@@ -274,7 +274,7 @@ mod memory {
 
         let mut pool = SlabPool::sized(
             &layout,
-            2 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+            4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
                 * layout.page_record_bytes,
         )
         .unwrap();
@@ -443,7 +443,8 @@ mod memory {
         // A pool holding one record evicts it when a second key is stored.
         let mut small = SlabPool::new(
             layout.page_record_bytes,
-            (3) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+            (3) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
+                + flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
@@ -456,8 +457,14 @@ mod memory {
             super::wait_event(&mut store, 60),
             StoreEvent::Stored { result: Ok(_), .. }
         ));
-        assert_eq!(store.pool().free_pages(), 0);
-        assert_eq!(store.pool().free_pages(), 0);
+        assert_eq!(
+            store.pool().free_pages(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
+        assert_eq!(
+            store.pool().free_pages(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         let mut other = PrefixHistory::new(IDENTITY);
         other.append(&tokens[..consumed as usize], &[]).unwrap();
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
@@ -475,7 +482,10 @@ mod memory {
         assert_eq!(store.store(&second).unwrap(), StoreOutcome::Queued);
         assert!(!store.index().contains(&checkpoint.key));
         assert!(store.index().contains(&second.key));
-        assert_eq!(store.pool().free_pages(), 0);
+        assert_eq!(
+            store.pool().free_pages(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         match super::wait_event(&mut store, 60) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, second.key);
@@ -625,7 +635,8 @@ mod composite {
         }
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
+                + flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -825,7 +836,8 @@ mod composite {
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
+                + flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -972,7 +984,8 @@ mod composite {
         // one page to spare; a third record evicts the least recently used.
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            (7) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+            (7) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
+                + flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
@@ -1232,7 +1245,8 @@ mod composite {
         let open_small = || {
             let mut pool = SlabPool::new(
                 layout.page_record_bytes,
-                (1) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
+                (1) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize
+                    + flare_selene::offload::intake_slots(&layout, 1),
             )
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
@@ -1297,7 +1311,10 @@ mod composite {
         assert_eq!(store.store(&large).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound_records(), 1);
         assert_eq!(store.disk().stats().outbound_in_flight, 1);
-        assert_eq!(store.memory().pool().free_pages(), 0);
+        assert_eq!(
+            store.memory().pool().free_pages(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert!(!store.retains_chain(&hit.chain));
         store.fetch(hit, ticket()).unwrap();

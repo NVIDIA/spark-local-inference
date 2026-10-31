@@ -972,6 +972,7 @@ pub struct Staged {
 
 impl Staged {
     pub fn new(pool: Option<SlabPool>, transfers: SharedCopier, disk: DiskThread) -> Self {
+        let pool = pool.map(|pool| pool.with_intake(lock(&transfers).layout()));
         Self {
             resources: Resources {
                 pool,

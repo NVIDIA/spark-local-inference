@@ -136,6 +136,14 @@ pub(crate) struct Memory {
 }
 
 impl SlabPool {
+    /// Keep room for at least one outbound and one inbound transfer window.
+    pub(crate) fn with_intake(mut self, layout: &Layout) -> Self {
+        self.intake_slots = self
+            .intake_slots
+            .max(crate::offload::intake_slots(layout, 1));
+        self
+    }
+
     /// Map equal, page-record-sized slots.
     pub fn new(page_bytes: u64, count: usize) -> Result<Self> {
         let mapping_bytes = region_bytes(page_bytes, count)?;

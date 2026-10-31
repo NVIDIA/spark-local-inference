@@ -183,6 +183,7 @@ impl Core {
     }
 
     fn new(identity: [u8; 32], pool: SlabPool, layout: Layout, flat: bool) -> Self {
+        let pool = pool.with_intake(&layout);
         Self {
             index: Index::new(layout.page_tokens),
             pool,
@@ -1525,8 +1526,12 @@ mod tests {
         Layout::new(&[geometry(PT, &[("k", 4096), ("v", 4096)], 4096)]).unwrap()
     }
 
+    fn host_pool(warm: usize) -> SlabPool {
+        SlabPool::new(PAGE, warm + crate::offload::intake_slots(&layout(), 1)).unwrap()
+    }
+
     fn store_core(pages: usize, rows: usize, flat: bool) -> Core {
-        let pool = SlabPool::new(PAGE, (pages) + (rows) * (ROW).div_ceil(PAGE) as usize).unwrap();
+        let pool = host_pool(pages + rows * layout().row_slots());
         Core::new(IDENTITY, pool, layout(), flat)
     }
 
@@ -1629,7 +1634,7 @@ mod tests {
     fn releasing_a_host_pin_notifies_capacity_waiters() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE, (1) + (1) * (ROW).div_ceil(PAGE) as usize).unwrap();
+        let pool = host_pool(2);
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
@@ -1637,10 +1642,10 @@ mod tests {
         store.poll(&mut events).unwrap();
         store.pin_record(&checkpoint.key).unwrap();
         let progress = store.stats().progress;
-        assert_eq!(store.reclaimable_slots(), 0);
+        assert_eq!(store.reclaimable_slots(), store.pool().intake_slots);
         store.unpin_record(&checkpoint.key).unwrap();
         assert!(store.stats().progress > progress);
-        assert_eq!(store.reclaimable_slots(), 2);
+        assert_eq!(store.reclaimable_slots(), store.pool().intake_slots + 2);
         store.close().unwrap();
     }
 
@@ -1648,7 +1653,7 @@ mod tests {
     fn published_prompt_copy_survives_reply_and_gpu_storage_reuse() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize).unwrap();
+        let pool = host_pool(4);
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         let full = history(128, 1);
         let prompt = published(&full, 64, None, 0, 1);
@@ -1749,7 +1754,7 @@ mod tests {
         assert_eq!(node.location.pages.len(), 3);
         assert!(node.location.row.is_some());
         assert!(node.location.durable);
-        assert_eq!(core.pool.free_pages(), 32);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 32);
 
         // The child arrives while the root's copy-out is in flight: it waits.
         let child = published(&full, 400, Some(200), 10, 2);
@@ -1875,12 +1880,12 @@ mod tests {
         let node = core.index.node(&child.key).unwrap();
         assert_eq!(node.parent, None);
         assert_eq!(node.location.pages.len(), 6);
-        assert_eq!(core.pool.free_pages(), 29);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 29);
         assert_eq!(
             stored(&finish(&mut core)),
             [(child.key, Some(6 * PAGE + ROW))]
         );
-        assert_eq!(core.pool.free_pages(), 29);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 29);
         assert_eq!(core.stats().stored, 1);
     }
 
@@ -2013,7 +2018,7 @@ mod tests {
         assert!(core.store(&root).unwrap());
         finish(&mut core);
         assert!(core.store(&child).unwrap());
-        assert_eq!(core.pool.free_pages(), 3);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 3);
 
         // The child is in flight and the root has that child: no leaf
         // qualifies, so the root's row is compacted away for the stranger.
@@ -2024,7 +2029,7 @@ mod tests {
         assert_eq!(root_node.location.row, None);
         assert_eq!(root_node.location.pages.len(), 3);
         assert!(core.index.contains(&child.key));
-        assert_eq!(core.pool.free_pages(), 0);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
 
         // Nothing is evictable for the pages a further record needs: it is skipped.
         let late = published(&other, 64, None, 30, 4);
@@ -2044,7 +2049,7 @@ mod tests {
         assert!(!core.index.contains(&stranger.key));
         assert!(core.index.contains(&child.key));
         assert!(core.index.contains(&root.key));
-        assert_eq!(core.pool.free_pages(), 2);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 2);
         finish(&mut core);
 
         // Removing the child leaves the page-only root childless: both go.
@@ -2054,7 +2059,7 @@ mod tests {
         assert!(!core.index.contains(&child.key));
         assert!(!core.index.contains(&root.key));
         assert!(core.index.contains(&late.key));
-        assert_eq!(core.pool.free_pages(), 4);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 4);
         finish(&mut core);
 
         // Records that are not durable are never evicted.
@@ -2077,13 +2082,17 @@ mod tests {
         let huge = published(&full, 1200, None, 0, 2);
         assert!(!core.store(&huge).unwrap());
         assert!(core.index.contains(&stranger.key));
-        assert_eq!(core.pool.free_pages(), 0);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
     }
 
     #[test]
-    fn row_compaction_reuses_every_piece_of_the_coldest_interior_row() {
+    fn row_compaction_releases_every_piece_of_the_coldest_interior_row() {
         let layout = Layout::new(&[geometry(PT, &[("kv", 4096)], 12288)]).unwrap();
-        let pool = SlabPool::new(layout.page_record_bytes, 12).unwrap();
+        let pool = SlabPool::new(
+            layout.page_record_bytes,
+            12 + crate::offload::intake_slots(&layout, 1),
+        )
+        .unwrap();
         let mut core = Core::new(IDENTITY, pool, layout, false);
         let full = history(128, 1);
         let root = full.key_at(64).unwrap();
@@ -2102,19 +2111,28 @@ mod tests {
             .unwrap()
             .unwrap();
         core.complete_record(&fresh, true).unwrap();
-        assert_eq!(core.pool.free_pages(), 0);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
         let next = history(1, 3).key_at(1).unwrap();
         let allocated = core
             .allocate(next, None, [3; 16], 0, true, true)
             .unwrap()
             .unwrap();
         assert_eq!(old.row.as_ref().unwrap().len(), 3);
-        assert_eq!(allocated.row, old.row);
+        assert_eq!(allocated.row.as_ref().unwrap().len(), 3);
+        let free = core.pool.allocate(core.pool.free_pages()).unwrap();
+        assert!(
+            old.row
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|slot| free.contains(slot))
+        );
+        core.pool.release(free);
         assert_clean_slots(&core);
         assert!(core.index.node(&root).unwrap().location.row.is_none());
         assert!(core.index.contains(&fresh));
         assert!(core.index.contains(&child));
-        assert_eq!(core.pool.free_pages(), 0);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
     }
 
     #[test]
@@ -2141,7 +2159,7 @@ mod tests {
         assert_eq!(core.record(&key), Some(&record));
         core.remove_record(&key).unwrap();
         assert!(core.remove_record(&key).is_err());
-        assert_eq!(core.pool.free_pages(), 20);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 20);
 
         let paged = core
             .allocate_record(key, bucket, 3, false)
@@ -2151,7 +2169,7 @@ mod tests {
         assert!(!core.index.node(&key).unwrap().row);
         core.complete_record(&key, false).unwrap();
         assert!(!core.index.contains(&key));
-        assert_eq!(core.pool.free_pages(), 20);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 20);
         assert!(core.complete_record(&key, false).is_err());
         assert!(core.mark_durable(&key).is_err());
 
@@ -2323,7 +2341,7 @@ mod tests {
         assert!(core.outbound.is_empty());
         assert!(!core.index.contains(&late.key));
         assert!(!core.index.node(&child.key).unwrap().pinned());
-        assert_eq!(core.pool.free_pages(), 28);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 28);
     }
 
     #[test]
@@ -2364,7 +2382,7 @@ mod tests {
         assert_eq!(stats.stored, 1);
         assert_eq!(stats.store_failed, 0);
         assert_eq!(stats.store_skipped, 0);
-        assert_eq!(core.pool.free_pages(), 1);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 1);
         let node = core.index.node(&root.key).unwrap();
         assert!(node.ready);
         assert!(!node.pinned());
@@ -2395,7 +2413,7 @@ mod tests {
             assert!(core.store(checkpoint).unwrap());
             finish(&mut core);
         }
-        assert_eq!(core.pool.free_pages(), 0);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots);
 
         // The child is the least recently used leaf, but it is the parent the
         // grandchild extends: the stranger is evicted instead.
@@ -2426,7 +2444,7 @@ mod tests {
         assert!(core.index.contains(&grandchild.key));
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
-        assert_eq!(core.pool.free_pages(), 2);
+        assert_eq!(core.pool.free_pages(), core.pool.intake_slots + 2);
     }
 
     #[test]
@@ -2547,7 +2565,11 @@ mod tests {
         for flat in [false, true] {
             for seed in 1..=8u64 {
                 let layout = Layout::new(&[geometry(PT, &[("kv", 4096)], 12288)]).unwrap();
-                let pool = SlabPool::new(layout.page_record_bytes, 48).unwrap();
+                let pool = SlabPool::new(
+                    layout.page_record_bytes,
+                    48 + crate::offload::intake_slots(&layout, 1),
+                )
+                .unwrap();
                 let mut core = Core::new(IDENTITY, pool, layout, flat);
                 let mut random = seed;
                 for serial in 1..=2000u64 {
@@ -2622,8 +2644,11 @@ mod tests {
 
     #[test]
     fn allocation_preserves_intake_by_evicting_only_cold_clean_records() {
-        let mut core = store_core(12, 4, true);
-        core.pool.intake_slots = 4;
+        let mut core = store_core(8, 4, true);
+        assert_eq!(
+            core.pool.intake_slots,
+            2 * (WINDOW_PAGES + core.layout.row_slots())
+        );
         let mut records = Vec::new();
         for salt in 1..=4 {
             let h = history(600, salt);
@@ -2726,8 +2751,8 @@ mod tests {
 
         let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let mut pool = SlabPool::new(PAGE, 110).unwrap();
-        pool.intake_slots = 10;
+        let intake = crate::offload::intake_slots(&layout(), 1);
+        let pool = host_pool(intake + 90);
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
         for salt in 1..=4 {
@@ -2741,12 +2766,12 @@ mod tests {
             store.poll(&mut Vec::new()).unwrap();
             std::thread::yield_now();
         }
-        assert_eq!(store.pool().free_pages(), 18);
-        assert_eq!(store.reserve(20), 0);
+        assert_eq!(store.pool().free_pages(), 2 * intake - 2);
+        assert_eq!(store.reserve(2 * intake), 0);
         store.poll(&mut Vec::new()).unwrap();
         assert!(store.take_retiring().is_empty());
         store.set_spill(true);
-        assert_eq!(store.reserve(20), 2);
+        assert_eq!(store.reserve(2 * intake), 2);
         store.poll(&mut Vec::new()).unwrap();
         let retiring = store.take_retiring();
         assert_eq!(retiring.len(), 1);
@@ -2869,16 +2894,14 @@ mod tests {
     fn expired_memory_records_release_their_slabs() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
-        let mut store = MemoryStore::new(
-            IDENTITY,
-            SlabPool::new(PAGE, (2) + (2) * (ROW).div_ceil(PAGE) as usize).unwrap(),
-            copier,
-        )
-        .unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(4), copier).unwrap();
         store.index_mut().max_age = std::time::Duration::from_secs(7200);
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         store.store(&checkpoint).unwrap();
-        assert_eq!((store.stats().rows_used, store.stats().rows_total), (1, 4));
+        assert_eq!(
+            (store.stats().rows_used, store.stats().rows_total),
+            (1, store.pool().page_count())
+        );
         store
             .index_mut()
             .node_mut(&checkpoint.key)
@@ -2886,8 +2909,11 @@ mod tests {
             .last_used = std::time::SystemTime::UNIX_EPOCH;
         store.poll(&mut Vec::new()).unwrap();
         assert_eq!(store.stats().expired, [1, 0]);
-        assert_eq!((store.stats().rows_used, store.stats().rows_total), (0, 4));
-        assert_eq!(store.pool().free_pages(), 4);
+        assert_eq!(
+            (store.stats().rows_used, store.stats().rows_total),
+            (0, store.pool().page_count())
+        );
+        assert_eq!(store.pool().free_pages(), store.pool().page_count());
         store.close().unwrap();
     }
 }
