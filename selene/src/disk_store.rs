@@ -49,7 +49,7 @@ use super::{
     geometry::invalid,
     index::{Eviction, Index, Match, Node},
     record::{self, Header, Scanned},
-    slab::{PageSlab, RowSlab, SlabPool, WINDOW_PAGES},
+    slab::{SlabPool, Slot, WINDOW_PAGES},
 };
 
 /// Windows of one record the staged transport keeps in staging at a time.
@@ -150,8 +150,8 @@ fn lock<'a>(
 /// slabs behind them when the transport allocated them.
 struct Buffers {
     pages: Vec<usize>,
-    row: Option<usize>,
-    slabs: Option<(Vec<PageSlab>, Option<RowSlab>)>,
+    row: Option<Vec<usize>>,
+    slabs: Option<(Vec<Slot>, Option<Vec<Slot>>)>,
 }
 
 /// The threads and pool every pipeline draws on, with the counters that keep
@@ -195,35 +195,23 @@ impl Resources {
     /// `None` leaves the pool unchanged when it cannot supply all of them.
     fn allocate(&mut self, pages: usize, row: bool) -> Option<Buffers> {
         let pool = self.pool.as_mut()?;
-        let mut slabs = Vec::with_capacity(pages);
-        for _ in 0..pages {
-            match pool.allocate_page() {
-                Some(slab) => slabs.push(slab),
-                None => {
-                    for slab in slabs {
-                        pool.release_page(slab);
-                    }
-                    return None;
-                }
-            }
+        let row_slots = lock(&self.transfers).layout().row_slots();
+        let needed = pages + usize::from(row) * row_slots;
+        if pool.free_pages() < needed {
+            return None;
         }
-        let row_slab = if row {
-            match pool.allocate_row() {
-                Some(slab) => Some(slab),
-                None => {
-                    for slab in slabs {
-                        pool.release_page(slab);
-                    }
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
+        let slabs: Vec<_> = (0..pages).map(|_| pool.allocate_page().unwrap()).collect();
+        let row_slabs: Option<Vec<_>> = row.then(|| {
+            (0..row_slots)
+                .map(|_| pool.allocate_page().unwrap())
+                .collect()
+        });
         Some(Buffers {
-            pages: slabs.iter().map(|slab| pool.page_address(*slab)).collect(),
-            row: row_slab.map(|slab| pool.row_address(slab)),
-            slabs: Some((slabs, row_slab)),
+            pages: slabs.iter().map(|&slab| pool.page_address(slab)).collect(),
+            row: row_slabs
+                .as_ref()
+                .map(|slabs| slabs.iter().map(|&slab| pool.page_address(slab)).collect()),
+            slabs: Some((slabs, row_slabs)),
         })
     }
 
@@ -233,7 +221,9 @@ impl Resources {
                 pool.release_page(slab);
             }
             if let Some(slab) = row {
-                pool.release_row(slab);
+                for slot in slab {
+                    pool.release_page(slot);
+                }
             }
         }
     }
@@ -256,7 +246,7 @@ enum Source {
         slot: StateSlotId,
     },
     /// Caller-owned registered buffers already holding every record.
-    Host { pages: Vec<usize>, row: usize },
+    Host { pages: Vec<usize>, row: Vec<usize> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -491,7 +481,7 @@ impl OutboundRecord {
                         .copied()
                         .zip(buffers.pages.iter().copied())
                         .collect(),
-                    row: buffers.row.map(|address| (*slot, address)),
+                    row: buffers.row.clone().map(|address| (*slot, address)),
                 };
                 if let Err(error) = resources.submit_transfer(job) {
                     resources.release(&mut buffers);
@@ -503,7 +493,7 @@ impl OutboundRecord {
             Source::Host { pages, row } => (
                 Buffers {
                     pages: pages[first..first + count].to_vec(),
-                    row: last.then_some(*row),
+                    row: last.then(|| row.clone()),
                     slabs: None,
                 },
                 OutPhase::Transferred,
@@ -539,7 +529,7 @@ impl OutboundRecord {
             window.referenced += 1;
             self.outstanding += 1;
         }
-        if let Some(buffer) = window.buffers.row
+        if let Some(buffers) = window.buffers.row.clone()
             && !window.row_submitted
         {
             if !resources.disk_space() {
@@ -547,7 +537,7 @@ impl OutboundRecord {
             }
             resources.submit_disk(disk::Job::WriteRow {
                 id: self.disk,
-                buffer,
+                buffers,
             })?;
             window.row_submitted = true;
             window.referenced += 1;
@@ -605,7 +595,7 @@ enum Destination {
     /// Caller-owned registered buffers.
     Host {
         pages: Vec<usize>,
-        row: Option<usize>,
+        row: Option<Vec<usize>>,
     },
 }
 
@@ -866,7 +856,7 @@ impl InboundRecord {
             },
             Destination::Host { pages, row } => Buffers {
                 pages: pages[plan.offset..plan.offset + plan.count].to_vec(),
-                row: if plan.row { *row } else { None },
+                row: if plan.row { row.clone() } else { None },
                 slabs: None,
             },
         };
@@ -904,13 +894,13 @@ impl InboundRecord {
             }
         }
         if !window.row_submitted {
-            match window.buffers.row {
+            match window.buffers.row.clone() {
                 None => window.row_submitted = true,
-                Some(buffer) => {
+                Some(buffers) => {
                     if !resources.disk_space() {
                         return Ok(());
                     }
-                    resources.submit_disk(disk::Job::ReadRow { id: disk, buffer })?;
+                    resources.submit_disk(disk::Job::ReadRow { id: disk, buffers })?;
                     window.row_submitted = true;
                     window.referenced += 1;
                     self.outstanding += 1;
@@ -938,7 +928,7 @@ impl InboundRecord {
                 .copied()
                 .zip(window.buffers.pages.iter().copied())
                 .collect(),
-            row: window.buffers.row.map(|address| (*slot, address)),
+            row: window.buffers.row.clone().map(|address| (*slot, address)),
         })?;
         window.phase = InPhase::Uploading;
         window.referenced += 1;
@@ -1037,7 +1027,7 @@ impl Staged {
         temporary: PathBuf,
         path: PathBuf,
         pages: Vec<usize>,
-        row: Option<usize>,
+        row: Option<Vec<usize>>,
     ) -> Result<()> {
         self.accept(id)?;
         if pages.len() != header.tail_pages as usize {
@@ -1064,7 +1054,7 @@ impl Staged {
         expected: Header,
         first_page: u32,
         pages: Vec<usize>,
-        row: Option<usize>,
+        row: Option<Vec<usize>>,
     ) -> Result<()> {
         self.accept(id)?;
         if pages.is_empty() && row.is_none() {
@@ -4186,7 +4176,7 @@ mod tests {
         SlabPool::staging(&Layout::new(&geometry()).unwrap()).unwrap()
     }
 
-    fn page_slabs(pool: &mut SlabPool, count: usize, seed: u64) -> Vec<PageSlab> {
+    fn page_slabs(pool: &mut SlabPool, count: usize, seed: u64) -> Vec<Slot> {
         (0..count as u64)
             .map(|index| {
                 let slab = pool.allocate_page().unwrap();
@@ -4196,13 +4186,13 @@ mod tests {
             .collect()
     }
 
-    fn row_slab(pool: &mut SlabPool, seed: u64) -> RowSlab {
-        let slab = pool.allocate_row().unwrap();
-        pattern(pool.row_mut(slab), seed);
+    fn row_slab(pool: &mut SlabPool, seed: u64) -> Slot {
+        let slab = pool.allocate_page().unwrap();
+        pattern(pool.page_mut(slab), seed);
         slab
     }
 
-    fn addresses(pool: &SlabPool, slabs: &[PageSlab]) -> Vec<usize> {
+    fn addresses(pool: &SlabPool, slabs: &[Slot]) -> Vec<usize> {
         slabs.iter().map(|slab| pool.page_address(*slab)).collect()
     }
 
@@ -4270,15 +4260,20 @@ mod tests {
             bytes[..record::HEADER_BYTES].copy_from_slice(&changed.encode().unwrap());
             fs::write(&path, bytes).unwrap();
             for device in [false, true] {
-                let mut pool = SlabPool::new(PAGE_RECORD, 4, ROW_RECORD, 2, true).unwrap();
+                let mut pool = SlabPool::new(
+                    PAGE_RECORD,
+                    (4) + (2) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
+                    true,
+                )
+                .unwrap();
                 for index in 0..4 {
-                    pool.page_mut(PageSlab(index)).fill(0xee);
+                    pool.page_mut(Slot(index)).fill(0xee);
                 }
                 for index in 0..2 {
-                    pool.row_mut(RowSlab(index)).fill(0xee);
+                    pool.page_mut(Slot(index)).fill(0xee);
                 }
-                let page = pool.page_address(PageSlab(0));
-                let row = pool.row_address(RowSlab(0));
+                let page = pool.page_address(Slot(0));
+                let row = pool.page_address(Slot(0));
                 let (host, staging) = if device {
                     (None, Some(pool))
                 } else {
@@ -4315,7 +4310,7 @@ mod tests {
                             expected.clone(),
                             0,
                             vec![page],
-                            Some(row),
+                            Some(vec![row]),
                         )
                         .unwrap();
                 }
@@ -4334,13 +4329,13 @@ mod tests {
                 let pool = host.as_ref().or_else(|| staged.pool()).unwrap();
                 for index in 0..4 {
                     assert!(
-                        pool.page(PageSlab(index)).iter().all(|byte| *byte == 0xee),
+                        pool.page(Slot(index)).iter().all(|byte| *byte == 0xee),
                         "{name} changed page {index}, device={device}"
                     );
                 }
                 for index in 0..2 {
                     assert!(
-                        pool.row(RowSlab(index)).iter().all(|byte| *byte == 0xee),
+                        pool.page(Slot(index)).iter().all(|byte| *byte == 0xee),
                         "{name} changed row {index}, device={device}"
                     );
                 }
@@ -4374,7 +4369,7 @@ mod tests {
                     directory.join(record::temporary_name(&header.key)),
                     directory.join(record::file_name(&header.key)),
                     addresses(&pool, &source),
-                    Some(pool.row_address(row)),
+                    Some(vec![pool.page_address(row)]),
                 )
                 .unwrap();
             assert!(matches!(
@@ -4413,7 +4408,7 @@ mod tests {
         for slab in &source {
             pool.page_mut(*slab).fill(0x87);
         }
-        pool.row_mut(row).fill(0x91);
+        pool.page_mut(row).fill(0x91);
         store
             .transport
             .staged_mut()
@@ -4424,7 +4419,7 @@ mod tests {
                 temporary,
                 path.clone(),
                 addresses(&pool, &source),
-                Some(pool.row_address(row)),
+                Some(vec![pool.page_address(row)]),
             )
             .unwrap();
         assert!(matches!(
@@ -4532,7 +4527,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses[..PAGES - 1].to_vec(),
-                    Some(pool.row_address(source_row))
+                    Some(vec![pool.page_address(source_row)])
                 )
                 .is_err()
         );
@@ -4564,7 +4559,7 @@ mod tests {
                 temporary.clone(),
                 path.clone(),
                 source_addresses.clone(),
-                Some(pool.row_address(source_row)),
+                Some(vec![pool.page_address(source_row)]),
             )
             .unwrap();
         assert!(
@@ -4575,7 +4570,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(pool.row_address(source_row))
+                    Some(vec![pool.page_address(source_row)])
                 )
                 .is_err()
         );
@@ -4614,7 +4609,7 @@ mod tests {
                 header.clone(),
                 SKIP as u32,
                 addresses(&pool, &targets[..PAGES - SKIP]),
-                Some(pool.row_address(target_row)),
+                Some(vec![pool.page_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4630,7 +4625,10 @@ mod tests {
         for (target, source) in targets.iter().zip(&sources[SKIP..]) {
             assert!(pool.page(*target) == pool.page(*source));
         }
-        assert!(pool.row(target_row) == pool.row(source_row));
+        assert_eq!(
+            &pool.page(target_row)[..ROW_RECORD as usize],
+            &pool.page(source_row)[..ROW_RECORD as usize]
+        );
         staged
             .read_into(
                 JobId(3),
@@ -4683,7 +4681,7 @@ mod tests {
                 header.clone(),
                 0,
                 addresses(&pool, &targets),
-                Some(pool.row_address(target_row)),
+                Some(vec![pool.page_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4721,7 +4719,7 @@ mod tests {
                 header.clone(),
                 WINDOW_PAGES as u32,
                 addresses(&pool, &targets[..PAGES - WINDOW_PAGES]),
-                Some(pool.row_address(target_row)),
+                Some(vec![pool.page_address(target_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4758,7 +4756,7 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(pool.row_address(source_row))
+                    Some(vec![pool.page_address(source_row)])
                 )
                 .is_err()
         );
@@ -4787,9 +4785,10 @@ mod tests {
         let mut ids = Ids::new();
         let free = |staged: &Staged| {
             let pool = staged.pool().unwrap();
-            (pool.free_pages(), pool.free_rows())
+            (pool.free_pages(), pool.free_pages())
         };
-        let all = (STAGING_PAGE_SLABS, STAGING_ROW_SLABS);
+        let count = STAGING_PAGE_SLABS + STAGING_ROW_SLABS * layout.row_slots();
+        let all = (count, count);
         assert_eq!(free(&staged), all);
 
         // A record written from caller buffers gives the fetches below a file.
@@ -4805,7 +4804,7 @@ mod tests {
                 directory.join(record::temporary_name(&stored.key)),
                 path.clone(),
                 source_addresses.clone(),
-                Some(host.row_address(source_row)),
+                Some(vec![host.page_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4878,10 +4877,7 @@ mod tests {
         staged
             .fetch(JobId(3), vec![segment.clone()], &ticket)
             .unwrap();
-        assert_eq!(
-            free(&staged),
-            (STAGING_PAGE_SLABS - 3, STAGING_ROW_SLABS - 1)
-        );
+        assert_eq!(free(&staged), (count - 4, count - 4));
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Fetched { id, result }] => {
                 assert_eq!(*id, JobId(3));
@@ -4946,7 +4942,7 @@ mod tests {
                 lost_temporary.clone(),
                 missing.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
-                Some(host.row_address(source_row)),
+                Some(vec![host.page_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4965,7 +4961,7 @@ mod tests {
                 missing.join(record::temporary_name(&lost.key)),
                 directory.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
-                Some(host.row_address(source_row)),
+                Some(vec![host.page_address(source_row)]),
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -5025,7 +5021,7 @@ mod tests {
                     directory.join(record::temporary_name(&header.key)),
                     directory.join(record::file_name(&header.key)),
                     source_addresses.clone(),
-                    Some(host.row_address(source_row)),
+                    Some(vec![host.page_address(source_row)]),
                 )
                 .unwrap();
         }

@@ -209,6 +209,7 @@ pub struct GpuMemory {
 /// the GPU as soon as a job is submitted, and reports the job on the next poll.
 pub struct SimulatedGpu {
     layout: Layout,
+    mapped_rows: bool,
     memory: GpuMemory,
     replies: Vec<Reply>,
 }
@@ -219,11 +220,18 @@ impl SimulatedGpu {
         Ok((
             Self {
                 layout: Layout::new(geometry)?,
+                mapped_rows: false,
                 memory: memory.clone(),
                 replies: Vec::new(),
             },
             memory,
         ))
+    }
+
+    pub fn shared_mapped(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
+        let (mut copier, memory) = Self::new(geometry)?;
+        copier.mapped_rows = true;
+        Ok((std::sync::Arc::new(std::sync::Mutex::new(copier)), memory))
     }
 
     pub fn shared(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
@@ -258,15 +266,23 @@ impl PageCopier for SimulatedGpu {
                 }
             }
         }
-        if let Some((slot, address)) = job.row {
-            let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, row) };
-            match job.direction {
-                crate::Direction::Out => {
-                    host.copy_from_slice(rows.get(&slot.0).map_or(&vec![0; row], |p| p));
+        if let Some((slot, slots)) = &job.row {
+            let mut data = rows.get(&slot.0).cloned().unwrap_or_else(|| vec![0; row]);
+            let pieces: Vec<_> = if !self.mapped_rows {
+                vec![(slots[0], 0, row)]
+            } else {
+                crate::slab::row_pieces(&self.layout, slots).collect()
+            };
+            for (address, offset, len) in pieces {
+                let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, len) };
+                let bytes = &mut data[offset as usize..offset as usize + len];
+                match job.direction {
+                    crate::Direction::Out => host.copy_from_slice(bytes),
+                    crate::Direction::In => bytes.copy_from_slice(host),
                 }
-                crate::Direction::In => {
-                    rows.insert(slot.0, host.to_vec());
-                }
+            }
+            if job.direction == crate::Direction::In {
+                rows.insert(slot.0, data);
             }
         }
         self.replies.push(Reply {

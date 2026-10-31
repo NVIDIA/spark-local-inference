@@ -209,7 +209,7 @@ pub enum Job {
     },
     WriteRow {
         id: JobId,
-        buffer: usize,
+        buffers: Vec<usize>,
     },
     /// Write the checksum segment and header, optionally `fdatasync`, rename to
     /// `path`, and close. Every page record and the row must have been written.
@@ -237,7 +237,7 @@ pub enum Job {
     },
     ReadRow {
         id: JobId,
-        buffer: usize,
+        buffers: Vec<usize>,
     },
     Close {
         id: JobId,
@@ -559,8 +559,8 @@ impl Worker {
                 window,
                 self.write_pages(id, first, &buffers),
             ),
-            Job::WriteRow { id, buffer } => {
-                reply(id, Operation::WriteRow, 0, self.write_row(id, buffer))
+            Job::WriteRow { id, buffers } => {
+                reply(id, Operation::WriteRow, 0, self.write_row(id, &buffers))
             }
             Job::Commit { id, path, sync } => {
                 reply(id, Operation::Commit, 0, self.commit(id, &path, sync))
@@ -589,8 +589,8 @@ impl Worker {
                 window,
                 self.read_pages(id, first, &buffers),
             ),
-            Job::ReadRow { id, buffer } => {
-                reply(id, Operation::ReadRow, 0, self.read_row(id, buffer))
+            Job::ReadRow { id, buffers } => {
+                reply(id, Operation::ReadRow, 0, self.read_row(id, &buffers))
             }
             Job::Close { id } => reply(id, Operation::Close, 0, self.close(id)),
             Job::Truncate { id, path, length } => {
@@ -667,18 +667,21 @@ impl Worker {
         Ok(moved)
     }
 
-    fn write_row(&mut self, id: JobId, buffer: usize) -> Result<u64> {
+    fn write_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let writing = writing(&mut self.records, id)?;
-        let row_bytes = writing.header.row_record_bytes();
-        let span = Span {
-            address: buffer,
-            offset: writing.header.row_segment,
-            length: row_bytes as usize,
-        };
-        let moved = self.ring.transfer(&writing.file, &[span], true)?;
-        // SAFETY: As for page buffers.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, row_bytes as usize) };
-        writing.header.row_checksum = checksum(bytes);
+        let layout = writing.header.layout()?;
+        if buffers.len() != layout.row_slots() {
+            return Err(invalid("row buffer count disagrees with record layout"));
+        }
+        let spans: Vec<_> = crate::slab::row_pieces(&layout, buffers)
+            .map(|(address, offset, length)| Span {
+                address,
+                offset: writing.header.row_segment + offset,
+                length,
+            })
+            .collect();
+        let moved = self.ring.transfer(&writing.file, &spans, true)?;
+        writing.header.row_checksum = crate::record::row_checksum(&layout, buffers);
         writing.row_written = true;
         writing.bytes += moved;
         Ok(moved)
@@ -864,18 +867,21 @@ impl Worker {
         Ok(moved)
     }
 
-    fn read_row(&mut self, id: JobId, buffer: usize) -> Result<u64> {
+    fn read_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let reading = reading(&mut self.records, id)?;
-        let row_bytes = reading.header.row_record_bytes();
-        let span = Span {
-            address: buffer,
-            offset: reading.header.row_segment,
-            length: row_bytes as usize,
-        };
-        let moved = self.ring.transfer(&reading.file, &[span], false)?;
-        // SAFETY: As for page buffers.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, row_bytes as usize) };
-        if checksum(bytes) != reading.header.row_checksum {
+        let layout = reading.header.layout()?;
+        if buffers.len() != layout.row_slots() {
+            return Err(invalid("row buffer count disagrees with record layout"));
+        }
+        let spans: Vec<_> = crate::slab::row_pieces(&layout, buffers)
+            .map(|(address, offset, length)| Span {
+                address,
+                offset: reading.header.row_segment + offset,
+                length,
+            })
+            .collect();
+        let moved = self.ring.transfer(&reading.file, &spans, false)?;
+        if crate::record::row_checksum(&layout, buffers) != reading.header.row_checksum {
             return Err(invalid(format!(
                 "row record of {} failed checksum verification",
                 reading.path.display()
@@ -1767,7 +1773,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id: writer,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -1849,7 +1857,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -1900,7 +1910,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reader }).unwrap();
@@ -1943,7 +1955,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reopened,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reopened }).unwrap();
@@ -2031,7 +2045,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -2192,7 +2208,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id: writer,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -2233,7 +2251,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reader }).unwrap();
@@ -2328,7 +2348,7 @@ mod tests {
             thread
                 .submit(Job::ReadRow {
                     id,
-                    buffer: row.address(),
+                    buffers: vec![row.address()],
                 })
                 .unwrap();
             let replies = wait(&thread, 3);
@@ -2685,5 +2705,94 @@ mod tests {
         small.read(&mut got).unwrap();
         assert_eq!(got, bytes[8192..16384]);
         fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn legacy_record_recovers_into_scattered_slots_and_rewrites_identically() {
+        let Some(directory) = test_directory("legacy-slots") else {
+            return;
+        };
+        // Written by the pre-slot disk engine: one page and a three-piece row.
+        let golden = include_bytes!("../tests/data/legacy-record.bin");
+        let header = Header::decode(&golden[..HEADER_BYTES]).unwrap();
+        let layout = header.layout().unwrap();
+        let path = directory.join(file_name(&header.key));
+        fs::write(&path, golden).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
+        let scanned = crate::record::scan(
+            &guard,
+            &header.identity,
+            &header.fingerprint,
+            header.page_tokens,
+            &header.ranks,
+        )
+        .unwrap();
+        assert_eq!(scanned.len(), 1);
+        let page = buffer(4096, 0);
+        let pieces: Vec<_> = (0..layout.row_slots()).map(|_| buffer(4096, 0)).collect();
+        let addresses: Vec<_> = pieces.iter().map(AlignedBuffer::address).collect();
+        let mut disk = DiskThread::start("legacy-slots").unwrap();
+        disk.submit(Job::Open {
+            id: JobId(1),
+            path: path.clone(),
+            expected: header.clone(),
+        })
+        .unwrap();
+        disk.submit(Job::ReadPages {
+            id: JobId(1),
+            window: 0,
+            first: 0,
+            buffers: vec![page.address()],
+        })
+        .unwrap();
+        disk.submit(Job::ReadRow {
+            id: JobId(1),
+            buffers: addresses.clone(),
+        })
+        .unwrap();
+        for reply in wait(&disk, 3) {
+            succeeded(&reply);
+        }
+        assert_eq!(
+            page.as_slice(),
+            &golden[header.page_segment as usize..header.row_segment as usize]
+        );
+        let row: Vec<u8> = pieces
+            .iter()
+            .flat_map(|piece| piece.as_slice().iter().copied())
+            .collect();
+        assert_eq!(row, golden[header.row_segment as usize..]);
+        disk.submit(Job::Close { id: JobId(1) }).unwrap();
+        succeeded(&wait(&disk, 1)[0]);
+        disk.submit(Job::Create {
+            id: JobId(2),
+            temporary: directory.join(temporary_name(&header.key)),
+            header: header.clone(),
+        })
+        .unwrap();
+        disk.submit(Job::WritePages {
+            id: JobId(2),
+            window: 0,
+            first: 0,
+            buffers: vec![page.address()],
+        })
+        .unwrap();
+        disk.submit(Job::WriteRow {
+            id: JobId(2),
+            buffers: addresses,
+        })
+        .unwrap();
+        disk.submit(Job::Commit {
+            id: JobId(2),
+            path: path.clone(),
+            sync: false,
+        })
+        .unwrap();
+        for reply in wait(&disk, 4) {
+            succeeded(&reply);
+        }
+        disk.close().unwrap();
+        assert_eq!(fs::read(path).unwrap(), golden);
+        drop(guard);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

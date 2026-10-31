@@ -48,7 +48,7 @@ impl CopierFactory for Copiers {
         geometry: Vec<CacheGeometry>,
         _: &crate::slab::SlabPool,
     ) -> Result<crate::SharedCopier> {
-        let (copier, memory) = SimulatedGpu::shared(&geometry)?;
+        let (copier, memory) = SimulatedGpu::shared_mapped(&geometry)?;
         let rank = contexts[0].0;
         for page in 1..=2 {
             memory

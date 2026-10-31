@@ -152,6 +152,27 @@ impl Layout {
         })
     }
 
+    pub fn page_share(&self, rank: usize) -> u64 {
+        self.ranks
+            .get(rank + 1)
+            .map_or(self.page_record_bytes, |r| r.page_offset)
+            - self.ranks[rank].page_offset
+    }
+
+    pub fn row_share(&self, rank: usize) -> u64 {
+        self.ranks
+            .get(rank + 1)
+            .map_or(self.row_record_bytes, |r| r.row_offset)
+            - self.ranks[rank].row_offset
+    }
+
+    pub fn row_slots(&self) -> usize {
+        (0..self.ranks.len())
+            .map(|rank| self.row_share(rank).div_ceil(self.page_share(rank)) as usize)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes a record with `pages` tail pages and a row occupies.
     pub fn record_bytes(&self, pages: u64) -> u64 {
         pages * self.page_record_bytes + self.row_record_bytes

@@ -905,6 +905,17 @@ pub fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
     Error::caused_by(format!("{message}: {error}"), error)
 }
 
+/// Hash scattered row bytes in persisted record order. The caller retains every piece.
+pub(crate) fn row_checksum(layout: &Layout, slots: &[usize]) -> u64 {
+    use std::hash::Hasher;
+    let mut hash = twox_hash::XxHash3_64::new();
+    for (address, _, len) in crate::slab::row_pieces(layout, slots) {
+        // SAFETY: The caller pins the row until hashing completes.
+        hash.write(unsafe { std::slice::from_raw_parts(address as *const u8, len) });
+    }
+    hash.finish()
+}
+
 /// 64-bit xxh3 over `bytes`.
 pub fn checksum(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)

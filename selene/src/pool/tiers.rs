@@ -118,8 +118,8 @@ pub(crate) struct HashJob {
     pub key: PrefixKey,
     pub pages: Vec<usize>,
     pub page_bytes: usize,
-    pub row: Option<usize>,
-    pub row_bytes: usize,
+    pub row: Option<Vec<usize>>,
+    pub layout: crate::Layout,
 }
 
 impl super::engine::hostfill::HostFiller<PrefixKey> {
@@ -140,7 +140,7 @@ impl super::engine::hostfill::HostFiller<PrefixKey> {
                         .collect(),
                     row: job
                         .row
-                        .map(|address| checksum(read(address, job.row_bytes))),
+                        .map(|slots| crate::record::row_checksum(&job.layout, &slots)),
                 })
             }),
         })
@@ -213,8 +213,17 @@ mod tests {
             key: key(1),
             pages: vec![base, base + 64],
             page_bytes: 64,
-            row: Some(base + 128),
-            row_bytes: 64,
+            row: Some(vec![base + 128]),
+            layout: crate::Layout {
+                page_tokens: 16,
+                page_record_bytes: 64,
+                row_record_bytes: 64,
+                ranks: vec![crate::geometry::RankLayout {
+                    page_offset: 0,
+                    plane_offsets: vec![0],
+                    row_offset: 0
+                }]
+            },
         }));
         let done = loop {
             let mut done = Vec::new();

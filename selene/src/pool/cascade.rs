@@ -246,7 +246,7 @@ mod tests {
             spans: vec![
                 MemorySpan {
                     pages: vec![a, a + PAGE, a + 2 * PAGE],
-                    row: Some(a + 3 * PAGE),
+                    row: Some(vec![a + 3 * PAGE]),
                     sums: Arc::new(RecordSums {
                         pages: vec![10, 11, 12],
                         row: Some(13),
@@ -254,7 +254,7 @@ mod tests {
                 },
                 MemorySpan {
                     pages: vec![b, b + PAGE],
-                    row: Some(b + 2 * PAGE),
+                    row: Some(vec![b + 2 * PAGE]),
                     sums: Arc::new(RecordSums {
                         pages: vec![20, 21],
                         row: Some(22),
@@ -262,7 +262,16 @@ mod tests {
                 },
             ],
             page_bytes: PAGE,
-            row_bytes: ROW,
+            layout: crate::Layout {
+                page_tokens: 16,
+                page_record_bytes: PAGE as u64,
+                row_record_bytes: ROW as u64,
+                ranks: vec![crate::geometry::RankLayout {
+                    page_offset: 0,
+                    plane_offsets: vec![0],
+                    row_offset: 0,
+                }],
+            },
             keys: vec![key(48, 1), key(80, 2)],
             releases: releases.clone(),
         };

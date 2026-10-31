@@ -1131,8 +1131,8 @@ fn restore_salted(
 /// A pooled store over a standalone memory store of `pages` pages, with its
 /// own simulated device.
 fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
-    let (transfers, gpu) = SimulatedGpu::shared(&geo()).unwrap();
-    let pool = SlabPool::new(PAGE as u64, pages, ROW as u64, pages, true).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
+    let pool = SlabPool::new(PAGE as u64, 2 * pages, true).unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
     let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
     let store =
@@ -1210,8 +1210,8 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let layout = Layout::new(&geometry).unwrap();
     let fingerprint = fingerprint(&geometry);
     // Memory holds two records of two pages; the disk tier, two files.
-    let (memory_transfers, gpu) = SimulatedGpu::shared(&geometry).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 4, ROW as u64, 4, true).unwrap();
+    let (memory_transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let pool = SlabPool::new(PAGE as u64, 8, true).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
     let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1227,7 +1227,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     )
     .unwrap()
     .length_with_row();
-    let (disk_transfers, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let (disk_transfers, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
     let disk = DiskStore::new(
         lock,
         [7; 32],
@@ -1287,15 +1287,22 @@ fn drained_records_are_announced_and_claimable_after_restart() {
         let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
         let lock = flare_selene::testing::directory_lock(&directory).unwrap();
-        let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
-        let (memory_copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
+        let scanned = record::scan(
+            &lock,
+            &[7; 32],
+            &fingerprint,
+            geometry[0].page_tokens,
+            &record::rank_sizes(&geometry),
+        )
+        .unwrap();
+        let (memory_copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let memory = MemoryStore::new_flat(
             [7; 32],
-            SlabPool::new(PAGE as u64, 16, ROW as u64, 4, true).unwrap(),
+            SlabPool::new(PAGE as u64, 20, true).unwrap(),
             memory_copier,
         )
         .unwrap();
-        let (disk_copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+        let (disk_copier, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let disk = DiskStore::new(
             lock,
             [7; 32],

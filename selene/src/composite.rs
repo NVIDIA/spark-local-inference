@@ -238,7 +238,7 @@ impl CompositeStore {
     }
 
     /// Host addresses of a ready memory record's page slabs and row slab.
-    fn slab_addresses(&self, key: &PrefixKey) -> Result<(Vec<usize>, Option<usize>)> {
+    fn slab_addresses(&self, key: &PrefixKey) -> Result<(Vec<usize>, Option<Vec<usize>>)> {
         let record = self
             .memory
             .record(key)
@@ -250,7 +250,10 @@ impl CompositeStore {
                 .iter()
                 .map(|slab| pool.page_address(*slab))
                 .collect(),
-            record.row.map(|slab| pool.row_address(slab)),
+            record
+                .row
+                .as_ref()
+                .map(|slots| slots.iter().map(|&slot| pool.page_address(slot)).collect()),
         ))
     }
 
@@ -284,7 +287,7 @@ impl CompositeStore {
                 rows += usize::from(node.location.row.is_some());
             }
         }
-        pages <= self.memory.pool().page_count() && rows <= self.memory.pool().row_count()
+        pages + rows * self.memory.layout().row_slots() <= self.memory.pool().page_count()
     }
 
     fn fail_children(&mut self, key: PrefixKey) {
@@ -564,16 +567,12 @@ impl CompositeStore {
 
     /// Memory slabs the parked and writing records give back once their files
     /// commit.
-    fn spillable_slabs(&self) -> (usize, usize) {
+    fn spillable_slabs(&self) -> usize {
         self.parked
             .keys()
             .filter_map(|key| self.memory.record(key))
-            .fold((0, 0), |(pages, rows), record| {
-                (
-                    pages + record.pages.len(),
-                    rows + usize::from(record.row.is_some()),
-                )
-            })
+            .map(|record| record.pages.len() + record.row.as_ref().map_or(0, Vec::len))
+            .sum()
     }
 
     /// Start the file write of a parked record.
@@ -705,7 +704,10 @@ impl CompositeStore {
             .iter()
             .map(|slab| pool.page_address(*slab))
             .collect();
-        let row = record.row.map(|slab| pool.row_address(slab));
+        let row = record
+            .row
+            .as_ref()
+            .map(|slots| slots.iter().map(|&slot| pool.page_address(slot)).collect());
         let id = self.disk.next_job();
         let submitted = self
             .staged()
@@ -1012,14 +1014,8 @@ impl HostStore for CompositeStore {
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
-        let (mut pages, mut rows) = self.memory.reclaimable_slabs();
-        if !self.parked.is_empty() {
-            // Parked records free their slabs once written.
-            let (spillable_pages, spillable_rows) = self.spillable_slabs();
-            pages += spillable_pages;
-            rows += spillable_rows;
-        }
-        if tail.len() > pages || rows == 0 {
+        let slots = self.memory.reclaimable_slabs() + self.spillable_slabs();
+        if tail.len() + self.memory.layout().row_slots() > slots {
             let result = self.disk.store(checkpoint);
             match &result {
                 Ok(outcome) if *outcome != StoreOutcome::Queued => self.stats.store_skipped += 1,
@@ -1269,7 +1265,7 @@ impl HostStore for CompositeStore {
                 let (pages, rows) = self.memory.headroom();
                 self.spill_parked(
                     pages.saturating_sub(self.memory.pool().free_pages()),
-                    rows.saturating_sub(self.memory.pool().free_rows()),
+                    rows.saturating_sub(0),
                 );
             } else {
                 self.spill_parked(usize::MAX, usize::MAX);
@@ -1470,7 +1466,7 @@ mod tests {
         disk::DiskThread,
         memory::MemoryRecord,
         record,
-        slab::{PageSlab, RowSlab, SlabPool},
+        slab::{SlabPool, Slot},
         testing::geometry as rank,
     };
     use std::{fs, path::Path};
@@ -1522,7 +1518,12 @@ mod tests {
     ) -> CompositeStore {
         let geometry = geometry();
         let transfers = StoppedCopier::shared(&geometry).unwrap();
-        let pool = SlabPool::new(PAGE_RECORD, pages, ROW_RECORD, rows, true).unwrap();
+        let pool = SlabPool::new(
+            PAGE_RECORD,
+            (pages) + (rows) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
+            true,
+        )
+        .unwrap();
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let directory_lock = crate::testing::directory_lock(directory).unwrap();
         let scanned = record::scan(&directory_lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
@@ -1547,16 +1548,16 @@ mod tests {
 
     /// Fill a slab through its address. The pool's mapping is valid for its
     /// lifetime and the test touches a slab only while no job references it.
-    fn fill_page(pool: &SlabPool, slab: PageSlab, seed: u64) {
+    fn fill_page(pool: &SlabPool, slab: Slot, seed: u64) {
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(pool.page_address(slab) as *mut u8, pool.page_bytes())
         };
         pattern(bytes, seed);
     }
 
-    fn fill_row(pool: &SlabPool, slab: RowSlab, seed: u64) {
+    fn fill_row(pool: &SlabPool, slab: Slot, seed: u64) {
         let bytes = unsafe {
-            std::slice::from_raw_parts_mut(pool.row_address(slab) as *mut u8, pool.row_bytes())
+            std::slice::from_raw_parts_mut(pool.page_address(slab) as *mut u8, ROW_RECORD as usize)
         };
         pattern(bytes, seed);
     }
@@ -1578,7 +1579,11 @@ mod tests {
         for (index, slab) in record.pages.iter().enumerate() {
             fill_page(store.memory.pool(), *slab, seed + index as u64);
         }
-        fill_row(store.memory.pool(), record.row.unwrap(), seed + 1000);
+        fill_row(
+            store.memory.pool(),
+            record.row.as_ref().unwrap()[0],
+            seed + 1000,
+        );
         store.memory.complete_record(&key, true).unwrap();
         record
     }
@@ -1591,8 +1596,8 @@ mod tests {
             .iter()
             .map(|slab| pool.page(*slab).to_vec())
             .collect();
-        if let Some(row) = record.row {
-            bytes.push(pool.row(row).to_vec());
+        if let Some(row) = &record.row {
+            bytes.push(pool.page(row[0])[..ROW_RECORD as usize].to_vec());
         }
         bytes
     }
@@ -1779,7 +1784,7 @@ mod tests {
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
-        assert_eq!(store.memory.pool().free_pages(), 4);
+        assert_eq!(store.memory.pool().free_pages(), 6);
         assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
         let parent_pins = store.disk.index().node(&root.key).unwrap().pins();
@@ -1808,13 +1813,7 @@ mod tests {
         assert_eq!(store.stats().store_failed, 2);
         assert!(store.memory.index().is_empty());
         assert!(store.disk.index().is_empty());
-        assert_eq!(
-            (
-                store.memory.pool().free_pages(),
-                store.memory.pool().free_rows()
-            ),
-            (4, 2)
-        );
+        assert_eq!((store.memory.pool().free_pages()), 6);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
@@ -1865,7 +1864,14 @@ mod tests {
         let geometry = geometry();
         let layout = Layout::new(&geometry).unwrap();
         let transfers = StoppedCopier::shared(&geometry).unwrap();
-        let pool = || SlabPool::new(PAGE_RECORD, 4, ROW_RECORD, 2, true).unwrap();
+        let pool = || {
+            SlabPool::new(
+                PAGE_RECORD,
+                (4) + (2) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
+                true,
+            )
+            .unwrap()
+        };
         let staging = || Some(SlabPool::staging(&layout).unwrap());
         let disk = |identity: [u8; 32], staging: Option<SlabPool>, shared: bool| {
             let disk_transfers = if shared {
@@ -1898,7 +1904,7 @@ mod tests {
         assert_eq!(
             store.stats(),
             StoreStats {
-                rows_total: 2,
+                rows_total: 6,
                 outbound_rate: INITIAL_MEMORY_RATE,
                 inbound_rate: INITIAL_MEMORY_RATE,
                 ..StoreStats::default()
@@ -2072,7 +2078,7 @@ mod tests {
             (1, bytes, 0)
         );
         assert_eq!((stats.memory_records, stats.disk_records), (1, 1));
-        assert_eq!(stats.memory_bytes, 10 * PAGE_RECORD + ROW_RECORD);
+        assert_eq!(stats.memory_bytes, 11 * PAGE_RECORD);
         assert_eq!(stats.disk_bytes, header.length_with_row());
         assert_eq!(stats.outbound_in_flight, 0);
 
@@ -3165,13 +3171,13 @@ mod tests {
         let Some(directory) = test_directory("composite", "large-record-headroom") else {
             return;
         };
-        let mut store = composite(&directory, 100, 16, 1 << 30);
+        let mut store = composite(&directory, 84, 16, 1 << 30);
         let mut ids = Ids::new();
         for salt in 1..=4 {
             parked_root(&mut store, &mut ids, salt, 22 * PAGE_TOKENS);
         }
         assert_eq!(store.memory.headroom().0, 22);
-        assert_eq!(store.memory.pool().free_pages(), 12);
+        assert_eq!(store.memory.pool().free_pages(), 8);
         assert!(store.jobs.is_empty());
         store.poll(&mut Vec::new()).unwrap();
         assert!(store.parked.values().any(|record| record.writing));
@@ -3227,7 +3233,9 @@ mod tests {
         let disk = store.disk.record(&held.key).unwrap();
         let mut expected = disk.header.clone();
         let memory = store.memory.record(&held.key).unwrap();
-        expected.row_checksum = record::checksum(store.memory.pool().row(memory.row.unwrap()));
+        expected.row_checksum = record::checksum(
+            &store.memory.pool().page(memory.row.as_ref().unwrap()[0])[..ROW_RECORD as usize],
+        );
         assert_eq!(
             Header::decode(&fs::read(&disk.path).unwrap()).unwrap(),
             expected
@@ -3782,10 +3790,15 @@ mod tests {
         // Room for one one-page record's file beside the header overhead.
         let limit = 2 * (record_bytes + 4096 * 3);
         let mut store = composite(&directory, 16, 16, limit);
-        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry()).unwrap();
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry()).unwrap();
         store.memory = MemoryStore::new_flat(
             IDENTITY,
-            SlabPool::new(PAGE_RECORD, 16, ROW_RECORD, 16, true).unwrap(),
+            SlabPool::new(
+                PAGE_RECORD,
+                (16) + (16) * (ROW_RECORD).div_ceil(PAGE_RECORD) as usize,
+                true,
+            )
+            .unwrap(),
             copier,
         )
         .unwrap();
@@ -3858,7 +3871,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "pooled-spill-notice") else {
             return;
         };
-        let mut store = composite(&directory, 32, 4, 1 << 30);
+        let mut store = composite(&directory, 30, 4, 1 << 30);
         let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
         store.announce_to(announcer.clone());

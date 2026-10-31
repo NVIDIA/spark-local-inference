@@ -58,6 +58,12 @@ CPU-mapped destination and the page planes are mapped only on the GPU side.
 A GPUDirect Storage transport could remove payload staging; its indexes and
 I/O control structures would still occupy host memory.
 
+Host checkpoint memory uses equal page-record-sized slots. Rows occupy several
+slots (for example, 23 for DeepSeek and 135 for Qwen TP1), with each rank's row
+pieces in its share of each slot. A row smaller than a slot uses a whole slot;
+this avoids the previous fixed 25% row split. Disk record bytes and checksums
+are unchanged.
+
 ## 2. Design
 
 ### 2.1 Checkpoint bytes

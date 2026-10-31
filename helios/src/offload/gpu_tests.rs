@@ -114,7 +114,12 @@ mod memory {
             seed(row_plane, source_slot),
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(
+            &layout,
+            2 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+                * layout.page_record_bytes,
+        )
+        .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -267,7 +272,12 @@ mod memory {
             0xDD,
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(
+            &layout,
+            2 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+                * layout.page_record_bytes,
+        )
+        .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -329,13 +339,24 @@ mod memory {
                     );
                 }
             }
-            let row_start = layout.ranks[0].row_offset as usize;
+            let slots: Vec<_> = record
+                .row
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&slot| pool.page_address(slot))
+                .collect();
+            let actual: Vec<u8> = flare_selene::slab::row_pieces(&layout, &slots)
+                .flat_map(|(address, _, len)| {
+                    unsafe { std::slice::from_raw_parts(address as *const u8, len) }.to_vec()
+                })
+                .collect();
             let mut expected = vec![0u8; rank.row.unit_bytes as usize];
             fill(&mut expected, seed(row_plane, source_slot));
-            assert!(
-                pool.row(record.row.unwrap())[row_start..row_start + expected.len()]
-                    == expected[..],
-                "{label}: row slab bytes differ from the device"
+            assert_eq!(
+                &actual[..expected.len()],
+                &expected[..],
+                "{label}: row bytes differ from the device"
             );
         };
         check_record(&store, &checkpoint.key, "first record");
@@ -422,9 +443,7 @@ mod memory {
         // A pool holding one record evicts it when a second key is stored.
         let mut small = SlabPool::new(
             layout.page_record_bytes,
-            3,
-            layout.row_record_bytes,
-            1,
+            (3) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
             true,
         )
         .unwrap();
@@ -439,7 +458,7 @@ mod memory {
             StoreEvent::Stored { result: Ok(_), .. }
         ));
         assert_eq!(store.pool().free_pages(), 0);
-        assert_eq!(store.pool().free_rows(), 0);
+        assert_eq!(store.pool().free_pages(), 0);
         let mut other = PrefixHistory::new(IDENTITY);
         other.append(&tokens[..consumed as usize], &[]).unwrap();
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
@@ -604,9 +623,7 @@ mod composite {
         }
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
+            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
             true,
         )
         .unwrap();
@@ -796,15 +813,18 @@ mod composite {
 
         // Restart: a fresh composite over the scanned directory and an empty memory pool.
         let directory_lock = flare_selene::testing::directory_lock(&directory).unwrap();
-        let scanned =
-            flare_selene::record::scan(&directory_lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &flare_selene::record::rank_sizes(&geometry))
-                .unwrap();
+        let scanned = flare_selene::record::scan(
+            &directory_lock,
+            &IDENTITY,
+            &fingerprint,
+            geometry[0].page_tokens,
+            &flare_selene::record::rank_sizes(&geometry),
+        )
+        .unwrap();
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
+            (16) + (4) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
             true,
         )
         .unwrap();
@@ -952,9 +972,7 @@ mod composite {
         // one page to spare; a third record evicts the least recently used.
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            7,
-            layout.row_record_bytes,
-            2,
+            (7) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
             true,
         )
         .unwrap();
@@ -1215,9 +1233,7 @@ mod composite {
         let open_small = || {
             let mut pool = SlabPool::new(
                 layout.page_record_bytes,
-                1,
-                layout.row_record_bytes,
-                1,
+                (1) + (1) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
                 true,
             )
             .unwrap();
@@ -1228,9 +1244,7 @@ mod composite {
             let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
             let mut staging_pool = SlabPool::new(
                 layout.page_record_bytes,
-                3,
-                layout.row_record_bytes,
-                2,
+                (3) + (2) * (layout.row_record_bytes).div_ceil(layout.page_record_bytes) as usize,
                 true,
             )
             .unwrap();
@@ -1531,7 +1545,7 @@ mod disk_store {
 
         fn staging_free(store: &mut DiskStore) -> (usize, usize) {
             let pool = store.transport_mut().staged_mut().unwrap().pool().unwrap();
-            (pool.free_pages(), pool.free_rows())
+            (pool.free_pages(), pool.free_pages())
         }
         let scan = |lock: &record::DirectoryLock| {
             record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()

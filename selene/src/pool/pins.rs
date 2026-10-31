@@ -95,7 +95,7 @@ fn check_window(
 pub(crate) struct MemorySpan {
     /// Addresses of every tail page of the record.
     pub pages: Vec<usize>,
-    pub row: Option<usize>,
+    pub row: Option<Vec<usize>>,
     pub sums: Arc<RecordSums>,
 }
 
@@ -105,7 +105,7 @@ pub struct MemoryPin {
     pub(crate) chain: HostChain,
     pub(crate) spans: Vec<MemorySpan>,
     pub(crate) page_bytes: usize,
-    pub(crate) row_bytes: usize,
+    pub(crate) layout: crate::Layout,
     pub(crate) keys: Vec<PrefixKey>,
     pub(crate) releases: Releases,
 }
@@ -121,7 +121,7 @@ impl HostPin for MemoryPin {
             window,
             dst,
             self.page_bytes as u64,
-            self.row_bytes as u64,
+            self.layout.row_record_bytes,
         )?;
         let span = &self.spans[window.record as usize];
         let mut offset = 0;
@@ -135,11 +135,15 @@ impl HostPin for MemoryPin {
             pages.push(span.sums.pages[page as usize]);
         }
         let row = if window.row {
-            let source = span
+            let slots = span
                 .row
+                .as_ref()
                 .ok_or_else(|| Error::new("the record has no row"))?;
-            let bytes = unsafe { std::slice::from_raw_parts(source as *const u8, self.row_bytes) };
-            dst[offset..offset + self.row_bytes].copy_from_slice(bytes);
+            for (address, record_offset, len) in crate::slab::row_pieces(&self.layout, slots) {
+                let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
+                let start = offset + record_offset as usize;
+                dst[start..start + len].copy_from_slice(bytes);
+            }
             span.sums.row
         } else {
             None
@@ -369,11 +373,20 @@ mod tests {
             chain: host_chain(16, 16, true, &nodes),
             spans: vec![MemorySpan {
                 pages: vec![base, base + page, base + 2 * page],
-                row: Some(base + 3 * page),
+                row: Some(vec![base + 3 * page]),
                 sums,
             }],
             page_bytes: page,
-            row_bytes: 32,
+            layout: crate::Layout {
+                page_tokens: 16,
+                page_record_bytes: page as u64,
+                row_record_bytes: 32,
+                ranks: vec![crate::geometry::RankLayout {
+                    page_offset: 0,
+                    plane_offsets: vec![0],
+                    row_offset: 0,
+                }],
+            },
             keys: vec![key(48, 1)],
             releases: releases.clone(),
         };

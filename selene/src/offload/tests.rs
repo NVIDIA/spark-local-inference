@@ -187,7 +187,7 @@ fn zero_disk_limit_does_not_create_a_record_directory() {
 fn zero_disk_limit_avoids_disk_setup_when_memory_is_enabled() {
     let directory = test_directory();
     let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
-    let memory_bytes = slab::SlabPool::minimum_bytes(&Layout::new(&geometry).unwrap());
+    let memory_bytes = 4096;
     let error = prepare(
         &PrefixCacheOffload {
             memory_bytes: Some(memory_bytes),
@@ -265,7 +265,11 @@ fn sizes_parse_binary_suffixes_like_the_ignition_configuration() {
 fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
     let layout = Layout {
         page_tokens: 64,
-        ranks: Vec::new(),
+        ranks: vec![crate::geometry::RankLayout {
+            page_offset: 0,
+            plane_offsets: vec![0],
+            row_offset: 0,
+        }],
         page_record_bytes: 32 << 20,
         row_record_bytes: 8 << 20,
     };
@@ -277,7 +281,7 @@ fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
         ((8u64 << 30) / 512 + STORE_DEVICE_MARGIN_BYTES, 16 << 30)
     );
     options.disk = Some("records".into());
-    let staging = 256 * (32u64 << 20) + 4 * (8u64 << 20);
+    let staging = 260 * (32u64 << 20);
     let host = (16u64 << 30) + staging;
     assert_eq!(
         options.headroom_bytes(2, &layout).unwrap(),
@@ -304,7 +308,7 @@ fn ordinary_input_share_preserves_checkpoint_minimum_and_mapping() {
         memory_bytes: Some(1 << 30),
         ..Default::default()
     };
-    let ordinary = input_memory_bytes(1 << 30, slab::SlabPool::minimum_bytes(&layout), true);
+    let ordinary = input_memory_bytes(1 << 30, layout.page_record_bytes * 128, true);
     let (device, host) = options.headroom_with_inputs(2, &layout, true).unwrap();
     assert_eq!(host, 1 << 30);
     assert_eq!(
@@ -318,7 +322,7 @@ fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
     let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let layout = Layout::new(&geometry).unwrap();
     let mut options = PrefixCacheOffload {
-        memory_bytes: Some(slab::SlabPool::minimum_bytes(&layout)),
+        memory_bytes: Some(layout.page_record_bytes * 128),
         pool: Some(pool("unix:/run/selene.sock")),
         ..Default::default()
     };
@@ -336,7 +340,7 @@ fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
         prepared
     };
     let prepared = build(&options);
-    let rows = prepared.memory_pool.as_ref().unwrap().row_count();
+    let rows = prepared.memory_pool.as_ref().unwrap().page_count();
     assert!(prepared.pool_row_warning(rows).is_none());
     let warning = prepared.pool_row_warning(rows + 1).unwrap();
     assert!(warning.contains(&format!("{rows} record rows for max concurrency {}", rows + 1)));

@@ -34,7 +34,7 @@ pub struct Job {
     pub window: u32,
     pub direction: Direction,
     pub pages: Vec<(PageId, usize)>,
-    pub row: Option<(StateSlotId, usize)>,
+    pub row: Option<(StateSlotId, Vec<usize>)>,
 }
 
 #[derive(Debug)]

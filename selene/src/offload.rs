@@ -76,13 +76,10 @@ impl PrefixCacheOffload {
         let staging = if disk {
             layout
                 .page_record_bytes
-                .checked_mul(slab::STAGING_PAGE_SLABS as u64)
-                .and_then(|n| {
-                    layout
-                        .row_record_bytes
-                        .checked_mul(slab::STAGING_ROW_SLABS as u64)
-                        .and_then(|rows| n.checked_add(rows))
-                })
+                .checked_mul(
+                    (slab::STAGING_PAGE_SLABS + slab::STAGING_ROW_SLABS * layout.row_slots())
+                        as u64,
+                )
                 .ok_or("prefix cache staging memory overflows the device budget")?
         } else {
             0
@@ -90,7 +87,7 @@ impl PrefixCacheOffload {
         let host = memory
             .checked_add(staging)
             .ok_or("prefix cache host memory overflows the device budget")?;
-        let ordinary = input_memory_bytes(memory, slab::SlabPool::minimum_bytes(layout), inputs);
+        let ordinary = input_memory_bytes(memory, 0, inputs);
         let pinned = memory - ordinary;
         let mapped = if disk {
             pinned + staging
@@ -240,7 +237,7 @@ impl Preparation {
 
 impl Prepared {
     pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
-        let rows = self.memory_pool.as_ref()?.row_count();
+        let rows = self.memory_pool.as_ref()?.page_count() / self.layout.row_slots();
         let recommended = max_concurrency.saturating_mul(2);
         (rows < max_concurrency).then(|| {
             format!(
@@ -255,10 +252,9 @@ impl Prepared {
         let mut parts = Vec::new();
         if let Some(pool) = &self.memory_pool {
             parts.push(format!(
-                "memory {} ({} pages + {} rows{})",
+                "memory {} ({} slots{})",
                 gibibytes(pool.bytes()),
                 pool.page_count(),
-                pool.row_count(),
                 if pool.rank_parts().is_some() {
                     ", split by rank"
                 } else {
@@ -410,14 +406,6 @@ pub fn prepare_with_inputs(
     if shard.is_some() && memory_bytes != 0 {
         return Err("a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
-    let minimum = slab::SlabPool::minimum_bytes(&layout);
-    if memory_bytes != 0 && memory_bytes < minimum {
-        return Err(format!(
-            "host prefix cache memory {memory_bytes} is below the {minimum} bytes this package needs for one outbound and one inbound window"
-        )
-        .into());
-    }
-
     let mut notes = Vec::new();
     let directory = match options
         .disk
@@ -459,7 +447,7 @@ pub fn prepare_with_inputs(
         .first()
         .ok_or("the host prefix store requires at least one rank")?
         .0;
-    let input_memory = input_memory_bytes(memory_bytes, minimum, input_staging != 0);
+    let input_memory = input_memory_bytes(memory_bytes, 0, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
     let memory_pool = (checkpoint_memory != 0)
         .then(|| {

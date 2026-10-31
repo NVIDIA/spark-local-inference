@@ -1665,8 +1665,12 @@ pub(crate) fn jobs_of(
             .map(|i| (page_id(i), page_address(i)))
             .collect();
         let last = end == count;
-        let row =
-            (last && row).then(|| (slot.expect("a window with a row has a slot"), row_address));
+        let row = (last && row).then(|| {
+            (
+                slot.expect("a window with a row has a slot"),
+                vec![row_address],
+            )
+        });
         jobs.push(Job {
             id: JobId(0),
             window,
