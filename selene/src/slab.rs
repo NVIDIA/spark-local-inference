@@ -30,10 +30,6 @@ use crate::{HostRegistrar, Registration, Result, SplitMapping};
 
 use super::geometry::{BLOCK_BYTES, Layout, invalid};
 
-/// Page slabs in a staging pool: two outbound and two inbound windows.
-pub const STAGING_PAGE_SLABS: usize = 256;
-/// Row slabs in a staging pool.
-pub const STAGING_ROW_SLABS: usize = 4;
 /// Pages per transfer window.
 pub use crate::shared::WINDOW_PAGES;
 
@@ -125,6 +121,7 @@ struct Split {
 /// Shared slots with immutable mapping geometry and resource ownership.
 #[derive(Clone)]
 pub struct SlabPool {
+    pub(crate) intake_slots: usize,
     pub(crate) memory: Arc<Memory>,
     slots: Arc<Mutex<Slots>>,
 }
@@ -145,6 +142,7 @@ impl SlabPool {
         let base = flare_eos::map_host(mapping_bytes)
             .map_err(|error| invalid(format!("allocate host slots: {error}")))?;
         Ok(Self {
+            intake_slots: 0,
             memory: Arc::new(Memory {
                 mapping: base,
                 mapping_bytes,
@@ -213,6 +211,7 @@ impl SlabPool {
             })
             .collect();
         Ok(Self {
+            intake_slots: 0,
             memory: Arc::new(Memory {
                 mapping: base,
                 mapping_bytes: memory.nbytes(),
@@ -268,14 +267,6 @@ impl SlabPool {
                 part_bytes: self.page_bytes(),
             })
             .collect()
-    }
-
-    /// Non-retaining slots for two inbound and two outbound windows.
-    pub fn staging(layout: &Layout) -> Result<Self> {
-        Self::new(
-            layout.page_record_bytes,
-            STAGING_PAGE_SLABS + STAGING_ROW_SLABS * layout.row_slots(),
-        )
     }
 
     /// Register the mapping through `registrar` as portable so every rank's context

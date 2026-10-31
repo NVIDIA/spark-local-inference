@@ -1392,7 +1392,7 @@ mod disk_store {
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
         record::{self, Scanned},
-        slab::{STAGING_PAGE_SLABS, SlabPool},
+        slab::SlabPool,
     };
 
     use crate::{
@@ -1516,8 +1516,9 @@ mod disk_store {
             source_slot,
         );
 
+        let intake = flare_selene::offload::intake_slots(&layout, 1);
         let open = |scanned: Vec<Scanned>, limit: u64| -> DiskStore {
-            let mut pool = SlabPool::staging(&layout).unwrap();
+            let mut pool = SlabPool::new(layout.page_record_bytes, intake).unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -1535,9 +1536,9 @@ mod disk_store {
             .unwrap()
         };
 
-        fn staging_free(store: &mut DiskStore) -> (usize, usize) {
+        fn staging_free(store: &mut DiskStore) -> usize {
             let pool = store.transport_mut().staged_mut().unwrap().pool().unwrap();
-            (pool.free_pages(), pool.free_pages())
+            pool.free_pages()
         }
         let scan = |lock: &record::DirectoryLock| {
             record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()
@@ -1574,7 +1575,7 @@ mod disk_store {
             (stats.stored, stats.bytes_out, stats.disk_bytes),
             (1, bytes, bytes)
         );
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
 
         // Poison the source pages and row, then restore into fresh ids and another slot.
         write_pages(&mut write_unit, &source_pages, &|plane, _| {
@@ -1605,7 +1606,7 @@ mod disk_store {
         };
         assert_eq!(key, root.key);
         assert_eq!(result.unwrap(), layout.record_bytes(u64::from(PAGES)));
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
         let stats = store.stats();
         assert_eq!((stats.fetched, stats.reused_tokens), (1, consumed));
         let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
@@ -1714,7 +1715,7 @@ mod disk_store {
         );
         assert_eq!(child_bytes, child_header.length_with_row());
         assert_eq!(scan(&store.directory_lock).len(), 2);
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
 
         // Above a resident checkpoint five pages into the root, the chain
         // restores through both files: the root's remaining pages, then the
@@ -1767,7 +1768,7 @@ mod disk_store {
             child_slot,
             restored_slot,
         );
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
         assert_eq!(store.stats().fetched, 2);
         store.close().unwrap();
         drop(store);

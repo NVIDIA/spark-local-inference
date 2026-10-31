@@ -1417,7 +1417,13 @@ fn large_recovered_nvme_records_restore_consecutively() {
             geometry,
             scanned,
             Box::new(Staged::new(
-                Some(SlabPool::staging(&layout).unwrap()),
+                Some(
+                    SlabPool::new(
+                        layout.page_record_bytes,
+                        flare_selene::offload::intake_slots(&layout, 1),
+                    )
+                    .unwrap(),
+                ),
                 copier,
                 DiskThread::start("recovered-pair").unwrap(),
             )),

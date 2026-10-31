@@ -534,6 +534,7 @@ impl NativeModel {
             let (device, host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
                 &flare_selene::Layout::new(&geometry)?,
+                active,
                 staging != 0,
             )?;
             let index = if staging == 0 {

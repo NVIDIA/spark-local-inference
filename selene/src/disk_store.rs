@@ -2564,12 +2564,8 @@ impl crate::store::TierStore for DiskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Ids, checkpoint, pattern, test_directory};
+    use crate::testing::{Ids, checkpoint, geometry as rank, pattern, test_directory};
     use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
-    use crate::{
-        slab::{STAGING_PAGE_SLABS, STAGING_ROW_SLABS},
-        testing::geometry as rank,
-    };
     use std::{
         cell::RefCell,
         fs,
@@ -4161,7 +4157,12 @@ mod tests {
 
     /// Caller-owned aligned buffers: the slabs of an unregistered pool.
     fn host_pool() -> SlabPool {
-        SlabPool::staging(&Layout::new(&geometry()).unwrap()).unwrap()
+        let layout = Layout::new(&geometry()).unwrap();
+        SlabPool::new(
+            layout.page_record_bytes,
+            crate::offload::intake_slots(&layout, 1),
+        )
+        .unwrap()
     }
 
     fn page_slabs(pool: &mut SlabPool, count: usize, seed: u64) -> Vec<Slot> {
@@ -4453,13 +4454,13 @@ mod tests {
         };
         let geometry = geometry();
         let layout = Layout::new(&geometry).unwrap();
-        let mut pool = host_pool();
+        const PAGES: usize = WINDOW_PAGES + 6;
+        let mut pool = SlabPool::new(PAGE_RECORD, 2 * layout.record_slots(PAGES, true)).unwrap();
         let mut staged = Staged::new(
             None,
             stopped_transfers(),
             DiskThread::start("flare-offload-disk").unwrap(),
         );
-        const PAGES: usize = WINDOW_PAGES + 6;
         let full = history(5000);
         let consumed = PAGES as u64 * PAGE_TOKENS + 3;
         let header = header(&geometry, &full, consumed, None);
@@ -4764,7 +4765,13 @@ mod tests {
         let layout = Layout::new(&geometry).unwrap();
         let mut host = host_pool();
         let mut staged = Staged::new(
-            Some(SlabPool::staging(&layout).unwrap()),
+            Some(
+                SlabPool::new(
+                    layout.page_record_bytes,
+                    crate::offload::intake_slots(&layout, 1),
+                )
+                .unwrap(),
+            ),
             stopped_transfers(),
             DiskThread::start("flare-offload-disk").unwrap(),
         );
@@ -4774,7 +4781,7 @@ mod tests {
             let pool = staged.pool().unwrap();
             (pool.free_pages(), pool.free_pages())
         };
-        let count = STAGING_PAGE_SLABS + STAGING_ROW_SLABS * layout.row_slots();
+        let count = crate::offload::intake_slots(&layout, 1);
         let all = (count, count);
         assert_eq!(free(&staged), all);
 

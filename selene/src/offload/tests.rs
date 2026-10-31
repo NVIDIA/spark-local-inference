@@ -36,6 +36,7 @@ fn prepare_with_inputs(
         identity,
         geometry,
         contexts,
+        1,
         inputs,
         shard,
         &crate::testing::IdentityRegistrar,
@@ -262,7 +263,7 @@ fn sizes_parse_binary_suffixes_like_the_ignition_configuration() {
 }
 
 #[test]
-fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
+fn memory_headroom_accounts_for_warm_slots_and_intake() {
     let layout = Layout {
         page_tokens: 64,
         ranks: vec![crate::geometry::RankLayout {
@@ -275,26 +276,33 @@ fn memory_headroom_accounts_for_the_actual_host_staging_geometry() {
     };
     let mut options = PrefixCacheOffload::default();
     assert_eq!(options.headroom_bytes(2, &layout).unwrap(), (0, 0));
+    let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     options.memory_bytes = Some(16 << 30);
     assert_eq!(
         options.headroom_bytes(2, &layout).unwrap(),
-        ((8u64 << 30) / 512 + STORE_DEVICE_MARGIN_BYTES, 16 << 30)
+        (
+            ((16u64 << 30) + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES,
+            (16 << 30) + intake
+        )
     );
     options.disk = Some("records".into());
-    let host = 16u64 << 30;
+    let host = (16u64 << 30) + intake;
     assert_eq!(
         options.headroom_bytes(2, &layout).unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
     options.memory_bytes = Some(0);
-    let staging = 260 * (32u64 << 20);
+    let staging = intake;
     assert_eq!(
         options.headroom_bytes(2, &layout).unwrap(),
         (staging.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, staging)
     );
     options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
-    assert_eq!(options.headroom_bytes(2, &layout).unwrap().1, 16 << 30);
+    assert_eq!(
+        options.headroom_bytes(2, &layout).unwrap().1,
+        (16 << 30) + intake
+    );
 }
 
 #[test]
@@ -305,7 +313,11 @@ fn ordinary_input_share_preserves_mapping() {
     assert_eq!(input_memory_bytes(1 << 30, false), 0);
     let layout = Layout {
         page_tokens: 64,
-        ranks: Vec::new(),
+        ranks: vec![crate::geometry::RankLayout {
+            page_offset: 0,
+            plane_offsets: vec![0],
+            row_offset: 0,
+        }],
         page_record_bytes: 4096,
         row_record_bytes: 4096,
     };
@@ -314,11 +326,12 @@ fn ordinary_input_share_preserves_mapping() {
         ..Default::default()
     };
     let ordinary = input_memory_bytes(1 << 30, true);
-    let (device, host) = options.headroom_with_inputs(2, &layout, true).unwrap();
-    assert_eq!(host, 1 << 30);
+    let (device, host) = options.headroom_with_inputs(2, &layout, 1, true).unwrap();
+    let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
+    assert_eq!(host, (1 << 30) + intake);
     assert_eq!(
         device,
-        ((1u64 << 30) - ordinary).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
+        ((1u64 << 30) - ordinary + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
     );
 }
 
@@ -480,4 +493,52 @@ fn disk_and_memory_share_one_registration_with_independent_copiers_and_safe_clos
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
+}
+
+#[test]
+fn intake_sizes_active_rows_and_rounds_warm_memory_down() {
+    let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 3 * 4096)];
+    let layout = Layout::new(&geometry).unwrap();
+    let active = 32;
+    assert_eq!(
+        intake_slots(&layout, active),
+        2 * active * 3 + 2 * slab::WINDOW_PAGES
+    );
+    let options = PrefixCacheOffload {
+        memory_bytes: Some(17 * 4096 + 1),
+        pool: Some(pool("unix:/run/selene.sock")),
+        ..Default::default()
+    };
+    let Preparation::Store(prepared) = super::prepare_with_inputs(
+        &options,
+        std::path::Path::new("unused"),
+        [0; 32],
+        geometry,
+        vec![(0, 0)],
+        active,
+        0,
+        None,
+        &crate::testing::IdentityRegistrar,
+    )
+    .unwrap() else {
+        panic!("no store")
+    };
+    let pool = prepared.memory_pool.unwrap();
+    assert_eq!(pool.intake_slots, intake_slots(&layout, active));
+    assert_eq!(pool.page_count(), 17 + pool.intake_slots);
+}
+
+#[test]
+fn intake_shrinks_to_two_full_windows_without_refusing() {
+    let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 3 * 4096)]).unwrap();
+    let memory = u64::MAX - intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
+    let options = PrefixCacheOffload {
+        memory_bytes: Some(memory),
+        ..Default::default()
+    };
+    let (_, host) = options.headroom_with_inputs(1, &layout, 64, false).unwrap();
+    assert_eq!(
+        host - memory,
+        intake_slots(&layout, 1) as u64 * layout.page_record_bytes
+    );
 }

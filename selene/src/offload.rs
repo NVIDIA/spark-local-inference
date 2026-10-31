@@ -59,13 +59,14 @@ impl PrefixCacheOffload {
     /// pool costs each device about 2 MiB per GiB, plus transfer streams and events. Without
     /// a disk tier the retaining pool is split by rank; disk staging is shared by all ranks.
     pub fn headroom_bytes(&self, ranks: usize, layout: &Layout) -> Result<(u64, u64)> {
-        self.headroom_with_inputs(ranks, layout, false)
+        self.headroom_with_inputs(ranks, layout, 1, false)
     }
 
     pub fn headroom_with_inputs(
         &self,
         ranks: usize,
         layout: &Layout,
+        max_active: usize,
         inputs: bool,
     ) -> Result<(u64, u64)> {
         if !self.enabled() {
@@ -73,29 +74,24 @@ impl PrefixCacheOffload {
         }
         let memory = self.memory_bytes.unwrap_or(0);
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
-        let staging = if disk && memory == 0 {
-            layout
-                .page_record_bytes
-                .checked_mul(
-                    (slab::STAGING_PAGE_SLABS + slab::STAGING_ROW_SLABS * layout.row_slots())
-                        as u64,
-                )
-                .ok_or("prefix cache staging memory overflows the device budget")?
+        let intake = if memory != 0 || disk {
+            intake_slots(layout, max_active)
+                .min((host_pool_budget(memory)? / layout.page_record_bytes) as usize)
+                .max(intake_slots(layout, 1)) as u64
         } else {
             0
         };
+        let intake = intake
+            .checked_mul(layout.page_record_bytes)
+            .ok_or("prefix cache intake memory overflows the device budget")?;
         let host = memory
-            .checked_add(staging)
+            .checked_add(intake)
             .ok_or("prefix cache host memory overflows the device budget")?;
-        let ordinary = input_memory_bytes(memory, inputs);
-        let pinned = memory - ordinary;
-        let mapped = if disk {
-            pinned + staging
-        } else if self.pool.is_some() {
-            // Records a pool shares must be readable by the CPU, so the pool is not split.
-            pinned
+        let pinned = memory - input_memory_bytes(memory, inputs);
+        let mapped = if disk || self.pool.is_some() {
+            pinned + intake
         } else {
-            pinned.div_ceil(ranks.max(1) as u64)
+            (pinned + intake).div_ceil(ranks.max(1) as u64)
         };
         // Pool copy streams and events are fixed headroom. Hello's shared regions or
         // remote data staging are budgeted separately before sizing GPU caches.
@@ -111,6 +107,11 @@ impl PrefixCacheOffload {
         };
         Ok((tiers + pool, host))
     }
+}
+
+/// Slots for two publication bursts and two streaming windows.
+pub fn intake_slots(layout: &Layout, max_active: usize) -> usize {
+    2 * max_active * layout.row_slots() + 2 * slab::WINDOW_PAGES
 }
 
 /// Transfer streams, events, and their driver allocations on each GPU; eight streams
@@ -379,7 +380,7 @@ pub fn prepare(
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     prepare_with_inputs(
-        options, package, identity, geometry, contexts, 0, None, registrar,
+        options, package, identity, geometry, contexts, 1, 0, None, registrar,
     )
 }
 
@@ -389,6 +390,7 @@ pub fn prepare_with_inputs(
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
+    max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
     registrar: &dyn crate::HostRegistrar,
@@ -454,21 +456,24 @@ pub fn prepare_with_inputs(
     let checkpoint_memory = memory_bytes - input_memory;
     let memory_pool = (checkpoint_memory != 0 || directory.is_some())
         .then(|| {
-            // A pool shares what the CPU can read, so its memory is never split by rank.
-            if directory.is_none() && options.pool.is_none() {
-                return Ok(slab::SlabPool::sized_by_rank(
-                    &layout,
-                    checkpoint_memory,
-                    &contexts,
-                    registrar,
-                )?);
-            }
-            let mut pool = if checkpoint_memory != 0 {
-                slab::SlabPool::sized(&layout, checkpoint_memory)?
+            let (_, host) = options.headroom_with_inputs(
+                contexts.len(),
+                &layout,
+                max_active,
+                input_staging != 0,
+            )?;
+            let intake = ((host - memory_bytes) / layout.page_record_bytes) as usize;
+            let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
+                * layout.page_record_bytes;
+            // Shared records must be readable by the CPU.
+            let mut pool = if directory.is_none() && options.pool.is_none() {
+                slab::SlabPool::sized_by_rank(&layout, bytes, &contexts, registrar)?
             } else {
-                slab::SlabPool::staging(&layout)?
+                let mut pool = slab::SlabPool::sized(&layout, bytes)?;
+                pool.register(registrar, context)?;
+                pool
             };
-            pool.register(registrar, context)?;
+            pool.intake_slots = intake;
             Ok::<_, crate::Error>(pool)
         })
         .transpose()?;

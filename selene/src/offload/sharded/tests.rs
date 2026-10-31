@@ -105,6 +105,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
             [3; 32],
             vec![local.clone()],
             vec![(rank, 0)],
+            1,
             0,
             Some((rank, 2)),
             &IdentityRegistrar,
