@@ -81,18 +81,29 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
         panic!("no pool store")
     };
     assert_eq!(prepared.geometry.len(), 1);
+    assert!(prepared.memory_pool.is_none());
+    assert_eq!(prepared.warm_bytes, 0);
     assert_eq!(
         prepared.fingerprint,
         geometry::shard_fingerprint(&local, 1, 2)
     );
-    options.memory_bytes = Some(1);
-    assert!(
-        prepare(&options)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("disk only")
-    );
+    for pooled in [false, true] {
+        for disk in [false, true] {
+            options.pool = pooled.then(|| pool("unix:/run/selene.sock"));
+            options.disk = disk.then(|| test_directory());
+            options.memory_bytes = Some(1);
+            assert!(
+                prepare(&options)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("disk only")
+            );
+            if let Some(directory) = &options.disk {
+                assert!(!directory.exists());
+            }
+        }
+    }
 }
 
 #[test]
@@ -140,6 +151,10 @@ fn disabled_preparation_requires_no_geometry_context_or_worker_binding() {
         PrefixCacheOffload::default(),
         PrefixCacheOffload {
             memory_bytes: Some(0),
+            ..Default::default()
+        },
+        PrefixCacheOffload {
+            memory_bytes: Some(0),
             disk_limit: Some(0),
             ..Default::default()
         },
@@ -152,6 +167,7 @@ fn disabled_preparation_requires_no_geometry_context_or_worker_binding() {
             Vec::new(),
         )
         .unwrap();
+        assert_eq!(prepared.summary(), "disabled");
         assert!(matches!(&prepared, Preparation::None(reason) if reason == "disabled"));
         assert!(prepared.into_shared().is_none());
     }

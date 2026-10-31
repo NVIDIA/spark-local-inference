@@ -1025,7 +1025,7 @@ fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     store.evicted(checkpoint.key, None);
 }
 
-fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
+fn store_and_wait<S: HostStore + ?Sized>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     let deadline = Instant::now() + Duration::from_secs(20);
     'attempt: loop {
         let outcome = store.store(checkpoint).unwrap();
@@ -1063,7 +1063,7 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
 }
 
 /// Poll `store` until `done`.
-fn drive<S: HostStore>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -> bool) {
+fn drive<S: HostStore + ?Sized>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut events = Vec::new();
     while !done(store) {
@@ -1967,3 +1967,284 @@ impl TestPinParts {
 mod ranks;
 #[path = "client/tls.rs"]
 mod tls;
+
+#[test]
+fn offload_startup_and_restore_cover_every_tier_combination() {
+    use flare_selene::{
+        HostRegistrar, Registration, SplitMapping,
+        offload::*,
+        pool::{Budget, PoolBuilder, PoolOptions},
+    };
+    use std::cell::RefCell;
+
+    // With one rank, the split mapping has the ordinary record layout.
+    struct OneRank(CountingRegistrar);
+    struct Split(SlabPool);
+    impl SplitMapping for Split {
+        fn address(&self) -> usize {
+            self.0.page_address(flare_selene::slab::Slot(0))
+        }
+        fn nbytes(&self) -> usize {
+            self.0.bytes() as usize
+        }
+        fn part_address(&self, index: usize) -> usize {
+            assert_eq!(index, 0);
+            self.address()
+        }
+    }
+    impl HostRegistrar for OneRank {
+        fn register(
+            &self,
+            context: usize,
+            address: usize,
+            bytes: usize,
+        ) -> Result<Box<dyn Registration>> {
+            self.0.register(context, address, bytes)
+        }
+        fn map_split(&self, requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
+            assert_eq!(requests.len(), 1);
+            Ok(Box::new(Split(SlabPool::new(
+                PAGE as u64,
+                requests[0].2 / PAGE,
+            )?)))
+        }
+    }
+    #[derive(Default)]
+    struct Copiers(RefCell<Vec<GpuMemory>>);
+    impl CopierFactory for Copiers {
+        fn mapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+            _: &SlabPool,
+        ) -> Result<flare_selene::SharedCopier> {
+            let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry)?;
+            self.0.borrow_mut().push(gpu);
+            Ok(copier)
+        }
+        fn unmapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+        ) -> Result<Box<dyn flare_selene::PageCopier>> {
+            let (copier, gpu) = SimulatedGpu::new(&geometry)?;
+            self.0.borrow_mut().push(gpu);
+            Ok(Box::new(copier))
+        }
+    }
+
+    let manager = Manager::start();
+    for warm in [false, true] {
+        for disk in [false, true] {
+            for pooled in [false, true] {
+                let name = format!("matrix-{warm}-{disk}-{pooled}");
+                let Some(directory) = offload_directory(&name) else {
+                    return;
+                };
+                let options = PrefixCacheOffload {
+                    memory_bytes: Some(if warm { 512 * PAGE as u64 } else { 0 }),
+                    disk: disk.then(|| directory.clone()),
+                    disk_limit: Some(1 << 20),
+                    pool: pooled.then(|| PoolOptions {
+                        address: manager.address(),
+                        ca: None,
+                    }),
+                    ..Default::default()
+                };
+                let registrar = Arc::new(OneRank(CountingRegistrar::default()));
+                let factory = Copiers::default();
+                let mut startup = Startup::default();
+                if pooled {
+                    startup
+                        .start_pool(
+                            PoolBuilder {
+                                options: options.pool.as_ref().unwrap(),
+                                identity: [7; 32],
+                                geometry: &geo(),
+                                gpu_uuids: vec![[1; 16]],
+                                registration_context: 0,
+                                budget: Budget {
+                                    host: Ok(u64::MAX),
+                                    devices: vec![(u64::MAX, false)],
+                                },
+                                peers: None,
+                                disk,
+                            },
+                            registrar.clone(),
+                            |approved| {
+                                assert!(approved);
+                                Ok(true)
+                            },
+                        )
+                        .unwrap();
+                }
+                let preparation = prepare_with_inputs(
+                    &options,
+                    std::path::Path::new("unused"),
+                    [7; 32],
+                    geo(),
+                    vec![(0, 0)],
+                    8,
+                    0,
+                    None,
+                    registrar.as_ref(),
+                )
+                .unwrap();
+                if !warm && !disk && !pooled {
+                    assert_eq!(preparation.summary(), "disabled");
+                    assert!(matches!(preparation, Preparation::None(_)));
+                    assert_eq!(startup.attach(preparation, &factory).unwrap(), "disabled");
+                    assert!(startup.binding(0).is_none());
+                    std::fs::remove_dir_all(directory).unwrap();
+                    continue;
+                }
+                let Preparation::Store(prepared) = &preparation else {
+                    panic!("{name}: disabled")
+                };
+                assert_eq!(prepared.warm_bytes, options.memory_bytes.unwrap());
+                assert_eq!(prepared.memory_pool.is_some(), warm || disk);
+                if let Some(pool) = &prepared.memory_pool {
+                    assert_eq!(
+                        pool.page_count(),
+                        intake_slots(&prepared.layout, 8) + usize::from(warm) * 512
+                    );
+                    assert_eq!(pool.rank_parts().is_some(), warm && !disk && !pooled);
+                }
+                // The manager's two regions are separate from the local shared mapping.
+                assert_eq!(
+                    registrar.0.calls.lock().unwrap().len(),
+                    usize::from(pooled) * 2 + usize::from(disk || (warm && pooled))
+                );
+                startup.attach(preparation, &factory).unwrap();
+                let mut store =
+                    open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();
+                let salt = 1 + u32::from(warm) * 4 + u32::from(disk) * 2 + u32::from(pooled);
+                let (checkpoint, history) = publication(&factory.0.borrow()[0], salt, 2);
+                for gpu in factory.0.borrow().iter().skip(1) {
+                    publication(gpu, salt, 2);
+                }
+                store_and_wait(store.as_mut(), &checkpoint);
+                if warm || disk {
+                    store.evicted(checkpoint.key, None);
+                    let hit = store.lookup(&history, 0, u64::MAX).unwrap();
+                    store
+                        .fetch(
+                            hit,
+                            flare_selene::InboundTicket {
+                                key: checkpoint.key,
+                                pages: vec![PageId(300), PageId(301)],
+                                slot: StateSlotId(9),
+                            },
+                        )
+                        .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let mut events = Vec::new();
+                        store.poll(&mut events).unwrap();
+                        if let Some(StoreEvent::Fetched { result, .. }) = events
+                            .into_iter()
+                            .find(|event| matches!(event, StoreEvent::Fetched { .. }))
+                        {
+                            assert_eq!(
+                                result.map_err(|error| error.to_string()),
+                                Ok((2 * PAGE + ROW) as u64),
+                                "{name}"
+                            );
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "{name}: local restore stalled");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    let memories = factory.0.borrow();
+                    let restored = memories
+                        .iter()
+                        .find(|gpu| gpu.rows.lock().unwrap().contains_key(&9))
+                        .unwrap();
+                    for page in 0..2 {
+                        assert_eq!(
+                            restored.pages.lock().unwrap()[&(300 + page as u32)],
+                            salted_page(salt, page)
+                        );
+                    }
+                    assert_eq!(restored.rows.lock().unwrap()[&9], salted_row(salt));
+                }
+                if pooled {
+                    let mut requester = instance(&manager, 2);
+                    requester.ready();
+                    drive(store.as_mut(), "the published record", |_| {
+                        let ticket = requester.client.begin_lookup(&history, 0);
+                        wait("the lookup", || {
+                            !matches!(ticket.state(), LookupState::Pending)
+                        });
+                        matches!(ticket.state(), LookupState::Ready(answer)
+                            if answer.candidates.iter().any(|candidate| candidate.plan.key == checkpoint.key)
+                                && answer.candidates.iter().all(|candidate| (!warm && !disk) || candidate.tier != Tier::Gpu))
+                    });
+                    let fetch = fetch_for(&mut requester, &history, 2, &[300, 301]);
+                    requester.client.fetch(fetch).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let mut events = Vec::new();
+                        store.poll(&mut events).unwrap();
+                        for event in events {
+                            if let StoreEvent::ExportRequested { export, key, .. } = event {
+                                assert!(!warm && !disk, "{name}: evicted GPU was selected");
+                                assert_eq!(key, checkpoint.key);
+                                store
+                                    .export_pinned(
+                                        export,
+                                        flare_selene::ExportChain {
+                                            nodes: vec![flare_selene::ExportNode {
+                                                key,
+                                                pages: checkpoint.chain_pages.clone(),
+                                            }],
+                                            skip_pages: 0,
+                                            row: Some(checkpoint.slot),
+                                        },
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        requester.poll();
+                        if let Some(at) = requester
+                            .events
+                            .iter()
+                            .position(|event| matches!(event, PoolEvent::Fetched { .. }))
+                        {
+                            let PoolEvent::Fetched { result, .. } = requester.events.remove(at)
+                            else {
+                                unreachable!()
+                            };
+                            assert_eq!(
+                                result.map_err(|error| error.error.to_string()),
+                                Ok((2 * PAGE + ROW) as u64),
+                                "{name}"
+                            );
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "{name}: restore stalled");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    for page in 0..2 {
+                        assert_eq!(
+                            requester.gpu.pages.lock().unwrap()[&(300 + page as u32)],
+                            salted_page(salt, page)
+                        );
+                    }
+                    assert_eq!(requester.gpu.rows.lock().unwrap()[&9], salted_row(salt));
+                    requester.client.close().unwrap();
+                }
+                store.evicted(checkpoint.key, None);
+                store.close().unwrap();
+                drop(store);
+                startup.reset();
+                assert_eq!(
+                    *registrar.0.drops.lock().unwrap(),
+                    registrar.0.calls.lock().unwrap().len(),
+                    "{name}"
+                );
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+}
