@@ -39,21 +39,50 @@ defines configuration precedence.
   Section 2.10 states the isolation mechanisms and section 4 the measurements
   that gate the default.
 
-One trait, `PrefixStore`, has three implementations, and the configuration
-selects one of them or none:
+The local tier dispatch keeps `MemoryStore`, `DiskStore`, and `CompositeStore`,
+then attaches the optional pool.
 
-| Memory size | Disk limit | Store | Behavior |
+`--prefix-cache-memory SIZE` (or `[prefix_cache] memory`) is the single warm
+host-memory setting. It defaults to zero; zero disables warm retention while
+leaving configured disk and pool tiers available. With no local tiers or pool,
+including an explicit memory size of zero, offload is silently disabled and the
+startup summary says `disabled`.
+
+| Warm memory | Local disk | Pool | Behavior |
 |---|---|---|---|
-| nonzero | nonzero | `CompositeStore` | Records are retained in registered memory and spilled to disk under pressure; disk reads warm the memory store when capacity permits. |
-| nonzero | zero | `MemoryStore` | Records are retained in pinned host memory only, each rank's part mapped by that rank's device alone. |
-| zero | nonzero | `DiskStore` | Records live on disk and stream through a bounded registered staging pool. |
-| zero | zero | none | The worker holds no store. |
+| 0 | none | none | Disabled. |
+| > 0 | none | none | `MemoryStore`; retain checkpoints in host memory. |
+| 0 | enabled | none | `DiskStore`; stream through automatic intake. |
+| > 0 | enabled | none | `CompositeStore`; retain warm records, spill under pressure. |
+| 0 | none | enabled | Pool only; the manager's arena supplies intake, with no local slot pool. |
+| > 0 | none | enabled | Warm memory, then pool on retirement. |
+| 0 | enabled | enabled | Local disk, then pool on retirement; automatic local intake. |
+| > 0 | enabled | enabled | Warm memory, then local disk, then pool on retirement. |
+
+All combinations apply on one host. Ranks on separate hosts support zero warm
+memory with disk and/or pool; nonzero warm memory is refused because that tier
+holds every rank's bytes in one process. Each disk peer uses its host's intake.
+
+Automatic registered intake is additional to the warm budget whenever warm
+memory or local disk is enabled. It needs no setting: its slot count is
+`2 × max_active × row_slots + 2 × WINDOW_PAGES`, where `WINDOW_PAGES = 64`.
+The warm checkpoint budget rounds down to whole slots. If host headroom cannot
+hold the full intake, it shrinks toward two complete windows,
+`2 × (64 + row_slots)`, and one warning reports the memory needed for full intake.
+Prepared image inputs use one eighth of the warm budget, rounded down to 4 KiB,
+in ordinary CPU memory; the rest holds checkpoint slots. Text-only packages use
+all warm bytes for checkpoints. CPU input serialization also has a separate
+bounded window derived from prepared image buffers, including with warm zero.
+
+Release note: warm 0 with disk now uses about 0.5–8 GB of host memory for intake,
+compared with about 0.2–0.7 GB previously; the amount depends on checkpoint
+geometry and selected concurrency.
 
 On an integrated-memory device, such as a DGX Spark, GPU memory and host
 memory are one physical pool, and the GPU prefix cache already takes the
 memory that `capacities` leaves after weights and live state. A retained
 memory store there would duplicate bytes within the same pool, so disk-only
-retention avoids that duplication. Its staging pool exists because direct I/O needs a
+retention avoids that duplication. Its intake exists because direct I/O needs a
 CPU-mapped destination and the page planes are mapped only on the GPU side.
 A GPUDirect Storage transport could remove payload staging; its indexes and
 I/O control structures would still occupy host memory.
@@ -161,9 +190,9 @@ worker holds `Option<Box<dyn HostStore>>`.
 Three components are shared by the implementations:
 
 - `Index`, the in-memory tree of section 2.3. Every store owns one.
-- `SlabPool`, a registered pool of fixed-size page and row slabs, section 2.5.
-  The memory store uses it with retention; the staged disk transport uses a
-  small one as staging without retention.
+- `SlabPool`, one pool of equal page-record-sized slots, section 2.5.
+  The memory store and `Staged` share its mapping, registration and free list;
+  there is no separate staging pool.
 - `Transfers`, the per-rank copy threads of section 2.5. Each tier owns its
   transfer queues; a composite has independent memory and disk transfer sets.
 
@@ -223,15 +252,12 @@ evicted. `fetch` copies resident slabs in. Lookup hits are always resident.
 backend, and a transport. The transport is a crate-private trait,
 `DiskTransport`, implemented by `Staged`:
 
-- `Staged` owns a staging slab pool without retention, a transfer handle, and
-  the disk thread. `store` streams the checkpoint out through staging windows
-  into a record file, and `fetch` streams record files through staging
-  windows into the GPU. The staging pool is a detail of this transport: its
-  size is derived from the package's record sizes, four row slabs plus 256
-  page slabs, enough for two outbound and two inbound windows in flight, and
-  it is not a setting. It also exposes `write_from(key, metadata, buffers)`
-  and `read_into(key, buffers)`, which move a record between its file and
-  caller-owned registered buffers, for the composite.
+- `Staged` shares the host slot pool with the memory store and owns an
+  independent transfer handle and the disk thread. `store` streams checkpoints
+  through intake windows into record files; `fetch` streams them back to the GPU.
+  With warm zero and disk enabled, the pool contains only intake slots.
+  `write_from(key, metadata, buffers)` and `read_into(key, buffers)` move records
+  between files and caller-owned registered slots for the composite.
 The deferred direct transport requirements are in section 2.6.
 
 `CompositeStore` owns a `MemoryStore` and a `DiskStore` and implements the
@@ -263,11 +289,9 @@ trait by orchestrating them:
   removal also removes the memory copy. A parked copy is never evictable until
   its file commits. Filesystem-full or quota errors retain it and retry with a
   short backoff. Terminal disk I/O errors may discard it and are counted.
-- The staged transport retains its bounded staging pool inside the composite.
-  Memory slabs supply spill and read-through buffers when retention
-  fits; disk staging handles records and chains that cannot be retained.
-  The staging pool is additional to the configured retention-memory budget
-  and appears separately in the startup summary.
+- The staged transport and memory store share slots. Warm slots supply spill
+  and read-through buffers when retention fits; reserved intake handles records
+  and chains that cannot be retained. Intake is additional to the warm budget.
 
 ### 2.5 Transfers, slabs, and record files
 
@@ -288,39 +312,30 @@ completion, through the event wait and the channel message, orders later
 model-stream work after the copies; the model stream never waits on an
 offload event.
 
-Transfers move records in windows of at most 64 pages plus the row. A window
-allocates its slabs, moves, and either retains or releases them according to
-the owning pool's policy before the next window is issued. The memory store's
-minimum size holds two row slabs and 128 page slabs, one outbound and one inbound
-window. A smaller explicit configuration fails at startup with the minimum for
-the package.
+Transfers move records in windows of at most 64 pages plus the multi-slot row.
+The pool contains warm checkpoint slots plus automatic intake slots. It is one
+4 KiB aligned anonymous mapping (`MAP_PRIVATE`, `MAP_ANONYMOUS`, `MAP_POPULATE`,
+advised for transparent huge pages), registered once at startup. Rows use each
+rank's page share across as many slots as needed; their pieces need not be
+contiguous. CPU readers traverse pieces in rank order, preserving disk bytes
+and streaming xxh3 checksum values. Existing records still recover.
 
-`SlabPool` is one anonymous mapping (`MAP_PRIVATE`, `MAP_ANONYMOUS`,
-`MAP_POPULATE`, advised for transparent huge pages), 4 KiB aligned, registered
-once at startup as portable so every rank's context can use it, and split
-into two sub-pools of fixed-size slabs: page slabs of the padded per-page
-record size across ranks and row slabs of the padded per-row record size
-across ranks, with rows taking one quarter of a retaining pool. Anonymous
-memory is used rather than the driver's host allocator so that direct I/O
-targets ordinary pages; the loader already uses this pattern for mapped host
-regions in `helios/src/runtime_package/mod.rs`. Allocation never blocks: when
-no slab is free and nothing is evictable, the requesting job fails, which
-skips an outbound and fails an inbound.
-
-Host memory pressure queues cold parked records through the existing disk spill
-path before allocation. The page watermark keeps room for at least the largest
-record seen, also when memory-only pool instances retire records to the manager.
-With long records near memory capacity, local memory spills most records soon
-after they land. A retry can still wait for that asynchronous write to
-release its slabs; neither publication nor admission waits for I/O. GPU-only
-retry records remain unpinned: even a brief retry pin can prevent admission when
-the next request needs its pages or snapshot.
+Memory allocation keeps at least `intake_slots` free slots by evicting the
+coldest ready, unpinned, durable records on demand. Maintenance starts writes of
+the coldest dirty records, or retirements to the pool, when `free + clean` falls
+below `2 × intake_slots`. Memory-only records are already durable. Maintenance
+never waits for `Staged`; independent memory and disk copier queues share the
+pool. No more than twice the intake plus one largest record is written ahead
+of need, so a large warm tier does not eagerly write its contents to disk.
+Neither publication nor admission waits for I/O. GPU-only retries remain
+unpinned so they cannot prevent admission. If a copier cannot drain at close,
+the mapping is leaked rather than reused under outstanding copies.
 
 Registering host memory maps it into every device's page tables. On an RTX PRO
 6000 that costs each device about 2 MiB of device memory per GiB registered,
 126 MiB for 64 GiB, whichever ranks copy the bytes. A memory store without a
-disk tier never reads a record on the CPU, so its pool is split by rank
-instead. Each rank's part of every page slab, then of every row slab, is one
+disk tier or pool sharing never reads records on the CPU, so its pool is split
+by rank instead. Each rank's share of all slots is one
 `cuMemCreate` allocation of pinned memory on the host NUMA node closest to the
 rank's device, mapped into one reserved range and opened by `cuMemSetAccess`
 to that device and the host only. Each device then pays only for its own part:
@@ -332,7 +347,7 @@ split slab's planes at their offsets relative to the rank's first plane.
 Composite and disk stores, whose disk threads read and write whole records,
 keep the registered mapping. Cache sizing leaves each device 1/512 of the
 host memory it maps, its share of a split pool or the whole registered pool
-and staging bound, plus 16 MiB for transfer streams.
+including intake, plus 16 MiB for transfer streams.
 
 A record file lives at
 `<directory>/<identity prefix>-<layout fingerprint>/<consumed>-<digest>.ckpt`,
@@ -631,19 +646,10 @@ Offload limits interference through bounded work and explicit ownership:
 
 ### 2.11 Configuration and defaults
 
-- Memory size: `flare run --prefix-cache-memory SIZE` sets it; zero selects no memory
-  retention, and a nonzero size below the package's checkpoint minimum fails startup.
-  Packages with image inputs reserve an ordinary-memory share of
-  `min(memory / 8, memory - checkpoint_minimum)`, rounded down to 4 KiB.
-  The remaining budget backs registered checkpoint slabs. Text-only packages
-  devote the entire budget to checkpoint slabs. Until
-  step 13 enables derived defaults, an unset size selects no memory store.
-  The derived default is zero on an integrated-memory device, detected
-  through `CU_DEVICE_ATTRIBUTE_INTEGRATED` on the selected devices, and
-  otherwise one eighth of the host's available memory at startup, as
-  `/proc/meminfo` reports it, clamped to the memory store's minimum and
-  32 GiB. The attribute's value on DGX Spark hardware must be verified before
-  the default is relied on there.
+- Memory size: `flare run --prefix-cache-memory SIZE` or `[prefix_cache] memory`
+  sets the warm budget, shared by checkpoints and prepared CPU inputs as described
+  in section 1. Zero and an unset value disable warm retention; automatic intake
+  still serves disk retention. There is no minimum warm size or row-count warning.
 - Disk directory: `--prefix-cache-disk DIR` names the directory under which
   the model's record directory, `<identity prefix>-<layout fingerprint>`, is
   created. An unwritable directory selects no disk store and says so on the startup line.
@@ -656,15 +662,8 @@ Offload limits interference through bounded work and explicit ownership:
   Checkpoint and CPU input records share this limit and the model's locked
   record directory.
 - Disk records move through registered host staging and batched stream copies.
-- The staged transport's staging pool size is derived; it is not a setting.
-- A memory store retains at most as many records as it has row slabs, and
-  rows take one quarter of the pool's bytes, preserving the minimum page windows.
-  Startup warns when rows fall below selected concurrency; twice concurrency
-  remains recommended, and publications may wait for spills when rows are scarce.
-  A memory tier that cannot hold more records than the GPU cache rarely has a record
-  the GPU has already lost; the derived default's lower clamp exists for the
-  staging minimum, and the sizing guidance for operators is a pool whose row
-  slabs exceed the GPU's state rows.
+- Intake size is automatic; only shrinking it for host headroom emits the
+  warning described in section 1.
 - Pool: `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-ca FILE`,
   the CA only with the pool; see
   [section 2.15](#215-sharing-through-a-pool). Unset, the instance uses its
@@ -673,6 +672,10 @@ Offload limits interference through bounded work and explicit ownership:
   memory size, directory, limit, transport, and pool.
 - The startup phase reports the selected store, transport, pool sizes, the
   directory, the limit, and the scanned record count.
+- Metrics expose `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total`
+  (including intake), and `flare_host_cache_intake_slots`. Used slots include
+  pages, every row piece, and staging allocations from the same local pool.
+  These replace `flare_host_cache_rows_in_use` and `flare_host_cache_rows_total`.
 - The GPU prefix cache remains derived, as the CLI design specifies. Host
   retention is explicit until the default-enablement criteria pass; host
   memory and disk are shared with other software.
@@ -835,7 +838,7 @@ silently never matching.
 
 A memory tier keeps every rank's bytes in one process, so a multi-host package
 supports disk-only retention; startup rejects a nonzero
-`--prefix-cache-memory`. A peer's record service holds its staging pool and
+`--prefix-cache-memory`. A peer's record service holds its host intake pool and
 transfer threads until rank zero closes its store after draining every rank,
 or until rank zero's connection ends. When the peer's own drain is not
 confirmed, the peer retains its transport, transfer threads, disk thread, and
@@ -981,9 +984,10 @@ same completion events the store produces.
   `io_error`). Tiers are `dram` and `nvme`. The existing `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge. `store_skipped` retains
   its existing meaning, including duplicates and retries.
-  `flare_host_cache_expired_total{tier}` counts direct age removals. Row-slot
-  gauges `flare_host_cache_rows_in_use` and `flare_host_cache_rows_total` report
-  actual allocated slabs and capacity, including rows held by in-flight copies.
+  `flare_host_cache_expired_total{tier}` counts direct age removals. Slot gauges
+  `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total` and
+  `flare_host_cache_intake_slots` report the shared local pool, including
+  every row piece and slots held by in-flight copies.
   `flare_host_cache_retry_abandoned_total{reason}` retains the existing metric
   name and adds the last retry cause (`inflight`, `slabs`,
   `queue`, `budget`) when a GPU checkpoint disappears. Terminal `oversize` and
@@ -1079,11 +1083,11 @@ on the file format fixed in step 5.
    Acceptance: byte-exact round trips; the direct read succeeds into
    registered memory.
 
-3. **Slab pool.** `selene/src/slab.rs`: anonymous mapping, two
-   fixed-size sub-pools, free lists, the retention flag, and separate
+3. **Slab pool.** `selene/src/slab.rs`: anonymous mapping,
+   equal page-record-sized slots, a shared free list, and separate
    `register` and `unregister` steps so CPU tests run without a driver.
-   Acceptance: tests for exhaustion, reuse, alignment of every slab, release
-   on completion without retention, and the minimum-size rule.
+   Acceptance: tests for exhaustion, reuse, alignment, multi-piece rows,
+   release on completion without retention, and intake reservation.
 
 4. **Index.** `selene/src/index.rs`: nodes, buckets, insert, lookup,
    pins, locations, leaf-first eviction with an evictability predicate,
@@ -1118,8 +1122,8 @@ on the file format fixed in step 5.
 8. **Memory store and disk store.** `selene/src/memory.rs` and
    `selene/src/disk_store.rs`, each implementing `HostStore` from
    `selene/src/store.rs` over the components above; the disk store
-   behind the `DiskTransport` trait with the `Staged` implementation, its
-   staging pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
+   behind the `DiskTransport` trait with the `Staged` implementation, the shared
+   slot pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
    test repeated through each store's `store` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
@@ -1259,7 +1263,7 @@ Every continuation asks for nine facts spread across the whole restored
 context and must answer each one correctly, after GPU-cache restores and host
 restores alike. Sampled continuations are evaluated by their factual answers;
 generated tokens are not compared verbatim. The memory scenario
-sizes its pool so that its row slabs outnumber the GPU's cached rows, because
+sizes its pool to hold more complete checkpoints than the GPU cache, because
 the filler prompts that evict the GPU cache publish a checkpoint each.
 
 `qualify/multihost_cache.py` covers the ranks-on-separate-hosts configuration.
@@ -1296,7 +1300,7 @@ A correctness failure in any scenario blocks performance claims.
 ## 5. Known limitations
 
 - Disk compaction of a record is not propagated to its memory copy, whose row
-  slab stays allocated until the whole copy is evicted.
+  slots stay allocated until the whole copy is evicted.
 - A publication whose key still names a stale memory copy pinned by an upload
   in flight is skipped rather than written again.
 - Shutdown deadlines apply separately to pipelines, disk workers, and CUDA

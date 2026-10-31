@@ -1272,8 +1272,9 @@ impl HostStore for CompositeStore {
             parked_records: parked,
             inbound_in_flight: self.inbound.len() + disk.inbound_in_flight,
             memory_records: memory.memory_records,
-            rows_used: memory.rows_used,
-            rows_total: memory.rows_total,
+            slots_used: memory.slots_used,
+            slots_total: memory.slots_total,
+            intake_slots: memory.intake_slots,
             memory_bytes: memory.memory_bytes,
             disk_records: disk.disk_records,
             disk_bytes: disk.disk_bytes,
@@ -1931,7 +1932,8 @@ mod tests {
         assert_eq!(
             store.stats(),
             StoreStats {
-                rows_total: store.memory.pool().page_count() / store.memory.layout().row_slots(),
+                slots_total: store.memory.pool().page_count(),
+                intake_slots: store.memory.pool().intake_slots,
                 outbound_rate: INITIAL_MEMORY_RATE,
                 inbound_rate: INITIAL_MEMORY_RATE,
                 ..StoreStats::default()

@@ -918,12 +918,9 @@ impl Core {
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
-            rows_used: self
-                .index
-                .nodes()
-                .filter(|n| n.location.row.is_some())
-                .count(),
-            rows_total: self.pool.page_count() / self.layout.row_slots(),
+            slots_used: self.pool.page_count() - self.pool.free_pages(),
+            slots_total: self.pool.page_count(),
+            intake_slots: self.pool.intake_slots,
             memory_bytes: self.resident_bytes(),
             outbound_rate: self.outbound_rate.0,
             inbound_rate: self.inbound_rate.0,
@@ -2637,6 +2634,19 @@ mod tests {
                         }
                     }
                     assert_clean_slots(&core);
+                    let stats = core.stats();
+                    assert_eq!(stats.slots_total, core.pool.page_count());
+                    assert_eq!(stats.intake_slots, core.pool.intake_slots);
+                    assert_eq!(
+                        stats.slots_used,
+                        core.index
+                            .nodes()
+                            .map(|node| {
+                                node.location.pages.len()
+                                    + node.location.row.as_ref().map_or(0, Vec::len)
+                            })
+                            .sum::<usize>()
+                    );
                 }
             }
         }
@@ -2895,12 +2905,13 @@ mod tests {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
         let mut store = MemoryStore::new(IDENTITY, host_pool(4), copier).unwrap();
+        assert_eq!(store.stats().intake_slots, store.pool().intake_slots);
         store.index_mut().max_age = std::time::Duration::from_secs(7200);
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         store.store(&checkpoint).unwrap();
         assert_eq!(
-            (store.stats().rows_used, store.stats().rows_total),
-            (1, store.pool().page_count())
+            (store.stats().slots_used, store.stats().slots_total),
+            (2, store.pool().page_count())
         );
         store
             .index_mut()
@@ -2910,7 +2921,7 @@ mod tests {
         store.poll(&mut Vec::new()).unwrap();
         assert_eq!(store.stats().expired, [1, 0]);
         assert_eq!(
-            (store.stats().rows_used, store.stats().rows_total),
+            (store.stats().slots_used, store.stats().slots_total),
             (0, store.pool().page_count())
         );
         assert_eq!(store.pool().free_pages(), store.pool().page_count());

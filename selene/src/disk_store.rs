@@ -121,6 +121,9 @@ pub trait DiskTransport {
     /// than reuse the ids that job holds.
     fn poll(&mut self, events: &mut Vec<TransportEvent>) -> Result<()>;
     fn close(&mut self) -> Result<()>;
+    fn pool(&self) -> Option<&SlabPool> {
+        None
+    }
     /// The staged transport behind this handle, for the composite store's
     /// transfers between files and its memory slabs.
     fn staged_mut(&mut self) -> Option<&mut Staged> {
@@ -1228,6 +1231,10 @@ impl Staged {
 }
 
 impl DiskTransport for Staged {
+    fn pool(&self) -> Option<&SlabPool> {
+        self.pool()
+    }
+
     fn store(
         &mut self,
         id: super::JobId,
@@ -2506,7 +2513,11 @@ impl HostStore for DiskStore {
     }
 
     fn stats(&self) -> StoreStats {
+        let pool = self.transport.pool();
         StoreStats {
+            slots_used: pool.map_or(0, |pool| pool.page_count() - pool.free_pages()),
+            slots_total: pool.map_or(0, SlabPool::page_count),
+            intake_slots: pool.map_or(0, |pool| pool.intake_slots),
             outbound_in_flight: self.outbound.len(),
             inbound_in_flight: self.inbound.len(),
             disk_records: self.index.len(),

@@ -924,7 +924,8 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
-    /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
+    /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
+    /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
 

@@ -150,6 +150,11 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
     .unwrap();
     let service = service.join().unwrap();
     let mut store = offload::open(zero.take().unwrap(), factory.as_ref()).unwrap();
+    let intake = offload::intake_slots(&crate::Layout::new(&[local]).unwrap(), 8);
+    let stats = store.stats();
+    assert_eq!(stats.slots_used, 0);
+    assert_eq!(stats.slots_total, intake);
+    assert_eq!(stats.intake_slots, intake);
     let mut history = TestHistory::new([3; 32]);
     history.append(&[7; 129], &[]).unwrap();
     let key = history.key_at(128).unwrap();

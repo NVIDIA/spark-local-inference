@@ -2127,6 +2127,15 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                 startup.attach(preparation, &factory).unwrap();
                 let mut store =
                     open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();
+                let stats = store.stats();
+                let intake = if warm || disk {
+                    intake_slots(&Layout::new(&geo()).unwrap(), 8)
+                } else {
+                    0
+                };
+                assert_eq!(stats.slots_used, 0, "{name}");
+                assert_eq!(stats.slots_total, intake + usize::from(warm) * 512, "{name}");
+                assert_eq!(stats.intake_slots, intake, "{name}");
                 let salt = 1 + u32::from(warm) * 4 + u32::from(disk) * 2 + u32::from(pooled);
                 let (checkpoint, history) = publication(&factory.0.borrow()[0], salt, 2);
                 for gpu in factory.0.borrow().iter().skip(1) {

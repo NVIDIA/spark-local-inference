@@ -270,7 +270,7 @@ pub(super) struct Metrics {
     host_store_failed: AtomicU64,
     host_held: [AtomicU64; 2],
     host_expired: [AtomicU64; 2],
-    host_rows: [AtomicU64; 2],
+    host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 6],
     host_parked: AtomicU64,
     host_fetched: AtomicU64,
@@ -543,8 +543,9 @@ impl Metrics {
             ),
             (&self.host_inbound_in_flight, stats.inbound_in_flight as u64),
             (&self.host_memory_records, stats.memory_records as u64),
-            (&self.host_rows[0], stats.rows_used as u64),
-            (&self.host_rows[1], stats.rows_total as u64),
+            (&self.host_slots[0], stats.slots_used as u64),
+            (&self.host_slots[1], stats.slots_total as u64),
+            (&self.host_slots[2], stats.intake_slots as u64),
             (&self.host_memory_bytes, stats.memory_bytes),
             (&self.host_disk_records, stats.disk_records as u64),
             (&self.host_disk_bytes, stats.disk_bytes),
@@ -1038,14 +1039,19 @@ impl Metrics {
                 &self.host_inbound_waiting,
             ),
             (
-                "host_cache_rows_in_use",
-                "Allocated host retention row slots.",
-                &self.host_rows[0],
+                "host_cache_slots_in_use",
+                "Allocated host checkpoint and intake slots.",
+                &self.host_slots[0],
             ),
             (
-                "host_cache_rows_total",
-                "Host retention row slot capacity.",
-                &self.host_rows[1],
+                "host_cache_slots_total",
+                "Host checkpoint slot capacity, including intake.",
+                &self.host_slots[1],
+            ),
+            (
+                "host_cache_intake_slots",
+                "Slots reserved for automatic host checkpoint intake.",
+                &self.host_slots[2],
             ),
             (
                 "host_cache_memory_records",
@@ -1417,8 +1423,9 @@ mod tests {
             bytes_out: 1 << 20,
             memory_records: 3,
             parked_records: 2,
-            rows_used: 3,
-            rows_total: 8,
+            slots_used: 3,
+            slots_total: 8,
+            intake_slots: 2,
             expired: [7, 9],
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6],
@@ -1434,6 +1441,9 @@ mod tests {
             ("free_kv_tokens", 1280),
             ("cached_kv_pages", 3),
             ("cached_kv_tokens", 384),
+            ("host_cache_slots_in_use", 3),
+            ("host_cache_slots_total", 8),
+            ("host_cache_intake_slots", 2),
         ] {
             assert!(text.contains(&format!("# TYPE flare_{name} gauge\n")));
             assert!(text.contains(&format!("\nflare_{name} {value}\n")));
@@ -1444,8 +1454,6 @@ mod tests {
         assert!(text.contains("flare_host_cache_inbound_waiting 1\n"));
         assert!(text.contains("flare_host_cache_bytes_out_total 1048576\n"));
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
-        assert!(text.contains("flare_host_cache_rows_in_use 3\n"));
-        assert!(text.contains("flare_host_cache_rows_total 8\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"dram\"} 7\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"nvme\"} 9\n"));
         for reason in [
