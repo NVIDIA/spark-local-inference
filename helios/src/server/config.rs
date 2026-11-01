@@ -334,6 +334,13 @@ impl Bootstrap {
         }
         let server = ServerConfig {
             scheduling_policy,
+            thinking_token_budget: object.get("thinking_token_budget")
+                .filter(|value| !value.is_null())
+                .map(|value| value.as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|&value| value > 0)
+                    .ok_or("server configuration thinking_token_budget must be a positive 32-bit integer"))
+                .transpose()?,
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
             served_names,
             context_hint: optional_text("context_hint")?,
@@ -381,12 +388,44 @@ impl Bootstrap {
                     ))
                 })?,
         };
+        server.validate_thinking_budget(&frontend, &model)?;
         Ok(Self {
             model,
             frontend,
             images,
             server,
         })
+    }
+}
+
+impl ServerConfig {
+    pub(super) fn validate_thinking_budget(
+        &self,
+        frontend: &Frontend,
+        model: &ModelConfig,
+    ) -> Result<()> {
+        if self.thinking_token_budget.is_some() {
+            let unsupported = "server configuration thinking_token_budget is not supported by this model's reasoning format";
+            let messages = [serde_json::json!({"role":"user", "content":""})];
+            let options = serde_json::Map::new();
+            let rendered = frontend
+                .render_chat(&messages, &options)
+                .map_err(|error| format!("{unsupported}: {error}"))?;
+            let output = crate::model::prepare_output(
+                model,
+                frontend,
+                &rendered,
+                &messages,
+                &options,
+                false,
+                &[],
+            )
+            .map_err(|error| format!("{unsupported}: {error}"))?;
+            super::request::thinking_budget_close(frontend, model, output.content.start)
+                .map_err(|error| format!("server configuration {error}"))?
+                .ok_or(unsupported)?;
+        }
+        Ok(())
     }
 }
 
@@ -478,12 +517,29 @@ mod tests {
         let vocab: tokenizers::models::bpe::Vocab = (0..128)
             .map(|id| ((id as u8 as char).to_string(), id))
             .collect();
-        let tokenizer = tokenizers::Tokenizer::new(
+        let mut tokenizer = tokenizers::Tokenizer::new(
             tokenizers::models::bpe::BPE::builder()
                 .vocab_and_merges(vocab, vec![])
                 .build()
                 .unwrap(),
         );
+        tokenizer
+            .add_special_tokens(
+                [
+                    "<|start|>",
+                    "<|message|>",
+                    "<|eom|>",
+                    "<|eot|>",
+                    "<｜begin▁of▁sentence｜>",
+                    "<｜end▁of▁sentence｜>",
+                    "<｜System｜>",
+                    "<｜User｜>",
+                    "<｜Assistant｜>",
+                    "<think>",
+                ]
+                .map(|text| tokenizers::AddedToken::from(text, true)),
+            )
+            .unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = directory.0.join(name);
             std::fs::write(&path, bytes).unwrap();
@@ -523,6 +579,96 @@ mod tests {
             "frontend":{"tokenizer":{},"eos_token_ids":[0]},
             "assets":{"tokenizer":tokenizer_asset}
         });
+        for (suffix, supported) in [
+            ("", false),
+            (" to=self<|message|>", true),
+            (" to=user<|message|>", true),
+        ] {
+            let template = format!("{{% mark %}}<|start|>assistant{suffix}");
+            let mut configured = config.clone();
+            configured["assets"]["chat_template"] = asset("recipient.jinja", template.as_bytes());
+            configured["thinking_token_budget"] = json!(16);
+            let syntax = &mut configured["model_contract"]["frontend"];
+            syntax["assistant_marker"] = json!("<|start|>assistant");
+            syntax["tools"] = json!(crate::model::contract::ToolParser {
+                kind: crate::model::contract::ToolParserKind::Atem,
+                wrapping_newlines: 0,
+                tag_separator: String::new(),
+            });
+            syntax["reasoning"] = json!(crate::model::contract::ReasoningParser {
+                kind: crate::model::contract::ReasoningParserKind::RecipientHeaders,
+                open: "<|start|>assistant to=self<|message|>".into(),
+                close: "<|eom|>".into(),
+                wrapping_newlines: 0,
+                terminal_markers: vec![],
+            });
+            let loaded = Bootstrap::load(&configured.to_string(), &manifest);
+            if supported {
+                assert_eq!(loaded.unwrap().server.thinking_token_budget, Some(16));
+            } else {
+                let error = loaded.err().unwrap();
+                assert!(
+                    error.to_string().contains("thinking_token_budget"),
+                    "{error}"
+                );
+            }
+        }
+        let mut native = config.clone();
+        native["frontend"]["prompt_encoder"] = json!(1);
+        for budget in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!("16"),
+            json!(u64::from(u32::MAX) + 1),
+            json!(16),
+        ] {
+            let mut configured = native.clone();
+            configured["thinking_token_budget"] = budget;
+            let error = Bootstrap::load(&configured.to_string(), &manifest)
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("thinking_token_budget"),
+                "{error}"
+            );
+        }
+        for supported in [false, true] {
+            let mut tokenizer = tokenizer.clone();
+            if supported {
+                tokenizer
+                    .add_special_tokens([tokenizers::AddedToken::from("</think>", true)])
+                    .unwrap();
+            }
+            let mut configured = native.clone();
+            configured["thinking_token_budget"] = json!(16);
+            configured["assets"]["tokenizer"] = asset(
+                "budget-tokenizer.json",
+                tokenizer.to_string(false).unwrap().as_bytes(),
+            );
+            configured["model_contract"]["frontend"]["assistant_marker"] = json!("<｜Assistant｜>");
+            configured["model_contract"]["frontend"]["reasoning"] =
+                json!(crate::model::contract::ReasoningParser {
+                    kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+                    open: "<think>".into(),
+                    close: "</think>".into(),
+                    wrapping_newlines: 0,
+                    terminal_markers: vec![],
+                });
+            let loaded = Bootstrap::load(&configured.to_string(), &manifest);
+            if supported {
+                assert_eq!(loaded.unwrap().server.thinking_token_budget, Some(16));
+            } else {
+                assert!(
+                    loaded
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("thinking_token_budget")
+                );
+            }
+        }
         for (selector, expected) in [
             (1, PromptEncoder::DeepseekV4),
             (2, PromptEncoder::DeepseekV41),
@@ -531,6 +677,7 @@ mod tests {
             native["frontend"]["prompt_encoder"] = selector.into();
             let loaded = Bootstrap::load(&native.to_string(), &manifest).unwrap();
             assert_eq!(loaded.frontend.prompt_encoder(), expected);
+            assert_eq!(loaded.server.thinking_token_budget, None);
             for assets in [
                 json!({}),
                 json!({"chat_template":template_asset}),

@@ -65,6 +65,7 @@ def _server_options(configuration, model, plan) -> dict:
         "model_id": model.model_id, "served_names": [recipe.served_model_name],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
+        "thinking_token_budget": configuration.get("server.thinking_token_budget").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
         "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
         "context_hint": "context is limited by the checkpoint and available cache capacity",

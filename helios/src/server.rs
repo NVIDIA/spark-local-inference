@@ -70,6 +70,8 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     /// Names requests may use for the model in addition to its identifier.
     pub served_names: Vec<String>,
+    /// Default reasoning-token cap for conversational requests without a budget.
+    pub thinking_token_budget: Option<u32>,
     /// Setting that raises the per-request context, appended to context rejections.
     pub context_hint: String,
     /// Setting that raises request or page capacity, appended to capacity rejections.
@@ -86,6 +88,7 @@ impl Default for ServerConfig {
             max_body_bytes: 32 * 1024 * 1024,
             api_key: None,
             served_names: Vec::new(),
+            thinking_token_budget: None,
             context_hint: String::new(),
             capacity_hint: String::new(),
             scheduling_policy: crate::scheduler::PolicyConfig::default(),
@@ -106,6 +109,7 @@ struct HttpState {
     ingress_capacity: usize,
     ids: AtomicU64,
     api_key: Option<String>,
+    thinking_token_budget: Option<u32>,
     context_hint: String,
     capacity_hint: String,
     started: Instant,
@@ -184,6 +188,7 @@ impl Server {
         }
         let delimiters =
             crate::model::reasoning_delimiter_tokens(&frontend, &model.contract.frontend)?;
+        config.validate_thinking_budget(&frontend, &model)?;
         let grammar = Arc::new(crate::grammar::GrammarCompiler::new(
             frontend.tokenizer(),
             model.contract.vocabulary,
@@ -221,6 +226,7 @@ impl Server {
             ingress_capacity,
             ids: AtomicU64::new(1),
             api_key: config.api_key.clone(),
+            thinking_token_budget: config.thinking_token_budget,
             context_hint: config.context_hint.clone(),
             capacity_hint: config.capacity_hint.clone(),
             started: Instant::now(),
@@ -394,7 +400,11 @@ impl Drop for Server {
 /// and metrics expose no request content and stay unauthenticated.
 fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize) -> Router {
     Router::new()
-        .merge(models::router(state.model.config(), served_names))
+        .merge(models::router(
+            state.model.config(),
+            served_names,
+            state.thinking_token_budget,
+        ))
         .route("/v1/chat/completions", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/completions", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))
         .route("/v1/messages", post(http::generate).layer(middleware::from_fn_with_state(state.clone(), admit_http)))

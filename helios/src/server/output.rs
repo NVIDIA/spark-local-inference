@@ -157,6 +157,14 @@ pub(super) struct Decoder<'a, P: ModelOutput> {
     worker_decoded: bool,
     local_decoded: bool,
 }
+impl Decoder<'_, crate::output::OutputPipeline> {
+    pub fn reasoning_open(&self) -> bool {
+        self.parser
+            .as_ref()
+            .is_some_and(|parser| parser.reasoning_open())
+    }
+}
+
 impl<'a, P: ModelOutput> Decoder<'a, P> {
     pub fn new(frontend: &'a Frontend, eos: &'a [u32], config: Option<P::Config>) -> Self {
         Self {
@@ -210,7 +218,12 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
         self.local_decoded = true;
         let mut events = self.parse(Input::Token(token))?;
         if !self.eos.contains(&token) {
-            if let Some(text) = self.decoder.push(&[token])? {
+            if let Some(tracking) = &mut self.tracking {
+                if let Some(span) = tracking.push(token, None)? {
+                    self.entries(span.tokens.into_iter().filter_map(|token| token.logprob));
+                    events.extend(self.parse(Input::Text(&span.text))?);
+                }
+            } else if let Some(text) = self.decoder.push(&[token])? {
                 events.extend(self.parse(Input::Text(&text))?);
             }
         }
@@ -1087,6 +1100,72 @@ impl ResponseOutput {
 mod logprob_retention_tests {
     use super::*;
     use crate::{execution::TokenLogprobs, output::{OutputConfig, OutputPipeline, tagged::{OutputConfig as Tags, OutputStart}}};
+    #[test]
+    fn forced_reasoning_close_preserves_decoding_and_sampled_logprob_offsets() {
+        let frontend = super::tests::frontend(&["plan", "</think>", "answer", "tail"]);
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = Some(crate::model::contract::ReasoningParser {
+            kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+            open: "<think>".into(),
+            close: "</think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let config = OutputConfig {
+            syntax,
+            control_tokens: vec![(1, "</think>".into())],
+            content: Tags {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![],
+            },
+        };
+        let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
+        decoder.track_logprobs(&frontend, true);
+        let mut events = decoder
+            .push_logprob(TokenLogprobs {
+                token: 0,
+                logprob: -1.,
+                top: vec![],
+            })
+            .unwrap();
+        events.extend(decoder.push(1).unwrap());
+        for token in [2, 3] {
+            events.extend(
+                decoder
+                    .push_logprob(TokenLogprobs {
+                        token,
+                        logprob: -1.,
+                        top: vec![],
+                    })
+                    .unwrap(),
+            );
+        }
+        events.extend(decoder.finish(Termination::OutputLimit).unwrap());
+        let (mut reasoning, mut content, mut entries) = (String::new(), String::new(), vec![]);
+        for event in &events {
+            match event {
+                Event::Reasoning(text) => reasoning.push_str(text),
+                Event::Content(text) => content.push_str(text),
+                Event::TokenLogprobs(values) => entries.extend(values),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "plan");
+        assert_eq!(content, "answertail");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.value.token)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.start).collect::<Vec<_>>(),
+            vec![0, 12, 18]
+        );
+    }
+
     #[test]
     fn responses_discard_unfinished_tool_body_entries_as_the_body_arrives() {
         let frontend = super::tests::frontend(&["<tool_call>", "<function=lookup>", "<parameter=q>", "xxxxxxxx"]);

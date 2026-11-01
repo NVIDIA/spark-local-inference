@@ -281,6 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config["served_names"] = serde_json::json!([name]);
     }
     config["api_key"] = key.into();
+    config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, shape)?;
     #[cfg(unix)]

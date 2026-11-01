@@ -29,6 +29,7 @@ struct Call {
 
 pub struct DsmlOutput<const SPACED: bool> {
     consumed: usize,
+    reasoning_open: bool,
     spans: Vec<Option<std::ops::Range<usize>>>,
     machine: Option<OutputParser>,
     pending: String,
@@ -50,6 +51,13 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                 .pending
                 .get(consumed..end)
                 .ok_or("DeepSeek parser returned an invalid source span")?;
+            // The upstream parser skips leading newlines; other non-reasoning actions end reasoning.
+            if self.reasoning_open
+                && segment.action != OutputAction::Reasoning
+                && !(segment.action == OutputAction::Skip && source.bytes().all(|b| b == b'\n'))
+            {
+                self.reasoning_open = false;
+            }
             let repeated = self.last_action == segment.action;
             self.last_action = segment.action;
             match segment.action {
@@ -172,6 +180,10 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         Ok(())
     }
 
+    pub fn reasoning_open(&self) -> bool {
+        self.reasoning_open
+    }
+
     pub fn with_special_tokens(mut self, tokens: Vec<(u32, String)>) -> Self {
         self.special_tokens = tokens;
         self
@@ -214,6 +226,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
     fn new(config: OutputConfig) -> Self {
         Self {
             consumed: 0,
+            reasoning_open: config.start == OutputStart::Reasoning,
             spans: vec![],
             machine: Some(OutputParser::new(ParsingOptions {
                 parse_tool_calls: !config.tools.is_empty(),

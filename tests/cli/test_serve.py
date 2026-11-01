@@ -194,6 +194,7 @@ def test_server_options_advertise_canonical_names_independently_of_checkpoint_so
     config = tmp_path / "config.toml"
     config.write_text("")
     options = serve._server_options(Configuration.load(config), model, plan)
+    assert options["thinking_token_budget"] is None
     assert options["served_names"] == [served_name]
     assert options["model_id"] == ("custom-checkpoint" if local else checkpoint.repository)
 
@@ -389,12 +390,13 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
 def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch):
     port = free_port()
     config = tmp_path / "config.toml"
-    config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n')
+    config.write_text(f'[server]\nport = {port}\napi_key = "secret"\nthinking_token_budget = 1536\n')
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
     assert calls[0][0] == f"127.0.0.1:{port}"
     assert calls[0][1]["api_key"] == "secret"
+    assert calls[0][1]["thinking_token_budget"] == 1536
     assert host["exports"] == 0
 
 
