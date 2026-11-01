@@ -657,3 +657,143 @@ fn message_boundaries_must_be_ordered_unique_and_within_the_prompt() {
         assert_eq!(s.free_page_count(), 256);
     }
 }
+
+#[test]
+fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
+    let page_tokens = 64;
+    for gap in [page_tokens - 1, page_tokens] {
+        for output in [1, 3] {
+            let mut s = scheduler_with_concurrency(16, false, page_tokens, 1);
+            s.enable_publications();
+            let message = 3 * page_tokens - 1;
+            let prompt = message + gap;
+            let mut request = spec(Some(message), prompt, output);
+            request.message_boundaries.insert(0, page_tokens);
+            let h = s.admit(request).unwrap();
+            stop_at_capture(&mut s, h, message as u64);
+            run_step(&mut s);
+            let message_id = s.request(h).unwrap().prefix.unwrap();
+            let deferred = gap < page_tokens && output > 1;
+            let offered = s.take_publications();
+            assert_eq!(offered.len(), if deferred { 1 } else { 2 });
+            let root = offered[0].key;
+            let terminal = finish(&mut s, h);
+            let offered = s.take_publications();
+            if output > 1 {
+                assert_eq!(offered.len(), 1);
+                let p = &offered[0];
+                assert_eq!(p.key.consumed_tokens, prompt as u64);
+                assert_eq!(
+                    p.parent,
+                    Some(if deferred {
+                        root
+                    } else {
+                        s.cache.checkpoint(message_id).unwrap().prefix()
+                    })
+                );
+                let start = p.parent.unwrap().consumed_tokens as usize / page_tokens;
+                assert_eq!(p.tail(), &s.cache.page_chain(p.id).unwrap()[start..]);
+                assert_eq!(s.cache.checkpoint(p.id).unwrap().parent(), Some(message_id));
+            } else {
+                assert!(offered.is_empty());
+            }
+            assert!(s.cache.checkpoint(message_id).unwrap().ready());
+            assert!(s.cache.checkpoint(terminal).unwrap().ready());
+            assert_eq!(
+                s.stats().snapshot_publications,
+                if output > 1 { 4 } else { 3 }
+            );
+        }
+    }
+}
+
+#[test]
+fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
+    let mut s = scheduler_with_concurrency(16, false, 64, 1);
+    s.enable_publications();
+    let h = s.admit(spec(Some(127), 129, 3)).unwrap();
+    stop_at_capture(&mut s, h, 127);
+    run_step(&mut s);
+    let message = s.request(h).unwrap().prefix.unwrap();
+    assert!(s.take_publications().is_empty());
+    let terminal = finish(&mut s, h);
+    let prompt = s.take_publications().pop().unwrap();
+    assert_eq!((prompt.parent, prompt.tail_pages), (None, 2));
+    for id in [message, terminal] {
+        let key = s.cache.checkpoint(id).unwrap().prefix();
+        let mut request = spec(None, 1, 1);
+        request.prompt = if id == message {
+            (0..127).collect()
+        } else {
+            let mut tokens: Vec<_> = (0..129).collect();
+            tokens.extend([900, 900]);
+            tokens
+        };
+        let plan = s.plan_admission(&request).unwrap();
+        assert_eq!(plan.resident_tokens(), key.consumed_tokens);
+        assert!(s.take_publications().is_empty());
+        let h = s.admit_planned(request.clone(), plan, None).unwrap().handle;
+        assert_eq!(s.request(h).unwrap().prefix, Some(id));
+        let offered = s.take_publications();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, id);
+        assert!(s.cache.checkpoint(id).unwrap().pin_count() > 0);
+        assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
+        assert_eq!(s.plan().unwrap().kind, GraphKind::Resume);
+        s.cancel(h).unwrap();
+        let h = s.admit(request).unwrap();
+        assert!(s.take_publications().is_empty());
+        s.cancel(h).unwrap();
+    }
+}
+
+#[test]
+fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
+    for cancel in [false, true] {
+        let mut s = scheduler_with_concurrency(3, false, 64, 1);
+        s.enable_publications();
+        let h = s.admit(spec(Some(127), 129, 3)).unwrap();
+        stop_at_capture(&mut s, h, 127);
+        run_step(&mut s);
+        let message = s.request(h).unwrap().prefix.unwrap();
+        assert!(s.take_publications().is_empty());
+        // Other requests reserve all remaining rows, so the planned prompt copy skips.
+        let held: Vec<_> = (0..2).map(|_| s.reserve_snapshot(0).unwrap()).collect();
+        if cancel {
+            s.cancel(h).unwrap();
+        } else {
+            assert_eq!(run_step(&mut s).kind, GraphKind::Prefill);
+            assert_eq!(s.request(h).unwrap().consumed_tokens, 129);
+            assert!(s.cache.checkpoint(message).unwrap().pin_count() > 0);
+            assert_eq!(s.stats().prompt_checkpoints, 0);
+        }
+        let offered = s.take_publications();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, message);
+        assert_eq!(offered[0].tail_pages, 1);
+        if !cancel {
+            assert_eq!(finish(&mut s, h), message);
+            assert!(s.take_publications().is_empty());
+        }
+        for snapshot in held {
+            s.release_snapshot(snapshot);
+        }
+    }
+}
+
+#[test]
+fn only_the_last_selected_message_can_be_shadowed_by_the_prompt() {
+    let mut s = scheduler_with_concurrency(16, false, 64, 1);
+    s.enable_publications();
+    let mut request = spec(None, 130, 3);
+    request.message_boundaries = vec![127, 129];
+    let h = s.admit(request).unwrap();
+    finish(&mut s, h);
+    assert_eq!(
+        s.take_publications()
+            .iter()
+            .map(|p| p.key.consumed_tokens)
+            .collect::<Vec<_>>(),
+        [127, 130]
+    );
+}

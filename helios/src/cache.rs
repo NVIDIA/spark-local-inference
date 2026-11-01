@@ -224,6 +224,16 @@ impl PrefixCheckpointCache {
         })
     }
 
+    pub(crate) fn single_child(&self, id: CheckpointId) -> Option<CheckpointId> {
+        if self.nodes.get(&id)?.child_count != 1 {
+            return None;
+        }
+        self.nodes
+            .values()
+            .find(|node| node.parent == Some(id))
+            .map(|node| node.id)
+    }
+
     /// The GPU-ready checkpoint published under `prefix`, if any.
     pub fn ready_by_prefix(&self, prefix: &PrefixKey) -> Option<CheckpointId> {
         let id = *self.prefixes.get(prefix)?;
