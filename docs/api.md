@@ -531,7 +531,8 @@ and valid sampler values; temperature bounds are positive. For example,
 `temperature: 0` becomes the declared minimum, or the default if no range exists.
 Malformed types still return HTTP 400; `top_k` must be an integer. `seed` remains
 request-controlled and uses its packaged default when omitted. Sampling defaults
-and ranges come from the model author's recommendations declared in the recipe.
+and ranges come from the model author's recommendations declared in the recipe,
+except for DeepSeek V4.1's repetition-penalty range based on measured use.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values
@@ -545,7 +546,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
-| `deepseek41` | 1 | 1 | Disabled | None | [DeepSeek-V4.1-Flash-1017 inference recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
+| `deepseek41` | 1 | 1 | Disabled | Top-p [0.95, 1]; repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 defaults](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference); [V4.1-Flash top-p recommendations and benchmarks](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference); repetition penalty from measured use over prompt + output, matching vLLM/HF semantics |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
@@ -556,6 +557,7 @@ frequency penalties. Unspecified filters are disabled and unspecified penalties
 are neutral. Disabled top-k is stored as `-1`; Step 5's recommended `0` has the
 same meaning. Packages exported without ranges continue to fix every distribution
 parameter at their stored defaults, including Qwen presence penalties.
+DeepSeek V4.1's new ranges require re-exporting the package.
 
 Native extensions such as `top_k`, `min_p`, repetition penalties, token stops,
 `grammar`, and `chat_template_kwargs` remain available. JSON output formats and

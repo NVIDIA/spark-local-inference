@@ -7,7 +7,7 @@
 from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
-from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation
+from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -53,7 +53,10 @@ RECIPE = Recipe(
     mla_compute_modes=("auto", "bf16"), mla_compute_mode="bf16", expert_scale_compression="csf",
     draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4", "fp8"),
     # Recommended sampling: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference.
-    sampling_defaults=SamplingDefaults(temperature=1., top_p=1., top_k=-1),
+    # Top-p 0.95 or 1.0 (benchmarks: 0.95): https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference.
+    # Repetition-penalty bounds enable measured use over prompt + output, matching vLLM/HF semantics.
+    sampling_defaults=SamplingDefaults(temperature=1., top_p=1., top_k=-1,
+        ranges={"top_p": SamplingRange(.95, 1.), "repetition_penalty": SamplingRange(1., 1.1)}),
     checkpoints=(Checkpoint(alias="deepseek-v4.1-flash", repository="deepseek-ai/DeepSeek-V4.1-Flash-1017",
         revision="1bae0e1088993b9b82de08f59de5be5a34e42170", architecture="DeepseekV41ForCausalLM",
         stored_bytes=510_286_023_000, device_bytes=306_557_453_640, draft_bytes=7_932_874_632,
