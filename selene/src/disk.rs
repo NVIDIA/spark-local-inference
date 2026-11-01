@@ -614,6 +614,14 @@ impl Worker {
         check_tail_pages(&header)?;
         let file = flare_eos::direct_file(&temporary, true)
             .map_err(|error| direct_open_failure("create record file", &temporary, error))?;
+        // Allocated blocks make every direct write an overwrite, which ext4 runs under a shared
+        // inode lock, so the ring's writes overlap instead of serializing at queue depth one.
+        // A sparse `set_len` would not: writes into holes still take the lock exclusively.
+        if let Err(error) = preallocate(&file, header.length(true)) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(io_failure("preallocate record file", error));
+        }
         #[cfg(windows)]
         self.ring
             .queue
@@ -962,6 +970,26 @@ fn direct_open_failure(action: &str, path: &Path, error: io::Error) -> Error {
         ));
     }
     io_failure(format!("{action} {}", path.display()), error)
+}
+
+/// Reserve `length` bytes of `file`; a filesystem without `fallocate` keeps the old behavior.
+#[cfg(target_os = "linux")]
+fn preallocate(file: &File, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: The descriptor is open for the call.
+    if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length as libc::off_t) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => Ok(()),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate(_file: &File, _length: u64) -> io::Result<()> {
+    Ok(())
 }
 
 fn truncate(path: &Path, length: u64) -> Result<u64> {
@@ -1717,6 +1745,35 @@ mod tests {
             SystemTime::now(),
         )
         .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn created_record_file_has_its_final_length() {
+        let Some(directory) = test_directory("preallocated") else {
+            return;
+        };
+        let key = PrefixKey {
+            consumed_tokens: 200,
+            digest: [8; 16],
+        };
+        let header = header(key, 3);
+        let temporary = directory.join(temporary_name(&key));
+        let mut thread = DiskThread::start("flare-offload-disk").unwrap();
+        thread
+            .submit(Job::Create {
+                id: JobId(1),
+                temporary: temporary.clone(),
+                header: header.clone(),
+            })
+            .unwrap();
+        let replies = wait(&thread, 1);
+        assert_eq!(succeeded(&replies[0]), 0);
+        assert_eq!(fs::metadata(&temporary).unwrap().len(), header.length(true));
+        thread.submit(Job::Abort { id: JobId(1) }).unwrap();
+        wait(&thread, 1);
+        assert!(!temporary.exists());
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

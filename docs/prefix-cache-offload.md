@@ -368,7 +368,8 @@ so one file format serves both transports; the cost is small because the
 large planes are already multiples of 4 KiB and only small index planes pad.
 The row exists when the file length covers the row segment; compaction
 truncates the file at the row segment offset and changes nothing else. Writes
-go to a temporary name in the same directory, use direct I/O, optionally
+go to a temporary name in the same directory (preallocated to its final length
+with `fallocate` on Linux, so direct writes overlap), use direct I/O, optionally
 `fdatasync`, and rename into place. Deletion is `unlink`. Checksums are
 64-bit xxh3 over each page record and over the row record to detect torn or
 corrupted files; the staged transport computes and verifies them on the disk
