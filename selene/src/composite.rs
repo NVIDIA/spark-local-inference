@@ -539,6 +539,7 @@ impl CompositeStore {
                         self.stats.stored += 1;
                     }
                     Err(_) => {
+                        self.drop_parked_children(key);
                         self.remove_copy(key);
                         self.stats.store_failed += 1;
                     }
@@ -549,11 +550,40 @@ impl CompositeStore {
                 // their tail pages, so they cannot be written without this
                 // record; their pins are released so it can leave the index.
                 self.stats.dropped[2] += 1;
+                self.drop_parked_children(key);
                 self.fail_children(key);
                 let _ = self.disk.commit_record(key, Err(error));
                 self.remove_copy(key);
                 self.stats.store_failed += 1;
             }
+        }
+    }
+
+    /// Drop the parked records under `key`, whose file will never exist: a
+    /// record must not be written under a parent that is not on disk.
+    fn drop_parked_children(&mut self, key: PrefixKey) {
+        let index = self.disk.index();
+        let children: Vec<_> = self
+            .parked
+            .keys()
+            .filter(|child| index.node(child).and_then(|node| node.parent) == Some(key))
+            .copied()
+            .collect();
+        for child in children {
+            // A child is written only after its parent commits, so none is writing.
+            debug_assert!(!self.parked[&child].writing);
+            self.drop_parked_children(child);
+            self.parked.remove(&child);
+            if let Some(mut outbound) = self.outbound.remove(&child) {
+                self.release_parent(&mut outbound);
+            }
+            let _ = self.disk.commit_record(
+                child,
+                Err(invalid("the record's parent did not reach disk")),
+            );
+            self.remove_copy(child);
+            self.stats.dropped[2] += 1;
+            self.stats.store_failed += 1;
         }
     }
 
@@ -567,14 +597,34 @@ impl CompositeStore {
             .sum()
     }
 
-    /// Start the file write of a parked record.
-    fn spill(&mut self, key: PrefixKey) {
-        if self.retry_after.is_some_and(|at| Instant::now() < at) {
-            return;
+    /// The root-most ancestor in the record's unbroken run of uncommitted parents.
+    fn unwritten_ancestor(&self, key: &PrefixKey) -> Option<PrefixKey> {
+        let index = self.disk.index();
+        let mut found = None;
+        let mut next = index.node(key).and_then(|node| node.parent);
+        while let Some(parent) = next.filter(|parent| self.outbound.contains_key(parent)) {
+            found = Some(parent);
+            next = index.node(&parent).and_then(|node| node.parent);
         }
-        let Some(parked) = self.parked.get(&key) else {
-            return;
-        };
+        found
+    }
+
+    /// Start the file write of a parked record. A record is written only after
+    /// its ancestors are on disk, so it never becomes ready under an unwritten
+    /// parent: the root-most unwritten ancestor goes first and the record waits.
+    /// Returns the key whose write started, which may be that ancestor.
+    fn spill(&mut self, key: PrefixKey) -> Option<PrefixKey> {
+        if let Some(ancestor) = self.unwritten_ancestor(&key) {
+            let idle = self
+                .parked
+                .get(&ancestor)
+                .is_some_and(|parked| !parked.writing);
+            return if idle { self.spill(ancestor) } else { None };
+        }
+        if self.retry_after.is_some_and(|at| Instant::now() < at) {
+            return None;
+        }
+        let parked = self.parked.get(&key)?;
         if !parked.reserved {
             let outbound = &self.outbound[&key];
             if !matches!(
@@ -587,7 +637,7 @@ impl CompositeStore {
                 ),
                 Ok(Some(_))
             ) {
-                return;
+                return None;
             }
             self.parked.get_mut(&key).unwrap().reserved = true;
             if let Some(mut outbound) = self.outbound.remove(&key) {
@@ -610,8 +660,12 @@ impl CompositeStore {
                 if let Some(parked) = self.parked.get_mut(&key) {
                     parked.writing = true;
                 }
+                Some(key)
             }
-            Err(_) => self.stats.held[0] += 1,
+            Err(_) => {
+                self.stats.held[0] += 1;
+                None
+            }
         }
     }
 
@@ -656,13 +710,11 @@ impl CompositeStore {
             if covered >= need_slots {
                 break;
             }
-            let slots = slots_of(self, &key);
-            if writing < MAX_SPILLS {
-                self.spill(key);
-                if self.parked.get(&key).is_some_and(|parked| parked.writing) {
-                    writing += 1;
-                    covered += slots;
-                }
+            if writing < MAX_SPILLS
+                && let Some(started) = self.spill(key)
+            {
+                writing += 1;
+                covered += slots_of(self, &started);
             }
         }
         if writing == MAX_SPILLS && covered < need_slots {
@@ -1357,6 +1409,15 @@ impl crate::store::TierStore for CompositeStore {
             }
             if started.elapsed() >= timeout {
                 break;
+            }
+            if self.unwritten_ancestor(&key).is_some() {
+                // A started ancestor is waited on by the in-flight branch above;
+                // if it cannot start, neither can this record.
+                if self.spill(key).is_none() {
+                    remaining.remove(&key);
+                    skipped += 1;
+                }
+                continue;
             }
             remaining.remove(&key);
             self.spill(key);
@@ -3987,6 +4048,170 @@ mod tests {
         store.spill_parked(5);
         assert_eq!(store.parked.values().filter(|record| record.writing).count(), 2);
         store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn parked_pair(
+        store: &mut CompositeStore,
+        ids: &mut Ids,
+        salt: u32,
+    ) -> (PublishedCheckpoint, PublishedCheckpoint) {
+        let mut history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..2 * PAGE_TOKENS as u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(salt))
+            .collect();
+        history.append(&list, &[]).unwrap();
+        let root = checkpoint(
+            ids,
+            &history,
+            PAGE_TOKENS,
+            None,
+            pages(0..1),
+            1,
+            StateSlotId(salt),
+        );
+        let child = checkpoint(
+            ids,
+            &history,
+            2 * PAGE_TOKENS,
+            Some(PAGE_TOKENS),
+            pages(0..2),
+            1,
+            StateSlotId(salt),
+        );
+        for (record, parent) in [(&root, None), (&child, Some(root.key))] {
+            let (_, bytes) = copy_landed(store, record, parent, u64::from(salt));
+            if let Some(parent) = parent {
+                // As `store` pins the parent for the child's copy-out.
+                store.disk.index_mut().pin(&parent).unwrap();
+            }
+            store.memory.mark_volatile(&record.key);
+            let mut events = Vec::new();
+            store.memory_stored(record.id, record.key, Ok(bytes), &mut events);
+            assert!(matches!(
+                events.as_slice(),
+                [StoreEvent::Stored { result: Ok(_), .. }]
+            ));
+        }
+        (root, child)
+    }
+
+    #[test]
+    fn a_cold_child_waits_for_its_parked_ancestor_to_reach_disk() {
+        let Some(directory) = test_directory("composite", "ancestor-first") else {
+            return;
+        };
+        let mut store = composite(&directory, 64, 32, 1 << 30);
+        let mut ids = Ids::new();
+        let (root, child) = parked_pair(&mut store, &mut ids, 1);
+        // The shared ancestor is hotter than the child.
+        store.memory.index_mut().touch(&root.key);
+        let writing = |store: &CompositeStore, key: &PrefixKey| {
+            store.parked.get(key).is_some_and(|parked| parked.writing)
+        };
+
+        // The child is the coldest, yet the parent is written and the child waits.
+        store.spill_parked(1);
+        assert!(writing(&store, &root.key));
+        assert!(!writing(&store, &child.key));
+        store.spill_parked(1000);
+        assert!(!writing(&store, &child.key));
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |store| {
+            !store.parked.contains_key(&root.key)
+        });
+        assert!(store.disk.index().node(&root.key).unwrap().ready);
+
+        store.spill_parked(1);
+        assert!(writing(&store, &child.key));
+        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        assert!(store.disk.index().node(&child.key).unwrap().ready);
+        assert!(store.disk.index().complete(&child.key));
+        assert_eq!(
+            store.disk.store_status(&child).unwrap(),
+            Some(StoreOutcome::Present)
+        );
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ancestors_written_for_cold_children_respect_the_write_cap() {
+        let Some(directory) = test_directory("composite", "ancestor-cap") else {
+            return;
+        };
+        let mut store = composite(&directory, 128, 64, 1 << 30);
+        let mut ids = Ids::new();
+        let pairs: Vec<_> = (1..=MAX_SPILLS as u32 + 2)
+            .map(|salt| parked_pair(&mut store, &mut ids, salt))
+            .collect();
+        for (root, _) in &pairs {
+            store.memory.index_mut().touch(&root.key);
+        }
+        store.spill_parked(1000);
+        let writing: Vec<_> = store
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.writing)
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(writing.len(), MAX_SPILLS);
+        assert!(pairs.iter().all(|(_, child)| !writing.contains(&child.key)));
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |store| store.jobs.is_empty());
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_drain_gives_up_a_child_whose_ancestor_cannot_start() {
+        let Some(directory) = test_directory("composite", "ancestor-drain") else {
+            return;
+        };
+        let mut store = composite(&directory, 64, 32, 1 << 30);
+        let mut ids = Ids::new();
+        let (root, child) = parked_pair(&mut store, &mut ids, 1);
+        store.memory.index_mut().touch(&child.key);
+        // No write can start.
+        store.retry_after = Some(Instant::now() + Duration::from_secs(3600));
+        store.drain_on_shutdown = Duration::from_secs(30);
+        let began = Instant::now();
+        store.drain_on_shutdown();
+        assert!(began.elapsed() < Duration::from_secs(10));
+        assert!(!store.parked[&root.key].writing);
+        assert!(!store.parked[&child.key].writing);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_parent_that_cannot_be_written_takes_its_parked_children_with_it() {
+        let Some(directory) = test_directory("composite", "ancestor-fails") else {
+            return;
+        };
+        let mut store = composite(&directory, 64, 32, 1 << 30);
+        let mut ids = Ids::new();
+        let (root, child) = parked_pair(&mut store, &mut ids, 1);
+        // The directory disappears under the root's writes.
+        fs::remove_dir_all(&directory).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            store.spill_parked(1000);
+            poll_until(&mut store, &mut events, |store| {
+                !store.parked.get(&root.key).is_some_and(|p| p.writing)
+            });
+        }
+        assert!(store.parked.is_empty());
+        assert!(store.outbound.is_empty());
+        assert!(store.memory.record(&child.key).is_none());
+        assert!(!store.disk.index().contains(&child.key));
+        assert!(!store.disk.index().contains(&root.key));
+        assert_eq!(store.stats().store_failed, 2);
+        fs::create_dir_all(&directory).unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
