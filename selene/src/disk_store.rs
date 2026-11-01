@@ -24,7 +24,7 @@
 use crate::store::TierStore;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime},
@@ -236,7 +236,7 @@ enum Source {
     /// Caller-owned registered buffers already holding every record, and their checksums if known.
     Host {
         pages: Vec<usize>,
-        row: Vec<usize>,
+        row: Option<Vec<usize>>,
         sums: Option<SliceSums>,
     },
 }
@@ -380,6 +380,10 @@ impl OutboundRecord {
                 id: self.disk,
                 temporary: self.temporary.clone(),
                 header: self.header.clone(),
+                row: match &self.source {
+                    Source::Host { row, .. } => row.is_some(),
+                    Source::Device { .. } => true,
+                },
                 sums: match &self.source {
                     Source::Host { sums, .. } => sums.clone(),
                     Source::Device { .. } => None,
@@ -489,7 +493,7 @@ impl OutboundRecord {
             Source::Host { pages, row, .. } => (
                 Buffers {
                     pages: pages[first..first + count].to_vec(),
-                    row: last.then(|| row.clone()),
+                    row: row.clone().filter(|_| last),
                     slots: None,
                 },
                 OutPhase::Transferred,
@@ -1036,9 +1040,6 @@ impl Staged {
                 pages.len()
             )));
         }
-        let Some(row) = row else {
-            return Err(invalid("a record cannot be written without its row"));
-        };
         let source = Source::Host { pages, row, sums };
         self.start_outbound(id, header, temporary, path, source);
         Ok(())
@@ -1454,6 +1455,8 @@ pub struct DiskStore {
     finishing: Vec<PrefixKey>,
     largest: u64,
     maintenance_progress: u64,
+    /// Committed children made these parents eligible for row truncation.
+    thinning: HashSet<PrefixKey>,
     pub directory_lock: record::DirectoryLock,
 }
 
@@ -1529,6 +1532,7 @@ impl DiskStore {
             finishing: Vec::new(),
             largest: scanned.iter().map(|r| r.bytes).max().unwrap_or(0),
             maintenance_progress: 0,
+            thinning: scanned.iter().filter_map(|r| r.header.parent).collect(),
             directory_lock,
         })
     }
@@ -1830,7 +1834,7 @@ impl DiskStore {
     }
 
     /// With `reserve=false`, index only uncharged metadata for a DRAM copy.
-    /// Make room for a record of `tail_pages`, index it as writing, pin it,
+    /// Make room for `tail_pages` and, when requested, a row; index it as writing, pin it,
     /// and return its header and file names; `None` when evicting every
     /// unpinned record would still not bring it under the limit. The key must
     /// be absent and the parent, when named, indexed with a row or readable
@@ -1843,6 +1847,7 @@ impl DiskStore {
         parent: Option<PrefixKey>,
         bucket: [u8; 16],
         tail_pages: usize,
+        row: bool,
         reserve: bool,
     ) -> Result<Option<(Header, PathBuf, PathBuf)>> {
         let parked = self.index.node(&key).is_some_and(|n| n.location.bytes == 0);
@@ -1887,7 +1892,7 @@ impl DiskStore {
             tail,
             SystemTime::now(),
         )?;
-        let bytes = header.length_with_row();
+        let bytes = header.length(row);
         if let Some(parent) = &parent {
             self.index.pin(parent)?;
         }
@@ -1930,7 +1935,7 @@ impl DiskStore {
             self.index.set_ready(&key, false)?;
         } else {
             self.index
-                .insert(key, parent, bucket, tail_pages, true, false, location)?;
+                .insert(key, parent, bucket, tail_pages, row, false, location)?;
         }
         if !parked {
             self.index.pin(&key)?;
@@ -1954,11 +1959,24 @@ impl DiskStore {
         prior_readable: bool,
     ) -> Result<()> {
         self.stats.progress += 1;
+        if let Ok(bytes) = &result {
+            let node = self
+                .index
+                .node_mut(&key)
+                .ok_or_else(|| invalid("cannot commit an unindexed host record"))?;
+            self.used -= node.location.bytes;
+            self.used += *bytes;
+            node.location.bytes = *bytes;
+            node.row = node.location.header.row_present(*bytes);
+            if let Some(parent) = node.parent {
+                self.thinning.insert(parent);
+            }
+        }
         if let Some(old) = self.replacements.remove(&key) {
             let node = self.index.node_mut(&key).unwrap();
             let ready = if result.is_ok() {
+                self.thinning.remove(&key);
                 self.used -= old.bytes;
-                node.row = true;
                 self.stats.row_refills += 1;
                 self.stats.stored += 1;
                 self.stats.bytes_out += result.as_ref().copied().unwrap();
@@ -2005,7 +2023,26 @@ impl DiskStore {
                 self.discard(&key)?;
             }
         }
+        self.sync_budget();
         Ok(())
+    }
+
+    pub(crate) fn thin_rows(&mut self) {
+        for key in std::mem::take(&mut self.thinning) {
+            if !self.index.row_redundant(&key, true) || !self.index[&key].row {
+                continue;
+            }
+            let node = &self.index[&key];
+            if !node.ready || node.pinned() {
+                self.thinning.insert(key);
+            } else {
+                self.index.drop_row(&key);
+                self.stats.rows_thinned[1] += 1;
+                if self.compact(&key).is_err() {
+                    self.stats.dropped[5] += 1;
+                }
+            }
+        }
     }
 
     /// Evict until `bytes` more fit under the limit; false when nothing
@@ -2435,8 +2472,14 @@ impl HostStore for DiskStore {
             return Ok(outcome);
         }
         let (parent, tail) = self.plan_record(checkpoint);
-        let Some((header, temporary, path)) =
-            self.reserve_record(checkpoint.key, parent, checkpoint.bucket, tail.len(), true)?
+        let Some((header, temporary, path)) = self.reserve_record(
+            checkpoint.key,
+            parent,
+            checkpoint.bucket,
+            tail.len(),
+            true,
+            true,
+        )?
         else {
             self.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Budget));
@@ -2520,6 +2563,7 @@ impl HostStore for DiskStore {
             self.apply(event, events);
         }
         self.flush_announcements();
+        self.thin_rows();
         self.maintain();
         polled
     }
@@ -2691,6 +2735,7 @@ mod tests {
         calls: Vec<Call>,
         events: Vec<TransportEvent>,
         closed: bool,
+        fail_truncate: bool,
     }
 
     /// A transport that records what the store asks of it and replies with
@@ -2744,6 +2789,9 @@ mod tests {
                 .borrow_mut()
                 .calls
                 .push(Call::Truncate { id, path, length });
+            if self.0.borrow().fail_truncate {
+                return Err(invalid("truncate submission failed"));
+            }
             Ok(())
         }
 
@@ -2784,6 +2832,153 @@ mod tests {
         )
         .unwrap();
         (store, log)
+    }
+
+    #[test]
+    fn eager_thinning_keeps_recovered_roots_branches_and_both_leaves() {
+        let full = history(256);
+        let headers = [
+            header(&geometry(), &full, 64, None),
+            header(&geometry(), &full, 128, Some(64)),
+            header(&geometry(), &full, 192, Some(128)),
+            header(&geometry(), &full, 256, Some(128)),
+        ];
+        let records = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| scanned(&directory(), h.clone(), i as u64, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        store.thin_rows();
+        assert!(store.index.nodes().all(|n| n.row));
+        assert!(log.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn recovered_linear_chain_thins_and_reannounces_its_interior() {
+        let full = history(192);
+        let headers = [
+            header(&geometry(), &full, 64, None),
+            header(&geometry(), &full, 128, Some(64)),
+            header(&geometry(), &full, 192, Some(128)),
+        ];
+        let records = headers
+            .iter()
+            .map(|h| scanned(&directory(), h.clone(), 0, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_records(announcer.clone());
+        let initial = announcer.take_batch(32).unwrap();
+        assert_eq!(initial.len(), 3);
+        let parent = &headers[1];
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.index[&headers[0].key].row && store.index[&headers[2].key].row);
+        assert!(!store.index[&parent.key].row);
+        assert_eq!(store.stats().rows_thinned, [0, 1]);
+        assert!(matches!(
+            log.borrow().calls.as_slice(),
+            [Call::Truncate { length, .. }] if *length == parent.row_segment
+        ));
+        log.borrow_mut().events.push(TransportEvent::Truncated {
+            id: JobId(1),
+            result: Ok(()),
+        });
+        store.poll(&mut Vec::new()).unwrap();
+        let notices = announcer.take_batch(32).unwrap();
+        assert!(
+            matches!(notices.as_slice(), [crate::pool::Notice::Saved(entry)]
+            if entry.key == parent.key && !entry.row && entry.tier == PoolTier::Nvme)
+        );
+        assert!(matches!(
+            store.pin_export_files(parent.key, 0, true),
+            Err(ExportRefusal::ChainGap)
+        ));
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(store.stats().rows_thinned, [0, 1]);
+    }
+
+    #[test]
+    fn thinning_submission_failure_rolls_back_bytes_and_preserves_poll_events() {
+        let full = history(192);
+        let headers = [
+            header(&geometry(), &full, 64, None),
+            header(&geometry(), &full, 128, Some(64)),
+            header(&geometry(), &full, 192, Some(128)),
+        ];
+        let records = headers
+            .iter()
+            .map(|h| scanned(&directory(), h.clone(), 0, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        let used = store.used();
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit.clone(),
+                InboundTicket {
+                    key: hit.key,
+                    pages: pages(10..13),
+                    slot: StateSlotId(1),
+                },
+            )
+            .unwrap();
+        log.borrow_mut().fail_truncate = true;
+        log.borrow_mut().events.push(TransportEvent::Fetched {
+            id: JobId(1),
+            result: Ok(hit.bytes),
+        });
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Fetched { result: Ok(_), .. }]
+        ));
+        assert!(!store.index[&headers[1].key].row);
+        assert_eq!(
+            store.record(&headers[1].key).unwrap().bytes,
+            headers[1].length_with_row()
+        );
+        assert_eq!(store.used(), used);
+        assert!(store.maintenance.is_empty());
+        assert_eq!(store.stats().dropped[5], 1);
+        assert_eq!(store.stats().rows_thinned, [0, 1]);
+    }
+
+    #[test]
+    fn deferred_thinning_does_not_count_an_uncommitted_replacement_child() {
+        let full = history(192);
+        let root = header(&geometry(), &full, 64, None);
+        let parent = header(&geometry(), &full, 128, Some(64));
+        let child = header(&geometry(), &full, 192, Some(128));
+        let records = [&root, &parent, &child]
+            .into_iter()
+            .map(|h| scanned(&directory(), h.clone(), 0, true))
+            .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        store.index.pin(&parent.key).unwrap();
+        store.poll(&mut Vec::new()).unwrap();
+        store.expire(child.key).unwrap();
+        store
+            .reserve_record(child.key, Some(parent.key), child.bucket, 1, true, true)
+            .unwrap()
+            .unwrap();
+        store.index.unpin(&parent.key).unwrap();
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.index[&parent.key].row);
+        assert!(
+            log.borrow()
+                .calls
+                .iter()
+                .all(|call| !matches!(call, Call::Truncate { .. }))
+        );
+        store
+            .commit_record(child.key, Err(invalid("write failed")))
+            .unwrap();
+        assert!(store.index[&parent.key].row);
+        assert_eq!(store.index[&parent.key].children(), 0);
+        assert_eq!(store.stats().rows_thinned, [0, 0]);
     }
 
     #[test]
@@ -2911,6 +3106,10 @@ mod tests {
                 original + if success { ROW_RECORD } else { 0 }
             );
             assert_eq!(store.stats().row_refills, u64::from(success));
+            store.poll(&mut Vec::new()).unwrap();
+            assert_eq!(store.index[&compacted.key].row, success);
+            assert_eq!(store.stats().rows_thinned, [0, 0]);
+            assert_eq!(log.borrow().calls.len(), 1);
             assert!(store.lookup(&full, 0, u64::MAX).is_some());
         }
     }
@@ -3069,7 +3268,7 @@ mod tests {
         assert!(store.pending_bytes() > 0);
         assert!(
             store
-                .reserve_record(key, None, candidate.bucket, 1, true)
+                .reserve_record(key, None, candidate.bucket, 1, true, true)
                 .unwrap()
                 .is_some()
         );
@@ -3189,7 +3388,7 @@ mod tests {
         // the page-only leaf is removed; that removal also reclaims the child.
         let key = full.key_at(300).unwrap();
         let (reserved, temporary, path) = store
-            .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true)
+            .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true, true)
             .unwrap()
             .unwrap();
         assert_eq!(reserved.tail_pages, 4);
@@ -3497,7 +3696,14 @@ mod tests {
         );
         assert!(
             store
-                .reserve_record(grandchild.key, Some(root.key), grandchild.bucket, 21, true)
+                .reserve_record(
+                    grandchild.key,
+                    Some(root.key),
+                    grandchild.bucket,
+                    21,
+                    true,
+                    true
+                )
                 .is_err()
         );
         assert!(store.record(&grandchild.key).is_none());
@@ -3517,7 +3723,7 @@ mod tests {
         // Evicting the child takes the remnant with it; only the child's file is unlinked.
         let key = full.key_at(704).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, full.bucket_at(704).unwrap(), 11, true)
+            .reserve_record(key, None, full.bucket_at(704).unwrap(), 11, true, true)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3653,7 +3859,7 @@ mod tests {
         let key = full.key_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true)
+                .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true, true)
                 .unwrap()
                 .is_some()
         );
@@ -3666,6 +3872,7 @@ mod tests {
                     None,
                     full.bucket_at(400).unwrap(),
                     6,
+                    true,
                     true
                 )
                 .unwrap()
@@ -3749,6 +3956,16 @@ mod tests {
         );
         assert!(!store.index().node(&root.key).unwrap().row);
         assert_eq!(store.used(), used + ROW_RECORD);
+        // The final restore also released the interior child's row for eager truncation.
+        assert!(!store.index().node(&child.key).unwrap().row);
+        complete(
+            &log,
+            TransportEvent::Truncated {
+                id: JobId(4),
+                result: Ok(()),
+            },
+            &mut store,
+        );
         assert!(store.maintenance.is_empty());
     }
 
@@ -3861,6 +4078,19 @@ mod tests {
             },
             &mut store,
         );
+        // Committing the grandchild submits a sixth call to truncate its
+        // non-root parent's row; the root and the new leaf retain theirs.
+        assert!(matches!(
+            &log.borrow().calls[5],
+            Call::Truncate { id: JobId(6), path, length }
+                if *path == store.directory().join(record::file_name(&child.key))
+                    && *length == root_bytes - ROW_RECORD
+        ));
+        assert!(store.index().node(&root.key).unwrap().row);
+        assert!(!store.index().node(&child.key).unwrap().row);
+        assert!(store.index().node(&grandchild.key).unwrap().row);
+        assert_eq!(store.used(), 2 * root_bytes + sibling_bytes - ROW_RECORD);
+        assert_eq!(store.pending_bytes(), sibling_bytes + ROW_RECORD);
 
         // A record larger than the whole limit is skipped before anything is evicted.
         store.limit = store.used();
@@ -3877,7 +4107,7 @@ mod tests {
         assert!(2 * 4096 + 47 * PAGE_RECORD + ROW_RECORD > store.limit());
         assert_ne!(store.store(&huge).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 2);
-        assert_eq!(log.borrow().calls.len(), 5);
+        assert_eq!(log.borrow().calls.len(), 6);
         assert_eq!(store.index().len(), 3);
         assert_eq!(store.used(), store.limit());
 
@@ -3885,7 +4115,7 @@ mod tests {
         // evicting anything.
         assert!(
             store
-                .reserve_record(root.key, None, root.bucket, 10, true)
+                .reserve_record(root.key, None, root.bucket, 10, true, true)
                 .is_err()
         );
         let unknown = full.key_at(1000).unwrap();
@@ -3896,13 +4126,25 @@ mod tests {
                     Some(unknown),
                     full.bucket_at(1100).unwrap(),
                     1,
+                    true,
                     true
                 )
                 .is_err()
         );
-        assert_eq!(log.borrow().calls.len(), 5);
+        assert_eq!(log.borrow().calls.len(), 6);
         assert_eq!(store.index().len(), 3);
         assert!(store.index().nodes().all(|node| !node.pinned()));
+        complete(
+            &log,
+            TransportEvent::Truncated {
+                id: JobId(6),
+                result: Ok(()),
+            },
+            &mut store,
+        );
+        assert_eq!(store.used(), store.limit());
+        // Only the earlier sibling unlink remains charged as pending reclaim.
+        assert_eq!(store.pending_bytes(), sibling_bytes);
     }
 
     #[test]
@@ -3931,6 +4173,7 @@ mod tests {
                 Some(root.key),
                 branch.bucket_at(1340).unwrap(),
                 10,
+                true,
                 true,
             )
             .unwrap()
@@ -3977,7 +4220,7 @@ mod tests {
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4, true)
+                .reserve_record(key, None, bucket, 4, true, true)
                 .unwrap()
                 .is_none()
         );
@@ -4023,7 +4266,7 @@ mod tests {
         // so its bytes stay charged although the record left the index.
         store.index_mut().unpin(&leaf.key).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, bucket, 4, true)
+            .reserve_record(key, None, bucket, 4, true, true)
             .unwrap()
             .unwrap();
         assert_eq!(store.take_evicted(), [leaf.key, child.key, root.key]);
@@ -4077,7 +4320,7 @@ mod tests {
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4, true)
+                .reserve_record(key, None, bucket, 4, true, true)
                 .unwrap()
                 .is_none()
         );
@@ -4118,7 +4361,7 @@ mod tests {
         // Releasing the pin lets the leaf go, and its page-only ancestors follow.
         store.index_mut().unpin(&leaf.key).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, bucket, 4, true)
+            .reserve_record(key, None, bucket, 4, true, true)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4417,7 +4660,7 @@ mod tests {
         )
         .unwrap();
         let (replacement, temporary, path) = store
-            .reserve_record(root.key, None, root.bucket, 2, true)
+            .reserve_record(root.key, None, root.bucket, 2, true, true)
             .unwrap()
             .unwrap();
         assert!(!store.index.complete(&child.key));
@@ -4545,19 +4788,6 @@ mod tests {
                     path.clone(),
                     source_addresses[..PAGES - 1].to_vec(),
                     Some(vec![pool.slot_address(source_row)]),
-                    None,
-                )
-                .is_err()
-        );
-        assert!(
-            staged
-                .write_from(
-                    JobId(1),
-                    header.clone(),
-                    temporary.clone(),
-                    path.clone(),
-                    source_addresses.clone(),
-                    None,
                     None,
                 )
                 .is_err()
@@ -4767,6 +4997,27 @@ mod tests {
         }
         assert!(!path.exists());
         assert!(settled(&staged));
+
+        // A compacted zero-tail record still writes and commits its metadata.
+        let empty = self::header(&geometry, &full, 1, None);
+        let empty_path = directory.join(record::file_name(&empty.key));
+        staged
+            .write_from(
+                JobId(10),
+                empty.clone(),
+                directory.join(record::temporary_name(&empty.key)),
+                empty_path.clone(),
+                Vec::new(),
+                None,
+                Some(SliceSums {
+                    pages: Vec::new(),
+                    row: None,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(&transport_events(&mut staged, 1)[0],
+            TransportEvent::Stored { result: Ok(bytes), .. } if *bytes == empty.row_segment));
+        assert_eq!(fs::metadata(empty_path).unwrap().len(), empty.row_segment);
 
         staged.close().unwrap();
         assert!(

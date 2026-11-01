@@ -152,6 +152,8 @@ pub struct StoreStats {
     pub held: [u64; 2],
     pub dropped: [u64; 6],
     pub expired: [u64; 2],
+    /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
+    pub rows_thinned: [u64; 2],
     pub fetched: u64,
     pub fetch_failed: u64,
     pub bytes_out: u64,

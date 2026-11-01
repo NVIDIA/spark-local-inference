@@ -199,6 +199,7 @@ pub enum Job {
         id: JobId,
         temporary: PathBuf,
         header: Header,
+        row: bool,
         sums: Option<SliceSums>,
     },
     /// Write page records `first..first + buffers.len()` from `buffers`.
@@ -213,7 +214,7 @@ pub enum Job {
         buffers: Vec<usize>,
     },
     /// Write the checksum segment and header, optionally `fdatasync`, rename to
-    /// `path`, and close. Every page record and the row must have been written.
+    /// `path`, and close. Every page and any declared row must have been written.
     Commit {
         id: JobId,
         path: PathBuf,
@@ -462,6 +463,7 @@ struct Writing {
     checksums: Vec<u64>,
     hashed: bool,
     written: Vec<bool>,
+    row_required: bool,
     row_written: bool,
     bytes: u64,
 }
@@ -549,12 +551,13 @@ impl Worker {
                 id,
                 temporary,
                 header,
+                row,
                 sums,
             } => reply(
                 id,
                 Operation::Create,
                 0,
-                self.create(id, temporary, header, sums),
+                self.create(id, temporary, header, row, sums),
             ),
             Job::WritePages {
                 id,
@@ -620,6 +623,7 @@ impl Worker {
         id: JobId,
         temporary: PathBuf,
         mut header: Header,
+        row: bool,
         sums: Option<SliceSums>,
     ) -> Result<u64> {
         if self.records.contains_key(&id) {
@@ -631,7 +635,7 @@ impl Worker {
         // Allocated blocks make every direct write an overwrite, which ext4 runs under a shared
         // inode lock, so the ring's writes overlap instead of serializing at queue depth one.
         // A sparse `set_len` would not: writes into holes still take the lock exclusively.
-        if let Err(error) = preallocate(&file, header.length(true)) {
+        if let Err(error) = preallocate(&file, header.length(row)) {
             drop(file);
             let _ = fs::remove_file(&temporary);
             return Err(io_failure("preallocate record file", error));
@@ -642,11 +646,14 @@ impl Worker {
             .attach(&file)
             .map_err(|e| io_failure("attach record writer", e))?;
         let tail = header.tail_pages as usize;
+        if !row {
+            header.row_checksum = 0;
+        }
         let given = sums.is_some();
         let (checksums, hashed) = match sums {
-            Some(SliceSums { pages, row: Some(row) }) if pages.len() == tail => {
-                header.row_checksum = row;
-                (pages, true)
+            Some(sums) if sums.pages.len() == tail && sums.row.is_some() == row => {
+                header.row_checksum = sums.row.unwrap_or(0);
+                (sums.pages, true)
             }
             _ => (vec![0; tail], false),
         };
@@ -660,6 +667,7 @@ impl Worker {
                 checksums,
                 hashed,
                 written: vec![false; tail],
+                row_required: row,
                 row_written: false,
                 bytes: 0,
             }),
@@ -703,6 +711,9 @@ impl Worker {
 
     fn write_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let writing = writing(&mut self.records, id)?;
+        if !writing.row_required {
+            return Err(invalid("page-only record does not declare a row"));
+        }
         let (layout, spans) = row_spans(&writing.header, buffers)?;
         let moved = self.ring.transfer(&writing.file, &spans, true)?;
         if !writing.hashed {
@@ -741,12 +752,16 @@ impl Worker {
 
     fn finish(&mut self, writing: &mut Writing, path: &Path, sync: bool) -> Result<u64> {
         let missing = writing.written.iter().filter(|written| !**written).count();
-        if missing > 0 || !writing.row_written {
+        if missing > 0 || (writing.row_required && !writing.row_written) {
             return Err(invalid(format!(
                 "record {} cannot be committed: {missing} of {} page records and {} row are unwritten",
                 writing.temporary.display(),
                 writing.written.len(),
-                if writing.row_written { "no" } else { "its" }
+                if writing.row_required && !writing.row_written {
+                    "its"
+                } else {
+                    "no"
+                }
             )));
         }
         let checksum_bytes = writing.header.checksum_bytes() as usize;
@@ -1790,6 +1805,7 @@ mod tests {
         let thread = DiskThread::start("flare-offload-disk").unwrap();
         thread
             .submit(Job::Create {
+                row: true,
                 id: JobId(1),
                 temporary: temporary.clone(),
                 header: header.clone(),
@@ -1829,6 +1845,7 @@ mod tests {
         };
         for job in [
             Job::Create {
+                row: true,
                 id: writer,
                 temporary: directory.join(temporary_name(&key)),
                 header: header.clone(),
@@ -1894,6 +1911,7 @@ mod tests {
         let writer = JobId(1);
         thread
             .submit(Job::Create {
+                row: true,
                 id: writer,
                 temporary: temporary.clone(),
                 header: header.clone(),
@@ -2139,6 +2157,64 @@ mod tests {
     }
 
     #[test]
+    fn page_only_records_require_every_page_but_no_row() {
+        let Some(directory) = test_directory("page-only") else {
+            return;
+        };
+        let key = PrefixKey {
+            consumed_tokens: 64,
+            digest: [8; 16],
+        };
+        let header = header(key, 1);
+        let page = buffer(header.page_record_bytes() as usize, 7);
+        let temporary = directory.join(temporary_name(&key));
+        let path = directory.join(file_name(&key));
+        let mut thread = DiskThread::start("page-only").unwrap();
+        for include_page in [false, true] {
+            thread
+                .submit(Job::Create {
+                    id: JobId(1),
+                    temporary: temporary.clone(),
+                    header: header.clone(),
+                    row: false,
+                    sums: None,
+                })
+                .unwrap();
+            succeeded(&wait(&thread, 1)[0]);
+            if include_page {
+                thread
+                    .submit(Job::WritePages {
+                        id: JobId(1),
+                        window: 0,
+                        first: 0,
+                        buffers: vec![page.address()],
+                    })
+                    .unwrap();
+                succeeded(&wait(&thread, 1)[0]);
+            }
+            thread
+                .submit(Job::Commit {
+                    id: JobId(1),
+                    path: path.clone(),
+                    sync: false,
+                })
+                .unwrap();
+            let replies = wait(&thread, 1);
+            if include_page {
+                assert_eq!(succeeded(&replies[0]), header.row_segment);
+                let bytes = fs::read(&path).unwrap();
+                assert_eq!(bytes.len() as u64, header.row_segment);
+                assert_eq!(&bytes[header.page_segment as usize..], page.as_slice());
+            } else {
+                assert!(failed(&replies[0]).contains("page records"));
+                assert!(!temporary.exists() && !path.exists());
+            }
+        }
+        thread.close().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn failed_writes_abort_and_exit_leave_no_record_behind() {
         let Some(directory) = test_directory("abort") else {
             return;
@@ -2159,6 +2235,7 @@ mod tests {
         let id = JobId(1);
         thread
             .submit(Job::Create {
+                row: true,
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
@@ -2218,6 +2295,7 @@ mod tests {
 
         thread
             .submit(Job::Create {
+                row: true,
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
@@ -2256,6 +2334,7 @@ mod tests {
 
         thread
             .submit(Job::Create {
+                row: true,
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
@@ -2290,6 +2369,7 @@ mod tests {
         // temporary file.
         thread
             .submit(Job::Create {
+                row: true,
                 id,
                 temporary: temporary.clone(),
                 header,
@@ -2342,6 +2422,7 @@ mod tests {
         let writer = JobId(1);
         thread
             .submit(Job::Create {
+                row: true,
                 id: writer,
                 temporary,
                 header: header.clone(),
@@ -2568,6 +2649,7 @@ mod tests {
             .unwrap();
         thread
             .submit(Job::Create {
+                row: true,
                 id: JobId(5),
                 temporary: wide_temporary.clone(),
                 header: wide,
@@ -2927,6 +3009,7 @@ mod tests {
             disk.submit(Job::Close { id: JobId(1) }).unwrap();
             succeeded(&wait(&disk, 1)[0]);
             disk.submit(Job::Create {
+                row: true,
                 id: JobId(2),
                 temporary: directory.join(temporary_name(&header.key)),
                 header: header.clone(),

@@ -273,6 +273,7 @@ pub(super) struct Metrics {
     host_store_failed: AtomicU64,
     host_held: [AtomicU64; 2],
     host_expired: [AtomicU64; 2],
+    host_rows_thinned: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 6],
     host_parked: AtomicU64,
@@ -521,12 +522,14 @@ impl Metrics {
             .iter()
             .chain(&self.host_dropped)
             .chain(&self.host_expired)
+            .chain(&self.host_rows_thinned)
             .zip(
                 stats
                     .held
                     .into_iter()
                     .chain(stats.dropped)
-                    .chain(stats.expired),
+                    .chain(stats.expired)
+                    .chain(stats.rows_thinned),
             )
         {
             counter.store(value, Ordering::Relaxed);
@@ -567,7 +570,13 @@ impl Metrics {
         let mut text = String::with_capacity(4096);
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
+        text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_rows_thinned_total{{tier=\"{tier}\"}} {}",
+                self.host_rows_thinned[i].load(Ordering::Relaxed)
+            );
             let _ = writeln!(
                 text,
                 "flare_host_cache_expired_total{{tier=\"{tier}\"}} {}",
@@ -1436,6 +1445,7 @@ mod tests {
             slots_total: 8,
             intake_slots: 2,
             expired: [7, 9],
+            rows_thinned: [5, 6],
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6],
             outbound_rate: 2.5e9,
@@ -1465,6 +1475,8 @@ mod tests {
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"dram\"} 7\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"nvme\"} 9\n"));
+        assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"dram\"} 5\n"));
+        assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"nvme\"} 6\n"));
         for reason in [
             "inflight", "slabs", "queue", "budget", "oversize", "io_error",
         ] {

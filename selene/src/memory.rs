@@ -34,7 +34,7 @@
 //! store answers no lookups of its own.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, PoisonError},
     time::{Duration, Instant},
 };
@@ -173,6 +173,8 @@ struct Core {
     held: HashMap<PrefixKey, usize>,
     /// Records whose moves ended and that leave once nothing reads them.
     finishing: Vec<PrefixKey>,
+    /// Parents whose committed child made their row redundant, waiting for pins.
+    thinning: HashSet<PrefixKey>,
     /// Checksum-backed holdings announced to the pool.
     announced: std::collections::HashSet<PrefixKey>,
 }
@@ -205,6 +207,7 @@ impl Core {
             retiring: Vec::new(),
             held: HashMap::new(),
             finishing: Vec::new(),
+            thinning: HashSet::new(),
             announced: Default::default(),
         }
     }
@@ -383,14 +386,7 @@ impl Core {
                 }
                 Some(Eviction::Compacted(compacted)) => {
                     self.stats.dropped[0] += u64::from(!self.flat);
-                    let slot = self
-                        .index
-                        .node_mut(&compacted)
-                        .and_then(|node| node.location.row.take());
-                    if let Some(slot) = slot {
-                        self.clean_slots -= slot.len();
-                        self.pool.release(slot);
-                    }
+                    self.drop_row(&compacted);
                 }
                 None => return Ok(None),
             }
@@ -579,9 +575,49 @@ impl Core {
                 self.index.set_ready(key, true)?;
                 self.clean_slots += self.clean_slots(&self.index[key]);
             }
+            if let Some(parent) = self.index[key].parent {
+                self.thinning.insert(parent);
+            }
+            self.thin_rows();
             return Ok(());
         }
         self.remove_record(key)
+    }
+
+    /// Release an idle row without changing the record's page storage.
+    fn drop_row(&mut self, key: &PrefixKey) -> bool {
+        let Some(node) = self.index.node(key) else {
+            return true;
+        };
+        if node.location.row.is_none() {
+            return true;
+        }
+        if !node.ready || node.pinned() {
+            return false;
+        }
+        let clean = self.clean_slots(node);
+        self.index.drop_row(key);
+        let row = self.index.node_mut(key).unwrap().location.row.take();
+        self.clean_slots -= clean;
+        self.clean_slots += self.clean_slots(&self.index[key]);
+        if let Some(row) = row {
+            self.pool.release(row);
+        }
+        self.stats.progress += 1;
+        true
+    }
+
+    fn thin_rows(&mut self) {
+        for key in std::mem::take(&mut self.thinning) {
+            if !self.index.row_redundant(&key, false) || !self.index[&key].row {
+                continue;
+            }
+            if !self.drop_row(&key) {
+                self.thinning.insert(key);
+            } else {
+                self.stats.rows_thinned[0] += 1;
+            }
+        }
     }
 
     fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -780,6 +816,7 @@ impl Core {
                 self.finish_inbound(inbound, events);
             }
         }
+        self.thin_rows();
     }
 
     fn finish_outbound(&mut self, outbound: Outbound, events: &mut Vec<StoreEvent>) {
@@ -1127,6 +1164,13 @@ impl MemoryStore {
         self.core.record(key)
     }
 
+    pub(crate) fn drop_row(&mut self, key: &PrefixKey) -> bool {
+        let row = self.core.index.node(key).is_some_and(|node| node.row);
+        let dropped = self.core.drop_row(key);
+        self.core.stats.rows_thinned[0] += u64::from(row && dropped);
+        dropped
+    }
+
     /// Remove an unpinned childless record and release its slots.
     pub fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.remove_record(key)
@@ -1198,11 +1242,12 @@ impl MemoryStore {
         let mut done = Vec::new();
         a.hasher.collect(&mut done);
         for done in done {
-            let Some(notice) = a.hashing.remove(&done.owner) else {
+            let Some(mut notice) = a.hashing.remove(&done.owner) else {
                 continue;
             };
             self.core.stats.progress += 1;
-            if self.core.index.node(&done.owner).is_some_and(|n| n.ready) {
+            if let Some(node) = self.core.index.node(&done.owner).filter(|n| n.ready) {
+                notice.row = node.row;
                 a.sums.insert(
                     done.owner,
                     Arc::new(done.result.expect("hashing pinned slots cannot fail")),
@@ -1640,6 +1685,140 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn conversation_rows_thin_to_root_and_tip_and_restore_through_page_carriers() {
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(32), copier).unwrap();
+        let full = history(8 * PT, 1);
+        let mut events = Vec::new();
+        for turn in 1..=8u32 {
+            gpu.pages
+                .lock()
+                .unwrap()
+                .insert(turn - 1, vec![turn as u8; PAGE as usize]);
+            gpu.rows
+                .lock()
+                .unwrap()
+                .insert(turn, vec![turn as u8; ROW as usize]);
+            let checkpoint = published(
+                &full,
+                u64::from(turn) * PT,
+                (turn > 1).then(|| u64::from(turn - 1) * PT),
+                0,
+                turn,
+            );
+            assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+            store.poll(&mut events).unwrap();
+            assert_eq!(
+                store.core.index.nodes().filter(|n| n.row).count(),
+                (turn as usize).min(2)
+            );
+            assert_clean_slots(&store.core);
+        }
+        assert_eq!(store.pool().slot_count() - store.pool().free_slots(), 10);
+        assert_eq!(store.stats().rows_thinned, [6, 0]);
+        for (tokens, expected) in [(8 * PT, 8 * PT), (7 * PT, PT)] {
+            let hit = store.lookup(&history(tokens, 1), 0, u64::MAX).unwrap();
+            assert_eq!(hit.consumed_tokens, expected);
+            // A rewind resumes at the root and re-prefills the remaining tokens.
+            assert_eq!(
+                tokens - hit.consumed_tokens,
+                if tokens == 7 * PT { 6 * PT } else { 0 }
+            );
+            store
+                .fetch(
+                    hit.clone(),
+                    InboundTicket {
+                        key: hit.key,
+                        pages: (100..100 + hit.pages as u32).map(PageId).collect(),
+                        slot: StateSlotId(20),
+                    },
+                )
+                .unwrap();
+            events.clear();
+            store.poll(&mut events).unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [StoreEvent::Fetched { result: Ok(_), .. }]
+            ));
+            for page in 0..hit.pages as u32 {
+                assert_eq!(
+                    gpu.pages.lock().unwrap()[&(100 + page)],
+                    vec![(page + 1) as u8; PAGE as usize]
+                );
+            }
+            assert_eq!(
+                gpu.rows.lock().unwrap()[&20],
+                vec![(expected / PT) as u8; ROW as usize]
+            );
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn thinning_waits_for_commit_and_pins_and_preserves_existing_branches() {
+        let layout = Layout::new(&[geometry(PT, &[("kv", PAGE)], 3 * PAGE)]).unwrap();
+        let mut core = Core::new(IDENTITY, host_pool(64), layout, false);
+        let full = history(320, 1);
+        let root = published(&full, 64, None, 0, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        for checkpoint in [&root, &parent] {
+            core.store(checkpoint).unwrap();
+            finish(&mut core);
+        }
+        let child = published(&full, 192, Some(128), 0, 3);
+        core.store(&child).unwrap();
+        assert!(core.index[&parent.key].row);
+        core.complete_record(&child.key, false).unwrap();
+        core.outbound.clear();
+        assert!(core.index[&parent.key].row);
+        core.pin_record(&parent.key).unwrap();
+        core.store(&child).unwrap();
+        finish(&mut core);
+        assert!(core.index[&parent.key].row);
+        let before = core.pool.free_slots();
+        core.unpin_record(&parent.key).unwrap();
+        core.settle(&mut Vec::new());
+        assert_eq!(core.pool.free_slots(), before + 3);
+        assert!(core.record(&parent.key).unwrap().row.is_none());
+        assert_eq!(core.record(&parent.key).unwrap().pages.len(), 1);
+        assert_clean_slots(&core);
+
+        // A late fork preserves the page carrier without reconstructing its lost row.
+        let mut branch = history(128, 1);
+        branch.append(&[99; 128], &[]).unwrap();
+        let sibling = published(&branch, 192, Some(128), 10, 4);
+        core.store(&sibling).unwrap();
+        finish(&mut core);
+        assert_eq!(core.index[&parent.key].children(), 2);
+        assert!(!core.index[&parent.key].row);
+        assert!(core.index[&child.key].row && core.index[&sibling.key].row);
+
+        // A branch formed while its row is pinned retains that row and both tips.
+        core.pin_record(&child.key).unwrap();
+        let leaf = published(&full, 256, Some(192), 0, 5);
+        core.store(&leaf).unwrap();
+        finish(&mut core);
+        let mut fork = history(192, 1);
+        fork.append(&[98; 64], &[]).unwrap();
+        let fork = published(&fork, 256, Some(192), 20, 6);
+        core.store(&fork).unwrap();
+        finish(&mut core);
+        core.unpin_record(&child.key).unwrap();
+        core.settle(&mut Vec::new());
+        assert!(core.index[&root.key].row && core.index[&child.key].row);
+        assert!(core.index[&leaf.key].row && core.index[&fork.key].row);
+        let tip = published(&full, 320, Some(256), 0, 7);
+        core.store(&tip).unwrap();
+        finish(&mut core);
+        assert_eq!(
+            core.lookup(&history(256, 1), 0, u64::MAX).unwrap().key,
+            child.key
+        );
+        assert_clean_slots(&core);
     }
 
     #[test]
@@ -2458,10 +2637,19 @@ mod tests {
         let parent = core.index.node(&child.key).unwrap();
         assert!(!parent.pinned());
         assert_eq!(parent.children(), 1);
+        // Allocation compacted the older root before evicting the stranger.
+        assert!(core.record(&root.key).unwrap().row.is_none());
+        assert!(core.record(&child.key).unwrap().row.is_some());
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
         assert_eq!(
             stored(&finish(&mut core)),
             [(grandchild.key, Some(3 * PAGE + ROW))]
         );
+        // Commit thins the child: nine page slots and the tip's one row slot
+        // occupy ten of twelve warm slots. The root's row was already freed.
+        assert!(core.record(&child.key).unwrap().row.is_none());
+        assert!(core.record(&grandchild.key).unwrap().row.is_some());
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
 
         // With nothing else evictable the publication is skipped rather than
         // stored at its parent's expense, and the parent's pin is released.
@@ -2474,6 +2662,7 @@ mod tests {
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_clean_slots(&core);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct Node<L> {
     pub ready: bool,
     pub location: L,
     children: u32,
+    ready_children: u32,
     pins: u32,
     accessed: u64,
     pub last_used: SystemTime,
@@ -170,6 +171,14 @@ impl<L> Index<L> {
             .ok_or_else(|| invalid("cannot change the readiness of an unindexed host record"))?;
         if node.ready != ready {
             node.ready = ready;
+            if let Some(parent) = node.parent {
+                let parent = self.nodes.get_mut(&parent).unwrap();
+                if ready {
+                    parent.ready_children += 1;
+                } else {
+                    parent.ready_children -= 1;
+                }
+            }
             let node = &self.nodes[key];
             self.notify(
                 if ready {
@@ -216,6 +225,18 @@ impl<L> Index<L> {
 
     pub fn node_mut(&mut self, key: &PrefixKey) -> Option<&mut Node<L>> {
         self.nodes.get_mut(key)
+    }
+
+    /// Whether a row is redundant in this tier; disk counts only committed children.
+    pub fn row_redundant(&self, key: &PrefixKey, ready_only: bool) -> bool {
+        self.node(key).is_some_and(|node| {
+            node.parent.is_some()
+                && if ready_only {
+                    node.ready_children == 1
+                } else {
+                    node.children == 1
+                }
+        })
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node<L>> {
@@ -268,6 +289,9 @@ impl<L> Index<L> {
             ));
         }
         let accessed = self.tick();
+        if ready && let Some(parent) = parent {
+            self.nodes.get_mut(&parent).unwrap().ready_children += 1;
+        }
         self.order.insert((accessed, key));
         let last_used = if self.max_age.is_zero() {
             SystemTime::UNIX_EPOCH
@@ -286,6 +310,7 @@ impl<L> Index<L> {
                 ready,
                 location,
                 children: 0,
+                ready_children: 0,
                 pins: 0,
                 accessed,
                 last_used,
@@ -327,7 +352,9 @@ impl<L> Index<L> {
             }
         }
         if let Some(parent) = node.parent {
-            self.nodes.get_mut(&parent).unwrap().children -= 1;
+            let parent = self.nodes.get_mut(&parent).unwrap();
+            parent.children -= 1;
+            parent.ready_children -= u32::from(node.ready);
         }
         self.notify(NodeEvent::Gone, &node);
         Ok(node)
@@ -420,6 +447,18 @@ impl<L> Index<L> {
         before: u64,
         usable: impl Fn(&Node<L>) -> bool,
     ) -> Option<Match> {
+        self.lookup_below_with(history, resident, before, |node, _| usable(node))
+    }
+
+    /// Like `lookup_below`, with separate availability checks for the endpoint's
+    /// row and its ancestors' pages. `row` is true only for the endpoint.
+    pub(crate) fn lookup_below_with(
+        &mut self,
+        history: &dyn History,
+        resident: u64,
+        before: u64,
+        usable: impl Fn(&Node<L>, bool) -> bool,
+    ) -> Option<Match> {
         let block = HASH_BLOCK_TOKENS as u64;
         let total = history.token_count().min(before.saturating_sub(1));
         let root = history.key_at(0)?;
@@ -486,10 +525,10 @@ impl<L> Index<L> {
         &self,
         key: &PrefixKey,
         resident: u64,
-        usable: &impl Fn(&Node<L>) -> bool,
+        usable: &impl Fn(&Node<L>, bool) -> bool,
     ) -> Option<Match> {
         let endpoint = self.nodes.get(key)?;
-        if !endpoint.row || !usable(endpoint) {
+        if !endpoint.row || !usable(endpoint, true) {
             return None;
         }
         let mut nodes = vec![*key];
@@ -502,7 +541,7 @@ impl<L> Index<L> {
                 }
                 Some(parent) => {
                     let node = self.nodes.get(&parent)?;
-                    if !usable(node) {
+                    if !usable(node, false) {
                         return None;
                     }
                     nodes.push(parent);
@@ -554,6 +593,7 @@ impl<L> Index<L> {
             if let Some(parent) = node.parent {
                 let parent_node = self.nodes.get_mut(&parent).unwrap();
                 parent_node.children -= 1;
+                parent_node.ready_children -= u32::from(node.ready);
                 if parent_node.children == 0 && !parent_node.row && parent_node.pins == 0 {
                     next = Some(parent);
                 }
@@ -860,6 +900,34 @@ mod tests {
     }
 
     #[test]
+    fn row_redundancy_tracks_commits_replacements_and_removed_children() {
+        let mut index = Index::new(64);
+        let full = history(256);
+        insert(&mut index, &full, 64, None);
+        insert(&mut index, &full, 128, Some(64));
+        insert(&mut index, &full, 192, Some(128));
+        let root = full.key_at(64).unwrap();
+        let parent = full.key_at(128).unwrap();
+        let child = full.key_at(192).unwrap();
+        assert!(!index.row_redundant(&root, true));
+        assert!(index.row_redundant(&parent, true));
+        index.set_ready(&child, false).unwrap();
+        index.set_ready(&child, false).unwrap();
+        assert!(!index.row_redundant(&parent, true));
+        assert!(index.row_redundant(&parent, false));
+        insert(&mut index, &full, 256, Some(128));
+        assert!(index.row_redundant(&parent, true));
+        assert!(!index.row_redundant(&parent, false));
+        index.remove_node(&full.key_at(256).unwrap()).unwrap();
+        assert!(!index.row_redundant(&parent, true));
+        index.set_ready(&child, true).unwrap();
+        assert!(index.row_redundant(&parent, true));
+        index.drop_row(&parent);
+        assert_eq!(index.remove(&child).unwrap().len(), 2);
+        assert_eq!(index[&root].ready_children, 0);
+    }
+
+    #[test]
     fn writing_nodes_are_invisible_until_ready() {
         let mut index = Index::new(64);
         let full = history(640);
@@ -873,7 +941,7 @@ mod tests {
                 .is_none()
         );
         assert!(index.evict(true, |_| true).is_none());
-        index.node_mut(&key).unwrap().ready = true;
+        index.set_ready(&key, true).unwrap();
         assert_eq!(
             index
                 .lookup_below(&full, 0, u64::MAX, |node| node.ready)
@@ -886,7 +954,7 @@ mod tests {
                 .lookup_below(&full, 0, u64::MAX, |node| node.ready && node.key != key)
                 .is_none()
         );
-        index.node_mut(&key).unwrap().ready = false;
+        index.set_ready(&key, false).unwrap();
         assert!(
             index
                 .lookup_below(&full, 0, u64::MAX, |node| node.ready)

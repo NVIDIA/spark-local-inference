@@ -806,12 +806,14 @@ pub fn scan(
     }
     loop {
         let keys: HashSet<PrefixKey> = records.iter().map(|record| record.header.key).collect();
+        let parents: HashSet<PrefixKey> = records.iter().filter_map(|r| r.header.parent).collect();
         let (kept, orphans): (Vec<Scanned>, Vec<Scanned>) =
             records.into_iter().partition(|record| {
-                record
-                    .header
-                    .parent
-                    .is_none_or(|parent| keys.contains(&parent))
+                (record.row || parents.contains(&record.header.key))
+                    && record
+                        .header
+                        .parent
+                        .is_none_or(|parent| keys.contains(&parent))
             });
         records = kept;
         if orphans.is_empty() {
@@ -1287,13 +1289,13 @@ mod tests {
             )
         };
         keep(&root);
-        keep(&child);
         let compacted = write_record(
             &directory,
-            &grandchild,
-            &file_name(&grandchild.key),
-            grandchild.row_segment,
+            &child,
+            &file_name(&child.key),
+            child.row_segment,
         );
+        keep(&grandchild);
         keep(&sibling);
         let deleted = vec![
             keep(&orphan),
@@ -1341,9 +1343,9 @@ mod tests {
         assert_eq!(records[0].header, root);
         assert!(records[0].row);
         assert_eq!(records[0].bytes, root.length_with_row());
-        assert!(!records[3].row);
-        assert_eq!(records[3].path, compacted);
-        assert_eq!(records[3].bytes, grandchild.row_segment);
+        assert!(!records[2].row);
+        assert_eq!(records[2].path, compacted);
+        assert_eq!(records[2].bytes, child.row_segment);
         for path in &deleted {
             assert!(!path.exists(), "{} survived", path.display());
         }
@@ -1387,8 +1389,8 @@ mod tests {
             vec![
                 (root.key, None, 3, true, 2),
                 (sibling.key, Some(root.key), 2, true, 0),
-                (child.key, Some(root.key), 3, true, 1),
-                (grandchild.key, Some(child.key), 3, false, 0),
+                (child.key, Some(root.key), 3, false, 1),
+                (grandchild.key, Some(child.key), 3, true, 0),
             ]
         );
 
@@ -1406,6 +1408,49 @@ mod tests {
         assert!(crate::testing::directory_lock(&file).is_err());
         drop(lock);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn scan_prunes_page_only_leaves_left_by_an_incomplete_spill_chain() {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-record-page-only-leaves-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let lock = crate::testing::directory_lock(&directory).unwrap();
+        let geometry = geometries().remove(0);
+        let root = header(&geometry, 64, None);
+        write_record(
+            &directory,
+            &root,
+            &file_name(&root.key),
+            root.length_with_row(),
+        );
+        let dead = [
+            header(&geometry, 128, Some(64)),
+            header(&geometry, 192, Some(128)),
+            header(&geometry, 256, None),
+        ]
+        .map(|header| {
+            write_record(
+                &directory,
+                &header,
+                &file_name(&header.key),
+                header.row_segment,
+            )
+        });
+        let records = scan(
+            &lock,
+            &IDENTITY,
+            &FINGERPRINT,
+            geometry[0].page_tokens,
+            &rank_sizes(&geometry),
+        )
+        .unwrap();
+        assert_eq!(names(&records), [file_name(&root.key)]);
+        assert!(dead.iter().all(|path| !path.exists()));
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

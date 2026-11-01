@@ -238,6 +238,17 @@ policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
+Each tier also drops a non-root record's row once its first child commits,
+keeping the pages. Eager thinning preserves rows at roots, leaves and existing branches;
+readers and spills delay removal until they release the row. DRAM releases the
+row slots, disk truncates at the row segment, and a later spill omits an already
+removed row. A rewind or a later fork at a page-only node restores the nearest
+row-bearing ancestor and re-prefills the remaining tokens.
+With lazy write-behind, a crash or an incomplete shutdown drain can lose the
+DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
+row-bearing ancestor. Startup prunes childless page-only records and any
+page-only ancestors they leave childless.
+
 An outbound for a key already present or in flight is skipped. An inbound for
 a key already in flight attaches the request as another waiter.
 
