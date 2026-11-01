@@ -238,12 +238,11 @@ policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Each tier also drops a non-root record's row once its first child commits,
-keeping the pages. Eager thinning preserves rows at roots, leaves and existing branches;
-readers and spills delay removal until they release the row. DRAM releases the
-row slots, disk truncates at the row segment, and a later spill omits an already
-removed row. A rewind or a later fork at a page-only node restores the nearest
-row-bearing ancestor and re-prefills the remaining tokens.
+Each tier drops a non-root record's row once its only child commits, keeping
+the pages; readers and spills delay removal until they release the row. DRAM
+releases row slots, disk truncates at the row segment, and later spills omit it.
+A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
+the remaining tokens.
 With lazy write-behind, a crash or an incomplete shutdown drain can lose the
 DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
 row-bearing ancestor. Startup prunes childless page-only records and any
@@ -329,7 +328,23 @@ The pool contains warm checkpoint slots plus automatic intake slots. It is one
 advised for transparent huge pages), registered once at startup. Rows use each
 rank's page share across as many slots as needed; their pieces need not be
 contiguous. CPU readers traverse pieces in rank order, preserving disk bytes
-and streaming xxh3 checksum values. Existing records still recover.
+and streaming xxh3 checksum values. After copy-out, Selene compares local ranks'
+**unpadded** plane and row bytes. Each record has two decisions: all of its pages
+share one representation, and its row has an independent representation. Identical
+shares pack into existing slots and unused slots are released; differing pages
+keep the entire page segment per-rank. TP1 is unchanged. Restores fan one stored
+share out to every local rank. Disk spills use DRAM's decisions without comparing
+again, then hash the stored bytes once. Disk-only stores decide from the first
+completed page window; a later differing page abandons that store after its jobs
+drain, without publishing a partial or mixed record.
+
+Memory-only TP>1 split pools remain per-rank because their slot identities are not
+CPU-readable. Pool records also remain per-rank, including disk files, checksums
+and announcements. Memory stores containing replicated records refuse pool
+announcements; recovered replicated files stay local. `/metrics` reports packed
+and per-rank record stores by tier, plus abandoned disk-only stores. A record
+counts as packed when its pages or row are replicated; promotions count as a new
+DRAM store. These decisions do not reduce GPU copy-out traffic.
 
 Memory allocation keeps at least `intake_slots` free slots by evicting the
 coldest ready, unpinned, durable records that, in pool mode, are not announced.
@@ -369,7 +384,12 @@ the storage namespace identity, the layout fingerprint, the key (consumed count 
 digest), the parent key, the bucket digest, the page token count, the tail
 page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
-time. A checksum segment follows, one 64-bit xxh3 per tail page, padded to
+time. Version 2 uses flag bit 31 for a replicated page segment and bit 30 for a
+replicated row. Page offsets use one fixed stride for the whole record. Version-1
+records still recover, and the layout fingerprint is unchanged. An older binary
+treats replicated version-2 files as invalid and **deletes them during recovery**;
+downgrading therefore starts those records cold. A checksum segment follows,
+one 64-bit xxh3 over each stored page record, padded to
 4 KiB, so a restore that reads only a suffix of the pages verifies each page
 it read. The page segment follows, page-major: page `i`, then rank `r`, then
 planes in geometry order, with every plane padded to 4 KiB. The row segment

@@ -274,6 +274,9 @@ pub(super) struct Metrics {
     host_held: [AtomicU64; 2],
     host_expired: [AtomicU64; 2],
     host_rows_thinned: [AtomicU64; 2],
+    host_packed_records: [AtomicU64; 2],
+    host_per_rank_records: [AtomicU64; 2],
+    host_abandoned_stores: AtomicU64,
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 6],
     host_parked: AtomicU64,
@@ -523,19 +526,24 @@ impl Metrics {
             .chain(&self.host_dropped)
             .chain(&self.host_expired)
             .chain(&self.host_rows_thinned)
+            .chain(&self.host_packed_records)
+            .chain(&self.host_per_rank_records)
             .zip(
                 stats
                     .held
                     .into_iter()
                     .chain(stats.dropped)
                     .chain(stats.expired)
-                    .chain(stats.rows_thinned),
+                    .chain(stats.rows_thinned)
+                    .chain(stats.packed_records)
+                    .chain(stats.per_rank_records),
             )
         {
             counter.store(value, Ordering::Relaxed);
         }
         for (target, value) in [
             (&self.host_stored, stats.stored),
+            (&self.host_abandoned_stores, stats.abandoned_stores),
             (&self.host_row_refills, stats.row_refills),
             (&self.host_store_skipped, stats.store_skipped),
             (&self.host_store_failed, stats.store_failed),
@@ -571,7 +579,23 @@ impl Metrics {
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
         text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
+        text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
+        let _ = writeln!(
+            text,
+            "flare_host_cache_abandoned_stores_total {}",
+            self.host_abandoned_stores.load(Ordering::Relaxed)
+        );
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            for (name, counters) in [
+                ("packed_records", &self.host_packed_records),
+                ("per_rank_records", &self.host_per_rank_records),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_{name}_total{{tier=\"{tier}\"}} {}",
+                    counters[i].load(Ordering::Relaxed)
+                );
+            }
             let _ = writeln!(
                 text,
                 "flare_host_cache_rows_thinned_total{{tier=\"{tier}\"}} {}",
@@ -1446,6 +1470,9 @@ mod tests {
             intake_slots: 2,
             expired: [7, 9],
             rows_thinned: [5, 6],
+            packed_records: [7, 8],
+            per_rank_records: [9, 10],
+            abandoned_stores: 11,
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6],
             outbound_rate: 2.5e9,
@@ -1475,6 +1502,11 @@ mod tests {
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"dram\"} 7\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"nvme\"} 9\n"));
+        assert!(text.contains("flare_host_cache_packed_records_total{tier=\"dram\"} 7\n"));
+        assert!(text.contains("flare_host_cache_packed_records_total{tier=\"nvme\"} 8\n"));
+        assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"dram\"} 9\n"));
+        assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"nvme\"} 10\n"));
+        assert!(text.contains("flare_host_cache_abandoned_stores_total 11\n"));
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"dram\"} 5\n"));
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"nvme\"} 6\n"));
         for reason in [

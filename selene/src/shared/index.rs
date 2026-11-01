@@ -912,7 +912,6 @@ mod tests {
         assert!(!index.row_redundant(&root, true));
         assert!(index.row_redundant(&parent, true));
         index.set_ready(&child, false).unwrap();
-        index.set_ready(&child, false).unwrap();
         assert!(!index.row_redundant(&parent, true));
         assert!(index.row_redundant(&parent, false));
         insert(&mut index, &full, 256, Some(128));

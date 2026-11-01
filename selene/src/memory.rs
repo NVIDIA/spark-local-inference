@@ -70,6 +70,31 @@ pub struct MemoryRecord {
     pub pages: Vec<Slot>,
     pub row: Option<Vec<Slot>>,
     pub durable: bool,
+    pub replication: crate::record::Replication,
+}
+
+impl MemoryRecord {
+    pub(crate) fn slots(&self) -> usize {
+        self.pages.chunk_by(|a, b| a == b).count() + self.row.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn page_addresses(
+        &self,
+        pool: &SlabPool,
+        layout: &Layout,
+        skip: usize,
+    ) -> Vec<usize> {
+        let page_bytes = if self.replication.pages {
+            layout.page_share(0) as usize
+        } else {
+            pool.page_bytes()
+        };
+        self.pages[skip..]
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| pool.slot_address(*slot) + (i + skip) * page_bytes % pool.page_bytes())
+            .collect()
+    }
 }
 
 /// Windows of one record: those not yet submitted and the count in flight.
@@ -157,6 +182,7 @@ struct Core {
     identity: [u8; 32],
     /// Every node is a root; the composite's disk index owns the tree.
     flat: bool,
+    pack_shares: bool,
     outbound: BTreeMap<JobId, Outbound>,
     inbound: BTreeMap<JobId, Inbound>,
     /// Publications waiting for the copy-out of the named parent key.
@@ -189,6 +215,7 @@ impl Core {
     }
 
     fn new(identity: [u8; 32], pool: SlabPool, layout: Layout, flat: bool) -> Self {
+        let pack_shares = pool.rank_parts().is_none() && layout.ranks.len() > 1;
         Self {
             index: Index::new(layout.page_tokens),
             pool,
@@ -196,6 +223,7 @@ impl Core {
             layout: Arc::new(layout),
             identity,
             flat,
+            pack_shares,
             outbound: BTreeMap::new(),
             inbound: BTreeMap::new(),
             deferred: Vec::new(),
@@ -386,7 +414,8 @@ impl Core {
                 }
                 Some(Eviction::Compacted(compacted)) => {
                     self.stats.dropped[0] += u64::from(!self.flat);
-                    self.drop_row(&compacted);
+                    let dropped = self.drop_row(&compacted);
+                    debug_assert!(dropped);
                 }
                 None => return Ok(None),
             }
@@ -399,6 +428,7 @@ impl Core {
             pages: slots,
             row: row.then_some(row_slots),
             durable,
+            replication: Default::default(),
         };
         // The index requires a root's tail to cover its whole chain; a flat
         // store's roots hold only their checkpoint's tail, so their count is
@@ -439,9 +469,7 @@ impl Core {
             let Some(node) = self.index.node(&key) else {
                 break;
             };
-            let held_slots = self
-                .layout
-                .record_slots(node.location.pages.len(), node.location.row.is_some());
+            let held_slots = node.location.slots();
             let retiring = Retiring {
                 tier: PoolTier::Dram,
                 key,
@@ -465,8 +493,7 @@ impl Core {
             && !node.pinned()
             && evictable(node, self.spill, self.announced.contains(&node.key))
         {
-            self.layout
-                .record_slots(node.location.pages.len(), node.location.row.is_some())
+            node.location.slots()
         } else {
             0
         }
@@ -568,6 +595,17 @@ impl Core {
     }
 
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
+        if success && self.index.node(key).is_some_and(|node| !node.ready) {
+            if self.pack_shares {
+                self.pack_shares(key);
+            }
+            let r = self.index[key].location.replication;
+            if r.pages || r.row {
+                self.stats.packed_records[0] += 1;
+            } else {
+                self.stats.per_rank_records[0] += 1;
+            }
+        }
         self.unpin_record(key)?;
         self.stats.progress += 1;
         if success {
@@ -584,6 +622,47 @@ impl Core {
         self.remove_record(key)
     }
 
+    /// Copy-out has drained and the unpublished record has no readers.
+    fn pack_shares(&mut self, key: &PrefixKey) {
+        let layout = &self.layout;
+        let pool = &self.pool;
+        let record = &mut self.index.node_mut(key).unwrap().location;
+        let addresses = record.page_addresses(pool, layout, 0);
+        let row = record.row.as_ref().map(|row| pool.addresses(row));
+        record.replication = crate::record::identical(layout, &addresses, row.as_deref());
+        if record.replication.pages {
+            let share = layout.page_share(0) as usize;
+            let per_slot = pool.page_bytes() / share;
+            let original = record.pages.clone();
+            for (i, slot) in record.pages.iter_mut().enumerate() {
+                *slot = original[i / per_slot];
+            }
+            for (source, destination) in
+                addresses.iter().zip(record.page_addresses(pool, layout, 0))
+            {
+                // SAFETY: Only this unpublished record owns these slots; packing moves backwards.
+                unsafe {
+                    std::ptr::copy(*source as *const u8, destination as *mut u8, share);
+                }
+            }
+            pool.release(
+                original
+                    .into_iter()
+                    .skip(record.pages.len().div_ceil(per_slot)),
+            );
+        }
+        if record.replication.row {
+            let row = record.row.as_mut().unwrap();
+            let addresses = pool.addresses(row);
+            crate::record::copy_row(
+                layout,
+                &addresses,
+                &crate::record::replicated_row_layout(layout),
+            );
+            pool.release(row.drain((layout.row_share(0) as usize).div_ceil(pool.page_bytes())..));
+        }
+    }
+
     /// Release an idle row without changing the record's page storage.
     fn drop_row(&mut self, key: &PrefixKey) -> bool {
         let Some(node) = self.index.node(key) else {
@@ -597,7 +676,9 @@ impl Core {
         }
         let clean = self.clean_slots(node);
         self.index.drop_row(key);
-        let row = self.index.node_mut(key).unwrap().location.row.take();
+        let record = &mut self.index.node_mut(key).unwrap().location;
+        let row = record.row.take();
+        record.replication.row = false;
         self.clean_slots -= clean;
         self.clean_slots += self.clean_slots(&self.index[key]);
         if let Some(row) = row {
@@ -607,15 +688,20 @@ impl Core {
         true
     }
 
+    fn thin(&mut self, key: &PrefixKey) -> bool {
+        let row = self.index.node(key).is_some_and(|node| node.row);
+        let dropped = self.drop_row(key);
+        self.stats.rows_thinned[0] += u64::from(row && dropped);
+        dropped
+    }
+
     fn thin_rows(&mut self) {
         for key in std::mem::take(&mut self.thinning) {
-            if !self.index.row_redundant(&key, false) || !self.index[&key].row {
+            if !self.index.row_redundant(&key, false) {
                 continue;
             }
-            if !self.drop_row(&key) {
+            if !self.thin(&key) {
                 self.thinning.insert(key);
-            } else {
-                self.stats.rows_thinned[0] += 1;
             }
         }
     }
@@ -687,7 +773,10 @@ impl Core {
             return Err(invalid("an inbound transfer for this key is in flight"));
         }
         let mut slots = Vec::with_capacity(chain.pages);
+        let id = self.next_job();
+        let mut groups: Vec<(bool, Vec<(PageId, usize)>)> = Vec::new();
         let mut row = None;
+        let mut row_replicated = false;
         for (position, key) in chain.nodes.iter().enumerate() {
             let node = self
                 .index
@@ -706,14 +795,32 @@ impl Core {
                     record.pages.len()
                 )));
             }
-            slots.extend(self.pool.addresses(&record.pages[skip..]));
+            let addresses = record.page_addresses(&self.pool, &self.layout, skip);
+            let offset = slots.len();
+            slots.extend_from_slice(&addresses);
             if key == last {
                 let slot = record
                     .row
                     .as_ref()
                     .ok_or_else(|| invalid("host chain endpoint has no row"))?;
                 row = Some((ticket.slot, self.pool.addresses(slot)));
+                row_replicated = record.replication.row;
             }
+            let ids = ticket
+                .pages
+                .get(offset..slots.len())
+                .ok_or_else(|| invalid("host chain exceeds ticket pages"))?;
+            if groups
+                .last()
+                .is_none_or(|g| g.0 != record.replication.pages)
+            {
+                groups.push((record.replication.pages, Vec::new()));
+            }
+            groups
+                .last_mut()
+                .unwrap()
+                .1
+                .extend(ids.iter().copied().zip(addresses));
         }
         if slots.len() != ticket.pages.len() || slots.len() != chain.pages {
             return Err(invalid(format!(
@@ -731,9 +838,19 @@ impl Core {
                 return Err(error);
             }
         }
-        let id = self.next_job();
-        let pages = ticket.pages.iter().copied().zip(slots);
-        let queued = windows(id, Direction::In, pages, row);
+        let mut queued = VecDeque::new();
+        let last = groups.len() - 1;
+        for (i, (packed, pages)) in groups.into_iter().enumerate() {
+            let mut group = windows(id, Direction::In, pages, row.clone().filter(|_| i == last));
+            for job in &mut group {
+                job.replication = crate::record::Replication {
+                    pages: packed,
+                    row: row_replicated && job.row.is_some(),
+                };
+                job.window += queued.len() as u32;
+            }
+            queued.extend(group);
+        }
         self.inbound_rate.started();
         self.inbound.insert(
             id,
@@ -976,6 +1093,7 @@ fn windows(
     while let Some(chunk) = chunks.next() {
         let last = chunks.peek().is_none();
         queued.push_back(Job {
+            replication: Default::default(),
             id,
             window: queued.len() as u32,
             direction,
@@ -985,6 +1103,7 @@ fn windows(
     }
     if queued.is_empty() && row.is_some() {
         queued.push_back(Job {
+            replication: Default::default(),
             id,
             window: 0,
             direction,
@@ -1165,10 +1284,7 @@ impl MemoryStore {
     }
 
     pub(crate) fn drop_row(&mut self, key: &PrefixKey) -> bool {
-        let row = self.core.index.node(key).is_some_and(|node| node.row);
-        let dropped = self.core.drop_row(key);
-        self.core.stats.rows_thinned[0] += u64::from(row && dropped);
-        dropped
+        self.core.thin(key)
     }
 
     /// Remove an unpinned childless record and release its slots.
@@ -1204,6 +1320,15 @@ impl MemoryStore {
         if self.announce.is_some() || self.core.pool.rank_parts().is_some() {
             return Ok(());
         }
+        if self
+            .core
+            .index
+            .nodes()
+            .any(|n| n.location.replication != Default::default())
+        {
+            return Err(invalid("cannot announce replicated records to a pool"));
+        }
+        self.core.pack_shares = false;
         let wake = announcer.wake.clone();
         let view = TierView::new(announcer, PoolTier::Dram, &self.core.layout);
         self.core.index.observe(view.sink());
@@ -1268,6 +1393,9 @@ impl MemoryStore {
                     let Some(node) = self.core.index.node(&key).filter(|n| n.ready) else {
                         continue;
                     };
+                    debug_assert!(
+                        !node.location.replication.row && !node.location.replication.pages
+                    );
                     let pool = &self.core.pool;
                     let job = HashJob {
                         key,
@@ -1566,7 +1694,7 @@ impl crate::store::TierStore for MemoryStore {
 mod tests {
     use super::*;
     use crate::testing::TestHistory as PrefixHistory;
-    use crate::testing::geometry;
+    use crate::testing::{geometry, poll_until};
 
     const IDENTITY: [u8; 32] = [7; 32];
     const PAGE: u64 = 8192;
@@ -3185,6 +3313,279 @@ mod tests {
             (0, store.pool().slot_count())
         );
         assert_eq!(store.pool().free_slots(), store.pool().slot_count());
+        store.close().unwrap();
+    }
+    #[test]
+    fn identical_shares_pack_slots_and_restore_every_rank_while_pool_records_stay_per_rank() {
+        use crate::testing::SimulatedGpu;
+        for pooled in [false, true] {
+            for mode in 0..3 {
+                for same_row in [false, true] {
+                    let geometry = vec![geometry(PT, &[("kv", PAGE)], 3 * PAGE); 4];
+                    let layout = Layout::new(&geometry).unwrap();
+                    let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+                    let pool = SlabPool::new(layout.page_record_bytes, 32, 0).unwrap();
+                    let mut store = MemoryStore::new(IDENTITY, pool.clone(), copier).unwrap();
+                    if pooled {
+                        store
+                            .announce_records(Announcer::new(Arc::new(tokio::sync::Notify::new())))
+                            .unwrap();
+                    }
+                    let h = history(6 * PT + 3, 1);
+                    let checkpoint = published(&h, 6 * PT + 3, None, 0, 1);
+                    let flags: Vec<_> = (0..6)
+                        .map(|page| mode == 0 || (mode == 2 && page % 3 != 1))
+                        .collect();
+                    let pages: Vec<Vec<u8>> = flags
+                        .iter()
+                        .enumerate()
+                        .map(|(page, same)| {
+                            let mut bytes = vec![0; layout.page_record_bytes as usize];
+                            for (rank, part) in layout.ranks.iter().enumerate() {
+                                let start = part.page_offset as usize;
+                                bytes[start..start + PAGE as usize]
+                                    .fill((page + if *same { 0 } else { rank } + 1) as u8);
+                            }
+                            bytes
+                        })
+                        .collect();
+                    let mut row = vec![0; layout.row_record_bytes as usize];
+                    for (rank, part) in layout.ranks.iter().enumerate() {
+                        let start = part.row_offset as usize;
+                        row[start..start + 3 * PAGE as usize].fill(if same_row {
+                            9
+                        } else {
+                            rank as u8 + 9
+                        });
+                    }
+                    for (page, bytes) in pages.iter().enumerate() {
+                        gpu.pages.lock().unwrap().insert(page as u32, bytes.clone());
+                    }
+                    gpu.rows.lock().unwrap().insert(1, row.clone());
+                    assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    poll_until(&mut store, deadline, |e| {
+                        matches!(e, StoreEvent::Stored { result: Ok(_), .. })
+                    });
+                    let record = store.record(&checkpoint.key).unwrap();
+                    let expected = !pooled && flags.iter().all(|same| *same);
+                    assert_eq!(record.replication.pages, expected);
+                    assert_eq!(record.replication.row, same_row && !pooled);
+                    let page_slots = if expected { 2 } else { 6 };
+                    let row_slots = if same_row && !pooled { 1 } else { 3 };
+                    let packed = expected || (same_row && !pooled);
+                    assert_eq!(store.stats().packed_records, [u64::from(packed), 0]);
+                    assert_eq!(store.stats().per_rank_records, [u64::from(!packed), 0]);
+                    assert_eq!(record.slots(), page_slots + row_slots);
+                    assert_eq!(pool.free_slots(), 32 - record.slots());
+                    if !pooled {
+                        assert_eq!(store.core.clean_slots, record.slots());
+                    }
+                    if !pooled && packed {
+                        assert!(
+                            store
+                                .announce_records(Announcer::new(Arc::new(
+                                    tokio::sync::Notify::new()
+                                )))
+                                .is_err()
+                        );
+                    }
+                    if pooled {
+                        let mut events = Vec::new();
+                        while store.announced_sums(&checkpoint.key).is_none() {
+                            assert!(Instant::now() < deadline);
+                            store.poll(&mut events).unwrap();
+                            std::thread::yield_now();
+                        }
+                        let sums = store.announced_sums(&checkpoint.key).unwrap();
+                        assert_eq!(
+                            sums.pages,
+                            pages
+                                .iter()
+                                .map(|p| crate::record::checksum(p))
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(sums.row, Some(crate::record::checksum(&row)));
+                    }
+                    let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+                    store
+                        .fetch(
+                            hit,
+                            InboundTicket {
+                                key: checkpoint.key,
+                                pages: (100..106).map(PageId).collect(),
+                                slot: StateSlotId(7),
+                            },
+                        )
+                        .unwrap();
+                    poll_until(&mut store, deadline, |e| {
+                        matches!(e, StoreEvent::Fetched { result: Ok(_), .. })
+                    });
+                    for (page, bytes) in pages.iter().enumerate() {
+                        assert_eq!(&gpu.pages.lock().unwrap()[&(100 + page as u32)], bytes);
+                    }
+                    assert_eq!(gpu.rows.lock().unwrap()[&7], row);
+                    store.remove_record(&checkpoint.key).unwrap();
+                    assert_eq!(pool.free_slots(), 32);
+                    store.close().unwrap();
+                }
+            }
+        }
+    }
+    #[test]
+    fn reused_slots_compare_live_units_without_padding() {
+        let geometry = vec![geometry(PT, &[("k", 5003), ("v", 777)], 43001); 4];
+        let layout = Layout::new(&geometry).unwrap();
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let pool =
+            SlabPool::new(layout.page_record_bytes, layout.record_slots(6, true), 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool.clone(), copier).unwrap();
+        let h = history(6 * PT + 3, 1);
+        let checkpoint = published(&h, 6 * PT + 3, None, 0, 1);
+        let mut previous = HashSet::new();
+        for cycle in 0..3 {
+            let record = store
+                .allocate_record(checkpoint.key, checkpoint.bucket, 6, true)
+                .unwrap()
+                .unwrap();
+            let slots: HashSet<_> = record
+                .pages
+                .iter()
+                .chain(record.row.iter().flatten())
+                .copied()
+                .collect();
+            if cycle > 0 {
+                assert_eq!(slots, previous);
+            }
+            previous = slots;
+            for address in record.page_addresses(&pool, &layout, 0) {
+                for (r, rank) in layout.ranks.iter().enumerate() {
+                    // SAFETY: This unpublished record owns the complete rank share.
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (address + rank.page_offset as usize) as *mut u8,
+                            layout.page_share(r) as usize,
+                        )
+                    }
+                    .fill(r as u8);
+                    for (offset, bytes) in rank.plane_offsets.iter().zip(&rank.plane_bytes) {
+                        // SAFETY: This unpublished record exclusively owns these unit ranges.
+                        unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (address + (rank.page_offset + offset) as usize) as *mut u8,
+                                *bytes as usize,
+                            )
+                        }
+                        .fill(7);
+                    }
+                }
+            }
+            let addresses = pool.addresses(record.row.as_ref().unwrap());
+            for (address, offset, length) in crate::slab::row_pieces(&layout, &addresses) {
+                let rank = layout.ranks.partition_point(|r| r.row_offset <= offset) - 1;
+                let local = (offset - layout.ranks[rank].row_offset) as usize;
+                // SAFETY: This unpublished record owns the complete row piece.
+                unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) }
+                    .fill(rank as u8);
+                let length = length.min((43001usize).saturating_sub(local));
+                // SAFETY: Row pieces are disjoint and retained until completion.
+                for (i, byte) in
+                    unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) }
+                        .iter_mut()
+                        .enumerate()
+                {
+                    *byte = ((local + i) / 4096 * 37 + (local + i) * 11) as u8;
+                }
+            }
+            store.complete_record(&checkpoint.key, true).unwrap();
+            let packed = store.record(&checkpoint.key).unwrap();
+            assert!(packed.replication.pages && packed.replication.row);
+            assert_eq!(packed.slots(), 3); // Two page slots and one row slot.
+            assert_eq!(store.stats().packed_records[0], cycle + 1);
+            assert_eq!(store.stats().per_rank_records, [0, 0]);
+            let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key: checkpoint.key,
+                        pages: (100..106).map(PageId).collect(),
+                        slot: StateSlotId(9),
+                    },
+                )
+                .unwrap();
+            let mut events = Vec::new();
+            store.poll(&mut events).unwrap();
+            assert!(matches!(
+                &events[..],
+                [StoreEvent::Fetched { result: Ok(_), .. }]
+            ));
+            for rank in &layout.ranks {
+                for (offset, bytes) in rank.plane_offsets.iter().zip(&rank.plane_bytes) {
+                    let start = (rank.page_offset + offset) as usize;
+                    assert_eq!(
+                        &gpu.pages.lock().unwrap()[&100][start..start + *bytes as usize],
+                        vec![7; *bytes as usize]
+                    );
+                }
+                let rows = gpu.rows.lock().unwrap();
+                let start = rank.row_offset as usize;
+                for (i, byte) in rows[&9][start..start + 43001].iter().enumerate() {
+                    assert_eq!(*byte, (i / 4096 * 37 + i * 11) as u8);
+                }
+            }
+            store.remove_record(&checkpoint.key).unwrap();
+            assert_eq!(pool.free_slots(), pool.slot_count());
+        }
+        store.close().unwrap();
+    }
+    #[test]
+    fn restore_chain_keeps_record_replication_decisions_independent() {
+        let geometry = vec![geometry(PT, &[("kv", PAGE)], PAGE); 2];
+        let layout = Layout::new(&geometry).unwrap();
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let pool = SlabPool::new(layout.page_record_bytes, 8, 0).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let h = history(2 * PT + 3, 1);
+        let a = published(&h, PT + 3, None, 0, 1);
+        let b = published(&h, 2 * PT + 3, Some(PT + 3), 0, 2);
+        let first = vec![7; layout.page_record_bytes as usize];
+        let mut second = first.clone();
+        second[PAGE as usize..].fill(8);
+        gpu.pages.lock().unwrap().insert(0, first.clone());
+        gpu.pages.lock().unwrap().insert(1, second.clone());
+        let row = vec![9; layout.row_record_bytes as usize];
+        gpu.rows.lock().unwrap().insert(1, row.clone());
+        gpu.rows.lock().unwrap().insert(2, row.clone());
+        for c in [&a, &b] {
+            assert_eq!(store.store(c).unwrap(), StoreOutcome::Queued);
+            let mut events = Vec::new();
+            store.poll(&mut events).unwrap();
+            assert!(matches!(
+                &events[..],
+                [StoreEvent::Stored { result: Ok(_), .. }]
+            ));
+        }
+        assert!(store.record(&a.key).unwrap().replication.pages);
+        assert!(!store.record(&b.key).unwrap().replication.pages);
+        let hit = store.lookup(&h, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: b.key,
+                    pages: vec![PageId(100), PageId(101)],
+                    slot: StateSlotId(9),
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        poll_until(&mut store, deadline, |e| {
+            matches!(e, StoreEvent::Fetched { result: Ok(_), .. })
+        });
+        assert_eq!(gpu.pages.lock().unwrap()[&100], first);
+        assert_eq!(gpu.pages.lock().unwrap()[&101], second);
+        assert_eq!(gpu.rows.lock().unwrap()[&9], row);
         store.close().unwrap();
     }
 }
