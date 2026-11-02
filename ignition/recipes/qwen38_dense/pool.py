@@ -24,11 +24,11 @@ def page_bytes(config, *, mtp=False):
     return sum(shape[0] for _, shape in page_specs(config, mtp=mtp))
 
 
-def continuation_layout(config, *, mtp=False):
+def continuation_layout(config, *, mtp=False, verification_width=8):
     regions = []
     for index, kind in enumerate(config.layers):
         if kind == "linear_attention":
-            regions.extend(((f"layer{index}.convolution", (10240, 10 if mtp else 3), torch.bfloat16),
+            regions.extend(((f"layer{index}.convolution", (10240, 2 + verification_width if mtp else 3), torch.bfloat16),
                             (f"layer{index}.recurrent", (48, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, mtp=mtp))
     if mtp:
@@ -42,8 +42,8 @@ def continuation_layout(config, *, mtp=False):
 
 class ContinuationPool(PagedStateStorage):
     @classmethod
-    def for_model(cls, config, slots, pages, device, *, mtp=False, **kwargs):
-        return cls.allocate(continuation_layout(config, mtp=mtp), page_specs(config, mtp=mtp), slots, pages, device, **kwargs)
+    def for_model(cls, config, slots, pages, device, *, mtp=False, verification_width=8, **kwargs):
+        return cls.allocate(continuation_layout(config, mtp=mtp, verification_width=verification_width), page_specs(config, mtp=mtp), slots, pages, device, **kwargs)
 
     def partial_pages(self):
         return tuple(self.pages.items())

@@ -18,7 +18,8 @@ from .decoder import PreparedDecoder
 
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence,
-                 session, workspace, buffers, decoder_buffers, context_buffers):
+                 session, workspace, buffers, decoder_buffers, context_buffers, study_width=None):
+        self.study_width = study_width
         self.page_tokens = PAGE_TOKENS
         self.weights, self.tables, self.pool = weights, None, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch
@@ -27,7 +28,7 @@ class SpeculativePreparation:
         self.collectives = dict(runtime=None, vocabulary_runtime=None, coordinator=None)
         self.markov_runtime = None
         self.records = GDNLayerRecords.allocate((i for i, kind in enumerate(weights.config.layers)
-            if kind == "linear_attention"), requests.capacity, pool.backing.device, key_heads=16, value_heads=48)
+            if kind == "linear_attention"), requests.capacity, pool.backing.device, key_heads=16, value_heads=48, width=8 if study_width is None else study_width)
 
         def decoder(weights, tables, scratch, metadata, pool, *, runtime, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, records=self.records,
@@ -41,6 +42,6 @@ class SpeculativePreparation:
                 embedding_runtime=None, buffers=buffers), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
-        self.block_size, self.logit_offset = weights.config.draft.block_size, 1
+        self.block_size, self.logit_offset = (weights.config.draft.block_size if study_width is None else study_width), 1
         self.draft_scratch = DraftScratch.allocate(weights.config.draft, weights.shard,
-            requests.capacity * self.block_size, pool.backing.device, buffers=buffers)
+            requests.capacity * self.block_size, pool.backing.device, buffers=buffers, block_size=self.block_size)

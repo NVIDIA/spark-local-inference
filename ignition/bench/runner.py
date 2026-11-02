@@ -264,6 +264,29 @@ def _check_metadata(model, step, case):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
 
+def acceptance_observation(forward):
+    """Read one input/RNG draw; restored timing replays are not additional observations."""
+    _, _, verification, commit = forward.operations
+    acceptance = verification.output
+    offered = acceptance.offered_drafts.cpu().tolist()
+    accepted = acceptance.accepted_drafts.cpu().tolist()
+    committed = commit.accepted_drafts.cpu().tolist()
+    emitted = commit.emitted_count.cpu().tolist()
+    tokens = commit.emitted_ids.cpu().tolist()
+    survival = acceptance.survival.cpu().tolist()
+    valid = acceptance.valid.cpu().tolist()
+    return dict(
+        observations_per_request=1,
+        survival_semantics="cumulative acceptance probability along the sampled proposal chain",
+        requests=[dict(valid=bool(valid[row]), offered_draft_count=int(count),
+                       accepted_draft_count=int(accepted[row]),
+                       committed_draft_count=int(committed[row]), emitted_count=int(emitted[row]),
+                       emitted_token_ids=tokens[row][:emitted[row]],
+                       proposal_survival=survival[row][:count])
+                  for row, count in enumerate(offered)],
+    )
+
+
 def measurement_result(cases, measurements, *, warmup, repetitions, seeds, status, failure=None):
     results = []
     for case, samples in zip(cases, measurements):
@@ -347,6 +370,8 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                         raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
                     if iteration == -1:
                         _check_metadata(model, step, case)
+                        if not isinstance(case, PrefillCase):
+                            samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
                 if progress is not None:
                     progress(result("running"))
                 snapshot.restore(runner.stream)

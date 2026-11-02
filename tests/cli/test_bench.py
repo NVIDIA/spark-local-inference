@@ -167,3 +167,38 @@ def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys
     assert json.loads(output.read_text()) == result
     assert "aggregate_ms" not in json.loads(output.read_text())
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("width", [8, 13, 16])
+def test_speculation_study_requires_explicit_private_mode(width):
+    value = settings("--speculation-study", "--verify-width", str(width),
+                     "--mtp-draft-tokens", str(width - 1), "--contexts", "8192")
+    assert value.speculation_study and value.batches == (1,) and value.width == width
+    if width != 8:
+        with pytest.raises(UsageError):
+            settings("--verify-width", str(width))
+
+
+@pytest.mark.parametrize("flags", [("--batches", "2"), ("--prefill",), ("--verify-width", "9")])
+def test_speculation_study_rejects_other_regimes(flags):
+    with pytest.raises(UsageError):
+        settings("--speculation-study", *flags)
+
+
+def test_study_width_catalog_uses_one_maximum_capacity():
+    value = settings("--speculation-study", "--study-widths", "16,8,13")
+    assert value.study_widths == (8, 13, 16)
+    assert value.width == 16
+    assert value.contexts == (8192,)
+    assert value.batches == (1,)
+
+
+@pytest.mark.parametrize("flags", [
+    ("--study-widths", "8,13"),
+    ("--speculation-study", "--study-widths", "8,9"),
+    ("--speculation-study", "--study-widths", "8,16", "--verify-width", "16"),
+    ("--speculation-study", "--study-widths", "8,16", "--mtp-draft-tokens", "15"),
+])
+def test_study_width_catalog_rejects_ambiguous_or_unsupported_selection(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)

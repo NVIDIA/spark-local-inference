@@ -211,9 +211,11 @@ other recipes fail explicitly.
 |---|---|---|
 | `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
 | `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` |
-| `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill` |
-| `--verify-width N` | Target tokens per request, including the pending token; only eight is supported, with seven draft tokens | `8` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
+| `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
+| `--verify-width N` | Target tokens per request, including the pending token; eight normally, or `8,13,16` with `--speculation-study` | `8` |
+| `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
+| `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
 | `--repetitions N` | Timed restored rounds per case and seed | `20` |
 | `--seeds LIST` | Distinct input and sampling seeds | `0,1,2` |
@@ -230,6 +232,50 @@ The prepared request capacity is the largest selected batch. JSON distinguishes
 that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
+
+With `--speculation-study`, batches and concurrency must be one; the default
+context is 8192. Widths 8, 13, and 16 prepare respectively 7, 12, and 15 drafts.
+The effective DFlash2 proposal block equals the selected width, independently
+of the checkpoint's eight-token block declaration. Weights and checkpoint
+configuration remain unchanged. For example:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --gpus 0 --speculation-study \
+  --contexts 8192 --batches 1 --max-concurrency 1 --verify-width 13 \
+  --mtp-draft-tokens 12 --speculative-token-capacity 64 \
+  --online-mxfp8 --draft-head-quantization mxfp8 \
+  --warmup 5 --repetitions 20 --seeds 0,1,2 --output /tmp/qwen38-study13.json
+```
+
+For a depth comparison with shared preparation, replace `--verify-width 13
+--mtp-draft-tokens 12` with `--study-widths 8,13,16`. All selected graphs share
+weights, one tuning session, a native prefill graph, and a pool sized for the
+largest width. Each context and seed is prefilled once with an output budget of
+twice the largest width. Every measured width restores that same request, cache,
+recurrent state, and all proposal/target RNG state before replay. JSON records
+shared sampling defaults, each sample's initial pending token and generation,
+and each graph's effective block. Independently prepared single-width runs can
+select different kernels and produce different prefill state; their acceptance
+counts do not isolate the effect of depth.
+
+Study graphs retain full draft generation, target verification, rejection
+sampling, request and recurrent-state commit, draft-context update, and saved
+hidden-state update. Caller-owned tensors expose their results; the timed graph
+omits native completion-record publication. Study graphs have private capture
+and compilation identities and cannot produce native package metadata. Native
+exports and ordinary round benchmarks retain the eight-token limit. Establish
+a width-eight study control before comparing deeper studies; native and study
+latencies have different publication boundaries.
+
+JSON identifies study timing as `cuda_graph_speculation_study_latency_ms`, with
+`native_completion_publication=false` and per-case `effective_draft_block`. Each seeded
+sample contains one `acceptance` observation: offered and accepted draft counts,
+committed draft and emitted token counts after clipping, emitted token IDs, and
+cumulative acceptance probabilities along the sampled proposal chain. Restored
+timing repetitions reuse the same RNG draw and are not independent acceptance
+observations. `useful_tokens_per_gpu_second` divides that input's emitted count
+by its median graph time; it does not measure serving throughput. Three default
+seeds provide an initial screen, not a robust acceptance estimate.
 
 With `--prefill`, each request has `context + chunk` prompt tokens. Admission
 and the preceding context run outside timing; each measured replay processes

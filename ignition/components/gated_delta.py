@@ -226,9 +226,9 @@ class PreparedGDN:
                 f"GDN convolution history must have shape [slots, {module.conv_dim}, 3 + drafts]"
             )
         self.speculative_tokens = state.convolution.shape[2] - 3
-        if not 0 <= self.speculative_tokens <= 7:
+        if not 0 <= self.speculative_tokens <= 15:
             raise ValueError(
-                "GDN history supports zero through seven speculative tokens"
+                "GDN history supports zero through fifteen speculative tokens"
             )
         if state.recurrent.ndim != 4 or tuple(state.recurrent.shape[1:]) != (
             self.value_heads,

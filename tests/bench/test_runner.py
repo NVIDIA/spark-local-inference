@@ -179,3 +179,33 @@ def test_device_snapshot_restores_graph_mutations_and_aliased_views():
         assert torch.equal(counters.cpu(), expected["counters"])
         assert torch.equal(quantized.view(torch.uint8).cpu(), expected["quantized"])
     assert all(saved.device == source.device for source, saved in snapshot.entries.values())
+
+
+def test_acceptance_observation_separates_verification_from_committed_clipping():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.runner import acceptance_observation
+
+    acceptance = SimpleNamespace(
+        offered_drafts=torch.tensor([3, 0]), accepted_drafts=torch.tensor([3, 0]),
+        valid=torch.tensor([True, False]),
+        survival=torch.tensor([[.75, .5, .25, -1, -1, -1, -1], [-1.] * 7]),
+    )
+    commit = SimpleNamespace(
+        accepted_drafts=torch.tensor([1, 0]), emitted_count=torch.tensor([2, 0]),
+        emitted_ids=torch.tensor([[11, 12, -1, -1], [-1, -1, -1, -1]]),
+    )
+    forward = SimpleNamespace(operations=(None, (), SimpleNamespace(output=acceptance), commit))
+    result = acceptance_observation(forward)
+    assert result["observations_per_request"] == 1
+    assert result["requests"] == [
+        dict(valid=True, offered_draft_count=3, accepted_draft_count=3,
+             committed_draft_count=1, emitted_count=2, emitted_token_ids=[11, 12],
+             proposal_survival=[.75, .5, .25]),
+        dict(valid=False, offered_draft_count=0, accepted_draft_count=0,
+             committed_draft_count=0, emitted_count=0, emitted_token_ids=[], proposal_survival=[]),
+    ]
+    sample = dict(seed=0, times_ms=[1.] * 20, acceptance=result)
+    summary = summarize_case(BenchmarkCase(1, 8, 8, 8192), [sample])
+    assert summary["samples"][0]["acceptance"]["observations_per_request"] == 1

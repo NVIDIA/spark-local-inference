@@ -113,3 +113,50 @@ def test_subset_contract_without_decode():
     signature = GraphSignature("speculative", 4, 8, speculation_enabled=True, packed_token_capacity=32)
     contract = prepare({"speculative4x8p32": signature}, buffers, pool, vocabulary=128)
     assert [graph["graph"] for graph in contract["graphs"]] == ["speculative4x8p32"]
+
+
+def test_packed_catalog_retains_logical_sample_capacity():
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    config = PreparationConfig(max_active=8, speculative_widths=(1, 8),
+                               speculative_token_capacity=16, draft_snapshot=Path("draft"))
+    assert (8, 8, 16) in config.speculative_round_shapes
+    assert config.decode_tokens == 16
+    assert config.decode_samples == 64
+
+
+@pytest.mark.parametrize("width", [8, 13, 16])
+def test_study_geometry_keeps_native_setup_catalog(width):
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    selection = BenchmarkSelection(batches=(1,), contexts=(8192,), width=width, speculation_study=True)
+    plan = replace(_plan(), concurrency=1, benchmark_selection=selection)
+    assert max(plan.speculation.widths) == 8
+    config = PreparationConfig(max_active=1, benchmark_selection=selection, draft_snapshot=Path("draft"))
+    assert config.speculative_round_shapes == ((1, 8, 8),)
+    assert config.decode_tokens == config.decode_samples == width
+
+
+def test_shared_study_catalog_sizes_pool_without_widening_native_catalog():
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    selection = BenchmarkSelection(batches=(1,), contexts=(8192,), width=16,
+                                   speculation_study=True, study_widths=(8, 13, 16))
+    config = PreparationConfig(max_active=1, benchmark_selection=selection, draft_snapshot=Path("draft"))
+    assert selection.selected_study_widths == (8, 13, 16)
+    assert selection.required_context == 8192 + 32
+    assert selection.physical_pages(128) == 66
+    assert config.speculative_round_shapes == ((1, 8, 8),)
+    assert config.decode_tokens == config.decode_samples == 16
+    assert selection.to_dict()["study_widths"] == (8, 13, 16)
+
+
+@pytest.mark.parametrize("values", [
+    dict(width=13, speculation_study=True, study_widths=(8, 16)),
+    dict(width=16, speculation_study=True, study_widths=(16, 8)),
+    dict(width=16, speculation_study=True, study_widths=(8, 9, 16)),
+    dict(width=8, study_widths=(8,)),
+])
+def test_invalid_shared_study_catalog(values):
+    with pytest.raises(ValueError):
+        BenchmarkSelection(batches=(1,), **values)

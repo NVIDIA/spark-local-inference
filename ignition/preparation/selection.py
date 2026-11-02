@@ -12,6 +12,8 @@ class BenchmarkSelection:
     contexts: tuple[int, ...] = (512, 2048, 8192, 16384)
     width: int = 8
     prefill_chunk: int = 0
+    speculation_study: bool = False
+    study_widths: tuple[int, ...] = ()
 
     def __post_init__(self):
         for name, values in (("batches", self.batches), ("contexts", self.contexts)):
@@ -27,8 +29,21 @@ class BenchmarkSelection:
             raise ValueError("prefill benchmark requires batch one")
         if any(context < (0 if self.prefill_chunk else 128) or context % 128 for context in self.contexts):
             raise ValueError("benchmark contexts must be positive multiples of 128, or zero for prefill")
-        if type(self.width) is not int or self.width != 8:
+        if self.speculation_study and (self.batches != (1,) or self.prefill_chunk):
+            raise ValueError("speculation study requires one request and no prefill timing")
+        if type(self.width) is not int or self.width not in ((8, 13, 16) if self.speculation_study else (8,)):
             raise ValueError("benchmark verification width must be 8")
+
+        if self.study_widths:
+            if (not self.speculation_study or not isinstance(self.study_widths, tuple)
+                    or tuple(sorted(set(self.study_widths))) != self.study_widths
+                    or any(type(w) is not int or w not in (8, 13, 16) for w in self.study_widths)
+                    or self.width != max(self.study_widths)):
+                raise ValueError("study widths must be increasing distinct widths in 8,13,16 with width equal to their maximum")
+
+    @property
+    def selected_study_widths(self):
+        return (self.study_widths or (self.width,)) if self.speculation_study else ()
 
     @property
     def max_batch(self):
@@ -61,5 +76,5 @@ class BenchmarkSelection:
 
     def to_dict(self):
         return dict(batches=self.batches, contexts=self.contexts, width=self.width,
-                    prefill_chunk=self.prefill_chunk,
+                    prefill_chunk=self.prefill_chunk, speculation_study=self.speculation_study, study_widths=self.selected_study_widths,
                     speculative_round_shapes=self.speculative_round_shapes)

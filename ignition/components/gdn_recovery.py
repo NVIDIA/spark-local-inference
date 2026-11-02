@@ -44,7 +44,7 @@ _CONFIG = triton.Config({}, num_warps=1, num_stages=2)
 def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, Delta, Keys, Decay,
             mixed_stride, a_stride, b_stride, state_stride, slot_stride,
             KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr, SCALE: tl.constexpr,
-            WINDOW: tl.constexpr, ROWS: tl.constexpr, IN_PLACE: tl.constexpr):
+            WINDOW: tl.constexpr, RECORD_WIDTH: tl.constexpr, ROWS: tl.constexpr, IN_PLACE: tl.constexpr):
     tile, request_head = tl.program_id(0), tl.program_id(1)
     request = request_head // VALUE_HEADS
     head = request_head % VALUE_HEADS
@@ -87,11 +87,11 @@ def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, De
                     tl.store(Output + token * (VALUE_HEADS * 128) + head * 128 + rows, output.to(tl.bfloat16))
                     if not IN_PLACE:
                         # Records are indexed by the request's row in the round, which the commit shares.
-                        tl.store(Delta + ((request * VALUE_HEADS + head) * WINDOW + position) * 128 + rows, delta)
+                        tl.store(Delta + ((request * VALUE_HEADS + head) * RECORD_WIDTH + position) * 128 + rows, delta)
                         if (tile == 0) & (head % (VALUE_HEADS // KEY_HEADS) == 0):
-                            tl.store(Keys + ((request * KEY_HEADS + key_head) * WINDOW + position) * 128 + keys, k)
+                            tl.store(Keys + ((request * KEY_HEADS + key_head) * RECORD_WIDTH + position) * 128 + keys, k)
                         if tile == 0:
-                            tl.store(Decay + (request * VALUE_HEADS + head) * WINDOW + position, decay)
+                            tl.store(Decay + (request * VALUE_HEADS + head) * RECORD_WIDTH + position, decay)
             if IN_PLACE:
                 tl.store(State + offsets, state)
 
@@ -99,7 +99,7 @@ def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, De
 @triton.autotune(configs=[_CONFIG], key=[])
 @triton.jit
 def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeqs, state_stride, slot_stride,
-            ROWS_CAPACITY: tl.constexpr, KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr, WINDOW: tl.constexpr,
+            ROWS_CAPACITY: tl.constexpr, KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr, WINDOW: tl.constexpr, RECORD_WIDTH: tl.constexpr,
             ROWS: tl.constexpr, STATE_ALIGNMENT: tl.constexpr):
     # Every argument a store reaches is a kernel operand, so whole-forward compilation sees the
     # mutation of the state backing: each layer's recurrent region sits at its offset in a row.
@@ -120,9 +120,9 @@ def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeq
             owner = layer * ROWS_CAPACITY + request
             for position in tl.range(0, WINDOW, loop_unroll_factor=1):
                 if position < count:
-                    k = tl.load(KeyRecords + ((owner * KEY_HEADS + key_head) * WINDOW + position) * 128 + keys)
-                    delta = tl.load(Delta + ((owner * VALUE_HEADS + head) * WINDOW + position) * 128 + rows)
-                    decay = tl.load(Decay + (owner * VALUE_HEADS + head) * WINDOW + position)
+                    k = tl.load(KeyRecords + ((owner * KEY_HEADS + key_head) * RECORD_WIDTH + position) * 128 + keys)
+                    delta = tl.load(Delta + ((owner * VALUE_HEADS + head) * RECORD_WIDTH + position) * 128 + rows)
+                    decay = tl.load(Decay + (owner * VALUE_HEADS + head) * RECORD_WIDTH + position)
                     state = state * decay
                     state = state + delta[:, None] * k[None, :]
             tl.store(State + offsets, state)
@@ -147,13 +147,15 @@ class GDNLayerRecords:
     decay: torch.Tensor
 
     @classmethod
-    def allocate(cls, layers, rows: int, device, *, key_heads: int, value_heads: int) -> GDNLayerRecords:
+    def allocate(cls, layers, rows: int, device, *, key_heads: int, value_heads: int, width: int = WINDOW) -> GDNLayerRecords:
+        if type(width) is not int or not 1 <= width <= 16:
+            raise ValueError("GDN record width must be in [1,16]")
         layers = tuple(layers)
         count = len(layers)
         return cls(layers,
-                   torch.zeros((count, rows, value_heads, WINDOW, 128), dtype=torch.float32, device=device),
-                   torch.zeros((count, rows, key_heads, WINDOW, 128), dtype=torch.float32, device=device),
-                   torch.zeros((count, rows, value_heads, WINDOW), dtype=torch.float32, device=device))
+                   torch.zeros((count, rows, value_heads, width, 128), dtype=torch.float32, device=device),
+                   torch.zeros((count, rows, key_heads, width, 128), dtype=torch.float32, device=device),
+                   torch.zeros((count, rows, value_heads, width), dtype=torch.float32, device=device))
 
     def __getitem__(self, layer: int) -> GDNRecords:
         index = self.layers.index(layer)
@@ -175,13 +177,15 @@ class PreparedRecoveredRecurrence:
     def __init__(self, *, mixed_qkv, a, b, A_log, dt_bias, state, metadata, output, records: GDNRecords | None,
                  key_heads: int, value_heads: int):
         sequences = metadata.query_start_loc.numel() - 1
+        width = metadata.state_indices.shape[1]
+        record_width = width if records is None else records.delta.shape[2]
         if (state.ndim != 4 or state.shape[1:] != (value_heads, 128, 128) or state.dtype != torch.float32
                 or state.stride()[1:] != (128 * 128, 128, 1) or output.shape[-1] != value_heads * 128
                 or output.dtype != torch.bfloat16 or not output.is_contiguous()
-                or (records is not None and (records.delta.shape[1:] != (value_heads, WINDOW, 128)
-                    or records.keys.shape[1:] != (key_heads, WINDOW, 128)
+                or (records is not None and (records.delta.shape[1:] != (value_heads, record_width, 128)
+                    or records.keys.shape[1:] != (key_heads, record_width, 128)
                     or records.keys.shape[0] != records.delta.shape[0] or records.delta.shape[0] < sequences))
-                or metadata.state_indices.shape[1] > WINDOW or value_heads % key_heads
+                or not 1 <= width <= record_width <= 16 or value_heads % key_heads
                 or mixed_qkv.stride(1) != 1 or a.stride(1) != 1 or b.stride(1) != 1):
             raise ValueError("recovered GDN verification requires packed FP32 state slots, contiguous BF16 "
                              "output and per-request records for its head geometry")
@@ -193,7 +197,7 @@ class PreparedRecoveredRecurrence:
                      b.stride(0), state.stride(0), metadata.state_indices.stride(0))
         verify_rows = 8 if sequences * value_heads >= 192 else 4
         self.options = {"KEY_HEADS": key_heads, "VALUE_HEADS": value_heads, "SCALE": 1.0 / math.sqrt(128),
-                        "WINDOW": WINDOW, "ROWS": verify_rows, "IN_PLACE": records is None}
+                        "WINDOW": width, "RECORD_WIDTH": record_width, "ROWS": verify_rows, "IN_PLACE": records is None}
         self.grid = (128 // verify_rows, sequences * value_heads, 1)
         self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
@@ -227,7 +231,7 @@ class PreparedGDNCommit:
         self.args = (floats, offsets, records.delta, records.keys, records.decay, metadata.state_indices[:, 0],
                      counts, metadata.num_seqs, floats.stride(0), metadata.state_indices.stride(0))
         self.options = {"ROWS_CAPACITY": records.delta.shape[1], "KEY_HEADS": key_heads, "VALUE_HEADS": value_heads,
-                        "WINDOW": WINDOW, "ROWS": ROWS, "STATE_ALIGNMENT": state_alignment}
+                        "WINDOW": metadata.state_indices.shape[1], "RECORD_WIDTH": records.delta.shape[3], "ROWS": ROWS, "STATE_ALIGNMENT": state_alignment}
         self.grid = (128 // ROWS, counts.numel(), len(records.layers) * value_heads)
         self.compiled = warmup_triton(_commit.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)

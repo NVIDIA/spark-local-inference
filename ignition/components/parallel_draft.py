@@ -295,17 +295,21 @@ class PreparedParallelDraftRound:
         prepare_sampling_broadcasts(broadcast_proposals, verify, collectives=o.collectives, session=o.session,
                                     name=self.name, buffers=self.buffers,
                                     result_runtime=getattr(o, "result_runtime", None))
-        commit = PreparedSpeculativeCommit(
+        from .speculation import PreparedSpeculativeStateCommit
+
+        private = getattr(o, "study_width", None) is not None
+        commit_type = PreparedSpeculativeStateCommit if private else PreparedSpeculativeCommit
+        commit = commit_type(
             o.requests,
             verify.output,
             self.candidates,
             o.inputs.row_slot_ids[:b],
             o.inputs.row_generations[:b],
             o.inputs.live_rows,
-            o.completion,
+            None if private else o.completion,
             o.frame,
             o.sequence,
-            logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng,
+            logits=None if private else self.decoder.scratch.logits.view(b, w, -1), rng=o.rng,
             draft_context_lag=0,
             token_limits=o.inputs.query_lengths[:b],
         )

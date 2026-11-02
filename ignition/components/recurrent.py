@@ -84,8 +84,8 @@ class DeltaMetadata:
     ) -> DeltaMetadata:
         if type(sequences) is not int or sequences <= 0:
             raise ValueError("delta sequence capacity must be positive")
-        if type(verification_columns) is not int or not 1 <= verification_columns <= 8:
-            raise ValueError("delta verification columns must be in [1, 8]")
+        if type(verification_columns) is not int or not 1 <= verification_columns <= 16:
+            raise ValueError("delta verification columns must be in [1, 16]")
 
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)

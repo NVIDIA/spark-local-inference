@@ -180,16 +180,18 @@ class DraftScratch:
     convolution: dict
     retained: list = field(default_factory=list)
     selectors: dict = field(default_factory=dict)
+    block_size: int = 8
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device, *, buffers):
-        if tokens <= 0 or tokens % config.block_size:
+    def allocate(cls, config, shard, tokens, device, *, buffers, block_size=None):
+        block_size = config.block_size if block_size is None else block_size
+        if tokens <= 0 or tokens % block_size:
             raise ValueError("DFlash2 scratch requires complete proposal blocks")
         s = buffers.fork()
         a, c = config.attention, config.text
         heads, kv_heads = a.local(shard)
-        rows = tokens // config.block_size
-        pages = rows * ((a.window + config.block_size + PAGE_TOKENS - 1) // PAGE_TOKENS)
+        rows = tokens // block_size
+        pages = rows * ((a.window + block_size + PAGE_TOKENS - 1) // PAGE_TOKENS)
         hidden = c["hidden_size"]
         vocab_width = ((c["vocab_size"] + shard.world_size - 1) // shard.world_size + 63) // 64 * 64
         def zeros(*shape, dtype=torch.bfloat16):
@@ -205,18 +207,18 @@ class DraftScratch:
             zeros(pages, PAGE_TOKENS, kv_heads, a.value_dim, dtype=torch.float8_e4m3fn),
             MLPScratch.allocate(tokens, hidden, c["intermediate_size"] // shard.world_size, device, buffers=s),
             zeros(tokens, hidden), zeros(tokens, vocab_width), zeros(tokens, vocab_width * shard.world_size),
-            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution)
+            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution, block_size=block_size)
 
     def rows(self, tokens, samples):
         if (not 0 < tokens <= self.embedding.shape[0] or samples != tokens
-                or tokens % 8):
-            raise ValueError("DFlash2 scratch requires complete eight-token proposal blocks")
+                or tokens % self.block_size):
+            raise ValueError("DFlash2 scratch requires complete proposal blocks")
         return type(self)(*(getattr(self, name) if name in
-            ("window_key", "window_value", "convolution", "retained", "selectors") else self.mlp.rows(tokens) if name == "mlp"
+            ("window_key", "window_value", "convolution", "retained", "selectors", "block_size") else self.mlp.rows(tokens) if name == "mlp"
             else getattr(self, name)[:tokens] for name in self.__dataclass_fields__))
 
     def scratch_tensors(self):
-        return tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "selectors")
+        return tuple(getattr(self, name) for name in self.__dataclass_fields__ if name not in ("selectors", "block_size"))
 
 
 class DraftAttention:
@@ -233,7 +235,8 @@ class DraftAttention:
         self.history_key, self.history_value = (pool.reserved_region(f"draft{index}.{kind}")
                                                for kind in ("key", "value"))
         rows = metadata.lengths.numel()
-        count = (a.window + config.block_size + PAGE_TOKENS - 1) // PAGE_TOKENS
+        block_size = scratch.block_size
+        count = (a.window + block_size + PAGE_TOKENS - 1) // PAGE_TOKENS
         self.staged_key, self.staged_value = scratch.window_key[:rows * count], scratch.window_value[:rows * count]
         self.staging = PreparedWindowStaging(self.history_key, self.history_value, scratch.key, scratch.value,
             self.staged_key, self.staged_value, metadata, session=session, name=name + ".staging")
@@ -241,7 +244,7 @@ class DraftAttention:
         self.lengths = buffers.zeros(metadata.lengths.shape, metadata.lengths.dtype)
         self.attention = PreparedPagedAttention(scratch.query, self.staged_key, self.staged_value,
             self.pages, self.lengths, metadata.query_start_loc, scratch.attended,
-            mode="verify", width=config.block_size, window=a.window - 1, causal=False,
+            mode="verify", width=scratch.block_size, window=a.window - 1, causal=False,
             session=session, workspace=workspace, name=name + ".attention")
         self.output = prepare_projection(scratch.attended.flatten(1), weights.output, scratch.partial,
             session=session, name=name + ".output", workspace=workspace)
@@ -273,7 +276,7 @@ class PreparedDraft:
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             prefix = f"{name}.layer{index}"
-            conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=c.block_size,
+            conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=s.block_size,
                 group_size=16, session=session, name=prefix + "." + kind, buffers=s.convolution,
                 token_capacity=s.convolution["before"].shape[0]) for kind in ("attention_conv", "mlp_conv")}
             attention = DraftAttention(index, layer, conv["attention_conv"].before, c, weights.shard, s, metadata, pool,
@@ -291,7 +294,7 @@ class PreparedDraft:
             activation_mode="a16", workspace=workspace)
         selector_key = (s.hidden.shape[0], id(weights.draft.selector))
         if selector_key not in s.selectors:
-            selector = PreparedCandidateSelector(s.hidden.view(-1, c.block_size, s.hidden.shape[-1]),
+            selector = PreparedCandidateSelector(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]),
                 weights.draft.selector, top_k=c.text["dflash_config"]["selector_top_k"], session=session,
                 name=name + ".selector")
             s.selectors[selector_key] = selector
@@ -313,7 +316,7 @@ class PreparedDraft:
         # The unary transform consumes the head result in FP32.
         unary = s.gathered_logits[:, :c.text["vocab_size"]].float() * self.multiplier
         s.logits.copy_(unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
-        self.selector.prepare(s.hidden.view(-1, c.block_size, s.hidden.shape[-1]))
+        self.selector.prepare(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]))
 
     def scratch_tensors(self):
         return self.scratch.scratch_tensors(), self.selector.projected
