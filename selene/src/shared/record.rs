@@ -43,8 +43,9 @@
 //!
 //! Each rank entry is a plane count as `u32`, that many plane unit sizes as
 //! `u64`, and the row unit size as `u64`. Unit sizes are the unpadded sizes
-//! the GPU geometry declares; padding is derived. The bytes after the last
-//! rank entry are zero. A geometry whose entries do not fit in the block is
+//! the GPU geometry declares; padding is derived. Version 2 uses flag bit 31
+//! for replicated pages and bit 30 for a replicated row. The bytes after
+//! the last rank entry are zero. A geometry whose entries do not fit in the block is
 //! rejected. The segment offsets are derived: the page segment starts after
 //! the checksum segment and the row segment after `tail_pages` page records.
 //!
@@ -72,6 +73,9 @@ use crate::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
 pub const VERSION: u32 = 1;
+const REPLICATED_VERSION: u32 = 2;
+const REPLICATED: u32 = 1 << 31;
+const REPLICATED_ROW: u32 = 1 << 30;
 pub const HEADER_BYTES: usize = BLOCK_BYTES as usize;
 pub const EXTENSION: &str = "ckpt";
 const SUFFIX: &str = ".ckpt";
@@ -97,6 +101,12 @@ impl RankSizes {
     fn encoded_bytes(&self) -> usize {
         4 + 8 * self.planes.len() + 8
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Replication {
+    pub pages: bool,
+    pub row: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +197,12 @@ impl Header {
         let mut bytes = [0u8; HEADER_BYTES];
         let mut cursor = Cursor::new(&mut bytes);
         cursor.put(&MAGIC);
-        cursor.put(&VERSION.to_le_bytes());
+        let version = if self.replicated() {
+            REPLICATED_VERSION
+        } else {
+            VERSION
+        };
+        cursor.put(&version.to_le_bytes());
         cursor.put(&self.flags.to_le_bytes());
         cursor.put(&self.identity);
         cursor.put(&self.fingerprint);
@@ -230,9 +245,9 @@ impl Header {
             return Err(invalid("record header magic is not FLARECKP"));
         }
         let version = cursor.u32("version")?;
-        if version != VERSION {
+        if version != VERSION && version != REPLICATED_VERSION {
             return Err(invalid(format!(
-                "record header version {version} is not the supported version {VERSION}"
+                "record header version {version} is unsupported; expected 1 or 2"
             )));
         }
         let flags = cursor.u32("flags")?;
@@ -294,8 +309,48 @@ impl Header {
             row_checksum,
             created,
         };
+        if (version == REPLICATED_VERSION) != header.replicated() {
+            return Err(invalid("record version disagrees with replication flags"));
+        }
         header.validate()?;
         Ok(header)
+    }
+
+    pub fn replicated(&self) -> bool {
+        self.replication() != Replication::default()
+    }
+
+    pub fn replication(&self) -> Replication {
+        Replication {
+            pages: self.flags & REPLICATED != 0,
+            row: self.flags & REPLICATED_ROW != 0,
+        }
+    }
+
+    pub fn set_replication(&mut self, replication: Replication) -> Result<()> {
+        self.flags = (self.flags & !(REPLICATED | REPLICATED_ROW))
+            | (u32::from(replication.pages) * REPLICATED)
+            | (u32::from(replication.row) * REPLICATED_ROW);
+        let derived = self.derive()?;
+        self.page_segment = derived.page_segment;
+        self.row_segment = derived.row_segment;
+        Ok(())
+    }
+
+    pub fn stored_page_bytes(&self) -> u64 {
+        if self.replication().pages {
+            self.ranks[0].page_record_bytes()
+        } else {
+            self.page_record_bytes()
+        }
+    }
+
+    pub fn stored_row_bytes(&self) -> u64 {
+        if self.replication().row {
+            self.ranks[0].row_record_bytes()
+        } else {
+            self.row_record_bytes()
+        }
     }
 
     /// Every field agrees with the layout rules: nonzero sizes, a key that
@@ -306,6 +361,12 @@ impl Header {
     fn validate(&self) -> Result<()> {
         if self.ranks.is_empty() {
             return Err(invalid("record header rank count is zero"));
+        }
+        if self.ranks.iter().any(|r| {
+            (self.replication().pages && r.planes != self.ranks[0].planes)
+                || (self.replication().row && r.row_bytes != self.ranks[0].row_bytes)
+        }) {
+            return Err(invalid("record replication disagrees with rank sizes"));
         }
         let entry_bytes: usize = self.ranks.iter().map(RankSizes::encoded_bytes).sum();
         if FIXED_FIELD_BYTES + entry_bytes > HEADER_BYTES {
@@ -404,6 +465,8 @@ impl Header {
                     ))
                 })?;
         }
+        let page_record_bytes = self.stored_page_bytes();
+        let row_record_bytes = self.stored_row_bytes();
         let page_segment = self.checksum_segment() + self.checksum_bytes();
         let row_segment = (self.tail_pages as u64)
             .checked_mul(page_record_bytes)
@@ -450,11 +513,11 @@ impl Header {
 
     /// File length with or without the state row.
     pub fn length(&self, row: bool) -> u64 {
-        self.row_segment + if row { self.row_record_bytes() } else { 0 }
+        self.row_segment + if row { self.stored_row_bytes() } else { 0 }
     }
 
     pub fn length_with_row(&self) -> u64 {
-        self.row_segment + self.row_record_bytes()
+        self.row_segment + self.stored_row_bytes()
     }
 
     pub fn row_present(&self, file_length: u64) -> bool {
@@ -491,6 +554,8 @@ impl Header {
             ranks.push(RankLayout {
                 page_offset: page_record_bytes,
                 plane_offsets,
+                plane_bytes: rank.planes.clone(),
+                row_bytes: rank.row_bytes,
                 row_offset: row_record_bytes,
             });
             page_record_bytes += offset;
@@ -806,12 +871,14 @@ pub fn scan(
     }
     loop {
         let keys: HashSet<PrefixKey> = records.iter().map(|record| record.header.key).collect();
+        let parents: HashSet<PrefixKey> = records.iter().filter_map(|r| r.header.parent).collect();
         let (kept, orphans): (Vec<Scanned>, Vec<Scanned>) =
             records.into_iter().partition(|record| {
-                record
-                    .header
-                    .parent
-                    .is_none_or(|parent| keys.contains(&parent))
+                (record.row || parents.contains(&record.header.key))
+                    && record
+                        .header
+                        .parent
+                        .is_none_or(|parent| keys.contains(&parent))
             });
         records = kept;
         if orphans.is_empty() {
@@ -907,13 +974,88 @@ pub fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
 
 /// Hash scattered row bytes in persisted record order. The caller retains every piece.
 pub(crate) fn row_checksum(layout: &Layout, slots: &[usize]) -> u64 {
+    checksum_pieces(crate::slab::row_pieces(layout, slots).map(|(a, _, n)| (a, n)))
+}
+
+/// Copy rank zero's padded row into the target layout in the same owned slots.
+pub(crate) fn copy_row(layout: &Layout, slots: &[usize], target: &Layout) {
+    let share = layout.page_share(0) as usize;
+    for (rank, part) in target.ranks.iter().enumerate() {
+        let stride = target.page_share(rank) as usize;
+        for offset in (0..layout.row_share(0) as usize).step_by(BLOCK_BYTES as usize) {
+            let from = slots[offset / share] + offset % share;
+            let to = slots[offset / stride] + part.page_offset as usize + offset % stride;
+            // SAFETY: The caller owns both complete blocks; packing moves backwards.
+            unsafe { std::ptr::copy(from as *const u8, to as *mut u8, BLOCK_BYTES as usize) };
+        }
+    }
+}
+
+/// Compare only live unit bytes; padding in reused slots is unspecified.
+/// The caller owns CPU-readable buffers through this comparison.
+pub(crate) fn identical(layout: &Layout, pages: &[usize], row: Option<&[usize]>) -> Replication {
+    let first = &layout.ranks[0];
+    let equal = |a, b, n| {
+        // SAFETY: Both unit ranges belong to the caller's pinned record buffers.
+        unsafe {
+            std::slice::from_raw_parts(a as *const u8, n)
+                == std::slice::from_raw_parts(b as *const u8, n)
+        }
+    };
+    let mut same = Replication {
+        pages: layout.ranks.len() > 1 && !pages.is_empty(),
+        row: layout.ranks.len() > 1 && row.is_some(),
+    };
+    for (i, rank) in layout.ranks.iter().enumerate().skip(1) {
+        if same.pages {
+            same.pages = rank.plane_bytes == first.plane_bytes
+                && pages.iter().all(|address| {
+                    first
+                        .plane_offsets
+                        .iter()
+                        .zip(&first.plane_bytes)
+                        .all(|(offset, n)| {
+                            equal(
+                                *address + *offset as usize,
+                                *address + (rank.page_offset + offset) as usize,
+                                *n as usize,
+                            )
+                        })
+                });
+        }
+        if let Some(slots) = row.filter(|_| same.row) {
+            let a = layout.page_share(0) as usize;
+            let b = layout.page_share(i) as usize;
+            same.row = rank.row_bytes == first.row_bytes
+                && (0..first.row_bytes as usize)
+                    .step_by(BLOCK_BYTES as usize)
+                    .all(|offset| {
+                        equal(
+                            slots[offset / a] + offset % a,
+                            slots[offset / b] + rank.page_offset as usize + offset % b,
+                            (first.row_bytes as usize - offset).min(BLOCK_BYTES as usize),
+                        )
+                    });
+        }
+    }
+    same
+}
+
+pub(crate) fn checksum_pieces(pieces: impl IntoIterator<Item = (usize, usize)>) -> u64 {
     use std::hash::Hasher;
     let mut hash = twox_hash::XxHash3_64::new();
-    for (address, _, len) in crate::slab::row_pieces(layout, slots) {
-        // SAFETY: The caller pins the row until hashing completes.
-        hash.write(unsafe { std::slice::from_raw_parts(address as *const u8, len) });
+    for (address, length) in pieces {
+        // SAFETY: Callers pin these CPU-readable pieces until this pass completes.
+        hash.write(unsafe { std::slice::from_raw_parts(address as *const u8, length) });
     }
     hash.finish()
+}
+
+pub(crate) fn replicated_row_layout(layout: &Layout) -> Layout {
+    let mut packed = layout.clone();
+    packed.ranks.truncate(1);
+    packed.row_record_bytes = layout.row_share(0);
+    packed
 }
 
 /// 64-bit xxh3 over `bytes`.
@@ -1063,7 +1205,7 @@ mod tests {
             Header::decode(&bytes).unwrap_err().to_string()
         };
         assert!(corrupt(0, b'X').contains("magic"));
-        assert!(corrupt(8, 2).contains("version"));
+        assert!(corrupt(8, 3).contains("version"));
         assert!(corrupt(88, 2).contains("parent presence"));
         assert!(corrupt(142, 0).contains("page segment"));
         assert!(corrupt(150, 0).contains("row segment"));
@@ -1287,13 +1429,13 @@ mod tests {
             )
         };
         keep(&root);
-        keep(&child);
         let compacted = write_record(
             &directory,
-            &grandchild,
-            &file_name(&grandchild.key),
-            grandchild.row_segment,
+            &child,
+            &file_name(&child.key),
+            child.row_segment,
         );
+        keep(&grandchild);
         keep(&sibling);
         let deleted = vec![
             keep(&orphan),
@@ -1341,9 +1483,9 @@ mod tests {
         assert_eq!(records[0].header, root);
         assert!(records[0].row);
         assert_eq!(records[0].bytes, root.length_with_row());
-        assert!(!records[3].row);
-        assert_eq!(records[3].path, compacted);
-        assert_eq!(records[3].bytes, grandchild.row_segment);
+        assert!(!records[2].row);
+        assert_eq!(records[2].path, compacted);
+        assert_eq!(records[2].bytes, child.row_segment);
         for path in &deleted {
             assert!(!path.exists(), "{} survived", path.display());
         }
@@ -1387,8 +1529,8 @@ mod tests {
             vec![
                 (root.key, None, 3, true, 2),
                 (sibling.key, Some(root.key), 2, true, 0),
-                (child.key, Some(root.key), 3, true, 1),
-                (grandchild.key, Some(child.key), 3, false, 0),
+                (child.key, Some(root.key), 3, false, 1),
+                (grandchild.key, Some(child.key), 3, true, 0),
             ]
         );
 
@@ -1406,6 +1548,49 @@ mod tests {
         assert!(crate::testing::directory_lock(&file).is_err());
         drop(lock);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn scan_prunes_page_only_leaves_left_by_an_incomplete_spill_chain() {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-record-page-only-leaves-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let lock = crate::testing::directory_lock(&directory).unwrap();
+        let geometry = geometries().remove(0);
+        let root = header(&geometry, 64, None);
+        write_record(
+            &directory,
+            &root,
+            &file_name(&root.key),
+            root.length_with_row(),
+        );
+        let dead = [
+            header(&geometry, 128, Some(64)),
+            header(&geometry, 192, Some(128)),
+            header(&geometry, 256, None),
+        ]
+        .map(|header| {
+            write_record(
+                &directory,
+                &header,
+                &file_name(&header.key),
+                header.row_segment,
+            )
+        });
+        let records = scan(
+            &lock,
+            &IDENTITY,
+            &FINGERPRINT,
+            geometry[0].page_tokens,
+            &rank_sizes(&geometry),
+        )
+        .unwrap();
+        assert_eq!(names(&records), [file_name(&root.key)]);
+        assert!(dead.iter().all(|path| !path.exists()));
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1482,5 +1667,55 @@ mod tests {
         assert!(!temporary.exists());
         drop(next);
         fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn replication_header_preserves_geometry_and_old_records() {
+        let geometry = vec![geometry(64, &[("kv", 4096)], 12288); 4];
+        let mut h = header(&geometry, 640, None);
+        let old = h.clone();
+        h.set_replication(Replication {
+            pages: true,
+            row: true,
+        })
+        .unwrap();
+        assert_eq!(h.layout().unwrap(), old.layout().unwrap());
+        assert_eq!(h.fingerprint, old.fingerprint);
+        assert_eq!(Header::decode(&h.encode().unwrap()).unwrap(), h);
+        assert_eq!(h.stored_page_bytes(), 4096);
+        assert_eq!(h.row_segment, h.page_segment + 10 * 4096);
+        assert_eq!(h.stored_row_bytes(), 12288);
+        assert_eq!(Header::decode(&old.encode().unwrap()).unwrap(), old);
+        h.ranks[1].planes[0] += BLOCK_BYTES;
+        assert!(h.encode().is_err());
+    }
+    #[test]
+    fn comparison_handles_unequal_page_strides_and_partial_row_pieces() {
+        let geometry = [
+            geometry(64, &[("kv", 4095)], 10001),
+            geometry(64, &[("kv", 8000)], 10001),
+        ];
+        let layout = Layout::new(&geometry).unwrap();
+        let pool =
+            crate::slab::SlabPool::new(layout.page_record_bytes, layout.row_slots(), 0).unwrap();
+        let slots = pool.allocate(layout.row_slots()).unwrap();
+        let addresses = pool.addresses(&slots);
+        for (address, offset, n) in crate::slab::row_pieces(&layout, &addresses) {
+            let local = offset % layout.row_share(0);
+            let n = n.min(10001usize.saturating_sub(local as usize));
+            // SAFETY: The test owns these mapped row pieces and retains them through comparison.
+            for (i, byte) in unsafe { std::slice::from_raw_parts_mut(address as *mut u8, n) }
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (local as usize + i) as u8;
+            }
+        }
+        assert!(identical(&layout, &[], Some(&addresses)).row);
+        // SAFETY: This is the last live byte of rank one's owned row, in its second piece.
+        unsafe {
+            *((addresses[1] + layout.ranks[1].page_offset as usize + 1808) as *mut u8) ^= 1;
+        }
+        assert!(!identical(&layout, &[], Some(&addresses)).row);
+        pool.release(slots);
     }
 }

@@ -21,6 +21,21 @@ use crate::{
 
 pub use crate::slab::rank_part;
 
+/// Poll a store until the requested completion arrives.
+pub fn poll_until(
+    store: &mut dyn crate::HostStore,
+    deadline: Instant,
+    done: impl Fn(&crate::StoreEvent) -> bool,
+) -> Vec<crate::StoreEvent> {
+    let mut events = Vec::new();
+    while !events.iter().any(&done) {
+        assert!(Instant::now() < deadline, "{events:?}");
+        store.poll(&mut events).unwrap();
+        std::thread::yield_now();
+    }
+    events
+}
+
 /// Retry locks briefly inherited by parallel subprocess tests before exec.
 pub fn directory_lock(directory: &Path) -> Result<crate::record::DirectoryLock> {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -255,20 +270,57 @@ impl PageCopier for SimulatedGpu {
             self.memory.rows.lock().unwrap(),
         );
         for (id, address) in &job.pages {
-            // The host address names a slot the caller keeps mapped for the job.
-            let host = unsafe { std::slice::from_raw_parts_mut(*address as *mut u8, page) };
+            // SAFETY: The host address names a slot the caller keeps mapped for the job.
+            let host = unsafe {
+                std::slice::from_raw_parts_mut(
+                    *address as *mut u8,
+                    if job.replication.pages {
+                        self.layout.page_share(0) as usize
+                    } else {
+                        page
+                    },
+                )
+            };
             match job.direction {
                 crate::Direction::Out => {
                     host.copy_from_slice(pages.get(&id.0).map_or(&vec![0; page], |p| p));
                 }
                 crate::Direction::In => {
-                    pages.insert(id.0, host.to_vec());
+                    if job.replication.pages {
+                        let share = self.layout.page_share(0) as usize;
+                        let mut data = vec![0; page];
+                        for rank in &self.layout.ranks {
+                            data[rank.page_offset as usize..rank.page_offset as usize + share]
+                                .copy_from_slice(&host[..share]);
+                        }
+                        pages.insert(id.0, data);
+                    } else {
+                        pages.insert(id.0, host.to_vec());
+                    }
                 }
             }
         }
         if let Some((slot, slots)) = &job.row {
             let mut data = rows.get(&slot.0).cloned().unwrap_or_else(|| vec![0; row]);
-            let pieces: Vec<_> = if !self.mapped_rows {
+            let pieces: Vec<_> = if job.replication.row {
+                self.layout
+                    .ranks
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(rank, part)| {
+                        let bytes = self.layout.row_share(rank) as usize;
+                        slots.iter().enumerate().filter_map(move |(i, address)| {
+                            (i * page < bytes).then(|| {
+                                (
+                                    *address,
+                                    part.row_offset + (i * page) as u64,
+                                    (bytes - i * page).min(page),
+                                )
+                            })
+                        })
+                    })
+                    .collect()
+            } else if !self.mapped_rows {
                 vec![(slots[0], 0, row)]
             } else {
                 crate::slab::row_pieces(&self.layout, slots).collect()

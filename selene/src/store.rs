@@ -152,6 +152,13 @@ pub struct StoreStats {
     pub held: [u64; 2],
     pub dropped: [u64; 6],
     pub expired: [u64; 2],
+    /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
+    pub rows_thinned: [u64; 2],
+    /// Successfully stored records using at least one packed share, by DRAM/NVMe tier.
+    pub packed_records: [u64; 2],
+    pub per_rank_records: [u64; 2],
+    /// Disk-only stores abandoned when later pages disagree with the initial packed decision.
+    pub abandoned_stores: u64,
     pub fetched: u64,
     pub fetch_failed: u64,
     pub bytes_out: u64,

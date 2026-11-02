@@ -28,8 +28,7 @@ defines configuration precedence.
 
 ## 1. Scope and configurations
 
-- Published prefix checkpoints at instruction, prompt, and terminal endpoints
-  are copied to the first host tier when published in both local and pool modes.
+- Offered GPU checkpoints are copied to the first host tier in local and pool modes.
   A later matching request restores a retained checkpoint the GPU no longer holds.
 - Live request state, in-flight speculative rounds, and anything not published
   as a checkpoint are never offloaded.
@@ -171,8 +170,18 @@ pub trait HostStore {
 }
 ```
 
-The worker calls `store` for each newly published checkpoint, without waiting for
-GPU pressure. `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
+The worker calls `store` for each offered checkpoint, without waiting for GPU
+pressure. The scheduler defers a message checkpoint whose own planned prompt
+checkpoint is its direct child less than one physical page later, and terminal
+checkpoints, until a request resumes at that exact checkpoint. A preempted
+terminal counts as resumed. If its prompt capture cannot obtain a snapshot, the
+message is offered while the request still pins it; cancellation or error before
+that capture offers it at retirement. GPU captures, prefill cuts, and retention
+are unchanged; deferred points can be lost to GPU
+eviction before reuse, and are not announced to the pool until offered.
+Compaction also offers a deferred branch point as its heir and refreshes
+descendant offers with their new parent.
+`Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
 requires a committed local copy. `Retry` accepts no copy. The worker retains only
 checkpoint IDs for retries after store progress and discards IDs that have left
 the GPU cache. `Deferred` releases the copy pin and schedules the same retry when
@@ -180,9 +189,9 @@ a queued publication cannot obtain host capacity. A failed transfer releases its
 pin without retrying. GPU eviction uses the existing LRU, leaf and compaction
 rules. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
 Submissions never wait; `poll` drains completions and failures.
-A `PublishedCheckpoint` names the GPU checkpoint, its key, its parent's key,
-its bucket digest, every page of
-its chain from the root with the count that belongs to the checkpoint itself,
+A `PublishedCheckpoint` names the GPU checkpoint, its key, its nearest offered
+ancestor's key, its bucket digest, every page of
+its chain from the root with the tail count since that offered ancestor,
 and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
 implement the trait for serving, and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn HostStore>>`.
@@ -237,6 +246,16 @@ continues to supply chain pages. A node is evictable only when its store's
 policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
+
+Each tier drops a non-root record's row once its only child commits, keeping
+the pages; readers and spills delay removal until they release the row. DRAM
+releases row slots, disk truncates at the row segment, and later spills omit it.
+A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
+the remaining tokens.
+With lazy write-behind, a crash or an incomplete shutdown drain can lose the
+DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
+row-bearing ancestor. Startup prunes childless page-only records and any
+page-only ancestors they leave childless.
 
 An outbound for a key already present or in flight is skipped. An inbound for
 a key already in flight attaches the request as another waiter.
@@ -318,7 +337,23 @@ The pool contains warm checkpoint slots plus automatic intake slots. It is one
 advised for transparent huge pages), registered once at startup. Rows use each
 rank's page share across as many slots as needed; their pieces need not be
 contiguous. CPU readers traverse pieces in rank order, preserving disk bytes
-and streaming xxh3 checksum values. Existing records still recover.
+and streaming xxh3 checksum values. After copy-out, Selene compares local ranks'
+**unpadded** plane and row bytes. Each record has two decisions: all of its pages
+share one representation, and its row has an independent representation. Identical
+shares pack into existing slots and unused slots are released; differing pages
+keep the entire page segment per-rank. TP1 is unchanged. Restores fan one stored
+share out to every local rank. Disk spills use DRAM's decisions without comparing
+again, then hash the stored bytes once. Disk-only stores decide from the first
+completed page window; a later differing page abandons that store after its jobs
+drain, without publishing a partial or mixed record.
+
+Memory-only TP>1 split pools remain per-rank because their slot identities are not
+CPU-readable. Pool records also remain per-rank, including disk files, checksums
+and announcements. Memory stores containing replicated records refuse pool
+announcements; recovered replicated files stay local. `/metrics` reports packed
+and per-rank record stores by tier, plus abandoned disk-only stores. A record
+counts as packed when its pages or row are replicated; promotions count as a new
+DRAM store. These decisions do not reduce GPU copy-out traffic.
 
 Memory allocation keeps at least `intake_slots` free slots by evicting the
 coldest ready, unpinned, durable records that, in pool mode, are not announced.
@@ -358,7 +393,12 @@ the storage namespace identity, the layout fingerprint, the key (consumed count 
 digest), the parent key, the bucket digest, the page token count, the tail
 page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
-time. A checksum segment follows, one 64-bit xxh3 per tail page, padded to
+time. Version 2 uses flag bit 31 for a replicated page segment and bit 30 for a
+replicated row. Page offsets use one fixed stride for the whole record. Version-1
+records still recover, and the layout fingerprint is unchanged. An older binary
+treats replicated version-2 files as invalid and **deletes them during recovery**;
+downgrading therefore starts those records cold. A checksum segment follows,
+one 64-bit xxh3 over each stored page record, padded to
 4 KiB, so a restore that reads only a suffix of the pages verifies each page
 it read. The page segment follows, page-major: page `i`, then rank `r`, then
 planes in geometry order, with every plane padded to 4 KiB. The row segment
@@ -535,12 +575,10 @@ API on this class of host and is the reference for call patterns.
   caller for cancellation and re-admission.
 - Cancelling a waiter removes it from the ticket. The ticket completes
   regardless, because the restored checkpoint is useful on its own.
-- `take_publications()` returns every checkpoint that became GPU-ready since
-  the previous call, each once, with its id, key, parent key, bucket digest,
-  the page ids of its whole chain with the count belonging to the checkpoint,
-  and the row's state slot from `snapshot_slot`. Checkpoints created by
-  `publish_boundary`, `retire`, and `finish_inbound` enter the list when the
-  completed fence makes them ready.
+- `take_publications()` returns GPU-ready checkpoints offered since the previous
+  call, each once, with their id, key, nearest offered ancestor's key, bucket
+  digest, whole page chain, tail count since that ancestor, and row state slot.
+  Deferred checkpoints enter the list on reuse or the fallback above.
 - `SchedulerStats` gains `host_lookups`, `host_hits`, `host_reused_tokens`,
   and `inbound_waiting`.
 - `release_after_shutdown` drops tickets.
@@ -598,7 +636,7 @@ the store and its transfer threads.
 
 Policy:
 
-- Outbound: copy each published checkpoint into the first host tier. In local
+- Outbound: copy each offered checkpoint into the first host tier. In local
   composite mode, spill to disk; in pool mode, move records down the
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
@@ -977,7 +1015,7 @@ same completion events the store produces.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
   expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
-  GPU publication announces the GPU holding and starts its first host copy;
+  A host offer announces the GPU holding and starts its first host copy;
   GPU eviction sends the existing notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
   holding events. `flare_host_cache_dropped_total{tier,reason}` counts local

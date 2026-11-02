@@ -47,13 +47,39 @@ fn publish(
 }
 
 #[test]
+fn cached_rows_beyond_eight_per_request_yield_backing_to_admission() {
+    let mut s = scheduler(1, 64, 64);
+    let aliases: Vec<_> = (0..64).map(|i| 63 - i..64 - i).collect();
+    s.share_snapshot_pages(&aliases).unwrap();
+    let h = history(1);
+    for end in 1..=48 {
+        publish(&mut s, &h, None, end, &[], 0);
+    }
+    assert_eq!(s.stats().snapshot_backing_pages, 48);
+    assert_eq!(s.free_page_count(), 16);
+    let mut request = spec(1984, 1);
+    request.prompt.fill(999);
+    let handle = s.admit(request).unwrap();
+    assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), 0);
+    assert_eq!(s.request(handle).unwrap().reserved_pages.len(), 32);
+    assert_eq!(s.stats().snapshot_backing_pages, 32);
+    assert_eq!(s.stats().snapshot_evictions, 16);
+    s.cancel(handle).unwrap();
+    assert_eq!(s.free_page_count(), 32);
+}
+
+#[test]
 fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     let mut s = scheduler(2, 16, 4);
+    s.enable_publications();
     s.enable_evictions();
     let h = history(3);
     let a = publish(&mut s, &h, None, 64, &[0], 0);
     let b = publish(&mut s, &h, Some(a), 128, &[1], 0);
     let c = publish(&mut s, &h, Some(b), 192, &[2], 0);
+    for id in [a, b, c] {
+        s.record_publication(id);
+    }
     let keys: Vec<_> = [a, b, c]
         .into_iter()
         .map(|id| s.cache.checkpoint(id).unwrap().prefix())
@@ -86,6 +112,95 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     assert_eq!(notices[0].heir.as_ref().unwrap().key, keys[2]);
     assert_eq!(notices[1].key, keys[2]);
     assert_eq!(notices[1].heir, None);
+}
+
+#[test]
+fn deferred_heirs_are_not_announced_and_offered_descendants_skip_them() {
+    let mut s = scheduler(2, 16, 4);
+    s.enable_publications();
+    s.enable_evictions();
+    let h = history(4);
+    let a = publish(&mut s, &h, None, 64, &[0], 0);
+    let b = publish(&mut s, &h, Some(a), 128, &[1], 0);
+    let c = publish(&mut s, &h, Some(b), 192, &[2], 0);
+    let d = publish(&mut s, &h, Some(c), 256, &[3], 0);
+    s.record_publication(a);
+    s.record_publication(d);
+    let offered = s.take_publications();
+    assert_eq!(offered[1].parent, Some(h.key_at(64).unwrap()));
+    assert_eq!(offered[1].tail(), &[PageId(1), PageId(2), PageId(3)]);
+    s.evict(EvictionTarget {
+        pages: 1,
+        snapshots: 1,
+    });
+    assert!(s.cache.checkpoint(a).is_err());
+    let heir = s.publication(d).unwrap();
+    assert_eq!(heir.parent, None);
+    assert_eq!(heir.tail(), &[PageId(0), PageId(1), PageId(2), PageId(3)]);
+    assert_eq!(
+        s.take_evictions(),
+        [EvictedCheckpoint {
+            key: offered[0].key,
+            heir: Some(heir),
+        }]
+    );
+    s.evict(EvictionTarget {
+        pages: 16,
+        snapshots: 4,
+    });
+    assert!(s.offered_publications.is_empty());
+}
+
+#[test]
+fn a_deferred_branch_point_is_offered_as_the_heir() {
+    let mut s = scheduler(2, 16, 4);
+    s.enable_publications();
+    s.enable_evictions();
+    let h = history(3);
+    let mut other = PrefixHistory::new([9; 32]);
+    other
+        .append(&(0..128).chain(500..564).collect::<Vec<_>>(), &[])
+        .unwrap();
+    let a = publish(&mut s, &h, None, 64, &[0], 0);
+    let b = publish(&mut s, &h, Some(a), 128, &[1], 0);
+    let c = publish(&mut s, &h, Some(b), 192, &[2], 0);
+    let d = publish(&mut s, &other, Some(b), 192, &[3], 0);
+    for id in [a, c, d] {
+        s.record_publication(id);
+    }
+    let offered = s.take_publications();
+    assert!(
+        offered[1..]
+            .iter()
+            .all(|node| node.parent == Some(offered[0].key))
+    );
+    s.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    let heir = s.publication(b).unwrap();
+    assert_eq!(heir.parent, None);
+    assert_eq!(heir.tail(), &[PageId(0), PageId(1)]);
+    let refreshed = s.take_publications();
+    assert_eq!(refreshed[0], heir);
+    assert_eq!(
+        refreshed[1..]
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        [c, d]
+    );
+    assert_eq!(
+        s.take_evictions(),
+        [EvictedCheckpoint {
+            key: offered[0].key,
+            heir: Some(heir.clone()),
+        }]
+    );
+    for child in &refreshed[1..] {
+        assert_eq!(child.parent, Some(heir.key));
+        assert_eq!(child.tail_pages, 1);
+    }
 }
 
 #[test]

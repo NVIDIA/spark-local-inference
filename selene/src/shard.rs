@@ -464,7 +464,10 @@ impl Kind {
 
     fn of(event: &TransportEvent) -> (Self, JobId, Result<u64>) {
         match event {
-            TransportEvent::Stored { id, result } => (Self::Stored, *id, copy(result)),
+            TransportEvent::Stored { id, result, header } => {
+                debug_assert!(header.as_ref().is_none_or(|h| !h.replicated()));
+                (Self::Stored, *id, copy(result))
+            }
             TransportEvent::StoreInvalidated { id, error } => {
                 (Self::StoreInvalidated, *id, Err(error.clone()))
             }
@@ -480,7 +483,11 @@ impl Kind {
 
     fn event(self, id: JobId, result: Result<u64>) -> TransportEvent {
         match self {
-            Self::Stored => TransportEvent::Stored { id, result },
+            Self::Stored => TransportEvent::Stored {
+                id,
+                result,
+                header: None,
+            },
             Self::StoreInvalidated => TransportEvent::StoreInvalidated {
                 id,
                 error: result
@@ -824,7 +831,9 @@ impl DiskTransport for Sharded {
         temporary: PathBuf,
         path: PathBuf,
         checkpoint: &PublishedCheckpoint,
+        detect: bool,
     ) -> Result<()> {
+        debug_assert!(!detect);
         self.accept()?;
         let tail = header.tail_pages as usize;
         let chain = checkpoint.chain_pages.len();
@@ -854,6 +863,7 @@ impl DiskTransport for Sharded {
             path.clone(),
             pages.to_vec(),
             checkpoint.slot,
+            false,
         )?;
         self.begin(Kind::Stored, id, Some(path), &frame);
         Ok(())
@@ -1040,7 +1050,7 @@ impl Peer {
             reader.end()?;
             let result = self
                 .staged
-                .store_pages(id, header, temporary, path, pages, slot);
+                .store_pages(id, header, temporary, path, pages, slot, false);
             return Ok(result.err().map(|error| (Kind::Stored, id, error)));
         }
         if tag == FETCH {

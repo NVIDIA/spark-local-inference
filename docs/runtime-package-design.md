@@ -584,8 +584,8 @@ the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and
 requires at least 8,192 cached tokens per active request.
 
-Up to eight immutable snapshot slots per active request share physical backing
-with KV pages. At load, CUDA virtual mappings expose the same allocation chunks
+Immutable snapshot capacity is bounded by borrowable KV backing and the prepared
+virtual extent. At load, CUDA virtual mappings expose the same allocation chunks
 through the page planes and the snapshot part of the continuation range. Small
 interleaved runs of dense page planes keep each snapshot's conflicting page range
 close to its byte cost. Planes whose allocation granules span more pages than a

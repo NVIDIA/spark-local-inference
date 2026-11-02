@@ -285,6 +285,8 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
         ranks: vec![crate::geometry::RankLayout {
             page_offset: 0,
             plane_offsets: vec![0],
+            plane_bytes: vec![32 << 20],
+            row_bytes: 8 << 20,
             row_offset: 0,
         }],
         page_record_bytes: 32 << 20,
@@ -337,6 +339,8 @@ fn ordinary_input_share_preserves_mapping() {
         ranks: vec![crate::geometry::RankLayout {
             page_offset: 0,
             plane_offsets: vec![0],
+            plane_bytes: vec![4096],
+            row_bytes: 4096,
             row_offset: 0,
         }],
         page_record_bytes: 4096,

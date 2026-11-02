@@ -1672,6 +1672,7 @@ pub(crate) fn jobs_of(
             )
         });
         jobs.push(Job {
+            replication: Default::default(),
             id: JobId(0),
             window,
             direction,

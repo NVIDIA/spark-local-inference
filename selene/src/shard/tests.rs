@@ -240,7 +240,7 @@ use std::net::TcpListener;
             events(&mut transport, 1).as_slice(),
             [TransportEvent::Stored {
                 id: JobId(7),
-                result: Err(_)
+                result: Err(_), ..
             }]
         ));
         assert!(seventh.exists());
