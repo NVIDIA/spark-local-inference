@@ -202,6 +202,10 @@ impl OutputPipeline {
         Some(envelope)
     }
 
+    pub fn reasoning_open(&self) -> bool {
+        dispatch!(self, parser => parser.reasoning_open())
+    }
+
     pub fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
         dispatch!(self, parser => parser.push(input))
     }
@@ -265,6 +269,61 @@ mod tests {
             .unwrap();
         output.finish().unwrap();
         output.message()
+    }
+
+    #[test]
+    fn reasoning_state_follows_recognized_closes_and_tool_boundaries() {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ThinkTags,
+            open: "<think>".into(),
+            close: "</think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec!["<tool_call>".into()],
+        });
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::QwenCoder,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let config = |syntax| OutputConfig {
+            syntax,
+            control_tokens: vec![],
+            content: TaggedConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Reasoning,
+                tools: vec![json!({"function":{"name":"lookup"}})],
+            },
+        };
+        let mut parser = OutputPipeline::new(config(syntax.clone()));
+        assert!(parser.reasoning_open());
+        parser.push(Input::Text("plan<tool_call>")).unwrap();
+        parser.push(Input::Text("\n<funct")).unwrap();
+        parser.push(Input::Text("ion=lookup></function>")).unwrap();
+        parser.push(Input::Text("</tool_call>")).unwrap();
+        assert!(!parser.reasoning_open());
+        let mut parser = OutputPipeline::new(config(syntax.clone()));
+        parser.push(Input::Text("mention <tool_call>")).unwrap();
+        assert!(!parser.reasoning_open());
+        parser.push(Input::Text(" in prose")).unwrap();
+        assert!(parser.reasoning_open());
+        parser.push(Input::Text("</think>")).unwrap();
+        assert!(!parser.reasoning_open());
+        for (separator, opener) in [("", "<｜DSML｜tool_calls>"), (" ", "<｜DSML｜ calls>")] {
+            syntax.tools = Some(ToolParser {
+                kind: ToolParserKind::Dsml,
+                wrapping_newlines: 0,
+                tag_separator: separator.into(),
+            });
+            for boundary in ["</think>", opener] {
+                let mut parser = OutputPipeline::new(config(syntax.clone()));
+                assert!(parser.reasoning_open());
+                parser.push(Input::Text("\n")).unwrap();
+                assert!(parser.reasoning_open());
+                parser.push(Input::Text(boundary)).unwrap();
+                assert!(!parser.reasoning_open(), "{boundary}");
+            }
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::runtime::Prompt;
+use super::runtime::{Prompt, ReasoningCut};
 use crate::{
     AdmissionError, Error, Failure, FrontendError, Result,
     frontend::{Frontend, images::ImageProcessor},
@@ -329,7 +329,7 @@ pub(super) fn prepare_inference_cached(
     {
         return Err("structured output cannot continue an existing assistant message".into());
     }
-    let max_new_tokens = if count_only || (raw.is_some() && opts.output_limit == Some(0)) {
+    let mut max_new_tokens = if count_only || (raw.is_some() && opts.output_limit == Some(0)) {
         if tokens.len() > config.limits.max_sequence_tokens {
             return Err(Error::admission(
                 AdmissionError::Context,
@@ -345,6 +345,35 @@ pub(super) fn prepare_inference_cached(
             config.limits.max_sequence_tokens,
         )?
     };
+    let reasoning_cut = if let Some(budget) = opts.thinking_budget {
+        let unsupported = "thinking_token_budget is not supported by this model's reasoning format";
+        let output = output.as_ref().ok_or(unsupported)?;
+        let close = if output.content.start == crate::output::tagged::OutputStart::Content {
+            None
+        } else {
+            let close = thinking_budget_close(frontend, config, output.content.start)?;
+            if close.is_none() && matches!(budget, super::inference::ThinkingBudget::Required(_)) {
+                return Err(unsupported.into());
+            }
+            close
+        };
+        if let Some(close) = close {
+            (budget.tokens() < u64::from(max_new_tokens)).then(|| {
+                let budget = budget.tokens() as u32;
+                let after = max_new_tokens - budget;
+                max_new_tokens = budget;
+                ReasoningCut {
+                    close,
+                    after,
+                    output: Some(output.clone()),
+                }
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let ignore_eos = opts.ignore_eos;
     if ignore_eos && grammar.is_some() {
         return Err("structured output cannot ignore end-of-sequence tokens".into());
@@ -358,6 +387,7 @@ pub(super) fn prepare_inference_cached(
             conditioning,
             sampling,
             max_new_tokens,
+            reasoning_cut,
             stop_sequences,
             stop_strings,
             grammar,
@@ -372,6 +402,25 @@ pub(super) fn prepare_inference_cached(
         output,
         rendered_prompt: rendered.text,
         echo,
+    })
+}
+
+pub(super) fn thinking_budget_close(
+    frontend: &Frontend,
+    config: &ModelConfig,
+    start: crate::output::tagged::OutputStart,
+) -> Result<Option<u32>> {
+    use crate::output::tagged::OutputStart;
+    if !matches!(start, OutputStart::Reasoning | OutputStart::Content) {
+        return Ok(None);
+    }
+    let Some(syntax) = &config.contract.frontend.reasoning else {
+        return Ok(None);
+    };
+    let close = frontend.encode(&syntax.close, false)?;
+    Ok(match close.as_slice() {
+        [close] => Some(*close),
+        _ => None,
     })
 }
 

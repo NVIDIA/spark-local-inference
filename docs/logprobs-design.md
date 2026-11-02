@@ -9,12 +9,14 @@ Wire formats are documented in [api.md](api.md#generation-log-probabilities).
 
 ## Numerical meaning
 
-For every returned token `t`, report `logits[t] - logsumexp(logits)` over the full
-vocabulary received by the sampler, accumulating in FP32. This precedes every
+For every returned sampled token `t`, report `logits[t] - logsumexp(logits)` over
+the full vocabulary received by the sampler, accumulating in FP32. This precedes every
 sampling transformation: penalties, grammar, temperature, top-k, top-p, and min-p.
 Speculative positions always use target logits, including correction tokens,
 width-one rounds, complete speculative rounds with packed targets, and history proposals.
 Draft probabilities never enter the reporting path.
+
+Forced tokens, such as the `thinking_token_budget` close, have no logprob entry.
 
 Exports provide K=20 alternatives. Requests select zero through K. Alternatives
 are ordered by decreasing logprob and increasing token ID for equal values. The

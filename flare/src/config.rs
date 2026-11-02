@@ -42,6 +42,7 @@ struct Server {
     host: Option<IpAddr>,
     port: Option<std::num::NonZeroU16>,
     api_key: Option<String>,
+    thinking_token_budget: Option<std::num::NonZeroU32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -252,6 +253,12 @@ impl Configuration {
             None => Ok(self.server.api_key.clone().unwrap_or_default()),
         }
     }
+
+    pub(crate) fn thinking_token_budget(&self) -> Option<u32> {
+        self.server
+            .thinking_token_budget
+            .map(std::num::NonZeroU32::get)
+    }
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -393,6 +400,7 @@ mod tests {
 host = "::1"
 port = 9001
 api_key = "configured-secret"
+thinking_token_budget = 1536
 [memory]
 reserve = "2G"
 [defaults]
@@ -429,6 +437,7 @@ namespace = "publisher"
         );
         assert_eq!(run.bind_address().to_string(), "[::1]:9001");
         assert_eq!(config.api_key(None).unwrap(), "configured-secret");
+        assert_eq!(config.thinking_token_budget(), Some(1536));
         assert_eq!(run.memory_limit, Some(MemoryLimit::Reserve(2 << 30)));
         assert_eq!(run.max_concurrency.unwrap().get(), 4);
         assert_eq!(run.prefix_cache_memory, Some(3 << 29));
@@ -500,6 +509,7 @@ namespace = "publisher"
         assert!(run.prefix_cache_disk_limit.is_none());
         assert_eq!(run.bind_address().to_string(), "127.0.0.1:8000");
         assert_eq!(config.api_key(None).unwrap(), "");
+        assert_eq!(config.thinking_token_budget(), None);
     }
 
     #[test]
@@ -575,6 +585,12 @@ namespace = "publisher"
             "[server]\nport=0",
             "[server]\nport=65536",
             "[server]\napi_key=7",
+            "[server]\nthinking_token_budget=0",
+            "[server]\nthinking_token_budget=-1",
+            "[server]\nthinking_token_budget=4294967296",
+            "[server]\nthinking_token_budget=true",
+            "[server]\nthinking_token_budget=1.5",
+            "[server]\nthinking_token_budget='1536'",
             "[defaults]\nmax_concurrency=0",
             "[models.recipe]\nmax_concurrency=-1",
             "[memory]\nreserve='-1G'",

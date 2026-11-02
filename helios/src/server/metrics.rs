@@ -90,6 +90,8 @@ pub struct Snapshot {
     pub pending: u64,
     /// Requests whose generation completed successfully.
     pub completed: u64,
+    /// Requests whose reasoning was closed by their hard token budget.
+    pub reasoning_budget_cuts: u64,
     /// Requests failed by admission, execution, grammar, or output backpressure.
     pub failed: u64,
     /// Sum of maximum rank-local CUDA intervals of completed graphs, including readiness waits.
@@ -223,6 +225,7 @@ pub(super) struct Metrics {
     pub admitted: AtomicU64,
     pub http_requests: [AtomicU64; 5],
     pub completed: AtomicU64,
+    pub reasoning_budget_cuts: AtomicU64,
     pub cancelled: AtomicU64,
     pub failed: AtomicU64,
     replay_gpu_ns: AtomicU64,
@@ -327,6 +330,7 @@ impl Metrics {
             active: self.active_requests.load(Ordering::Relaxed),
             pending: self.pending.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
+            reasoning_budget_cuts: self.reasoning_budget_cuts.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             replay_gpu_ns: self.replay_gpu_ns.load(Ordering::Relaxed),
             replay_readiness_wait_ns: self.replay_readiness_wait_ns.load(Ordering::Relaxed),
@@ -777,7 +781,7 @@ impl Metrics {
             ),
             (
                 "generated_tokens_total",
-                "Committed generated tokens, including EOS and tokens subsequently withheld by text stops.",
+                "Committed generated tokens, including host-forced tokens, EOS and tokens subsequently withheld by text stops.",
                 &self.generated_tokens,
             ),
             (
@@ -809,6 +813,11 @@ impl Metrics {
                 "requests_completed_total",
                 "Requests whose model generation completed successfully, including explicit token stops.",
                 &self.completed,
+            ),
+            (
+                "reasoning_budget_cuts_total",
+                "Requests whose reasoning was closed by their hard token budget.",
+                &self.reasoning_budget_cuts,
             ),
             (
                 "requests_cancelled_total",

@@ -52,6 +52,7 @@ pub struct ThinkReasoning<D: ToolDialect> {
     tools: bool,
     trim_wrap: bool,
     tool_ends_reasoning: bool,
+    tool_undecided: bool,
     finishing: bool,
     /// Delimiters with a token count only at `offsets`; other spellings are text.
     open_token: bool,
@@ -146,6 +147,7 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 break;
             }
         }
+        self.tool_undecided = undecided.is_some();
         if let Some((end, consumed)) = boundary {
             let text = &self.buffer[..end];
             let text = if self.trim_wrap {
@@ -298,6 +300,10 @@ pub struct TaggedOutput<D: ToolDialect> {
     pending_text: String,
 }
 impl<D: ToolDialect> TaggedOutput<D> {
+    pub fn reasoning_open(&self) -> bool {
+        matches!(self.mode, Mode::Reasoning) && !self.reasoning.tool_undecided
+    }
+
     /// `control_tokens` lists delimiters that occupy one tokenizer token; those
     /// count only where generated as that token.
     pub fn with_reasoning(
@@ -357,6 +363,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 tools,
                 trim_wrap: D::TRIM_NEWLINES,
                 tool_ends_reasoning: D::TOOL_ENDS_REASONING,
+                tool_undecided: false,
                 finishing: false,
                 dialect: std::marker::PhantomData,
                 open_token: false,
@@ -691,6 +698,7 @@ impl<D: ToolDialect> TaggedOutput<D> {
                                 trim_newlines: u8::from(self.reasoning.trim_wrap) as usize,
                                 trim_wrap: self.reasoning.trim_wrap,
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
+                                tool_undecided: false,
                                 tools: !self.tools.is_empty(),
                                 finishing: self.finishing,
                                 open_token: self.reasoning.open_token,

@@ -77,6 +77,10 @@ impl RecipientOutput {
             pending_text: String::new(),
         }
     }
+    pub fn reasoning_open(&self) -> bool {
+        matches!(self.state, State::Reasoning)
+    }
+
     pub fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
         self.spans.clone()
     }

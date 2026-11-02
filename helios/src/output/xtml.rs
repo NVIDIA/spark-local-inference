@@ -60,6 +60,10 @@ impl XtmlOutput {
         }
     }
 
+    pub fn reasoning_open(&self) -> bool {
+        matches!(self.channel, Channel::Reasoning)
+    }
+
     pub fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
         self.spans.clone()
     }

@@ -173,17 +173,24 @@ impl<'a> TextStops<'a> {
         value: crate::execution::TokenLogprobs,
         silent: bool,
     ) -> Result<(Vec<crate::output::Piece>, bool)> {
-        let tracked = self.tracked.as_mut().ok_or("logprob stop decoder was not initialized")?;
-        if silent {
-            return Ok(match tracked.silent(token, Some(value)) {
-                Some(span) => self.accept_span(span, false),
-                None => (vec![], false),
-            });
-        }
-        match tracked.push(token, Some(value))? {
-            Some(span) => Ok(self.accept_span(span, false)),
-            None => Ok((vec![], false)),
-        }
+        self.push_tracked(token, Some(value), silent)
+    }
+    fn push_tracked(
+        &mut self,
+        token: u32,
+        value: Option<crate::execution::TokenLogprobs>,
+        silent: bool,
+    ) -> Result<(Vec<crate::output::Piece>, bool)> {
+        let tracked = self
+            .tracked
+            .as_mut()
+            .ok_or("logprob stop decoder was not initialized")?;
+        let span = if silent {
+            tracked.silent(token, value)
+        } else {
+            tracked.push(token, value)?
+        };
+        Ok(span.map_or((vec![], false), |span| self.accept_span(span, false)))
     }
     fn accept_span(&mut self, span: super::token_spans::Span, finish: bool) -> (Vec<crate::output::Piece>, bool) {
         let silent = !span.tokens.is_empty()
@@ -203,6 +210,9 @@ impl<'a> TextStops<'a> {
         self.accept_text(span.text, finish)
     }
     pub fn push(&mut self, token: u32) -> Result<(Vec<crate::output::Piece>, bool)> {
+        if self.tracked.is_some() {
+            return self.push_tracked(token, None, false);
+        }
         self.pending_tokens.push(token);
         let text = self.decoder.push(&[token])?;
         Ok(self.accept_text(text.unwrap_or_default(), false))

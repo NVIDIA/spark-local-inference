@@ -40,6 +40,7 @@ The additional `flare` object reports prepared and selected serving metadata:
 | `prefill_chunk_size` | Maximum tokens in a prefill chunk, not the context limit |
 | `default_max_tokens` | Default output-token budget when a request omits it; remaining context still bounds output |
 | `sampling_defaults` | Packaged seed, temperature, filters, and penalties used for omitted request fields |
+| `thinking_token_budget` | Operator default reasoning-token cap for conversational requests; null when unset |
 | `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its packaged default; seed remains request-controlled |
 | `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only packages |
 | `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only packages |
@@ -291,6 +292,7 @@ instantaneous gauges.
 | `active` | Model slots with a live request | `flare_active_requests` |
 | `pending` | Requests waiting in the model scheduler | `flare_pending_requests` |
 | `completed` | Requests whose generation completed successfully | `flare_requests_completed_total` |
+| `reasoning_budget_cuts` | Requests whose reasoning was closed by their hard token budget | `flare_reasoning_budget_cuts_total` |
 | `failed` | Requests failed by admission, execution, grammar, or output backpressure | `flare_requests_failed_total` |
 | `replay_gpu_ns` | Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits | `flare_replay_gpu_nanoseconds_total` |
 | `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for both RAM and disk delivery | `flare_replay_readiness_wait_nanoseconds_total` |
@@ -535,7 +537,8 @@ and valid sampler values; temperature bounds are positive. For example,
 `temperature: 0` becomes the declared minimum, or the default if no range exists.
 Malformed types still return HTTP 400; `top_k` must be an integer. `seed` remains
 request-controlled and uses its packaged default when omitted. Sampling defaults
-and ranges come from the model author's recommendations declared in the recipe.
+and ranges come from the model author's recommendations declared in the recipe,
+except for DeepSeek V4.1's repetition-penalty range based on measured use.
 
 The recipes use these default-mode settings. Parameters without an interval in
 the table are fixed at their defaults. Bounds span the minimum and maximum values
@@ -549,7 +552,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
-| `deepseek41` | 1 | 1 | Disabled | None | [DeepSeek-V4.1-Flash-1017 inference recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
+| `deepseek41` | 1 | 1 | Disabled | Top-p [0.95, 1]; repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 defaults](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference); [V4.1-Flash top-p recommendations and benchmarks](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference) |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
@@ -570,9 +573,39 @@ custom stops cannot be combined with output constraints.
 For conversational JSON output, the schema and a JSON-only formatting instruction
 are included in the system prompt as well as enforced by token masks.
 
-Anthropic thinking budgets are advisory effort hints, not independent token
-budgets. Budgets up to 5,000 map to low effort, up to 20,000 to high effort, and
-larger budgets to maximum effort. Responses and Anthropic named effort settings
+`thinking_token_budget` is a positive 32-bit integer accepted by Chat Completions,
+Responses, and Messages. It caps generated reasoning tokens from the start of
+this request's output. At the cap, if reasoning is unambiguously open, output
+capacity remains, and any grammar allows it, Flare emits the packaged reasoning
+close token and continues with the remaining output limit. The forced close
+counts as a generated token within that limit; forced tokens are omitted from
+logprobs. No transition text is inserted.
+If reasoning closed earlier, a tool opener is still undecided, or the grammar
+disallows the close, generation continues without an injected token.
+EOS, user stops, and errors terminate normally without continuation.
+
+The budget requires packaged reasoning syntax with a single-token close delimiter
+when output starts in reasoning. Unsupported formats and raw Completions
+return HTTP 400 naming `thinking_token_budget`. When output starts in content,
+the budget is accepted without a cut.
+
+`[server] thinking_token_budget = N` sets a default for Chat Completions, Responses,
+and Messages requests that omit a budget, including when the request field is null.
+An explicit request budget, including Messages `thinking.budget_tokens`, wins.
+The setting must be a positive 32-bit integer. Startup rejects packages without
+reasoning syntax, a single-token close delimiter, or a supported default output start.
+The default does not select reasoning effort or apply to raw Completions. Omitting
+it leaves requests without a budget uncapped. `/v1/models` advertises it in
+`flare.thinking_token_budget`.
+
+On Messages, enabled or adaptive `thinking.budget_tokens` also caps reasoning on
+supported formats and remains an advisory effort hint on models that cannot honour a hard cap.
+Explicit `thinking_token_budget` still returns HTTP 400 on unsupported reasoning formats.
+If both budget fields are present, their values must match. Budgets
+retain their effort mapping: up to 5,000 map to low effort, up to 20,000 to high
+effort, and larger budgets to maximum effort; explicit `output_config.effort` wins.
+Messages budgets above the 32-bit output limit are accepted and never trigger a cut.
+Responses and Anthropic named effort settings
 (`reasoning.effort` and `output_config.effort`) accept named levels and map into
 the same neutral levels. They do not accept numeric scores. The frontend resolves
 those levels against the effort vocabulary accepted by the packaged template: for example Qwen uses
@@ -599,7 +632,7 @@ floating-point numbers such as `80.0`, booleans, and numeric strings such as
 `"80"` are rejected. Omitted values retain prepared defaults; explicit `null`
 selects the encoder's high default. Disabling thinking suppresses the effort
 prefix. The score is a prompt hint, not a token count or hard reasoning budget;
-Anthropic `thinking.budget_tokens` retains the threshold mapping described above.
+Anthropic `thinking.budget_tokens` also sets `thinking_token_budget` as described above.
 
 Both native DeepSeek encoders reject `drop_thinking`, assistant continuation,
 and `add_generation_prompt=false`.

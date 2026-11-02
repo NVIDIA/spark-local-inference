@@ -25,6 +25,47 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_template(b"{% mark %}{{ messages[0].content }}", &["<eos>"], &[])
+    }
+
+    fn reasoning() -> Self {
+        let mut fixture = Self::with_template(
+            b"a{% mark %}assistant<think>",
+            &[
+                "<eos>",
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</function>",
+                "</tool_call>",
+                "<parameter=n>",
+                "</parameter>",
+            ],
+            &["<function=lookup>"],
+        );
+        fixture.config.contract.frontend.assistant_marker = "assistant".into();
+        fixture.config.contract.frontend.reasoning =
+            Some(crate::model::contract::ReasoningParser {
+                kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+                open: "<think>".into(),
+                close: "</think>".into(),
+                wrapping_newlines: 0,
+                terminal_markers: vec![],
+            });
+        // Prepared text prompts have no image arrays or image graph inputs.
+        for graph in &mut fixture.config.contract.graphs {
+            graph.inputs.retain(|binding| {
+                !matches!(
+                    binding.source,
+                    crate::model::contract::ValueSource::ImageFeatureIndex
+                        | crate::model::contract::ValueSource::ImageFeatureSlot
+                )
+            });
+        }
+        fixture
+    }
+
+    fn with_template(template: &[u8], special_tokens: &[&str], text_tokens: &[&str]) -> Self {
         static SERIAL: AtomicUsize = AtomicUsize::new(0);
         let directory = std::env::temp_dir().join(format!(
             "flare-worker-phase-{}-{}",
@@ -34,6 +75,7 @@ impl Fixture {
         std::fs::create_dir(&directory).unwrap();
         let vocabulary: tokenizers::models::bpe::Vocab = ["a", "b", "c", "d", "x"]
             .into_iter()
+            .chain(text_tokens.iter().copied())
             .enumerate()
             .map(|(id, token)| (token.to_owned(), id as u32))
             .collect();
@@ -45,8 +87,13 @@ impl Fixture {
         );
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
         tokenizer
-            .add_special_tokens([tokenizers::AddedToken::from("<eos>", true)])
+            .add_special_tokens(
+                special_tokens
+                    .iter()
+                    .map(|&text| tokenizers::AddedToken::from(text, true)),
+            )
             .unwrap();
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = directory.join(name);
             std::fs::write(&path, bytes).unwrap();
@@ -63,7 +110,7 @@ impl Fixture {
                     tokenizer.to_string(false).unwrap().as_bytes(),
                 ),
                 tokens: Default::default(),
-                chat_template: Some(asset("chat.jinja", b"{% mark %}{{ messages[0].content }}")),
+                chat_template: Some(asset("chat.jinja", template)),
             },
             Default::default(),
         )
@@ -85,7 +132,7 @@ impl Fixture {
                     pages: 16,
                     snapshots: 16,
                 },
-                eos_token_ids: vec![5],
+                eos_token_ids: vec![eos],
                 sampling_ranges: Default::default(),
                 sampling_defaults: SamplingParameters::default(),
                 max_new_tokens: 16,
@@ -162,6 +209,7 @@ impl Fixture {
             conditioning: vec![],
             sampling: SamplingParameters::default(),
             max_new_tokens: limit,
+            reasoning_cut: None,
             stop_sequences: vec![],
             stop_strings: vec![],
             logprobs: false,
@@ -345,6 +393,648 @@ fn advance(worker: &mut Worker<'_>, kind: GraphKind, sequence: u64, token: Optio
     let step = planned(worker, kind, sequence);
     let frame = completion(worker, &step, sequence, token);
     worker.complete(kind, frame).unwrap();
+}
+
+fn budget_cut(close: u32, after: u32) -> ReasoningCut {
+    let close_text = ["a", "b", "c", "d", "x"][close as usize];
+    let mut syntax = crate::model::testing::metadata().frontend;
+    syntax.reasoning = Some(crate::model::contract::ReasoningParser {
+        kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+        open: "<think>".into(),
+        close: close_text.into(),
+        wrapping_newlines: 0,
+        terminal_markers: vec![],
+    });
+    ReasoningCut {
+        close,
+        after,
+        output: Some(crate::output::OutputConfig {
+            syntax,
+            content: crate::output::tagged::OutputConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Reasoning,
+                tools: vec![],
+            },
+            control_tokens: vec![(close, close_text.into())],
+        }),
+    }
+}
+
+// Drive the worker's normal completion and terminal-checkpoint phases without CUDA.
+fn budget_pass(worker: &mut Worker<'_>, sequence: &mut u64, samples: &[u32]) {
+    let steps = samples.len() + 40;
+    let mut samples = samples.iter().copied();
+    for _ in 0..steps {
+        if worker.active.iter().all(Option::is_none) {
+            assert!(samples.next().is_none());
+            return;
+        }
+        let step = worker
+            .plan(0)
+            .unwrap()
+            .0
+            .expect("budget pass must progress");
+        *sequence += 1;
+        worker.reserve_and_pack(&step, Fence(*sequence)).unwrap();
+        let lane = &step.lanes[0];
+        let live = worker.scheduler.request(lane.request).unwrap();
+        let generates = matches!(step.kind, GraphKind::Decode | GraphKind::Resume)
+            || (step.kind == GraphKind::Prefill
+                && lane.start_position + lane.tokens as u64 == live.prompt_tokens as u64);
+        let token = generates.then(|| samples.next().expect("unexpected generation"));
+        let mut frame = completion(worker, &step, *sequence, token);
+        if token.is_some_and(|token| worker.config.eos_token_ids.contains(&token))
+            && !worker.active[lane.request.slot as usize]
+                .as_ref()
+                .unwrap()
+                .incoming
+                .prompt
+                .ignore_eos
+        {
+            frame.records[lane.request.slot as usize].status = 2;
+        }
+        if let Some(token) = token
+            && worker.active[lane.request.slot as usize]
+                .as_ref()
+                .unwrap()
+                .incoming
+                .prompt
+                .logprobs
+        {
+            let mut values = vec![std::array::from_fn(|_| None); 4];
+            values[lane.request.slot as usize][0] = Some(crate::execution::TokenLogprobs {
+                token,
+                logprob: -1.,
+                top: vec![],
+            });
+            frame.logprobs = Some(values);
+        }
+        worker.complete(step.kind, frame).unwrap();
+        worker.publish().unwrap();
+    }
+    panic!("budget pass did not finish");
+}
+
+fn budget_events(
+    generation: &mut Generation,
+) -> (Vec<u32>, Vec<(usize, u32, &'static str)>, Vec<u32>) {
+    let mut tokens = vec![];
+    let mut finished = vec![];
+    let mut logprobs = vec![];
+    while let Ok(event) = generation.events.try_recv() {
+        match event {
+            GenerationEvent::Token(token) => tokens.push(token),
+            GenerationEvent::LogprobToken(value) => {
+                tokens.push(value.token);
+                logprobs.push(value.token);
+            }
+            GenerationEvent::Protocol(pieces) => {
+                for piece in pieces {
+                    match piece {
+                        crate::output::Piece::Token(token) => tokens.push(token),
+                        crate::output::Piece::Logprob(entry) => logprobs.push(entry.value.token),
+                        _ => {}
+                    }
+                }
+            }
+            GenerationEvent::Finished {
+                prompt_tokens,
+                generated_tokens,
+                reason,
+                ..
+            } => {
+                finished.push((prompt_tokens, generated_tokens, reason));
+            }
+            GenerationEvent::Error(error) | GenerationEvent::AdmissionRejected(error) => {
+                panic!("{error}")
+            }
+            _ => {}
+        }
+    }
+    (tokens, finished, logprobs)
+}
+
+#[test]
+fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
+    for close_at in [None, Some(1), Some(2)] {
+        for after in [1, 4] {
+            let mut fixture = Fixture::new();
+            fixture.config.history_drafts = true;
+            let (sender, receiver) = mpsc::channel();
+            let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+            incoming.prompt.reasoning_cut = Some(budget_cut(4, after));
+            sender.send(vec![incoming]).unwrap();
+            let mut worker = fixture.worker(receiver);
+            worker.admit().unwrap();
+            let mut first = [1; 3];
+            if let Some(at) = close_at {
+                first[at] = 4;
+            }
+            let mut sequence = 0;
+            budget_pass(&mut worker, &mut sequence, &first);
+            let (mut tokens, mut finished, _) = budget_events(&mut generation);
+            let forced = close_at.is_none();
+            let mut expected = first.to_vec();
+            if forced {
+                expected.push(4);
+            }
+            assert_eq!(tokens, expected);
+            assert_eq!(
+                worker.metrics.snapshot(false).reasoning_budget_cuts,
+                u64::from(forced)
+            );
+            if after > u32::from(forced) {
+                assert!(finished.is_empty());
+                assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 0);
+                let (incoming, parked) = worker.parked.front().unwrap();
+                assert_eq!(incoming.prompt.tokens, [vec![0], expected.clone()].concat());
+                assert!(incoming.prompt.reasoning_cut.is_none());
+                assert_eq!(incoming.prompt.max_new_tokens, after - u32::from(forced));
+                assert_eq!(parked.carried.generated_tokens, expected.len() as u32);
+                assert!(parked.reasoning.is_none());
+                assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+                budget_pass(
+                    &mut worker,
+                    &mut sequence,
+                    &vec![2; after as usize - usize::from(forced)],
+                );
+                let (tail, terminal, _) = budget_events(&mut generation);
+                tokens.extend(tail);
+                finished.extend(terminal);
+            }
+            assert_eq!(tokens.len(), 3 + after as usize);
+            assert_eq!(tokens.iter().filter(|&&token| token == 4).count(), 1);
+            assert_eq!(finished, vec![(1, 3 + after, "length")]);
+            assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+            assert_eq!(worker.metrics.admitted.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                worker.metrics.snapshot(false).generated_tokens,
+                (3 + after) as u64
+            );
+            assert!(worker.parked.is_empty());
+            if forced && after == 4 {
+                assert_eq!(
+                    worker.scheduler.history_proposal(&[1, 1, 1, 4], 7),
+                    ([2, 2, 2, -1, -1, -1, -1], 3)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+    incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+    incoming.prompt.ignore_eos = true;
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.admit().unwrap();
+    let mut sequence = 0;
+    budget_pass(&mut worker, &mut sequence, &[1, 1, 5]);
+    let (incoming, parked) = worker.parked.front().unwrap();
+    assert_eq!(incoming.prompt.tokens, vec![0, 1, 1, 5, 4]);
+    assert_eq!(incoming.prompt.max_new_tokens, 2);
+    assert_eq!(parked.carried.generated_tokens, 4);
+    assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 1);
+    worker.admit().unwrap();
+    budget_pass(&mut worker, &mut sequence, &[2, 2]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![1, 1, 5, 4, 2, 2], vec![(1, 6, "length")], vec![])
+    );
+}
+
+#[test]
+fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
+    let mut fixture = Fixture::new();
+    fixture.config.speculative_widths = vec![1, 4];
+    fixture.config.speculative_fixed_width = Some(4);
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 4);
+    incoming.prompt.reasoning_cut = Some(budget_cut(4, 2));
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.enable_speculation(&[1, 4]).unwrap();
+    worker.scheduler.fixed_speculative_width(Some(4)).unwrap();
+    worker.admit().unwrap();
+    advance(&mut worker, GraphKind::Init, 1, None);
+    advance(&mut worker, GraphKind::Prefill, 2, Some(1));
+    advance(&mut worker, GraphKind::Snapshot, 3, None);
+    let step = planned(&mut worker, GraphKind::Speculative, 4);
+    assert_eq!(step.token_capacity, 4);
+    assert_eq!(step.lanes[0].tokens, 3);
+    let mut frame = completion(&worker, &step, 4, None);
+    let record = &mut frame.records[step.lanes[0].request.slot as usize];
+    record.consumed_tokens = 16;
+    record.generated_tokens = 4;
+    record.token_id = 1;
+    record.vector = Some(crate::execution::TokenVector {
+        emitted_count: 3,
+        offered_drafts: 2,
+        accepted_drafts: 2,
+        verification_width: 4,
+        draft_cache_consumed: 15,
+        tokens: [1, 1, 1, -1, -1, -1, -1, -1],
+        ..Default::default()
+    });
+    worker.complete(GraphKind::Speculative, frame).unwrap();
+    worker.publish().unwrap();
+    let mut sequence = 4;
+    budget_pass(&mut worker, &mut sequence, &[]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![1, 1, 1, 1, 4], vec![], vec![])
+    );
+    let (incoming, parked) = worker.parked.front().unwrap();
+    assert_eq!(
+        incoming.prompt.tokens,
+        [vec![0; 13], vec![1, 1, 1, 1, 4]].concat()
+    );
+    assert_eq!(incoming.prompt.max_new_tokens, 1);
+    assert_eq!(parked.carried.generated_tokens, 5);
+    assert!(
+        worker
+            .metrics
+            .render()
+            .contains("flare_reasoning_budget_cuts_total 1\n")
+    );
+    worker.admit().unwrap();
+    budget_pass(&mut worker, &mut sequence, &[2]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![2], vec![(13, 6, "length")], vec![])
+    );
+}
+
+fn prepared_budget_request(
+    fixture: &Fixture,
+    protocol: crate::server::protocol::Protocol,
+    body: serde_json::Value,
+) -> (
+    Incoming,
+    Generation,
+    super::super::output::Decoder<'_, crate::output::OutputPipeline>,
+    usize,
+) {
+    let decoded = crate::server::protocol::decode(protocol, body, false).unwrap();
+    let compiler = crate::grammar::GrammarCompiler::new(
+        fixture.frontend.tokenizer(),
+        fixture.config.contract.vocabulary,
+        &fixture.config.eos_token_ids,
+        &[],
+    )
+    .unwrap();
+    let prepared = crate::server::request::prepare_inference(
+        &fixture.frontend,
+        None,
+        &compiler,
+        &fixture.config,
+        &decoded.request,
+        0,
+        false,
+    )
+    .unwrap();
+    let prompt_tokens = prepared.prompt.tokens.len();
+    let decoder = super::super::output::Decoder::new(
+        &fixture.frontend,
+        &fixture.config.eos_token_ids,
+        prepared.output,
+    );
+    let (mut incoming, generation) = fixture.incoming(vec![], 0);
+    incoming.prompt = prepared.prompt;
+    (incoming, generation, decoder, prompt_tokens)
+}
+
+#[test]
+fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
+    use crate::model::contract::{ToolParser, ToolParserKind};
+    use crate::server::protocol::Protocol;
+    use serde_json::json;
+    for (budget, constrained) in [(2, false), (2, true), (4, false), (4, true)] {
+        let mut fixture = Fixture::reasoning();
+        fixture
+            .config
+            .contract
+            .frontend
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .terminal_markers = vec!["<tool_call>".into()];
+        fixture.config.contract.frontend.tools = Some(ToolParser {
+            kind: ToolParserKind::QwenCoder,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let mut body = json!({"messages":[{"role":"user","content":"a"}],
+            "max_tokens":8,"thinking_token_budget":budget,"add_generation_prompt":true,
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                "type":"object","properties":{"n":{"type":"string"}}}}}]});
+        if constrained {
+            body["response_format"] = json!({"type":"json_object"});
+        }
+        let (incoming, mut generation, mut decoder, prompt_tokens) =
+            prepared_budget_request(&fixture, Protocol::Chat, body);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        let token = |text| fixture.frontend.tokenizer().token_to_id(text).unwrap();
+        let samples = [
+            token("b"),
+            token("<tool_call>"),
+            token("<function=lookup>"),
+            token("<parameter=n>"),
+            token("c"),
+            token("</parameter>"),
+            token("</function>"),
+            token("</tool_call>"),
+        ];
+        let first = &samples[..budget];
+        budget_pass(&mut worker, &mut sequence, first);
+        let (mut tokens, finished, _) = budget_events(&mut generation);
+        assert!(finished.is_empty());
+        let (incoming, parked) = worker.parked.front().unwrap();
+        assert_eq!(&incoming.prompt.tokens[prompt_tokens..], first);
+        assert_eq!(incoming.prompt.max_new_tokens, (8 - budget) as u32);
+        assert_eq!(parked.carried.generated_tokens, budget as u32);
+        assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &samples[budget..]);
+        let (tail, finished, _) = budget_events(&mut generation);
+        tokens.extend(tail);
+        assert!(!tokens.contains(&token("</think>")));
+        assert_eq!(finished, vec![(prompt_tokens, 8, "length")]);
+        let mut output = crate::server::output::Accumulator::new("tool".into());
+        for token in tokens {
+            output.apply(decoder.push(token).unwrap()).unwrap();
+        }
+        output
+            .apply(
+                decoder
+                    .finish(crate::output::Termination::OutputLimit)
+                    .unwrap(),
+            )
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(output.message()["reasoning_content"], "b");
+        assert_eq!(
+            output.message()["tool_calls"][0]["function"]["arguments"],
+            "{\"n\":\"c\"}"
+        );
+    }
+}
+
+#[test]
+fn reasoning_budget_streams_reasoning_then_content_on_chat_and_messages() {
+    use crate::server::protocol::{Encoder, PromptUsage, Protocol};
+    use serde_json::json;
+    for protocol in [Protocol::Chat, Protocol::Messages] {
+        let fixture = Fixture::reasoning();
+        let (incoming, mut generation, mut decoder, prompt_tokens) = prepared_budget_request(
+            &fixture,
+            protocol,
+            json!({"messages":[{"role":"user","content":"a"}],
+            "max_tokens":5,"thinking_token_budget":2,"add_generation_prompt":true,"stream":true}),
+        );
+        let mut encoder = Encoder::new(
+            protocol,
+            "cut".into(),
+            "local".into(),
+            0,
+            1,
+            vec![PromptUsage {
+                tokens: prompt_tokens,
+                image_tokens: 0,
+            }],
+            vec![],
+            crate::server::inference::ToolChoice::Auto,
+            true,
+            true,
+            json!({}),
+        );
+        let mut frames = encoder.start();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &[2, 2]);
+        while let Ok(event) = generation.events.try_recv() {
+            match event {
+                GenerationEvent::Token(token) => {
+                    frames.extend(encoder.apply(0, decoder.push(token).unwrap()).unwrap())
+                }
+                GenerationEvent::Finished {
+                    generated_tokens,
+                    reused_prompt_tokens,
+                    termination,
+                    ..
+                } => {
+                    frames.extend(
+                        encoder
+                            .apply(0, decoder.finish(termination).unwrap())
+                            .unwrap(),
+                    );
+                    frames.extend(
+                        encoder
+                            .finish(0, termination, generated_tokens, reused_prompt_tokens, None)
+                            .unwrap(),
+                    );
+                }
+                GenerationEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let (reasoning, content) = if protocol == Protocol::Chat {
+            (
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["choices"][0]["delta"]["reasoning_content"].as_str())
+                    .collect::<String>(),
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>(),
+            )
+        } else {
+            (
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["delta"]["thinking"].as_str())
+                    .collect::<String>(),
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["delta"]["text"].as_str())
+                    .collect::<String>(),
+            )
+        };
+        assert_eq!((reasoning.as_str(), content.as_str()), ("bb", "cc"));
+        assert_eq!(
+            encoder.usage_value()[if protocol == Protocol::Chat {
+                "completion_tokens"
+            } else {
+                "output_tokens"
+            }],
+            5
+        );
+    }
+}
+
+#[test]
+fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
+    for (strings, sequences, samples, generated) in [
+        (vec![], vec![], vec![5], 1),
+        (vec!["b".into()], vec![], vec![1], 1),
+        (vec![], vec![vec![1]], vec![1], 1),
+        (vec![], vec![], vec![1, 1, 5], 3),
+    ] {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 4));
+        incoming.prompt.stop_strings = strings;
+        incoming.prompt.stop_sequences = sequences;
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut 0, &samples);
+        assert_eq!(
+            budget_events(&mut generation).1,
+            vec![(1, generated, "stop")]
+        );
+        assert!(worker.parked.is_empty());
+        assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+    }
+}
+
+#[test]
+fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
+    for mode in 0..3 {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 4));
+        incoming.prompt.stop_strings = vec![if mode == 0 { "bx" } else { "xc" }.into()];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        let (tokens, finished, _) = budget_events(&mut generation);
+        if mode == 0 {
+            assert_eq!(finished, vec![(1, 3, "stop")]);
+            assert!(!tokens.contains(&4));
+            assert!(worker.parked.is_empty());
+        } else {
+            assert!(finished.is_empty());
+            assert_eq!(worker.parked.len(), 1);
+            if mode == 1 {
+                generation.cancelled.store(true, Ordering::Release);
+                worker.admit().unwrap();
+                assert!(worker.parked.is_empty());
+                assert!(worker.active.iter().all(Option::is_none));
+                assert_eq!(worker.metrics.cancelled.load(Ordering::Relaxed), 1);
+            } else {
+                worker.admit().unwrap();
+                budget_pass(&mut worker, &mut sequence, &[2]);
+                assert_eq!(budget_events(&mut generation).1, vec![(1, 4, "stop")]);
+                assert!(worker.parked.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
+    for allows_close in [false, true] {
+        let fixture = Fixture::new();
+        let compiler = crate::grammar::GrammarCompiler::new(
+            fixture.frontend.tokenizer(),
+            fixture.config.contract.vocabulary,
+            &fixture.config.eos_token_ids,
+            &[],
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+        incoming.prompt.grammar = Some(
+            compiler
+                .compile_lark(if allows_close {
+                    "start: \"bbxcc\""
+                } else {
+                    "start: \"bbccc\""
+                })
+                .unwrap(),
+        );
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        if allows_close {
+            let grammar = worker
+                .parked
+                .front()
+                .unwrap()
+                .0
+                .prompt
+                .grammar
+                .as_ref()
+                .unwrap();
+            assert!(grammar.allows(2));
+            worker.admit().unwrap();
+            budget_pass(&mut worker, &mut sequence, &[2, 2]);
+            assert_eq!(
+                budget_events(&mut generation),
+                (vec![1, 1, 4, 2, 2], vec![(1, 5, "length")], vec![])
+            );
+        } else {
+            let (incoming, parked) = worker.parked.front().unwrap();
+            assert_eq!(incoming.prompt.tokens, vec![0, 1, 1]);
+            assert_eq!(incoming.prompt.max_new_tokens, 3);
+            assert_eq!(parked.carried.generated_tokens, 2);
+            assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+            worker.admit().unwrap();
+            budget_pass(&mut worker, &mut sequence, &[2, 2, 2]);
+            assert_eq!(
+                budget_events(&mut generation),
+                (vec![1, 1, 2, 2, 2], vec![(1, 5, "length")], vec![])
+            );
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_omits_only_the_forced_tokens_logprob() {
+    for text_stops in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.max_top_logprobs = 20;
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+        incoming.prompt.logprobs = true;
+        if text_stops {
+            incoming.prompt.stop_strings = vec!["dx".into()];
+        }
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &[2, 2]);
+        let (tokens, finished, logprobs) = budget_events(&mut generation);
+        assert_eq!(finished, vec![(1, 5, "length")]);
+        assert_eq!(tokens, vec![1, 1, 4, 2, 2]);
+        assert_eq!(logprobs, vec![1, 1, 2, 2]);
+    }
 }
 
 #[test]
@@ -2438,6 +3128,7 @@ fn exercise_text_preemption(
     metadata: crate::model::PreparedContract,
     data: impl Fn(usize) -> crate::model::PromptData,
     evict_checkpoint: bool,
+    reasoning_cut: Option<ReasoningCut>,
 ) {
     let mut fixture = Fixture::new();
     fixture.config.history_drafts = true;
@@ -2449,8 +3140,10 @@ fn exercise_text_preemption(
     let page_tokens = crate::model::scheduler_capabilities(&fixture.config).page_tokens;
     let budget = (page_tokens * 4) as u32;
     let (sender, receiver) = mpsc::channel();
-    let (first, mut first_generation) = fixture.incoming_for(vec![0; 60], budget, data(60));
-    let (second, mut second_generation) = fixture.incoming_for(vec![2; 60], budget, data(60));
+    let (mut first, mut first_generation) = fixture.incoming_for(vec![0; 60], budget, data(60));
+    let (mut second, mut second_generation) = fixture.incoming_for(vec![2; 60], budget, data(60));
+    first.prompt.reasoning_cut = reasoning_cut.clone();
+    second.prompt.reasoning_cut = reasoning_cut.clone();
     sender.send(vec![first, second]).unwrap();
     let mut worker = fixture.worker_for(receiver);
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -2458,6 +3151,7 @@ fn exercise_text_preemption(
     assert_eq!(worker.scheduler.free_page_count(), 2);
     let older = worker.active[0].as_ref().unwrap().request;
     let mut sequence = 0;
+    let mut emitted = [vec![], vec![]];
     while worker.parked.is_empty() {
         sequence += 1;
         assert!(sequence < (page_tokens * 8) as u64, "no request was parked");
@@ -2479,18 +3173,34 @@ fn exercise_text_preemption(
         let frame = completion(&worker, &step, sequence, sample);
         worker.complete(step.kind, frame).unwrap();
         worker.publish().unwrap();
-        for generation in [&mut first_generation, &mut second_generation] {
-            while let Ok(event) = generation.events.try_recv() {
-                assert!(!matches!(
-                    event,
-                    GenerationEvent::Error(_) | GenerationEvent::AdmissionRejected(_)
-                ));
-            }
+        for (index, generation) in [&mut first_generation, &mut second_generation]
+            .into_iter()
+            .enumerate()
+        {
+            let (tokens, finished, _) = budget_events(generation);
+            assert!(finished.is_empty());
+            emitted[index].extend(tokens);
         }
     }
     assert!(worker.scheduler.stats().preemptions > 0);
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
+    assert_eq!(
+        incoming
+            .prompt
+            .reasoning_cut
+            .as_ref()
+            .map(|cut| (cut.close, cut.after)),
+        reasoning_cut.as_ref().map(|cut| (cut.close, cut.after))
+    );
+    assert_eq!(
+        parked
+            .reasoning
+            .as_ref()
+            .is_some_and(|parser| parser.reasoning_open()),
+        reasoning_cut.as_ref().is_some_and(|cut| cut.close != 1)
+    );
+    let index = usize::from(incoming.prompt.tokens[0] == 2);
     let decoded_sequence = parked.carried.decoded_sequence;
     assert_ne!(decoded_sequence, Default::default());
     let history_len = incoming.prompt.tokens.len();
@@ -2541,7 +3251,8 @@ fn exercise_text_preemption(
         assert_eq!(live.consumed_tokens, history_len as u64 - 1);
     }
     let mut recomputed = false;
-    for _ in 0..history_len / 64 + 8 {
+    let mut generated_once = false;
+    for _ in 0..budget as usize + history_len / 64 + 40 {
         sequence += 1;
         let step = worker.plan(0).unwrap().0.unwrap();
         recomputed |= step.kind == GraphKind::Prefill
@@ -2558,7 +3269,7 @@ fn exercise_text_preemption(
         let frame = completion(&worker, &step, sequence, sample);
         worker.complete(step.kind, frame).unwrap();
         worker.publish().unwrap();
-        if worker.scheduler.request(resumed).unwrap().generated_tokens > 0 {
+        if !generated_once && worker.scheduler.request(resumed).unwrap().generated_tokens > 0 {
             assert_eq!(recomputed, evict_checkpoint);
             assert!(
                 worker.active[resumed.slot as usize]
@@ -2568,6 +3279,38 @@ fn exercise_text_preemption(
                     .generated_tokens
                     > 0
             );
+            if reasoning_cut.is_none() {
+                return;
+            }
+            generated_once = true;
+        }
+        let generation = if index == 0 {
+            &mut first_generation
+        } else {
+            &mut second_generation
+        };
+        let (tokens, finished, _) = budget_events(generation);
+        assert!(finished.is_empty());
+        emitted[index].extend(tokens);
+        if worker.active.iter().all(Option::is_none) {
+            let cut = reasoning_cut.as_ref().unwrap();
+            let forced = cut.close != 1;
+            let mut expected = vec![1; budget as usize];
+            if forced {
+                expected.push(cut.close);
+            }
+            worker.admit().unwrap();
+            budget_pass(
+                &mut worker,
+                &mut sequence,
+                &vec![2; (cut.after - u32::from(forced)) as usize],
+            );
+            let (tokens, finished, _) = budget_events(generation);
+            emitted[index].extend(tokens);
+            expected.extend(vec![2; (cut.after - u32::from(forced)) as usize]);
+            assert_eq!(emitted[index], expected);
+            assert_eq!(finished, vec![(60, budget + cut.after, "length")]);
+            assert!(worker.parked.is_empty());
             return;
         }
     }
@@ -2588,6 +3331,25 @@ fn text_preemption_restores_or_recomputes_every_attention_contract() {
                     ..Default::default()
                 },
                 evict,
+                None,
+            );
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_survives_preemption_and_checkpoint_recomputation() {
+    for evict in [false, true] {
+        for close in [1, 4] {
+            exercise_text_preemption(
+                crate::model::testing::metadata(),
+                |n| PromptData {
+                    positions: (0..n).map(|p| [p as i64; 3]).collect(),
+                    vision_token_indices: vec![-1; n],
+                    ..Default::default()
+                },
+                evict,
+                Some(budget_cut(close, 16)),
             );
         }
     }
@@ -2695,15 +3457,23 @@ fn http_state(
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
 ) -> Arc<super::super::HttpState> {
+    http_state_for(Fixture::new(), sender, api_key)
+}
+
+fn http_state_for(
+    mut fixture: Fixture,
+    sender: mpsc::SyncSender<Vec<Incoming>>,
+    api_key: Option<String>,
+) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
-    let mut fixture = Fixture::new();
-    fixture.config.contract.vocabulary = 6;
-    fixture.config.contract.input_vocabulary = 6;
+    let vocabulary = fixture.frontend.tokenizer().get_vocab_size(true);
+    fixture.config.contract.vocabulary = vocabulary;
+    fixture.config.contract.input_vocabulary = vocabulary;
     fixture.config.sampling_defaults.top_k = -1;
     let grammar = crate::grammar::GrammarCompiler::new(
         fixture.frontend.tokenizer(),
-        6,
+        vocabulary,
         &fixture.config.eos_token_ids,
         &[],
     )
@@ -2736,6 +3506,7 @@ fn http_state(
         ingress_capacity: 4,
         ids: Default::default(),
         api_key,
+        thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
         started: std::time::Instant::now(),
@@ -2787,6 +3558,66 @@ async fn http_generation_request(
     .await
     .unwrap();
     (response, incoming)
+}
+
+#[tokio::test]
+async fn http_operator_thinking_budget_defaults_and_request_overrides() {
+    use super::super::http;
+    use axum::{Extension, extract::State};
+    use serde_json::json;
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/messages",
+        "/v1/completions",
+    ] {
+        for explicit in [None, Some(3)] {
+            let fixture = Fixture::reasoning();
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let mut state = http_state_for(fixture, sender, None);
+            Arc::get_mut(&mut state).unwrap().thinking_token_budget = Some(2);
+            let mut body = json!({"model":"qwen-worker-phases", "max_tokens":8,
+                "max_output_tokens":8, "add_generation_prompt":true});
+            match path {
+                "/v1/responses" => body["input"] = json!("a"),
+                "/v1/completions" => body["prompt"] = json!("a"),
+                _ => body["messages"] = json!([{"role":"user","content":"a"}]),
+            }
+            if path == "/v1/messages" {
+                if let Some(budget) = explicit {
+                    body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
+                }
+            } else if path != "/v1/completions" {
+                body["thinking_token_budget"] = json!(explicit);
+            }
+            let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = tokio::spawn(http::generate(State(state), Extension(ingress), request));
+            let incoming = tokio::task::spawn_blocking(move || {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            let prompt = &incoming[0].prompt;
+            if path == "/v1/completions" {
+                assert_eq!(prompt.max_new_tokens, 8);
+                assert!(prompt.reasoning_cut.is_none());
+            } else {
+                let budget = explicit.unwrap_or(2);
+                assert_eq!(prompt.max_new_tokens, budget);
+                assert_eq!(prompt.reasoning_cut.as_ref().unwrap().after, 8 - budget);
+            }
+            response.abort();
+        }
+    }
 }
 
 #[tokio::test]

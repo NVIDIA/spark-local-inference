@@ -19,7 +19,7 @@ DEFAULT_PATH = Path("~/.config/flare/config.toml")
 
 _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str},
-    "server": {"host": str, "port": int, "api_key": str},
+    "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int},
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int},
     "memory": {"reserve": str},
@@ -33,6 +33,7 @@ _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
 # Empty prefix-cache values leave the decision to Flare, which derives them from the host.
 _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
+    "server.thinking_token_budget": None,
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
@@ -121,6 +122,8 @@ class Configuration:
                 raise UsageError(f"{path}: collective_tuning must be static or runtime")
             if key == "port" and not 1 <= value <= 65535:
                 raise UsageError(f"{path}: port in [{section}] must be 1 through 65535")
+            if key == "thinking_token_budget" and not 1 <= value <= 2**32 - 1:
+                raise UsageError(f"{path}: thinking_token_budget in [{section}] must be a positive 32-bit integer")
             if key in ("max_concurrency", "image_concurrency", "speculative_token_capacity",
                        "speculative_graph_budget", "compile_workers") and value < 1:
                 raise UsageError(f"{path}: {key} in [{section}] must be at least 1")
@@ -168,6 +171,7 @@ class Configuration:
             f'# host = "{self.get("server.host").value}"',
             f'# port = {self.get("server.port").value}',
             '# api_key = ""                    # empty: no authentication',
+            '# thinking_token_budget = 1536    # omitted: no default reasoning cap',
             "", "[defaults]",
             f'# model = "{model}"',
             f"# max_concurrency = {max_concurrency}",

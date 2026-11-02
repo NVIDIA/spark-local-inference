@@ -630,12 +630,8 @@ impl RequestGrammar {
         masks.extend_from_slice(&self.mask);
         let mut count = 0;
         for &token in tokens {
-            let id = token as usize;
             // EOS remains a target outcome; a stopped parser has no bonus mask.
-            if self.eos_ids.contains(&token)
-                || id >= self.tokenizer_vocab
-                || (tentative.mask[id / 32] as u32 & (1 << (id % 32))) == 0
-            {
+            if self.eos_ids.contains(&token) || !tentative.allows(token) {
                 break;
             }
             if let Err(error) = tentative.matcher.consume_token(token) {
@@ -659,6 +655,11 @@ impl RequestGrammar {
         &self.mask
     }
 
+    pub fn allows(&self, token: u32) -> bool {
+        (token as usize) < self.tokenizer_vocab
+            && self.mask[token as usize / 32] as u32 & (1 << (token % 32)) != 0
+    }
+
     pub fn is_accepting(&self) -> bool {
         self.accepting && self.error.is_none()
     }
@@ -678,8 +679,7 @@ impl RequestGrammar {
                 "grammar already consumed EOS",
             ));
         }
-        let id = token as usize;
-        if id >= self.tokenizer_vocab || (self.mask[id / 32] as u32 & (1 << (id % 32))) == 0 {
+        if !self.allows(token) {
             return self.fail(Error::admission(
                 AdmissionError::Grammar,
                 format!("token {token} is forbidden by the grammar mask"),
@@ -905,10 +905,6 @@ mod tests {
         Tokenizer::from_bytes(tokenizer.to_string()).unwrap()
     }
 
-    fn allowed(request: &RequestGrammar, token: u32) -> bool {
-        request.mask()[token as usize / 32] as u32 & (1 << (token % 32)) != 0
-    }
-
     fn accepts(compiler: &GrammarCompiler, schema: &Value, text: &str, eos: u32) -> bool {
         let mut request = compiler.compile_json_schema(schema).unwrap();
         for &token in text.as_bytes() {
@@ -957,8 +953,8 @@ mod tests {
         request.advance(31).unwrap();
         assert!(request.is_accepting());
         assert!(!request.is_stopped());
-        assert!(allowed(&request, 256) && allowed(&request, 257));
-        assert!((258..320).all(|id| !allowed(&request, id)));
+        assert!(request.allows(256) && request.allows(257));
+        assert!((258..320).all(|id| !request.allows(id)));
         request.advance(257).unwrap();
         assert!(request.is_stopped());
         assert!(request.mask().iter().all(|&word| word == 0));
@@ -1249,7 +1245,7 @@ mod tests {
             for token in [prefix(&spelled), encode(r#"{"literal":""#)].concat() {
                 grammar.advance(token).unwrap();
             }
-            assert!(allowed(&grammar, think) && allowed(&grammar, end));
+            assert!(grammar.allows(think) && grammar.allows(end));
             for text in [
                 literal,
                 "<tool_call><function=lookup><parameter=query>東京</parameter></function></tool_call>",
@@ -1406,7 +1402,7 @@ mod tests {
         let mut request = compiler
             .compile_json_schema(&json!({"const":true}))
             .unwrap();
-        assert!(!allowed(&request, 256));
+        assert!(!request.allows(256));
         let error = request.advance(b'f' as u32).unwrap_err();
         assert!(matches!(
             error,
@@ -1612,8 +1608,8 @@ mod tests {
                 let tokens = tokenizer.encode(text, false).unwrap();
                 let mut steps = Vec::new();
                 for &token in tokens.get_ids().iter().chain([eos].iter()) {
-                    assert!(allowed(&request, token), "{name}: forbidden token {token}");
-                    assert!((248_077..248_320).all(|id| !allowed(&request, id)));
+                    assert!(request.allows(token), "{name}: forbidden token {token}");
+                    assert!((248_077..248_320).all(|id| !request.allows(id)));
                     let words: Vec<u8> = request
                         .mask()
                         .iter()
@@ -1657,7 +1653,7 @@ mod tests {
                             .is_some_and(|bytes| !bytes.is_empty() && remaining.starts_with(bytes))
                     };
                     assert_eq!(
-                        allowed(&request, id as u32),
+                        request.allows(id as u32),
                         expected,
                         "literal {text:?}, consumed {consumed}, token {id}"
                     );

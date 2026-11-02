@@ -1025,8 +1025,8 @@ Ignition and native Flare read this file; `--config PATH` selects another file.
 An absent default file supplies no overrides; an explicitly selected missing
 file or an invalid runtime setting is an error. Help does not read the file.
 
-Native `flare run` applies `[server] host`, `port`, and `api_key`, `[memory] reserve`,
-`[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
+Native `flare run` applies `[server] host`, `port`, `api_key`, and `thinking_token_budget`,
+`[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
 settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] package_cache`. Flags override these defaults, including explicit
 zero limits and values equal to the built-in defaults. An empty `--api-key-file`
@@ -1054,6 +1054,7 @@ settings. `flare run --hosts` forwards resolved runtime options to its peer rank
 host = "127.0.0.1"
 port = 8000
 api_key = ""                      # Empty: no authentication.
+# thinking_token_budget = 1536    # Optional default reasoning-token cap.
 
 [defaults]
 model = "qwen3.8-flash"

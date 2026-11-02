@@ -987,6 +987,18 @@ impl RequestScheduler {
         request.decoded_sequence = sequence;
         Ok(())
     }
+
+    /// Records host-forced output without changing device completion counters.
+    #[cfg(feature = "server")]
+    pub(crate) fn record_decoded_token(&mut self, handle: RequestHandle, token: u32) -> Result<()> {
+        let mut sequence = self.request(handle)?.decoded_sequence;
+        if let Some(history) = &mut self.decoded_history {
+            history.append(&mut sequence, token);
+            self.request_mut(handle)?.decoded_sequence = sequence;
+        }
+        Ok(())
+    }
+
     pub fn graph_durations(&mut self, graphs: &[crate::execution::GraphDescriptor]) -> Result<()> {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("graph durations must be configured before admission".into());

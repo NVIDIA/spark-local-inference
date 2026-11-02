@@ -119,6 +119,19 @@ pub struct LogprobOptions {
     pub token_ids: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThinkingBudget {
+    Required(u64),
+    Advisory(u64),
+}
+impl ThinkingBudget {
+    pub fn tokens(self) -> u64 {
+        match self {
+            Self::Required(tokens) | Self::Advisory(tokens) => tokens,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Options {
     pub sampling: Sampling,
@@ -126,6 +139,7 @@ pub struct Options {
     pub prompt_logprobs: Option<usize>,
     pub effort: Option<Effort>,
     pub output_limit: Option<u64>,
+    pub thinking_budget: Option<ThinkingBudget>,
     pub stops: Vec<String>,
     pub token_stops: Vec<Vec<u32>>,
     pub constraint: Option<Constraint>,

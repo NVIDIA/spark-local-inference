@@ -35,6 +35,7 @@ pub struct Prompt {
     pub conditioning: Vec<ConditioningEvent>,
     pub sampling: SamplingParameters,
     pub max_new_tokens: u32,
+    pub reasoning_cut: Option<ReasoningCut>,
     pub stop_sequences: Vec<Vec<u32>>,
     pub stop_strings: Vec<String>,
     pub grammar: Option<crate::grammar::RequestGrammar>,
@@ -43,6 +44,14 @@ pub struct Prompt {
     pub logprobs: bool,
     pub logprob_token_ids: Vec<u32>,
     pub prompt_logprobs: bool,
+}
+
+#[derive(Clone)]
+pub struct ReasoningCut {
+    pub close: u32,
+    /// Output tokens available after the budget pass.
+    pub after: u32,
+    pub output: Option<crate::output::OutputConfig>,
 }
 
 impl Prompt {
@@ -289,6 +298,8 @@ struct Active<'a> {
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
+    // The client decoder runs on another thread; the worker needs reasoning state at the cut.
+    reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
 }
 
 /// Output accounting and decoded tail retained across admissions.
@@ -321,9 +332,25 @@ struct Parked<'a> {
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
+    reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
 }
 
 impl Active<'_> {
+    fn close_reasoning(&mut self, close: u32, eos: &[u32]) -> Result<bool> {
+        if let Some(grammar) = &mut self.incoming.prompt.grammar {
+            grammar.advance(close).map_err(|error| {
+                Error::from(ExecutionError::Completion(Failure::caused_by(
+                    format!("thinking_token_budget grammar advancement failed: {error}"),
+                    error,
+                )))
+            })?;
+        }
+        self.incoming.observe_token(close);
+        self.last_token = Some(close);
+        self.carried.generated_tokens += 1;
+        self.emit_output(close, eos, None)
+    }
+
     fn emit_output(
         &mut self,
         token: u32,
@@ -1331,6 +1358,13 @@ impl<'a> Worker<'a> {
                     },
                     last_token: None,
                     carried: Carried::default(),
+                    reasoning: incoming.prompt.reasoning_cut.as_mut().map(|cut| {
+                        super::output::Decoder::new(
+                            self.frontend,
+                            &self.config.eos_token_ids,
+                            cut.output.take(),
+                        )
+                    }),
                     held_logprobs: VecDeque::new(),
                 },
             };
@@ -1354,6 +1388,7 @@ impl<'a> Worker<'a> {
                 prepared_image: None,
                 carried: parked.carried,
                 held_logprobs: parked.held_logprobs,
+                reasoning: parked.reasoning,
             });
             progress = true;
         }
@@ -1555,6 +1590,14 @@ impl<'a> Worker<'a> {
             {
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
+                if let Some(reasoning) = &mut request.reasoning {
+                    if let Err(error) = reasoning.push(token.token) {
+                        // The budget tracker surfaces errors the client decoder would also report.
+                        request.incoming.fail(error);
+                        stopped.push(token.request);
+                        continue;
+                    }
+                }
                 if let Some(grammar) = &mut request.incoming.prompt.grammar {
                     if let Err(error) = grammar.advance(token.token) {
                         request.incoming.fail(
@@ -1671,11 +1714,74 @@ impl<'a> Worker<'a> {
                 if live.phase == RequestPhase::Finishing
                     && live.last_use() <= self.scheduler.completed()
                 {
+                    let (generated, prompt_tokens, reused) = (
+                        live.generated_tokens,
+                        live.prompt_tokens,
+                        live.reused_prompt_tokens(),
+                    );
                     if let Some(error) = live.error_code {
                         request
                             .incoming
                             .fail(ExecutionError::Device { code: error }.into());
                     } else {
+                        let mut budget_stop = false;
+                        if request.incoming.prompt.reasoning_cut.is_some()
+                            && generated == request.incoming.prompt.max_new_tokens
+                            && !request.incoming.cancelled.load(Ordering::Acquire)
+                            && (request.incoming.prompt.ignore_eos
+                                || !request.last_token.is_some_and(|token| {
+                                    self.config.eos_token_ids.contains(&token)
+                                }))
+                        {
+                            let cut = request.incoming.prompt.reasoning_cut.take().unwrap();
+                            let close_allowed = request
+                                .incoming
+                                .prompt
+                                .grammar
+                                .as_ref()
+                                .is_none_or(|grammar| grammar.allows(cut.close));
+                            let forced =
+                                request.reasoning.take().unwrap().reasoning_open() && close_allowed;
+                            let abandon = forced
+                                && match request
+                                    .close_reasoning(cut.close, &self.config.eos_token_ids)
+                                {
+                                    Ok(stopped) => {
+                                        budget_stop = stopped;
+                                        false
+                                    }
+                                    Err(error) => {
+                                        request.incoming.fail(error);
+                                        true
+                                    }
+                                };
+                            if forced && !abandon {
+                                self.scheduler
+                                    .record_decoded_token(request.request, cut.close)?;
+                                self.metrics
+                                    .reasoning_budget_cuts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.progress(0, 1, 0, 0, 0, 0);
+                            }
+                            if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
+                                self.scheduler.cancel(request.request)?;
+                                self.active[slot] = None;
+                                self.admissions[slot] = None;
+                                progress = true;
+                                continue;
+                            }
+                            let remaining = cut.after - u32::from(forced);
+                            if remaining > 0 && !budget_stop {
+                                let appended = if forced {
+                                    std::slice::from_ref(&cut.close)
+                                } else {
+                                    &[]
+                                };
+                                self.park(slot, appended, remaining)?;
+                                progress = true;
+                                continue;
+                            }
+                        }
                         let user_stop = if let Some(stops) = &mut request.text_stops {
                             let eos = request
                                 .last_token
@@ -1698,7 +1804,7 @@ impl<'a> Worker<'a> {
                             }
                         } else {
                             false
-                        };
+                        } || budget_stop;
                         self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                         for token in request.stops.finish() {
                             if request
@@ -1731,13 +1837,12 @@ impl<'a> Worker<'a> {
                                 prompt_tokens: request
                                     .carried
                                     .prompt_tokens
-                                    .unwrap_or(live.prompt_tokens),
-                                generated_tokens: request.carried.generated_tokens
-                                    + live.generated_tokens,
+                                    .unwrap_or(prompt_tokens),
+                                generated_tokens: request.carried.generated_tokens + generated,
                                 reused_prompt_tokens: request
                                     .carried
                                     .reused_prompt_tokens
-                                    .unwrap_or(live.reused_prompt_tokens()),
+                                    .unwrap_or(reused),
                                 reason,
                                 stop_sequence: request
                                     .text_stops
@@ -1790,7 +1895,22 @@ impl<'a> Worker<'a> {
         {
             return Ok(false);
         }
-        let tokens = live.tokens().to_vec();
+        let remaining = self.active[slot]
+            .as_ref()
+            .unwrap()
+            .incoming
+            .prompt
+            .max_new_tokens
+            - live.generated_tokens;
+        self.park(slot, &[], remaining)?;
+        Ok(true)
+    }
+
+    fn park(&mut self, slot: usize, appended: &[u32], remaining: u32) -> Result<()> {
+        let handle = self.active[slot].as_ref().unwrap().request;
+        let live = self.scheduler.request(handle)?;
+        let mut tokens = live.tokens().to_vec();
+        tokens.extend_from_slice(appended);
         let decoded_sequence = live.decoded_sequence;
         let (generated, prompt_tokens, reused) = (
             live.generated_tokens,
@@ -1804,7 +1924,7 @@ impl<'a> Worker<'a> {
         crate::model::prompt_metadata(&mut incoming.prompt.data)
             .extend_text(incoming.prompt.tokens.len(), tokens.len())?;
         incoming.prompt.tokens = tokens;
-        incoming.prompt.max_new_tokens -= generated;
+        incoming.prompt.max_new_tokens = remaining;
         incoming.readmitted = true;
         self.begin_pool_lookups(std::slice::from_mut(&mut incoming));
         let seed = active.carried.seed.unwrap_or(incoming.prompt.sampling.seed);
@@ -1815,6 +1935,7 @@ impl<'a> Worker<'a> {
             stops: active.stops,
             text_stops: active.text_stops,
             held_logprobs: active.held_logprobs,
+            reasoning: active.reasoning,
             carried: Carried {
                 decoded_sequence,
                 prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(prompt_tokens)),
@@ -1824,7 +1945,7 @@ impl<'a> Worker<'a> {
             },
         };
         self.parked.push_back((incoming, parked));
-        Ok(true)
+        Ok(())
     }
 
     fn retire(&mut self, stopped: &[RequestHandle]) -> Result<()> {
@@ -2250,6 +2371,7 @@ impl<'a> Worker<'a> {
                 text_stops: active.text_stops,
                 carried: active.carried,
                 held_logprobs: active.held_logprobs,
+                reasoning: active.reasoning,
             },
         ));
     }
@@ -2816,6 +2938,7 @@ mod tests {
                 conditioning: vec![],
                 sampling: SamplingParameters::default(),
                 max_new_tokens: 10,
+                reasoning_cut: None,
                 stop_sequences: vec![],
                 stop_strings: vec![],
                 logprobs: false,
@@ -3118,6 +3241,7 @@ mod tests {
             text_stops: None,
             held_logprobs: VecDeque::new(),
             carried: Carried::default(),
+            reasoning: None,
         };
         let mut active: [Option<Active<'_>>; 4] = std::array::from_fn(|_| None);
         active[failed.slot as usize] = Some(make_active(failed, incoming));
@@ -3308,6 +3432,7 @@ mod tests {
                 super::super::stops::TextStops::new(&frontend, vec!["END".into()]).unwrap(),
             ),
             carried: Carried::default(),
+            reasoning: None,
         };
         request.incoming.observe_token(0);
         assert!(!request.emit_output(0, &[248046], None).unwrap());
