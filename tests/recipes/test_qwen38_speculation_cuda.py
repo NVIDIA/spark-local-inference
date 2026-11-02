@@ -426,16 +426,17 @@ def test_fixed_graph_commits_bounded_prefixes_at_batch_four(compiled, bonus):
             assert outputs.speculative_survival[0, slot, extent:].eq(-1).all()
 
 
+@pytest.mark.parametrize("width", [8, 16])
 @torch.no_grad()
-def test_compiled_survival_prefixes_remain_monotone_at_unit_ratios():
+def test_compiled_survival_prefixes_remain_monotone_at_unit_ratios(width):
     from ignition.preparation.compilation import compile_forward
 
-    args = tensors(4, 8)
+    args = tensors(4, width)
     state, slots, epochs, live, inputs, records, frame, sequence = args
     drafts = inputs[:, 1:].contiguous()
-    draft_probs = torch.zeros((4, 7, VOCAB), device="cuda")
-    target_probs = torch.zeros((4, 8, VOCAB), device="cuda")
-    for column in range(7):
+    draft_probs = torch.zeros((4, width - 1, VOCAB), device="cuda")
+    target_probs = torch.zeros((4, width, VOCAB), device="cuda")
+    for column in range(width - 1):
         draft_probs[:, column, 4 + column] = .5
         draft_probs[:, column, 100] = .5
         target_probs[:, column, 4 + column] = .5
@@ -445,24 +446,26 @@ def test_compiled_survival_prefixes_remain_monotone_at_unit_ratios():
     verify = PreparedStochasticVerification(draft_probs, drafts, target_probs,
         state, slots, epochs, live, rng=rng)
     verify.prepare()
-    ratios = torch.rand((32, 4, 7), generator=torch.Generator().manual_seed(13))
+    ratios = torch.rand((32, 4, width - 1), generator=torch.Generator().manual_seed(13))
     ratios[:, :, 3:] = 1
     def run():
         verify()
     compiled = compile_forward(run)
     with captured(compiled, (*args, verify, rng), {"survival": verify.output.survival}) as replay:
         for values in ratios:
-            for column in range(7):
+            for column in range(width - 1):
                 probability = values[:, column].to("cuda") * .5
                 target_probs[:, column, 4 + column] = probability
                 target_probs[:, column, 101] = 1 - probability
             replay()
             actual = verify.output.survival.cpu()
+            assert actual[:, width - 1:].eq(-1).all()
+            actual = actual[:, :width - 1]
             assert verify.output.valid.all()
             assert torch.isfinite(actual).all() and ((actual >= 0) & (actual <= 1)).all()
             assert (actual[:, 1:] <= actual[:, :-1]).all(), actual
             prefixes = [values[:, 0]]
-            for column in range(1, 7):
+            for column in range(1, width - 1):
                 prefixes.append(prefixes[-1] * values[:, column])
             torch.testing.assert_close(actual, torch.stack(prefixes, -1), rtol=0, atol=0)
 
