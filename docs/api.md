@@ -607,7 +607,9 @@ effort, and larger budgets to maximum effort; explicit `output_config.effort` wi
 Messages budgets above the 32-bit output limit are accepted and never trigger a cut.
 Responses and Anthropic named effort settings
 (`reasoning.effort` and `output_config.effort`) accept named levels and map into
-the same neutral levels. They do not accept numeric scores. The frontend resolves
+the same neutral levels; `none` instead sets `enable_thinking=false` without
+selecting a level, as Messages `thinking.type: "disabled"` does. They do not
+accept numeric scores. The frontend resolves
 those levels against the effort vocabulary accepted by the packaged template: for example Qwen uses
 `low/medium/xhigh`. Native DeepSeek V4 and V4.1 prompt encoders accept
 `low/high/xhigh/max` and default to thinking enabled and high effort.
@@ -641,6 +643,11 @@ Jinja templates retain their packaged template semantics.
 Kimi K3 always uses thinking: its template ignores `enable_thinking=false` and
 `thinking=false` without an error, preserves assistant reasoning history, and
 accepts `low`, `high`, or `max` effort (default `max`).
+GLM 5.3 Flash also always uses thinking: its template ignores
+`enable_thinking=false` without an error. It uses requested `low` or `high`
+effort and `max` otherwise, including for effort `none`. It preserves assistant
+reasoning history; `chat_template_kwargs.clear_thinking=true` empties reasoning
+in assistant turns before the last user message.
 The generation output limit includes reasoning and tool syntax.
 
 Anthropic thinking blocks carry a deterministic `flare-thinking-v1:` marker
@@ -732,7 +739,9 @@ cargo test --manifest-path helios/Cargo.toml --features server,runtime-package -
 tests use temporary repositories and check a real read/edit/test task. Scheduler
 regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
 and adaptive speculative execution. These environment variables configure tests,
-not the native server.
+not the native server. Protocol tests that check visible text set
+`enable_thinking=false` with output limits as small as 16 tokens; packages whose
+templates always open reasoning can exhaust those limits in reasoning and fail them.
 
 ## System One decisions
 
