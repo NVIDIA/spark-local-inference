@@ -61,7 +61,7 @@ for patch application in standalone Python tools.
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
-ignition bench [MODEL] [flags]                   measure complete prepared GPU graph round latency
+ignition bench [MODEL] [flags]                   measure prepared decode-round or prefill graph latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
@@ -203,12 +203,16 @@ other recipes fail explicitly.
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 \
   --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
+  --prefill-chunk-size 4096 --contexts 0,4096 --output /tmp/qwen38-prefill.json
 ```
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4` | `1,2,4` |
-| `--contexts LIST` | Distinct consumed context lengths before each measured round; positive multiples of 128 | `512,2048,8192,16384` |
+| `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
+| `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` |
+| `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill` |
 | `--verify-width N` | Target tokens per request, including the pending token; only eight is supported, with seven draft tokens | `8` |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
 | `--repetitions N` | Timed restored rounds per case and seed | `20` |
@@ -224,9 +228,29 @@ autotuning, precision, and overlap settings. Omitted concurrency defaults to the
 largest selected batch; configured and explicit capacities must cover it.
 The prepared request capacity is the largest selected batch. JSON distinguishes
 that capacity from the concurrency requested through configuration or flags.
-`--no-mtp`, mixed prefill, and prompt-logprob graphs do not apply.
+`--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
+are unsupported.
 
-Each case starts from a real tokenized and prefilled context. Context length
+With `--prefill`, each request has `context + chunk` prompt tokens. Admission
+and the preceding context run outside timing; each measured replay processes
+the final chunk and samples its pending token. For example, chunk 4096 at
+context 4096 measures positions 4096–8191 after an untimed 4096-token prefix.
+The selected graph has exactly the requested token capacity, without padding
+to a larger bucket. Preparation includes that capacity and any smaller capacity
+needed for a prefix remainder, and omits decode and speculative round graphs.
+Complete-forward Inductor compilation is enabled by default; `--no-compile`
+retains the diagnostic uncompiled capture path and JSON records
+`configuration.compiled_forwards`.
+
+Prefill timing includes target computation, vocabulary projection, sampling,
+state commit, and DFlash2 context assimilation when speculation is enabled.
+Use `--no-mtp` to omit the draft model and its context work. `--verify-width`
+does not apply to prefill. The request and every persistent cache are restored
+before each replay, outside timing. JSON uses metric
+`cuda_graph_prefill_latency_ms` and records `chunk_tokens` and
+`context_tokens` for each case; the table reports chunk and preceding context.
+
+Each speculative case starts from a real tokenized and prefilled context. Context length
 counts consumed positions before the pending token. Complete cache and
 speculative state restoration occurs outside CUDA timing before every round.
 A same-device snapshot retains one additional complete mutable-state copy

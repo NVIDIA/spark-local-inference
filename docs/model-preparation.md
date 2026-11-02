@@ -386,6 +386,18 @@ The [benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines workload
 selection, repetitions, seeds, and the equal-weight latency score. Native
 serving measurements still use an exported package with `flare run`.
 
+To time a complete Inductor-compiled prefill graph at one exact chunk size:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
+  --prefill-chunk-size 4096 --contexts 0 --output /tmp/qwen38-prefill.json
+```
+
+`--contexts` specifies consumed tokens preceding the timed chunk. Admission,
+prefix preparation, and state restoration remain outside timing. DFlash2
+context assimilation is included by default; add `--no-mtp` for target-only
+prefill. This mode prepares no decode or speculative round graphs.
+
 ## Qwen3.8 Flash
 
 Enable hybrid history drafting at serving startup with

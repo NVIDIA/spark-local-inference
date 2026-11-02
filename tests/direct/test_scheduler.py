@@ -362,7 +362,8 @@ def test_acceptance_follows_helios_depth_estimates():
     assert acceptance.depths[0][1] == 3
 
 
-def test_layout_selects_the_serving_variant_of_each_graph():
+@pytest.mark.parametrize("prefill_only", [False, True])
+def test_layout_selects_the_serving_variant_of_each_graph(prefill_only):
     from ignition.preparation.execution import GraphSignature
 
     def Signature(kind, batch, tokens, enabled):
@@ -388,6 +389,8 @@ def test_layout_selects_the_serving_variant_of_each_graph():
                          "frontend": {"eos_token_ids": [7, 8]}, "speculative_widths": [1, 2],
                          "speculative_fixed_width": None, "state_rows_per_request": 1}
 
+    if prefill_only:
+        del Model.signatures["speculative4x2"]
     fixture = layout(context=8192, table_width=32, graphs={
         (v.kind, v.batch_capacity, v.token_capacity): name for name, v in Model.signatures.items()
         if v.speculation_enabled in (None, True)})
@@ -399,8 +402,10 @@ def test_layout_selects_the_serving_variant_of_each_graph():
         tensor.dtype = dtype
         Model.buffers[name] = tensor
     result = Layout.of(Model())
-    assert result.graphs == {("prefill", 1, 128): "prefill128", ("init", 4, 1): "init4",
-                             ("speculative", 4, 2, 8, 1): "speculative4x2"}
+    expected = {("prefill", 1, 128): "prefill128", ("init", 4, 1): "init4"}
+    if not prefill_only:
+        expected[("speculative", 4, 2, 8, 1)] = "speculative4x2"
+    assert result.graphs == expected
     assert (result.capacity, result.max_active, result.table_width, result.draft_pages) == (4, 3, 32, 1)
     assert (result.execution_width, result.state_row(2), result.snapshot_row(1)) == (2, 3, 5)
 

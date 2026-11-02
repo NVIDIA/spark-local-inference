@@ -84,13 +84,15 @@ class PreparationConfig:
         request_capacity(self.max_active)
         selection = self.benchmark_selection
         if selection is not None:
-            if not self.mtp or self.prompt_logprobs:
+            if (not self.mtp and not selection.prefill_chunk) or self.prompt_logprobs:
                 raise ValueError("benchmark preparation requires speculative unscored text graphs")
-            if selection.max_batch > self.max_active or selection.width not in self.speculative_widths:
+            if selection.max_batch > self.max_active or (not selection.prefill_chunk and selection.width not in self.speculative_widths):
                 raise ValueError("benchmark shapes exceed the configured request or width capacities")
-            if selection.max_context + selection.width > self.context:
-                raise ValueError("benchmark context must leave room for a complete round")
-            if (self.speculative_token_capacity is not None
+            if selection.required_context > self.context:
+                raise ValueError("benchmark workload and output allowance must fit the context")
+            if selection.prefill_chunk and selection.prefill_chunk != self.prefill_chunk_size:
+                raise ValueError("benchmark chunk must match the prepared prefill chunk")
+            if (not selection.prefill_chunk and self.speculative_token_capacity is not None
                     and selection.max_batch * selection.width > self.speculative_token_capacity):
                 raise ValueError("benchmark shapes exceed the speculative token capacity")
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
@@ -235,7 +237,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
         speculation = None
-        if config.mtp:
+        if config.mtp and config.speculative_round_shapes:
             speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
                 completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
                 buffers=draft_buffers.cursor(), decoder_buffers=target_buffers, context_buffers=context_buffers)
@@ -245,7 +247,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
         batch_sizes = config.benchmark_selection.batches
-    modes = (True,) if config.benchmark_selection is not None else ((True, False) if config.mtp else (False,))
+    modes = (config.mtp,) if config.benchmark_selection is not None else ((True, False) if config.mtp else (False,))
+    prefill_only = config.benchmark_selection is not None and config.benchmark_selection.prefill_chunk
     with phase(progress, "Construct graph catalog"):
         def add(name, forward, kind, rows, tokens, fields, enabled, packed=0):
             if kind == "scored_prefill":
@@ -259,7 +262,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             mode_weights = weights if enabled else replace(weights, draft=None)
             fields = forward_inputs
-            for kind, mode, sizes in prefill_modes(prefill_sizes, () if enabled else reversed(batch_sizes), scoring):
+            for kind, mode, sizes in prefill_modes(prefill_sizes, () if enabled or prefill_only else reversed(batch_sizes), scoring):
                 for capacity in sizes:
                     rows = 1 if mode == "prefill" else capacity
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
@@ -289,12 +292,13 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             mode_weights = weights if enabled else replace(weights, draft=None)
             for capacity in reversed(batch_sizes):
-                name = f"resume{capacity}" + suffix
-                forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
-                    rows=capacity, runtime=None, vocabulary_runtime=None, coordinator=coordinator,
-                    session=session, name=name, activation_mode="auto", buffers=private_buffers.cursor())
-                add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled)
-                for mode in ("init", "restore", "snapshot"):
+                if not prefill_only:
+                    name = f"resume{capacity}" + suffix
+                    forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
+                        rows=capacity, runtime=None, vocabulary_runtime=None, coordinator=coordinator,
+                        session=session, name=name, activation_mode="auto", buffers=private_buffers.cursor())
+                    add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled)
+                for mode in (("init",) if prefill_only else ("init", "restore", "snapshot")):
                     name = f"{mode}{capacity}" + suffix
                     forward = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
                         runtime=None, coordinator=coordinator, session=session, name=name, capacity=capacity,
@@ -363,14 +367,17 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         state["state_pool"] = pool.backing[:int(pool.memory_capacity[0].item())]
         state.update((f"cache.{name}", tensor[:pages]) for name, tensor in pool.pages.items())
         state.update((f"request.{field.name}", getattr(requests, field.name)) for field in dataclass_fields(requests))
-        state.update((f"speculation.rng.{field.name}", getattr(speculation.rng, field.name))
-                     for field in dataclass_fields(speculation.rng))
-        state.update({"speculation.generation": speculation.generation, "speculation.offset": speculation.offset})
+        if speculation is not None:
+            state.update((f"speculation.rng.{field.name}", getattr(speculation.rng, field.name))
+                         for field in dataclass_fields(speculation.rng))
+            state.update({"speculation.generation": speculation.generation, "speculation.offset": speculation.offset})
     roots, components = _declared_weight_roots(weights)
     prepared = PreparedModel(rebuild_weights=declare_weights(roots, components=components, layers=()), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         benchmark_state=state, benchmark_pool=pool if state is not None else None,
         benchmark_requests=requests if state is not None else None,
+        benchmark_prefills=None if state is None else {name: value for name, value in metadata.items()
+            if signatures[name].kind == "prefill"},
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)),

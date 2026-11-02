@@ -90,7 +90,7 @@ class Layout:
     def of(cls, model):
         """Read a prepared model's serving configuration and graph catalog."""
         config, buffers = model.server_config, model.buffers
-        speculative = any(signature.kind in ("speculative",)
+        speculative = any(signature.kind == "speculative" or signature.speculation_enabled is True
                           for signature in model.signatures.values())
         graphs = {}
         for name, signature in model.signatures.items():

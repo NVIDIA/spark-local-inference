@@ -10,6 +10,52 @@ import pytest
 from ignition.bench.runner import BenchmarkCase, prompt_tokens, summarize_case
 
 
+@pytest.mark.parametrize("context", [0, 128, 1152])
+def test_prefill_step_consumes_exact_chunk_after_prefix(context):
+    from copy import deepcopy
+    from ignition.bench.runner import PrefillCase, _prefill_step
+    from ignition.direct.scheduler import Lane, Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(max_active=1, prefill_chunk=512,
+                     graphs={("init", 1, 1): "init1", ("prefill", 1, 128): "prefill128",
+                             ("prefill", 1, 512): "prefill512"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    member = request(1, [10] * (context + 512), limit=2)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    while member.consumed < context:
+        count = min(context - member.consumed, 512)
+        step = scheduler._step("prefill", count, [Lane(member, member.consumed, count)])
+        assert uploads(scheduler, step)["sample_enabled"][0][0] == 0
+        scheduler.complete(step, records(scheduler, step, {member: (1, member.consumed + count, [], 0)}))
+    baseline = deepcopy(scheduler, {id(catalog): catalog})
+    for _ in range(2):
+        scheduler = deepcopy(baseline, {id(catalog): catalog})
+        step = _prefill_step(scheduler, PrefillCase(512, context))
+        member = step.lanes[0].request
+        assert (step.graph, step.width, step.lanes[0].start, step.lanes[0].tokens) == (
+            "prefill512", 512, context, 512)
+        assert uploads(scheduler, step)["sample_enabled"][0][0] == 1
+        scheduler.complete(step, records(scheduler, step, {member: (1, context + 512, [42], 0)}))
+        assert member.phase == "decode" and member.generated == [42]
+
+
+def test_prefill_step_rejects_padded_graph():
+    from ignition.bench.runner import PrefillCase, _prefill_step
+    from ignition.direct.scheduler import Scheduler
+    from tests.direct.test_scheduler import layout, records, request
+
+    scheduler = Scheduler(layout(), prefix_cache=False)
+    member = request(1, [10] * 384)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    with pytest.raises(ValueError, match="without capacity padding"):
+        _prefill_step(scheduler, PrefillCase(384, 0))
+
+
 def test_case_estimate_keeps_raw_samples_and_uses_all_seeds():
     case = BenchmarkCase(2, 8, 16, 512)
     samples = [dict(seed=0, times_ms=[1., 3.]), dict(seed=1, times_ms=[2., 10.])]

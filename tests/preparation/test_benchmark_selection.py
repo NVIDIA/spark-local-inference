@@ -29,6 +29,36 @@ def test_complete_rounds_and_context_backing():
     assert selection.physical_pages(128) * 128 > 4 * (16384 + 8)
 
 
+def test_prefill_catalog_has_exact_chunk_and_prefix_remainder():
+    selection = BenchmarkSelection(batches=(1,), contexts=(0, 512, 4608), prefill_chunk=2048)
+    assert selection.prefill_capacities(2048) == (512, 2048)
+    assert selection.speculative_round_shapes == ()
+    assert selection.required_context == 6658
+    assert selection.physical_pages(128) == 53
+    with pytest.raises(ValueError, match="match"):
+        selection.prefill_capacities(4096)
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+def test_prefill_plan_and_recipe_accept_no_decode_catalog(mtp):
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    selection = BenchmarkSelection(batches=(1,), contexts=(0, 512, 4096), prefill_chunk=2048)
+    plan = _plan()
+    plan = replace(plan, prefill_chunk=2048, benchmark_selection=selection,
+                   speculation=plan.speculation if mtp else None)
+    assert plan.benchmark_selection.prefill_chunk == 2048
+    config = PreparationConfig(mtp=mtp, draft_snapshot=Path("draft") if mtp else None,
+        prefill_chunk_size=2048, benchmark_selection=selection, speculative_widths=(1,))
+    assert config.speculative_round_shapes == ()
+    with pytest.raises(ValueError, match="match"):
+        replace(config, prefill_chunk_size=4096)
+    with pytest.raises(UsageError, match="prepared context"):
+        replace(plan, recipe=replace(plan.recipe, context=6144))
+    with pytest.raises(UsageError, match="match"):
+        replace(plan, prefill_chunk=4096)
+
+
 @pytest.mark.parametrize("values", [dict(batches=()), dict(batches=(1, 3)), dict(batches=(1, 8)),
     dict(batches=(2, 1)), dict(contexts=(512, 512)), dict(contexts=(513,)),
     dict(contexts=(0,)), dict(width=0), dict(width=True), dict(width=4), dict(width=9)])
