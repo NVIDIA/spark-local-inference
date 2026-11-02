@@ -1626,6 +1626,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
         use std::io::{Seek, SeekFrom, Write};
         let mut file = OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(offset + 1)).unwrap();
