@@ -199,9 +199,10 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
         if self.finished || self.worker_decoded { return Err("invalid token decoding state".into()); }
         self.local_decoded = true;
         let token = value.token;
+        let is_end_of_turn = self.eos.contains(&token);
         let mut events = self.parse(Input::Token(token))?;
         let tracking = self.tracking.as_mut().ok_or("logprob decoder was not initialized")?;
-        if self.eos.contains(&token) {
+        if is_end_of_turn {
             if let Some(span) = tracking.silent(token, Some(value)) {
                 self.entries(span.tokens.into_iter().filter_map(|t| t.logprob));
                 events.extend(self.parse(Input::Text(""))?);
@@ -210,7 +211,7 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             self.entries(span.tokens.into_iter().filter_map(|t| t.logprob));
             events.extend(self.parse(Input::Text(&span.text))?);
         }
-        self.attribute(1, &events);
+        self.attribute(u32::from(!is_end_of_turn), &events);
         Ok(events)
     }
     pub fn push(&mut self, token: u32) -> Result<Vec<Event>> {
@@ -221,8 +222,9 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             return Err("cannot mix worker-decoded protocol pieces with token decoding".into());
         }
         self.local_decoded = true;
+        let is_end_of_turn = self.eos.contains(&token);
         let mut events = self.parse(Input::Token(token))?;
-        if !self.eos.contains(&token) {
+        if !is_end_of_turn {
             if let Some(tracking) = &mut self.tracking {
                 if let Some(span) = tracking.push(token, None)? {
                     self.entries(span.tokens.into_iter().filter_map(|token| token.logprob));
@@ -232,7 +234,9 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
                 events.extend(self.parse(Input::Text(&text))?);
             }
         }
-        self.attribute(1, &events);
+        // The end-of-turn token publishes nothing in any region, so it stays
+        // out of the pool that a withheld span later joins.
+        self.attribute(u32::from(!is_end_of_turn), &events);
         Ok(events)
     }
     pub fn push_protocol(&mut self, pieces: Vec<crate::output::Piece>) -> Result<Vec<Event>> {
@@ -267,7 +271,8 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
     /// still ruling out a delimiter, so a token that published nothing joins the
     /// region of the next published span. A span that carries both regions
     /// credits reasoning, which is the region it opens. Tokens that never
-    /// publish, such as the end-of-turn token, stay uncredited. Worker-decoded
+    /// publish, such as the end-of-turn token, stay uncredited, and a span
+    /// published only from `finish()` credits the pool the same way. Worker-decoded
     /// pieces are credited one piece at a time, so a batch that closes reasoning
     /// and opens content credits only the pieces whose spans published
     /// reasoning.
@@ -334,6 +339,11 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             let consumed = parser.consumed_bytes();
             events.extend(self.decorate(final_events, spans, consumed));
         }
+        // A parser may withhold a span until termination and publish it from
+        // finish(), including the flush of the incremental decoder. Credit the
+        // pool to the region those final events opened, exactly as an
+        // in-stream span would; the end-of-turn token is already outside it.
+        self.attribute(0, &events);
         Ok(events)
     }
     pub fn abort(&mut self, cause: Termination) {
@@ -867,6 +877,153 @@ pub(crate) mod tests {
         decoder.push_protocol(vec![Piece::Token(99)]).unwrap();
         decoder.finish(Termination::Eos).unwrap();
         assert_eq!(decoder.reasoning_tokens(), 3, "the unpublished end-of-turn token stays uncredited");
+    }
+
+    /// Withholds every span until termination, publishing them together as
+    /// reasoning the way a real parser flushes a buffer it still considered a
+    /// possible delimiter.
+    struct HoldUntilFinish {
+        held: String,
+    }
+    impl ModelOutput for HoldUntilFinish {
+        type Config = ();
+        fn new(_: Self::Config) -> Self {
+            Self { held: String::new() }
+        }
+        fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
+            vec![]
+        }
+        fn consumed_bytes(&self) -> usize {
+            0
+        }
+        fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
+            if let Input::Text(text) = input {
+                self.held.push_str(text);
+            }
+            Ok(vec![])
+        }
+        fn finish(&mut self, _: Termination) -> Result<Vec<Event>> {
+            let held = std::mem::take(&mut self.held);
+            if held.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(vec![Event::Reasoning(held)])
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_published_only_at_termination_is_credited() {
+        let frontend = frontend(&["Th", "ink"]);
+        let mut decoder = Decoder::<HoldUntilFinish>::new(&frontend, &[99], Some(()));
+        for token in [0, 1] {
+            decoder.push(token).unwrap();
+        }
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            0,
+            "the parser withholds every span until termination"
+        );
+        let events = decoder.finish(Termination::Eos).unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Reasoning(text)] if text == "Think"),
+            "the terminal flush publishes the withheld reasoning"
+        );
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            2,
+            "tokens withheld until the terminal flush still credit reasoning"
+        );
+    }
+
+    #[test]
+    fn end_of_turn_token_never_joins_a_reasoning_flush() {
+        let frontend = frontend(&["Th", "ink"]);
+        let mut decoder = Decoder::<HoldUntilFinish>::new(&frontend, &[99], Some(()));
+        for token in [0, 1, 99] {
+            decoder.push(token).unwrap();
+        }
+        let events = decoder.finish(Termination::Eos).unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Reasoning(_)]),
+            "the terminal flush publishes reasoning"
+        );
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            2,
+            "the end-of-turn token stays outside every region even when a terminal flush credits the pool"
+        );
+    }
+
+    /// Publishes reasoning and content from a single span, as a parser does
+    /// when one withheld buffer turns out to close reasoning and open content.
+    struct BothRegions;
+    impl ModelOutput for BothRegions {
+        type Config = ();
+        fn new(_: Self::Config) -> Self {
+            Self
+        }
+        fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
+            vec![]
+        }
+        fn consumed_bytes(&self) -> usize {
+            0
+        }
+        fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
+            match input {
+                Input::Text(text) if text == "B" => Ok(vec![
+                    Event::Reasoning("R".into()),
+                    Event::Content("C".into()),
+                ]),
+                Input::Text(_) | Input::Token(_) => Ok(vec![]),
+            }
+        }
+        fn finish(&mut self, _: Termination) -> Result<Vec<Event>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn a_span_publishing_both_regions_credits_reasoning() {
+        let frontend = frontend(&["B"]);
+        let mut decoder = Decoder::<BothRegions>::new(&frontend, &[99], Some(()));
+        decoder.push(0).unwrap();
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            1,
+            "a span that carries reasoning and content alike is credited to the region it opens"
+        );
+    }
+
+    #[test]
+    fn real_parser_terminal_flush_credits_every_generated_token_to_reasoning() {
+        use crate::output::tagged::OutputStart;
+        let frontend = frontend(&["thin", "k<|im_", "\n"]);
+        let mut decoder = Decoder::<ChatMlOutput>::new(
+            &frontend,
+            &[99],
+            Some(OutputConfig {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![],
+            }),
+        );
+        for token in [0, 1, 2] {
+            decoder.push(token).unwrap();
+        }
+        let events = decoder.finish(Termination::OutputLimit).unwrap();
+        let published: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            3,
+            "tokens withheld while a delimiter is ruled out join reasoning at the terminal flush; published reasoning: {published:?}"
+        );
     }
 
     #[test]
