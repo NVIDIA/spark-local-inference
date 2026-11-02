@@ -11,6 +11,7 @@ import torch
 import triton
 
 from ignition.components.embedding import PreparedEmbedding
+from ignition.components.dflash2 import PreparedContextCapture
 from ignition.components.gated_delta import GDNScratch, PreparedGDN
 from ignition.components.head_gate import PreparedHeadGate
 from ignition.components.linear import QuantizedProjection, prepare_projection
@@ -18,6 +19,7 @@ from ignition.components.gdn_recovery import PreparedGDNCommit
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
 from ignition.components.rms_norm import PreparedRMSNorm
+from ignition.components.head_norm_rope import head_norm_rope
 from ignition.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
@@ -95,13 +97,30 @@ class GroupedMLP(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, canonical, source, output, *, session, name):
+    def __init__(self, canonical, source, output, *, session, name, residual=None):
         super().__init__()
         self.operation = PreparedRMSNorm(source, canonical.weight, output, eps=canonical.eps,
-                                         zero_centered=True, session=session, name=name)
+                                         zero_centered=True, session=session, name=name, residual=residual)
 
-    def forward(self, source):
-        return self.operation(source)
+    def forward(self, source, residual=None):
+        return self.operation(source, residual)
+
+
+class ResidualNormalizedLayer(torch.nn.Module):
+    """Compute attention and MLP branches with prepared residual normalization."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, hidden_states, normalized, position_embeddings):
+        layer = self.layer
+        if layer.block_type == "linear_attention":
+            attended = layer.linear_attn(normalized)
+        else:
+            attended, _ = layer.self_attn(normalized, position_embeddings=position_embeddings)
+        normalized = layer.post_attention_layernorm(attended, hidden_states)
+        return attended, layer.mlp(normalized)
 
 
 def module_copy(module):
@@ -119,6 +138,14 @@ class RecurrentAttention(torch.nn.Module):
         return self.operation(hidden_states)
 
 
+def _attention_query_dtype(source, metadata, mode, head_dim):
+    if (mode == "prefill" and source.shape[0] >= 128 and head_dim == 256
+            and metadata.page_table.shape[0] == 1
+            and torch.cuda.get_device_capability(source.device) in ((12, 0), (12, 1))):
+        return torch.float8_e4m3fn
+    return torch.bfloat16
+
+
 class FullAttention(torch.nn.Module):
     def __init__(self, module, weights, source, metadata, pool, layer, *, mode, session, workspace, name, buffers,
                  projection_staging=None):
@@ -129,17 +156,24 @@ class FullAttention(torch.nn.Module):
         self.dim = config.text["head_dim"]
         tokens, device = source.shape[0], source.device
 
-        def empty(field, width):
+        def empty(field, width, dtype=torch.bfloat16):
             if field not in buffers:
-                buffers[field] = torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
+                buffers[field] = torch.zeros((tokens, width), dtype=dtype, device=device)
             return buffers[field][:tokens]
 
         self.qg = empty("qg", 2 * self.heads * self.dim)
-        self.k, self.v = (empty(field, self.kv_heads * self.dim) for field in ("k", "v"))
-        self.q = empty("q", self.heads * self.dim).view(tokens, self.heads, self.dim)
+        prefix = f"layers.{layer}.self_attn."
+        if prefix + "kv_proj" in weights.projections:
+            kv = empty("kv", 2 * self.kv_heads * self.dim)
+            self.k, self.v = kv.chunk(2, dim=-1)
+            inputs = (("kv_proj", source, kv),)
+        else:
+            self.k, self.v = (empty(field, self.kv_heads * self.dim) for field in ("k", "v"))
+            inputs = (("k_proj", source, self.k), ("v_proj", source, self.v))
+        query_dtype = _attention_query_dtype(source, metadata, mode, self.dim)
+        self.q = empty("q", self.heads * self.dim, query_dtype).view(tokens, self.heads, self.dim)
         self.key = empty("key", self.kv_heads * self.dim).view(tokens, self.kv_heads, self.dim)
         self.attended, self.output = empty("attended", self.heads * self.dim), empty("output", config.hidden)
-        prefix = f"layers.{layer}.self_attn."
         def projection(field, inputs, output):
             weight = weights.projections[prefix + field]
             if isinstance(weight, TensorFP8Weight):
@@ -147,9 +181,8 @@ class FullAttention(torch.nn.Module):
                                            staging=projection_staging)
             return prepare_projection(inputs, weight, output, session=session, name=name + "." + field,
                                       workspace=workspace)
-        operands = (
-            ("q_proj", source, self.qg), ("k_proj", source, self.k),
-            ("v_proj", source, self.v), ("o_proj", self.attended, self.output))
+        operands = (("q_proj", source, self.qg), *inputs, ("o_proj", self.attended, self.output))
+        self.input_projections = tuple(field for field, _, _ in operands[:-1])
         self.projections = {
             field: projection(field, inputs, output)
             for field, inputs, output in operands
@@ -161,9 +194,12 @@ class FullAttention(torch.nn.Module):
             key_cache, value_cache, self.slots, session=session, name=name + ".write")
         self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, metadata.page_table,
             self.lengths, metadata.query_start_loc, self.attended.view(tokens, self.heads, self.dim),
+            output_gate=self.qg.view(tokens, self.heads, 2 * self.dim)[..., self.dim:] if mode == "prefill" else None,
             tuning_page_count=int(pool.memory_capacity[1].item()),
             mode=mode, width=metadata.max_query_tokens if mode == "verify" else 1,
             session=session, workspace=workspace, name=name + ".attention")
+        if query_dtype == torch.float8_e4m3fn and self.attention.tma is None:
+            raise ValueError("FP8 Qwen prefill queries require the prepared TMA attention path")
         self.output_gate = None
         if mode != "prefill":
             self.output_gate = PreparedHeadGate(self.attended.view(tokens * self.heads, self.dim, 1),
@@ -173,13 +209,20 @@ class FullAttention(torch.nn.Module):
     def write_cache(self, hidden_states, position_embeddings):
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
-        for field in ("q_proj", "k_proj", "v_proj"):
+        for field in self.input_projections:
             self.projections[field](hidden_states)
         query, gate = self.qg.view(-1, self.heads, 2 * self.dim).chunk(2, dim=-1)
-        q, k = apply_rotary_pos_emb(self.canonical.q_norm(query),
-            self.canonical.k_norm(self.k.view(-1, self.kv_heads, self.dim)), *position_embeddings)
-        self.q.copy_(q)
-        self.key.copy_(k)
+        if self.q.dtype == torch.float8_e4m3fn:
+            cosine, sine = position_embeddings
+            head_norm_rope(query, self.canonical.q_norm.weight, cosine, sine, self.q,
+                           eps=self.canonical.q_norm.eps)
+            head_norm_rope(self.k.view(-1, self.kv_heads, self.dim), self.canonical.k_norm.weight,
+                           cosine, sine, self.key, eps=self.canonical.k_norm.eps)
+        else:
+            q, k = apply_rotary_pos_emb(self.canonical.q_norm(query),
+                self.canonical.k_norm(self.k.view(-1, self.kv_heads, self.dim)), *position_embeddings)
+            self.q.copy_(q)
+            self.key.copy_(k)
         m = self.metadata
         page = m.token_page_table.gather(1, (m.positions.clamp(min=0) // PAGE_TOKENS)[:, None]).squeeze(1)
         self.slots.copy_(torch.where(m.positions >= 0, page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1))
@@ -190,10 +233,11 @@ class FullAttention(torch.nn.Module):
     def forward(self, hidden_states, position_embeddings, **kwargs):
         gate = self.write_cache(hidden_states, position_embeddings)
         self.attention()
-        if self.output_gate is None:
-            self.attended.mul_(gate.reshape_as(self.attended).sigmoid())
-        else:
-            self.output_gate()
+        if self.attention.output_gate is None:
+            if self.output_gate is None:
+                self.attended.mul_(gate.reshape_as(self.attended).sigmoid())
+            else:
+                self.output_gate()
         return self.projections["o_proj"](self.attended), None
 
 
@@ -206,16 +250,25 @@ class PreparedDecoder:
         self.delta = DeltaMetadata.allocate(metadata.starts.numel(), scratch.activations.device,
             verification_columns=metadata.max_query_tokens if mode == "verify" else 1)
         config, source = weights.config, scratch.activations
-        def zeros(shape):
-            return (torch.zeros(shape, dtype=source.dtype, device=source.device) if buffers is None
-                    else buffers.zeros(shape, source.dtype))
-        attention_buffers = {field: zeros((source.shape[0], width)) for field, width in (
+        def zeros(shape, dtype=None):
+            dtype = source.dtype if dtype is None else dtype
+            return (torch.zeros(shape, dtype=dtype, device=source.device) if buffers is None
+                    else buffers.zeros(shape, dtype))
+        query_dtype = _attention_query_dtype(source, metadata, mode, config.text["head_dim"])
+        attention_buffers = {field: zeros((source.shape[0], width), query_dtype if field == "q" else None)
+                             for field, width in (
             ("qg", 2 * config.text["num_attention_heads"] * config.text["head_dim"]),
             ("q", config.text["num_attention_heads"] * config.text["head_dim"]),
             ("attended", config.text["num_attention_heads"] * config.text["head_dim"]),
-            ("k", config.text["num_key_value_heads"] * config.text["head_dim"]),
-            ("v", config.text["num_key_value_heads"] * config.text["head_dim"]),
             ("key", config.text["num_key_value_heads"] * config.text["head_dim"]), ("output", config.hidden))}
+        kv_groups = tuple(f"layers.{i}.self_attn.kv_proj" in weights.projections
+                          for i, kind in enumerate(config.layers) if kind == "full_attention")
+        kv_width = config.text["num_key_value_heads"] * config.text["head_dim"]
+        if any(kv_groups):
+            attention_buffers["kv"] = zeros((source.shape[0], 2 * kv_width))
+        if not all(kv_groups):
+            for field in ("k", "v"):
+                attention_buffers[field] = zeros((source.shape[0], kv_width))
         intermediate = config.text["intermediate_size"]
         mlp_buffers = {"down_proj": zeros((source.shape[0], config.hidden))}
         grouped = tuple(f"layers.{i}.mlp.gate_up" in weights.projections for i in range(len(weights.tree.layers)))
@@ -226,13 +279,16 @@ class PreparedDecoder:
                 mlp_buffers[field] = zeros((source.shape[0], intermediate))
         mlp_input = zeros((source.shape[0], intermediate))
         normalized = zeros(source.shape)
+        self.prefill = mode == "prefill"
         self.layers = []
+        previous_attended = None
         for index, original in enumerate(weights.tree.layers):
             layer = module_copy(original)
             prefix = f"layers.{index}."
-            for field in ("input_layernorm", "post_attention_layernorm"):
-                setattr(layer, field, RMSNorm(getattr(original, field), source, normalized,
-                    session=session, name=name + "." + prefix + field))
+            layer.input_layernorm = RMSNorm(original.input_layernorm,
+                mlp_buffers["down_proj"] if self.prefill and index else source, normalized,
+                session=session, name=name + "." + prefix + "input_layernorm",
+                residual=previous_attended if self.prefill and index else None)
             if original.block_type == "linear_attention":
                 inputs = (("in_proj_qkvz",) if prefix + "linear_attn.in_proj_qkvz" in weights.projections
                           else ("in_proj_qkv", "in_proj_z"))
@@ -248,6 +304,12 @@ class PreparedDecoder:
                 layer.self_attn = FullAttention(original.self_attn, weights, source, metadata, pool, index,
                     mode=mode, session=session, workspace=workspace, name=name + "." + prefix + "attention",
                     buffers=attention_buffers, projection_staging=scratch.quantized)
+            attended = (scratch.gdn.output if original.block_type == "linear_attention"
+                        else attention_buffers["output"])
+            layer.post_attention_layernorm = RMSNorm(original.post_attention_layernorm,
+                attended if mode == "prefill" else source, normalized, session=session,
+                name=name + "." + prefix + "post_attention_layernorm",
+                residual=source if mode == "prefill" else None)
             if grouped[index]:
                 layer.mlp = GroupedMLP(original.mlp, source,
                     weights.projections[prefix + "mlp.gate_up"], weights.projections[prefix + "mlp.down_proj"],
@@ -261,7 +323,8 @@ class PreparedDecoder:
                     output = mlp_buffers[field]
                     setattr(layer.mlp, field, Projection(prepare_projection(inputs, weight, output,
                         activation_mode="auto", session=session, workspace=workspace, name=name + "." + prefix + field)))
-            self.layers.append(layer)
+            self.layers.append(ResidualNormalizedLayer(layer) if self.prefill else layer)
+            previous_attended = attended
         rotary = config.text["rope_parameters"]
         dim = int(config.text["head_dim"] * rotary["partial_rotary_factor"])
         self.inverse_frequency = 1.0 / (rotary["rope_theta"] ** (
@@ -271,8 +334,10 @@ class PreparedDecoder:
             name=name + ".prompt", copy_source=True)
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto")
-        self.auxiliary = (zeros((source.shape[0], config.hidden * len(config.draft.target_layers)))
-                          if weights.draft is not None else None)
+        self.context_capture = (PreparedContextCapture(metadata,
+            config.hidden * len(config.draft.target_layers), config.draft.attention.window,
+            compact_prefill=mode == "prefill", buffers=buffers) if weights.draft is not None else None)
+        self.auxiliary = None if self.context_capture is None else self.context_capture.output
         self.replay = None
         if mode == "verify":
             self.commit_counts = torch.zeros(metadata.starts.numel(), dtype=torch.int32, device=source.device)
@@ -307,12 +372,23 @@ class PreparedDecoder:
         embedding = torch.cat((frequency, frequency), dim=-1)
         position_embeddings = embedding.cos().bfloat16(), embedding.sin().bfloat16()
         hidden = self.embedding()
+        if self.context_capture is not None:
+            self.context_capture.begin()
         taps = () if self.auxiliary is None else self.weights.config.draft.target_layers
+        normalized = self.layers[0].layer.input_layernorm(hidden) if self.prefill else None
         for index, layer in enumerate(self.layers):
-            hidden = layer(hidden, position_embeddings=position_embeddings)
+            if self.prefill:
+                residual, projected = layer(hidden, normalized, position_embeddings=position_embeddings)
+                if index + 1 < len(self.layers):
+                    normalized = self.layers[index + 1].layer.input_layernorm(projected, residual)
+                    hidden = projected
+                else:
+                    hidden = residual + projected
+            else:
+                hidden = layer(hidden, position_embeddings=position_embeddings)
             if index in taps:
                 column = taps.index(index) * hidden.shape[-1]
-                self.auxiliary[:, column:column + hidden.shape[-1]].copy_(hidden)
+                self.context_capture(hidden, column)
         if self.scoring is not None:
             self.scoring.source.copy_(self.weights.tree.norm(hidden))
             self.scoring()

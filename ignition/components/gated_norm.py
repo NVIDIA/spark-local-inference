@@ -9,10 +9,11 @@ import triton
 import triton.language as tl
 
 from ignition.preparation.triton import launch_triton, warmup_triton
+from b12x.gemm.blockscaled._quantize import _scale_offset
 
 
 @triton.jit
-def _gated_rms_norm(Hidden, Gate, Weight, Output, Live, gate_row_stride, EPS: tl.constexpr, HEADS: tl.constexpr,
+def _gated_values(Hidden, Gate, Weight, Live, gate_row_stride, EPS: tl.constexpr, HEADS: tl.constexpr,
                     DIM: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROUND_NORMALIZED: tl.constexpr,
                     BF16_WEIGHT: tl.constexpr, SILU_GATE: tl.constexpr,
                     NORM_BEFORE_GATE: tl.constexpr = True, WEIGHT_PER_HEAD: tl.constexpr = False):
@@ -45,7 +46,42 @@ def _gated_rms_norm(Hidden, Gate, Weight, Output, Live, gate_row_stride, EPS: tl
         hidden = weight * hidden
     value = hidden * gate if NORM_BEFORE_GATE else hidden
     live = row < tl.load(Live)
-    tl.store(Output + offset, tl.where(live, value, 0.0).to(Output.dtype.element_ty), mask=mask)
+    return offset, mask, tl.where(live, value, 0.0).to(tl.bfloat16)
+
+
+@triton.jit
+def _gated_rms_norm(Hidden, Gate, Weight, Output, Live, gate_row_stride, EPS: tl.constexpr, HEADS: tl.constexpr,
+                    DIM: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROUND_NORMALIZED: tl.constexpr,
+                    BF16_WEIGHT: tl.constexpr, SILU_GATE: tl.constexpr,
+                    NORM_BEFORE_GATE: tl.constexpr = True, WEIGHT_PER_HEAD: tl.constexpr = False):
+    offset, mask, value = _gated_values(Hidden, Gate, Weight, Live, gate_row_stride, EPS, HEADS,
+        DIM, HEAD_BLOCK, ROUND_NORMALIZED, BF16_WEIGHT, SILU_GATE, NORM_BEFORE_GATE, WEIGHT_PER_HEAD)
+    tl.store(Output + offset, value, mask=mask)
+
+
+@triton.jit
+def _gated_rms_norm_mxfp8(Hidden, Gate, Weight, Output, Live, gate_row_stride, Values, ScaleRows, ScaleMma,
+                         EPS: tl.constexpr, HEADS: tl.constexpr, DIM: tl.constexpr, HEAD_BLOCK: tl.constexpr,
+                         ROUND_NORMALIZED: tl.constexpr, BF16_WEIGHT: tl.constexpr, SILU_GATE: tl.constexpr,
+                         NORM_BEFORE_GATE: tl.constexpr, WEIGHT_PER_HEAD: tl.constexpr):
+    offset, mask, value = _gated_values(Hidden, Gate, Weight, Live, gate_row_stride, EPS, HEADS,
+        DIM, HEAD_BLOCK, ROUND_NORMALIZED, BF16_WEIGHT, SILU_GATE, NORM_BEFORE_GATE, WEIGHT_PER_HEAD)
+    if Output is not None:
+        tl.store(Output + offset, value, mask=mask)
+    groups: tl.constexpr = HEADS * DIM // 32
+    local_groups: tl.constexpr = HEAD_BLOCK * DIM // 32
+    x = tl.reshape(value.to(tl.float32), (local_groups, 32))
+    amax = tl.max(tl.abs(x), 1)
+    ratio = tl.where(amax > 0, amax / 448.0, 1.0)
+    exponent = tl.minimum(tl.maximum(tl.ceil(tl.log2(ratio)), -127.0), 127.0)
+    scale = tl.exp2(exponent)
+    quantized = (x / scale[:, None]).to(tl.float8e4nv)
+    tl.store(Values + offset, tl.reshape(quantized, (HEAD_BLOCK, DIM)), mask=mask)
+    row = tl.program_id(0)
+    group = tl.program_id(1) * local_groups + tl.arange(0, local_groups)
+    byte = (exponent + 127).to(tl.uint8)
+    tl.store(ScaleRows + row * groups + group, byte, group < groups)
+    tl.store(ScaleMma + _scale_offset(row, group, groups), byte, group < groups)
 
 
 class PreparedGatedRMSNorm:
@@ -61,16 +97,21 @@ class PreparedGatedRMSNorm:
     ``norm_before_gate=False`` gates in FP32 before computing the variance.
     A [heads, dim] weight gives each group separate affine parameters. Passing a
     preparation session declares compilation and tuning with the model's batch.
+    With an encoded destination, output=None omits the BF16 output entirely.
     """
 
     def __init__(self, hidden, gate, weight, output, live, *, eps, round_normalized=False, activation="sigmoid",
-                 norm_before_gate=True, session=None, name=None):
+                 norm_before_gate=True, session=None, name=None, encoded=None):
         rows, heads, dim = hidden.shape
         gate_rows_contiguous = gate.stride()[1:] == (dim, 1)
-        if (gate.shape != hidden.shape or output.shape != hidden.shape or weight.shape not in ((dim,), (heads, dim))
-                or any(t.dtype != torch.bfloat16 for t in (hidden, gate, output))
+        if output is None and encoded is None:
+            raise ValueError("gated RMS norm requires a BF16 output or an encoded destination")
+        outputs = () if output is None else (output,)
+        if (gate.shape != hidden.shape or any(t.shape != hidden.shape for t in outputs)
+                or weight.shape not in ((dim,), (heads, dim))
+                or any(t.dtype != torch.bfloat16 for t in (hidden, gate, *outputs))
                 or weight.dtype not in (torch.bfloat16, torch.float32)
-                or not all(t.is_contiguous() for t in (hidden, output, weight)) or not gate_rows_contiguous
+                or not all(t.is_contiguous() for t in (hidden, weight, *outputs)) or not gate_rows_contiguous
                 or live.shape != (1,) or dim & (dim - 1) or activation not in ("sigmoid", "silu")):
             raise ValueError("gated RMS norm requires BF16 [rows,heads,dim] tensors with contiguous rows "
                              "and a [dim] or [heads,dim] weight")
@@ -82,9 +123,19 @@ class PreparedGatedRMSNorm:
                         "BF16_WEIGHT": weight.dtype == torch.bfloat16, "SILU_GATE": activation == "silu",
                         "NORM_BEFORE_GATE": bool(norm_before_gate), "WEIGHT_PER_HEAD": weight.ndim == 2,
                         "num_warps": 4}
+        self.kernel = _gated_rms_norm
+        if encoded is not None:
+            from b12x.quantization import mxfp8
+
+            if (session is not None or dim % 32 or not isinstance(encoded, mxfp8.MXFP8Rows)
+                    or encoded.values.shape != (rows, heads * dim) or encoded.values.device != hidden.device):
+                raise ValueError("encoded gated norm requires prepared MXFP8 rows and 32-aligned head dimensions")
+            self.kernel = _gated_rms_norm_mxfp8
+            self.args += (encoded.values, encoded.scale_rows.view(torch.uint8),
+                          mxfp8.dense_scale_storage(encoded.scale_mma))
         self.plan = None
         if session is None:
-            self.compiled = warmup_triton(_gated_rms_norm, self.args, self.grid, **self.options)
+            self.compiled = warmup_triton(self.kernel, self.args, self.grid, **self.options)
         else:
             from .gated_norm_preparation import declare_norm
 
@@ -92,7 +143,7 @@ class PreparedGatedRMSNorm:
 
     def __call__(self):
         if self.plan is None:
-            launch_triton(_gated_rms_norm, self.compiled, self.args, self.grid, **self.options)
+            launch_triton(self.kernel, self.compiled, self.args, self.grid, **self.options)
         else:
             from .gated_norm_preparation import execute
 

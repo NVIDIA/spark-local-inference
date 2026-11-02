@@ -268,7 +268,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                         vocabulary_runtime=None, coordinator=coordinator, session=session, name=name, workspace=arena)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool, buffers=private)
                     context = (partial(PreparedContext, runtime=None, coordinator=None,
-                        buffers=context_buffers.cursor()) if enabled else None)
+                        buffers=context_buffers.cursor(), compact_prefill=mode == "prefill") if enabled else None)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=None,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
                         context_factory=context, buffers=private)

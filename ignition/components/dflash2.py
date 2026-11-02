@@ -41,20 +41,64 @@ def _rotary(values, positions, inverse):
     return values * cos[:, None] + rotate_half(values) * sin[:, None]
 
 
+class PreparedContextCapture:
+    """Capture target features that can survive in a draft context ring.
+
+    Compact prefill accepts every live input row. Verification retains all rows
+    until its accepted prefix is known.
+    """
+
+    def __init__(self, metadata, columns, window, *, compact_prefill=False, buffers=None):
+        self.metadata = metadata
+        rows = metadata.positions.numel()
+        self.offsets = self.indices = self.live = None
+        def zeros(shape, dtype):
+            return (torch.zeros(shape, dtype=dtype, device=metadata.positions.device)
+                    if buffers is None else buffers.zeros(shape, dtype))
+        if compact_prefill and metadata.starts.numel() == 1 and rows > window:
+            rows = window
+            self.offsets = torch.arange(rows, device=metadata.positions.device)
+            self.indices = zeros((rows,), torch.int64)
+            self.live = zeros((rows,), torch.bool)
+        self.output = zeros((rows, columns), torch.bfloat16)
+
+    def begin(self):
+        if self.indices is not None:
+            m = self.metadata
+            count = m.lengths[0].long()
+            kept = count.clamp(max=self.output.shape[0])
+            self.indices.copy_((m.query_start_loc[0] + count - kept + self.offsets).clamp(
+                0, m.positions.numel() - 1))
+            self.live.copy_((self.offsets < kept) & (m.positions[self.indices] >= 0))
+
+    def __call__(self, hidden, column):
+        values = hidden if self.indices is None else torch.where(
+            self.live[:, None], hidden[self.indices], 0)
+        self.output[:, column:column + hidden.shape[-1]].copy_(values)
+
+
 class PreparedContext:
     """Write accepted target features into independent draft KV rings.
 
     The supplied cursor is dedicated to context scratch. Each graph variant forks
     its starting position; target auxiliary features must occupy disjoint storage.
+    Compact prefill consumes a suffix captured from all live input rows; counts
+    must equal the metadata lengths used by PreparedContextCapture.
     """
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 runtime, coordinator, buffers):
+                 runtime, coordinator, buffers, compact_prefill=False):
         self.metadata = metadata
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         tokens, hidden = auxiliary.shape[0], c.text["hidden_size"]
         scratch = buffers.fork()
+        self.compact_offsets = self.compact_positions = None
+        if compact_prefill and metadata.starts.numel() == 1 and metadata.positions.numel() > self.window:
+            if tokens != self.window:
+                raise ValueError("compact prefill context requires one retained window of auxiliary rows")
+            self.compact_offsets = torch.arange(tokens, device=auxiliary.device)
+            self.compact_positions = scratch.full((tokens,), -1, metadata.positions.dtype)
         self.local = scratch.zeros((tokens, hidden // weights.shard.world_size), torch.bfloat16)
         self.projected = scratch.zeros((tokens, hidden), torch.bfloat16)
         _, kv_heads = a.local(weights.shard)
@@ -80,24 +124,38 @@ class PreparedContext:
 
     def __call__(self, auxiliary, counts):
         m = self.metadata
-        offset = m.positions - m.starts[m.requests]
-        count = counts[m.requests]
-        valid = (m.positions >= 0) & (offset >= 0) & (offset < count)
-        valid &= offset >= (count - self.window).clamp_min(0)
+        if self.compact_positions is None:
+            positions = m.positions
+            offset = positions - m.starts[m.requests]
+            count = counts[m.requests]
+            valid = (positions >= 0) & (offset >= 0) & (offset < count)
+            valid &= offset >= (count - self.window).clamp_min(0)
+            states = m.state_rows[m.requests]
+        else:
+            count = counts[0].long()
+            kept = count.clamp(max=self.window)
+            indices = (m.query_start_loc[0] + count - kept + self.compact_offsets).clamp(
+                0, m.positions.numel() - 1)
+            positions = m.positions[indices]
+            valid = (self.compact_offsets < kept) & (positions >= 0)
+            self.compact_positions.copy_(torch.where(valid, positions, -1))
+            positions = self.compact_positions
+            states = m.state_rows[0]
         self.slots.copy_(torch.where(valid,
-            m.state_rows[m.requests] * self.window + m.positions.remainder(self.window), -1))
+            states * self.window + positions.remainder(self.window), -1))
         self.projected.copy_(self.norm(self.gather(self.project(auxiliary))))
         self.project_kv(self.projected)
         width = self.key.shape[1] * self.key.shape[2]
         chunks = self.kv.view(self.kv.shape[0], len(self.layers), 2 * width)
         for index, (norm, writer) in enumerate(self.layers):
             key = norm(chunks[:, index, :width].view_as(self.key))
-            self.key.copy_(_rotary(key, m.positions, self.inverse))
+            self.key.copy_(_rotary(key, positions, self.inverse))
             self.value.copy_(chunks[:, index, width:].view_as(self.value))
             writer()
 
     def scratch_tensors(self):
-        return self.local, self.projected, self.kv, self.key, self.value, self.slots
+        tensors = self.local, self.projected, self.kv, self.key, self.value, self.slots
+        return tensors if self.compact_positions is None else (*tensors, self.compact_positions)
 
 
 @dataclass(frozen=True)

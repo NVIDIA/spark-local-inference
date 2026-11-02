@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from functools import cached_property
 
 import torch
 from b12x.gemm.blockscaled import Weight
@@ -90,6 +91,18 @@ class GDNScratch:
         return cls(qkvz[:, :10240 // world_size], convolved, qkvz[:, 10240 // world_size:], ba[:, 48 // world_size:], ba[:, :48 // world_size],
                    recurrence, gated, output, qkvz, ba, prefill.query, prefill.key, prefill.value, prefill.decay,
                    prefill.beta)
+
+    @cached_property
+    def mxfp8_output(self):
+        from b12x.quantization import mxfp8
+
+        rows, columns = self.gated.shape
+        shapes = mxfp8.dense_rows_storage_shapes(rows, columns)
+        bases = tuple(torch.zeros(shape, dtype=dtype, device=self.gated.device)
+                      for shape, dtype in zip(shapes, (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+        bases[1].fill_(127)
+        bases[2].fill_(127)
+        return mxfp8.dense_rows_from_bases(*bases)
 
     def rows(self, tokens: int) -> GDNScratch:
         if type(tokens) is not int or not 0 < tokens <= self.projected_qkv.shape[0]:
@@ -248,6 +261,12 @@ class PreparedGDN:
         if set(projections) != expected:
             raise ValueError("GDN requires QKV/Z, packed B/A, and output projection weights")
 
+        from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+
+        self.output_encoding = (scratch.mxfp8_output if prepare_projections and mode == "prefill" and partitions is None
+            and not sm103.is_sm103(self.device) and isinstance(projections["out_proj"], MXFP8LinearWeight)
+            else None)
+
         def projection(key, inputs, output):
             weight = projections[key]
             options = dict(session=session, name=f"{name}.{key}")
@@ -256,7 +275,7 @@ class PreparedGDN:
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(inputs, weight, output, **options)
             return QuantizedProjection(inputs, weight, output, activation_mode="auto",
-                                       workspace=projection_workspace, **options)
+                                       workspace=projection_workspace, encoded=self.output_encoding if key == "out_proj" else None, **options)
 
         if prepare_projections:
             inputs = (("in_proj_qkvz", scratch.projected_qkvz),) if self.fused_qkvz else (
@@ -427,8 +446,10 @@ class PreparedGDN:
             self.output_norm = PreparedGatedRMSNorm(
                 scratch.recurrence.view(self.tokens, self.value_heads, 128),
                 scratch.z.view(self.tokens, self.value_heads, 128), module.norm.weight,
-                scratch.gated.view(self.tokens, self.value_heads, 128), metadata.num_tokens,
-                eps=module.norm.variance_epsilon, round_normalized=True, activation=module.norm.activation)
+                None if self.output_encoding is not None else scratch.gated.view(self.tokens, self.value_heads, 128),
+                metadata.num_tokens,
+                eps=module.norm.variance_epsilon, round_normalized=True, activation=module.norm.activation,
+                encoded=self.output_encoding)
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
         scratch = self.scratch

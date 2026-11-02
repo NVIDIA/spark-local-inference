@@ -53,7 +53,21 @@ class ModelWeights:
             }
             grouped_names = {part.removeprefix(TEXT_PREFIX + ".") + ".weight"
                              for parts in mlp_groups.values() for part in parts}
+            kv_groups = {
+                f"layers.{index}.self_attn.": tuple(TEXT_PREFIX + f".layers.{index}.self_attn." + field
+                                                  for field in ("k_proj", "v_proj"))
+                for index, layer in enumerate(tree.layers)
+                if online_mxfp8 and layer.block_type == "full_attention"
+                and all(loader.linear_format(TEXT_PREFIX + f".layers.{index}.self_attn." + field) == "bfloat16"
+                        for field in ("k_proj", "v_proj"))
+            }
+            kv_names = {part.removeprefix(TEXT_PREFIX + ".") + ".weight"
+                        for parts in kv_groups.values() for part in parts}
             for name, parameter in tree.named_parameters():
+                if name in kv_names:
+                    if tuple(manifest.tensors[TEXT_PREFIX + "." + name].shape) != tuple(parameter.shape):
+                        raise ValueError(f"{name}: checkpoint projection shape differs from the model")
+                    continue
                 if name in grouped_names:
                     stored = manifest.tensors[TEXT_PREFIX + "." + name].shape
                     if len(stored) != 2 or (stored[0], 2 * stored[1]) != tuple(parameter.shape):
@@ -83,6 +97,9 @@ class ModelWeights:
                 if (combined.out_features, combined.in_features) != expected:
                     raise ValueError(f"{prefix}gate_up: checkpoint projection shape differs from the model")
                 projections[prefix + "gate_up"] = combined
+            for prefix, parts in kv_groups.items():
+                combined = loader.load_linear_group(parts)
+                projections[prefix + "kv_proj"] = quantize_bf16_linear_as_mxfp8(combined)
             head = loader.load_linear("lm_head")
             head_shape = tuple(head.shape) if isinstance(head, torch.Tensor) else (head.out_features, head.in_features)
             if head_shape != (config.vocabulary, config.hidden):
