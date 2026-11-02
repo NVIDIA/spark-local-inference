@@ -452,7 +452,12 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
             ),
         ),
     ];
-    let markers = [(1, "<|open|>"), (2, "<|close|>"), (3, "<|sep|>")];
+    let markers = [
+        (1, "<|open|>"),
+        (2, "<|close|>"),
+        (3, "<|sep|>"),
+        (4, "｜DSML｜"),
+    ];
     for (kind, wrapping_newlines, separator, text) in cases {
         let mut pieces = Vec::new();
         let mut rest = text;
@@ -498,10 +503,15 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
                             unreachable!("tool parser fixture contains only tokens and text")
                         }
                         Piece::Token(id) => vec![OutputInput::Token(*id)],
-                        Piece::Text(text) if split_characters => text
-                            .char_indices()
-                            .map(|(at, ch)| OutputInput::Text(&text[at..at + ch.len_utf8()]))
-                            .collect(),
+                        // Control tokens decode whole; split only ordinary text.
+                        Piece::Text(text)
+                            if split_characters
+                                && !markers.iter().any(|(_, marker)| text.as_str() == *marker) =>
+                        {
+                            text.char_indices()
+                                .map(|(at, ch)| OutputInput::Text(&text[at..at + ch.len_utf8()]))
+                                .collect()
+                        }
                         Piece::Text(text) => vec![OutputInput::Text(text)],
                     };
                     for input in inputs {
