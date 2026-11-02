@@ -186,7 +186,7 @@ verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
 record no history preference. Package defaults fill omitted settings; explicit
-startup settings win. Serving requires execution ABI 5 and prepared model
+startup settings win. Serving requires execution ABI 6 and prepared model
 contract 3; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
@@ -263,9 +263,10 @@ sampling, request and recurrent-state commit, draft-context update, and saved
 hidden-state update. Caller-owned tensors expose their results; the timed graph
 omits native completion-record publication. Study graphs have private capture
 and compilation identities and cannot produce native package metadata. Native
-exports and ordinary round benchmarks retain the eight-token limit. Establish
-a width-eight study control before comparing deeper studies; native and study
-latencies have different publication boundaries.
+exports support recipe-declared verification capacities through sixteen tokens;
+ordinary round benchmarks use width eight. Establish a width-eight study control
+before comparing deeper studies; native and study latencies have different
+publication boundaries.
 
 JSON identifies study timing as `cuda_graph_speculation_study_latency_ms`, with
 `native_completion_publication=false` and per-case `effective_draft_block`. Each seeded
@@ -992,7 +993,7 @@ selects a destination and `--form` selects packed or directory form. Conversion
 leaves its source intact. Conversion rejects logical-resource containers;
 export them again with Ignition to obtain a payload package. Serving accepts
 payload format 2 and signed format-6 logical-resource containers, both requiring
-execution ABI 5 and prepared model contract 3. Other execution ABI or prepared
+execution ABI 6 and prepared model contract 3. Other execution ABI or prepared
 contract versions require re-export.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's

@@ -215,9 +215,9 @@ impl LoadOptions {
                         && graph.prefill_capacity >= 64 && graph.prefill_capacity.is_multiple_of(64)
                         && graph.prefill_capacity <= config["prefill_chunk_size"].as_u64().unwrap_or(0)
                         && graph.speculation_enabled.is_some()
-                        && if speculative { (1..=8).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
+                        && if speculative { (1..=16).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
                     GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
-                    GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=8).contains(&graph.token_capacity),
+                    GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=16).contains(&graph.token_capacity),
                     _ => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && graph.token_capacity == 1,
                 };
                 if !valid || graph.batch_capacity > prepared.next_power_of_two() as u64
@@ -231,7 +231,7 @@ impl LoadOptions {
                     || (kind == GraphKind::Decode && graph.speculation_enabled == Some(true))
                     || if speculative {
                         graph.verify_tokens != Some(graph.token_capacity as u32)
-                            || graph.draft_tokens.is_none_or(|n| n > 7)
+                            || graph.draft_tokens.is_none_or(|n| n > 15)
                             || (kind == GraphKind::Speculative && graph.token_capacity == 1 && graph.draft_tokens != Some(0))
                             || ![1, 2].contains(&graph.draft_source)
                     } else {
@@ -1518,7 +1518,7 @@ mod tests {
     #[test]
     fn malformed_rounds_and_obsolete_abis_reject_before_loading() {
         for rank in [0usize, 1] {
-            for abi in [0, 1, 2, 3, 4, 6] {
+            for abi in [0, 1, 2, 3, 4, 5, 7] {
                 let mut ranks = [round_package(8, 48, false), round_package(8, 48, false)];
                 ranks[rank].execution.as_mut().unwrap().abi_version = abi;
                 assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string().contains("execution ABI"));
@@ -1535,7 +1535,7 @@ mod tests {
                 1 => graph.packed_token_capacity = graph.batch_capacity - 1,
                 2 => graph.packed_token_capacity = graph.batch_capacity * graph.token_capacity + 1,
                 3 => graph.draft_tokens = None,
-                4 => graph.draft_tokens = Some(8),
+                4 => graph.draft_tokens = Some(16),
                 5 => graph.verify_tokens = Some(5),
                 6 => graph.confidence_width = 7,
                 7 => graph.draft_source = 0,

@@ -51,6 +51,17 @@ pub struct Inputs {
 }
 
 impl Inputs {
+    pub(crate) fn copy_proposal_capacity(&self, vocabulary: usize) -> usize {
+        let words = vocabulary.div_ceil(32);
+        self.contract.graphs.iter().flat_map(|graph| &graph.inputs)
+            .filter_map(|input| match input.binding.source {
+                ValueSource::CopyTokenIds => Some(input.width),
+                ValueSource::CopyGrammarMask => Some((input.width / words).saturating_sub(1)),
+                _ => None,
+            })
+            .min().unwrap_or(0)
+    }
+
     pub fn new(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<Self> {
         config.contract.validate(manifest)?;
         let graphs = manifest
@@ -164,12 +175,29 @@ impl Inputs {
                         }
                         let expected_width = match binding.source {
                             ValueSource::SamplingParameters => 6,
-                            ValueSource::EosTokenIds | ValueSource::LiveStateRows => 8,
+                            ValueSource::EosTokenIds => 8,
+                            ValueSource::LiveStateRows => {
+                                if !(semantics.state_rows_per_request..=crate::execution::MAX_OUTPUT_TOKENS).contains(&width) {
+                                    return Err("state-row input does not cover the graph storage extent".into());
+                                }
+                                width
+                            },
                             ValueSource::PromptHistogram => config.contract.vocabulary,
                             ValueSource::GrammarMask => config.contract.vocabulary.div_ceil(32),
-                            ValueSource::CopyTokenIds => 7,
+                            ValueSource::CopyTokenIds => {
+                                if !(graph.draft_tokens.max(1)..=crate::execution::MAX_DRAFT_TOKENS).contains(&width) {
+                                    return Err("copied-token input does not cover the graph draft extent".into());
+                                }
+                                width
+                            },
                             ValueSource::CopyGrammarMask => {
-                                8 * config.contract.vocabulary.div_ceil(32)
+                                let words = config.contract.vocabulary.div_ceil(32);
+                                let positions = width / words;
+                                let required = if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed) { graph.token_capacity } else { 1 };
+                                if !width.is_multiple_of(words) || !(required..=crate::execution::MAX_OUTPUT_TOKENS).contains(&positions) {
+                                    return Err("copy grammar input does not cover the graph verification extent".into());
+                                }
+                                width
                             }
                             ValueSource::PromptPosition => {
                                 config.contract.frontend.position_dimensions
@@ -685,11 +713,15 @@ impl Inputs {
                             .or_else(|| history.as_ref().map(|(_, n)| *n))
                             .unwrap_or(0);
                         match binding.source {
-                            CopyTokenIds => values.extend(
-                                copy.map(|p| p.tokens)
+                            CopyTokenIds => {
+                                if count > input.width {
+                                    return Err("active copied-token proposal exceeds its input extent".into());
+                                }
+                                let tokens = copy.map(|p| p.tokens)
                                     .or_else(|| history.map(|(t, _)| t))
-                                    .unwrap_or([-1; 7]),
-                            ),
+                                    .unwrap_or([-1; crate::execution::MAX_DRAFT_TOKENS]);
+                                values.extend_from_slice(&tokens[..input.width]);
+                            },
                             CopyTokenCount => values.push(count as i64),
                             CopyConsumedTokens => {
                                 values.push(if copy.is_some() || history.is_some() {
@@ -705,6 +737,9 @@ impl Inputs {
                             }),
                             CopyGrammarMask => {
                                 if let Some(copy) = copy {
+                                    if copy.grammar_masks.len() > input.width {
+                                        return Err("active copied-token grammar exceeds its input extent".into());
+                                    }
                                     values.extend(copy.grammar_masks.iter().map(|v| *v as i64));
                                 }
                             }

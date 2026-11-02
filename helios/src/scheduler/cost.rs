@@ -91,7 +91,7 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [[Option<u64>; 9]; 7],
+    packed_round_durations: [[Option<u64>; crate::execution::MAX_OUTPUT_TOKENS + 1]; 7],
     now_ns: u64,
     ttl_ns: u64,
 }

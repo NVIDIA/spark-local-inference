@@ -5,7 +5,7 @@ process needs to rebuild the model's CUDA graphs and storage without a Python
 interpreter. The [package format](package-format-design.md) defines a packed
 `.safetensors` file and a directory form with `model.safetensors` plus immutable
 payload companions. The Flare model cache stores the directory form. Serving
-requires execution ABI 5 and prepared model contract 3; other versions require
+requires execution ABI 6 and prepared model contract 3; other versions require
 re-export. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
 the package, the Rust `flare` executable, and its system library dependencies
 (including libturbojpeg). Python and preparation tools are not required.
@@ -150,7 +150,7 @@ bytes in the preparation allocator. Weight tensors, MTP weights, rotary
 tables, pointer tables, and required initialized metadata retain their contents.
 
 Serving accepts payload format 2 and signed format-6 logical-resource containers,
-with execution ABI 5 and prepared model contract 3 required in both carriers.
+with execution ABI 6 and prepared model contract 3 required in both carriers.
 Packages with another execution ABI or prepared contract require re-export with
 Ignition and fail loading before graph replay. Unsigned rank staging cannot load.
 The canonical format uses signed content IDs, payload-relative initializers,
@@ -160,7 +160,7 @@ and unsigned physical locations; see [payload packages](package-format-design.md
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
 completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
-`Struct` configuration is not accepted. Execution ABI 5, model contract 3, and
+`Struct` configuration is not accepted. Execution ABI 6, model contract 3, and
 payload format 2 are independent version domains.
 
 Two prepared-contract fields fail validation when absent or out of
@@ -303,7 +303,7 @@ with the total elapsed time.
 
 Payload packages use signed content IDs and unsigned locations. Signed format-6
 logical-resource containers use the archive reader and must declare execution
-ABI 5 and prepared model contract 3. Payload conversion accepts only payload
+ABI 6 and prepared model contract 3. Payload conversion accepts only payload
 packages; converting logical-resource containers requires re-export with Ignition.
 
 Canonical payload packages do not use logical filenames, layout segments, or
@@ -352,7 +352,7 @@ rather than selecting a recipe default.
 Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
 `--all` includes the tensor catalogs. Absent manifests are reported as null.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
-catalog versions. Serving still requires execution ABI 5 and model contract 3.
+catalog versions. Serving still requires execution ABI 6 and model contract 3.
 Changing signed rebuild metadata requires signing the package again.
 
 ### Publisher authentication and executable access

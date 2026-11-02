@@ -124,7 +124,7 @@ def test_actual_kda_native_prefill_and_decode(world, tokens, decode_capacity, ov
             session.freeze()
             control = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                        "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                       "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device=device)}
+                       "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64, device=device)}
             bundle = PreparedExecution(device=0, graphs=graphs, buffers=control,
                 signatures={"prefill": GraphSignature("prefill", 1, prefill_capacity),
                             "decode": GraphSignature("decode", decode_capacity, 1)},

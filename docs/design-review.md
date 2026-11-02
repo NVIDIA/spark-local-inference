@@ -100,7 +100,7 @@ before committing; a design acknowledgment cannot authorize them.
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
 13. **Validate the supported model package contract.** Serving requires execution
-    ABI 5 and prepared model contract 3. Payload format 2 is the canonical carrier;
+    ABI 6 and prepared model contract 3. Payload format 2 is the canonical carrier;
     signed format-6 logical-resource containers require the same contracts. Reject unsupported
     execution ABI and prepared contract versions before replay with a clear
     re-export error. Version semantic contract changes, reserve removed Protobuf

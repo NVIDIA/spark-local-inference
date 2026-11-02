@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
-pub const ABI_VERSION: u32 = 5;
-pub const VECTOR_RECORD_FIELDS: usize = 24;
-pub const MAX_OUTPUT_TOKENS: usize = 8;
+pub const ABI_VERSION: u32 = 6;
+pub const VECTOR_RECORD_FIELDS: usize = 32;
+pub const MAX_OUTPUT_TOKENS: usize = 16;
+pub const MAX_DRAFT_TOKENS: usize = MAX_OUTPUT_TOKENS - 1;
 pub const REQUEST_LANES: usize = 64;
 pub const MAX_TOP_LOGPROBS: usize = 20;
 pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
@@ -533,7 +534,7 @@ impl ExecutionManifest {
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
             if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI5 and two float32 frames of seven prefixes per request slot".into());
+                return Err("completion_speculative_survival requires ABI6 and two float32 frames of fifteen prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
@@ -558,7 +559,7 @@ impl ExecutionManifest {
             if graph.kind == GraphKind::Speculative {
                 if graph.packed_token_capacity < graph.batch_capacity
                     || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)
-                    || graph.draft_tokens > 7
+                    || graph.draft_tokens > MAX_DRAFT_TOKENS
                     || (graph.token_capacity == 1 && graph.draft_tokens != 0) {
                     return Err("speculative B/D/W/P geometry is invalid".into());
                 }
@@ -589,7 +590,7 @@ impl ExecutionManifest {
                     self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && (2..=self.request_capacity()).contains(&graph.batch_capacity)
-                        && (1..=8).contains(&graph.token_capacity)
+                        && (1..=MAX_OUTPUT_TOKENS).contains(&graph.token_capacity)
                         && graph.prefill_capacity >= 64
                         && graph.prefill_capacity.is_multiple_of(64)
                         && graph.packed_tokens() <= i32::MAX as usize
@@ -602,7 +603,7 @@ impl ExecutionManifest {
                     self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
-                        && (1..=8).contains(&graph.token_capacity)
+                        && (1..=MAX_OUTPUT_TOKENS).contains(&graph.token_capacity)
                 }
                 GraphKind::Prefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1

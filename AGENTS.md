@@ -241,7 +241,7 @@ architectural boundary before committing the change.
 
 ## Model package compatibility
 
-- Model packages require execution ABI 5 and prepared model contract 3. The
+- Model packages require execution ABI 6 and prepared model contract 3. The
   canonical carrier is payload format 2; signed format-6 logical-resource
   containers also load when they satisfy the same execution and model contracts.
   Packages with another execution ABI or prepared contract require re-export

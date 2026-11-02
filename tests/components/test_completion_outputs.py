@@ -17,7 +17,7 @@ from ignition.components.completion import (
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='CUDA opt-in')
 def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='cuda')
+    outputs = CompletionOutputs.allocate((2, 4, 32), device='cuda')
     cursor = outputs.private_storage.cursor()
     prompt, decode = outputs.private(cursor), outputs.private(cursor)
     assert prompt.requested is decode.requested is outputs.requested
@@ -52,7 +52,7 @@ def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
 
 @pytest.mark.parametrize('change', ['missing_output', 'missing_flags', 'wrong_dtype', 'wrong_frame', 'wrong_slots', 'wrong_k'])
 def test_malformed_logprob_declarations_are_rejected(change):
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='meta')
+    outputs = CompletionOutputs.allocate((2, 4, 32), device='meta')
     buffers = outputs.buffers()
     validate_completion_buffers(buffers, 4)
     if change == 'missing_output':
@@ -81,14 +81,24 @@ def test_malformed_logprob_declarations_are_rejected(change):
     validate_completion_buffers({'completion_records': outputs.records}, 4)
 
 
-@pytest.mark.parametrize('shape,dtype', [((1, 4, 7), torch.float32),
-    ((2, 3, 7), torch.float32), ((2, 4, 8), torch.float32), ((2, 4, 7), torch.float64)])
+@pytest.mark.parametrize('shape,dtype', [((1, 4, 15), torch.float32),
+    ((2, 3, 15), torch.float32), ((2, 4, 8), torch.float32), ((2, 4, 15), torch.float64)])
 def test_optional_survival_requires_two_float32_frames(shape, dtype):
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='meta')
+    outputs = CompletionOutputs.allocate((2, 4, 32), device='meta')
     validate_completion_buffers(outputs.buffers(), 4)
     buffers = {'completion_records': outputs.records,
                'completion_speculative_survival': torch.empty(shape, dtype=dtype, device='meta')}
     with pytest.raises(ValueError, match='completion_speculative_survival'):
         validate_completion_buffers(buffers, 4)
-    with pytest.raises(ValueError, match='24-field'):
+    with pytest.raises(ValueError, match='32-field'):
         CompletionOutputs.allocate((2, 4, 8), device='meta')
+
+
+def test_completion_storage_covers_sixteen_tokens_and_fifteen_survival_values():
+    outputs = CompletionOutputs.allocate((2, 4, 32), device="meta")
+    assert outputs.records.shape == (2, 4, 32)
+    assert outputs.logprobs.shape == (2, 4, 16, LOGPROB_FIELDS)
+    assert outputs.speculative_survival.shape == (2, 4, 15)
+    validate_completion_buffers(outputs.buffers(), 4)
+    with pytest.raises(ValueError, match="32-field"):
+        CompletionOutputs.allocate((2, 4, 24), device="meta")

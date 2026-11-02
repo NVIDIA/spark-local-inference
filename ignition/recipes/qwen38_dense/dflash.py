@@ -18,8 +18,11 @@ from .decoder import PreparedDecoder
 
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence,
-                 session, workspace, buffers, decoder_buffers, context_buffers, study_width=None):
+                 session, workspace, buffers, decoder_buffers, context_buffers, verification_width=8, study_width=None):
         self.study_width = study_width
+        width = verification_width if study_width is None else study_width
+        if type(width) is not int or not 1 <= width <= 16:
+            raise ValueError("Qwen verification capacity must be an integer in [1,16]")
         self.page_tokens = PAGE_TOKENS
         self.weights, self.tables, self.pool = weights, None, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch
@@ -28,7 +31,7 @@ class SpeculativePreparation:
         self.collectives = dict(runtime=None, vocabulary_runtime=None, coordinator=None)
         self.markov_runtime = None
         self.records = GDNLayerRecords.allocate((i for i, kind in enumerate(weights.config.layers)
-            if kind == "linear_attention"), requests.capacity, pool.backing.device, key_heads=16, value_heads=48, width=8 if study_width is None else study_width)
+            if kind == "linear_attention"), requests.capacity, pool.backing.device, key_heads=16, value_heads=48, width=width)
 
         def decoder(weights, tables, scratch, metadata, pool, *, runtime, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, records=self.records,
@@ -42,6 +45,6 @@ class SpeculativePreparation:
                 embedding_runtime=None, buffers=buffers), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
-        self.block_size, self.logit_offset = (weights.config.draft.block_size if study_width is None else study_width), 1
+        self.block_size, self.logit_offset = width, 1
         self.draft_scratch = DraftScratch.allocate(weights.config.draft, weights.shard,
             requests.capacity * self.block_size, pool.backing.device, buffers=buffers, block_size=self.block_size)

@@ -207,7 +207,7 @@ def _rank(rank, rendezvous, directory, widths):
 
                 buffers = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device)}
+                    "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device=device)}
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{width}-{rows}": value
                                 for (width, rows), value in outputs.items()})

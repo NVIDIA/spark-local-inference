@@ -86,7 +86,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             return Err("copy proposal source requires speculative graphs".into());
         }
     } else if manifest.abi_version != ABI_VERSION {
-        return Err("speculative catalog requires ABI5".into());
+        return Err("speculative catalog requires ABI6".into());
     }
     for graph in &manifest.graphs {
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)
@@ -249,7 +249,7 @@ pub fn select_shape_with_drafts(
             }
             GraphKind::Speculative => {
                 config.speculative_widths.contains(&tokens)
-                    && drafts <= 7
+                    && drafts <= crate::execution::MAX_DRAFT_TOKENS
                     && packed >= batch && packed <= batch.saturating_mul(tokens)
                     && (tokens == 1 || packed <= config.speculative_token_capacity)
             }

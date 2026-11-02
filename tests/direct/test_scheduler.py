@@ -28,7 +28,7 @@ def layout(**overrides):
                    for batch in (1, 2, 4) for width in (1, 2, 3)})
     values = dict(capacity=4, max_active=4, context=4096, page_tokens=256, table_width=16, pages=64,
                   snapshots=2, prefill_chunk=512, vocabulary=VOCABULARY, eos=EOS, graphs=graphs,
-                  widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=24)
+                  widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=32)
     values.update(overrides)
     from ignition.preparation import contract as c, runtime_package_pb2 as p
     bindings = {name: list(c.text_inputs(key[0]).values()) for key, name in values["graphs"].items()}
@@ -383,7 +383,7 @@ def test_layout_selects_the_serving_variant_of_each_graph(prefill_only):
                       "decode4": Signature("decode", 4, 1, False), "init4": Signature("init", 4, 1, True),
                       "speculative4x2": Signature("speculative", 4, 2, True)}
         buffers = {"row_slot_ids": Tensor(4), "page_tables": Tensor(4, 32), "draft_page_tables": Tensor(4, 32),
-                   "completion_records": Tensor(2, 4, 24)}
+                   "completion_records": Tensor(2, 4, 32)}
         server_config = {"max_sequence_tokens": 8192, "page_tokens": 256, "pages": 100, "snapshots": 5,
                          "prefill_chunk_size": 128, "model_contract": {"vocabulary": VOCABULARY},
                          "frontend": {"eos_token_ids": [7, 8]}, "speculative_widths": [1, 2],
@@ -586,7 +586,7 @@ def test_layout_reads_complete_catalog_and_retains_all_c32_p128_shapes():
                   for key, name in graphs.items()}
     buffers = {name: torch.from_numpy(np.zeros(shape, dtype=dtype))
                for name, (dtype, shape) in fixture.buffer_specs.items()}
-    buffers['completion_records'] = torch.zeros((2, 32, 24), dtype=torch.int64)
+    buffers['completion_records'] = torch.zeros((2, 32, 32), dtype=torch.int64)
     config = dict(max_sequence_tokens=4096, pages=64, snapshots=2, prefill_chunk_size=512,
                   speculative_widths=[1, 2, 3, 4, 5, 6], frontend=dict(eos_token_ids=[7]),
                   model_contract=dict(vocabulary=VOCABULARY,
@@ -629,3 +629,33 @@ def test_packed_completion_honors_explicit_absence_of_a_draft_cursor(bad_cursor)
     else:
         scheduler.complete(step, rows, confidence=np.full((4, 5), .75))
         assert [len(r.generated) for r in requests] == [3, 2, 2]
+
+
+def test_sixteen_token_packed_round_uploads_full_ceiling_and_publishes_every_token():
+    graphs = {("speculative", b, 1): f"width-one-{b}" for b in (1, 2, 4)}
+    graphs[("speculative", 4, 16, 64, 15)] = "packed-sixteen"
+    scheduler = Scheduler(layout(graphs=graphs, widths=(1, 16),
+        confidence_widths={"packed-sixteen": 15}, completion_cursors={"packed-sixteen": 1}), prefix_cache=False)
+    requests = [request(0, [10, 11], limit=40), request(1, [10, 11], limit=10)]
+    for current in requests:
+        scheduler.submit(current)
+    scheduler._admit()
+    for current in requests:
+        current.phase, current.consumed, current.generated = "decode", 2, [42]
+    for shape in graphs:
+        scheduler.policy.costs.observe(shape, 1_000 if len(shape) == 5 else 100_000_000)
+    step = scheduler.plan()
+    assert (step.width, step.draft_tokens, step.packed_tokens) == (16, 15, 64)
+    assert [lane.tokens for lane in step.lanes] == [16, 9]
+    assert uploads(scheduler, step)["speculative_prefix_limits"] == {0: [16, 9, 0, 0]}
+    tokens = list(range(100, 116))
+    rows = records(scheduler, step, {
+        requests[0]: (1, 18, tokens, 0, 15, 15),
+        requests[1]: (2, 11, tokens[:9], 0, 8, 8),
+    })
+    scheduler.complete(step, rows, confidence=[[1.] * 15] * 4)
+    assert requests[0].generated == [42] + tokens
+    assert requests[0].pending_token == 115 and requests[0].consumed == 18
+    assert requests[1].generated == [42] + tokens[:9] and requests[1].done
+    assert requests[0].acceptance.expected(16) == 16
+    assert len(requests[0].acceptance.expectations(16)) == 17

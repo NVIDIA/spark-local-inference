@@ -90,7 +90,7 @@ def test_graph_replay_saves_graph_times_that_eager_execution_reads(tmp_path):
     graphs = {("speculative", 1, 1): "speculative1x1", ("speculative", 1, 2): "speculative1x2",
               ("prefill", 1, 128): "prefill128"}
     layout = Layout(bindings={}, buffer_specs={}, page_views={}, capacity=1, max_active=1, context=1024, page_tokens=64, table_width=16, pages=16, snapshots=0,
-                    prefill_chunk=128, vocabulary=16, eos=(1,), graphs=graphs, widths=(1, 2), record_fields=24)
+                    prefill_chunk=128, vocabulary=16, eos=(1,), graphs=graphs, widths=(1, 2), record_fields=32)
     server = object.__new__(DirectServer)
     server.layout, server.scheduler, server.lock = layout, Scheduler(layout), threading.Lock()
     server.graph_times = tmp_path / "times.json"

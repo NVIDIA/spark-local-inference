@@ -31,7 +31,7 @@ def export(root, rank):
             buffers = {
                 "frame_index": torch.zeros(1, dtype=torch.int32, device="cuda"),
                 "submission_sequence": torch.zeros(1, dtype=torch.int64, device="cuda"),
-                "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device="cuda"),
+                "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device="cuda"),
                 "source": source, "output": output,
             }
             records = buffers["completion_records"]

@@ -8,7 +8,7 @@
 
 use crate::{Result, execution::BATCH_CAPACITIES};
 
-pub const WIDTHS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+pub const WIDTHS: [usize; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProposalSource {
@@ -31,12 +31,12 @@ impl ProposalSource {
 #[derive(Clone, Debug)]
 pub struct CopyProposal {
     pub consumed: u64,
-    pub tokens: [i64; 7],
+    pub tokens: [i64; crate::execution::MAX_DRAFT_TOKENS],
     pub count: usize,
     pub grammar_masks: Vec<i32>,
 }
 
-pub fn graph_width_masks(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [u8; 7] {
+pub fn graph_width_masks(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [u16; 7] {
     let mask = fixed.map_or_else(
         || {
             widths
@@ -50,7 +50,7 @@ pub fn graph_width_masks(widths: &[usize], fixed: Option<usize>, capacity: usize
 
 pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [Vec<usize>; 7] {
     graph_width_masks(widths, fixed, capacity)
-        .map(|mask| (1..=8).filter(|w| mask & (1 << (w - 1)) != 0).collect())
+        .map(|mask| (1..=16).filter(|w| mask & (1 << (w - 1)) != 0).collect())
 }
 
 pub fn validate_widths(widths: &[usize]) -> Result<()> {
@@ -60,7 +60,7 @@ pub fn validate_widths(widths: &[usize]) -> Result<()> {
             || widths.iter().any(|w| !WIDTHS.contains(w)))
     {
         return Err(
-            "speculative widths must be sorted unique integers in 1..=8 including 1".into(),
+            "speculative widths must be sorted unique integers in 1..=16 including 1".into(),
         );
     }
     Ok(())
@@ -99,7 +99,7 @@ impl PrefixEstimate {
 /// Prefix survival of the complete proposal program, including copy overrides.
 #[derive(Clone, Copy)]
 pub struct AcceptanceProfile {
-    prefixes: [[PrefixEstimate; 7]; 2],
+    prefixes: [[PrefixEstimate; crate::execution::MAX_DRAFT_TOKENS]; 2],
     rounds: u64,
 }
 
@@ -117,7 +117,7 @@ impl AcceptanceProfile {
             .map(|_| self.curve(source, 0, false)[depth])
     }
 
-    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> [f64; 7] {
+    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> [f64; crate::execution::MAX_DRAFT_TOKENS] {
         let mut bound = 1.0f64;
         self.prefixes[source as usize].map(|p| {
             bound = bound.min(if optimistic { p.upper(generated) } else { p.mean() });
@@ -126,7 +126,7 @@ impl AcceptanceProfile {
     }
 
     pub fn expected_tokens(&self, source: ProposalSource, width: usize) -> f64 {
-        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(7)].iter().sum::<f64>()
+        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(crate::execution::MAX_DRAFT_TOKENS)].iter().sum::<f64>()
     }
 
     pub fn rounds(&self) -> u64 {
@@ -145,9 +145,9 @@ impl AcceptanceProfile {
         offered: usize,
         accepted: usize,
         rejected: bool,
-        survival: Option<&[f32; 7]>,
+        survival: Option<&[f32; crate::execution::MAX_DRAFT_TOKENS]>,
     ) {
-        debug_assert!(accepted <= offered && offered <= 7);
+        debug_assert!(accepted <= offered && offered <= crate::execution::MAX_DRAFT_TOKENS);
         if offered == 0 {
             return;
         }
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn probability_feedback_replaces_the_binary_sample_and_respects_censoring() {
         let mut profile = AcceptanceProfile::default();
-        let survival = [0.8, 0.4, 0.2, 0.1, 0.05, 0.025, 0.01];
+        let survival = [0.8, 0.4, 0.2, 0.1, 0.05, 0.025, 0.01, -1., -1., -1., -1., -1., -1., -1., -1.];
         profile.observe(ProposalSource::Mtp, 0, 7, 0, true, Some(&survival));
         for depth in 0..7 {
             let expected = (2.0 * 0.5f64.powi(depth as i32 + 1) + f64::from(survival[depth])) / 3.0;
@@ -207,4 +207,15 @@ mod tests {
         profile.observe(ProposalSource::Mtp, 0, 7, 1, false, Some(&survival));
         assert_eq!(profile.curve(ProposalSource::Mtp, 0, false)[1..], before[1..]);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn sixteen_width_mask_retains_high_bit_and_declared_catalog() {
+    validate_widths(&[1, 8, 16]).unwrap();
+    assert!(validate_widths(&[1, 17]).is_err());
+    assert_eq!(graph_width_masks(&[1, 8, 16], None, 1)[0], 0x8081);
+    assert_eq!(graph_width_masks(&[1, 8, 16], Some(16), 1)[0], 0x8000);
+    assert_eq!(graph_catalog(&[1, 8, 16], None, 1)[0], vec![1, 8, 16]);
+    assert!(graph_catalog(&[1, 8, 16], None, 1)[1].is_empty());
 }

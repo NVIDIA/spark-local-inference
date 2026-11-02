@@ -5,7 +5,7 @@ Flare's speculative engine supports the embedded MTP modules in
 `local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD`, and the DSpark drafter in
 `deepseek-ai/DeepSeek-V4.1-Flash` on SM120/121. Python prepares
 weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
-graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI5 token-vector completion contract.
+graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI6 token-vector completion contract.
 Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
 select the draft-token maximum and default verification policy.
 `flare run PACKAGE --history-drafts` augments Qwen's learned MTP proposals
@@ -371,8 +371,8 @@ contributes no tokens, RNG advancement, or cache updates to a queued round.
 Rust freezes request epochs, page reservations, and CPU query lengths or GPU
 prefix ceilings before submission. CUDA dependencies serialize model work and
 protect shared scratch independently of completion readback. Rust reserves each
-round's maximum page and output extent before submission. ABI5 uses two transfer
-frames, each containing one 24-field `int64` record per prepared request slot.
+round's maximum page and output extent before submission. ABI6 uses two transfer
+frames, each containing one 32-field `int64` record per prepared request slot.
 Each record contains request
 identity, token counters, terminal status, emitted/offered/accepted counts,
 copy-source bits, draft-cache position, verification width, and eight padded

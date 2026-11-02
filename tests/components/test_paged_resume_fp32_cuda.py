@@ -45,7 +45,7 @@ def test_cached_resume_fp32_head_projection_and_capture(rows):
         .expand(-1, 8)
         .contiguous(),
     )
-    records = torch.zeros(2, capacity, 24, device=device, dtype=torch.int64)
+    records = torch.zeros(2, capacity, 32, device=device, dtype=torch.int64)
     frame = torch.zeros(1, device=device, dtype=torch.int32)
     sequence = torch.ones(1, device=device, dtype=torch.int64)
 

@@ -251,8 +251,8 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 PromptHistogram => config.contract.vocabulary,
                 GrammarMask => config.contract.vocabulary.div_ceil(32),
                 PageTable => config.prepared_sequence_tokens / config.contract.cache.page_tokens,
-                CopyTokenIds => 7,
-                CopyGrammarMask => 8 * config.contract.vocabulary.div_ceil(32),
+                CopyTokenIds => config.speculative_widths.iter().copied().max().unwrap_or(8).saturating_sub(1).max(1),
+                CopyGrammarMask => config.speculative_widths.iter().copied().max().unwrap_or(8) * config.contract.vocabulary.div_ceil(32),
                 PromptPosition => 3,
                 _ => 1,
             };
@@ -299,7 +299,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         ("submission_sequence".into(), (Dtype::Int64, vec![1])),
         (
             "completion_records".into(),
-            (Dtype::Int64, vec![2, slots, 24]),
+            (Dtype::Int64, vec![2, slots, crate::execution::VECTOR_RECORD_FIELDS]),
         ),
         ("state_pool".into(), (Dtype::Uint8, vec![1024, 32])),
         ("pending".into(), (Dtype::Int64, vec![slots])),
@@ -379,7 +379,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         .collect();
     ExecutionManifest {
         tuning_graphs: vec![],
-        abi_version: 5,
+        abi_version: 6,
         context: 1,
         device: 0,
         max_active: slots,

@@ -62,7 +62,7 @@ impl CompletionRecord {
     pub(crate) fn validate_vector(&self) -> Result<()> {
         if self.status != 0 {
             if let Some(v) = self.vector {
-                if !(1..=8).contains(&v.verification_width)
+                if !(1..=MAX_OUTPUT_TOKENS as i64).contains(&v.verification_width)
                     || !(0..=v.verification_width).contains(&v.emitted_count)
                     || !(0..v.verification_width).contains(&v.offered_drafts)
                     || v.accepted_drafts < v.emitted_count.saturating_sub(1).max(0)
@@ -175,7 +175,7 @@ pub struct FrameCompletion {
     pub speculative_survival: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
 }
 
-pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[CompletionRecord]) -> Result<()> {
+pub(crate) fn validate_speculative_survival(rows: &[[f32; crate::execution::MAX_DRAFT_TOKENS]], records: &[CompletionRecord]) -> Result<()> {
     if rows.len() < records.len() || rows.len() > REQUEST_LANES {
         return Err("speculative survival does not cover completion slots".into());
     }
@@ -184,7 +184,7 @@ pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[Comple
             .and_then(|record| record.vector).map_or(0, |vector| {
                 if vector.emitted_count > vector.accepted_drafts { vector.offered_drafts }
                 else { vector.accepted_drafts.min(vector.offered_drafts) }
-            }).clamp(0, 7) as usize;
+            }).clamp(0, (MAX_OUTPUT_TOKENS - 1) as i64) as usize;
         let mut bound = 1.0;
         let mut missing = false;
         for (depth, &value) in row.iter().enumerate() {
@@ -975,7 +975,7 @@ impl GraphExecutor {
             frame.survival.as_ref().map(|readback| {
                 let mut rows = [[-1.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
                 // SAFETY: The completion transfer protects this frame's retained feedback bytes.
-                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact(7 * 4)) {
+                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact((MAX_OUTPUT_TOKENS - 1) * 4)) {
                     for (value, bytes) in row.iter_mut().zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
@@ -1334,7 +1334,7 @@ pub(super) fn decode_records(
                 model_reserved: fields[12],
                 draft_cache_consumed: fields[13],
                 verification_width: fields[15],
-                tokens: fields[16..24].try_into().unwrap(),
+                tokens: fields[16..VECTOR_RECORD_FIELDS].try_into().unwrap(),
             }),
         };
         if record.status != 0 && fields[14] != 0 {

@@ -36,7 +36,7 @@ def test_noncontiguous_bindings_snapshot_normalization_and_runtime_bounds(capaci
              for layer in (*range(3, 48, 4), 48)}
     speculation = SimpleNamespace(cache=cache, draft_tables=torch.full_like(inputs.page_tables, -1),
         previous_accepted=torch.ones(capacity, dtype=torch.int32, device=device))
-    records = torch.zeros((2, capacity, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, capacity, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     operations, graphs = [], {}

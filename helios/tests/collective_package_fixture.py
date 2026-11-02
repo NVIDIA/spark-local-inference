@@ -180,7 +180,7 @@ def _rank(rank, directory, startup_tuning=False):
                     group="KV_PAGES", maximum=16, units=16)
                 buffers = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device),
+                    "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device=device),
                     "state_pool": state, "memory_capacity": torch.tensor([4, 16], device=device),
                     "pages": pages}
                 records = buffers["completion_records"]

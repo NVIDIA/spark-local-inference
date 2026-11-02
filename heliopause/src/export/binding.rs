@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
         let value = serde_json::json!({
-            "abi_version": 5, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
+            "abi_version": 6, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
             "graphs": [{"name": "decode", "kind": "decode", "handle": 17,
                 "tuned_bindings": [{"buffer": "winner", "tuning_graph": "tune"}]}],
             "tuning_graphs": [{"name": "tune", "handle": 18,
@@ -1014,7 +1014,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":5,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
+        let input = serde_json::json!({"abi_version":6,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));

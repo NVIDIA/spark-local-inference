@@ -144,13 +144,13 @@ impl DecodedHistory {
         self.end += 1;
     }
 
-    fn continuation(&self, mut position: u64, length: usize, maximum: usize) -> ([i64; 7], usize) {
+    fn continuation(&self, mut position: u64, length: usize, maximum: usize) -> ([i64; crate::execution::MAX_DRAFT_TOKENS], usize) {
         for _ in 0..length {
             position = self.token(position).expect("indexed context is retained").next;
         }
-        let mut output = [-1; 7];
+        let mut output = [-1; crate::execution::MAX_DRAFT_TOKENS];
         let mut count = 0;
-        while count < maximum.min(7) {
+        while count < maximum.min(crate::execution::MAX_DRAFT_TOKENS) {
             let Some(token) = self.token(position) else { break };
             output[count] = i64::from(token.id);
             count += 1;
@@ -159,8 +159,8 @@ impl DecodedHistory {
         (output, count)
     }
 
-    pub(crate) fn lookup(&self, context: &[u32], maximum: usize) -> ([i64; 7], usize) {
-        if maximum == 0 { return ([-1; 7], 0) }
+    pub(crate) fn lookup(&self, context: &[u32], maximum: usize) -> ([i64; crate::execution::MAX_DRAFT_TOKENS], usize) {
+        if maximum == 0 { return ([-1; crate::execution::MAX_DRAFT_TOKENS], 0) }
         if context.len() >= 8 {
             if let Some(&position) = self.eight.get(&Key(context[context.len() - 8..].try_into().unwrap())) {
                 return self.continuation(position, 8, maximum);
@@ -171,7 +171,7 @@ impl DecodedHistory {
                 return self.continuation(position, 4, maximum);
             }
         }
-        ([-1; 7], 0)
+        ([-1; crate::execution::MAX_DRAFT_TOKENS], 0)
     }
 }
 
@@ -192,11 +192,11 @@ mod tests {
         append(&mut cache, &mut first, &[9, 10, 11, 12, 13, 14, 15, 16]);
         let mut second = DecodedSequence::default();
         append(&mut cache, &mut second, &[5, 6, 7, 8, 90, 91]);
-        assert_eq!(cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8], 99), ([9, 10, 11, 12, 13, 14, 15], 7));
-        assert_eq!(cache.lookup(&[5, 6, 7, 8], 7), ([90, 91, -1, -1, -1, -1, -1], 2));
-        assert_eq!(cache.lookup(&[5, 6, 7, 8], 1), ([90, -1, -1, -1, -1, -1, -1], 1));
-        assert_eq!(cache.lookup(&[5, 6, 7, 8], 0), ([-1; 7], 0));
-        assert_eq!(cache.lookup(&[6, 7, 8], 7), ([-1; 7], 0));
+        assert_eq!(cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8], 99), ([9, 10, 11, 12, 13, 14, 15, 16, -1, -1, -1, -1, -1, -1, -1], 8));
+        assert_eq!(cache.lookup(&[5, 6, 7, 8], 7), ([90, 91, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 2));
+        assert_eq!(cache.lookup(&[5, 6, 7, 8], 1), ([90, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 1));
+        assert_eq!(cache.lookup(&[5, 6, 7, 8], 0), ([-1; crate::execution::MAX_DRAFT_TOKENS], 0));
+        assert_eq!(cache.lookup(&[6, 7, 8], 7), ([-1; crate::execution::MAX_DRAFT_TOKENS], 0));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
         append(&mut cache, &mut delayed, &[1, 2, 3, 4]);
         append(&mut cache, &mut recent, &[1, 2, 3, 4, 90]);
         cache.append(&mut delayed, 50);
-        assert_eq!(cache.lookup(&[1, 2, 3, 4], 7), ([90, -1, -1, -1, -1, -1, -1], 1));
+        assert_eq!(cache.lookup(&[1, 2, 3, 4], 7), ([90, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 1));
         let mut noise = DecodedSequence::default();
         append(&mut cache, &mut noise, &[99; 26]);
         assert_eq!(cache.lookup(&[1, 2, 3, 4], 7).0[0], 90);
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(cache.lookup(&[1, 2, 3, 4], 7).0[0], 60);
     }
 
-    fn oracle(events: &[(u64, u32)], context: &[u32], capacity: usize) -> ([i64; 7], usize) {
+    fn oracle(events: &[(u64, u32)], context: &[u32], capacity: usize) -> ([i64; crate::execution::MAX_DRAFT_TOKENS], usize) {
         let mut sequences = std::collections::BTreeMap::<u64, Vec<(usize, u32)>>::new();
         for (position, &(sequence, token)) in events.iter().enumerate().skip(events.len().saturating_sub(capacity)) {
             sequences.entry(sequence).or_default().push((position, token));
@@ -232,7 +232,7 @@ mod tests {
                         && best.as_ref().is_none_or(|(position, _, _)| sequence[start].0 > *position)
                     {
                         let count = 7.min(sequence.len() - start - length);
-                        let mut output = [-1; 7];
+                        let mut output = [-1; crate::execution::MAX_DRAFT_TOKENS];
                         for i in 0..count { output[i] = i64::from(sequence[start + length + i].1); }
                         best = Some((sequence[start].0, output, count));
                     }
@@ -240,7 +240,7 @@ mod tests {
             }
             if let Some((_, output, count)) = best { return (output, count); }
         }
-        ([-1; 7], 0)
+        ([-1; crate::execution::MAX_DRAFT_TOKENS], 0)
     }
 
     #[test]

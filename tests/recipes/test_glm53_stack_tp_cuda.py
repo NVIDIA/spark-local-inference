@@ -116,7 +116,7 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
         requests = DeviceRequestState.allocate(device, vocab_size=154880,
             consumed_tokens=pool.consumed_tokens[1:5, 0]) if generate else None
         inputs = BatchInputs.allocate(capacity, 64, device) if generate else None
-        records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device) if generate else None
+        records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device) if generate else None
         frame = torch.zeros(1, dtype=torch.int32, device=device) if generate else None
         sequence = torch.zeros(1, dtype=torch.int64, device=device) if generate else None
         admission = AdmissionBuffers.allocate(device, vocab_size=154880) if checkpoint else None

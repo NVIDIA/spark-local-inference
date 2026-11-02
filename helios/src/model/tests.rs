@@ -405,7 +405,7 @@ fn completion_frontiers_follow_declared_history_cursor() {
         status: 1,
         vector: Some(crate::execution::TokenVector {
             emitted_count: 1,
-            tokens: [7, -1, -1, -1, -1, -1, -1, -1],
+            tokens: [7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             draft_cache_consumed: 64,
             ..Default::default()
         }),
@@ -744,7 +744,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             handle,
             CopyProposal {
                 consumed: 65,
-                tokens: [8, 9, -1, -1, -1, -1, -1],
+                tokens: [8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 count: 2,
                 grammar_masks: masks.clone(),
             },
@@ -799,7 +799,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             copy_offered_mask: 3,
             draft_cache_consumed: -1,
             verification_width: 8,
-            tokens: [10, -1, -1, -1, -1, -1, -1, -1],
+            tokens: [10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         }),
         ..Default::default()
@@ -812,7 +812,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             handle,
             CopyProposal {
                 consumed: 66,
-                tokens: [-1; 7],
+                tokens: [-1; crate::execution::MAX_DRAFT_TOKENS],
                 count: 0,
                 grammar_masks: vec![16; words],
             },
@@ -840,6 +840,18 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             .chunks_exact(4)
             .all(|b| i32::from_le_bytes(b.try_into().unwrap()) == 16)
     );
+}
+
+#[test]
+fn copy_proposal_capacity_tracks_prepared_token_and_grammar_extents() {
+    for width in [8, 16] {
+        let mut config = config();
+        config.speculative_widths = vec![1, width];
+        add_copy_inputs(&mut config);
+        let manifest = manifest(&config);
+        let inputs = Inputs::new(&config, &manifest).unwrap();
+        assert_eq!(inputs.copy_proposal_capacity(config.contract.vocabulary), width - 1);
+    }
 }
 
 fn add_copy_inputs(config: &mut ModelConfig) {

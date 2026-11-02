@@ -12,18 +12,18 @@ const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
 #[derive(Clone, Copy)]
 struct Forecast {
     request: RequestHandle,
-    prefixes: [speculation::PrefixEstimate; 7],
+    prefixes: [speculation::PrefixEstimate; crate::execution::MAX_DRAFT_TOKENS],
 }
 
 impl Forecast {
-    fn new(request: RequestHandle, prior: [f32; 7], generated: u32) -> Self {
+    fn new(request: RequestHandle, prior: [f32; crate::execution::MAX_DRAFT_TOKENS], generated: u32) -> Self {
         Self { request, prefixes: prior.map(|p| speculation::PrefixEstimate::new(f64::from(p), generated)) }
     }
 }
 
 pub(super) struct Forecasts {
     requests: [Option<Forecast>; REQUEST_LANES],
-    pub(super) population: [f32; 7],
+    pub(super) population: [f32; crate::execution::MAX_DRAFT_TOKENS],
 }
 
 impl Default for Forecasts {
@@ -33,7 +33,7 @@ impl Default for Forecasts {
 }
 
 pub(super) struct HostPrefixRanking {
-    probabilities: [[f64; 7]; REQUEST_LANES],
+    probabilities: [[f64; crate::execution::MAX_DRAFT_TOKENS]; REQUEST_LANES],
     ranks_by_slot: [Vec<usize>; REQUEST_LANES],
     slots_by_rank: Vec<usize>,
 }
@@ -71,7 +71,7 @@ impl RequestScheduler {
             .map(|lane| submission.lane_advance_ceiling(lane)).sum::<usize>()).sum()
     }
 
-    pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> [f64; 7] {
+    pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> [f64; crate::execution::MAX_DRAFT_TOKENS] {
         if self.proposal_source == speculation::ProposalSource::Mtp
             && self.capabilities.speculative_allocations.iter().any(|shape| shape.4 == crate::execution::PrefixAllocation::Gpu) {
             let forecast = self.forecasts.requests[request.handle.slot as usize]
@@ -151,7 +151,7 @@ impl RequestScheduler {
 
     pub(super) fn host_prefix_ranking(&self, available: &[usize], drafts: usize, width: usize,
         values: &[LaneValue; REQUEST_LANES], optimistic: bool) -> HostPrefixRanking {
-        let mut probabilities = [[0.0; 7]; REQUEST_LANES];
+        let mut probabilities = [[0.0; crate::execution::MAX_DRAFT_TOKENS]; REQUEST_LANES];
         let mut scores = Vec::new();
         for &slot in available {
             let request = self.slots[slot].request.as_ref().unwrap();
@@ -203,7 +203,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn observe_packed_forecasts(&mut self, step: &ScheduledStep,
-        records: &[CompletionRecord], confidence: &[[f32; 7]]) {
+        records: &[CompletionRecord], confidence: &[[f32; crate::execution::MAX_DRAFT_TOKENS]]) {
         for (row, lane) in step.lanes.iter().enumerate() {
             let record = &records[lane.request.slot as usize];
             let Some(vector) = record.vector else { continue; };

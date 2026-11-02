@@ -73,7 +73,7 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
     requests = DeviceRequestState.allocate(device)
     requests.admit(2, RequestAdmission(17, 93), [1, 2, 3, 4, 5], consumed_tokens=2)
     output = torch.arange(64 * 2560, device=device).reshape(64, 2560).bfloat16()
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     pool = GraphBufferPool(device, chunk_bytes=2 << 20)

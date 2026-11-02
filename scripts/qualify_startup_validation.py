@@ -100,7 +100,7 @@ def fixture(snapshot):
         ("state_num_ops", "int32", [1]),
         ("frame_index", "int32", [1]),
         ("submission_sequence", "int64", [1]),
-        ("completion_records", "int64", [2, 4, 24]),
+        ("completion_records", "int64", [2, 4, 32]),
     ]
     buffers, bindings = [], []
     address, host = 0x10000, 0
@@ -174,7 +174,7 @@ def cases(snapshot):
     add("overlapping-buffers", "overlap", lambda m, c:
         buffer(m, "row_generations").update(address=buffer(m, "row_slot_ids")["address"]))
     add("completion-layout", "required buffer layout", lambda m, c:
-        buffer(m, "completion_records").update(shape=[4, 2, 24], strides=[48, 24, 1]))
+        buffer(m, "completion_records").update(shape=[4, 2, 32], strides=[64, 32, 1]))
     add("missing-resume4", "lacks Resume/General graph with batch 4, tokens 1", lambda m, c:
         m.update(graphs=[g for g in m["graphs"] if g["name"] != "resume-4-1"]))
     add("missing-prefill512", "lacks Prefill/General graph with batch 1, tokens 512", lambda m, c:

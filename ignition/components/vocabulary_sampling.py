@@ -17,12 +17,14 @@ from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.triton import prepare_triton
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from .collectives import PreparedAllGather
+from .completion import MAX_OUTPUT_TOKENS
 from .markov_sampling import _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
 from .speculation import SpeculativeAcceptance, TARGET_RNG_DOMAIN, _geometry, _metadata, _tensor
 
 SUMMARY_WORDS = 32
 _WORDS = tl.constexpr(SUMMARY_WORDS)
 _TARGET_DOMAIN = tl.constexpr(TARGET_RNG_DOMAIN)
+_OUTPUT_TOKENS = tl.constexpr(MAX_OUTPUT_TOKENS)
 
 
 @triton.jit
@@ -246,24 +248,25 @@ def _selected_records(
     WIDTH: tl.constexpr,
     BLOCKS: tl.constexpr,
     PAD: tl.constexpr,
+    WORDS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    word = tl.arange(0, _WORDS)
-    tl.store(Summary + row * _WORDS + word, 0.0)
+    word = tl.arange(0, WORDS)
+    tl.store(Summary + row * WORDS + word, 0.0)
     tile = tl.arange(0, PAD)
     for step in tl.static_range(WIDTH):
         base = Partials + (row * WIDTH + step) * 3 * BLOCKS + tile
         pmass = tl.sum(tl.load(base, tile < BLOCKS, other=0.0), 0)
         qmass = tl.sum(tl.load(base + BLOCKS, tile < BLOCKS, other=0.0), 0)
-        tl.store(Summary + row * _WORDS + 16 + step, pmass)
-        tl.store(Summary + row * _WORDS + 24 + step, qmass)
+        tl.store(Summary + row * WORDS + 2 * (WORDS // 4) + step, pmass)
+        tl.store(Summary + row * WORDS + 3 * (WORDS // 4) + step, qmass)
         if step < WIDTH - 1:
             local_token = tl.load(Drafts + row * (WIDTH - 1) + step) - tl.load(VocabularyOffset)
             present = (local_token >= 0) & (local_token < LOCAL)
             p = tl.load(P + (row * WIDTH + step) * LOCAL + local_token, present, other=0.0)
             q = tl.load(Q + (row * (WIDTH - 1) + step) * LOCAL + local_token, present, other=0.0)
-            tl.store(Summary + row * _WORDS + step, p)
-            tl.store(Summary + row * _WORDS + 8 + step, q)
+            tl.store(Summary + row * WORDS + step, p)
+            tl.store(Summary + row * WORDS + WORDS // 4 + step, q)
 
 
 @triton.jit
@@ -289,12 +292,13 @@ def _correction_tiles(
     BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
+    WORDS: tl.constexpr,
 ):
     tile, row = tl.program_id(0), tl.program_id(1)
     rank = tl.arange(0, RANK_PAD)
     first_position = tl.program_id(2) * POS_PAD
     position = first_position + tl.arange(0, POS_PAD)
-    selected = Selected + (row * WORLD + rank) * _WORDS
+    selected = Selected + (row * WORLD + rank) * WORDS
     log_prefix = tl.full((), 0.0, tl.float32)
     prefix = tl.full((POS_PAD,), 0.0, tl.float32)
     for step in tl.static_range(WIDTH):
@@ -303,7 +307,7 @@ def _correction_tiles(
         if step < WIDTH - 1:
             if step < first_position + POS_PAD - 1:
                 p_chosen = tl.sum(tl.load(selected + step, rank < WORLD, other=0.0), 0)
-                q_chosen = tl.sum(tl.load(selected + 8 + step, rank < WORLD, other=0.0), 0)
+                q_chosen = tl.sum(tl.load(selected + WORDS // 4 + step, rank < WORLD, other=0.0), 0)
                 log_prefix = tl.minimum(log_prefix + tl.log(p_chosen) - tl.log(q_chosen), 0.0)
     local = tile * BLOCK + tl.arange(0, BLOCK)
     token = tl.load(VocabularyOffset) + local
@@ -331,7 +335,7 @@ def _correction_tiles(
 
 
 @triton.jit
-def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr):
+def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr, WORDS: tl.constexpr):
     distribution = tl.program_id(0)
     tile = tl.arange(0, PAD)
     base = Partials + distribution * 3 * BLOCKS + tile
@@ -340,11 +344,11 @@ def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constex
     ids = tl.load(base + 2 * BLOCKS, tile < BLOCKS, other=0.0)
     winner = tl.argmax(scores, 0, tie_break_left=True)
     token = tl.sum(tl.where(tile == winner, ids, 0.0), 0)
-    word = tl.arange(0, _WORDS)
+    word = tl.arange(0, WORDS)
     record = tl.where(
         word == 0, tl.sum(masses, 0), tl.where(word == 1, tl.max(scores, 0), tl.where(word == 2, token, 0.0))
     )
-    tl.store(Summary + distribution * _WORDS + word, record)
+    tl.store(Summary + distribution * WORDS + word, record)
 
 
 @triton.jit
@@ -379,10 +383,11 @@ def _complete_block(
     RUNNING: tl.constexpr,
     RESERVATION: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
+    WORDS: tl.constexpr,
 ):
     row = tl.program_id(0)
     rank = tl.arange(0, RANK_PAD)
-    records = Selected + (row * WORLD + rank) * _WORDS
+    records = Selected + (row * WORLD + rank) * WORDS
     limit = tl.load(Limits + row) if HAS_LIMITS else WIDTH
     valid = (
         (limit >= 1)
@@ -394,17 +399,17 @@ def _complete_block(
     offset = tl.where(tl.load(RngGeneration + slot) == tl.load(Generations + row), tl.load(RngOffset + slot), 0)
     log_prefix, survival = tl.full((), 0.0, tl.float32), tl.full((), 1.0, tl.float32)
     accepted = tl.full((), 0, tl.int32)
-    step_ids = tl.arange(0, 8)
-    survivals = tl.full((8,), -1.0, tl.float32)
+    step_ids = tl.arange(0, _OUTPUT_TOKENS)
+    survivals = tl.full((_OUTPUT_TOKENS,), -1.0, tl.float32)
     for step in tl.static_range(WIDTH):
         if step < limit:
-            mass = tl.sum(tl.load(records + 16 + step, rank < WORLD, other=0.0), 0)
+            mass = tl.sum(tl.load(records + 2 * (WORDS // 4) + step, rank < WORLD, other=0.0), 0)
             valid &= (tl.abs(mass - 1) <= 1e-4) & tl.load(TargetValid + row * WIDTH + step)
             if step < WIDTH - 1:
                 if step < limit - 1:
-                    qmass = tl.sum(tl.load(records + 24 + step, rank < WORLD, other=0.0), 0)
+                    qmass = tl.sum(tl.load(records + 3 * (WORDS // 4) + step, rank < WORLD, other=0.0), 0)
                     token = tl.load(Drafts + row * (WIDTH - 1) + step)
-                    q = tl.sum(tl.load(records + 8 + step, rank < WORLD, other=0.0), 0)
+                    q = tl.sum(tl.load(records + WORDS // 4 + step, rank < WORLD, other=0.0), 0)
                     p = tl.sum(tl.load(records + step, rank < WORLD, other=0.0), 0)
                     valid &= (
                         (tl.abs(qmass - 1) <= 1e-4)
@@ -417,7 +422,7 @@ def _complete_block(
                     prefix = tl.exp(log_prefix)
                     probability = prefix
                     if step < limit - 2:
-                        next_record = Residual + ((row * WIDTH + step + 1) * WORLD + rank) * _WORDS
+                        next_record = Residual + ((row * WIDTH + step + 1) * WORLD + rank) * WORDS
                         mass = tl.sum(tl.load(next_record, rank < WORLD, other=0.0), 0)
                         denominator = mass + 1.0 - prefix
                         probability = tl.where(denominator > 0, mass / denominator, 1.0)
@@ -427,7 +432,7 @@ def _complete_block(
                     accepted = tl.where(draw <= probability, step + 1, accepted)
                     survival *= tl.minimum(tl.div_rn(p, q), 1.0)
                     survivals = tl.where(step_ids == step, survival, survivals)
-    correction = Residual + ((row * WIDTH + accepted) * WORLD + rank) * _WORDS
+    correction = Residual + ((row * WIDTH + accepted) * WORLD + rank) * WORDS
     winners = tl.load(correction + 1, rank < WORLD, other=-float("inf"))
     selected_rank = tl.argmax(winners, 0, tie_break_left=True)
     ids = tl.load(correction + 2, rank < WORLD, other=0.0)
@@ -436,7 +441,7 @@ def _complete_block(
     draft = tl.load(Drafts + row * (WIDTH - 1) + step_ids, step_ids < WIDTH - 1, other=-1)
     output = tl.where(step_ids < accepted, draft, next_token)
     tl.store(Tokens + row * WIDTH + step_ids, tl.where(valid & (step_ids <= accepted), output, -1), step_ids < WIDTH)
-    tl.store(Survival + row * 7 + step_ids, tl.where(valid, survivals, -1.0), step_ids < 7)
+    tl.store(Survival + row * (_OUTPUT_TOKENS - 1) + step_ids, tl.where(valid, survivals, -1.0), step_ids < _OUTPUT_TOKENS - 1)
     tl.store(Valid + row, valid)
     tl.store(Offered + row, tl.minimum(tl.maximum(limit - 1, 0), WIDTH - 1))
     tl.store(Accepted + row, tl.where(valid, accepted, 0))
@@ -753,13 +758,14 @@ class PreparedVocabularyBlockVerification:
         self.output.validate(b, w, device)
         self.draw_reservation = 4 * ((w + 1 + 3) // 4)
         blocks = triton.cdiv(local, 256)
+        self.summary_words = max(SUMMARY_WORDS, 4 * triton.next_power_of_2(w))
         self.scratch = bind_scratch(
             dict(
                 partials=((b, w, 3, blocks), torch.float32),
-                selected_summary=((b, SUMMARY_WORDS), torch.float32),
-                selected=((b, world * SUMMARY_WORDS), torch.float32),
-                residual_summary=((b * w, SUMMARY_WORDS), torch.float32),
-                residual=((b * w, world * SUMMARY_WORDS), torch.float32),
+                selected_summary=((b, self.summary_words), torch.float32),
+                selected=((b, world * self.summary_words), torch.float32),
+                residual_summary=((b * w, self.summary_words), torch.float32),
+                residual=((b * w, world * self.summary_words), torch.float32),
             ),
             device=device,
             workspace=workspace,
@@ -805,6 +811,7 @@ class PreparedVocabularyBlockVerification:
             WIDTH=w,
             BLOCKS=blocks,
             PAD=triton.next_power_of_2(blocks),
+            WORDS=self.summary_words,
             num_warps=4,
         )
         # Two positions share prefix work while retaining enough independent
@@ -836,6 +843,7 @@ class PreparedVocabularyBlockVerification:
             BLOCKS=blocks,
             BLOCK=256,
             HAS_LIMITS=self.limits is not None,
+            WORDS=self.summary_words,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -845,6 +853,7 @@ class PreparedVocabularyBlockVerification:
             (b * w, 1, 1),
             BLOCKS=blocks,
             PAD=triton.next_power_of_2(blocks),
+            WORDS=self.summary_words,
             num_warps=4,
         )
         finish = prepare_triton(
@@ -882,6 +891,7 @@ class PreparedVocabularyBlockVerification:
             RUNNING=RUNNING,
             RESERVATION=self.draw_reservation,
             HAS_LIMITS=self.limits is not None,
+            WORDS=self.summary_words,
             num_warps=4,
             enable_fp_fusion=False,
         )

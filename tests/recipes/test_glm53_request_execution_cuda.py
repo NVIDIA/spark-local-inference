@@ -35,7 +35,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("rank", [0, 3])
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [32])
 @torch.no_grad()
 def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -130,7 +130,7 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
         assert record[5:8] == [2 if rank == 0 else 1, 0, 0]
         assert requests.rng_counter[2].item() == (2 if rank == 0 else 0)
         assert requests.histogram[2].sum().item() == 65 + (2 if rank == 0 else 0)
-        if fields == 24:
+        if fields == 32:
             assert record[8] == int(rank == 0)
             assert record[16] == record[4]
         assert executor.outstanding == 0

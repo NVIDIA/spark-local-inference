@@ -67,7 +67,7 @@ def test_pooled_encoder_publication_matches_unpooled_after_poisoning(weights, ca
     requests = DeviceRequestState.allocate(device, vocab_size=config["vocab_size"], capacity=2)
     requests.generation[0], requests.status[0] = 7, 1
     batch = BatchInputs.allocate(capacity, 1, device, capacity=2)
-    records = torch.zeros((2, 2, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 2, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     graphs, owners, states = {}, [], []

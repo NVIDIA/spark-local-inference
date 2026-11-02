@@ -17,7 +17,7 @@ def execution(**changes):
         signatures={"decode": GraphSignature("decode", 1, 1, ("tokens",))},
         buffers={"frame_index": torch.zeros(1, dtype=torch.int32),
                  "submission_sequence": torch.zeros(1, dtype=torch.int64),
-                 "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64),
+                 "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64),
                  "tokens": torch.zeros(1, dtype=torch.int64),
                  "selector": torch.ones(1, dtype=torch.int32),
                  "status": torch.ones(1, dtype=torch.int32)},
@@ -32,7 +32,7 @@ def test_manifest_has_separate_tuners_without_host_uploads(monkeypatch):
              for index, tensor in enumerate(bundle.buffers.values())]
     monkeypatch.setattr(bundle, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = bundle.manifest()
-    assert manifest["abi_version"] == 5
+    assert manifest["abi_version"] == 6
     assert set(bundle.signatures) == set(bundle.estimated_durations_ns) == {"decode"}
     assert set(bundle.graphs) == {"decode", "choose"}
     assert manifest["tuning_graphs"] == [dict(name="choose", handle=12,

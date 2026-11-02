@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("batch,depth", [(1, 1), (1, 7), (8, 3), (32, 1), (32, 5), (64, 7)])
+@pytest.mark.parametrize("batch,depth", [(1, 1), (1, 7), (1, 15), (8, 15), (8, 3), (32, 1), (32, 5), (64, 7)])
 @torch.no_grad()
 def test_eager_captured_prefix_oracle_and_allocation_stability(batch, depth):
     rng = random.Random(batch * 100 + depth)

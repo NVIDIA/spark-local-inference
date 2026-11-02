@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .completion import CompletionOutputs
+from .completion import CompletionOutputs, VECTOR_RECORD_FIELDS
 from .logprobs import PreparedLogprobs
 from .capacity import BATCH_CAPACITIES
 from .flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, sample_probabilities
@@ -409,8 +409,8 @@ def _check_tensor(tensor, shape, dtype, device, name, *, contiguous=True):
 
 
 def _completion_fields(records, device, capacity=4):
-    if records.ndim != 3 or records.shape[:2] != (2, capacity) or records.shape[2] != 24:
-        raise ValueError("completion_records requires [2,capacity,24]")
+    if records.ndim != 3 or records.shape[:2] != (2, capacity) or records.shape[2] != VECTOR_RECORD_FIELDS:
+        raise ValueError("completion_records requires [2,capacity,32]")
     _check_tensor(records, records.shape, torch.int64, device, "completion_records")
     return records.shape[2]
 

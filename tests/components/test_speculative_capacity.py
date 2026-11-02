@@ -79,3 +79,20 @@ def test_kimi_parallel_rounds_have_packed_target_capacity():
                                speculative_token_capacity=4, draft_checkpoint="/tmp/dspark")
     assert (2, 4, 3) in config.speculative_round_shapes
     assert config.decode_tokens == 4 and config.decode_samples == 8
+
+
+def test_shared_catalogs_cover_fifteen_drafts_with_bounded_target_rows():
+    from ignition.components.capacity import parallel_speculative_shapes
+
+    widths = tuple(range(1, 17))
+    shapes = speculative_shapes(4, widths, 32)
+    assert (1, 16) in shapes and (2, 16) in shapes and (4, 16) not in shapes
+    assert set(proposal_shapes(4, 15)) == {(1, 15), (2, 15), (4, 15)}
+    rounds = parallel_speculative_shapes(4, widths, 32)
+    assert (1, 16, 16) in rounds and (2, 16, 32) in rounds and (4, 16, 32) in rounds
+    assert all(width == 1 or batch < packed <= min(32, batch * width)
+               for batch, width, packed in rounds)
+    with pytest.raises(ValueError, match="sixteen"):
+        speculative_shapes(4, (*widths, 17), 32)
+    with pytest.raises(ValueError, match="proposal depth"):
+        proposal_shapes(4, 16)

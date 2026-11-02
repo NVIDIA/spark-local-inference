@@ -20,7 +20,7 @@ from ignition.components.capacity import (
     speculative_shapes,
     speculative_token_capacity,
 )
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_RECORD_FIELDS
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -217,7 +217,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_RECORD_FIELDS), device=device)
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None

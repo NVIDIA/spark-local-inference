@@ -47,7 +47,7 @@ def test_native_replay_reads_full_tables_without_checkpoint_files(tmp_path, rank
     count = torch.full((1,), tokens, dtype=torch.int32, device=device)
     source = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     mailbox = MappedHostAllocation((tokens * 24 + 1,), torch.int64, device)
     mailbox.host_view.zero_()
     worker = graph = None

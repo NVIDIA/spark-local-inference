@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_RECORD_FIELDS
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -148,7 +148,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_RECORD_FIELDS), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "draft": weights.config.draft.text if drafting else None,

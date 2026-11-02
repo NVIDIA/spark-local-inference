@@ -1427,7 +1427,7 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
 #[test]
 fn speculative_width_catalog_is_validated() {
     use super::speculation::validate_widths;
-    for bad in [vec![2], vec![1, 9], vec![1, 4, 2]] {
+    for bad in [vec![2], vec![1, 17], vec![1, 4, 2]] {
         assert!(validate_widths(&bad).is_err());
     }
 }
@@ -1455,7 +1455,7 @@ fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining
     assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
     assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).1, 0);
     s.complete(Fence(4), &completion, Default::default()).unwrap();
-    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1], 2));
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 2));
     assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
     assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
     s.cancel(h).unwrap();
@@ -1877,7 +1877,7 @@ fn fixed_and_adaptive_widths_are_independent_of_batch_capacity() {
 }
 
 fn copied(consumed: u64, count: usize, grammar: bool) -> speculation::CopyProposal {
-    let mut tokens = [-1; 7];
+    let mut tokens = [-1; crate::execution::MAX_DRAFT_TOKENS];
     for (index, token) in tokens[..count].iter_mut().enumerate() {
         *token = index as i64 + 10;
     }
@@ -2047,7 +2047,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
     retain_prompt(&mut s, 4);
     let mut proposal = speculation::CopyProposal {
         consumed: 4,
-        tokens: [32, -1, -1, -1, -1, -1, -1],
+        tokens: [32, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
         count: 1,
         grammar_masks: vec![],
     };

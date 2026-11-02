@@ -123,7 +123,7 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
         batch = BatchInputs.allocate(n, 2, device, capacity=2)
         state = VisionState(batch, PrefillVisionInputs.allocate(n, device), requests,
                             image_token=163605, features=16384, hidden=448)
-        records = torch.zeros((2,2, 24), dtype=torch.int64, device=device)
+        records = torch.zeros((2,2, 32), dtype=torch.int64, device=device)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.ones(1, dtype=torch.int64, device=device)
         # TP ranks bind publication scratch at identical offsets after encoder buffers.

@@ -130,6 +130,10 @@ class PreparationConfig:
         return tuple(sorted({(b, w) for b, w, _ in self.speculative_round_shapes}))
 
     @property
+    def verification_width(self):
+        return max(self.speculative_widths) if self.mtp else 1
+
+    @property
     def decode_tokens(self):
         if self.benchmark_selection is not None and self.benchmark_selection.speculation_study:
             return self.benchmark_selection.width
@@ -188,7 +192,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     release_unused()
     study_widths = (() if config.benchmark_selection is None
                     else config.benchmark_selection.selected_study_widths)
-    verification_width = max(study_widths, default=8)
+    verification_width = max((config.verification_width, *study_widths))
     layout = continuation_layout(weights.config, mtp=config.mtp, verification_width=verification_width)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if snapshots < 1:
@@ -210,12 +214,13 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 32), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],
             "draft": None if weights.config.draft is None else weights.config.draft.text,
             "draft_headers": draft_headers,
+            "draft_block_size": config.verification_width if config.mtp else None,
             **({} if not study_widths else {"speculation_study_blocks": study_widths}),
             "online_mxfp8": config.online_mxfp8,
             "draft_head_quantization": config.draft_head_quantization,
@@ -245,7 +250,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         if config.mtp and config.speculative_round_shapes:
             speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
                 completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
-                buffers=draft_buffers.cursor(), decoder_buffers=target_buffers, context_buffers=context_buffers)
+                buffers=draft_buffers.cursor(), decoder_buffers=target_buffers, context_buffers=context_buffers,
+                verification_width=config.verification_width)
         study_owners = {}
         for study_width in study_widths:
             study_owners[study_width] = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,

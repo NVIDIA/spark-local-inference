@@ -48,7 +48,7 @@ def _run(rank, world, rendezvous=None):
         inputs, commands = BatchInputs.allocate(1, 3, device), StateCommands.allocate(device)
         inputs.request_state_rows[:, 0] = torch.tensor([6, 3, 1, 4], device=device)
         admission = AdmissionBuffers.allocate(device, vocab_size=154880)
-        records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+        records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.ones(1, dtype=torch.int64, device=device)
         operations = {}

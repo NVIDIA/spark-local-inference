@@ -1968,6 +1968,11 @@ impl<'a> Worker<'a> {
             == crate::scheduler::speculation::ProposalSource::Copy
             && outstanding == 0
         {
+            let prepared_copy_capacity = self.inputs.as_ref()
+                .ok_or("copy proposals require prepared inputs")?
+                .copy_proposal_capacity(self.config.contract.vocabulary);
+            let copy_capacity = self.config.speculative_widths.iter().copied().max()
+                .unwrap_or(1).saturating_sub(1).min(prepared_copy_capacity);
             for slot in 0..self.active.len() {
                 let Some(request) = self.active[slot].as_ref() else {
                     continue;
@@ -1977,7 +1982,7 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { 7 }),
+                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { copy_capacity }),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
                     &self.config.eos_token_ids,
@@ -2590,11 +2595,14 @@ fn cancel_stopped(
 }
 
 fn prepare_copy_proposal(
-    (mut ids, mut count): ([i64; 7], usize),
+    (mut ids, mut count): ([i64; crate::execution::MAX_DRAFT_TOKENS], usize),
     consumed: u64,
     grammar: Option<&crate::grammar::RequestGrammar>,
     eos_ids: &[u32],
 ) -> Result<crate::scheduler::speculation::CopyProposal> {
+    if count > ids.len() {
+        return Err("copied-token count exceeds proposal storage".into());
+    }
     if let Some(end) = ids[..count]
         .iter()
         .position(|id| eos_ids.contains(&(*id as u32)))
@@ -2755,13 +2763,13 @@ mod tests {
 
     #[test]
     fn copy_preparation_trims_eos_and_preserves_empty_proposals() {
-        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
+        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
         assert_eq!(copy.count, 1);
-        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1]);
+        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
         assert_eq!(copy.consumed, 11);
         assert!(copy.grammar_masks.is_empty());
-        let empty = prepare_copy_proposal(([-1; 7], 0), 11, None, &[12]).unwrap();
-        assert_eq!((empty.count, empty.tokens), (0, [-1; 7]));
+        let empty = prepare_copy_proposal(([-1; crate::execution::MAX_DRAFT_TOKENS], 0), 11, None, &[12]).unwrap();
+        assert_eq!((empty.count, empty.tokens), (0, [-1; crate::execution::MAX_DRAFT_TOKENS]));
     }
 
     #[test]
@@ -3178,7 +3186,7 @@ mod tests {
                 failed,
                 crate::scheduler::speculation::CopyProposal {
                     consumed: 1,
-                    tokens: [1, 2, 3, -1, -1, -1, -1],
+                    tokens: [1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                     count,
                     grammar_masks,
                 },
@@ -3210,7 +3218,7 @@ mod tests {
                 accepted_drafts: 2,
                 draft_cache_consumed: -1,
                 verification_width: 4,
-                tokens: [4, 1, 2, -1, -1, -1, -1, -1],
+                tokens: [4, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             }),
             ..Default::default()

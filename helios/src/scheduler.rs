@@ -438,7 +438,7 @@ impl ScheduledStep {
 
     pub fn validate_mixed(&self) -> Result<()> {
         if self.kind == GraphKind::Speculative {
-            if self.draft_tokens > 7 || !(1..=8).contains(&self.token_capacity)
+            if self.draft_tokens > crate::execution::MAX_DRAFT_TOKENS || !(1..=crate::execution::MAX_OUTPUT_TOKENS).contains(&self.token_capacity)
                 || (self.token_capacity == 1 && self.draft_tokens != 0)
                 || self.packed_token_capacity < self.batch_capacity
                 || !crate::execution::BATCH_CAPACITIES.contains(&self.batch_capacity)
@@ -466,7 +466,7 @@ impl ScheduledStep {
                     && m.prefill_capacity >= 64
                     && m.prefill_capacity.is_multiple_of(64)
                     && m.prefill_row.is_none_or(|row| row < self.lanes.len())
-                    && (1..=8).contains(&self.token_capacity)
+                    && (1..=crate::execution::MAX_OUTPUT_TOKENS).contains(&self.token_capacity)
                     && (m.speculative || self.token_capacity == 1)
                     && self.lanes.iter().enumerate().all(|(row, lane)| {
                         lane.tokens > 0
@@ -946,7 +946,7 @@ impl RequestScheduler {
         if request.phase != RequestPhase::Decode
             || request.pending != 0
             || proposal.consumed != request.consumed_tokens
-            || proposal.count > 7
+            || proposal.count > crate::execution::MAX_DRAFT_TOKENS
             || proposal.tokens[..proposal.count]
                 .iter()
                 .any(|id| *id < 0 || *id >= vocabulary as i64)
@@ -976,8 +976,8 @@ impl RequestScheduler {
         Ok(())
     }
 
-    pub fn history_proposal(&self, context: &[u32], maximum: usize) -> ([i64; 7], usize) {
-        self.decoded_history.as_ref().map_or(([-1; 7], 0), |history| history.lookup(context, maximum))
+    pub fn history_proposal(&self, context: &[u32], maximum: usize) -> ([i64; crate::execution::MAX_DRAFT_TOKENS], usize) {
+        self.decoded_history.as_ref().map_or(([-1; crate::execution::MAX_DRAFT_TOKENS], 0), |history| history.lookup(context, maximum))
     }
 
     #[cfg(feature = "server")]
@@ -2248,7 +2248,7 @@ impl RequestScheduler {
         fence: Fence,
         records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming,
-        survival: Option<&[[f32; 7]]>,
+        survival: Option<&[[f32; crate::execution::MAX_DRAFT_TOKENS]]>,
     ) -> Result<Vec<GeneratedToken>> {
         if self.submissions.get(&fence).is_some_and(|s| s.kind == GraphKind::Speculative && s.draft_tokens > 0
             && self.gpu_prefix_allocation(s.batch_capacity, s.draft_tokens, s.token_capacity, s.packed_token_capacity)) {
@@ -2262,7 +2262,7 @@ impl RequestScheduler {
         fence: Fence,
         records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming,
-        confidence: &[[f32; 7]],
+        confidence: &[[f32; crate::execution::MAX_DRAFT_TOKENS]],
     ) -> Result<Vec<GeneratedToken>> {
         self.complete_packed_round_with_survival(fence, records, timing, confidence, None)
     }
@@ -2272,8 +2272,8 @@ impl RequestScheduler {
         fence: Fence,
         records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming,
-        confidence: &[[f32; 7]],
-        survival: Option<&[[f32; 7]]>,
+        confidence: &[[f32; crate::execution::MAX_DRAFT_TOKENS]],
+        survival: Option<&[[f32; crate::execution::MAX_DRAFT_TOKENS]]>,
     ) -> Result<Vec<GeneratedToken>> {
         let step = self.submissions.get(&fence)
             .ok_or("speculative round completion has no submission")?.step.clone();
@@ -2292,7 +2292,7 @@ impl RequestScheduler {
         fence: Fence,
         records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming,
-        survival: Option<&[[f32; 7]]>,
+        survival: Option<&[[f32; crate::execution::MAX_DRAFT_TOKENS]]>,
     ) -> Result<Vec<GeneratedToken>> {
         if records.len() < self.limits.request_capacity() || records.len() > REQUEST_LANES {
             return Err("completion does not cover the prepared request capacity".into());
@@ -2321,7 +2321,7 @@ impl RequestScheduler {
             for lane in &step.lanes {
                 let record = &records[lane.request.slot as usize];
                 record.validate_vector()?;
-                let vector = record.vector.ok_or("speculative round completion requires ABI5")?;
+                let vector = record.vector.ok_or("speculative round completion requires ABI6")?;
                 if record.status != 0 && record.status != 3 {
                     let offered = usize::try_from(vector.offered_drafts)
                         .map_err(|_| "negative speculative prefix offer")?;
@@ -2398,7 +2398,7 @@ impl RequestScheduler {
                     return Err("token vector does not match committed request progress".into());
                 }
             } else if matches!(kind, GraphKind::Speculative) {
-                return Err("speculative completion requires ABI5 token vector".into());
+                return Err("speculative completion requires ABI6 token vector".into());
             }
             if record.generation != lane.request.generation as i64
                 || record.submission_sequence != fence.0 as i64

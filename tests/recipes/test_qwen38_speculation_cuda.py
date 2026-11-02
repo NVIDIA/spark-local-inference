@@ -79,7 +79,7 @@ def tensors(batch, width):
     epochs = torch.full((batch,), 7, device="cuda", dtype=torch.int64)
     live = torch.tensor([batch], device="cuda", dtype=torch.int32)
     inputs = torch.arange(3, 3 + width, device="cuda").expand(batch, -1).contiguous()
-    records = torch.full((2, 4, 24), -99, device="cuda", dtype=torch.int64)
+    records = torch.full((2, 4, 32), -99, device="cuda", dtype=torch.int64)
     frame = torch.tensor([0], device="cuda", dtype=torch.int32)
     sequence = torch.tensor([1], device="cuda", dtype=torch.int64)
     for slot in range(4):
@@ -129,7 +129,7 @@ def captured(run, resources, buffers, restore=lambda: None):
         graph.reset()
 
 
-@pytest.mark.parametrize("width", range(1, 9))
+@pytest.mark.parametrize("width", range(1, 17))
 def test_native_flashinfer_one_hot_all_prefix_lengths_and_clipping(width):
     args = tensors(4, width)
     state, slots, epochs, live, inputs, records, frame, sequence = args
@@ -167,6 +167,11 @@ def test_native_flashinfer_one_hot_all_prefix_lengths_and_clipping(width):
             replay()
             assert commit.emitted_count.cpu().tolist() == [accepted + 1] * 4
             assert commit.commit_column.cpu().tolist() == [accepted] * 4
+            for record in records[accepted % 2]:
+                assert record[8].item() == accepted + 1
+                assert record[15].item() == width
+                assert record[16:17 + accepted].tolist() == list(range(4, 4 + accepted)) + [100]
+                assert record[17 + accepted:].eq(-1).all()
             assert state.pending_token.cpu().tolist() == [100] * 4
             assert state.consumed_tokens.cpu().tolist() == [64 + accepted] * 4
         restore()
@@ -285,7 +290,7 @@ def test_native_conditional_filtering_full_vocabulary_ties_and_masks():
         assert op.probabilities[0, 1:, 0].eq(1).all() and op.probabilities[3, :, 0].eq(1).all()
 
 
-@pytest.mark.parametrize("width", range(1, 9))
+@pytest.mark.parametrize("width", range(1, 17))
 @pytest.mark.parametrize("compiled", [False, True])
 def test_native_flashinfer_chain_accept_reject_rng_and_budget(width, compiled):
     args = tensors(4, width)

@@ -399,8 +399,8 @@ fn speculative_survival_is_optional_and_validated_per_rank_without_numeric_conse
             ..Default::default()
         });
     }
-    let mut values = [[-1.; 7]; 64];
-    values[..4].fill([0.75, 0.5, 0.25, -1., -1., -1., -1.]);
+    let mut values = [[-1.; crate::execution::MAX_DRAFT_TOKENS]; 64];
+    values[..4].fill([0.75, 0.5, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.]);
     root.speculative_survival = Some(values);
     let mut peer = completed(1);
     peer.records = root.records.clone();
@@ -458,7 +458,7 @@ fn rank_completion_requires_every_record() {
 #[test]
 fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     let mut root = completed(1);
-    root.proposal_confidence = Some([[0.5; 7]; 64]);
+    root.proposal_confidence = Some([[0.5; crate::execution::MAX_DRAFT_TOKENS]; 64]);
     let mut peer = completed(1);
     assert!(agree(&root, &peer).is_err());
     peer.proposal_confidence = root.proposal_confidence;
@@ -479,7 +479,7 @@ fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
 fn proposal_confidence_validates_each_rank_without_changing_root_values() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.0; 7]; 64]);
+    root.proposal_confidence = Some([[0.0; crate::execution::MAX_DRAFT_TOKENS]; 64]);
     peer.proposal_confidence = root.proposal_confidence;
     root.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79148d);
     peer.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79149e);
@@ -503,7 +503,7 @@ fn proposal_confidence_validates_each_rank_without_changing_root_values() {
 fn rank_zero_confidence_is_authoritative_without_relaxing_request_agreement() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.5; 7]; 64]);
+    root.proposal_confidence = Some([[0.5; crate::execution::MAX_DRAFT_TOKENS]; 64]);
     peer.proposal_confidence = root.proposal_confidence;
     root.proposal_confidence.as_mut().unwrap()[2][2] = 0.51028365;
     peer.proposal_confidence.as_mut().unwrap()[2][2] = 0.5102996;

@@ -42,11 +42,11 @@ def test_private_commit_every_accepted_prefix(width, clipping):
         assert commit.emitted_ids[0, count:].eq(-1).all()
 
 
-def test_private_width_does_not_relax_native_signature_or_commit():
+def test_native_signature_and_commit_reject_width_beyond_sixteen():
     from ignition.components.speculation import PreparedSpeculativeCommit
     from ignition.preparation.execution import GraphSignature
 
-    for width in (13, 16):
+    for width in (17, 32):
         with pytest.raises(ValueError):
             GraphSignature("speculative", 1, width, ())
         with pytest.raises(ValueError, match="native speculative commit"):

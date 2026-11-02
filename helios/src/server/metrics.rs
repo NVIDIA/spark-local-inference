@@ -233,8 +233,8 @@ pub(super) struct Metrics {
     replay_readiness_samples: AtomicU64,
     launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
-    speculative: [[RoundMetrics; 8]; 7],
-    draft_sources: [[[AtomicU64; 2]; 2]; 7],
+    speculative: [[RoundMetrics; crate::execution::MAX_OUTPUT_TOKENS]; 7],
+    draft_sources: [[[AtomicU64; 2]; 2]; crate::execution::MAX_DRAFT_TOKENS],
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
     cache_lookups: AtomicU64,
@@ -777,7 +777,7 @@ impl Metrics {
                 .into_iter()
                 .zip(&self.speculative)
             {
-                for (width, counts) in (1..=8).zip(widths) {
+                for (width, counts) in (1..=crate::execution::MAX_OUTPUT_TOKENS).zip(widths) {
                     let value = match metric {
                         "rounds_total" => &counts.rounds,
                         "gpu_nanoseconds_total" => &counts.gpu_ns,
@@ -1550,4 +1550,18 @@ mod tests {
             9
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn sixteen_width_metrics_include_fifteenth_draft() {
+    let metrics = Metrics::default();
+    let record = CompletionRecord { status: 1,
+        vector: Some(crate::execution::TokenVector { verification_width: 16, emitted_count: 16,
+            offered_drafts: 15, accepted_drafts: 15, copy_offered_mask: 1 << 14,
+            ..Default::default() }), ..Default::default() };
+    metrics.speculative_completed(1, 16, 15, 1000, &[record]);
+    let text = metrics.render();
+    assert!(text.contains("flare_speculative_rounds_total{batch=\"1\",width=\"16\"} 1"));
+    assert!(text.contains("flare_speculative_drafts_total{depth=\"15\",source=\"copy\",outcome=\"accepted\"} 1"));
 }

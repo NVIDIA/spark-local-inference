@@ -39,6 +39,8 @@ from types import MappingProxyType
 
 import numpy as np
 
+from ignition.components.capacity import MAX_OUTPUT_TOKENS
+
 from .policy import Accounting, Policy
 
 INACTIVE, RUNNING, FINISHED, ERROR = 0, 1, 2, 3
@@ -75,14 +77,14 @@ class Layout:
     fixed_width: int | None = None
     state_rows_per_request: int | None = None
     draft_pages: int = 0
-    record_fields: int = 24
+    record_fields: int = 32
     confidence_widths: dict = field(default_factory=dict)
     completion_cursors: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
             raise ValueError("direct execution requires positive pages and slots within request capacity")
-        if self.record_fields != 24:
+        if self.record_fields != 32:
             raise ValueError("completions require token-vector records")
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
 
@@ -201,7 +203,7 @@ class Acceptance:
     MEMORY = 128.
 
     def __init__(self):
-        self.depths = [[.5, 2.] for _ in range(7)]
+        self.depths = [[.5, 2.] for _ in range(MAX_OUTPUT_TOKENS - 1)]
         self.native_confidence = False
 
     def confidence(self, values):
@@ -224,7 +226,7 @@ class Acceptance:
     def expected(self, width):
         """Expected tokens one round of `width` emits: the pending token, then each accepted draft."""
         chain, total = 1., float(width != 0)
-        for probability, _ in self.depths[:min(max(width - 1, 0), 7)]:
+        for probability, _ in self.depths[:min(max(width - 1, 0), MAX_OUTPUT_TOKENS - 1)]:
             chain *= probability
             total += chain
         return total
@@ -232,7 +234,7 @@ class Acceptance:
     def expectations(self, maximum):
         """`expected(width)` for every width through `maximum`, computed in one pass."""
         chain, total, values = 1., 1., [0., 1.]
-        for probability, _ in self.depths[:min(max(maximum - 1, 0), 7)]:
+        for probability, _ in self.depths[:min(max(maximum - 1, 0), MAX_OUTPUT_TOKENS - 1)]:
             chain *= probability
             total += chain
             values.append(total)
@@ -664,7 +666,7 @@ class Scheduler:
                 raise CompletionError("packed completion is inactive, stale, or has an invalid frozen ceiling")
             width = int(record[15])
             tokens = record[16:16 + max(emitted, 0)]
-            if (not 1 <= width <= 8 or not 0 <= emitted <= width or not 0 <= offered < width
+            if (not 1 <= width <= MAX_OUTPUT_TOKENS or not 0 <= emitted <= width or not 0 <= offered < width
                     or not max(emitted - 1, 0) <= accepted <= min(emitted, offered)
                     or record[7] != 0 or record[11] != 0 or record[12] != -1
                     or record[13] < -1 or record[14] != 0

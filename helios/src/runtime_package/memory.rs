@@ -282,7 +282,7 @@ fn capacities(
     if packages.len() != available.len()
         || packages.is_empty()
         || !(1..=64).contains(&active)
-        || !(1..=8).contains(&width)
+        || !(1..=crate::execution::MAX_OUTPUT_TOKENS as u64).contains(&width)
         || page_tokens == 0
     {
         return Err(invalid("invalid cache planning geometry"));

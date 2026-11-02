@@ -9,7 +9,7 @@ The Python representation is a dictionary with these fields:
 
 ```python
 {
-    "abi_version": 5,
+    "abi_version": 6,
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
@@ -128,7 +128,7 @@ Two graph inputs are reserved and required in every serving executable's binding
 |---|---|---|---|
 | `frame_index` | int32 | `[1]` | Native executor |
 | `submission_sequence` | int64 | `[1]` | Native executor |
-| `completion_records` | int64 | `[2,capacity,24]` | Captured graph finalizer |
+| `completion_records` | int64 | `[2,capacity,32]` | Captured graph finalizer |
 
 `completion_records` is an output and cannot appear in input bindings. Each
 buffer has one fixed host offset shared across all graph bindings that name
@@ -144,7 +144,7 @@ where C is padded request capacity. Sampling graphs also bind
 `logprob_token_ids: int32[C,128]` and `logprob_token_id_counts: int32[C]`.
 Counts are cleared every submission: zero selects natural top-20; 1..128 selects
 the uploaded ID prefix. Sampling graphs require the complete input group.
-`completion_logprobs: int32[2,C,8,258]` contains a chosen pair followed by up to
+`completion_logprobs: int32[2,C,16,258]` contains a chosen pair followed by up to
 128 alternative pairs, each storing a token ID and FP32 logprob bits. Reporting
 uses raw target logits before sampling transforms, gated by slot epoch and
 committed output positions. The host retains each pending frame's selections
@@ -201,7 +201,7 @@ Each completion lane begins with eight signed 64-bit fields in this order:
 7. Error code, `0` on success.
 8. Reserved, `0`.
 
-The 24-field completion record includes these zero-based indices:
+The 32-field completion record includes these zero-based indices:
 
 | Index | Meaning |
 |---|---|
@@ -212,15 +212,15 @@ The 24-field completion record includes these zero-based indices:
 | 12 | Reserved field; every prepared model contract requires `-1` |
 | 13 | Committed draft-cache length, `max(consumed_tokens-lag_tokens,0)` for the declared completion cursor; `-1` without a draft cache |
 | 14 | Reserved, `0` |
-| 15 | Verification width, an integer from 1 through 8 |
-| 16–23 | Emitted token IDs in order, with unused entries `-1` |
+| 15 | Verification width, an integer from 1 through 16 |
+| 16–31 | Emitted token IDs in order, with unused entries `-1` |
 
 The scalar token in field 4 equals the last vector token, or `-1` for an empty
 vector. Accepted drafts number either `emitted_count-1` or `emitted_count`;
 the latter occurs when EOS or the output budget clips inside the accepted draft
 prefix. It never exceeds the offered count. Ordinary sampling emits at most
 one token and reports width one. Maintenance and non-sampling prefill emit
-zero tokens. Every serving graph in an ABI5 catalog writes the 24-field layout.
+zero tokens. Every serving graph in an ABI6 catalog writes the 32-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
 request state advances. A speculative completion requires a
@@ -231,8 +231,8 @@ invalid. Each speculative graph declares one fixed
 `token_capacity`, so a finalizer writes that value into field 15 of every
 record it emits.
 
-ABI5 optionally declares `completion_speculative_survival`, a contiguous
-`float32[2,capacity,7]` output indexed by completion frame, physical request
+ABI6 optionally declares `completion_speculative_survival`, a contiguous
+`float32[2,capacity,15]` output indexed by completion frame, physical request
 slot, and draft-prefix depth. Each value is the cumulative product of
 `min(1, p(token)/q(token))` through that prefix, using the distributions used
 for stochastic verification. Observed values must be finite, within `[0,1]`,

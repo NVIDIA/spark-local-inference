@@ -103,9 +103,9 @@ def verifier(op, p, *, limits=None):
     return result
 
 
-@pytest.mark.parametrize("limit", [1, 2, 4])
-def test_identical_distributions_accept_every_offered_token(limit):
-    op = fixture(depth=3)
+@pytest.mark.parametrize("depth,limit", [(3, 1), (3, 2), (3, 4), (7, 8), (15, 9), (15, 16)])
+def test_identical_distributions_accept_every_offered_token(depth, limit):
+    op = fixture(depth=depth)
     op()
     p = torch.cat((op.probabilities, op.probabilities[:, -1:]), 1)
     limits = torch.full((op.batch,), limit, device="cuda", dtype=torch.int32)
@@ -116,6 +116,8 @@ def test_identical_distributions_accept_every_offered_token(limit):
     assert (verify.output.proposed_count == limit).all()
     torch.testing.assert_close(verify.output.token_ids[:, :limit - 1], op.tokens[:, :limit - 1])
     assert (verify.output.token_ids[:, limit:] == -1).all()
+    assert verify.output.survival[:, :limit - 1].eq(1).all()
+    assert verify.output.survival[:, limit - 1:].eq(-1).all()
 
 
 @pytest.mark.parametrize("depth", [1, 3, 7])

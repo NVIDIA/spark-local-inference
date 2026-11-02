@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", r
 @pytest.mark.parametrize("requested_ids", [False, True])
 def test_raw_scores_frames_ties_and_mutated_replay(dtype, width, requested_ids):
     vocabulary = 4097
-    outputs = CompletionOutputs.allocate((2, 4, 24), device="cuda")
+    outputs = CompletionOutputs.allocate((2, 4, 32), device="cuda")
     logits = torch.randn((2, width, vocabulary), dtype=dtype, device="cuda")
     logits[0, :, :40] = 20
     slots = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
@@ -89,7 +89,7 @@ def _parallel_logprob_rank(rank, rendezvous):
     offset = rank * local.shape[-1]
     size = min(local.shape[-1], full.shape[-1] - offset)
     local[:, :, :size].copy_(full[:, :, offset:offset + size])
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     slots = torch.tensor([2, 0], dtype=torch.int32, device=device)
     epochs = torch.tensor([9, 10], dtype=torch.int64, device=device)
     live = torch.tensor([2], dtype=torch.int32, device=device)

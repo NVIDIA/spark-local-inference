@@ -148,7 +148,7 @@ def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadca
     inputs.sample_enabled.fill_(1)
     prefix_limits = torch.full((batch,), depth + 1, dtype=torch.int32, device=device)
     inputs.query_lengths.copy_(prefix_limits)
-    records = torch.empty((2, batch, 24), dtype=torch.int64, device=device)
+    records = torch.empty((2, batch, 32), dtype=torch.int64, device=device)
     owner = SimpleNamespace(requests=state, inputs=inputs, sequence=torch.tensor([6], device=device),
         frame=torch.zeros(1, dtype=torch.int32, device=device), completion=completion_outputs(records),
         offset=torch.tensor([8, 12, 16, 20], device=device), generation=state.generation.clone(),
@@ -841,7 +841,7 @@ def _tp_rank(rank, rendezvous, sockets):
                     assert completion.speculative_survival is not None
                     if case == "rank2_nan":
                         assert all(row[5:7] == [3, 6] for row in completion.records)
-                        assert completion.speculative_survival == [[-1.] * 7] * 4
+                        assert completion.speculative_survival == [[-1.] * 15] * 4
                     else:
                         admitted, _ = allocate([[.25] * 3] * 4, [3, 0, 2, 1],
                             [row < live for row in range(4)], [True] * 4, [1, 4, 4, 4], 12, 4)
@@ -851,7 +851,7 @@ def _tp_rank(rank, rendezvous, sockets):
                         assert [record[8] for record in completion.records] == by_slot
                         if case == "partial":
                             assert all(completion.records[slot] == f.commit.idle_record.tolist() for slot in (1, 2))
-                            assert all(completion.speculative_survival[slot] == [-1.] * 7 for slot in (1, 2))
+                            assert all(completion.speculative_survival[slot] == [-1.] * 15 for slot in (1, 2))
                 executor.close()
                 assert executor.drained
                 executor = None
@@ -1027,7 +1027,7 @@ def _ordinary_generation_rank(rank, rendezvous):
             decoder.logits[:, 5 + rank].fill_(8.)
             decoder.weights, decoder.pool = SimpleNamespace(draft=None), pool
             decoder.head = SimpleNamespace(gather=SimpleNamespace(runtime=result))
-            outputs = completion_outputs(torch.zeros((2, 4, 24), dtype=torch.int64, device=device))
+            outputs = completion_outputs(torch.zeros((2, 4, 32), dtype=torch.int64, device=device))
             frame = torch.zeros(1, dtype=torch.int32, device=device)
             sequence = torch.ones(1, dtype=torch.int64, device=device)
             initial = {name: value.clone() for name, value in vars(state).items()}

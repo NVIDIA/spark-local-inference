@@ -321,7 +321,7 @@ same boundary; violations must be resolved before committing.
   Independent enum identifiers select reusable tool/reasoning parsers and image
   preparation/layout implementations only. Review every field and all consumers.
 - **Model packages enforce versioned contracts.** Serving requires payload format
-  2, execution ABI 5, and prepared model contract 3. Other execution ABI or
+  2, execution ABI 6, and prepared model contract 3. Other execution ABI or
   prepared contract versions fail before replay and require re-export. Semantic
   changes require explicit versioning; removed Protobuf fields and enum values
   remain reserved. Remove superseded loaders and migration-only tests. Backward
@@ -976,7 +976,7 @@ writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. ABI5 uses 24-field completions for every serving operation.
+history. ABI6 uses 32-field completions for every serving operation.
 
 Captured operators use b12x's default numerical policy and tuned execution plans.
 MoE reductions may use arrival-ordered atomic additions, so identical graph inputs
@@ -1239,7 +1239,7 @@ manage penalties, grammar masks and request-state updates. Temperature must be
 positive; zero-temperature requests are rejected because greedy decoding
 collapses the model's probability distribution.
 
-Execution ABI 5 uses `sampling_mode="general"` as their sole
+Execution ABI 6 uses `sampling_mode="general"` as their sole
 supported manifest value. Bounded top-k optimization is deferred. Measure
 sampler cost inside the complete graph before changing it; threshold ties
 must never be truncated to a fixed number of candidates.

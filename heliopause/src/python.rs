@@ -269,9 +269,9 @@ struct ExecutionCompletion {
     #[pyo3(get)]
     graph_index: usize,
     #[pyo3(get)]
-    proposal_confidence: Option<Vec<[f32; 7]>>,
+    proposal_confidence: Option<Vec<[f32; helios_core::execution::MAX_DRAFT_TOKENS]>>,
     #[pyo3(get)]
-    speculative_survival: Option<Vec<[f32; 7]>>,
+    speculative_survival: Option<Vec<[f32; helios_core::execution::MAX_DRAFT_TOKENS]>>,
     #[pyo3(get)]
     records: Vec<Vec<i64>>,
     #[pyo3(get)]

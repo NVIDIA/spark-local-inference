@@ -117,7 +117,9 @@ def test_complete_ring_and_target_page_geometry(config):
     for drafting, expected_bytes in ((False, 158148864), (True, 186001664)):
         pool = ContinuationPool.for_model(config, 3, 2, "meta", mtp=drafting)
         assert continuation_layout(config, mtp=drafting).row_bytes == expected_bytes
-        assert pool.layout.row_bytes == recipe.costs(1, recipe.speculation if drafting else None).state_row_bytes
+        planned = recipe.costs(1, recipe.speculation if drafting else None).state_row_bytes
+        assert planned == (193865984 if drafting else expected_bytes)
+        assert pool.layout.row_bytes <= planned
         assert page_bytes(config, mtp=drafting) == recipe.costs(1, recipe.speculation if drafting else None).page_bytes == 4194304
         assert len(pool.pages) == 32
         assert all(not name.startswith("draft") for name in pool.pages)
@@ -135,7 +137,8 @@ def test_complete_ring_and_target_page_geometry(config):
 def test_parallel_speculative_catalog_and_explicit_ordinary_mode():
     from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
     recipe = resolve("qwen3.8-27b").recipe
-    assert recipe.speculation.draft_tokens == recipe.max_draft_tokens == 7
+    assert recipe.speculation.draft_tokens == 7
+    assert recipe.max_draft_tokens == 15
     assert recipe.speculation.adaptive and recipe.speculation.packed_verification
     assert recipe.speculation.token_capacity == 128
     assert (recipe.concurrency, recipe.max_concurrency) == (32, 64)
@@ -150,7 +153,7 @@ def test_parallel_speculative_catalog_and_explicit_ordinary_mode():
     fixed = PreparationConfig(draft_snapshot=Path("draft"), speculative_fixed_width=4)
     assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 4}
     with pytest.raises(ValueError):
-        PreparationConfig(draft_snapshot=Path("draft"), speculative_widths=(1, 9))
+        PreparationConfig(draft_snapshot=Path("draft"), speculative_widths=(1, 17))
 
 
 @pytest.mark.parametrize("location", ["decoder", "projector"])
@@ -211,3 +214,62 @@ def test_qad_precision_options_reach_preparation_plan(online, head):
     if head:
         with pytest.raises(ValueError, match="requires DFlash2"):
             PreparationConfig(mtp=False, draft_head_quantization=head)
+
+
+@pytest.mark.parametrize("width", [1, 8, 16])
+def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
+    from types import SimpleNamespace
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.components.sampling import DeviceRequestState
+    from ignition.preparation.scratch import GraphBufferPool
+    from ignition.recipes.qwen38_dense.dflash import SpeculativePreparation
+    from ignition.recipes.qwen38_dense.pool import ContinuationPool
+
+    pool = ContinuationPool.for_model(config, 3, 2, "meta", mtp=True, verification_width=width)
+    requests = DeviceRequestState.allocate("meta", vocab_size=config.vocabulary, capacity=2)
+    weights = SimpleNamespace(config=config, shard=TensorParallelShard(0, 1),
+        tree=SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.empty((config.vocabulary, config.hidden), device="meta"))),
+        head=None, draft_head=None)
+    buffers = [GraphBufferPool("meta") for _ in range(3)]
+    owner = SpeculativePreparation(weights, pool, requests, None, None,
+        completion=None, frame=None, sequence=None, session=None, workspace=None,
+        buffers=buffers[0].cursor(), decoder_buffers=buffers[1], context_buffers=buffers[2],
+        verification_width=width)
+    assert owner.study_width is None
+    assert owner.block_size == owner.draft_scratch.block_size == width
+    assert owner.draft_scratch.embedding.shape == (2 * width, config.hidden)
+    assert owner.records.delta.shape == (48, 2, 48, width, 128)
+    assert owner.records.keys.shape == (48, 2, 16, width, 128)
+    assert owner.records[0].delta.stride(0) == 48 * width * 128
+    assert pool.recurrent(0).convolution.shape == (3, 10240, 2 + width)
+    assert config.draft.block_size == config.draft.text["dflash_config"]["block_size"] == 8
+    expected_bytes = 186001664 + 48 * 10240 * (width - 8) * 2
+    assert pool.layout.row_bytes == expected_bytes
+    assert pool.layout.row_bytes <= resolve("qwen3.8-27b").recipe.ranks[1].state_row_bytes
+
+
+@pytest.mark.parametrize("width", [1, 8, 16])
+@pytest.mark.parametrize("capacity", [16, 64])
+def test_native_depth_catalog_preserves_logical_and_packed_capacities(width, capacity):
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    config = PreparationConfig(draft_snapshot=Path("draft"), max_active=8,
+        speculative_widths=tuple(range(1, width + 1)), speculative_token_capacity=capacity,
+        speculative_graph_budget=64)
+    shapes = config.speculative_round_shapes
+    assert config.verification_width == width
+    assert {(b, 1, b) for b in (1, 2, 4, 8)} <= set(shapes)
+    assert all(p <= min(capacity, b * w) for b, w, p in shapes)
+    if width > 1:
+        assert (8, width, min(capacity, 8 * width)) in shapes
+        assert sum(w > 1 for _, w, _ in shapes) <= 64
+    assert config.decode_tokens == max(p for _, _, p in shapes)
+    assert config.decode_samples == 8 * width
+
+
+@pytest.mark.parametrize("width", [0, 17, True])
+def test_continuation_rejects_unsupported_verification_capacity(config, width):
+    from ignition.recipes.qwen38_dense.pool import continuation_layout
+
+    with pytest.raises(ValueError, match="verification capacity"):
+        continuation_layout(config, mtp=True, verification_width=width)

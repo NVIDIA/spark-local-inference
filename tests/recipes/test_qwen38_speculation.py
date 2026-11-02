@@ -23,8 +23,8 @@ from ignition.components.speculation import (
 )
 
 
-def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2):
-    state = DeviceRequestState.allocate("cpu", vocab_size=16)
+def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2, vocab=16):
+    state = DeviceRequestState.allocate("cpu", vocab_size=vocab)
     state.admit(slot, RequestAdmission(generation=7, seed=2**64 - 1, max_new_tokens=budget,
         temperature=1, top_k=0, top_p=1, eos_token_ids=eos), [1, 2], consumed_tokens=2, ple_history=(1, 2))
     state.consumed_tokens[slot] = consumed
@@ -46,7 +46,7 @@ def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2):
     acceptance.accepted_drafts.fill_(emitted - 1)
     acceptance.offered_drafts.fill_(width - 1)
     acceptance.valid.fill_(True)
-    records = torch.full((2, 4, 24), -99, dtype=torch.int64)
+    records = torch.full((2, 4, 32), -99, dtype=torch.int64)
     frame, sequence = torch.tensor([1], dtype=torch.int32), torch.tensor([37], dtype=torch.int64)
     logits = torch.zeros((*inputs.shape, state.vocab_size), device=inputs.device)
     commit = PreparedSpeculativeCommit(state, acceptance, inputs, slots, epochs, live,
@@ -54,10 +54,10 @@ def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2):
     return state, acceptance, commit, records
 
 
-@pytest.mark.parametrize("width", range(1, 9))
+@pytest.mark.parametrize("width", range(1, 17))
 def test_commit_accepts_each_explicit_verified_prefix(width):
     for emitted in range(1, width + 1):
-        state, acceptance, commit, records = example(width=width)
+        state, acceptance, commit, records = example(width=width, vocab=32)
         acceptance.token_ids.fill_(-1)
         acceptance.token_ids[:, :emitted] = commit.inputs[:, :emitted] + 1
         acceptance.proposed_count.fill_(emitted)
@@ -98,7 +98,7 @@ def test_commit_advances_input_and_output_histories_once():
     assert state.histogram[2, 3] == 1 and state.histogram[2, 9] == 1
     assert state.rng_counter[2].item() == 4
     assert records[1, 2, :11].tolist() == [7, 37, 5, 4, 9, RUNNING, 0, 0, 3, 3, 2]
-    assert records[1, 2, 12:].tolist() == [-1, 4, 0, 4, 4, 5, 9, -1, -1, -1, -1, -1]
+    assert records[1, 2, 12:].tolist() == [-1, 4, 0, 4, 4, 5, 9] + [-1] * 13
     assert records[0].eq(-99).all()
     assert records[1, 0, 16:].eq(-1).all()
 
@@ -219,3 +219,54 @@ def records_only_cpu_commit(monkeypatch):
     # These state-machine tests run without CUDA; reduction and graph ordering
     # have independent CUDA coverage.
     monkeypatch.setattr("ignition.components.speculation.PreparedLogprobs", RecordOnlyLogprobs)
+
+
+@pytest.mark.parametrize("clipping", ["none", "budget", "eos", "inactive"])
+def test_sixteen_token_commit_preserves_records_histogram_rng_history_and_survival(clipping):
+    state, acceptance, original, records = example(width=16, vocab=32, budget=40)
+    acceptance.token_ids.copy_(original.inputs + 1)
+    acceptance.proposed_count.fill_(16)
+    acceptance.accepted_drafts.fill_(15)
+    acceptance.rng_increment.fill_(31)
+    acceptance.survival.copy_(torch.linspace(.95, .25, 15)[None])
+    outputs = completion_outputs(records)
+    rng = SpeculativeRngState.allocate("cpu")
+    rng.generation[2], rng.target_offset[2] = 7, 99
+    commit = PreparedSpeculativeCommit(state, acceptance, original.inputs, original.slots,
+        original.generations, original.live, outputs, original.frame, original.sequence,
+        logits=torch.zeros((1, 16, 32)), rng=rng)
+    if clipping == "budget":
+        state.max_new_tokens[2] = 15
+    elif clipping == "eos":
+        state.eos_count[2], state.eos_token_ids[2, 0] = 1, 17
+    elif clipping == "inactive":
+        original.live.zero_()
+    before = {name: tensor.clone() for name, tensor in state.__dict__.items()
+              if isinstance(tensor, torch.Tensor)}
+    commit()
+    count = 0 if clipping == "inactive" else 14 if clipping in ("budget", "eos") else 16
+    assert commit.emitted_count.item() == count
+    assert state.consumed_tokens[2] == 2 + count
+    assert state.generated_tokens[2] == 1 + count
+    assert state.pending_token[2] == 3 + count
+    assert state.rng_counter[2] == 1 + count
+    assert rng.target_offset[2] == (130 if count else 99)
+    if count:
+        record = records[1, 2]
+        assert record[8:11].tolist() == [count, 15, min(15, count)]
+        assert record[15] == 16
+        assert record[16:16 + count].tolist() == list(range(4, 4 + count))
+        assert record[16 + count:].eq(-1).all()
+        assert state.ple_history[2].tolist() == [count + 1, count + 2]
+        assert state.histogram[2, 4:4 + count].eq(1).all()
+        extent = 13 if clipping == "budget" else min(count, 15)
+        assert torch.equal(outputs.speculative_survival[1, 2, :extent], acceptance.survival[0, :extent])
+        assert outputs.speculative_survival[1, 2, extent:].eq(-1).all()
+    else:
+        for name, tensor in before.items():
+            assert torch.equal(getattr(state, name), tensor), name
+        assert records[1, :, 5].eq(0).all()
+        assert outputs.speculative_survival[1].eq(-1).all()
+    assert records[0].eq(-99).all()
+    assert records[1, [0, 1, 3], 16:].eq(-1).all()
+    assert outputs.speculative_survival[1, [0, 1, 3]].eq(-1).all()

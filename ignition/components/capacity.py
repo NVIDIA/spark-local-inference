@@ -9,6 +9,7 @@ import heapq
 from math import isqrt
 
 MAX_CONCURRENCY = 64
+MAX_OUTPUT_TOKENS = 16
 BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 
 
@@ -66,8 +67,8 @@ def speculative_shapes(concurrency, widths, token_capacity=None):
     """Cover every prefix inside the target-token envelope and every decode batch."""
     batches = batch_capacities(concurrency)
     if (not widths or widths[0] != 1 or tuple(sorted(set(widths))) != tuple(widths)
-            or any(type(w) is not int or not 1 <= w <= 8 for w in widths)):
-        raise ValueError("speculative widths must increase from one through at most eight")
+            or any(type(w) is not int or not 1 <= w <= MAX_OUTPUT_TOKENS for w in widths)):
+        raise ValueError("speculative widths must increase from one through at most sixteen")
     capacity = speculative_token_capacity(concurrency, widths[-1], token_capacity)
     return tuple((batch, width) for batch in batches for width in reversed(widths)
                  if width == 1 or batch * width <= capacity)
@@ -83,8 +84,8 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     the complete integer capacity range saturate without duplicate graphs.
     """
     batches = batch_capacities(concurrency)
-    if type(width) is not int or not 2 <= width <= 8:
-        raise ValueError("packed verification width must be an integer in [2, 8]")
+    if type(width) is not int or not 2 <= width <= MAX_OUTPUT_TOKENS:
+        raise ValueError("packed verification width must be an integer in [2, 16]")
     capacity = speculative_token_capacity(concurrency, width, token_capacity)
     shapes, intervals = set(), []
     total = 0
@@ -116,8 +117,8 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
 
 def proposal_shapes(concurrency, drafts):
     """Full configured proposal blocks cover every request batch."""
-    if type(drafts) is not int or not 1 <= drafts <= 7:
-        raise ValueError("proposal depth must be in [1, 7]")
+    if type(drafts) is not int or not 1 <= drafts < MAX_OUTPUT_TOKENS:
+        raise ValueError("proposal depth must be in [1, 15]")
     return tuple((batch, drafts) for batch in batch_capacities(concurrency))
 
 

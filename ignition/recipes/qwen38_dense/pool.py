@@ -25,6 +25,8 @@ def page_bytes(config, *, mtp=False):
 
 
 def continuation_layout(config, *, mtp=False, verification_width=8):
+    if type(verification_width) is not int or not 1 <= verification_width <= 16:
+        raise ValueError("Qwen verification capacity must be an integer in [1,16]")
     regions = []
     for index, kind in enumerate(config.layers):
         if kind == "linear_attention":

@@ -82,7 +82,7 @@ def _rank(rank, directory, readiness):
                     "source": source, "output": output,
                     "frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device),
+                    "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device=device),
                 }
                 print(f"rank {rank}: capture automatic startup catalog", flush=True)
                 prepared = PreparedModel(device=rank, graphs=graphs, buffers=buffers,
