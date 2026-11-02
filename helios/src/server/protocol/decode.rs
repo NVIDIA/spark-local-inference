@@ -939,10 +939,13 @@ mod native_prompt_tests {
                     "<|media_begin|>",
                     "<|media_content|>",
                     "<|media_end|>",
+                    "<｜System｜>",
+                    "<｜User｜>",
                 ]
                 .map(|s| AddedToken::from(s, true)),
             )
             .unwrap();
+        tokenizer.add_tokens([AddedToken::from("｜DSML｜", false)]).unwrap();
         let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").unwrap();
         let bytes = tokenizer.to_string(false).unwrap();
         let path = std::env::temp_dir().join(format!(

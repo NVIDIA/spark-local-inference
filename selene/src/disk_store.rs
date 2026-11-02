@@ -2289,7 +2289,7 @@ impl DiskStore {
             pages: chain.pages,
             bytes,
             tier: Tier::Nvme,
-            estimated_seconds: bytes as f64 / self.inbound_rate.0.max(1.0),
+            estimated_seconds: bytes as f64 / self.inbound_rate.get().max(1.0),
             chain,
         }
     }
@@ -2484,6 +2484,7 @@ impl HostStore for DiskStore {
             }
             return Err(error);
         }
+        self.inbound_rate.started();
         self.inbound.insert(
             id,
             Inbound {
@@ -2523,8 +2524,8 @@ impl HostStore for DiskStore {
             disk_bytes: self.used,
             progress: self.stats.progress
                 + self.budget.as_ref().map_or(0, |budget| budget.progress()),
-            outbound_rate: self.outbound_rate.0,
-            inbound_rate: self.inbound_rate.0,
+            outbound_rate: self.outbound_rate.get(),
+            inbound_rate: self.inbound_rate.get(),
             ..self.stats
         }
     }

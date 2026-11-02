@@ -372,7 +372,19 @@ fn contextual_labels_reject_prefix_retokenization_multi_token_and_special_ids() 
     ));
     tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
     tokenizer
-        .add_special_tokens([tokenizers::AddedToken::from("SPECIAL", true)])
+        .add_special_tokens(
+            [
+                "SPECIAL",
+                "<｜begin▁of▁sentence｜>",
+                "<｜end▁of▁sentence｜>",
+                "<｜System｜>",
+                "<｜User｜>",
+                "<｜Assistant｜>",
+                "<think>",
+                "</think>",
+            ]
+            .map(|text| tokenizers::AddedToken::from(text, true)),
+        )
         .unwrap();
     let bytes = tokenizer.to_string(false).unwrap().into_bytes();
     let path = root.join("tokenizer.json");

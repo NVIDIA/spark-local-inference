@@ -69,7 +69,11 @@ request, so the requester recomputed it. When the first session of a scope arriv
 logs, once for that scope, how many tokens of context one export can hold in the configured
 staging and warns if that is under 262,144 tokens (Flare's usual per-request limit; the manager
 does not know a model's real maximum). The warning names the staging size that would hold it.
-Size `--staging` from that line and from your longest contexts.
+One export holds (`--staging` minus the row bytes) divided by the page bytes, rounded down,
+times the page tokens: about 143,000 tokens at 2 GiB and 294,000 at the 4 GiB default for a
+model with 905,216-byte pages of 64 tokens and a 122 MiB row. A longer context is refused
+`NO_WINDOWS` and recomputed, so size `--staging` from the figure the manager logs when a scope
+opens.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
@@ -84,8 +88,11 @@ The files are fixed (`arena`, `staging`, and a `generation` and `holders` file b
 persist across restarts. A restarted manager with the same `--memory` and `--staging` reopens the
 same files at the same offsets, so instances that registered them with CUDA at startup keep
 working; a killed manager never blocks a restart, and debris from a crash is reclaimed. If a size
-changed or a file is unusable, the manager recreates them under a new generation and logs that
-running instances must restart to use the pool: until they do, they run on local tiers only. After
+changed or a file is missing, the wrong size or has no valid generation, the manager
+recreates them under a new generation and logs that running instances must restart to use the
+pool: until they do, they run on local tiers only. A file owned by another user stops the
+start, as does an unexpected I/O error while checking them
+(an interrupted call is retried) stops the manager's start with an error and deletes nothing. After
 a crash the manager keeps the regions out of service until each process that had a session has
 reconnected or exited (PROTOCOL.md 8.6). The files outlive a stopped manager and keep their
 memory: remove `/dev/shm/selene/<name>` to give it back.
@@ -243,7 +250,8 @@ the total; a nonzero value that does not fall means an instance is hung, not a l
 ## Metrics
 
 `GET /metrics` on `--metrics HOST:PORT` returns Prometheus text (`selene_` prefix, content type
-`text/plain; version=0.0.4`); only that path is served.
+`text/plain; version=0.0.4`); only that path is served. Store series are built when scraped, on the store thread; if it
+does not answer within 1 s the previous store text is served.
 
 | Series | Meaning | Alert on |
 |---|---|---|

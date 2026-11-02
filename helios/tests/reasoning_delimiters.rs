@@ -18,16 +18,18 @@ use flare_helios::model::contract::{
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-fn delimiters(variable: &str, syntax: &FrontendContract) -> Vec<(u32, String)> {
+fn checkpoint(variable: &str) -> Frontend {
     let root = PathBuf::from(std::env::var_os(variable).unwrap());
     let asset = |path: PathBuf| Asset {
         range: None,
         sha256: format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
         path,
     };
+    static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let template = std::env::temp_dir().join(format!(
-        "flare-reasoning-delimiters-{}-{variable}.jinja",
-        std::process::id()
+        "flare-reasoning-delimiters-{}-{variable}-{}.jinja",
+        std::process::id(),
+        SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&template, "{% mark %}{{ messages[0].content }}").unwrap();
     let frontend = Frontend::load(
@@ -40,7 +42,11 @@ fn delimiters(variable: &str, syntax: &FrontendContract) -> Vec<(u32, String)> {
     )
     .unwrap();
     std::fs::remove_file(template).unwrap();
-    model::reasoning_delimiter_tokens(&frontend, syntax).unwrap()
+    frontend
+}
+
+fn delimiters(variable: &str, syntax: &FrontendContract) -> Vec<(u32, String)> {
+    model::reasoning_delimiter_tokens(&checkpoint(variable), syntax).unwrap()
 }
 
 fn pairs(tokens: &[(u32, &str)]) -> Vec<(u32, String)> {
@@ -69,6 +75,70 @@ fn glm53_think_tags_are_single_tokens() {
         ),
         pairs(&[(154841, "<think>"), (154842, "</think>")])
     );
+}
+
+/// The reported GLM-5.3 shape, streamed from the checkpoint's own close delimiter
+/// token: reasoning, that token, a short answer, the same token again, and the
+/// rest of the answer. A close delimiter generated as its token is protocol
+/// markup, so it never reaches content.
+#[test]
+#[ignore = "requires FLARE_GLM_TEST_SNAPSHOT with the GLM-5.3 tokenizer"]
+fn glm53_close_delimiter_tokens_never_become_content() {
+    use flare_helios::output::tagged::{OutputConfig as ContentConfig, OutputStart};
+    use flare_helios::output::{Event, Input, OutputConfig, OutputPipeline, Termination};
+
+    let frontend = checkpoint("FLARE_GLM_TEST_SNAPSHOT");
+    let syntax = support::contract("glm53").frontend;
+    let control = model::reasoning_delimiter_tokens(&frontend, &syntax).unwrap();
+    let close = 154842;
+    assert!(
+        control.iter().any(|(id, marker)| *id == close && marker == "</think>"),
+        "{control:?}"
+    );
+    let mut parser = OutputPipeline::new(OutputConfig {
+        syntax,
+        control_tokens: control,
+        content: ContentConfig {
+            structured: false,
+            start: OutputStart::Reasoning,
+            tools: vec![],
+        },
+    });
+    let marker = frontend.decode(&[close], false).unwrap();
+    assert_eq!(marker, "</think>");
+    let pushes = [
+        (None, "The record immediately before it is Record 11.".to_owned()),
+        (Some(close), marker.clone()),
+        (None, "**CFM6HF6M, 11.".to_owned()),
+        (Some(close), marker),
+        (None, "**CFM6HF6M, 11**\n\nThe vault access code is CFM6HF6M.".to_owned()),
+    ];
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    for (token, text) in pushes {
+        if let Some(token) = token {
+            assert!(parser.push(Input::Token(token)).unwrap().is_empty());
+        }
+        for event in parser.push(Input::Text(&text)).unwrap() {
+            match event {
+                Event::Reasoning(text) => reasoning.push_str(&text),
+                Event::Content(text) => content.push_str(&text),
+                event => panic!("{event:?}"),
+            }
+        }
+    }
+    for event in parser.finish(Termination::Eos).unwrap() {
+        match event {
+            Event::Reasoning(text) => reasoning.push_str(&text),
+            Event::Content(text) => content.push_str(&text),
+            event => panic!("{event:?}"),
+        }
+    }
+    assert_eq!(reasoning, "The record immediately before it is Record 11.");
+    assert_eq!(
+        content,
+        "**CFM6HF6M, 11.**CFM6HF6M, 11**\n\nThe vault access code is CFM6HF6M."
+    );
+    assert!(!content.contains("</think>"), "{content}");
 }
 
 #[test]

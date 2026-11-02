@@ -588,27 +588,32 @@ impl<D: ToolDialect> TaggedOutput<D> {
                             continue;
                         }
                     }
-                    if self.reasoning.tool_ends_reasoning {
-                        if let Some(at) = self.reasoning.find_delimiter(&self.buffer, start, true) {
-                            let earlier = self
-                                .reasoning
-                                .find_delimiter(&self.buffer, start, false)
-                                .into_iter()
-                                .chain(
-                                    [D::OPEN, D::FUNCTION.map_or(D::OPEN, |(open, _)| open)]
-                                        .iter()
-                                        .filter_map(|marker| self.buffer.find(marker)),
-                                )
-                                .any(|opener| opener < at);
-                            if !earlier {
-                                let prefix: String = self.buffer.drain(..at).collect();
-                                self.buffer.drain(..self.reasoning.close.len());
-                                if !prefix.is_empty() {
-                                    self.spans.push(Some(start..start + prefix.len()));
-                                    output.push(Event::Content(prefix));
-                                }
-                                continue;
+                    // Reasoning consumes the first close delimiter. A later one that
+                    // arrives as its delimiter token is protocol markup as well, so it
+                    // is dropped instead of becoming answer text. An opener before it
+                    // takes precedence because that envelope owns the delimiter.
+                    if (self.reasoning.tool_ends_reasoning || self.reasoning.close_token)
+                        && let Some(at) = self.reasoning.find_delimiter(&self.buffer, start, true)
+                    {
+                        let earlier = self
+                            .reasoning
+                            .find_delimiter(&self.buffer, start, false)
+                            .is_some_and(|opener| opener < at)
+                            || (!self.tools.is_empty()
+                                && [D::OPEN, D::FUNCTION.map_or(D::OPEN, |(open, _)| open)]
+                                    .iter()
+                                    .flat_map(|marker| self.buffer[..at].match_indices(marker))
+                                    .any(|(open, _)| {
+                                        D::starts_call(&self.buffer[open..]) != Some(false)
+                                    }));
+                        if !earlier {
+                            let prefix: String = self.buffer.drain(..at).collect();
+                            self.buffer.drain(..self.reasoning.close.len());
+                            if !prefix.is_empty() {
+                                self.spans.push(Some(start..start + prefix.len()));
+                                output.push(Event::Content(prefix));
                             }
+                            continue;
                         }
                     }
                     let mut marker = self

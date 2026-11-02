@@ -111,9 +111,25 @@ impl XtmlOutput {
                     } else {
                         RESPONSE_CLOSE
                     };
+                    // Reasoning consumes the first close delimiter. A later one that
+                    // arrives as its control tokens is protocol markup as well, so it is
+                    // dropped instead of becoming answer text. Ordinary text escapes
+                    // its `<` bytes, so only control-token text matches a raw marker.
+                    let stray = (!reasoning).then(|| self.buffer.find(THINK_CLOSE)).flatten();
                     let boundary = self.buffer.find(close);
-                    let visible = boundary
-                        .unwrap_or_else(|| self.buffer.len() - partial(&self.buffer, close));
+                    let cut = match (boundary, stray) {
+                        (Some(boundary), Some(stray)) => Some(boundary.min(stray)),
+                        (boundary, stray) => boundary.or(stray),
+                    };
+                    let visible = cut.unwrap_or_else(|| {
+                        let held = partial(&self.buffer, close);
+                        let held = if reasoning {
+                            held
+                        } else {
+                            held.max(partial(&self.buffer, THINK_CLOSE))
+                        };
+                        self.buffer.len() - held
+                    });
                     let start = self.consumed_bytes();
                     let text: String = self.buffer.drain(..visible).collect();
                     if !text.is_empty() {
@@ -124,8 +140,12 @@ impl XtmlOutput {
                             Event::Content(unescape(&text))
                         });
                     }
-                    if boundary.is_none() {
+                    let Some(cut) = cut else {
                         break;
+                    };
+                    if stray == Some(cut) {
+                        self.buffer.drain(..THINK_CLOSE.len());
+                        continue;
                     }
                     self.buffer.drain(..close.len());
                     self.channel = Channel::Envelope;

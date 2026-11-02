@@ -629,7 +629,7 @@ impl Core {
             pages: chain.pages,
             bytes,
             tier: Tier::Dram,
-            estimated_seconds: bytes as f64 / self.inbound_rate.0.max(1.0),
+            estimated_seconds: bytes as f64 / self.inbound_rate.get().max(1.0),
             chain,
         })
     }
@@ -698,6 +698,7 @@ impl Core {
         let id = self.next_job();
         let pages = ticket.pages.iter().copied().zip(slots);
         let queued = windows(id, Direction::In, pages, row);
+        self.inbound_rate.started();
         self.inbound.insert(
             id,
             Inbound {
@@ -916,8 +917,8 @@ impl Core {
             slots_total: self.pool.slot_count(),
             intake_slots: self.pool.intake_slots(),
             memory_bytes: self.resident_bytes(),
-            outbound_rate: self.outbound_rate.0,
-            inbound_rate: self.inbound_rate.0,
+            outbound_rate: self.outbound_rate.get(),
+            inbound_rate: self.inbound_rate.get(),
             ..self.stats
         }
     }
