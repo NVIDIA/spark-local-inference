@@ -56,6 +56,7 @@ impl Frame {
 struct Usage {
     generated: u32,
     cached: u64,
+    reasoning: u32,
 }
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PromptUsage {
@@ -203,6 +204,12 @@ impl Encoder {
     /// Count raw generated tokens before text decoding can merge or hide them.
     pub fn observe_generated_token(&mut self, index: usize) {
         self.usage[index].generated += 1;
+    }
+    /// Record how many of a choice's generated tokens the output pipeline
+    /// published as reasoning. The count is absolute, so streaming usage can
+    /// refresh it with the decoder's running total on every chunk.
+    pub fn report_reasoning_tokens(&mut self, index: usize, tokens: u32) {
+        self.usage[index].reasoning = tokens;
     }
     fn named(&mut self, name: &str, mut data: Value) -> Frame {
         data["type"] = json!(name);
@@ -548,7 +555,11 @@ impl Encoder {
             "stop"
         };
         self.reasons[index] = Some(reason);
-        self.usage[index] = Usage { generated, cached };
+        self.usage[index] = Usage {
+            generated,
+            cached,
+            reasoning: self.usage[index].reasoning,
+        };
         self.stop = stop;
         if matches!(self.protocol, Protocol::Chat | Protocol::Completions) {
             frames.push(self.chunk(
@@ -600,6 +611,7 @@ impl Encoder {
         let prompt_tokens: usize = self.prompts.iter().map(|p| p.tokens).sum();
         let image_tokens: usize = self.prompts.iter().map(|p| p.image_tokens).sum();
         let generated: u64 = self.usage.iter().map(|u| u.generated as u64).sum();
+        let reasoning: u64 = self.usage.iter().map(|u| u.reasoning as u64).sum();
         // Prompt usage counts each input once even with n > 1. Use its first
         // choice's admission lookup, independent of completion order or reuse
         // by later siblings after that choice has published a checkpoint.
@@ -615,13 +627,17 @@ impl Encoder {
                 if image_tokens > 0 {
                     details["multimodal_tokens"] = json!({"image":image_tokens});
                 }
-                json!({"prompt_tokens":prompt_tokens,"completion_tokens":generated,"total_tokens":prompt_tokens as u64+generated,"prompt_tokens_details":details})
+                let mut usage = json!({"prompt_tokens":prompt_tokens,"completion_tokens":generated,"total_tokens":prompt_tokens as u64+generated,"prompt_tokens_details":details});
+                if self.protocol == Protocol::Chat {
+                    usage["completion_tokens_details"] = json!({"reasoning_tokens":reasoning});
+                }
+                usage
             }
             Protocol::Messages => {
                 json!({"input_tokens":prompt_tokens as u64-cached,"output_tokens":generated,"cache_creation_input_tokens":0,"cache_read_input_tokens":cached})
             }
             Protocol::Responses => {
-                json!({"input_tokens":prompt_tokens,"output_tokens":generated,"total_tokens":prompt_tokens as u64+generated,"input_tokens_details":{"cached_tokens":cached}})
+                json!({"input_tokens":prompt_tokens,"output_tokens":generated,"total_tokens":prompt_tokens as u64+generated,"input_tokens_details":{"cached_tokens":cached},"output_tokens_details":{"reasoning_tokens":reasoning}})
             }
         }
     }

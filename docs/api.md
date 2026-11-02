@@ -655,8 +655,11 @@ prompt tokens actually reused at admission, including restored prefixes; it is
 zero when no prefix is reused. Cached tokens remain part of `prompt_tokens`
 and `total_tokens`. Image requests also include
 `prompt_tokens_details.multimodal_tokens.image`, the image feature tokens already
-included in the prompt total. Responses reports reuse through
-`input_tokens_details.cached_tokens`.
+included in the prompt total. Chat adds `completion_tokens_details.reasoning_tokens`,
+the generated tokens the output pipeline published as reasoning; raw completions
+has no reasoning region and omits it. Responses reports reuse through
+`input_tokens_details.cached_tokens` and always includes the schema-required
+`output_tokens_details.reasoning_tokens`, counted the same way.
 
 Anthropic reports reused tokens in `cache_read_input_tokens` and the remaining
 prompt tokens in `input_tokens`; their sum is the token-count endpoint's result.

@@ -150,6 +150,8 @@ pub(super) struct Decoder<'a, P: ModelOutput> {
     next_entries: Vec<super::token_spans::ReturnedLogprob>,
     pending_entries: Vec<super::token_spans::ReturnedLogprob>,
     text_bytes: usize,
+    reasoning_tokens: u32,
+    unattributed_tokens: u32,
 
     parser: Option<P>,
     eos: &'a [u32],
@@ -174,6 +176,8 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             next_entries: vec![],
             pending_entries: vec![],
             text_bytes: 0,
+            reasoning_tokens: 0,
+            unattributed_tokens: 0,
             parser: config.map(P::new),
             eos,
             finished: false,
@@ -206,6 +210,7 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             self.entries(span.tokens.into_iter().filter_map(|t| t.logprob));
             events.extend(self.parse(Input::Text(&span.text))?);
         }
+        self.attribute(1, &events);
         Ok(events)
     }
     pub fn push(&mut self, token: u32) -> Result<Vec<Event>> {
@@ -227,6 +232,7 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
                 events.extend(self.parse(Input::Text(&text))?);
             }
         }
+        self.attribute(1, &events);
         Ok(events)
     }
     pub fn push_protocol(&mut self, pieces: Vec<crate::output::Piece>) -> Result<Vec<Event>> {
@@ -239,13 +245,53 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
         self.worker_decoded = true;
         let mut events = Vec::new();
         for piece in pieces {
-            events.extend(match piece {
-                crate::output::Piece::Logprob(entry) => { self.entries([entry]); vec![] },
-                crate::output::Piece::Token(token) => self.parse(Input::Token(token))?,
-                crate::output::Piece::Text(text) => self.parse(Input::Text(&text))?,
-            });
+            match piece {
+                crate::output::Piece::Logprob(entry) => self.entries([entry]),
+                crate::output::Piece::Token(token) => {
+                    let parsed = self.parse(Input::Token(token))?;
+                    self.attribute(1, &parsed);
+                    events.extend(parsed);
+                }
+                crate::output::Piece::Text(text) => {
+                    let parsed = self.parse(Input::Text(&text))?;
+                    self.attribute(0, &parsed);
+                    events.extend(parsed);
+                }
+            }
         }
         Ok(events)
+    }
+    /// Credit generated tokens to the region whose spans the pipeline published.
+    ///
+    /// A token's decoded text can stay in a parser buffer while the parser is
+    /// still ruling out a delimiter, so a token that published nothing joins the
+    /// region of the next published span. A span that carries both regions
+    /// credits reasoning, which is the region it opens. Tokens that never
+    /// publish, such as the end-of-turn token, stay uncredited. Worker-decoded
+    /// pieces are credited one piece at a time, so a batch that closes reasoning
+    /// and opens content credits only the pieces whose spans published
+    /// reasoning.
+    fn attribute(&mut self, tokens: u32, events: &[Event]) {
+        self.unattributed_tokens += tokens;
+        let mut reasoning = false;
+        let mut content = false;
+        for event in events {
+            match event {
+                Event::Reasoning(text) if !text.is_empty() => reasoning = true,
+                Event::Content(text) if !text.is_empty() => content = true,
+                _ => {}
+            }
+        }
+        if reasoning {
+            self.reasoning_tokens += self.unattributed_tokens;
+            self.unattributed_tokens = 0;
+        } else if content {
+            self.unattributed_tokens = 0;
+        }
+    }
+    /// Generated tokens the pipeline published as reasoning content.
+    pub fn reasoning_tokens(&self) -> u32 {
+        self.reasoning_tokens
     }
     pub fn finish(&mut self, cause: Termination) -> Result<Vec<Event>> {
         if self.finished {
@@ -734,6 +780,93 @@ pub(crate) mod tests {
                 .push(format!("finish:{cause:?}"));
             Ok(vec![])
         }
+    }
+
+    /// Publishes each decoded span as reasoning or content by its leading
+    /// character, and withholds a span that could still be a delimiter the
+    /// way a real parser does while it rules one out.
+    struct Regions {
+        held: String,
+    }
+    impl ModelOutput for Regions {
+        type Config = ();
+        fn new(_: Self::Config) -> Self {
+            Self { held: String::new() }
+        }
+        fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
+            vec![]
+        }
+        fn consumed_bytes(&self) -> usize {
+            0
+        }
+        fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
+            let Input::Text(text) = input else {
+                return Ok(vec![]);
+            };
+            let span = std::mem::take(&mut self.held) + text;
+            if span.is_empty() {
+                return Ok(vec![]);
+            }
+            if span.ends_with('?') {
+                self.held = span;
+                return Ok(vec![]);
+            }
+            Ok(if span.starts_with('R') {
+                vec![Event::Reasoning(span)]
+            } else {
+                vec![Event::Content(span)]
+            })
+        }
+        fn finish(&mut self, _: Termination) -> Result<Vec<Event>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn reasoning_count_credits_tokens_to_the_region_their_spans_publish_in() {
+        let frontend = frontend(&["Ra", "R?", "x", "Ca"]);
+        let mut decoder = Decoder::<Regions>::new(&frontend, &[99], Some(()));
+        assert_eq!(decoder.reasoning_tokens(), 0, "no token has published yet");
+        for token in [0, 1, 2, 3] {
+            decoder.push(token).unwrap();
+        }
+        // "Ra" and "x" publish as reasoning; the withheld "R?" token joins the
+        // span its text completed, so it credits reasoning too. "Ca" is content.
+        assert_eq!(decoder.reasoning_tokens(), 3);
+        decoder.push(99).unwrap();
+        decoder.finish(Termination::Eos).unwrap();
+        assert_eq!(decoder.reasoning_tokens(), 3, "the end-of-turn token publishes nothing");
+    }
+
+    #[test]
+    fn protocol_pieces_batch_splits_attribution_between_regions() {
+        use crate::output::Piece;
+        let frontend = frontend(&["Ra", "R?", "x", "Ca"]);
+        let mut decoder = Decoder::<Regions>::new(&frontend, &[99], Some(()));
+        // One batch that closes reasoning and immediately opens content. Batch-
+        // level attribution would credit the whole batch to reasoning because
+        // the batch carries a reasoning span; per-piece attribution follows the
+        // region each piece's spans published in.
+        decoder
+            .push_protocol(vec![
+                Piece::Token(0),
+                Piece::Text("Ra".to_string()),
+                Piece::Token(1),
+                Piece::Text("R?".to_string()),
+                Piece::Token(2),
+                Piece::Text("x".to_string()),
+                Piece::Token(3),
+                Piece::Text("Ca".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(
+            decoder.reasoning_tokens(),
+            3,
+            "the content piece's token credits content, not reasoning"
+        );
+        decoder.push_protocol(vec![Piece::Token(99)]).unwrap();
+        decoder.finish(Termination::Eos).unwrap();
+        assert_eq!(decoder.reasoning_tokens(), 3, "the unpublished end-of-turn token stays uncredited");
     }
 
     #[test]
