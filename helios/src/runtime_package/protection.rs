@@ -1664,11 +1664,15 @@ impl super::payload::Files for PayloadSource {
                 .relative
                 .get(&span.filename)
                 .ok_or_else(|| invalid("payload container has no relative name"))?;
-            Ok(self
-                .path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(relative))
+            // An empty relative name means the payload is stored in the primary container.
+            Ok(if relative.is_empty() {
+                self.path.clone()
+            } else {
+                self.path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(relative)
+            })
         }
     }
     fn release_page_cache(&self) {}
@@ -3813,6 +3817,39 @@ mod payload_package_tests {
             "an unexported tensor-parallel size must be rejected"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_paths_read_initializer_bytes_in_directory_and_packed_packages() {
+        use crate::runtime_package::payload::Files;
+
+        let (root, publishers) = two_initializer_package();
+        let packed = root.with_extension("safetensors");
+        crate::package::conversion::pack(&root, &packed).unwrap();
+        for path in [&root, &packed] {
+            let verified = VerifiedPackage::open_tensor_parallel(path, &publishers, 1, None).unwrap();
+            let authorized = verified.authorize("two-init", false).unwrap();
+            let AuthorizedKind::Payload(payload) = &authorized.kind else {
+                panic!("expected a payload package");
+            };
+            let package = &payload.packages[0];
+            let allocation = &package.allocations[0];
+            assert_eq!(allocation.sources.len(), 2);
+            for (source, expected) in allocation
+                .sources
+                .iter()
+                .zip([vec![2, 3, 4, 5], vec![9, 10, 11]])
+            {
+                let span = payload.source.span(package, &source.resource).unwrap();
+                let (_, offset) = payload.source.source(span).unwrap();
+                let file = File::open(payload.source.asset_path(span).unwrap()).unwrap();
+                let mut bytes = vec![0; source.nbytes as usize];
+                FileReadAt::read_exact_at(&file, &mut bytes, offset + source.offset).unwrap();
+                assert_eq!(bytes, expected, "{}", path.display());
+            }
+        }
+        std::fs::remove_file(packed).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

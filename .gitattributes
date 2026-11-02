@@ -1,3 +1,6 @@
 # Preserve upstream license and notice bytes, including original line endings.
 third_party/rust/** -text
 packaging/license-supplements/** -text
+
+# Preserve the bytes used by chat-template digests and embedded template parsing.
+ignition/recipes/*/assets/*.jinja text eol=lf
