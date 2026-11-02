@@ -122,6 +122,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             [3; 32],
             vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
             vec![(0, 0)],
+            1,
             0,
             Some((1, 2)),
         )

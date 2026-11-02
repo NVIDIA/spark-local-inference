@@ -905,6 +905,17 @@ pub fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
     Error::caused_by(format!("{message}: {error}"), error)
 }
 
+/// Hash scattered row bytes in persisted record order. The caller retains every piece.
+pub(crate) fn row_checksum(layout: &Layout, slots: &[usize]) -> u64 {
+    use std::hash::Hasher;
+    let mut hash = twox_hash::XxHash3_64::new();
+    for (address, _, len) in crate::slab::row_pieces(layout, slots) {
+        // SAFETY: The caller pins the row until hashing completes.
+        hash.write(unsafe { std::slice::from_raw_parts(address as *const u8, len) });
+    }
+    hash.finish()
+}
+
 /// 64-bit xxh3 over `bytes`.
 pub fn checksum(bytes: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(bytes)
@@ -1261,7 +1272,7 @@ mod tests {
         )
         .unwrap();
 
-        let lock = DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
@@ -1392,7 +1403,7 @@ mod tests {
 
         let file = directory.join("file");
         fs::write(&file, b"").unwrap();
-        assert!(DirectoryLock::acquire(&file).is_err());
+        assert!(crate::testing::directory_lock(&file).is_err());
         drop(lock);
         fs::remove_dir_all(&directory).unwrap();
     }
@@ -1412,7 +1423,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let lock = DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         let geometry = geometries().remove(0);
         let root = header(&geometry, 200, None);
         let path = write_record(
@@ -1443,7 +1454,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         let geometry = geometries().remove(0);
-        let owner = DirectoryLock::acquire(&directory).unwrap();
+        let owner = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&owner, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
@@ -1452,15 +1463,17 @@ mod tests {
         let temporary = directory.join(temporary_name(&key(200, 17)));
         fs::write(&temporary, b"pending record").unwrap();
 
-        let error = DirectoryLock::acquire(&directory).unwrap_err().to_string();
+        let error = crate::testing::directory_lock(&directory)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already in use"), "{error}");
         assert!(error.contains(directory.to_str().unwrap()), "{error}");
         assert_eq!(fs::read(&temporary).unwrap(), b"pending record");
         let alias = directory.join(".");
-        assert!(DirectoryLock::acquire(&alias).is_err());
+        assert!(crate::testing::directory_lock(&alias).is_err());
 
         drop(owner);
-        let next = DirectoryLock::acquire(&directory).unwrap();
+        let next = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&next, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()

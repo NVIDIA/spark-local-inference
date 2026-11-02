@@ -86,7 +86,8 @@ impl FakeCopier {
                         }
                     }
                 }
-                if let Some((slot, address)) = job.row {
+                if let Some((slot, ref addresses)) = job.row {
+                    let address = addresses[0];
                     let host =
                         unsafe { std::slice::from_raw_parts_mut(address as *mut u8, ROW as usize) };
                     match job.direction {
@@ -727,7 +728,10 @@ fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_
         jobs[1].pages.iter().map(|(p, _)| p.0).collect::<Vec<_>>(),
         [12]
     );
-    assert_eq!(jobs[1].row.map(|(slot, _)| slot), Some(StateSlotId(9)));
+    assert_eq!(
+        jobs[1].row.clone().map(|(slot, _)| slot),
+        Some(StateSlotId(9))
+    );
     let out = rig.drain_copies();
     let released = pick!(out, WindowReleased);
     assert_eq!(released.iter().map(|r| r.index).collect::<Vec<_>>(), [0, 1]);

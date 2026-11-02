@@ -1068,7 +1068,7 @@ max_concurrency = 4
 reserve = "0"                     # GPU memory left for processes started later.
 
 [prefix_cache]
-memory = ""                      # Host retention budget; empty: disabled.
+memory = ""                      # Warm checkpoints and CPU inputs; empty or 0: no warm tier. Intake is additional.
 drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
 disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
 disk_transport = ""              # Empty: staged; also accepts direct.

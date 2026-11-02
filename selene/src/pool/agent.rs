@@ -1654,7 +1654,7 @@ pub(crate) fn jobs_of(
     row: bool,
     page_id: impl Fn(usize) -> PageId,
     slot: Option<StateSlotId>,
-    page_address: impl Fn(usize) -> usize,
+    slot_address: impl Fn(usize) -> usize,
     row_address: usize,
 ) -> Vec<Job> {
     let mut jobs = Vec::new();
@@ -1662,11 +1662,15 @@ pub(crate) fn jobs_of(
     while first < count || (count == 0 && jobs.is_empty()) {
         let end = (first + WINDOW_PAGES).min(count);
         let pages = (first..end)
-            .map(|i| (page_id(i), page_address(i)))
+            .map(|i| (page_id(i), slot_address(i)))
             .collect();
         let last = end == count;
-        let row =
-            (last && row).then(|| (slot.expect("a window with a row has a slot"), row_address));
+        let row = (last && row).then(|| {
+            (
+                slot.expect("a window with a row has a slot"),
+                vec![row_address],
+            )
+        });
         jobs.push(Job {
             id: JobId(0),
             window,

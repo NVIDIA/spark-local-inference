@@ -1025,7 +1025,7 @@ fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     store.evicted(checkpoint.key, None);
 }
 
-fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
+fn store_and_wait<S: HostStore + ?Sized>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     let deadline = Instant::now() + Duration::from_secs(20);
     'attempt: loop {
         let outcome = store.store(checkpoint).unwrap();
@@ -1047,7 +1047,9 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
                             return;
                         }
                     }
-                    StoreEvent::Deferred { checkpoint: id } if id == checkpoint.id => retry = true,
+                    StoreEvent::Deferred { checkpoint: id, .. } if id == checkpoint.id => {
+                        retry = true
+                    }
                     _ => {}
                 }
             }
@@ -1061,7 +1063,7 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
 }
 
 /// Poll `store` until `done`.
-fn drive<S: HostStore>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -> bool) {
+fn drive<S: HostStore + ?Sized>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut events = Vec::new();
     while !done(store) {
@@ -1129,8 +1131,15 @@ fn restore_salted(
 /// A pooled store over a standalone memory store of `pages` pages, with its
 /// own simulated device.
 fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
-    let (transfers, gpu) = SimulatedGpu::shared(&geo()).unwrap();
-    let pool = SlabPool::new(PAGE as u64, pages, ROW as u64, pages, true).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
+    let layout = Layout::new(&geo()).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let pool = SlabPool::new(
+        PAGE as u64,
+        2 * intake + pages + 2 * layout.row_slots(),
+        intake,
+    )
+    .unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
     let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
     let store =
@@ -1205,13 +1214,13 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let mut requester = instance(&manager, 2);
     requester.ready();
     let geometry: Vec<CacheGeometry> = geo();
-    let layout = Layout::new(&geometry).unwrap();
     let fingerprint = fingerprint(&geometry);
     // Memory holds two records of two pages; the disk tier, two files.
-    let (memory_transfers, gpu) = SimulatedGpu::shared(&geometry).unwrap();
-    let pool = SlabPool::new(PAGE as u64, 4, ROW as u64, 4, true).unwrap();
+    let (memory_transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 8, intake).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
-    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
     let file_bytes = record::Header::new(
         &geometry,
@@ -1225,7 +1234,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     )
     .unwrap()
     .length_with_row();
-    let (disk_transfers, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let (disk_transfers, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
     let disk = DiskStore::new(
         lock,
         [7; 32],
@@ -1234,7 +1243,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
         geometry,
         scanned,
         Box::new(Staged::new(
-            Some(SlabPool::staging(&layout).unwrap()),
+            Some(memory.pool().clone()),
             disk_transfers,
             DiskThread::start("cascade-test-disk").unwrap(),
         )),
@@ -1255,12 +1264,14 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let (second, _) = publication(&gpu, 2, 2);
     let (third, _) = publication(&gpu, 3, 2);
     let (fourth, _) = publication(&gpu, 4, 2);
-    // Memory and the disk tier fill: nothing is written until memory needs room.
+    // The small warm tier is below the clean floor, so landed copies spill.
     publish(&mut store, &first);
     publish(&mut store, &second);
-    assert!(!directory.join(record::file_name(&first.key)).exists());
-    // The third pushes the first to disk; the fourth finds the disk tier full
-    // and pushes the coldest file on to the manager.
+    drive(&mut store, "the first record to commit on disk", |_| {
+        directory.join(record::file_name(&first.key)).exists()
+    });
+    // Further publications fill the disk tier and push the coldest file
+    // to the manager, releasing its memory copy too.
     publish(&mut store, &third);
     publish(&mut store, &fourth);
     drive(&mut store, "the first record's file to go", |_| {
@@ -1282,18 +1293,29 @@ fn drained_records_are_announced_and_claimable_after_restart() {
     requester.ready();
     let open = || {
         let geometry = geo();
-        let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
-        let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
-        let (memory_copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
+        let lock = flare_selene::testing::directory_lock(&directory).unwrap();
+        let scanned = record::scan(
+            &lock,
+            &[7; 32],
+            &fingerprint,
+            geometry[0].page_tokens,
+            &record::rank_sizes(&geometry),
+        )
+        .unwrap();
+        let (memory_copier, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let memory = MemoryStore::new_flat(
             [7; 32],
-            SlabPool::new(PAGE as u64, 16, ROW as u64, 4, true).unwrap(),
+            SlabPool::new(
+                PAGE as u64,
+                20 + 2 * flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
+                flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1),
+            )
+            .unwrap(),
             memory_copier,
         )
         .unwrap();
-        let (disk_copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+        let (disk_copier, _) = SimulatedGpu::shared_mapped(&geometry).unwrap();
         let disk = DiskStore::new(
             lock,
             [7; 32],
@@ -1302,7 +1324,7 @@ fn drained_records_are_announced_and_claimable_after_restart() {
             geometry,
             scanned,
             Box::new(Staged::new(
-                Some(SlabPool::staging(&layout).unwrap()),
+                Some(memory.pool().clone()),
                 disk_copier,
                 DiskThread::start("drained-restart").unwrap(),
             )),
@@ -1330,11 +1352,11 @@ fn drained_records_are_announced_and_claimable_after_restart() {
             .iter()
             .all(|(_, history)| offered(&requester, history))
     });
-    assert!(
+    drive(&mut source, "the cold record to commit on disk", |_| {
         directory
             .join(record::file_name(&records[0].0.key))
             .exists()
-    );
+    });
     let last_file = directory.join(record::file_name(&records[2].0.key));
     assert!(!last_file.exists(), "the last record is DRAM-only");
     source.close().unwrap();
@@ -1399,7 +1421,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
         let geometry = geo();
         let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let lock = flare_selene::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
         let (copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
         let store = DiskStore::new(
@@ -1410,7 +1432,14 @@ fn large_recovered_nvme_records_restore_consecutively() {
             geometry,
             scanned,
             Box::new(Staged::new(
-                Some(SlabPool::staging(&layout).unwrap()),
+                Some(
+                    SlabPool::new(
+                        layout.page_record_bytes,
+                        flare_selene::offload::intake_slots(&layout, 1),
+                        flare_selene::offload::intake_slots(&layout, 1),
+                    )
+                    .unwrap(),
+                ),
                 copier,
                 DiskThread::start("recovered-pair").unwrap(),
             )),
@@ -1954,3 +1983,315 @@ impl TestPinParts {
 mod ranks;
 #[path = "client/tls.rs"]
 mod tls;
+
+#[test]
+fn offload_startup_and_restore_cover_every_tier_combination() {
+    use flare_selene::{
+        HostRegistrar, Registration, SplitMapping,
+        offload::*,
+        pool::{Budget, PoolBuilder, PoolOptions},
+    };
+    use std::cell::RefCell;
+
+    // With one rank, the split mapping has the ordinary record layout.
+    struct OneRank(CountingRegistrar);
+    struct Split(SlabPool);
+    impl SplitMapping for Split {
+        fn address(&self) -> usize {
+            self.0.slot_address(flare_selene::slab::Slot(0))
+        }
+        fn nbytes(&self) -> usize {
+            self.0.bytes() as usize
+        }
+        fn part_address(&self, index: usize) -> usize {
+            assert_eq!(index, 0);
+            self.address()
+        }
+    }
+    impl HostRegistrar for OneRank {
+        fn register(
+            &self,
+            context: usize,
+            address: usize,
+            bytes: usize,
+        ) -> Result<Box<dyn Registration>> {
+            self.0.register(context, address, bytes)
+        }
+        fn map_split(&self, requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
+            assert_eq!(requests.len(), 1);
+            Ok(Box::new(Split(SlabPool::new(
+                PAGE as u64,
+                requests[0].2 / PAGE,
+                0,
+            )?)))
+        }
+    }
+    #[derive(Default)]
+    struct Copiers(RefCell<Vec<GpuMemory>>);
+    impl CopierFactory for Copiers {
+        fn mapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+            _: &SlabPool,
+        ) -> Result<flare_selene::SharedCopier> {
+            let (copier, gpu) = SimulatedGpu::shared_mapped(&geometry)?;
+            self.0.borrow_mut().push(gpu);
+            Ok(copier)
+        }
+        fn unmapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+        ) -> Result<Box<dyn flare_selene::PageCopier>> {
+            let (copier, gpu) = SimulatedGpu::new(&geometry)?;
+            self.0.borrow_mut().push(gpu);
+            Ok(Box::new(copier))
+        }
+    }
+
+    let mut geometry = geo();
+    geometry[0].row.unit_bytes = 3 * PAGE as u64;
+    let manager = Manager::start();
+    for warm in [false, true] {
+        for disk in [false, true] {
+            for pooled in [false, true] {
+                let name = format!("matrix-{warm}-{disk}-{pooled}");
+                let Some(directory) = offload_directory(&name) else {
+                    return;
+                };
+                let options = PrefixCacheOffload {
+                    memory_bytes: Some(if warm { 512 * PAGE as u64 } else { 0 }),
+                    disk: disk.then(|| directory.clone()),
+                    disk_limit: Some(1 << 20),
+                    pool: pooled.then(|| PoolOptions {
+                        address: manager.address(),
+                        ca: None,
+                    }),
+                    ..Default::default()
+                };
+                let registrar = Arc::new(OneRank(CountingRegistrar::default()));
+                let factory = Copiers::default();
+                let mut startup = Startup::default();
+                if pooled {
+                    startup
+                        .start_pool(
+                            PoolBuilder {
+                                options: options.pool.as_ref().unwrap(),
+                                identity: [7; 32],
+                                geometry: &geometry,
+                                gpu_uuids: vec![[1; 16]],
+                                registration_context: 0,
+                                budget: Budget {
+                                    host: Ok(u64::MAX),
+                                    devices: vec![(u64::MAX, false)],
+                                },
+                                peers: None,
+                                disk,
+                            },
+                            registrar.clone(),
+                            |approved| {
+                                assert!(approved);
+                                Ok(true)
+                            },
+                        )
+                        .unwrap();
+                }
+                let preparation = prepare_with_inputs(
+                    &options,
+                    std::path::Path::new("unused"),
+                    [7; 32],
+                    geometry.clone(),
+                    vec![(0, 0)],
+                    8,
+                    0,
+                    None,
+                    registrar.as_ref(),
+                )
+                .unwrap();
+                if !warm && !disk && !pooled {
+                    assert_eq!(preparation.summary(), "disabled");
+                    assert!(matches!(preparation, Preparation::None(_)));
+                    assert_eq!(startup.attach(preparation, &factory).unwrap(), "disabled");
+                    assert!(startup.binding(0).is_none());
+                    std::fs::remove_dir_all(directory).unwrap();
+                    continue;
+                }
+                let Preparation::Store(prepared) = &preparation else {
+                    panic!("{name}: disabled")
+                };
+                assert_eq!(prepared.warm_bytes, options.memory_bytes.unwrap());
+                assert_eq!(prepared.memory_pool.is_some(), warm || disk);
+                if let Some(pool) = &prepared.memory_pool {
+                    assert_eq!(
+                        pool.slot_count(),
+                        intake_slots(&prepared.layout, 8) + usize::from(warm) * 512
+                    );
+                    assert_eq!(pool.rank_parts().is_some(), warm && !disk && !pooled);
+                }
+                // The manager's two regions are separate from the local shared mapping.
+                assert_eq!(
+                    registrar.0.calls.lock().unwrap().len(),
+                    usize::from(pooled) * 2 + usize::from(disk || (warm && pooled))
+                );
+                startup.attach(preparation, &factory).unwrap();
+                let mut store =
+                    open(startup.binding(0).unwrap().take().unwrap(), &factory).unwrap();
+                let stats = store.stats();
+                let intake = if warm || disk {
+                    intake_slots(&Layout::new(&geometry).unwrap(), 8)
+                } else {
+                    0
+                };
+                assert_eq!(stats.slots_used, 0, "{name}");
+                assert_eq!(stats.slots_total, intake + usize::from(warm) * 512, "{name}");
+                assert_eq!(stats.intake_slots, intake, "{name}");
+                let salt = 1 + u32::from(warm) * 4 + u32::from(disk) * 2 + u32::from(pooled);
+                let (checkpoint, history) = publication(&factory.0.borrow()[0], salt, 2);
+                let row: Vec<u8> = (0..3 * PAGE)
+                    .map(|i| ((i * 11 + salt as usize * 17 + 3) % 251) as u8)
+                    .collect();
+                for gpu in factory.0.borrow().iter() {
+                    publication(gpu, salt, 2);
+                    gpu.rows.lock().unwrap().insert(salt, row.clone());
+                }
+                store_and_wait(store.as_mut(), &checkpoint);
+                if warm || disk {
+                    store.evicted(checkpoint.key, None);
+                    let hit = store.lookup(&history, 0, u64::MAX).unwrap();
+                    store
+                        .fetch(
+                            hit,
+                            flare_selene::InboundTicket {
+                                key: checkpoint.key,
+                                pages: vec![PageId(300), PageId(301)],
+                                slot: StateSlotId(9),
+                            },
+                        )
+                        .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let mut events = Vec::new();
+                        store.poll(&mut events).unwrap();
+                        if let Some(StoreEvent::Fetched { result, .. }) = events
+                            .into_iter()
+                            .find(|event| matches!(event, StoreEvent::Fetched { .. }))
+                        {
+                            assert_eq!(
+                                result.map_err(|error| error.to_string()),
+                                Ok((2 * PAGE + row.len()) as u64),
+                                "{name}"
+                            );
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "{name}: local restore stalled");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    let memories = factory.0.borrow();
+                    let restored = memories
+                        .iter()
+                        .find(|gpu| gpu.rows.lock().unwrap().contains_key(&9))
+                        .unwrap();
+                    for page in 0..2 {
+                        assert_eq!(
+                            restored.pages.lock().unwrap()[&(300 + page as u32)],
+                            salted_page(salt, page)
+                        );
+                    }
+                    assert_eq!(restored.rows.lock().unwrap()[&9], row);
+                }
+                if pooled {
+                    let mut options = config(&manager, 2);
+                    options.scope = Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap();
+                    let (copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
+                    let mut requester = Instance {
+                        client: PoolClient::start(
+                            options,
+                            None,
+                            copier,
+                            Arc::new(OkRegistrar),
+                            flare_selene::pool::Roots::System,
+                            STARTUP_WAIT,
+                        )
+                        .unwrap(),
+                        gpu,
+                        events: Vec::new(),
+                    };
+                    requester.ready();
+                    drive(store.as_mut(), "the published record", |_| {
+                        let ticket = requester.client.begin_lookup(&history, 0);
+                        wait("the lookup", || {
+                            !matches!(ticket.state(), LookupState::Pending)
+                        });
+                        matches!(ticket.state(), LookupState::Ready(answer)
+                            if answer.candidates.iter().any(|candidate| candidate.plan.key == checkpoint.key)
+                                && answer.candidates.iter().all(|candidate| (!warm && !disk) || candidate.tier != Tier::Gpu))
+                    });
+                    let fetch = fetch_for(&mut requester, &history, 2, &[300, 301]);
+                    requester.client.fetch(fetch).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let mut events = Vec::new();
+                        store.poll(&mut events).unwrap();
+                        for event in events {
+                            if let StoreEvent::ExportRequested { export, key, .. } = event {
+                                assert!(!warm && !disk, "{name}: evicted GPU was selected");
+                                assert_eq!(key, checkpoint.key);
+                                store
+                                    .export_pinned(
+                                        export,
+                                        flare_selene::ExportChain {
+                                            nodes: vec![flare_selene::ExportNode {
+                                                key,
+                                                pages: checkpoint.chain_pages.clone(),
+                                            }],
+                                            skip_pages: 0,
+                                            row: Some(checkpoint.slot),
+                                        },
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        requester.poll();
+                        if let Some(at) = requester
+                            .events
+                            .iter()
+                            .position(|event| matches!(event, PoolEvent::Fetched { .. }))
+                        {
+                            let PoolEvent::Fetched { result, .. } = requester.events.remove(at)
+                            else {
+                                unreachable!()
+                            };
+                            assert_eq!(
+                                result.map_err(|error| error.error.to_string()),
+                                Ok((2 * PAGE + row.len()) as u64),
+                                "{name}"
+                            );
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "{name}: restore stalled");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    for page in 0..2 {
+                        assert_eq!(
+                            requester.gpu.pages.lock().unwrap()[&(300 + page as u32)],
+                            salted_page(salt, page)
+                        );
+                    }
+                    assert_eq!(requester.gpu.rows.lock().unwrap()[&9], row);
+                    requester.client.close().unwrap();
+                }
+                store.evicted(checkpoint.key, None);
+                store.close().unwrap();
+                drop(store);
+                startup.reset();
+                assert_eq!(
+                    *registrar.0.drops.lock().unwrap(),
+                    registrar.0.calls.lock().unwrap().len(),
+                    "{name}"
+                );
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+}

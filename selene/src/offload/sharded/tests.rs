@@ -46,9 +46,14 @@ impl CopierFactory for Copiers {
         &self,
         contexts: &[(usize, i32)],
         geometry: Vec<CacheGeometry>,
-        _: &crate::slab::SlabPool,
+        pool: &crate::slab::SlabPool,
     ) -> Result<crate::SharedCopier> {
-        let (copier, memory) = SimulatedGpu::shared(&geometry)?;
+        assert_eq!(
+            pool.intake_slots(),
+            offload::intake_slots(&crate::Layout::new(&geometry)?, 8)
+        );
+        assert_eq!(pool.slot_count(), pool.intake_slots());
+        let (copier, memory) = SimulatedGpu::shared_mapped(&geometry)?;
         let rank = contexts[0].0;
         for page in 1..=2 {
             memory
@@ -61,7 +66,7 @@ impl CopierFactory for Copiers {
             .rows
             .lock()
             .unwrap()
-            .insert(1, vec![rank as u8 + 10; 4096]);
+            .insert(1, vec![rank as u8 + 10; 3 * 4096]);
         self.0.lock().unwrap().insert(rank, memory);
         Ok(copier)
     }
@@ -92,9 +97,10 @@ fn completed(store: &mut dyn HostStore) -> StoreEvent {
 fn sharded_export_and_restore_use_each_ranks_real_record_file() {
     let directory = crate::testing::test_directory("sharded", "real-records").unwrap();
     let factory = Arc::new(Copiers::default());
-    let local = geometry(64, &[("kv", 4096)], 4096);
+    let local = geometry(64, &[("kv", 4096)], 3 * 4096);
     let prepare = |rank| {
         let options = PrefixCacheOffload {
+            memory_bytes: Some(0),
             disk: Some(directory.join(format!("rank-{rank}"))),
             disk_limit: Some(1 << 20),
             ..Default::default()
@@ -105,6 +111,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
             [3; 32],
             vec![local.clone()],
             vec![(rank, 0)],
+            8,
             0,
             Some((rank, 2)),
             &IdentityRegistrar,
@@ -143,6 +150,11 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
     .unwrap();
     let service = service.join().unwrap();
     let mut store = offload::open(zero.take().unwrap(), factory.as_ref()).unwrap();
+    let intake = offload::intake_slots(&crate::Layout::new(&[local]).unwrap(), 8);
+    let stats = store.stats();
+    assert_eq!(stats.slots_used, 0);
+    assert_eq!(stats.slots_total, intake);
+    assert_eq!(stats.intake_slots, intake);
     let mut history = TestHistory::new([3; 32]);
     history.append(&[7; 129], &[]).unwrap();
     let key = history.key_at(128).unwrap();
@@ -184,7 +196,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
         assert_eq!(pages[&4], vec![*rank as u8 + 2; 4096]);
         assert_eq!(
             memory.rows.lock().unwrap()[&2],
-            vec![*rank as u8 + 10; 4096]
+            vec![*rank as u8 + 10; 3 * 4096]
         );
     }
     store.close().unwrap();

@@ -6,7 +6,11 @@
 //! Fixtures for tests of this crate and of the crates that implement its seams.
 
 pub use crate::pool::{engine::RESTORE_DEADLINE, net::{Roots, trusted}, options::pool_address};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
 
@@ -16,6 +20,27 @@ use crate::{
 };
 
 pub use crate::slab::rank_part;
+
+/// Retry locks briefly inherited by parallel subprocess tests before exec.
+pub fn directory_lock(directory: &Path) -> Result<crate::record::DirectoryLock> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::record::DirectoryLock::acquire(directory) {
+            Ok(guard) => return Ok(guard),
+            Err(error) => {
+                let busy = error.cause().is_some_and(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                });
+                if !busy || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
 
 /// A token history with the key structure the index reads: a key at every
 /// hash-block boundary and at any endpoint between them. Digests chain, so two
@@ -180,10 +205,11 @@ pub struct GpuMemory {
     pub rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
 }
 
-/// A copier that moves bytes between host slabs and an in-memory stand-in for
+/// A copier that moves bytes between host slots and an in-memory stand-in for
 /// the GPU as soon as a job is submitted, and reports the job on the next poll.
 pub struct SimulatedGpu {
     layout: Layout,
+    mapped_rows: bool,
     memory: GpuMemory,
     replies: Vec<Reply>,
 }
@@ -194,11 +220,18 @@ impl SimulatedGpu {
         Ok((
             Self {
                 layout: Layout::new(geometry)?,
+                mapped_rows: false,
                 memory: memory.clone(),
                 replies: Vec::new(),
             },
             memory,
         ))
+    }
+
+    pub fn shared_mapped(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
+        let (mut copier, memory) = Self::new(geometry)?;
+        copier.mapped_rows = true;
+        Ok((std::sync::Arc::new(std::sync::Mutex::new(copier)), memory))
     }
 
     pub fn shared(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
@@ -222,7 +255,7 @@ impl PageCopier for SimulatedGpu {
             self.memory.rows.lock().unwrap(),
         );
         for (id, address) in &job.pages {
-            // The host address names a slab the caller keeps mapped for the job.
+            // The host address names a slot the caller keeps mapped for the job.
             let host = unsafe { std::slice::from_raw_parts_mut(*address as *mut u8, page) };
             match job.direction {
                 crate::Direction::Out => {
@@ -233,15 +266,23 @@ impl PageCopier for SimulatedGpu {
                 }
             }
         }
-        if let Some((slot, address)) = job.row {
-            let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, row) };
-            match job.direction {
-                crate::Direction::Out => {
-                    host.copy_from_slice(rows.get(&slot.0).map_or(&vec![0; row], |p| p));
+        if let Some((slot, slots)) = &job.row {
+            let mut data = rows.get(&slot.0).cloned().unwrap_or_else(|| vec![0; row]);
+            let pieces: Vec<_> = if !self.mapped_rows {
+                vec![(slots[0], 0, row)]
+            } else {
+                crate::slab::row_pieces(&self.layout, slots).collect()
+            };
+            for (address, offset, len) in pieces {
+                let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, len) };
+                let bytes = &mut data[offset as usize..offset as usize + len];
+                match job.direction {
+                    crate::Direction::Out => host.copy_from_slice(bytes),
+                    crate::Direction::In => bytes.copy_from_slice(host),
                 }
-                crate::Direction::In => {
-                    rows.insert(slot.0, host.to_vec());
-                }
+            }
+            if job.direction == crate::Direction::In {
+                rows.insert(slot.0, data);
             }
         }
         self.replies.push(Reply {

@@ -75,7 +75,7 @@ impl<O: Send + 'static> HostFiller<O> {
             .is_some_and(|jobs| jobs.send(job).is_ok())
     }
 
-    /// Wait for reads of slabs that their owner is about to free.
+    /// Wait for reads of slots that their owner is about to free.
     pub(crate) fn join(&mut self) {
         self.jobs.take();
         if let Some(thread) = self.thread.take() {

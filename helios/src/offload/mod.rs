@@ -29,7 +29,7 @@ use crate::Result;
 
 pub use flare_selene::offload::{
     Binding, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared, input_memory_bytes,
-    parse_drain_on_shutdown, parse_size,
+    parse_drain_on_shutdown, parse_max_age, parse_size,
 };
 
 pub fn prepare(
@@ -39,7 +39,7 @@ pub fn prepare(
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, package, identity, geometry, contexts, 0, None)
+    prepare_with_inputs(options, package, identity, geometry, contexts, 1, 0, None)
 }
 
 pub fn prepare_with_inputs(
@@ -48,6 +48,7 @@ pub fn prepare_with_inputs(
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
+    max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
 ) -> Result<Preparation> {
@@ -57,6 +58,7 @@ pub fn prepare_with_inputs(
         identity,
         geometry,
         contexts,
+        max_active,
         input_staging,
         shard,
         &registrar::CudaRegistrar,

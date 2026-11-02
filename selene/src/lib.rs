@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Host tiers for prefix checkpoints: DRAM slabs and local record files.
+//! Host tiers for prefix checkpoints: DRAM slots and local record files.
 //!
 //! Selene holds the host-tier index, the eviction policy, the record format and
 //! its recovery. It has no CUDA dependency: the GPU tier's owner moves bytes
-//! between devices and host slabs through the [`PageCopier`] and
+//! between devices and host slots through the [`PageCopier`] and
 //! [`HostRegistrar`] seams it implements.
 //!
 //! Three stores implement [`HostStore`]: [`memory::MemoryStore`] retains records

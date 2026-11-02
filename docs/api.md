@@ -313,7 +313,11 @@ Host retention also exports `flare_host_cache_held_total{tier}` and
 `end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
 writes. `flare_host_cache_store_skipped_total` still includes duplicates and
-retries; it is not a dropped-record counter.
+retries; it is not a dropped-record counter. Local checkpoint pool capacity is
+reported by `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total`
+(including automatic intake), and `flare_host_cache_intake_slots`. Used slots
+include pages, row pieces, and staging allocations. These replace the row
+capacity gauges.
 
 Dashboard DEPTH is the change in `verification_drafts` divided by the change in
 `verification_rounds` over the sampling window. It averages each request's planned

@@ -139,7 +139,7 @@ fn retain(prepared: &mut Prepared, agreed: &HashMap<PrefixKey, bool>) -> Result<
 /// Whether this rank serves a disk store its peers can mirror; a memory tier keeps records in
 /// one process's memory, which other hosts cannot reach.
 fn mirrored(prepared: &Prepared) -> Result<bool> {
-    if prepared.memory_pool.is_some() {
+    if prepared.warm_bytes != 0 {
         return Err(invalid(
             "a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0",
         ));
@@ -407,12 +407,12 @@ pub fn join_peer(
     // then fails the join instead of interrupting serving, when rank zero has
     // already treated this rank as joined.
     let pool = prepared
-        .staging_pool
+        .memory_pool
         .as_ref()
-        .ok_or_else(|| invalid("a peer's prefix record service needs a staging pool"))?;
+        .ok_or_else(|| invalid("a peer's prefix record service needs an intake pool"))?;
     let transfers = factory.mapped(&prepared.contexts, prepared.geometry.clone(), pool)?;
     let staged = Staged::new(
-        prepared.staging_pool.take(),
+        prepared.memory_pool.take(),
         transfers,
         DiskThread::start("flare-offload-disk")?,
     );

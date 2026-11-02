@@ -47,9 +47,6 @@ impl crate::store::TierStore for Hooks {
         self.0.lock().unwrap().push(format!("pin {tier:?}"));
         Err(ExportRefusal::ChainGap)
     }
-    fn cascade(&mut self) {
-        self.0.lock().unwrap().push("cascade".into());
-    }
     fn set_spill(&mut self, enabled: bool) {
         self.0.lock().unwrap().push(format!("spill {enabled}"));
     }
@@ -74,7 +71,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         digest: [1; 16],
     };
     tiers.drain_on_shutdown();
-    tiers.cascade();
     tiers.set_spill(true);
     assert!(tiers.take_retiring().is_empty());
     tiers.retired(key, crate::pool::Tier::Dram, crate::Retirement::Moved);
@@ -86,7 +82,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         *hooks.0.lock().unwrap(),
         [
             "drain",
-            "cascade",
             "spill true",
             "take_retiring",
             "retired Dram Moved",
@@ -95,7 +90,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
     );
     // With no tiers there is nothing to reach.
     let mut none = Tiers::new(None);
-    none.cascade();
     assert!(none.take_retiring().is_empty());
     assert!(matches!(
         none.pin_export(crate::pool::Tier::Dram, key, 0, true),
