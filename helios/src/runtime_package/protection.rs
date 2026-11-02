@@ -3992,6 +3992,15 @@ mod payload_package_tests {
         // relative path. Authenticated reads must keep using the handles opened before acceptance.
         let moved = root.with_extension("moved");
         let _ = std::fs::remove_dir_all(&moved);
+        if cfg!(windows) {
+            // Windows package handles deny renaming or replacing the package while it is
+            // open (docs/windows.md), so the replacement cannot occur there.
+            assert!(std::fs::rename(&root, &moved).is_err());
+            payload.verify_stored_data().unwrap();
+            drop(authorized);
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
         std::fs::rename(&root, &moved).unwrap();
         let weight = moved.join("weights/tp1.safetensors");
         std::fs::remove_file(&weight).unwrap();
