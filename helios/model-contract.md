@@ -223,7 +223,12 @@ and DSML tool syntax may be paired independently with think-tag reasoning.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
 markers are explicit syntax data. A reasoning terminal marker must be the
 declared tool syntax's opener. Reasoning delimiters that the frontend tokenizer
-encodes as one token delimit output only when generated as that token.
+encodes as one token delimit output only when generated as that token. A close
+delimiter generated as its token ends reasoning once; a later one is protocol
+markup that the parser drops instead of emitting as answer content, while a
+plain-text spelling that is not the token remains text. A structured answer
+stays an opaque grammar-constrained document, so literal delimiters inside it
+remain answer text.
 
 The shared prompt path determines initial reasoning state from an open assistant
 envelope, excluding completed user, tool, and assistant messages. When a template

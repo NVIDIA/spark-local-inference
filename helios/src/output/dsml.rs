@@ -436,6 +436,83 @@ mod deepseek4_syntax_tests {
 }
 
 #[cfg(test)]
+mod reasoning_close_tests {
+    use super::*;
+    use crate::output::tagged::OutputConfig;
+    use crate::output::{Input, ModelOutput, Termination};
+    use crate::server::output::Accumulator;
+
+    /// The reported shape: reasoning, its close delimiter token, a short answer, a
+    /// second close delimiter token, and the rest of the answer. The DeepSeek
+    /// parser skips a thinking-end token outside reasoning, so no close delimiter
+    /// reaches content. A plain-text spelling is plain tokens and stays content.
+    fn check<const SPACED: bool>(feed: usize, spelled: bool) {
+        let close = (128822, "</think>".to_owned());
+        let mut parser = DsmlOutput::<SPACED>::new(OutputConfig {
+            structured: false,
+            start: OutputStart::Reasoning,
+            tools: vec![],
+        })
+        .with_special_tokens(vec![(128821, "<think>".to_owned()), close.clone()]);
+        let mut output = Accumulator::new("close".into());
+        let second = if spelled { None } else { Some(close.0) };
+        let pieces = [
+            (None, "Reason."),
+            (Some(close.0), close.1.as_str()),
+            (None, "Answer."),
+            (second, close.1.as_str()),
+            (None, "More."),
+        ];
+        for (token, text) in pieces {
+            if let Some(token) = token {
+                output
+                    .apply(parser.push(Input::Token(token)).unwrap())
+                    .unwrap();
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else if feed == 0 {
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else {
+                for character in text.chars() {
+                    output
+                        .apply(parser.push(Input::Text(&character.to_string())).unwrap())
+                        .unwrap();
+                }
+            }
+        }
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        let message = output.message();
+        assert_eq!(message["reasoning_content"], "Reason.");
+        assert_eq!(
+            message["content"],
+            if spelled { "Answer.</think>More." } else { "Answer.More." }
+        );
+    }
+
+    #[test]
+    fn compact_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<false>(feed, false);
+            check::<false>(feed, true);
+        }
+    }
+
+    #[test]
+    fn spaced_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<true>(feed, false);
+            check::<true>(feed, true);
+        }
+    }
+}
+
+#[cfg(test)]
 mod prefixed_tool_tests {
     use super::*;
     use crate::output::tagged::{OutputConfig, OutputStart};
