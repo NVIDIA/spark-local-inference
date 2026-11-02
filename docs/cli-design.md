@@ -1118,9 +1118,9 @@ value in preference to that recorded reserve.
 
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
-recomputing it. A finished exchange can retain its prompt and answer states, so the
-engine exposes up to eight snapshot slots per concurrent request, about four
-recent exchanges each. Snapshot slots share physical backing with KV pages and
+recomputing it. Immutable snapshot capacity is bounded by borrowable KV backing
+and the prepared virtual extent. The per-request capture budget is capped at
+eight. Snapshot slots share physical backing with KV pages and
 acquire it only when retaining a checkpoint. Unpinned checkpoints are evicted
 to admit requests. If active requests or transfers own all suitable backing,
 the engine skips optional checkpoint retention. There is no dedicated snapshot
@@ -1190,7 +1190,7 @@ every rank and have no configuration-file key. See
 | Tensor-parallel size | Count of `--gpus`, or the smallest recipe-supported size whose estimate fits the first GPUs with enough free memory |
 | Context limit | The smaller of the prepared context ceiling and loaded KV capacity after per-request draft-page storage; admission also checks available shared capacity |
 | KV pages | Remaining supply after the runtime memory limit or package reserve, engine headroom, weights, graphs, scratch, and execution rows; bounded by `--kv-cache-limit` and prepared virtual extents. Retained snapshot rows borrow page backing; the load display reports total KV capacity |
-| Prefix cache | Up to eight snapshot slots per `--max-concurrency` request, acquired on demand from shared KV backing and evicted under pressure |
+| Prefix cache | Immutable snapshot capacity bounded by borrowable KV backing and the prepared virtual extent, acquired on demand and evicted under pressure; per-request capture budget capped at eight |
 | Live state | One null row plus the recipe's execution rows per active request slot; GLM verification commits into one live row |
 | Decode graph capacities | 1 through `--max-concurrency`, rounded to the recipe's captured set |
 | Image feature arena | Prepared image concurrency times per-request feature capacity and embedding width; slots remain owned through request retirement |

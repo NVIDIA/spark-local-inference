@@ -1395,10 +1395,10 @@ to earlier tokens cannot reuse a checkpoint for different tokens.
 
 At admission, the scheduler budgets newly captured cache snapshots from the
 loaded snapshot capacity divided by configured maximum concurrency, rounded
-down. A nonempty pool permits at least one capture per request; an empty pool
-permits none. The budget reserves a terminal capture and, when generation can
-continue beyond the prompt and the budget permits, a prompt capture. A single
-output token shares the prompt and terminal endpoint.
+down and capped at eight. A nonempty pool permits at least one capture per
+request; an empty pool permits none. The budget reserves a terminal capture and,
+when generation can continue beyond the prompt and the budget permits, a prompt
+capture. A single output token shares the prompt and terminal endpoint.
 
 The remaining budget selects message checkpoints within the uncached prompt
 suffix. If all eligible boundaries fit, retain them all. Otherwise, place token

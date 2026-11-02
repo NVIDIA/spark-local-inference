@@ -150,6 +150,27 @@ fn checkpoint_targets_follow_token_distance_and_exclude_reused_prefixes() {
 }
 
 #[test]
+fn larger_snapshot_pools_keep_the_same_eight_capture_prefill_cuts() {
+    let mut previous = None;
+    for snapshots in [32, 1024] {
+        let mut s = scheduler(snapshots, false);
+        let mut request = spec(None, 700, 3);
+        request.message_boundaries = (1..700).collect();
+        let handle = s.admit(request).unwrap();
+        let boundaries = s.request(handle).unwrap().message_boundaries.clone();
+        assert_eq!(boundaries.len(), 6);
+        if let Some(previous) = previous {
+            assert_eq!(boundaries, previous);
+        }
+        previous = Some(boundaries);
+        finish(&mut s, handle);
+        assert_eq!(s.stats().message_checkpoints, 6);
+        assert_eq!(s.stats().prompt_checkpoints, 1);
+        assert_eq!(s.stats().snapshot_publications, 8);
+    }
+}
+
+#[test]
 fn small_snapshot_shares_prioritize_endpoints_and_allow_completion() {
     for snapshots in [0, 1, 2, 4, 8, 12] {
         for output in [1, 3] {
@@ -544,30 +565,32 @@ fn every_message_endpoint_can_restore_after_a_changed_following_turn() {
     let endpoints = vec![1, 7, 63, 64, 65, 129, 300, 514, 700];
     for page_tokens in [64, 128, 256, 2048] {
         for mtp in [false, true] {
-            let mut s = scheduler_with_concurrency(16, mtp, page_tokens, 1);
-            let mut request = spec(None, 901, 3);
-            request.message_boundaries = endpoints.clone();
-            let handle = s.admit(request).unwrap();
-            for &end in &endpoints {
-                stop_at_capture(&mut s, handle, end as u64);
-                assert_eq!(s.request(handle).unwrap().generated_tokens, 0);
-                run_step(&mut s);
-                assert_eq!(s.request(handle).unwrap().prefix_tokens, end as u64);
-            }
-            finish(&mut s, handle);
-            assert_eq!(s.stats().message_checkpoints, endpoints.len() as u64);
-            for &end in &endpoints {
-                let mut branch = spec(None, end + 10, 1);
-                branch.prompt[end..].fill(1000);
-                branch.message_boundaries = endpoints.iter().copied().filter(|&n| n <= end).collect();
-                let branch = s.admit(branch).unwrap();
-                assert_eq!(s.request(branch).unwrap().reused_prompt_tokens(), end as u64);
-                assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
-                let step = s.plan().unwrap();
-                assert_eq!(step.kind, GraphKind::Prefill);
-                assert_eq!(step.lanes[0].start_position, end as u64);
-                assert_eq!(step.lanes[0].tokens, 10);
-                s.cancel(branch).unwrap();
+            for endpoints in endpoints.chunks(6) {
+                let mut s = scheduler_with_concurrency(16, mtp, page_tokens, 1);
+                let mut request = spec(None, 901, 3);
+                request.message_boundaries = endpoints.to_vec();
+                let handle = s.admit(request).unwrap();
+                for &end in endpoints {
+                    stop_at_capture(&mut s, handle, end as u64);
+                    assert_eq!(s.request(handle).unwrap().generated_tokens, 0);
+                    run_step(&mut s);
+                    assert_eq!(s.request(handle).unwrap().prefix_tokens, end as u64);
+                }
+                finish(&mut s, handle);
+                assert_eq!(s.stats().message_checkpoints, endpoints.len() as u64);
+                for &end in endpoints {
+                    let mut branch = spec(None, end + 10, 1);
+                    branch.prompt[end..].fill(1000);
+                    branch.message_boundaries = endpoints.iter().copied().filter(|&n| n <= end).collect();
+                    let branch = s.admit(branch).unwrap();
+                    assert_eq!(s.request(branch).unwrap().reused_prompt_tokens(), end as u64);
+                    assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
+                    let step = s.plan().unwrap();
+                    assert_eq!(step.kind, GraphKind::Prefill);
+                    assert_eq!(step.lanes[0].start_position, end as u64);
+                    assert_eq!(step.lanes[0].tokens, 10);
+                    s.cancel(branch).unwrap();
+                }
             }
         }
     }

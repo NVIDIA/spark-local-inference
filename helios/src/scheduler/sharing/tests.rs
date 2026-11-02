@@ -47,6 +47,28 @@ fn publish(
 }
 
 #[test]
+fn cached_rows_beyond_eight_per_request_yield_backing_to_admission() {
+    let mut s = scheduler(1, 64, 64);
+    let aliases: Vec<_> = (0..64).map(|i| 63 - i..64 - i).collect();
+    s.share_snapshot_pages(&aliases).unwrap();
+    let h = history(1);
+    for end in 1..=48 {
+        publish(&mut s, &h, None, end, &[], 0);
+    }
+    assert_eq!(s.stats().snapshot_backing_pages, 48);
+    assert_eq!(s.free_page_count(), 16);
+    let mut request = spec(1984, 1);
+    request.prompt.fill(999);
+    let handle = s.admit(request).unwrap();
+    assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), 0);
+    assert_eq!(s.request(handle).unwrap().reserved_pages.len(), 32);
+    assert_eq!(s.stats().snapshot_backing_pages, 32);
+    assert_eq!(s.stats().snapshot_evictions, 16);
+    s.cancel(handle).unwrap();
+    assert_eq!(s.free_page_count(), 32);
+}
+
+#[test]
 fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     let mut s = scheduler(2, 16, 4);
     s.enable_publications();

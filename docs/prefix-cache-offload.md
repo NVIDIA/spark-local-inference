@@ -179,6 +179,8 @@ message is offered while the request still pins it; cancellation or error before
 that capture offers it at retirement. GPU captures, prefill cuts, and retention
 are unchanged; deferred points can be lost to GPU
 eviction before reuse, and are not announced to the pool until offered.
+Compaction also offers a deferred branch point as its heir and refreshes
+descendant offers with their new parent.
 `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
 requires a committed local copy. `Retry` accepts no copy. The worker retains only
 checkpoint IDs for retries after store progress and discards IDs that have left

@@ -1581,7 +1581,7 @@ impl RequestScheduler {
         let checkpoint_budget = if self.limits.snapshots == 0 {
             0
         } else {
-            (self.limits.snapshots as usize / self.limits.max_active).max(1)
+            (self.limits.snapshots as usize / self.limits.max_active).clamp(1, 8)
         };
         let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
         let message_boundaries = checkpoint_boundaries(
