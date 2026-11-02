@@ -104,10 +104,10 @@ patches before starting their process:
 uv run --locked --extra prepare python -m ignition.patches
 ```
 
-`python scripts/setup_preparation.py` updates FlashInfer to the tip of its `main`
-branch, syncs preparation/test dependencies, rebuilds FlashInfer and Heliopause,
-and applies the bundled patches before exiting. It updates `uv.lock` when the
-branch advances.
+`python scripts/setup_preparation.py` resolves the FlashInfer revision declared
+in `pyproject.toml`, syncs preparation/test dependencies, rebuilds FlashInfer and
+Heliopause, and applies the bundled patches before exiting. It updates `uv.lock`
+when the declared dependency resolves differently.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
@@ -140,10 +140,10 @@ together. Refresh and commit `helios/Cargo.lock`, `flare/Cargo.lock`, and
 and Heliopause against the pinned revision. Compare rendered prompts and token
 IDs with upstream when changing encoder behavior.
 
-The preparation dependency tracks the `main` branch of
-`local-inference-lab/flashinfer`; `uv.lock` pins the resolved commit. The setup
-script updates it automatically. To update the lock alone, run
-`uv lock --upgrade-package flashinfer-python`, then sync the environment.
+The preparation dependency pins a revision of `local-inference-lab/flashinfer`
+in `pyproject.toml`; `uv.lock` records the same commit. To update FlashInfer,
+change that revision and run `uv lock --upgrade-package flashinfer-python`,
+then sync the environment.
 For local FlashInfer development, install the sibling
 checkout explicitly with `uv pip install --python .venv/bin/python --no-deps -e ../flashinfer`;
 `uv sync --locked --extra prepare --extra test` restores the Git dependency.

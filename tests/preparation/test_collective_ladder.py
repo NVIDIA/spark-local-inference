@@ -67,6 +67,90 @@ def test_invalid_bucket(changes):
         validate(data)
 
 
+def clustered_ladder():
+    data = deepcopy(load(LADDER))
+    data["buckets"][0].update(threads=512, blocks=64, cluster_size=8,
+                              profiles={"payload_rsag": [64], "pull": [2, 8], "payload_rsag_phased": [8]})
+    return data
+
+
+def test_clustered_geometry_retains_ordinary_profiles_and_exact_contents():
+    data = clustered_ladder()
+    expected = deepcopy(data)
+    assert validate(data) is data and data == expected
+    assert choose(data, 16) is data["buckets"][0]
+    ordinary = deepcopy(load(LADDER))
+    ordinary["buckets"][0]["cluster_size"] = 1
+    assert validate(ordinary) is ordinary
+
+
+@pytest.mark.parametrize("filename, changed_count", [
+    ("gb202_pcie_tp4_clustered.json", 36),
+    ("gb202_pcie_tp4_clustered_full.json", 37),
+])
+def test_clustered_catalog_preserves_every_ordinary_candidate(filename, changed_count):
+    baseline = load(LADDER)
+    clustered = load(LADDER.with_name(filename))
+    assert {key: value for key, value in clustered.items() if key not in ("name", "buckets")} == {
+        key: value for key, value in baseline.items() if key not in ("name", "buckets")}
+    assert len(clustered["buckets"]) == len(baseline["buckets"])
+    changed = []
+    for ordinary, candidate in zip(baseline["buckets"], clustered["buckets"], strict=True):
+        if candidate == ordinary:
+            continue
+        changed.append(candidate["max_bytes"])
+        without_cluster = deepcopy(candidate)
+        assert without_cluster.pop("cluster_size") == 8
+        for mode in ("payload_rsag_phased", "full_phased"):
+            if mode in without_cluster["profiles"]:
+                assert without_cluster["profiles"].pop(mode) == [8]
+        assert without_cluster == ordinary
+        assert ordinary["threads"] == 512 and ordinary["blocks"] == 64
+    assert len(changed) == changed_count
+    assert {169984, 339952} <= set(changed)
+    assert (84992 in changed) == filename.endswith("_full.json")
+
+
+def test_full_phase_catalog_differs_only_at_the_80_kib_bucket():
+    packed = load(LADDER.with_name("gb202_pcie_tp4_clustered.json"))
+    full = load(LADDER.with_name("gb202_pcie_tp4_clustered_full.json"))
+    changed = [(before, after) for before, after in zip(packed["buckets"], full["buckets"], strict=True)
+               if before != after]
+    assert len(changed) == 1
+    before, after = changed[0]
+    assert before["max_bytes"] == 84992
+    expected = deepcopy(before)
+    expected.update(cluster_size=8)
+    expected["profiles"]["full_phased"] = [8]
+    assert after == expected
+
+
+@pytest.mark.parametrize("changes", [dict(cluster_size=True), dict(cluster_size=0),
+    dict(cluster_size=16), dict(threads=256), dict(blocks=16),
+    dict(profiles={"payload_rsag_phased": [1]}), dict(profiles={"payload_rsag_phased": [16]}),
+    dict(profiles={"payload_rsag_phased": [8, 16]})])
+def test_clustered_profiles_reject_incomplete_or_multiple_active_clusters(changes):
+    data = clustered_ladder()
+    data["buckets"][0].update(changes)
+    with pytest.raises(UsageError, match="collective ladder"):
+        validate(data)
+
+
+def test_phased_profiles_require_clustered_supported_geometry():
+    data = clustered_ladder()
+    del data["buckets"][0]["cluster_size"]
+    with pytest.raises(UsageError, match="prepared joint kernel"):
+        validate(data)
+    data = clustered_ladder()
+    data["compute_capability"] = [10, 3]
+    with pytest.raises(UsageError, match="SM120 or SM121"):
+        validate(data)
+    data = clustered_ladder()
+    data["buckets"][0].update(implementation="joint_bandwidth", profiles={"full_phased": [8]})
+    with pytest.raises(UsageError, match="prepared joint kernel"):
+        validate(data)
+
+
 def test_runtime_requires_file_and_static_rejects_it(tmp_path):
     with pytest.raises(UsageError, match="requires --collective-ladder"):
         resolve("runtime", None)
@@ -119,13 +203,45 @@ def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort):
             lower = row["max_bytes"] + 16
 
 
-def test_native_export_preserves_ladder_contents():
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
+@pytest.mark.parametrize("filename", ["gb202_pcie_tp4_clustered.json", "gb202_pcie_tp4_clustered_full.json"])
+def test_clustered_catalog_profiles_are_admitted_by_b12x(effort, filename):
+    from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
+    from b12x.comm.pcie._joint_profile import selected_profile
+    from b12x.preparation import FrozenMapping, autotune_effort
+
+    data = load(LADDER.with_name(filename))
+    lower = data["min_bytes"]
+    with autotune_effort(effort):
+        for row in data["buckets"]:
+            if row.get("cluster_size", 1) == 8:
+                family = row["implementation"]
+                for mode, counts in row["profiles"].items():
+                    for active in counts:
+                        config = CollectiveConfig(implementation=family, threads=512, blocks=64,
+                                                  submode=mode, active_blocks=active)
+                        for size in (lower, row["max_bytes"]):
+                            query = CollectiveQuery(operation="all_reduce", world_size=4, rank=0,
+                                alternatives=FrozenMapping({family: dict(surface="OneshotAllReduce.all_reduce",
+                                    world_size=4, rank=0, topology="pcie_ipc", setup={"joint_max_blocks": 64},
+                                    call=dict(transport=family, threads=512, blocks=64, submode=mode, active_blocks=active,
+                                        size_packs=size // 16, stage_input=True, dtype="bfloat16",
+                                        joint_cluster_size=8))}), default=config)
+                            configured = TUNING.configure(query, device=None, override=config, search=effort != "off")
+                            assert configured.pinned == config
+                        encoded = selected_profile(family, 64, mode, active, cluster_size=8)
+                        assert encoded & 0xffff == active
+            lower = row["max_bytes"] + 16
+
+
+@pytest.mark.parametrize("clustered", [False, True])
+def test_native_export_preserves_ladder_contents(clustered):
     import json
     from ignition.preparation.package_proto import serving
     from ignition.preparation.runtime_package_pb2 import ModelIndex
     from tests.preparation.test_frontend_metadata import server
 
-    data = load(LADDER)
+    data = clustered_ladder() if clustered else load(LADDER)
     source = server()
     source["rebuild_manifest"] = dict(version=1, collective_tuning="runtime",
                                       collective_ladder_json=json.dumps(data))

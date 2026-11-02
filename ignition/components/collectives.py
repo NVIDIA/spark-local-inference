@@ -143,10 +143,15 @@ class PreparedAllReduce:
                              inplace=source.data_ptr() == output.data_ptr())
                 self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
                 self.runtime_cache_policy = ladder["cache_policy"]
-                # One active CTA is legal at every payload; runtime selects from the supplied profiles.
+                cluster_size = row.get("cluster_size", 1)
+                mode, active = self.runtime_profiles[0]
+                # Phased modes need a complete cluster, so use a declared clustered profile.
+                initial_active = active if cluster_size > 1 else 1
                 plan_options = dict(joint_only=True, override=CollectiveConfig(
                     implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1))
+                    submode=mode, active_blocks=initial_active))
+                if cluster_size > 1:
+                    plan_options["joint_cluster_size"] = cluster_size
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
 

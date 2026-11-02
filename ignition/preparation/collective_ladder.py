@@ -12,6 +12,10 @@ MODES = {
     "joint_latency": ("full", "payload_rsag", "pull"),
     "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
 }
+CLUSTER_MODES = {
+    "joint_latency": ("full_phased", "payload_rsag_phased"),
+    "joint_bandwidth": ("payload_rsag_phased",),
+}
 GATHER_MODES = {
     "gather_joint": ("barrier", "word_exchange"),
     "gather_selected_barrier": ("barrier",),
@@ -89,7 +93,8 @@ def validate(data):
     require(isinstance(data["buckets"], list) and bool(data["buckets"]), "buckets must be nonempty")
     previous = data["min_bytes"] - 16
     for row in data["buckets"]:
-        require(isinstance(row, dict) and set(row) == {"max_bytes", "implementation", "threads", "blocks", "profiles"},
+        required = {"max_bytes", "implementation", "threads", "blocks", "profiles"}
+        require(isinstance(row, dict) and required <= set(row) <= required | {"cluster_size"},
                 "invalid bucket fields")
         upper = row["max_bytes"]
         require(type(upper) is int and upper > previous and upper % 16 == 0,
@@ -98,12 +103,23 @@ def validate(data):
         require(isinstance(row["implementation"], str) and row["implementation"] in MODES, "unknown joint kernel")
         require(type(row["threads"]) is int and row["threads"] in (32, 64, 128, 256, 512), "invalid threads")
         require(type(row["blocks"]) is int and 1 <= row["blocks"] <= 64, "invalid physical grid")
+        cluster_size = row.get("cluster_size", 1)
+        require(type(cluster_size) is int and cluster_size in (1, 8), "cluster_size must be 1 or 8")
+        if cluster_size == 8:
+            require(tuple(data["compute_capability"]) in ((12, 0), (12, 1)),
+                    "clustered joint reductions require SM120 or SM121")
+            require(row["threads"] == 512 and row["blocks"] == 64,
+                    "clustered joint reductions require 512 threads and 64 physical CTAs")
         require(isinstance(row["profiles"], dict) and bool(row["profiles"]), "profiles must be nonempty")
         for mode, counts in row["profiles"].items():
-            require(mode in MODES[row["implementation"]], "mode does not belong to joint kernel")
+            phased = mode in CLUSTER_MODES[row["implementation"]]
+            require(mode in MODES[row["implementation"]] or (cluster_size == 8 and phased),
+                    "mode does not belong to the prepared joint kernel")
             require(isinstance(counts, list) and bool(counts)
                     and all(type(v) is int and 1 <= v <= row["blocks"] for v in counts), "invalid active CTA counts")
             require(len(set(counts)) == len(counts), "duplicate active CTA counts")
+            if phased:
+                require(counts == [cluster_size], "phased profiles require exactly one complete active cluster")
     _validate_gathers(data["all_gather"], data["world_size"])
     return data
 
