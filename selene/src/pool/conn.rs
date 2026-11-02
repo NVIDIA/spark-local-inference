@@ -294,6 +294,9 @@ pub(crate) async fn connect(
     Unreachable,
 > {
     match &link.address {
+        #[cfg(not(unix))]
+        PoolAddress::Unix(_) => Err("Unix-socket pool addresses need a Unix host".to_string().into()),
+        #[cfg(unix)]
         PoolAddress::Unix(path) => {
             let path = path.clone();
             let channel = Endpoint::try_from("http://selene.local")

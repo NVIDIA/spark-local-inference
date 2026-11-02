@@ -625,7 +625,6 @@ mod tests;
 
 pub const HOST_SERVICE_HEADROOM_BYTES: u64 = 2 << 30;
 pub const HOST_SYSTEM_SHARE: u64 = 20;
-#[cfg(any(unix, test))]
 pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
     let available = meminfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();

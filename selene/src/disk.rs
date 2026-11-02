@@ -1759,7 +1759,7 @@ mod tests {
         };
         let header = header(key, 3);
         let temporary = directory.join(temporary_name(&key));
-        let mut thread = DiskThread::start("flare-offload-disk").unwrap();
+        let thread = DiskThread::start("flare-offload-disk").unwrap();
         thread
             .submit(Job::Create {
                 id: JobId(1),

@@ -2529,7 +2529,7 @@ mod tests {
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
-  
+
     #[test]
     fn parallel_disk_reads_are_timed_as_one_fetch() {
         let Some(directory) = test_directory("composite", "parallel-read-rate") else {
@@ -2571,12 +2571,12 @@ mod tests {
         let before = started.elapsed();
         poll_until(&mut store, &mut Vec::new(), |s| s.jobs.is_empty());
         let bytes = (20 * PAGE_RECORD + ROW_RECORD) as f64;
-        assert!(store.disk_inbound_rate.0 >= bytes / started.elapsed().as_secs_f64());
-        assert!(store.disk_inbound_rate.0 <= bytes / before.as_secs_f64());
+        assert!(store.disk_inbound_rate.get() >= bytes / started.elapsed().as_secs_f64());
+        assert!(store.disk_inbound_rate.get() <= bytes / before.as_secs_f64());
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
-    }  
+    }
 
     #[test]
     fn a_fetch_attaches_to_a_record_another_fetch_is_reading() {
@@ -3823,6 +3823,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn shutdown_key(salt: u32) -> PrefixKey {
         let mut history = PrefixHistory::new(IDENTITY);
         history
