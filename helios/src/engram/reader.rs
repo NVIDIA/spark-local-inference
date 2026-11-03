@@ -8,8 +8,6 @@
 
 use super::{Stats, cache::RowCache};
 use crate::Result;
-#[cfg(unix)]
-use io_uring::{IoUring, opcode, types};
 use std::{
     fs::File,
     sync::{Arc, atomic::Ordering},
@@ -22,6 +20,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(test)]
 use std::path::Path;
 
+#[cfg(unix)]
+mod uring;
 #[cfg(windows)]
 mod windows;
 
@@ -352,15 +352,10 @@ impl Drop for Aligned {
 }
 
 pub(crate) struct DiskReader {
-    // Destroying the ring cancels and drains outstanding I/O before the buffers are freed.
     #[cfg(unix)]
-    ring: IoUring,
+    uring: uring::Readers,
     #[cfg(windows)]
     windows: windows::Readers,
-    #[cfg(unix)]
-    staging: Aligned,
-    #[cfg(unix)]
-    files: Vec<Arc<File>>,
     fragments: Vec<Fragment>,
     reads: Vec<Read>,
     resident_scales: Option<Resident>,
@@ -393,35 +388,14 @@ impl Drop for DiskTimings<'_> {
 impl DiskReader {
     fn from_files(files: &[Arc<File>], stats: Arc<Stats>, workers: usize) -> Result<Self> {
         #[cfg(unix)]
-        if workers != 1 {
-            return Err("parallel embedding disk workers require Windows".into());
-        }
-        #[cfg(unix)]
-        let staging = Aligned::new(DEPTH * CHUNK)?;
-        #[cfg(unix)]
-        let ring = {
-            let ring = IoUring::new(DEPTH as u32).map_err(|e| format!("Engram io_uring: {e}"))?;
-            let buffers: Vec<_> = (0..DEPTH)
-                .map(|i| libc::iovec {
-                    iov_base: staging.at(i).cast(),
-                    iov_len: CHUNK,
-                })
-                .collect();
-            unsafe { ring.submitter().register_buffers(&buffers) }
-                .map_err(|e| format!("register Engram staging: {e}"))?;
-            ring
-        };
+        let uring = uring::Readers::new(files, workers)?;
         #[cfg(windows)]
         let windows = windows::Readers::new(files, workers)?;
         Ok(Self {
+            #[cfg(unix)]
+            uring,
             #[cfg(windows)]
             windows,
-            #[cfg(unix)]
-            ring,
-            #[cfg(unix)]
-            staging,
-            #[cfg(unix)]
-            files: files.to_vec(),
             fragments: Vec::new(),
             reads: Vec::new(),
             resident_scales: None,
@@ -496,72 +470,8 @@ impl DiskReader {
         }
         timing.plan = begin.elapsed().as_nanos() as u64;
         #[cfg(unix)]
-        for batch in self.reads.chunks(DEPTH) {
-            let begin = Instant::now();
-            for (slot, read) in batch.iter().enumerate() {
-                let entry = opcode::ReadFixed::new(
-                    types::Fd(self.files[read.file].as_raw_fd()),
-                    self.staging.at(slot),
-                    read.nbytes as u32,
-                    slot as u16,
-                )
-                .offset(read.offset)
-                .build()
-                .user_data(slot as u64);
-                unsafe { self.ring.submission().push(&entry) }
-                    .map_err(|_| "Engram submission queue full")?;
-            }
-            self.stats
-                .disk_reads
-                .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            self.stats.disk_bytes.fetch_add(
-                batch.iter().map(|read| read.nbytes as u64).sum(),
-                Ordering::Relaxed,
-            );
-            timing.submit += begin.elapsed().as_nanos() as u64;
-            let mut completed = 0;
-            let mut failure = None;
-            while completed < batch.len() {
-                let begin = Instant::now();
-                let result = self.ring.submit_and_wait(1);
-                timing.wait += begin.elapsed().as_nanos() as u64;
-                match result {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(format!("submit Engram reads: {error}").into()),
-                }
-                let begin = Instant::now();
-                for entry in self.ring.completion() {
-                    completed += 1;
-                    let slot = entry.user_data() as usize;
-                    let read = &batch[slot];
-                    let count = entry.result();
-                    if count < 0 || (count as usize) < read.required {
-                        failure = Some(format!(
-                            "Engram read at {} returned {count}, requires {} bytes",
-                            read.offset, read.required
-                        ));
-                        continue;
-                    }
-                    for fragment in &self.fragments[read.fragments.clone()] {
-                        let source = unsafe {
-                            std::slice::from_raw_parts(
-                                self.staging
-                                    .at(slot)
-                                    .add((fragment.source - read.offset) as usize),
-                                fragment.nbytes,
-                            )
-                        };
-                        output[fragment.destination..fragment.destination + fragment.nbytes]
-                            .copy_from_slice(source);
-                    }
-                }
-                timing.complete += begin.elapsed().as_nanos() as u64;
-            }
-            if let Some(error) = failure {
-                return Err(error.into());
-            }
-        }
+        self.uring
+            .gather(&self.reads, &self.fragments, output, &self.stats)?;
         #[cfg(windows)]
         self.windows
             .gather(&self.reads, &self.fragments, output, &self.stats)?;
@@ -1339,5 +1249,207 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn parallel_gathers_preserve_rows_and_recover_after_truncation() {
+        for (width, scale, rows) in [(80, 10, 65536), (256, 8, 65536), (4109, 37, 2048)] {
+            let path = std::env::temp_dir().join(format!(
+                "flare-worker-rows-{}-{width}.bin",
+                std::process::id()
+            ));
+            let first = 4093;
+            let second = first + rows * width + 7;
+            let bytes: Vec<_> = (0..second + rows * scale)
+                .map(|i| (i * 13 + i / 257) as u8)
+                .collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let planes = [
+                Plane {
+                    file: 0,
+                    offset: first as u64,
+                    nbytes: rows * width,
+                    row_bytes: width,
+                },
+                Plane {
+                    file: 0,
+                    offset: second as u64,
+                    nbytes: rows * scale,
+                    row_bytes: scale,
+                },
+            ];
+            let ids: Vec<i64> = (0..1025)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        -1
+                    } else if i % 19 == 0 {
+                        113
+                    } else {
+                        ((i * 113) % rows) as i64
+                    }
+                })
+                .collect();
+            let mut baseline_reads = None;
+            for workers in [1, 2, 4, 8] {
+                let stats = Arc::new(Stats::default());
+                let file = Arc::new(File::open(&path).unwrap());
+                let mut reader = Reader::from_files(
+                    std::slice::from_ref(&file),
+                    &planes,
+                    false,
+                    0,
+                    ids.len(),
+                    stats.clone(),
+                    workers,
+                    false,
+                )
+                .unwrap();
+                drop(file);
+                let check = |reader: &mut Reader, ids: &[i64]| {
+                    let mut expected = Vec::new();
+                    for plane in planes {
+                        for &id in ids {
+                            if id < 0 {
+                                expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                            } else {
+                                let begin = plane.offset as usize + id as usize * plane.row_bytes;
+                                expected.extend_from_slice(&bytes[begin..begin + plane.row_bytes]);
+                            }
+                        }
+                    }
+                    let mut guarded = vec![0xa5; expected.len() + 64];
+                    reader
+                        .gather(&planes, ids, &mut guarded[32..32 + expected.len()])
+                        .unwrap();
+                    assert_eq!(&guarded[32..32 + expected.len()], expected);
+                    assert!(
+                        guarded[..32]
+                            .iter()
+                            .chain(&guarded[32 + expected.len()..])
+                            .all(|b| *b == 0xa5)
+                    );
+                };
+                for count in [0, 1, 77, 1025, 5, 1025] {
+                    check(&mut reader, &ids[..count]);
+                }
+                let count = stats.disk_reads.load(Ordering::Relaxed);
+                if let Some(expected) = baseline_reads {
+                    assert_eq!(count, expected);
+                } else {
+                    baseline_reads = Some(count);
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                let mut output = vec![0; ids.len() * (width + scale)];
+                assert!(reader.gather(&planes, &ids, &mut output).is_err());
+                std::fs::write(&path, &bytes).unwrap();
+                check(&mut reader, &ids);
+                check(&mut reader, &[rows as i64 - 1, -1, 0, rows as i64 - 1]);
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn parallel_shard_gathers_keep_file_indices_and_recover_after_truncation() {
+        let rows = 2048;
+        let width = 4109;
+        let offset = 4093;
+        let planes = std::array::from_fn(|file| Plane {
+            file,
+            offset: offset as u64,
+            nbytes: rows * width,
+            row_bytes: width,
+        });
+        let paths: Vec<_> = (0..2)
+            .map(|file| {
+                std::env::temp_dir().join(format!(
+                    "flare-ring-shard-{}-{file}.bin",
+                    std::process::id()
+                ))
+            })
+            .collect();
+        let bytes: Vec<Vec<u8>> = (0..2)
+            .map(|file| {
+                (0..offset + rows * width)
+                    .map(|i| ((i * 19 + i / 37 + file * 83) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        for (path, bytes) in paths.iter().zip(&bytes) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let ids: Vec<i64> = (0..257)
+            .map(|i| match i % 31 {
+                0 => -1,
+                1 => 42,
+                _ => ((i * 7) % rows) as i64,
+            })
+            .collect();
+        let mut baseline_reads = None;
+        for workers in [1, 2, 4, 8] {
+            let files: Vec<_> = paths
+                .iter()
+                .map(|path| Arc::new(open_file(path).unwrap()))
+                .collect();
+            let stats = Arc::new(Stats::default());
+            let mut reader =
+                Reader::from_files(&files, &planes, false, 0, ids.len(), stats.clone(), workers, false)
+                    .unwrap();
+            drop(files);
+            let check = |reader: &mut Reader, ids: &[i64]| {
+                let mut expected = Vec::new();
+                for plane in planes {
+                    for &id in ids {
+                        if id < 0 {
+                            expected.extend(std::iter::repeat_n(0, width));
+                        } else {
+                            let start = offset + id as usize * width;
+                            expected.extend_from_slice(&bytes[plane.file][start..start + width]);
+                        }
+                    }
+                }
+                let mut guarded = vec![0xa5; expected.len() + 64];
+                reader
+                    .gather(&planes, ids, &mut guarded[32..32 + expected.len()])
+                    .unwrap();
+                assert_eq!(&guarded[32..32 + expected.len()], expected);
+                assert!(
+                    guarded[..32]
+                        .iter()
+                        .chain(&guarded[32 + expected.len()..])
+                        .all(|b| *b == 0xa5)
+                );
+            };
+            for count in [0, 3, 257, 17, 257] {
+                check(&mut reader, &ids[..count]);
+            }
+            let count = stats.disk_reads.load(Ordering::Relaxed);
+            assert!(count > 2 * DEPTH as u64);
+            if let Some(expected) = baseline_reads {
+                assert_eq!(count, expected);
+            } else {
+                baseline_reads = Some(count);
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&paths[1])
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            assert!(
+                reader
+                    .gather(&planes, &ids, &mut vec![0; ids.len() * width * 2])
+                    .is_err()
+            );
+            std::fs::write(&paths[1], &bytes[1]).unwrap();
+            check(&mut reader, &ids);
+            check(&mut reader, &[rows as i64 - 1, -1, 0]);
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }

@@ -84,10 +84,6 @@ impl LoadOptions {
             if self.embedding_table_storage == Some(crate::engram::Storage::Ram) {
                 return Err(invalid("embedding table workers require disk storage"));
             }
-            #[cfg(unix)]
-            if workers != 1 {
-                return Err(invalid("parallel embedding disk workers require Windows"));
-            }
         }
         if self
             .embedding_table_cache_bytes
