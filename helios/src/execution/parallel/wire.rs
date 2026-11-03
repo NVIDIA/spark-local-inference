@@ -163,6 +163,22 @@ impl<'a> Reader<'a> {
     }
 }
 
+pub(super) fn validate_completion_packet(manifest: &ExecutionManifest) -> Result<()> {
+    let readiness = manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
+        .map_or(0, |buffer| buffer.shape[1] / 3);
+    let sidecars = usize::from(manifest.graphs.iter().any(|graph| graph.confidence_width > 0))
+        + usize::from(manifest.buffers.iter().any(|buffer| buffer.name == "completion_speculative_survival"));
+    let bytes = manifest.request_capacity().checked_mul(manifest.completion_fields())
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| manifest.request_capacity().checked_mul(manifest.completion_token_capacity - 1)
+            .and_then(|sidecar| sidecar.checked_mul(4 * sidecars)).and_then(|sidecar| n.checked_add(sidecar)))
+        .and_then(|n| n.checked_add((9 + 2 * readiness) * 8));
+    if bytes.is_none_or(|bytes| bytes > MAX_PACKET) {
+        return Err(invalid("prepared completion frame exceeds the tensor-parallel control packet capacity"));
+    }
+    Ok(())
+}
+
 /// Logical I/O schema only; CUDA addresses and handles never cross processes.
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();

@@ -100,6 +100,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
         manifest.validate()?;
+        wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
         let mut peers = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
@@ -516,6 +517,7 @@ pub unsafe fn serve_rank(
         if world < 2 || !(1..world).contains(&rank) {
             return Err(invalid("invalid tensor-parallel peer identity"));
         }
+        wire::validate_completion_packet(executor.manifest())?;
         let mut channel = Channel::new(socket)?;
         let result = (|| -> Result<()> {
             let mut hello = Vec::new();

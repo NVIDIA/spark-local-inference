@@ -651,3 +651,21 @@ fn startup_tuning_rank_agreement_includes_producers_bindings_and_buffer_schemas(
         assert_ne!(layout(&peer), expected, "mutation {mutation}");
     }
 }
+
+#[test]
+fn socket_completion_capacity_is_checked_before_rank_startup() {
+    let mut manifest = crate::execution::tests::manifest();
+    manifest.max_active = 64;
+    manifest.completion_token_capacity = 65;
+    validate_completion_packet(&manifest).unwrap();
+    manifest.completion_token_capacity = 131072;
+    assert!(validate_completion_packet(&manifest).unwrap_err().to_string().contains("packet capacity"));
+    manifest.completion_token_capacity = 65536;
+    validate_completion_packet(&manifest).unwrap();
+    manifest.graphs[0].confidence_width = 1;
+    manifest.buffers.push(crate::execution::BufferDescriptor {
+        name: "completion_speculative_survival".into(), address: 1, nbytes: 1,
+        dtype: crate::execution::Dtype::Float32, shape: vec![2, 64, 65535], strides: vec![64 * 65535, 65535, 1],
+    });
+    assert!(validate_completion_packet(&manifest).is_err());
+}
