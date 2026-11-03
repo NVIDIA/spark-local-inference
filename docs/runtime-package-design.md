@@ -515,6 +515,14 @@ power-of-two request bucket has width-one execution. Wider programs fit the
 prepared aggregate target envelope. A package must include its configured
 maximum prefill chunk; intermediate prefill capacities are optional.
 
+`Execution.completion_token_capacity` (uint32 field 7) declares the maximum
+tokens per completion. Zero or omission resolves to eight; positive values are
+literal. ABI6 records contain 16 metadata fields followed by that many token
+fields. Logprob storage uses the same token capacity, and optional survival and
+proposal-confidence storage uses one fewer position. Capacity one omits these
+zero-depth outputs. All ranks must agree on the resolved capacity. Graph widths
+fit this capacity; continuation-state storage has independently declared geometry.
+
 Execution metadata identifies complete speculative programs by B/D/W/P: request
 capacity, captured proposal depth, per-request target capacity including the pending
 token, and physical aggregate target rows. P is explicit for rectangular programs

@@ -976,7 +976,9 @@ writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. ABI6 uses 32-field completions for every serving operation.
+history. ABI6 completions contain 16 metadata fields plus the package-defined token
+capacity for every serving operation. An omitted or zero
+`completion_token_capacity` resolves to eight; positive values are literal.
 
 Captured operators use b12x's default numerical policy and tuned execution plans.
 MoE reductions may use arrival-ordered atomic additions, so identical graph inputs

@@ -1,6 +1,6 @@
 # Prepared execution manifest
 
-Execution ABI `5` describes graph execution and transport over one existing CUDA
+Execution ABI `6` describes graph execution and transport over one existing CUDA
 context. A resource owner retains the context, graphs and allocations through
 shutdown. `NativeResources` reconstructs these resources from a runtime package written
 by Ignition before native serving starts. The model recipe defines the numerical behavior of each executable.
@@ -13,6 +13,7 @@ The Python representation is a dictionary with these fields:
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
+    "completion_token_capacity": int, # Zero resolves to eight; positive values are literal.
     "input_frame_bytes": int,       # Positive, multiple of 8.
     "buffers": [
         {
@@ -82,6 +83,15 @@ producers. Tuning storage remains owned through execution drain.
 
 ## Serving graph transport
 
+`Execution.completion_token_capacity` is a uint32 package field. An omitted or
+zero value resolves to eight tokens; a positive value is the token capacity T.
+All ranks use the same resolved value. Completion records have 16 metadata fields
+and T token fields. Generation logprobs have T token positions, and optional
+survival and proposal-confidence outputs have T−1 positions. Packages with T=1
+omit these zero-depth outputs. Graph verification widths cannot exceed T; model
+and operator limits may be smaller. Continuation-state geometry is independent
+of completion token capacity.
+
 Supported dtypes are `bool`, `uint8`, `int32`, `int64`, `float32`, `float16`, and
 `bfloat16`. Shapes are nonempty and every extent is positive. `nbytes` equals
 the contiguous element count times dtype size. Device addresses and host
@@ -96,7 +106,8 @@ batch capacities are powers of two through 64. Decode has one token per lane.
 A speculative graph performs complete proposal, optional confidence/allocation,
 verification, and commit work. It declares B/D/W/P explicitly: request capacity,
 captured proposal depth, per-request target capacity, and aggregate target rows.
-W is from 1 through 8; P is from B through B × W, including rectangular P = B × W.
+W is from 1 through T, the resolved completion token capacity; P is from B
+through B × W, including rectangular P = B × W.
 Width-one speculative graphs have D = 0 and maintain draft context. No standalone
 proposal, verification, or packed-speculative graph kind exists.
 Prefill has batch capacity 1. Token capacities are 1, 16, or a multiple of 64
@@ -128,7 +139,7 @@ Two graph inputs are reserved and required in every serving executable's binding
 |---|---|---|---|
 | `frame_index` | int32 | `[1]` | Native executor |
 | `submission_sequence` | int64 | `[1]` | Native executor |
-| `completion_records` | int64 | `[2,capacity,32]` | Captured graph finalizer |
+| `completion_records` | int64 | `[2,capacity,16+T]` | Captured graph finalizer |
 
 `completion_records` is an output and cannot appear in input bindings. Each
 buffer has one fixed host offset shared across all graph bindings that name
@@ -144,23 +155,23 @@ where C is padded request capacity. Sampling graphs also bind
 `logprob_token_ids: int32[C,128]` and `logprob_token_id_counts: int32[C]`.
 Counts are cleared every submission: zero selects natural top-20; 1..128 selects
 the uploaded ID prefix. Sampling graphs require the complete input group.
-`completion_logprobs: int32[2,C,16,258]` contains a chosen pair followed by up to
+`completion_logprobs: int32[2,C,T,258]` contains a chosen pair followed by up to
 128 alternative pairs, each storing a token ID and FP32 logprob bits. Reporting
 uses raw target logits before sampling transforms, gated by slot epoch and
 committed output positions. The host retains each pending frame's selections
 and appends its chosen pair only when absent from explicit alternatives.
 
-For a reporting frame, one pitched D2H copy transfers `8C * 4(2+2W)` bytes,
+For a reporting frame, one pitched D2H copy transfers `TC * 4(2+2W)` bytes,
 with W the larger of 20 and the frame's largest explicit count. Source pitch
 follows package storage; compact pinned decoding uses the copied pitch, while
 mapped-host decoding uses package pitch. Frames without reporting copy no
-generation payload. Natural width-20 readback remains 1,344C bytes; explicit
-width 128 uses 8,256C.
+generation payload. Natural width-20 readback uses 168TC bytes; explicit
+width 128 uses 1,032TC.
 Prompt output geometry and readback are independent of generation width.
 
-Relative to width-20 packages, persistent generation output adds 13,824C bytes
-per rank and inputs add 516C. Each private output adds another 13,824C; two
-pinned generation frames add 13,824C on discrete GPUs. Two input staging frames
+Relative to width-20 packages, persistent generation output adds 1,728TC bytes
+per rank and inputs add 516C. Each private output adds another 1,728TC; two
+pinned generation frames add 1,728TC on discrete GPUs. Two input staging frames
 add 1,032C before alignment. Allocator rounding and resulting KV capacity must
 be measured for the complete package.
 
@@ -201,7 +212,7 @@ Each completion lane begins with eight signed 64-bit fields in this order:
 7. Error code, `0` on success.
 8. Reserved, `0`.
 
-The 32-field completion record includes these zero-based indices:
+The (16+T)-field completion record includes these zero-based indices:
 
 | Index | Meaning |
 |---|---|
@@ -212,15 +223,19 @@ The 32-field completion record includes these zero-based indices:
 | 12 | Reserved field; every prepared model contract requires `-1` |
 | 13 | Committed draft-cache length, `max(consumed_tokens-lag_tokens,0)` for the declared completion cursor; `-1` without a draft cache |
 | 14 | Reserved, `0` |
-| 15 | Verification width, an integer from 1 through 16 |
-| 16–31 | Emitted token IDs in order, with unused entries `-1` |
+| 15 | Verification width, an integer from 1 through T |
+| 16 through 15+T | Emitted token IDs in order, with unused entries `-1` |
+
+Copy-source masks use the low 63 bits of the signed field and therefore describe
+at most 63 copied drafts. This bound does not limit learned proposal depth.
 
 The scalar token in field 4 equals the last vector token, or `-1` for an empty
 vector. Accepted drafts number either `emitted_count-1` or `emitted_count`;
 the latter occurs when EOS or the output budget clips inside the accepted draft
 prefix. It never exceeds the offered count. Ordinary sampling emits at most
 one token and reports width one. Maintenance and non-sampling prefill emit
-zero tokens. Every serving graph in an ABI6 catalog writes the 32-field layout.
+zero tokens. Every serving graph in an ABI6 catalog writes the same
+(16+T)-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
 request state advances. A speculative completion requires a
@@ -232,7 +247,7 @@ invalid. Each speculative graph declares one fixed
 record it emits.
 
 ABI6 optionally declares `completion_speculative_survival`, a contiguous
-`float32[2,capacity,15]` output indexed by completion frame, physical request
+`float32[2,capacity,T-1]` output indexed by completion frame, physical request
 slot, and draft-prefix depth. Each value is the cumulative product of
 `min(1, p(token)/q(token))` through that prefix, using the distributions used
 for stochastic verification. Observed values must be finite, within `[0,1]`,

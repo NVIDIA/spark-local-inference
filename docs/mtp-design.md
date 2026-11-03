@@ -372,11 +372,12 @@ Rust freezes request epochs, page reservations, and CPU query lengths or GPU
 prefix ceilings before submission. CUDA dependencies serialize model work and
 protect shared scratch independently of completion readback. Rust reserves each
 round's maximum page and output extent before submission. ABI6 uses two transfer
-frames, each containing one 32-field `int64` record per prepared request slot.
+frames, each containing one `int64` record per prepared request slot with
+16 metadata fields and the package-defined number of token fields.
 Each record contains request
 identity, token counters, terminal status, emitted/offered/accepted counts,
-copy-source bits, draft-cache position, verification width, and eight padded
-token IDs. Confidence, logprob, survival, and readiness outputs use the same
+copy-source bits, draft-cache position, verification width, and padded token IDs. Confidence, logprob, survival, and
+readiness outputs use the same
 frame index. A frame remains owned until its transfer and host consumption
 finish. Ordinary decode uses the same two-frame completion contract.
 

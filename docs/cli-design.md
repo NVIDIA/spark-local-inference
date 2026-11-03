@@ -263,7 +263,8 @@ sampling, request and recurrent-state commit, draft-context update, and saved
 hidden-state update. Caller-owned tensors expose their results; the timed graph
 omits native completion-record publication. Study graphs have private capture
 and compilation identities and cannot produce native package metadata. Native
-exports support recipe-declared verification capacities through sixteen tokens;
+exports declare the completion capacity required by the recipe's verification
+catalog;
 ordinary round benchmarks use width eight. Establish a width-eight study control
 before comparing deeper studies; native and study latencies have different
 publication boundaries.

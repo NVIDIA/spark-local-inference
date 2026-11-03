@@ -26,13 +26,14 @@ The reduction does not change sampling or Philox state.
 ## Persistent I/O
 
 `CompletionOutputs` owns records, one packed output, and request flags. `capacity`
-is the padded physical request capacity. Eight positions cover every supported
-speculative completion vector. All tensors have contiguous row-major storage.
+is the padded physical request capacity. T is the resolved package
+`completion_token_capacity`: zero or omission means eight, and positive values
+are literal. All tensors have contiguous row-major storage.
 
 | Buffer | dtype | Shape | Meaning |
 | --- | --- | --- | --- |
-| `completion_records` | int64 | `[2, capacity, 32]` | ABI6 completion vectors |
-| `completion_logprobs` | int32 | `[2, capacity, 16, 2+2*K]` | Packed token statistics |
+| `completion_records` | int64 | `[2, capacity, 16+T]` | ABI6 completion vectors |
+| `completion_logprobs` | int32 | `[2, capacity, T, 2+2*K]` | Packed token statistics |
 | `logprob_requested` | int32 | `[capacity]` | Nonzero for requesting lanes in this submission |
 
 Each packed position has chosen token ID, chosen FP32 logprob bits, then K pairs
