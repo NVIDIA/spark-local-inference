@@ -299,7 +299,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         ("submission_sequence".into(), (Dtype::Int64, vec![1])),
         (
             "completion_records".into(),
-            (Dtype::Int64, vec![2, slots, crate::execution::VECTOR_RECORD_FIELDS]),
+            (Dtype::Int64, vec![2, slots, 16 + config.completion_token_capacity]),
         ),
         ("state_pool".into(), (Dtype::Uint8, vec![1024, 32])),
         ("pending".into(), (Dtype::Int64, vec![slots])),
@@ -378,6 +378,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         })
         .collect();
     ExecutionManifest {
+        completion_token_capacity: config.completion_token_capacity,
         tuning_graphs: vec![],
         abi_version: 6,
         context: 1,

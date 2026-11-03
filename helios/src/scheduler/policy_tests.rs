@@ -3394,7 +3394,7 @@ fn finished_queued_round_does_not_observe_uncomputed_confidence() {
     records[handle.slot as usize].status = 2;
     records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
     scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &vec![vec![0.9; 15]; 2]).unwrap();
-    let population = scheduler.forecasts.population;
+    let population = scheduler.forecasts.population.clone();
     let request = scheduler.request(handle).unwrap();
     let mut records = vec![CompletionRecord::default(); scheduler.limits.request_capacity()];
     records[handle.slot as usize] = CompletionRecord {
@@ -3697,7 +3697,7 @@ fn cached_host_prefix_ranks_match_greedy_allocation_for_every_small_cohort_order
             for (index, handle) in handles.iter().enumerate() {
                 let profile = &mut scheduler.request_mut(*handle).unwrap().acceptance;
                 let probability = [0.1, 0.9, 0.5, 0.5][index];
-                let survival = std::array::from_fn(|depth| (probability as f32).powi(depth as i32 + 1));
+                let survival: [f32; 15] = std::array::from_fn(|depth| (probability as f32).powi(depth as i32 + 1));
                 for _ in 0..8 { profile.observe(speculation::ProposalSource::Mtp, 1, 7, 0, true, Some(&survival)); }
             }
             let available: Vec<_> = handles.iter().map(|handle| handle.slot as usize).collect();

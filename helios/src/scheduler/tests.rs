@@ -344,7 +344,7 @@ fn state_records(
             request.generated_tokens as i64,
             -1,
             1,
-        )[slot];
+        )[slot].clone();
     }
     output
 }
@@ -1453,12 +1453,12 @@ fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining
     s.commit(&step, Fence(4)).unwrap();
     let mut completion = vector_records(h, 4, 70, 6, &[11, 12, 13, 90, 91], 8, 1);
     completion[0].vector.as_mut().unwrap().accepted_drafts = 4;
-    let mut invalid = completion;
+    let mut invalid = completion.clone();
     invalid[0].generation += 1;
     assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
     assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).1, 0);
     s.complete(Fence(4), &completion, Default::default()).unwrap();
-    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 2));
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), (vec![90, 91, -1, -1, -1, -1, -1], 2));
     assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
     assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
     s.cancel(h).unwrap();
@@ -1708,7 +1708,7 @@ fn completion_learns_only_proven_acceptance_and_is_transactional() {
         s.commit(&plan, Fence(4)).unwrap();
         let mut completion = bounded_vector_records(h, 4, 66, 2, &[10], 8, status, plan.lanes[0].tokens);
         completion[0].vector.as_mut().unwrap().accepted_drafts = accepted;
-        let mut invalid = completion;
+        let mut invalid = completion.clone();
         invalid[0].generation += 1;
         assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
         assert_eq!(s.request(h).unwrap().acceptance().rounds(), 0);
@@ -1934,7 +1934,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
         assert!(s.plan().is_none());
         let mut complete = bounded_vector_records(a, 6, 66, 2, &[40], 8, 1, step.lanes[0].tokens);
         let other = vector_records(b, 6, 66, 2, &[41], 8, 1);
-        complete[b.slot as usize] = other[b.slot as usize];
+        complete[b.slot as usize] = other[b.slot as usize].clone();
         for h in [a, b] {
             complete[h.slot as usize]
                 .vector
@@ -2110,7 +2110,7 @@ fn scheduler_uses_only_loaded_verification_shapes() {
         for h in &handles {
             complete[h.slot as usize] =
                 vector_records(*h, 12, 66, 2, &[10], step.token_capacity as i64, 1)
-                    [h.slot as usize];
+                    [h.slot as usize].clone();
         }
         s.complete(Fence(12), &complete, Default::default())
             .unwrap();
@@ -3296,4 +3296,19 @@ fn bounded_vector_records(h: RequestHandle, fence: u64, consumed: i64, generated
     vector.offered_drafts = vector.offered_drafts.min(limit.saturating_sub(1) as i64);
     vector.accepted_drafts = vector.accepted_drafts.min(vector.offered_drafts);
     rows
+}
+
+#[test]
+fn package_capacity_bounds_catalog_and_request_profiles() {
+    for capacity in [8, 13, 16, 32, 257] {
+        let fixture = scheduler(1, 32, 4);
+        let mut capabilities = fixture.capabilities.clone();
+        capabilities.completion_token_capacity = capacity;
+        let mut scheduler = RequestScheduler::new(fixture.limits.clone(), capabilities).unwrap();
+        scheduler.enable_speculation(&[1, capacity]).unwrap();
+        assert!(scheduler.enable_speculation(&[1, capacity + 1]).is_err());
+        assert_eq!(scheduler.forecasts.population.len(), capacity - 1);
+        let handle = scheduler.admit(spec(1, 32)).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
+    }
 }

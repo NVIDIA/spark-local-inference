@@ -1572,7 +1572,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             tokens: vec![1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
-        let mut invalid = frame.records;
+        let mut invalid = frame.records.clone();
         invalid[step.lanes[0].request.slot as usize].generated_tokens = 20;
         assert!(
             worker

@@ -243,7 +243,7 @@ mod tests {
         assert!(s.reserve_snapshot(0).is_none());
         s.complete(
             Fence(1),
-            &[CompletionRecord::default(); REQUEST_LANES],
+            &vec![CompletionRecord::default(); REQUEST_LANES],
             Default::default(),
         )
         .unwrap();

@@ -148,7 +148,7 @@ fn packed_combined_packing_preserves_sparse_slot_keys_and_ceiling_padding() {
                 "host reservations cover per-lane worst cases, not sampled allocation");
             return;
         }
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         for lane in &plan.lanes {
             let live = scheduler.request(lane.request).unwrap();
             let samples = plan.kind == GraphKind::Prefill;
