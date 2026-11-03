@@ -141,6 +141,24 @@ pub fn try_lock(file: &File) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Volume serial number, file index, and hard-link count of the file at `path`.
+/// The handle requests no data access, so other handles' sharing modes do not
+/// prevent the query.
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path)?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = u64::from(information.nFileIndexHigh) << 32 | u64::from(information.nFileIndexLow);
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        index,
+        u64::from(information.nNumberOfLinks),
+    ))
+}
+
 pub fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     let source = wide(source)?;
     let destination = wide(destination)?;

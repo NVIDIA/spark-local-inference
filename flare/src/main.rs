@@ -408,9 +408,14 @@ fn load_package(
         }
         package.clone()
     };
-    let root = path
-        .canonicalize()
-        .map_err(|e| format!("cannot access package {}: {e}", path.display()))?;
+    // A leased cache entry is loaded from the directory its lease pins. Canonicalizing
+    // it would only name an alias, such as a Windows verbatim path with long names.
+    let root = if lease.is_some() {
+        path
+    } else {
+        path.canonicalize()
+            .map_err(|e| format!("cannot access package {}: {e}", path.display()))?
+    };
     if lease.is_none() {
         lease = local_package_lease(
             &root,

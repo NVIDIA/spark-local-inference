@@ -125,7 +125,7 @@ fn usage(directory: &Path) -> Result<Usage, Box<dyn std::error::Error>> {
 
 #[cfg(not(unix))]
 fn usage(directory: &Path) -> Result<Usage, Box<dyn std::error::Error>> {
-    let mut seen: BTreeMap<PathBuf, u64> = BTreeMap::new();
+    let mut seen: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
     let mut stack = vec![directory.to_path_buf()];
     while let Some(path) = stack.pop() {
         for entry in std::fs::read_dir(&path)? {
@@ -136,14 +136,19 @@ fn usage(directory: &Path) -> Result<Usage, Box<dyn std::error::Error>> {
                 continue;
             }
             if metadata.is_file() {
-                seen.insert(entry.path(), metadata.len());
+                let (volume, index, links) = crate::windows::file_identity(&entry.path())?;
+                seen.insert((volume, index), (metadata.len(), links));
             }
         }
     }
     let mut usage = Usage::default();
-    for (_, logical) in seen {
+    for (logical, links) in seen.values() {
         usage.logical_bytes += logical;
         usage.files += 1;
+        if *links > 1 {
+            usage.shared_logical_bytes += logical;
+            usage.shared_objects += 1;
+        }
     }
     Ok(usage)
 }

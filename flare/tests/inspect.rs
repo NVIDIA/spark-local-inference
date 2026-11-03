@@ -269,11 +269,11 @@ fn invalid_packages_fail_before_loading() {
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("invalid safetensors header size"), "{error}");
-    let output = flare(&["inspect", "/nonexistent/package.safetensors"]);
+    let missing = "/nonexistent/package.safetensors";
+    // The operating system words the missing-path error.
+    let reason = std::fs::metadata(missing).unwrap_err().to_string();
+    let output = flare(&["inspect", missing]);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("No such file")
-    );
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains(&reason), "{error}");
 }

@@ -641,7 +641,9 @@ fn reclaim_installed_commit(
         {
             continue;
         }
-        if !installed.contains(&identity(&metadata, &entry.path())) || links(&metadata) > 1 {
+        if !installed.contains(&identity(&metadata, &entry.path())?)
+            || links(&metadata, &entry.path())? > 1
+        {
             continue;
         }
         let lock = blobs.join(format!("{name}.lock"));
@@ -674,21 +676,21 @@ fn snapshot_inodes(path: &Path, identities: &mut HashSet<(u64, u64)>) -> Result<
             snapshot_inodes(&entry.path(), identities)?;
         } else if file_type.is_file() {
             let metadata = entry.metadata()?;
-            identities.insert(identity(&metadata, &entry.path()));
+            identities.insert(identity(&metadata, &entry.path())?);
         }
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn links(metadata: &fs::Metadata) -> u64 {
+fn links(metadata: &fs::Metadata, _path: &Path) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    metadata.nlink()
+    Ok(metadata.nlink())
 }
 
 #[cfg(not(unix))]
-fn links(_metadata: &fs::Metadata) -> u64 {
-    1
+fn links(_metadata: &fs::Metadata, path: &Path) -> io::Result<u64> {
+    crate::windows::file_identity(path).map(|(_, _, links)| links)
 }
 
 fn reclaim_repositories(root: &Path, reclaimed: &mut Reclaimed) -> Result<(), Failure> {
@@ -1186,7 +1188,7 @@ fn legacy_usage(tree: &Path) -> Result<TreeUsage, Failure> {
             if name.ends_with(".lock") || name.ends_with(".flare.lock") {
                 continue;
             }
-            if !seen.insert(identity(&metadata, &entry.path())) {
+            if !seen.insert(identity(&metadata, &entry.path())?) {
                 continue;
             }
             usage.bytes += metadata.len();
@@ -1270,7 +1272,7 @@ fn file_usage(path: &Path) -> Result<(usize, u64), Failure> {
         if !metadata.is_file() {
             continue;
         }
-        if see.insert(identity(&metadata, &path)) {
+        if see.insert(identity(&metadata, &path)?) {
             bytes += metadata.len();
         }
     }
@@ -1309,7 +1311,7 @@ fn unique_bytes(path: &Path) -> Result<u64, Failure> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        if metadata.is_file() && seen.insert(identity(&metadata, &path)) {
+        if metadata.is_file() && seen.insert(identity(&metadata, &path)?) {
             bytes += metadata.len();
         }
     }
@@ -1317,18 +1319,14 @@ fn unique_bytes(path: &Path) -> Result<u64, Failure> {
 }
 
 #[cfg(unix)]
-fn identity(metadata: &fs::Metadata, _path: &Path) -> (u64, u64) {
+fn identity(metadata: &fs::Metadata, _path: &Path) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    (metadata.dev(), metadata.ino())
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn identity(_metadata: &fs::Metadata, path: &Path) -> (u64, u64) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    (0, hasher.finish())
+fn identity(_metadata: &fs::Metadata, path: &Path) -> io::Result<(u64, u64)> {
+    crate::windows::file_identity(path).map(|(volume, index, _)| (volume, index))
 }
 
 #[cfg(all(test, unix))]
