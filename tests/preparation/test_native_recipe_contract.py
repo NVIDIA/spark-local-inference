@@ -50,7 +50,7 @@ def _vision_buffers(recipe):
     return values
 
 
-def _recipe_metadata(recipe, *, all_variants=True):
+def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completion_capacity=None):
     module = importlib.import_module(f"ignition.recipes.{recipe}.contract")
     bootstrap = importlib.import_module(f"ignition.recipes.{recipe}.bootstrap")
     options = {}
@@ -60,10 +60,13 @@ def _recipe_metadata(recipe, *, all_variants=True):
     fields = bootstrap.PreparationConfig.__dataclass_fields__
     if recipe == "qwen38_dense":
         options.update(draft_snapshot=Path("metadata-draft"), max_active=32)
+    if recipe in ("qwen38", "glm53"):
+        options["mtp"] = True
     if recipe == "qwen38":
-        options.update(mtp=True, mixed_prefill=True)
+        options["mixed_prefill"] = True
     if "draft_checkpoint" in fields:
         options["draft_checkpoint"] = Path("metadata-draft")
+    options.update(config_options or {})
     config = bootstrap.PreparationConfig(**options)
     capacity = config.max_active
     vocabulary = getattr(module, "VOCABULARY", 262144)
@@ -84,7 +87,8 @@ def _recipe_metadata(recipe, *, all_variants=True):
         frame_index=torch.zeros(1, dtype=torch.int32),
         submission_sequence=torch.zeros(1, dtype=torch.int64),
         draft_page_tables=torch.zeros_like(inputs.page_tables))
-    buffers.update(CompletionOutputs.allocate((2, capacity, 16 + config.completion_token_capacity), device="cpu").buffers())
+    completion_capacity = config.completion_token_capacity if completion_capacity is None else completion_capacity
+    buffers.update(CompletionOutputs.allocate((2, capacity, 16 + completion_capacity), device="cpu").buffers())
     vision_buffers = _vision_buffers(recipe)
     buffers.update(vision_buffers)
     if vision_buffers:
@@ -138,8 +142,9 @@ def _recipe_metadata(recipe, *, all_variants=True):
     for tokens in scored_prefill_capacities(config.prefill_chunk_size):
         for enabled in ((True, False) if recipe == "deepseek41" else (None,)):
             add("scored_prefill", 1, tokens, enabled=enabled)
-    for batch, width in getattr(config, "speculative_shapes", ()):
-        add("speculative", batch, width)
+    if getattr(config, "mtp", True):
+        for batch, width in getattr(config, "speculative_shapes", ()):
+            add("speculative", batch, width)
     for batch, width, rows in getattr(config, "speculative_round_shapes", ()):
         add("speculative", batch, width, packed=rows)
     for batch, rows in getattr(config, "packed_speculative_shapes", ()):
@@ -153,9 +158,11 @@ def _recipe_metadata(recipe, *, all_variants=True):
     for key, value in dict(page_tokens=256 if recipe == "glm53" else 64 if recipe == "qwen38" else 128,
             draft_lag=0 if recipe in ("deepseek41", "deepseek4", "mimo_v2") else 1,
             rows=None if recipe in ("deepseek41", "deepseek4") else 1,
-            vocabulary=vocabulary, mtp=True, dspark=True, image_slots=4).items():
+            vocabulary=vocabulary, mtp=getattr(config, "mtp", True), dspark=True, image_slots=4).items():
         if key in arguments:
             kwargs[key] = value
+    if recipe == "glm53" and not config.mtp:
+        kwargs["draft_lag"] = None
     if "frontend" in arguments:
         kwargs["frontend"] = importlib.import_module(f"ignition.recipes.{recipe}.frontend").FRONTEND
     if recipe not in ("gemma4", "qwen38_dense"):
@@ -247,3 +254,42 @@ def test_qwen_dense_packed_catalog_and_zero_lag_cursor_pass_native_contract_vali
     assert config.speculative_token_capacity == 128
     assert all(graph["draft_cursor"]["lag_tokens"] == 0
         for graph in contract["graphs"] if graph["kind"] == p.SPECULATIVE)
+
+
+@pytest.mark.parametrize("tokens", [8, 13, 16, 32])
+def test_native_contract_uses_explicit_completion_capacity_for_every_output_axis(tokens):
+    import flare_heliopause
+
+    _, contract, manifest = _recipe_metadata("qwen38_dense", completion_capacity=tokens)
+    assert manifest["completion_token_capacity"] == tokens
+    fields = {buffer["name"]: buffer["shape"] for buffer in manifest["buffers"]}
+    assert fields["completion_records"][-1] == 16 + tokens
+    assert fields["completion_logprobs"][2] == tokens
+    assert fields["completion_speculative_survival"][2] == tokens - 1
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    manifest["completion_token_capacity"] = tokens + 1
+    with pytest.raises(ValueError):
+        flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_native_contract_accepts_omitted_or_zero_capacity_only_with_eight_token_buffers():
+    import flare_heliopause
+
+    _, contract, manifest = _recipe_metadata("qwen38_dense", completion_capacity=8)
+    manifest.pop("completion_token_capacity")
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    manifest["completion_token_capacity"] = 0
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_native_capacity_one_omits_survival_without_narrowing_state_row_storage():
+    import flare_heliopause
+
+    config, contract, manifest = _recipe_metadata("glm53", config_options=dict(mtp=False))
+    assert config.completion_token_capacity == manifest["completion_token_capacity"] == 1
+    fields = {buffer["name"]: buffer["shape"] for buffer in manifest["buffers"]}
+    assert fields["completion_records"] == [2, 4, 17]
+    assert fields["request_state_rows"] == [4, 8]
+    assert "completion_speculative_survival" not in fields
+    assert all(graph["kind"] != "speculative" for graph in manifest["graphs"])
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
