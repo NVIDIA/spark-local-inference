@@ -130,12 +130,12 @@ impl RequestScheduler {
         for slot in bits(mask) { lengths[slot] = 1; }
         let remaining = packed.saturating_sub(mask.count_ones() as usize);
         if remaining == 0 { return lengths; }
-        let probabilities: [[f64; 7]; REQUEST_LANES] = std::array::from_fn(|slot| {
-            if mask & (1 << slot) == 0 { return [0.0; 7]; }
+        let probabilities: [Vec<f64>; REQUEST_LANES] = std::array::from_fn(|slot| {
+            if mask & (1 << slot) == 0 { return Vec::new(); }
             let request = self.slots[slot].request.as_ref().unwrap();
             if gpu { self.speculative_curve(request, optimistic) }
             else { request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .map(|probability| probability.powf(self.policy.adaptive_verification_alpha) * values[slot].output_token) }
+                .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha) * values[slot].output_token).collect() }
         });
         let mut positions = Vec::new();
         for slot in bits(mask) {
@@ -188,8 +188,8 @@ impl RequestScheduler {
     }
 
     /// Prefix survival raised to the adaptive verification exponent.
-    pub(super) fn powered_curve(&self, request: &LiveRequest, optimistic: bool) -> [f64; 7] {
-        self.speculative_curve(request, optimistic).map(|p| p.powf(self.policy.adaptive_verification_alpha))
+    pub(super) fn powered_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
+        self.speculative_curve(request, optimistic).into_iter().map(|p| p.powf(self.policy.adaptive_verification_alpha)).collect()
     }
 
     pub(super) fn speculative_duration(&self, request: &LiveRequest, batch: usize, width: usize) -> Option<u64> {
@@ -303,7 +303,7 @@ impl RequestScheduler {
         let mut fixed_prefixes = HashMap::new();
         let mut host_rankings = HashMap::new();
         // Lane forecasts stay fixed while shapes compete; evaluate each at most once.
-        let mut curves: [Option<[f64; 7]>; REQUEST_LANES] = [None; REQUEST_LANES];
+        let mut curves: [Option<Vec<f64>>; REQUEST_LANES] = std::array::from_fn(|_| None);
         let mut order = Vec::with_capacity(available.len());
         let mut frontier = std::collections::BinaryHeap::new();
         for shape in self.costs.packed_round_shapes() {
@@ -437,6 +437,6 @@ impl RequestScheduler {
 }
 
 /// Expected tokens from a round of `width` positions with powered prefix survival.
-pub(super) fn forecast_tokens(powered: &[f64; 7], width: usize) -> f64 {
+pub(super) fn forecast_tokens(powered: &[f64], width: usize) -> f64 {
     f64::from(width != 0) + powered[..width.saturating_sub(1)].iter().sum::<f64>()
 }

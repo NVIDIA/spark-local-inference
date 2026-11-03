@@ -462,7 +462,7 @@ fn budget_pass(worker: &mut Worker<'_>, sequence: &mut u64, samples: &[u32]) {
                 .prompt
                 .logprobs
         {
-            let mut values = vec![std::array::from_fn(|_| None); 4];
+            let mut values = vec![vec![None; 16]; 4];
             values[lane.request.slot as usize][0] = Some(crate::execution::TokenLogprobs {
                 token,
                 logprob: -1.,
@@ -576,7 +576,7 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             if forced && after == 4 {
                 assert_eq!(
                     worker.scheduler.history_proposal(&[1, 1, 1, 4], 7),
-                    ([2, 2, 2, -1, -1, -1, -1], 3)
+                    (vec![2, 2, 2, -1, -1, -1, -1], 3)
                 );
             }
         }
@@ -638,7 +638,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
         accepted_drafts: 2,
         verification_width: 4,
         draft_cache_consumed: 15,
-        tokens: [1, 1, 1, -1, -1, -1, -1, -1],
+        tokens: vec![1, 1, 1, -1, -1, -1, -1, -1],
         ..Default::default()
     });
     worker.complete(GraphKind::Speculative, frame).unwrap();

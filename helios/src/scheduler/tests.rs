@@ -3309,7 +3309,12 @@ fn package_capacity_bounds_catalog_and_request_profiles() {
         assert!(scheduler.enable_speculation(&[1, capacity + 1]).is_err());
         assert_eq!(scheduler.forecasts.population.len(), capacity - 1);
         let handle = scheduler.admit(spec(1, 32)).unwrap();
-        assert_eq!(scheduler.request(handle).unwrap().acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        let request = scheduler.request(handle).unwrap();
+        assert_eq!(request.acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        let powered = scheduler.powered_curve(request, false);
+        assert_eq!(powered.len(), capacity - 1);
+        assert_eq!(scheduler.expected_speculative_tokens(request, capacity),
+            1.0 + powered.iter().sum::<f64>());
     }
 }
 

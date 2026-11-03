@@ -58,11 +58,11 @@ fn greedy_lengths(scheduler: &RequestScheduler, mask: u64, batch: usize, drafts:
     let gpu = scheduler.gpu_prefix_allocation(batch, drafts, width, packed);
     if (gpu && preserve) || (!gpu && scheduler.speculative_fixed_width.is_some())
         || ceilings.iter().sum::<usize>() <= packed { return ceilings; }
-    let probabilities: [[f64; 7]; REQUEST_LANES] = std::array::from_fn(|slot| {
-        let Some(request) = scheduler.slots.get(slot).and_then(|slot| slot.request.as_ref()) else { return [0.0; 7]; };
+    let probabilities: [Vec<f64>; REQUEST_LANES] = std::array::from_fn(|slot| {
+        let Some(request) = scheduler.slots.get(slot).and_then(|slot| slot.request.as_ref()) else { return Vec::new(); };
         if gpu { scheduler.speculative_curve(request, optimistic) }
         else { request.acceptance.curve(scheduler.proposal_source, request.generated_tokens, optimistic)
-            .map(|p| p.powf(scheduler.policy.adaptive_verification_alpha) * values[slot].output_token) }
+            .into_iter().map(|p| p.powf(scheduler.policy.adaptive_verification_alpha) * values[slot].output_token).collect() }
     });
     let mut lengths = [0; REQUEST_LANES];
     for slot in policy::bits(mask) { lengths[slot] = 1; }
@@ -96,7 +96,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                             emitted_count: 1, offered_drafts: 7, verification_width: 8, ..Default::default()
                         }), ..Default::default()
                     };
-                    std::array::from_fn(|depth| [0.0, 0.25, 0.75, 1.0][(row + depth) % 4])
+                    (0..7).map(|depth| [0.0, 0.25, 0.75, 1.0][(row + depth) % 4]).collect::<Vec<_>>()
                 }).collect();
                 scheduler.observe_packed_forecasts(&round, &records, &confidence);
                 for seed in 0..4 {
@@ -110,7 +110,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                         request.host_stops = seed == 2 && slot % 7 == 0;
                         request.grammar_constrained = seed == 3 && slot % 11 == 0;
                         request.copy_proposal = Some(speculation::CopyProposal {
-                            consumed: request.consumed_tokens, tokens: [9; 7], count: (slot + seed) % 8,
+                            consumed: request.consumed_tokens, tokens: vec![9; 7], count: (slot + seed) % 8,
                             grammar_masks: vec![],
                         });
                         if seed == 0 { request.acceptance = Default::default(); }
@@ -119,7 +119,7 @@ fn ranked_prefix_allocation_matches_greedy_frontiers() {
                         values[slot].output_token = [0.0, 1.0, 1.0, 4.0][(slot + seed) % 4];
                     }
                     scheduler.limits.max_sequence_tokens = if seed == 3 { 83 } else { 8192 };
-                    scheduler.forecasts.population = [0.9, 0.9, 0.5, 0.5, 0.25, 0.0, 0.0];
+                    scheduler.forecasts.population = vec![0.9, 0.9, 0.5, 0.5, 0.25, 0.0, 0.0];
                     let lanes = mask.count_ones() as usize;
                     for width in [1, 2, 4, 8] {
                         for drafts in [width - 1, 7] {
