@@ -694,6 +694,9 @@ pub(crate) fn publish_payload(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
     };
+    if !cache_only && form == "directory" {
+        helios_core::package::cache::preflight_directory_publication(path)?;
+    }
     fs::create_dir_all(parent)?;
     let staging_directory = tempfile::Builder::new()
         .prefix(".flare-payload-")

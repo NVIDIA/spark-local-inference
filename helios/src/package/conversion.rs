@@ -231,6 +231,8 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
     if directory_form(source, &verified.metadata) {
         return Err(invalid("package is already in directory form"));
     }
+    crate::package::cache::preflight_directory_publication(output)
+        .map_err(|error| invalid(format!("directory export preflight: {error}")))?;
     let payloads = verified.payloads()?;
     payloads.verify()?;
 

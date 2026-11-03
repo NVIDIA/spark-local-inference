@@ -2362,6 +2362,7 @@ impl Root {
             )
             .into());
         }
+        preflight_directory_publication(destination).map_err(failure)?;
         let parent = parent_of(destination);
         let name = destination
             .file_name()
@@ -3118,7 +3119,6 @@ impl Staging {
     /// and renamed into place, so a failed or interrupted export never exposes a
     /// partial tree and never replaces an existing output.
     pub fn commit_standalone(mut self, destination: &Path) -> Result<()> {
-        synchronize(&self.directory)?;
         if fs::symlink_metadata(destination).is_ok() {
             return Err(format!(
                 "export destination {} already exists",
@@ -3126,6 +3126,8 @@ impl Staging {
             )
             .into());
         }
+        preflight_directory_publication(destination).map_err(failure)?;
+        synchronize(&self.directory)?;
         let parent = parent_of(destination);
         let name = destination
             .file_name()
@@ -3554,6 +3556,95 @@ fn parent_of(destination: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// Check Linux directory no-replace support before preparing a standalone export.
+/// The final publication must still use `rename_noreplace`: this probe reserves nothing.
+pub fn preflight_directory_publication(destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return preflight_directory_publication_with(destination, rename_noreplace);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = destination;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_directory_publication_with(
+    destination: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    use std::os::unix::fs::DirBuilderExt;
+
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination exists",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = parent_of(destination);
+    fs::create_dir_all(parent)?;
+    let probe = loop {
+        let mut random = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| io::Error::other("could not generate publication probe name"))?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let probe = parent.join(format!(".flare-rename-probe-{name}"));
+        match fs::DirBuilder::new().mode(0o700).create(&probe) {
+            Ok(()) => break probe,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        let source = probe.join("source");
+        let target = probe.join("target");
+        fs::create_dir(&source)?;
+        fs::create_dir(&target)?;
+        match rename(&source, &target) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+            Ok(()) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no-replace rename replaced an existing directory",
+                ));
+            }
+        }
+        fs::remove_dir(&target)?;
+        rename(&source, &target)
+    })();
+    let cleanup = fs::remove_dir_all(&probe);
+    let result = result.map_err(|error| {
+        if error.kind() == io::ErrorKind::Unsupported
+            || matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS))
+        {
+            io::Error::new(io::ErrorKind::Unsupported, format!(
+                "filesystem at {} does not support atomic no-replace directory publication: {error}",
+                parent.display()
+            ))
+        } else {
+            error
+        }
+    });
+    match (result, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; could not remove publication probe {}: {cleanup}",
+                probe.display()
+            ),
+        )),
+    }
+}
+
 /// Rename without ever replacing an existing destination.
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
@@ -3717,6 +3808,77 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_publication_preflight_cleans_its_probe_and_preserves_destinations() {
+        let temporary = Temporary::new();
+        fs::create_dir_all(&temporary.0).unwrap();
+        let destination = temporary.0.join("export");
+        preflight_directory_publication(&destination).unwrap();
+        assert_eq!(fs::read_dir(&temporary.0).unwrap().count(), 0);
+
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"existing").unwrap();
+        assert_eq!(
+            preflight_directory_publication(&destination)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"existing");
+        assert_eq!(fs::read_dir(&temporary.0).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_publication_preflight_rejects_unsupported_rename_and_cleans_up() {
+        let temporary = Temporary::new();
+        fs::create_dir_all(&temporary.0).unwrap();
+        let destination = temporary.0.join("export");
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::ENOSYS] {
+            let error = preflight_directory_publication_with(&destination, |source, target| {
+                assert!(source.is_dir());
+                assert!(target.is_dir());
+                assert_eq!(source.parent().unwrap().parent().unwrap(), temporary.0);
+                Err(io::Error::from_raw_os_error(code))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("atomic no-replace directory publication")
+            );
+            assert_eq!(fs::read_dir(&temporary.0).unwrap().count(), 0);
+        }
+        let error = preflight_directory_publication_with(&destination, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fs::read_dir(&temporary.0).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_publication_preflight_does_not_reserve_the_destination() {
+        let temporary = Temporary::new();
+        fs::create_dir_all(&temporary.0).unwrap();
+        let destination = temporary.0.join("export");
+        preflight_directory_publication(&destination).unwrap();
+        let staging = temporary.0.join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("new"), b"new").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("existing"), b"existing").unwrap();
+        assert_eq!(
+            rename_noreplace(&staging, &destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(destination.join("existing")).unwrap(), b"existing");
+        assert!(staging.join("new").is_file());
+    }
 
     struct Temporary(PathBuf);
 
