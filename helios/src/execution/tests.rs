@@ -1289,7 +1289,17 @@ fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
         output.shape = vec![2, 4, fields];
         output.strides = vec![4 * fields, fields, 1];
         output.nbytes = 2 * 4 * fields * 8;
+        manifest.graphs[0].kind = GraphKind::Speculative;
+        manifest.graphs[0].token_capacity = capacity;
+        manifest.graphs[0].draft_tokens = capacity - 1;
+        manifest.graphs[0].packed_token_capacity = 4 * capacity;
         manifest.validate().unwrap();
+        if capacity > 1 {
+            manifest.buffers.push(BufferDescriptor { name: "completion_speculative_survival".into(),
+                address: 0x20000, nbytes: 2 * 4 * (capacity - 1) * 4, dtype: Dtype::Float32,
+                shape: vec![2, 4, capacity - 1], strides: vec![4 * (capacity - 1), capacity - 1, 1] });
+            manifest.validate().unwrap();
+        }
         manifest.completion_token_capacity += 1;
         assert!(manifest.validate().is_err());
     }
@@ -1299,4 +1309,32 @@ fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
     let mut previous = manifest();
     previous.abi_version = 5;
     assert!(previous.validate().unwrap_err().to_string().contains("re-export"));
+}
+
+#[test]
+fn package_sized_logprobs_and_survival_decode_active_and_padding_rows() {
+    for capacity in [1usize, 8, 16, 33, 65] {
+        let mut records = vec![CompletionRecord { vector: Some(TokenVector {
+            tokens: vec![-1; capacity], ..Default::default() }), ..Default::default() }; 2];
+        records[1].status = 1;
+        records[1].token_id = 42;
+        let vector = records[1].vector.as_mut().unwrap();
+        vector.tokens[0] = 42;
+        vector.emitted_count = 1;
+        let fields = 4;
+        let mut words = vec![0i32; 2 * capacity * fields];
+        let start = capacity * fields;
+        words[start..start + 4].copy_from_slice(&[42, (-0.5f32).to_bits() as i32, 42, (-0.5f32).to_bits() as i32]);
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let decoded = transport::decode_logprobs(&bytes, &records, 1, fields, 2, &[vec![], vec![]]).unwrap();
+        assert_eq!(decoded[1].len(), capacity);
+        assert_eq!(decoded[1][0].as_ref().unwrap().token, 42);
+        assert!(decoded[0].iter().all(Option::is_none));
+        assert!(decoded[1][1..].iter().all(Option::is_none));
+        let rows = vec![vec![-1.0; capacity - 1]; 2];
+        validate_speculative_survival(&rows, &records).unwrap();
+        let mut invalid = rows;
+        invalid[0].push(-1.0);
+        assert!(validate_speculative_survival(&invalid, &records).is_err());
+    }
 }

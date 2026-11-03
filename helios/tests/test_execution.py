@@ -80,7 +80,7 @@ class Resources:
             offset = (offset + 7) // 8 * 8
             bindings.append({"buffer_name": name, "host_offset": offset, "nbytes": tensor.numel() * tensor.element_size()})
             offset += bindings[-1]["nbytes"]
-        self.manifest = {"abi_version": 6, "context": context, "device": device, "max_active": 4,
+        self.manifest = {"abi_version": 6, "completion_token_capacity": 16, "context": context, "device": device, "max_active": 4,
             "input_frame_bytes": (offset + 7)//8*8,
             "buffers": [{"name": name, "address": tensor.data_ptr(), "nbytes": tensor.numel() * tensor.element_size(),
                 "dtype": str(tensor.dtype).removeprefix("torch."), "shape": list(tensor.shape), "strides": list(tensor.stride())}

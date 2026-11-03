@@ -683,6 +683,18 @@ mod tests {
     }
 
     #[test]
+    fn completion_capacity_wire_default_and_positive_values_roundtrip() {
+        for capacity in [0u32, 1, 8, 16, 33, 65] {
+            let execution = wire::Execution { abi_version: 6, completion_token_capacity: capacity,
+                ..Default::default() };
+            let restored = wire::Execution::decode(execution.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(restored.completion_token_capacity, capacity);
+            assert_eq!(crate::execution::resolve_completion_token_capacity(restored.completion_token_capacity),
+                if capacity == 0 { 8 } else { capacity as usize });
+        }
+    }
+
+    #[test]
     fn startup_tuning_metadata_roundtrips_physical_and_semantic_bindings() {
         let binding = wire::TunedBinding { buffer: "winner".into(), tuning_graph: "tune".into() };
         let execution = wire::Execution {

@@ -36,6 +36,14 @@ fn logical_layout_excludes_process_addresses_and_detects_contract_changes() {
 }
 
 #[test]
+fn rank_layout_includes_resolved_completion_capacity() {
+    let manifest = crate::execution::tests::manifest();
+    let mut peer = manifest.clone();
+    peer.completion_token_capacity = 33;
+    assert_ne!(layout(&manifest), layout(&peer));
+}
+
+#[test]
 fn rank_layout_requires_equal_cache_capacities_and_snapshot_exclusions() {
     let mut manifest = super::super::tests::manifest();
     let mut cache = flare_selene::testing::geometry(64, &[("kv", 4096)], 65536);
