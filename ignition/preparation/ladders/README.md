@@ -77,6 +77,55 @@ validate exact payload bytes and select among the supplied profiles. Gathers
 with equal byte sizes use the same recommendations regardless of row width.
 RoCE gathers and reduction-only ladders retain their preparation policy.
 
+### Thread-block clusters
+
+A bucket may set `"cluster_size": 8` to launch eight-CTA CUDA thread-block
+clusters. Omitting the field, or setting it to `1`, retains an ordinary launch.
+Clustered buckets require SM120 or SM121 with at least 64 SMs, 512 threads per
+CTA, and 64 physical CTAs. Preparation checks that the compiled function can
+keep eight clusters resident. Ordinary profiles retain their active-CTA counts.
+Phased full all-reduce is named `full_phased`; phased reduce-scatter followed
+by all-gather is named `payload_rsag_phased`. The latency family admits both;
+the bandwidth family admits `payload_rsag_phased`. Each phased profile must select
+exactly eight active CTAs.
+
+Phased execution uses the first complete cluster to write one peer destination
+at a time. All its CTAs participate in each phase barrier; other clusters return
+without changing collective state. System-scope publication fences remain
+required for peer-visible writes. This uses existing kernel launch attributes
+in execution ABI 5 and does not require cooperative launch.
+
+`gb202_pcie_tp4_clustered.json` adds phased RSAG to 36 compatible buckets used
+by packed DeepSeek V4.1 TP4 verification graphs with eight, sixteen, or thirty-two
+requests, seven draft positions, and up to 128 target rows. It retains every
+ordinary candidate, kernel family, thread count, and physical grid from
+`gb202_pcie_tp4.json`. Its 256-thread buckets use ordinary launches.
+`gb202_pcie_tp4_clustered_full.json` adds one further choice: phased Full in the
+bucket containing 80 KiB. This also covers the target reductions for one request
+verified at eight rows.
+
+The compiled cluster geometry also applies when startup selects an ordinary
+profile; startup selection cannot disable clustering. Cluster scheduling can
+affect those profiles, so retaining every ordinary candidate does not guarantee
+unchanged latency. Qualify these catalogs on the intended GPU topology and
+complete serving workload; component improvements do not establish a throughput gain.
+`gb202_pcie_tp4.json` remains the ordinary catalog.
+
+Select the catalog with both phased modes during export:
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --collective-tuning runtime \
+  --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4_clustered_full.json
+```
+
+Use `gb202_pcie_tp4_clustered.json` in the same flag to exclude the phased Full
+choice at 80 KiB. `--collective-tuning static` uses preparation-time autotuning
+and accepts no ladder; these catalogs require the explicit `runtime` policy.
+Changing the catalog requires package export because cluster geometry is compiled
+into its kernels and captured launch attributes. Existing packages retain their
+prepared geometry and profiles.
+
 ## GB202 PCIe TP4 recommendations
 
 `gb202_pcie_tp4.json` contains 210 buckets from 16 bytes through 8 MiB.

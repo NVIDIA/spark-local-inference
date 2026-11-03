@@ -112,6 +112,38 @@ def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypat
             session=object(), coordinator=object(), name="reduce")
 
 
+@pytest.mark.parametrize("first_profile", [("payload_rsag_phased", 8), ("payload_rsag", 64)])
+def test_clustered_ladder_prepares_a_valid_initial_profile(monkeypatch, first_profile):
+    from copy import deepcopy
+    from b12x.comm.pcie import CollectiveConfig
+    from ignition.components import collectives
+    from ignition.preparation import startup_tuning
+    from ignition.preparation.collective_ladder import load, validate
+
+    data = deepcopy(load("ignition/preparation/ladders/gb202_pcie_tp4.json"))
+    mode, active = first_profile
+    data["buckets"][0].update(threads=512, blocks=64, cluster_size=8, profiles={mode: [active]})
+    validate(data)
+    calls = []
+    plan = SimpleNamespace(request=lambda **kwargs: object())
+    runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
+        exchange_group=object(), for_stream=lambda: SimpleNamespace(_joint_workspace=object()),
+        plan=lambda *args, **kwargs: calls.append(kwargs) or plan)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
+    monkeypatch.setattr(startup_tuning, "register_collective", lambda *args: None)
+    source = torch.ones(8, dtype=torch.bfloat16)
+    output = torch.empty_like(source)
+    collectives.PreparedAllReduce(source, output, runtime=runtime,
+        session=SimpleNamespace(collective_tuning="runtime", collective_ladder=data),
+        coordinator=object(), name="hidden.reduce")
+    assert calls == [dict(out=output, joint_only=True, joint_cluster_size=8,
+                         override=CollectiveConfig(implementation="joint_latency", threads=512,
+                             blocks=64, submode=mode, active_blocks=active))]
+
+
 def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
     from b12x.comm.pcie import joint_finalist_policy
     from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
