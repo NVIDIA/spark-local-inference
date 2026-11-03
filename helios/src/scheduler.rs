@@ -2087,7 +2087,7 @@ impl RequestScheduler {
     fn speculative_tokens(&self, request: &LiveRequest, width: usize) -> usize {
         let context = self.limits.max_sequence_tokens - request.scheduled_consumed as usize;
         let output = (request.max_new_tokens - request.generated_tokens) as usize;
-        let output = output.saturating_sub(self.pending_token_ceiling(request.handle));
+        let output = output.saturating_sub(self.pending_ceiling(request));
         let proposal = if request.host_stops
             || (request.grammar_constrained
                 && self.proposal_source == speculation::ProposalSource::Mtp)
