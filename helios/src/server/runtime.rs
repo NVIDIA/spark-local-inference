@@ -2830,7 +2830,7 @@ mod tests {
             step
         }
 
-        let metrics = super::super::metrics::Metrics::default();
+        let metrics = super::super::metrics::Metrics::new(0, 0, 0, 16);
         let mut scheduler = RequestScheduler::new(
             [5; 32],
             SchedulerLimits {
@@ -2962,7 +2962,7 @@ mod tests {
             first_token: std::cell::Cell::new(Some(first_token)),
             cancelled: cancelled.clone(),
             failure: failure.clone(),
-            metrics: Arc::new(super::super::metrics::Metrics::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
             host_lookup: true,
             readmitted: false,

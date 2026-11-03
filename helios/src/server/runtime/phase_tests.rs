@@ -146,7 +146,7 @@ impl Fixture {
             },
             frontend,
             stop: AtomicBool::new(false),
-            metrics: Arc::new(Default::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
         }
     }
 
