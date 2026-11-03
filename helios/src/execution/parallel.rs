@@ -503,6 +503,9 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
+    if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
+        return Shutdown { drained: true, error: Some(error) };
+    }
     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
         Ok(executor) => executor,
         Err(error) => {
@@ -517,7 +520,6 @@ pub unsafe fn serve_rank(
         if world < 2 || !(1..world).contains(&rank) {
             return Err(invalid("invalid tensor-parallel peer identity"));
         }
-        wire::validate_completion_packet(executor.manifest())?;
         let mut channel = Channel::new(socket)?;
         let result = (|| -> Result<()> {
             let mut hello = Vec::new();
