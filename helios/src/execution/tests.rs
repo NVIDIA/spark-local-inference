@@ -936,7 +936,7 @@ fn old_execution_manifests_serve_without_logprob_outputs_and_partial_declaration
 
 #[test]
 fn logprob_readback_uses_only_emitted_positions_and_validates_chosen_ids() {
-    let mut records = vec![CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord { vector: Some(TokenVector { tokens: vec![-1; 16], ..Default::default() }), ..Default::default() }; 4];
     records[2] = CompletionRecord {
         generation: 9, submission_sequence: 7, consumed_tokens: 3,
         generated_tokens: 2, token_id: 8, status: 1,
@@ -1141,6 +1141,7 @@ fn explicit_logprob_decoding_preserves_order_appends_sample_and_honors_pitch() {
             assert!(result[1][1..].iter().all(Option::is_none));
             words[start] = ids[0] as i32;
             records[1].token_id = i64::from(ids[0]);
+            records[1].vector.as_mut().unwrap().tokens[0] = i64::from(ids[0]);
             assert_eq!(
                 decode(&words, &records).unwrap()[1][0]
                     .as_ref()

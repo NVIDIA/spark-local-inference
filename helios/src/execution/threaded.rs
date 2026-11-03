@@ -750,8 +750,8 @@ mod tests {
             records.shape = vec![2, 4, 32];
             records.strides = vec![4 * 32, 32, 1];
             root.buffers.push(BufferDescriptor {
-                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 5 * 4,
-                dtype: Dtype::Float32, shape: vec![2, 4, 5], strides: vec![20, 5, 1],
+                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 15 * 4,
+                dtype: Dtype::Float32, shape: vec![2, 4, 15], strides: vec![60, 15, 1],
             });
             root.buffers.push(BufferDescriptor {
                 name: "prefill_row".into(), address: 0x40000, nbytes: 4,
