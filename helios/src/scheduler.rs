@@ -563,6 +563,7 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    delivers_feedback: bool,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
@@ -1026,7 +1027,7 @@ impl RequestScheduler {
         step: &ScheduledStep,
         timing: crate::execution::ExecutionTiming,
     ) {
-        self.costs.observe(step, timing);
+        self.costs.observe(step, timing, Some(self.step_delivers_feedback(step)));
     }
 
     pub fn submitted_timing(&self, fence: Fence) -> Result<SubmittedTiming> {
@@ -1051,16 +1052,22 @@ impl RequestScheduler {
     }
 
     pub fn plan_requires_feedback(&self, plan: &ScheduledPlan) -> bool {
-        let geometry = (plan.kind, plan.batch_capacity, plan.draft_tokens, plan.token_capacity,
-            plan.packed_token_capacity, plan.prefill_capacity());
-        plan.requires_feedback || !matches!(plan.kind, GraphKind::Decode | GraphKind::Speculative)
+        plan.requires_feedback || self.step_delivers_feedback(plan)
+            || !self.costs.is_fresh(cost::Key::from_step(plan))
+            || plan.origin.is_probe()
+    }
+
+    /// Whether the host must consume this step's completion before another submission
+    /// for reasons other than measuring its cost.
+    fn step_delivers_feedback(&self, step: &ScheduledStep) -> bool {
+        let geometry = (step.kind, step.batch_capacity, step.draft_tokens, step.token_capacity,
+            step.packed_token_capacity, step.prefill_capacity());
+        !matches!(step.kind, GraphKind::Decode | GraphKind::Speculative)
             || self.capabilities.completion_inputs.iter().any(|(key, inputs)| *key == geometry && !inputs.is_empty())
-            || plan.lanes.iter().any(|lane| self.request(lane.request).is_ok_and(|request|
+            || step.lanes.iter().any(|lane| self.request(lane.request).is_ok_and(|request|
                 request.grammar_constrained || request.host_stops
                     || self.proposal_source == speculation::ProposalSource::Copy
                     || self.decoded_history.is_some()))
-            || !self.costs.is_fresh(cost::Key::from_step(plan))
-            || plan.origin.is_probe()
     }
 
     fn selected_cost(&self, key: cost::Key) -> SelectedCost {
@@ -2133,6 +2140,7 @@ impl RequestScheduler {
             }
         }
         let feedback = self.plan_requires_feedback(plan);
+        let delivers_feedback = self.step_delivers_feedback(step);
         if self.submissions.len() >= 2
             || (feedback && !self.submissions.is_empty())
             || self.submissions.values().any(|step| step.requires_feedback)
@@ -2223,6 +2231,7 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                delivers_feedback,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,
@@ -2440,7 +2449,8 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        self.observe_execution(&submission.step, timing);
+        self.costs.observe(&submission.step, timing,
+            (!submission.origin.is_probe()).then_some(submission.delivers_feedback));
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;

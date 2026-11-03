@@ -1109,7 +1109,10 @@ fn worker_observes_prefill_decode_and_prerequisite_timings() {
         ];
         frame.timing.wall_ns = 350;
         worker.complete(kind, frame).unwrap();
-        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(619));
+        // The median of the prepared 1000 ns and the observed 200 ns, plus the 150 ns
+        // handoff of steps whose completion must be consumed before the next submission.
+        let handoff = if kind == GraphKind::Decode { 0 } else { 150 };
+        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(600 + handoff));
         let metrics = fixture.metrics.snapshot(false);
         assert_eq!(metrics.verification_drafts, 0);
         assert_eq!(
@@ -1600,7 +1603,9 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
         let source = fixture.config.speculative_proposal_source;
         assert!(profile.prefix_probability(source, 0).unwrap() > 0.5);
         assert!(profile.prefix_probability(source, 2).unwrap() < 0.125);
-        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(1063));
+        // Copied proposals need each completion before the next round and expose its
+        // 500 ns handoff; MTP rounds overlap it with the queued round.
+        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(if copy { 1500 } else { 1000 }));
         let metrics = fixture.metrics.snapshot(!copy);
         assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 4));
         assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (2, 1));

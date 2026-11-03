@@ -83,7 +83,11 @@ never the proposals or allocation of the completed program.
 Costs use the full graph, including proposal work, allocation, verification,
 commit, collectives, and readiness stalls. GPU replay and serial host handoff
 have separate estimates; queued completion wall time does not become an isolated
-handoff sample. A trace attaches physical B/D/W/P, selected cost, observation
+handoff sample. Handoff is exposed only when the next submission waits for a
+completion: the median handoff of a graph's drained executions is charged in
+proportion to its ordinary executions that require completion feedback. Host
+delays around pipelined executions and probes that drain only to measure do not
+change a graph's cost. A trace attaches physical B/D/W/P, selected cost, observation
 age, selection reason, and exploration credit to each committed plan.
 `flare_speculative_*` counters cover complete speculative programs rather than
 separate producer and target calls.

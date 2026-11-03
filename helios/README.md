@@ -337,8 +337,11 @@ lane's logical token limit even when the completion reports physical padding.
 update it with the median of up to nine replay observations. After 30 seconds without a valid observation,
 the cost becomes stale but remains available for selection. The next valid
 observation replaces the stale estimate. Tensor-parallel observations use the
-maximum positive rank interval. Isolated executions also measure host handoff;
-queued executions exclude queue wait from the timing updates. Unmeasured
+maximum positive rank interval. Executions that drain the queue also measure host
+handoff, which is charged in proportion to the graph's ordinary executions that
+must deliver completion feedback before another submission. Pipelined executions
+charge no handoff, and queued executions exclude queue wait from the timing
+updates. Unmeasured
 candidates compete by useful work and can beat measured candidates. Both
 unmeasured and stale physical dispatches require an empty queue and completion
 before another submission.

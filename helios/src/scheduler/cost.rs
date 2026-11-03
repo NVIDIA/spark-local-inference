@@ -50,6 +50,7 @@ pub(super) struct PackedRoundShape {
 struct Estimate {
     nanos: u64,
     replays: ReplayTimes,
+    handoff: HostHandoff,
     handoff_ns: u64,
     observed_at_ns: u64,
     last_attempt_ns: u64,
@@ -78,6 +79,39 @@ impl ReplayTimes {
         } else {
             ordered[middle]
         }
+    }
+}
+
+/// Host time a graph leaves the GPU idle between executions. A pipelined execution
+/// overlaps its handoff with the queued one, and host delays around it belong to the
+/// host rather than to the graph. Only an execution that must deliver completion
+/// feedback before the next submission drains the queue and exposes its handoff, so
+/// the median drained handoff is charged in proportion to such ordinary executions.
+#[derive(Default)]
+struct HostHandoff {
+    drained: ReplayTimes,
+    drained_ns: u64,
+    feedback: u16,
+    executions: u32,
+}
+
+impl HostHandoff {
+    /// `drained_ns` is the handoff of an execution that ran with an empty queue
+    /// because it required feedback. `feedback` records whether an ordinary
+    /// execution required it; probes drain the queue only to measure and omit it.
+    fn observe(&mut self, drained_ns: Option<u64>, feedback: Option<bool>) -> u64 {
+        if let Some(ns) = drained_ns {
+            self.drained_ns = self.drained.observe(ns, true);
+        }
+        if let Some(feedback) = feedback {
+            self.feedback = self.feedback << 1 | u16::from(feedback);
+            self.executions = (self.executions + 1).min(u16::BITS);
+        }
+        if self.executions == 0 {
+            return 0;
+        }
+        let executions = u128::from(self.executions);
+        ((u128::from(self.drained_ns) * u128::from(self.feedback.count_ones()) + executions / 2) / executions) as u64
     }
 }
 
@@ -114,6 +148,7 @@ impl ActionCosts {
         let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
         estimate.replays.observe(nanos, false);
+        estimate.handoff = HostHandoff::default();
         estimate.handoff_ns = 0;
         estimate.observed_at_ns = self.now_ns;
         self.refresh_packed_durations();
@@ -139,6 +174,7 @@ impl ActionCosts {
                 Estimate {
                     nanos: 0,
                     replays: ReplayTimes::default(),
+                    handoff: HostHandoff::default(),
                     handoff_ns: 0,
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
@@ -246,7 +282,9 @@ impl ActionCosts {
         self.duration_key(Key::from_step(step))
     }
 
-    pub fn observe(&mut self, step: &ScheduledStep, timing: ExecutionTiming) {
+    /// `feedback` tells whether an ordinary execution had to deliver completion
+    /// feedback before the next submission; it is absent for probes.
+    pub fn observe(&mut self, step: &ScheduledStep, timing: ExecutionTiming, feedback: Option<bool>) {
         let Some(raw_sample) = timing.gpu_ns.into_iter().flatten().max().filter(|n| *n > 0) else {
             return;
         };
@@ -265,14 +303,12 @@ impl ActionCosts {
         if let Some(&index) = self.index.get(&key) {
             let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);
-            if !timing.queued {
-                let handoff = timing.wall_ns.saturating_sub(raw_sample);
-                estimate.handoff_ns = if fresh {
-                    ((7 * u128::from(estimate.handoff_ns) + u128::from(handoff) + 4) / 8) as u64
-                } else { handoff };
-            } else if !fresh {
-                estimate.handoff_ns = 0;
+            if !fresh {
+                estimate.handoff = HostHandoff::default();
             }
+            let drained = (step.requires_feedback && !timing.queued)
+                .then(|| timing.wall_ns.saturating_sub(raw_sample));
+            estimate.handoff_ns = estimate.handoff.observe(drained, feedback);
             estimate.nanos = estimate.replays.observe(sample, fresh);
             estimate.observed_at_ns = self.now_ns;
             self.refresh_packed_durations();
@@ -282,7 +318,7 @@ impl ActionCosts {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplayTimes;
+    use super::{HostHandoff, ReplayTimes};
 
     #[test]
     fn isolated_slow_replay_does_not_displace_the_steady_cost() {
@@ -308,6 +344,32 @@ mod tests {
         assert_eq!(replays.observe(16, true), 16);
         assert_eq!(replays.observe(32, false), 32);
         assert_eq!(replays.observe(16, true), 24);
+    }
+
+    #[test]
+    fn pipelined_executions_expose_no_handoff() {
+        let mut handoff = HostHandoff::default();
+        assert_eq!(handoff.observe(Some(90_000), None), 0);
+        for _ in 0..16 {
+            assert_eq!(handoff.observe(None, Some(false)), 0);
+        }
+    }
+
+    #[test]
+    fn feedback_executions_charge_their_median_drained_handoff() {
+        let mut handoff = HostHandoff::default();
+        for _ in 0..8 {
+            assert_eq!(handoff.observe(Some(100_000), Some(true)), 100_000);
+        }
+        assert_eq!(handoff.observe(Some(30_000_000), Some(true)), 100_000);
+        for _ in 0..8 {
+            handoff.observe(None, Some(false));
+        }
+        assert_eq!(handoff.observe(None, Some(false)), 43_750);
+        for _ in 0..7 {
+            handoff.observe(None, Some(false));
+        }
+        assert_eq!(handoff.observe(None, None), 0);
     }
 
     #[test]
