@@ -167,7 +167,7 @@ class QuantizedProjection:
         mxfp8_min_amax: float | None = None,
         encoded=None,
         rhs_prefetch_ready: bool = False,
-        allow_bf16_atomic_reduction: bool = True,
+        allow_bf16_atomic_reduction: bool | None = None,
         buffers=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
@@ -177,6 +177,11 @@ class QuantizedProjection:
         _validate_bias(bias, out_features=weight.out_features, out_dtype=output.dtype, device=source.device)
         if bias is not None and _overlap(output, bias):
             raise ValueError("projection output must not overlap bias")
+
+        if allow_bf16_atomic_reduction is None:
+            allow_bf16_atomic_reduction = not isinstance(weight, MXFP8LinearWeight)
+        elif type(allow_bf16_atomic_reduction) is not bool:
+            raise TypeError("BF16 atomic reduction permission must be a boolean or None")
 
         self.weight = weight
         self.output = output
@@ -312,6 +317,7 @@ class QuantizedProjection:
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,
                                                source_activation=source_activation,
+                                               allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)

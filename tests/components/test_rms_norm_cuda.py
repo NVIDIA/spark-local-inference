@@ -263,3 +263,43 @@ def test_prefill_cross_layer_residual_tap_survives_buffer_reuse():
             assert torch.isfinite(attended).all()
             assert torch.isfinite(normalized).all()
         graph.reset()
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 17])
+@torch.no_grad()
+def test_bf16_residual_normalization_preserves_rounded_decoder_sum(tokens):
+    from ignition.preparation.compilation import compile_forward
+
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device=device).manual_seed(9027 + tokens)
+    source = torch.randn(tokens, 5120, device=device, generator=generator).bfloat16()
+    residual = torch.randn(tokens, 5120, device=device, generator=generator).bfloat16()
+    initial_source, initial_residual = source.clone(), residual.clone()
+    weight = torch.randn(5120, device=device, generator=generator) * .1
+    output = torch.empty_like(source)
+    with PreparationSession(device=device, autotune=False) as session:
+        operation = PreparedRMSNorm(source, weight, output, eps=1e-6, zero_centered=True,
+                                   residual=residual, session=session, name="decoder_residual_rms")
+        forward = compile_forward(lambda: operation(source, residual))
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            forward()
+        for gain in (0., .5, 1.5):
+            source.copy_(initial_source * gain)
+            residual.copy_(initial_residual * (2 - gain))
+            expected_source = source + residual
+            values = expected_source.float()
+            expected = (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+                        * (1 + weight)).bfloat16()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(source, expected_source, atol=0, rtol=0)
+            lower = torch.nextafter(expected, torch.full_like(expected, -torch.inf))
+            upper = torch.nextafter(expected, torch.full_like(expected, torch.inf))
+            assert ((output >= lower) & (output <= upper)).all()
+            assert (output != expected).float().mean() < .001
+        graph.reset()

@@ -159,3 +159,8 @@
 [ ] Reduce the host-bridge cost of the 512-thread selected barrier gather for
     512-byte rows at 1 MiB per rank: 20.1% above the best measured geometry.
     Raw width comparisons: ~/benchmarks/gather-byte-ladder/width-*.jsonl.
+
+[ ] Validate the shared MXFP8 projection FP32 split-reduction default on Qwen3.8
+    MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
+    Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
+    shared operator bounds. Checkpoint coverage for these other consumers remains pending.

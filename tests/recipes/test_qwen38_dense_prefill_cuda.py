@@ -28,7 +28,7 @@ def test_checkpoint_captured_chunked_prefill_preserves_counts_and_state(checkpoi
     from ignition.recipes.qwen38_dense.weights import ModelWeights
 
     device = torch.device("cuda:0")
-    hub = Path.home() / ".cache/huggingface/hub"
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
     target = resolve(checkpoint).snapshot(hub)
     draft = hub / "models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
     weights = ModelWeights.load(inspect_indexed_checkpoint(target), device, mtp=True, draft_snapshot=draft, online_mxfp8=online_mxfp8)

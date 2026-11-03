@@ -176,6 +176,9 @@ def test_ordinary_fp4_linear_graph(tmp_path, rows, fmt, native):
         if native:
             assert projection.activation_mode == "quantized"
             assert projection.plan.selection.config.mode == "quantized"
+        if not projection.sm103:
+            assert projection.plan.query.allow_bf16_atomic_reduction is True
+        projection(x)
         session.freeze()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):

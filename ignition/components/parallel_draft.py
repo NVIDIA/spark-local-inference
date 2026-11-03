@@ -8,7 +8,7 @@ import torch
 
 from .candidate_selector import PreparedCandidateSelector
 from .collectives import PreparedAllReduce
-from .draft_sampling import PreparedDraftDistribution, PreparedDraftBlockBroadcast
+from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, PreparedBatch
 from .speculation import (
     DRAFT_RNG_DOMAIN,
@@ -240,7 +240,9 @@ class PreparedParallelDraftRound:
             target.prepare()
         for index, proposal in enumerate(proposals):
             bias = None if self.markov is None else getattr(self.markov, "logits", None)
-            if (self.draft is not None and self.selector is None
+            if self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
+                proposal.bind_shortlist(self.shortlisted_selector.ids[:, index + o.logit_offset])
+            elif (self.draft is not None and self.selector is None
                     and (self.markov is None or bias is not None)):
                 block = self.draft_inputs.shape[1]
                 proposal.bind_logits(self.draft.scratch.logits.view(b, block, -1)[:, index + o.logit_offset],

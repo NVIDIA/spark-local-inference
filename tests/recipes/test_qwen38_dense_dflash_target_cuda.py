@@ -32,7 +32,7 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(chec
     from ignition.recipes.qwen38_dense.pool import ContinuationPool
     from ignition.recipes.qwen38_dense.weights import ModelWeights
 
-    hub = Path.home() / ".cache/huggingface/hub"
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
     target = resolve(checkpoint).snapshot(hub)
     draft = hub / "models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
     assert (target / "config.json").is_file() and (draft / "model.safetensors").is_file()
@@ -40,6 +40,26 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(chec
     if checkpoint == "qwen3.8-27b-qad":
         assert sum(name.endswith(".mlp.gate_up") for name in weights.projections) == 64
         assert not any(name.endswith((".mlp.gate_proj", ".mlp.up_proj")) for name in weights.projections)
+        if online_mxfp8:
+            from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear_as_mxfp8
+
+            packed_names = [name for name in weights.projections if name.endswith(".self_attn.qgkv_proj")]
+            assert len(packed_names) == 16
+            assert not any(name.endswith((".self_attn.q_proj", ".self_attn.kv_proj")) for name in weights.projections)
+            packed_weight = weights.projections["layers.3.self_attn.qgkv_proj"]
+            prefix = "model.language_model.layers.3.self_attn."
+            with DirectWeightLoader(inspect_indexed_checkpoint(target), "cuda:0", prefixes=(prefix,)) as loader:
+                original_q = loader.load_linear(prefix + "q_proj")
+                original_kv = loader.load_linear_group((prefix + "k_proj", prefix + "v_proj"))
+            original = (quantize_bf16_linear_as_mxfp8(original_q), quantize_bf16_linear_as_mxfp8(original_kv))
+            order = torch.cat((torch.arange(12288, device="cuda").view(24, 2, 256).transpose(0, 1).reshape(-1),
+                               torch.arange(12288, 14336, device="cuda")))
+            for field in ("values", "scale_rows"):
+                rows = torch.cat([getattr(part.weight, field).view(torch.uint8).reshape(part.out_features, -1)
+                                  for part in original])
+                actual = getattr(packed_weight.weight, field).view(torch.uint8).reshape(14336, -1)
+                assert torch.equal(rows.index_select(0, order), actual)
+            del original, original_q, original_kv, rows, actual
         from ignition.recipes.qwen38_dense.config import TEXT_PREFIX
         from ignition.reference.qwen38_quant import CheckpointTensors
 
@@ -82,6 +102,20 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(chec
         operation = PreparedParallelDraftRound(owner, 2, width, "qwen.actual.packed", buffers=private_buffers.cursor(),
             target_token_capacity=width + 1)
         operation.prepare()
+        if checkpoint == "qwen3.8-27b-qad":
+            gdn = [layer.layer.linear_attn.operation for layer in operation.decoder.layers
+                   if layer.layer.block_type == "linear_attention"]
+            assert len(gdn) == 48
+            assert all(attention.projections[key].plan.query.allow_bf16_atomic_reduction is False
+                       for attention in gdn for key in ("in_proj_qkvzba", "out_proj"))
+        if online_mxfp8:
+            attentions = [layer.layer.self_attn for layer in operation.decoder.layers
+                          if layer.layer.block_type == "full_attention"]
+            assert len(attentions) == 16
+            for attention in attentions:
+                assert attention.input_projections == ("qgkv_proj",)
+                assert attention.query.stride() == attention.gate.stride() == (14336, 256, 1)
+                assert attention.k.stride() == attention.v.stride() == (14336, 1)
         narrow = PreparedParallelDraftRound(owner, 2, 1, "qwen.actual.width1", buffers=private_buffers.cursor())
         narrow.prepare()
         arena.finalize()

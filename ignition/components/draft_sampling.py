@@ -83,6 +83,25 @@ def _block_candidates(Scores, Probabilities, TopK, Candidates, V: tl.constexpr, 
 
 
 @triton.jit
+def _shortlist_candidates(Scores, Ids, Candidates, id_stride, V: tl.constexpr,
+                          SUPPORT: tl.constexpr, POOL: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    index = tl.arange(0, POOL)
+    # Padding keeps top-k cutoffs above the support size valid without duplicate token IDs.
+    padding = index - SUPPORT
+    token = tl.load(Ids + row * id_stride + index, index < SUPPORT, other=0)
+    token = tl.where(index < SUPPORT, token, padding)
+    present = (index < SUPPORT) | ((padding >= 0) & (padding < K + SUPPORT) & (padding < V))
+    for entry in tl.static_range(SUPPORT):
+        support_id = tl.load(Ids + row * id_stride + entry)
+        present &= (index < SUPPORT) | (token != support_id)
+    present &= (token >= 0) & (token < V)
+    scores = tl.load(Scores + row * V + token, present, other=-float("inf"))
+    keys = (_orderable(scores).to(tl.int64) << 32) | (2147483647 - token).to(tl.int64)
+    tl.store(Candidates + row * POOL + index, tl.where(present, keys, -9223372036854775808))
+
+
+@triton.jit
 def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, Params, Slots, Seed,
                        Offset, Sampled, V: tl.constexpr, BLOCKS: tl.constexpr, POOL: tl.constexpr, K: tl.constexpr,
                        SLOTS: tl.constexpr, SupportIds, SupportProbabilities, WRITE_SUPPORT: tl.constexpr):
@@ -293,7 +312,7 @@ _SCORE_BLOCK = BLOCK
 
 
 class PreparedDraftProposal:
-    """Two captured launches over explicit request-policy inputs for one draft position."""
+    """Captured candidate selection over explicit request-policy inputs for one draft position."""
 
     def __init__(self, scores, probabilities, valid, top_k, top_p, params, slots, seed, offset, sampled,
                  *, capacity, candidates=None, selected=None):
@@ -310,12 +329,30 @@ class PreparedDraftProposal:
                 raise ValueError("draft proposal scratch requires contiguous Int64 tensors on the score device")
         pool = triton.next_power_of_2(self.blocks * DRAFT_CANDIDATES)
         self._block_args = (scores, probabilities, top_k, self.candidates, vocab, self.blocks, BLOCK, DRAFT_CANDIDATES)
-        self._select_args = (self.candidates, self.selected, probabilities, valid, top_k, top_p,
-                             params, slots,
-                             seed, offset, sampled, vocab, self.blocks, pool, DRAFT_CANDIDATES, capacity)
+        self._select_args = (self.selected, probabilities, valid, top_k, top_p, params, slots,
+                             seed, offset, sampled, vocab)
+        self._candidate_source = self.candidates
+        self._candidate_geometry = (self.blocks, pool, DRAFT_CANDIDATES, capacity)
+        self._shortlist_args = None
         self._grids = ((rows, self.blocks, 1), (rows, 1, 1))
         self._kernels = None
         self._support = None
+
+    def bind_shortlist(self, ids, candidates):
+        if self._kernels is not None:
+            raise RuntimeError("draft shortlist must be bound before prepare()")
+        rows, vocab = self._block_args[0].shape[0], self._block_args[4]
+        if (ids.ndim != 2 or ids.shape[0] != rows or not 0 < ids.shape[1] <= DRAFT_CANDIDATES
+                or ids.dtype != torch.int64 or ids.device != self.selected.device or ids.stride(-1) != 1):
+            raise ValueError("draft shortlist requires Int64 token rows with at most 64 candidates")
+        shape = (rows, 4, DRAFT_CANDIDATES)
+        if (candidates.shape != shape or candidates.dtype != torch.int64
+                or candidates.device != ids.device or not candidates.is_contiguous()):
+            raise ValueError("draft shortlist scratch requires contiguous Int64 candidate storage")
+        self._candidate_source = candidates
+        self._candidate_geometry = (4, 4 * DRAFT_CANDIDATES, DRAFT_CANDIDATES, self._candidate_geometry[-1])
+        self._shortlist_args = (self._block_args[0], ids, candidates, ids.stride(0),
+                               vocab, ids.shape[1], 4 * DRAFT_CANDIDATES, DRAFT_CANDIDATES)
 
     def bind_support(self, ids, probabilities):
         """Bind canonical broadcast payloads before graph capture, preserving candidate order."""
@@ -332,20 +369,27 @@ class PreparedDraftProposal:
         from ignition.preparation.triton import prepare_triton
 
         support = (self.selected, self._block_args[1]) if self._support is None else self._support
-        return prepare_triton(_select_and_sample, self._select_args + support, self._grids[1],
+        return prepare_triton(_select_and_sample,
+                              (self._candidate_source, *self._select_args, *self._candidate_geometry, *support), self._grids[1],
                               WRITE_SUPPORT=self._support is not None, num_warps=4)
 
     def prepare(self, *, candidates_prepared=False):
         from ignition.preparation.triton import prepare_triton
 
-        self._kernels = (() if candidates_prepared else (
-            prepare_triton(_block_candidates, self._block_args, self._grids[0], num_warps=8),
-        )) + (self._prepare_select(),)
+        if self._shortlist_args is not None:
+            self._kernels = (prepare_triton(_shortlist_candidates, self._shortlist_args,
+                                           self._grids[1], num_warps=4), self._prepare_select())
+        else:
+            self._kernels = (() if candidates_prepared else (
+                prepare_triton(_block_candidates, self._block_args, self._grids[0], num_warps=8),
+            )) + (self._prepare_select(),)
         self()
 
     def __call__(self):
         if self._kernels is None:
             raise RuntimeError("draft proposal prepare() must complete before capture")
+        if self._shortlist_args is not None:
+            self._block_args[1].zero_()
         for kernel in self._kernels:
             kernel()
 
@@ -365,7 +409,8 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         return {**PreparedSpeculativeDistributions.scratch_layout(batch, width, vocab),
             "block_max": ((batch, triton.cdiv(vocab, _SCORE_BLOCK)), torch.float32),
             "proposal_candidates": ((batch, triton.cdiv(vocab, BLOCK), DRAFT_CANDIDATES), torch.int64),
-            "proposal_selected": ((batch, DRAFT_CANDIDATES), torch.int64)}
+            "proposal_selected": ((batch, DRAFT_CANDIDATES), torch.int64),
+            "shortlist_candidates": ((batch, 4, DRAFT_CANDIDATES), torch.int64)}
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids, *,
                  seed, offset, sampled, prefix_offset=0, workspace=None):
@@ -386,10 +431,16 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         self._candidate_kernels = None
         self._restore_support = None
 
+    def bind_shortlist(self, ids):
+        """Bind unique IDs covering every logit other than negative infinity."""
+        if self._prepared or self.source_logits is not None:
+            raise RuntimeError("draft shortlist must be bound before preparation without bound logits")
+        self.proposal.bind_shortlist(ids, self.shortlist_candidates)
+
     def bind_logits(self, logits, bias=None):
         """Read strided BF16/FP32 head rows and bias with FP32 addition, without staging logits."""
-        if self._prepared:
-            raise RuntimeError("draft logits must be bound before prepare()")
+        if self._prepared or self.proposal._shortlist_args is not None:
+            raise RuntimeError("draft logits must be bound before preparation without a shortlist")
         shape = (self.logits.shape[0], self.logits.shape[-1])
         if (self.logits.dtype != torch.float32 or logits.shape != shape
                 or logits.device != self.logits.device or logits.dtype not in (torch.bfloat16, torch.float32)

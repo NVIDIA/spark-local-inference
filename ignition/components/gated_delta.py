@@ -73,14 +73,18 @@ class GDNScratch:
 
     @classmethod
     def allocate(cls, tokens: int, device: torch.device, *, world_size=1, hidden_size=2560, buffers=None,
-                 output=None) -> GDNScratch:
+                 output=None, pack_ba=False) -> GDNScratch:
         if type(tokens) is not int or tokens <= 0:
             raise ValueError("GDN token capacity must be positive")
         def zeros(width):
             return (torch.zeros((tokens, width), device=device, dtype=torch.bfloat16) if buffers is None
                     else buffers.zeros((tokens, width), torch.bfloat16))
-        qkvz = zeros(16384 // world_size)
-        ba = zeros(96 // world_size)
+        if pack_ba:
+            packed = zeros(16480 // world_size)
+            qkvz, ba = packed.split((16384 // world_size, 96 // world_size), dim=-1)
+        else:
+            qkvz = zeros(16384 // world_size)
+            ba = zeros(96 // world_size)
         convolved, recurrence, gated = (
             zeros(width)
             for width in (10240 // world_size, 6144 // world_size, 6144 // world_size))
@@ -196,8 +200,11 @@ class PreparedGDN:
             raise ValueError("prepared GDN requires CUDA")
         widths = tuple(width if index == 7 else width // world_size for index, width in
                        enumerate((10240, 10240, 6144, 48, 48, 6144, 6144, module.hidden_size, 16384, 96)))
-        strides = tuple(stride if index == 7 else stride // world_size for index, stride in
-                        enumerate((16384, 10240, 16384, 96, 96, 6144, 6144, module.hidden_size, 16384, 96)))
+        qkvz_stride, ba_stride = scratch.projected_qkvz.stride(0), scratch.projected_ba.stride(0)
+        if qkvz_stride < 16384 // world_size or ba_stride < 96 // world_size:
+            raise ValueError("GDN projection row strides must cover their complete outputs")
+        strides = (qkvz_stride, 10240 // world_size, qkvz_stride, ba_stride, ba_stride,
+                   6144 // world_size, 6144 // world_size, module.hidden_size, qkvz_stride, ba_stride)
         # Projection operands; the chunked-prefill buffers are validated where they are used.
         projected = [field for field in fields(scratch) if not field.name.startswith("prefill_")]
         for field, width, stride in zip(projected, widths, strides, strict=True):
@@ -255,9 +262,12 @@ class PreparedGDN:
             raise ValueError(
                 "GDN preparation requires zero live token and sequence counts"
             )
+        self.fused_qkvzba = "in_proj_qkvzba" in projections
         self.fused_qkvz = "in_proj_qkvz" in projections
-        expected = ({"in_proj_qkvz"} if self.fused_qkvz else {"in_proj_qkv", "in_proj_z"})
-        expected |= {"in_proj_ba", "out_proj"}
+        expected = ({"in_proj_qkvzba"} if self.fused_qkvzba else
+                    {"in_proj_qkvz", "in_proj_ba"} if self.fused_qkvz else
+                    {"in_proj_qkv", "in_proj_z", "in_proj_ba"})
+        expected.add("out_proj")
         if set(projections) != expected:
             raise ValueError("GDN requires QKV/Z, packed B/A, and output projection weights")
 
@@ -275,13 +285,22 @@ class PreparedGDN:
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(inputs, weight, output, **options)
             return QuantizedProjection(inputs, weight, output, activation_mode="auto",
+                                       allow_bf16_atomic_reduction=False if key == "in_proj_qkvzba" else None,
                                        workspace=projection_workspace, encoded=self.output_encoding if key == "out_proj" else None, **options)
 
         if prepare_projections:
-            inputs = (("in_proj_qkvz", scratch.projected_qkvz),) if self.fused_qkvz else (
-                ("in_proj_qkv", scratch.projected_qkv), ("in_proj_z", scratch.z))
-            self.projections = {key: projection(key, source, output)
-                                for key, output in (*inputs, ("in_proj_ba", scratch.projected_ba))}
+            if self.fused_qkvzba:
+                width = 16480 // world_size
+                if (qkvz_stride != width or ba_stride != width
+                        or scratch.projected_ba.data_ptr() != scratch.projected_qkvz.data_ptr() + 2 * 16384 // world_size):
+                    raise ValueError("combined GDN projection requires adjacent QKV/Z and B/A column views")
+                packed = scratch.projected_qkvz.as_strided((self.tokens, width), (width, 1))
+                inputs = (("in_proj_qkvzba", packed),)
+            else:
+                inputs = (("in_proj_qkvz", scratch.projected_qkvz),) if self.fused_qkvz else (
+                    ("in_proj_qkv", scratch.projected_qkv), ("in_proj_z", scratch.z))
+                inputs = (*inputs, ("in_proj_ba", scratch.projected_ba))
+            self.projections = {key: projection(key, source, output) for key, output in inputs}
             self.projections["out_proj"] = projection("out_proj", scratch.gated, scratch.output)
             self.parallel_projections = None
             if (self.fused_qkvz and mode == "decode" and self.tokens <= 16
@@ -329,17 +348,22 @@ class PreparedGDN:
             conv_caps,
             invocation=short_conv.invocation_from_tensors(**conv_args),
         )
-        self.conv_binding = prepare_sequence_binding(
-            self.conv_plan,
-            conv_args,
-            session=session,
-            name=f"{name}.short_conv",
-            public_bind=short_conv.bind,
-            bind_plan=True,
-            workspace=workspace,
-            mode=mode,
-            set_binding=lambda binding: setattr(self, "conv_binding", binding),
-        )
+        fused_convolution = mode == "decode" and records is not None and metadata.state_indices.shape[1] > 1
+        self.conv_binding = None
+        if fused_convolution:
+            self.conv_plan = None
+        else:
+            self.conv_binding = prepare_sequence_binding(
+                self.conv_plan,
+                conv_args,
+                session=session,
+                name=f"{name}.short_conv",
+                public_bind=short_conv.bind,
+                bind_plan=True,
+                workspace=workspace,
+                mode=mode,
+                set_binding=lambda binding: setattr(self, "conv_binding", binding),
+            )
         common = {
             "A_log": module.A_log,
             "dt_bias": module.dt_bias,
@@ -359,7 +383,8 @@ class PreparedGDN:
             self.recovered = PreparedRecoveredRecurrence(
                 mixed_qkv=scratch.convolved_qkv, a=scratch.a, b=scratch.b, A_log=module.A_log,
                 dt_bias=module.dt_bias, state=state.recurrent, metadata=metadata, output=scratch.recurrence,
-                records=records, key_heads=self.key_heads, value_heads=self.value_heads)
+                records=records, key_heads=self.key_heads, value_heads=self.value_heads,
+                convolution=conv_args if fused_convolution else None)
         elif mode == "decode":
             caps = gdn_decode.Caps(
                 device=self.device,
@@ -453,7 +478,9 @@ class PreparedGDN:
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
         scratch = self.scratch
-        if self.parallel_projections is None:
+        if self.fused_qkvzba:
+            self.projections["in_proj_qkvzba"](source)
+        elif self.parallel_projections is None:
             if self.fused_qkvz:
                 self.projections["in_proj_qkvz"](source)
             else:
@@ -474,7 +501,8 @@ class PreparedGDN:
 
     def run_sequence(self):
         scratch = self.scratch
-        short_conv.run(self.conv_binding)
+        if self.conv_binding is not None:
+            short_conv.run(self.conv_binding)
         if self.recovered is not None:
             self.recovered()
             self.output_norm()

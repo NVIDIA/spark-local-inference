@@ -10,8 +10,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("tokens", [8, 16, 32, 64])
+@pytest.mark.parametrize("packed", [False, True])
 @torch.no_grad()
-def test_strided_attention_gate_preserves_rounding_and_captured_storage(tokens):
+def test_strided_attention_gate_preserves_rounding_and_captured_storage(tokens, packed):
     from b12x.preparation import PreparationSession
     from ignition.components.head_gate import PreparedHeadGate
     from ignition.preparation.scratch import GraphBufferPool
@@ -19,17 +20,17 @@ def test_strided_attention_gate_preserves_rounding_and_captured_storage(tokens):
     pool = GraphBufferPool("cuda", chunk_bytes=2 << 20)
     buffers = pool.cursor()
     before = buffers.zeros((1024,), torch.bfloat16)
-    qg = buffers.zeros((tokens, 24, 512), torch.bfloat16)
+    qg = buffers.zeros((tokens, 14336) if packed else (tokens, 24, 512), torch.bfloat16)
     values = buffers.zeros((tokens, 24, 256), torch.bfloat16)
     after = buffers.zeros((1024,), torch.bfloat16)
     before.fill_(17)
     after.fill_(-19)
-    gate = qg[..., 256:]
-    flat_gate = gate.view(tokens * 24, 256)
-    assert flat_gate.stride() == (512, 1)
+    gate = qg[:, 6144:12288].view(tokens, 24, 256) if packed else qg[..., 256:]
+    flat_gate = gate.view(tokens, 6144) if packed else gate.view(tokens * 24, 256)
+    assert flat_gate.stride() == ((14336, 1) if packed else (512, 1))
     assert flat_gate.data_ptr() == gate.data_ptr()
     with PreparationSession(device="cuda", autotune=False) as session:
-        operation = PreparedHeadGate(values.view(tokens * 24, 256, 1), flat_gate,
+        operation = PreparedHeadGate(values.view(tokens, 6144, 1) if packed else values.view(tokens * 24, 256, 1), flat_gate,
                                      session=session, name="attention.output_gate")
         compiled = torch.compile(operation, fullgraph=True)
         compiled()
