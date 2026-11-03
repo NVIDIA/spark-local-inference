@@ -120,7 +120,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         for field in fields:
             if field not in buffers:
                 shape = (1,) if field in ("vision_slot", "vision_generation", "vision_feature_slot", "prefill_row") else (capacity,)
-                dtype = torch.int32 if field == "speculative_prefix_limits" else torch.int64
+                dtype = torch.int32 if field in ("speculative_prefix_limits", "prefill_row") else torch.int64
                 buffers[field] = torch.zeros(shape, dtype=dtype)
         name = f"{kind}-{batch}-{width}-{packed}-{enabled}"
         signatures[name] = GraphSignature(kind, batch, width, tuple(fields),

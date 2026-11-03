@@ -15,7 +15,7 @@ import torch
 from ignition.components.sampling import _completion_fields
 
 
-@pytest.mark.parametrize("fields", [24, 29, 32, 48])
+@pytest.mark.parametrize("fields", [17, 24, 29, 32, 48])
 def test_completion_shape_contract(fields):
     assert _completion_fields(torch.zeros(2, 4, fields, dtype=torch.int64), torch.device("cpu")) == fields
 
@@ -27,7 +27,7 @@ def test_completion_shape_rejects_malformed_records(shape, dtype):
         _completion_fields(torch.zeros(shape, dtype=dtype), torch.device("cpu"))
 
 
-@pytest.mark.parametrize("fields", [24, 29, 32, 48])
+@pytest.mark.parametrize("fields", [17, 24, 29, 32, 48])
 def test_actual_completion_kernels_with_cpu_interpreter(fields):
     env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(fields)],
@@ -36,7 +36,7 @@ def test_actual_completion_kernels_with_cpu_interpreter(fields):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA device")
-@pytest.mark.parametrize("fields", [24, 29, 32, 48])
+@pytest.mark.parametrize("fields", [17, 24, 29, 32, 48])
 def test_actual_completion_kernels_cuda(fields):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"
     _kernel_cases(fields, "cuda")
