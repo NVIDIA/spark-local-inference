@@ -107,6 +107,8 @@ struct HttpState {
     max_body_bytes: usize,
     frontend_capacity: usize,
     ingress_capacity: usize,
+    /// Keeps request and tool-call IDs unique across restarts and hosts.
+    run: u64,
     ids: AtomicU64,
     api_key: Option<String>,
     thinking_token_budget: Option<u32>,
@@ -115,6 +117,12 @@ struct HttpState {
     started: Instant,
     generated: Mutex<VecDeque<(Instant, u64)>>,
 }
+/// Distinguishes one server start from another; the standard hasher's keys are random.
+fn run_id() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(0u8)
+}
+
 impl HttpState {
     /// Records the generated-token counter, retaining one sample at or before the window start.
     fn sample_generated(&self) {
@@ -224,6 +232,7 @@ impl Server {
             max_body_bytes: config.max_body_bytes,
             frontend_capacity: config.frontend_workers,
             ingress_capacity,
+            run: run_id(),
             ids: AtomicU64::new(1),
             api_key: config.api_key.clone(),
             thinking_token_budget: config.thinking_token_budget,

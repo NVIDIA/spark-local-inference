@@ -3504,6 +3504,7 @@ fn http_state_for(
         max_body_bytes: 65536,
         frontend_capacity: 1,
         ingress_capacity: 4,
+        run: crate::server::run_id(),
         ids: Default::default(),
         api_key,
         thinking_token_budget: None,
@@ -3723,6 +3724,24 @@ async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_t
     assert!(!body.contains("[DONE]"), "{body}");
     assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
     assert!(incoming.iter().all(|i| i.cancelled.load(Ordering::Acquire)));
+}
+
+#[tokio::test]
+async fn request_ids_differ_across_server_starts() {
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 4, "stream": true,
+        });
+        let (response, _incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        ids.push(response.headers()["x-request-id"].to_str().unwrap().to_owned());
+    }
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[tokio::test]
