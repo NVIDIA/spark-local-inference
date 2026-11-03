@@ -419,49 +419,70 @@ def test_transient_retention_reuses_retained_physical_backing(mailbox_storage):
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                     reason="requires an explicitly assigned CUDA device")
-def test_transient_mapping_inventory_records_full_pooled_extent(mailbox_storage):
-    import ctypes as C
+def test_transient_retention_preserves_live_segment_extents(mailbox_storage):
+    import gc
     import torch
 
     storage = mailbox_storage
-    allocate = storage.library.flare_package_transient_allocate
-    allocate.argtypes = [C.c_size_t, C.c_int, C.c_void_p]
-    allocate.restype = C.c_void_p
-    transient_free = storage.library.flare_package_transient_free
-    transient_free.argtypes = [C.c_void_p, C.c_size_t, C.c_int, C.c_void_p]
-    transient_free.restype = None
-
-    segment_size = 16 << 20
-    smaller_size = segment_size // 2
-    value = C.c_ubyte()
-    free_before = torch.cuda.mem_get_info()[0]
+    larger_size = 32 << 20
+    smaller_size = (16 << 20) - 1
     with storage.retain_transient_backing():
-        first = allocate(segment_size, storage.device, None)
-        assert first is not None
-        assert storage.mappings[first].nbytes == segment_size
-        transient_free(first, segment_size, storage.device, None)
-
-        second = allocate(smaller_size, storage.device, None)
-        assert second is not None
-        assert storage.mappings[second].nbytes == segment_size
-        storage.cuda.call("cuMemsetD8_v2", C.c_uint64(second), C.c_ubyte(19),
-                          C.c_size_t(smaller_size))
-        storage.cuda.call("cuMemcpyDtoH_v2", C.byref(value), C.c_uint64(second),
-                          C.c_size_t(1))
-        assert value.value == 19
+        with storage.transient():
+            temporary = torch.empty(larger_size, dtype=torch.uint8, device="cuda")
+            larger_address = temporary.data_ptr()
+            larger_segment, = (segment for segment in torch.cuda.memory_snapshot()
+                               if segment["address"] == larger_address)
+            larger_extent = larger_segment["total_size"]
+            assert storage.mappings[larger_address].nbytes == larger_extent
+            del temporary
+        with storage.transient():
+            live = torch.full((smaller_size,), 19, dtype=torch.uint8, device="cuda")
+            live_address = live.data_ptr()
+            live_segment, = (segment for segment in torch.cuda.memory_snapshot()
+                             if segment["address"] == live_address)
+            live_extent = live_segment["total_size"]
+            assert live_extent < larger_extent
+            assert live_address != larger_address
+            assert storage.mappings[live_address].nbytes == live_extent
         snapshot = storage._snapshot()
         assert snapshot["retained_handles"] == 1
-        assert snapshot["retained_reusable_handles"] == 0
-        transient_free(second, smaller_size, storage.device, None)
+        assert snapshot["retained_reusable_handles"] == 1
+        assert snapshot["retained_reusable_bytes"] == larger_extent
+        with storage.transient():
+            temporary = torch.empty(larger_size, dtype=torch.uint8, device="cuda")
+            assert temporary.data_ptr() == larger_address
+            assert storage.mappings[larger_address].nbytes == larger_extent
+            del temporary
         snapshot = storage._snapshot()
         assert snapshot["retained_handles"] == 2
         assert snapshot["retained_reusable_handles"] == 1
-        assert snapshot["retained_reusable_bytes"] == segment_size
-        assert free_before - torch.cuda.mem_get_info()[0] < segment_size + storage.granularity
+        assert snapshot["retained_reusable_bytes"] == larger_extent
     snapshot = storage._snapshot()
     assert snapshot["retained_handles"] == 0
     assert snapshot["retained_reference_bytes"] == 0
-    assert torch.cuda.mem_get_info()[0] >= free_before - storage.granularity
+    assert larger_address not in storage.mappings
+    assert storage.mappings[live_address].nbytes == live_extent
+    block, = (block for block in live_segment["blocks"] if block["address"] == live_address)
+    assert block["requested_size"] == live.nbytes < block["size"]
+    padding = (live_address + live.nbytes, live_address + block["size"])
+    assert padding in storage.unused_ranges()
+    assert torch.all(live == 19)
+    output = torch.empty_like(live)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, pool=storage.graph_pool.id):
+            output.copy_(live)
+        for value in (19, 37):
+            live.fill_(value)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.all(output == value)
+    finally:
+        graph.reset()
+    del live, output
+    gc.collect()
+    torch.cuda.empty_cache()
+    assert live_address not in storage.mappings
     assert storage.error is None
 
 

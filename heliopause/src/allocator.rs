@@ -143,12 +143,11 @@ struct RetainedMappingPool {
 
 impl RetainedMappingPool {
     fn take(&mut self, size: usize) -> Option<RetainedMapping> {
-        let mapping_size = self.mappings.range(size..).next().map(|(&size, _)| size)?;
-        let mappings = self.mappings.get_mut(&mapping_size)?;
+        let mappings = self.mappings.get_mut(&size)?;
         debug_assert!(!mappings.is_empty());
         let mapping = mappings.pop()?;
         if mappings.is_empty() {
-            self.mappings.remove(&mapping_size);
+            self.mappings.remove(&size);
         }
         Some(mapping)
     }
@@ -246,8 +245,10 @@ fn properties(device: i32, gpudirect: bool) -> AllocationProperties {
 }
 
 fn failure(error: impl ToString) {
-    *ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(CString::new(error.to_string().replace('\0', " ")).unwrap());
+    ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| CString::new(error.to_string().replace('\0', " ")).unwrap());
 }
 
 #[unsafe(no_mangle)]
@@ -607,6 +608,22 @@ mod tests {
 
     // Tests that install the global arena must not interleave with each other.
     static ARENA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn failure_preserves_first_fatal_allocator_error() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        failure("first allocator failure");
+        failure("secondary allocator failure");
+        let recorded = ERROR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .unwrap();
+        assert_eq!(recorded.to_str().unwrap(), "first allocator failure");
+    }
 
     #[test]
     fn secondary_aborted_free_preserves_first_driver_error() {
@@ -973,25 +990,45 @@ mod tests {
     }
 
     #[test]
-    fn retained_mapping_pool_uses_smallest_fit() {
+    fn retained_mapping_pool_requires_exact_size() {
         let mut pool = RetainedMappingPool::default();
         pool.insert(RetainedMapping {
             address: 0x100,
             size: 4096,
         });
         pool.insert(RetainedMapping {
+            address: 0x180,
+            size: 4096,
+        });
+        pool.insert(RetainedMapping {
             address: 0x200,
             size: 8192,
         });
-        assert_eq!(pool.len(), 2);
-        assert_eq!(pool.bytes(), 12288);
+        pool.insert(RetainedMapping {
+            address: 0x300,
+            size: 16384,
+        });
+        assert_eq!(pool.len(), 4);
+        assert_eq!(pool.bytes(), 32768);
+        for size in [2048, 6144, 12288, 32768] {
+            assert!(pool.take(size).is_none());
+            assert_eq!(pool.len(), 4);
+            assert_eq!(pool.bytes(), 32768);
+        }
         let popped = pool.pop().unwrap();
-        assert_eq!((popped.address, popped.size), (0x100, 4096));
+        assert_eq!((popped.address, popped.size), (0x180, 4096));
         pool.insert(popped);
-        let first = pool.take(2048).unwrap();
-        assert_eq!((first.address, first.size), (0x100, 4096));
+        let first = pool.take(4096).unwrap();
+        assert_eq!((first.address, first.size), (0x180, 4096));
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.bytes(), 28672);
         let second = pool.take(4096).unwrap();
-        assert_eq!((second.address, second.size), (0x200, 8192));
+        assert_eq!((second.address, second.size), (0x100, 4096));
+        assert!(pool.take(4096).is_none());
+        let larger = pool.take(8192).unwrap();
+        assert_eq!((larger.address, larger.size), (0x200, 8192));
+        let largest = pool.take(16384).unwrap();
+        assert_eq!((largest.address, largest.size), (0x300, 16384));
         assert_eq!(pool.len(), 0);
         assert_eq!(pool.bytes(), 0);
         assert!(pool.take(4096).is_none());
@@ -1003,6 +1040,89 @@ mod tests {
 
     unsafe extern "C" fn abort_test_release(_handle: u64) -> i32 {
         panic!("driver release called after abort");
+    }
+
+    unsafe extern "C" fn failing_retain(_handle: *mut u64, _pointer: *mut c_void) -> i32 {
+        715
+    }
+
+    #[test]
+    fn transient_allocation_after_abort_preserves_first_driver_error() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Ok(mut driver) = Driver::load() else {
+            return;
+        };
+        driver.physical_retain = failing_retain;
+        driver.unmap = abort_test_unmap;
+        driver.physical_release = abort_test_release;
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.retain(4096, || Ok(7)).unwrap();
+        let mut retained_mappings = RetainedMappingPool::default();
+        retained_mappings.insert(RetainedMapping {
+            address: 0x10000,
+            size: 4096,
+        });
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
+            *arena = Some(Arena {
+                driver,
+                device: 0,
+                granularity: 4096,
+                gpudirect: false,
+                host_base: 0,
+                free: Vec::new(),
+                mappings: BTreeMap::new(),
+                retained,
+                retained_mappings,
+            });
+        }
+        let pointer = flare_package_transient_allocate(4095, 0, null_mut());
+        assert_eq!(pointer as u64, 0x10000);
+        flare_package_transient_free(pointer, 4095, 0, null_mut());
+        let first = ERROR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap();
+        assert!(
+            first
+                .to_str()
+                .unwrap()
+                .contains("cuMemRetainAllocationHandle")
+        );
+        assert!(first.to_str().unwrap().contains("715"));
+        assert!(
+            first
+                .to_str()
+                .unwrap()
+                .contains("retained reference bytes=4096, handles=1")
+        );
+
+        assert!(flare_package_transient_allocate(4095, 0, null_mut()).is_null());
+        let after_allocate = ERROR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(flare_package_retention_finish(), -1);
+        let after_finish = ERROR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
+            let allocator = arena.as_ref().unwrap();
+            assert!(allocator.retained.aborted);
+            assert_eq!(allocator.mappings.get(&0x10000), Some(&4096));
+            assert!(allocator.retained_mappings.mappings.is_empty());
+            assert_eq!(allocator.retained.handles, vec![(7, 4096)]);
+            *arena = None;
+        }
+        assert_eq!(after_allocate.as_ref(), Some(&first));
+        assert_eq!(after_finish.as_ref(), Some(&first));
     }
 
     #[test]
