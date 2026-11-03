@@ -305,8 +305,8 @@ pub(super) async fn generate(
         Protocol::Responses => "resp",
     };
     let id = format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
+        "{prefix}-{:016x}-{}",
+        state.run,
         state.ids.fetch_add(1, Ordering::Relaxed)
     );
     let submitted = if prompts.is_empty() {
