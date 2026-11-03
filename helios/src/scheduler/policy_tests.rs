@@ -3871,3 +3871,26 @@ fn sixteen_wide_round_commits_fifteen_drafts_and_respects_output_limit() {
         assert_eq!(s.request(handle).unwrap().generated_tokens, (remaining + 1) as u32);
     }
 }
+
+#[test]
+fn fixed_host_prefixes_preserve_lengths_above_255() {
+    let fixture = engine(1, false);
+    let mut capabilities = fixture.capabilities.clone();
+    capabilities.completion_token_capacity = 257;
+    let mut scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
+    scheduler.enable_speculation(&[1, 257]).unwrap();
+    scheduler.fixed_speculative_width(Some(257)).unwrap();
+    let graphs = vec![crate::execution::GraphDescriptor {
+        tuned_bindings: vec![], confidence_width: 0, name: "speculative-b1-d256-w257-p257".into(),
+        kind: GraphKind::Speculative, sampling_mode: SamplingMode::General, draft_tokens: 256,
+        handle: 1, batch_capacity: 1, token_capacity: 257, packed_token_capacity: 257,
+        prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![],
+    }];
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let handles = fixed_host_requests(&mut scheduler, &[257]);
+    let plan = scheduler.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Speculative);
+    assert_eq!(plan.lanes[0].request, handles[0]);
+    assert_eq!(plan.lanes[0].tokens, 257);
+    assert_eq!(plan.token_capacity, 257);
+}

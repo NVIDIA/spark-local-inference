@@ -3304,7 +3304,7 @@ fn package_capacity_bounds_catalog_and_request_profiles() {
         let fixture = scheduler(1, 32, 4);
         let mut capabilities = fixture.capabilities.clone();
         capabilities.completion_token_capacity = capacity;
-        let mut scheduler = RequestScheduler::new(fixture.limits.clone(), capabilities).unwrap();
+        let mut scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
         scheduler.enable_speculation(&[1, capacity]).unwrap();
         assert!(scheduler.enable_speculation(&[1, capacity + 1]).is_err());
         assert_eq!(scheduler.forecasts.population.len(), capacity - 1);
