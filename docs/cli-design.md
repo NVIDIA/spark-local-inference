@@ -213,7 +213,7 @@ other recipes fail explicitly.
 | `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
 | `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
-| `--verify-width N` | Target tokens per request, including the pending token; eight normally, or `8,13,16` with `--speculation-study` | `8` |
+| `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
 | `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
 | `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
@@ -232,6 +232,19 @@ The prepared request capacity is the largest selected batch. JSON distinguishes
 that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
+
+For fifteen drafts plus the pending token, select `--mtp-draft-tokens 15` or
+`--verify-width 16`. Specifying both requires matching values. This measures the
+native width-sixteen graph, including verification, commit, and completion
+publication, with package-defined ABI 6 completion capacity:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --gpus 0 \
+  --batches 1 --max-concurrency 1 --contexts 4096 \
+  --mtp-draft-tokens 15 --verify-width 16 --speculative-token-capacity 16 \
+  --online-mxfp8 --draft-head-quantization mxfp8 \
+  --output /tmp/qwen38-depth15-rounds.json
+```
 
 With `--speculation-study`, batches and concurrency must be one; the default
 context is 8192. Widths 8, 13, and 16 prepare respectively 7, 12, and 15 drafts.

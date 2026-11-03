@@ -29,6 +29,27 @@ def test_complete_rounds_and_context_backing():
     assert selection.physical_pages(128) * 128 > 4 * (16384 + 8)
 
 
+def test_fifteen_draft_native_catalog_and_completion_capacity():
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    selection = BenchmarkSelection(batches=(1,), contexts=(4096,), width=16)
+    original = _plan()
+    plan = replace(original, concurrency=1,
+                   speculation=replace(original.speculation, draft_tokens=15),
+                   benchmark_selection=selection)
+    config = PreparationConfig(max_active=1, speculative_widths=plan.speculation.widths,
+        speculative_token_capacity=16, draft_snapshot=Path("draft"), benchmark_selection=selection)
+    assert config.speculative_round_shapes == ((1, 16, 16),)
+    assert config.decode_tokens == config.decode_samples == config.completion_token_capacity == 16
+    assert selection.required_context == 4128
+    assert selection.physical_pages(128) == 34
+    assert not selection.selected_study_widths
+    with pytest.raises(ValueError, match="width capacities"):
+        replace(config, speculative_widths=(1, 8))
+    with pytest.raises(ValueError, match="token capacity"):
+        replace(config, speculative_token_capacity=8)
+
+
 def test_prefill_catalog_has_exact_chunk_and_prefix_remainder():
     selection = BenchmarkSelection(batches=(1,), contexts=(0, 512, 4608), prefill_chunk=2048)
     assert selection.prefill_capacities(2048) == (512, 2048)

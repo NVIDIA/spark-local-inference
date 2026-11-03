@@ -31,8 +31,8 @@ class BenchmarkSelection:
             raise ValueError("benchmark contexts must be positive multiples of 128, or zero for prefill")
         if self.speculation_study and (self.batches != (1,) or self.prefill_chunk):
             raise ValueError("speculation study requires one request and no prefill timing")
-        if type(self.width) is not int or self.width not in ((8, 13, 16) if self.speculation_study else (8,)):
-            raise ValueError("benchmark verification width must be 8")
+        if type(self.width) is not int or self.width not in ((8, 13, 16) if self.speculation_study else (8, 16)):
+            raise ValueError("benchmark verification width must be 8 or 16 (also 13 for speculation studies)")
 
         if self.study_widths:
             if (not self.speculation_study or not isinstance(self.study_widths, tuple)

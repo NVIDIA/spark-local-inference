@@ -42,7 +42,7 @@ def arguments(parser):
     options.add_argument("--contexts", type=_integers, metavar="LIST",
                          help="preceding consumed tokens, multiples of 128 (default: 512,2048,8192,16384; --prefill: 0)")
     options.add_argument("--verify-width", type=int, metavar="N",
-                         help="target tokens per request including pending token; 8 normally; 8,13,16 with --speculation-study")
+                         help="target tokens per request including pending token: 8 or 16; 8,13,16 with --speculation-study")
     options.add_argument("--warmup", type=int, default=5, metavar="N",
                          help="positive untimed restored replays per case and seed (default: 5)")
     options.add_argument("--repetitions", type=int, default=20, metavar="N",
@@ -88,8 +88,8 @@ class Settings:
             raise UsageError("--verify-width must equal --mtp-draft-tokens + 1")
         if study and (args.prefill or batches != (1,) or width not in (8, 13, 16)):
             raise UsageError("--speculation-study requires --batches 1 and --verify-width 8,13,16 without --prefill")
-        if not args.prefill and not study and width != 8:
-            raise UsageError("ignition bench requires --verify-width 8 and --mtp-draft-tokens 7")
+        if not args.prefill and not study and width not in (8, 16):
+            raise UsageError("ignition bench requires --verify-width 8 or 16 and matching --mtp-draft-tokens 7 or 15")
         if any(value not in (1, 2, 4) for value in batches):
             raise UsageError("--batches must select request counts from 1,2,4")
         if any(value < (0 if args.prefill else 128) or value % 128 for value in contexts):

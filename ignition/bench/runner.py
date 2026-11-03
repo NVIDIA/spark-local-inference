@@ -19,9 +19,9 @@ class BenchmarkCase:
     context_tokens: int
 
     def __post_init__(self):
-        if (self.batch not in (1, 2, 4) or self.width != 8
+        if (self.batch not in (1, 2, 4) or self.width not in (8, 16)
                 or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4, W=8, P=B*W and positive context")
+            raise ValueError("round benchmark requires B=1,2,4, W=8,16, P=B*W and positive context")
 
 
 @dataclass(frozen=True)

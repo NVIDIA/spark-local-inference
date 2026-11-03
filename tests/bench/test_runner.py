@@ -10,6 +10,28 @@ import pytest
 from ignition.bench.runner import BenchmarkCase, prompt_tokens, summarize_case
 
 
+def test_fifteen_draft_round_selects_and_packs_native_graph():
+    from ignition.bench.runner import _round
+    from ignition.direct.scheduler import Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(max_active=1, widths=(1, 8, 16), graphs={
+        ("init", 1, 1): "init1", ("prefill", 1, 512): "prefill512",
+        ("speculative", 1, 8, 8, 7): "round8",
+        ("speculative", 1, 16, 16, 15): "round16"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    member = request(1, [10] * 512, limit=64)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 512, [42], 0)}))
+    step = _round(scheduler, BenchmarkCase(1, 16, 16, 512))
+    assert (step.graph, step.width, step.packed_tokens, step.draft_tokens) == ("round16", 16, 16, 15)
+    assert step.lanes[0].tokens == 16
+    assert uploads(scheduler, step)["query_lengths"][0][0] == 16
+
+
 @pytest.mark.parametrize("context", [0, 128, 1152])
 def test_prefill_step_consumes_exact_chunk_after_prefix(context):
     from copy import deepcopy

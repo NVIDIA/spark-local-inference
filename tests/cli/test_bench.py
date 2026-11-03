@@ -170,13 +170,29 @@ def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys
 
 
 @pytest.mark.parametrize("width", [8, 13, 16])
-def test_speculation_study_requires_explicit_private_mode(width):
+def test_speculation_study_selects_private_mode(width):
     value = settings("--speculation-study", "--verify-width", str(width),
                      "--mtp-draft-tokens", str(width - 1), "--contexts", "8192")
     assert value.speculation_study and value.batches == (1,) and value.width == width
-    if width != 8:
+    if width == 13:
         with pytest.raises(UsageError):
             settings("--verify-width", str(width))
+
+
+@pytest.mark.parametrize("flags", [
+    ("--mtp-draft-tokens", "15"),
+    ("--verify-width", "16"),
+    ("--mtp-draft-tokens", "15", "--verify-width", "16"),
+])
+def test_fifteen_drafts_select_native_rounds(flags):
+    value = settings("--batches", "1", "--contexts", "4096", *flags)
+    assert (value.batches, value.contexts, value.width) == ((1,), (4096,), 16)
+    assert not value.speculation_study and not value.study_widths
+
+
+def test_fifteen_drafts_reject_mismatched_verification_width():
+    with pytest.raises(UsageError, match="must equal"):
+        settings("--mtp-draft-tokens", "15", "--verify-width", "8")
 
 
 @pytest.mark.parametrize("flags", [("--batches", "2"), ("--prefill",), ("--verify-width", "9")])
