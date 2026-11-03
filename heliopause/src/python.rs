@@ -158,6 +158,7 @@ fn current_context() -> PyResult<(usize, i32)> {
 #[pyfunction]
 fn validate_prepared_contract(manifest: &Bound<'_, PyAny>, contract_json: &str) -> PyResult<()> {
     let manifest = execution_manifest(manifest)?;
+    manifest.validate().map_err(|error| PyValueError::new_err(error.to_string()))?;
     let contract: crate::model::PreparedContract = serde_json::from_str(contract_json)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     contract
