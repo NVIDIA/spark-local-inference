@@ -153,6 +153,21 @@ def test_recipe_sampling_ranges_are_optional_and_preserve_defaults():
         defaults.ranges["temperature"] = SamplingRange(0., 2.)
 
 
+@pytest.mark.parametrize("top_k", [-1, 0])
+def test_unfiltered_policy_fixes_filters_and_keeps_other_ranges(top_k):
+    defaults = SamplingDefaults(temperature=1., top_p=1., top_k=top_k, ranges={
+        "top_p": SamplingRange(.95, 1.), "top_k": SamplingRange(-1, 100), "min_p": SamplingRange(0., .1),
+        "temperature": SamplingRange(.5, 1.5), "repetition_penalty": SamplingRange(1., 1.1)})
+    assert defaults.unfiltered().as_dict() == {**defaults.as_dict(), "ranges": {
+        "temperature": {"min": .5, "max": 1.5}, "repetition_penalty": {"min": 1., "max": 1.1}}}
+
+
+@pytest.mark.parametrize("filters", [{"top_p": .95}, {"top_k": 20}, {"min_p": .05}])
+def test_unfiltered_policy_rejects_enabled_filter_defaults(filters):
+    with pytest.raises(ValueError, match="disabled top-k, top-p, and min-p"):
+        SamplingDefaults(**{"temperature": 1., "top_p": 1., "top_k": -1, **filters}).unfiltered()
+
+
 @pytest.mark.parametrize("name,bounds", [
     ("seed", (0, 1)), ("unknown", (0, 1)), ("temperature", (0., 1.)),
     ("temperature", (1.5, 2.)), ("temperature", (2., 1.)),

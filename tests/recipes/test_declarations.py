@@ -379,6 +379,34 @@ def test_deepseek41_recipe_defaults_and_adapter_preserve_packed_gpu_planning(mon
     assert config.packed_verification and config.draft_prefix_selection == "gpu"
 
 
+@pytest.mark.parametrize("vocabulary_parallel", [False, True])
+def test_deepseek41_vocabulary_parallel_export_omits_unsupported_filter_ranges(monkeypatch, tmp_path, vocabulary_parallel):
+    from ignition.cli import _parser, preparation
+    from ignition.cli.config import Configuration
+
+    model = resolve("deepseek-v4.1-flash")
+    args = _parser().parse_args(["export", model.checkpoint.alias,
+                                 *(["--vocabulary-parallel-sampling"] if vocabulary_parallel else [])])
+    config_path = tmp_path / "flare.toml"
+    config_path.write_text("")
+    configuration = Configuration.load(config_path)
+    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency, args.max_concurrency)
+    devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}",
+                                 96 << 30, 95 << 30, (12, 0)) for index in range(4))
+    plan = preparation.derive(configuration, model, preparation.Host(devices, None), gpus="0,1,2,3",
+        concurrency=concurrency, speculation=preparation.speculation(args, model, configuration),
+        image_concurrency=args.image_concurrency, mla_compute_mode=args.mla_compute_mode,
+        expert_scale_compression=args.expert_scale_compression)
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
+                        lambda snapshot, config, prepare, **options: config)
+    config = model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
+    assert config.vocabulary_parallel_sampling is vocabulary_parallel
+    policy = config.sampling_defaults.as_dict()
+    assert (policy["top_p"], policy["top_k"], policy["min_p"]) == (1., -1, 0.)
+    assert policy["ranges"]["repetition_penalty"] == {"min": 1., "max": 1.1}
+    assert policy["ranges"].get("top_p") == (None if vocabulary_parallel else {"min": .95, "max": 1.})
+
+
 @pytest.mark.parametrize("alias,options", [
     ("deepseek-v4-flash", {}),
     ("mimo-v2.6-pro-mopd", {}),

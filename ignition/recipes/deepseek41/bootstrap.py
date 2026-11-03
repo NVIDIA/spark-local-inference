@@ -144,6 +144,7 @@ class PreparationConfig:
                     vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
+        self.sampling_defaults
         drafting = self.dspark and self.draft_tokens > 0
         for name in ("packed_verification",):
             value = getattr(self, name)
@@ -234,6 +235,11 @@ class PreparationConfig:
     @property
     def completion_token_capacity(self):
         return max(self.speculative_widths) if self.dspark else 1
+
+    @property
+    def sampling_defaults(self):
+        # Vocabulary-parallel verification serves only unfiltered target distributions.
+        return RECIPE.sampling_defaults.unfiltered() if self.vocabulary_parallel_sampling else RECIPE.sampling_defaults
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buffers,
@@ -618,7 +624,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(metadata_path, eos_token_ids=[1], prompt_encoder=PromptEncoder.DEEPSEEK_V41,
             image_profile="deepseek_row_major" if vision_state is not None else None),
-        "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
+        "sampling_defaults": config.sampling_defaults.as_dict(), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}

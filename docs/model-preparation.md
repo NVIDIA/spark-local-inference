@@ -720,10 +720,11 @@ disabled. DeepSeek V4.1 requires TP4 for this option; its TP3 gather is unavaila
 The option requires positive learned draft depth and supports BF16 or
 row-scaled FP8 Markov weights; NVFP4 Markov weights are unsupported. Target
 vocabulary weights and logits retain BF16 and FP32 precision. Full softmax and
-greedy targets are supported; top-k, top-p, and min-p filtering must remain
-disabled, as in the recipe's default policy. Raw generation logprobs and grammar
-constraints remain available. Block rejection changes seeded output relative to
-the full-vocabulary serial sampler.
+greedy targets are supported; top-k, top-p, and min-p filtering are not. These
+packages declare no ranges for those filters, so requests use the recipe's
+disabled defaults; DeepSeek V4.1's top-p range is omitted. Raw generation
+logprobs and grammar constraints remain available. Block rejection changes
+seeded output relative to the full-vocabulary serial sampler.
 
 For a TP4, single-request configuration with seven drafts, run:
 

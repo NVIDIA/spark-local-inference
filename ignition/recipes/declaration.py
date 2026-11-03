@@ -65,6 +65,17 @@ class SamplingDefaults:
             result["ranges"] = {name: asdict(bounds) for name, bounds in self.ranges.items()}
         return result
 
+    def unfiltered(self):
+        """Fix top-k, top-p, and min-p at their disabled defaults for samplers without filters.
+
+        An absent range clamps requests to the default, so the package declares
+        only distributions its prepared sampler supports.
+        """
+        if self.top_k > 0 or self.top_p != 1 or self.min_p != 0:
+            raise ValueError("unfiltered sampling requires disabled top-k, top-p, and min-p defaults")
+        return replace(self, ranges={name: bounds for name, bounds in self.ranges.items()
+                                     if name not in ("top_k", "top_p", "min_p")})
+
 
 @dataclass(frozen=True)
 class Checkpoint:

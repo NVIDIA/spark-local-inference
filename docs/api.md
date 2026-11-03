@@ -562,7 +562,10 @@ All recipes default to `min_p=0`, `repetition_penalty=1`, and zero presence and
 frequency penalties. Unspecified filters are disabled and unspecified penalties
 are neutral. Disabled top-k is stored as `-1`; Step 5's recommended `0` has the
 same meaning. Packages exported without ranges continue to fix every distribution
-parameter at their stored defaults, including Qwen presence penalties.
+parameter at their stored defaults, including Qwen presence penalties. DeepSeek
+V4.1 packages exported with `--vocabulary-parallel-sampling` omit the top-p range
+and fix top-p at 1; see
+[DeepSeek V4.1 preparation](model-preparation.md#deepseek-v41-flash).
 
 Native extensions such as `top_k`, `min_p`, repetition penalties, token stops,
 `grammar`, and `chat_template_kwargs` remain available. JSON output formats and
