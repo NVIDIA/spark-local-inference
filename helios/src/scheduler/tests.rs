@@ -1430,7 +1430,7 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
 #[test]
 fn speculative_width_catalog_is_validated() {
     use super::speculation::validate_widths;
-    for bad in [vec![2], vec![1, 17], vec![1, 4, 2]] {
+    for bad in [vec![2], vec![0, 1], vec![1, 1], vec![1, 4, 2]] {
         assert!(validate_widths(&bad).is_err());
     }
 }

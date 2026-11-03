@@ -1568,3 +1568,23 @@ fn sixteen_width_metrics_include_fifteenth_draft() {
     assert!(text.contains("flare_speculative_rounds_total{batch=\"1\",width=\"16\"} 1"));
     assert!(text.contains("flare_speculative_drafts_total{depth=\"15\",source=\"copy\",outcome=\"accepted\"} 1"));
 }
+
+#[cfg(test)]
+#[test]
+fn package_capacity_sizes_metrics_beyond_copy_mask_depth() {
+    for capacity in [8, 13, 16, 32, 65] {
+        let metrics = Metrics::new(0, 0, 0, capacity);
+        let drafts = capacity - 1;
+        let record = CompletionRecord { status: 1,
+            vector: Some(crate::execution::TokenVector {
+                verification_width: capacity as i64, emitted_count: capacity as i64,
+                offered_drafts: drafts as i64, accepted_drafts: drafts as i64,
+                copy_offered_mask: 0, tokens: vec![7; capacity], ..Default::default()
+            }), ..Default::default() };
+        metrics.speculative_completed(1, capacity, drafts, 1000, &[record]);
+        assert_eq!(metrics.speculative[0].len(), capacity);
+        assert_eq!(metrics.draft_sources.len(), drafts);
+        assert_eq!(metrics.draft_sources[drafts - 1][0][1].load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.draft_sources[drafts - 1][1][1].load(Ordering::Relaxed), 0);
+    }
+}
