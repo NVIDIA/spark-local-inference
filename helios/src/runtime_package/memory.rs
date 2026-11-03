@@ -528,7 +528,8 @@ impl NativeModel {
                         package,
                         contract.cache.page_tokens as u64,
                         (active as u64).checked_mul(width).and_then(|rows| rows.checked_add(1))
-                            .ok_or_else(|| invalid("cache execution row capacity overflows"))?,
+                            .filter(|&rows| rows < u32::MAX as u64)
+                            .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?,
                         1,
                     )
                 })

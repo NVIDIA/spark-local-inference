@@ -490,11 +490,11 @@ fn proposal_confidence_validates_each_rank_without_changing_root_values() {
     agree(&root, &peer).unwrap();
     assert_eq!(root.proposal_confidence, authoritative);
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.000001, 1.000001] {
-        root.proposal_confidence = authoritative;
-        peer.proposal_confidence = authoritative;
+        root.proposal_confidence = authoritative.clone();
+        peer.proposal_confidence = authoritative.clone();
         root.proposal_confidence.as_mut().unwrap()[1][2] = invalid;
         assert!(agree(&root, &peer).is_err());
-        root.proposal_confidence = authoritative;
+        root.proposal_confidence = authoritative.clone();
         peer.proposal_confidence.as_mut().unwrap()[1][2] = invalid;
         assert!(agree(&root, &peer).is_err());
     }

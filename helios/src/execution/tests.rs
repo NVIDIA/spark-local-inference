@@ -1082,7 +1082,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
     let mut root = FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
         records: vec![active.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     root.records[3].status = 0;
-    let mut peer_records = root.records;
+    let mut peer_records = root.records.clone();
     peer_records[3].generated_tokens = 17;
     peer_records[3].token_id = 400;
     peer_records[3].vector.as_mut().unwrap().offered_drafts = 6;

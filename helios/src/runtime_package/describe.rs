@@ -619,6 +619,7 @@ mod tests {
             execution: Some(wire::Execution {
                 tuning_graphs: vec![],
                 abi_version: 9,
+                completion_token_capacity: 0,
                 max_active: 32,
                 input_frame_bytes: 0,
                 buffers: vec![],
