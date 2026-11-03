@@ -169,6 +169,7 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     for value in [
         6,
         manifest.abi_version as usize,
+        manifest.completion_token_capacity,
         manifest.max_active,
         manifest.input_frame_bytes,
         manifest.buffers.len(),
@@ -390,11 +391,11 @@ pub(super) fn completion(value: &FrameCompletion) -> Vec<u8> {
     bytes
 }
 
-pub(super) fn proposal_confidence(reader: &mut Reader<'_>) -> Result<Option<[[f32; crate::execution::MAX_DRAFT_TOKENS]; 64]>> {
+pub(super) fn proposal_confidence(reader: &mut Reader<'_>, slots: usize, token_capacity: usize) -> Result<Option<Vec<Vec<f32>>>> {
     match reader.number()? {
         0 => Ok(None),
         1 => {
-            let mut rows = [[0.0; crate::execution::MAX_DRAFT_TOKENS]; 64];
+            let mut rows = vec![vec![0.0; token_capacity - 1]; slots];
             for value in rows.iter_mut().flatten() {
                 *value = f32::from_le_bytes(reader.bytes(4)?.try_into().unwrap());
             }
@@ -404,11 +405,11 @@ pub(super) fn proposal_confidence(reader: &mut Reader<'_>) -> Result<Option<[[f3
     }
 }
 
-pub(super) fn speculative_survival(reader: &mut Reader<'_>) -> Result<Option<[[f32; crate::execution::MAX_DRAFT_TOKENS]; 64]>> {
+pub(super) fn speculative_survival(reader: &mut Reader<'_>, slots: usize, token_capacity: usize) -> Result<Option<Vec<Vec<f32>>>> {
     match reader.number()? {
         0 => Ok(None),
         1 => {
-            let mut rows = [[-1.0; crate::execution::MAX_DRAFT_TOKENS]; 64];
+            let mut rows = vec![vec![-1.0; token_capacity - 1]; slots];
             for value in rows.iter_mut().flatten() {
                 *value = f32::from_le_bytes(reader.bytes(4)?.try_into().unwrap());
             }

@@ -177,7 +177,7 @@ impl Inputs {
                             ValueSource::SamplingParameters => 6,
                             ValueSource::EosTokenIds => 8,
                             ValueSource::LiveStateRows => {
-                                if !(semantics.state_rows_per_request..=crate::execution::MAX_OUTPUT_TOKENS).contains(&width) {
+                                if width < semantics.state_rows_per_request {
                                     return Err("state-row input does not cover the graph storage extent".into());
                                 }
                                 width
@@ -185,7 +185,7 @@ impl Inputs {
                             ValueSource::PromptHistogram => config.contract.vocabulary,
                             ValueSource::GrammarMask => config.contract.vocabulary.div_ceil(32),
                             ValueSource::CopyTokenIds => {
-                                if !(graph.draft_tokens.max(1)..=crate::execution::MAX_DRAFT_TOKENS).contains(&width) {
+                                if width < graph.draft_tokens.max(1) {
                                     return Err("copied-token input does not cover the graph draft extent".into());
                                 }
                                 width
@@ -194,7 +194,7 @@ impl Inputs {
                                 let words = config.contract.vocabulary.div_ceil(32);
                                 let positions = width / words;
                                 let required = if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed) { graph.token_capacity } else { 1 };
-                                if !width.is_multiple_of(words) || !(required..=crate::execution::MAX_OUTPUT_TOKENS).contains(&positions) {
+                                if !width.is_multiple_of(words) || positions < required {
                                     return Err("copy grammar input does not cover the graph verification extent".into());
                                 }
                                 width
@@ -391,7 +391,7 @@ impl Inputs {
         // and graphs without that input may replace its contents.
         self.unconstrained_masks.retain(|(name, _, _)|
             graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
-        let mut history_proposals = [None; REQUEST_LANES];
+        let mut history_proposals: [Option<(Vec<i64>, usize)>; REQUEST_LANES] = std::array::from_fn(|_| None);
         if frame.config.history_drafts
             && frame.config.speculative_proposal_source
                 == crate::scheduler::speculation::ProposalSource::Mtp
@@ -707,7 +707,7 @@ impl Inputs {
                                 "copy proposal is shorter than the verification input".into()
                             );
                         }
-                        let history = history_proposals[row];
+                        let history = history_proposals[row].as_ref();
                         let count = copy
                             .map(|p| p.count)
                             .or_else(|| history.as_ref().map(|(_, n)| *n))
@@ -717,10 +717,14 @@ impl Inputs {
                                 if count > input.width {
                                     return Err("active copied-token proposal exceeds its input extent".into());
                                 }
-                                let tokens = copy.map(|p| p.tokens)
-                                    .or_else(|| history.map(|(t, _)| t))
-                                    .unwrap_or([-1; crate::execution::MAX_DRAFT_TOKENS]);
-                                values.extend_from_slice(&tokens[..input.width]);
+                                let tokens = copy.map(|p| p.tokens.as_slice())
+                                    .or_else(|| history.map(|(t, _)| t.as_slice()))
+                                    .unwrap_or(&[]);
+                                if count > tokens.len() {
+                                    return Err("copied-token proposal exceeds its host storage".into());
+                                }
+                                values.extend_from_slice(&tokens[..count]);
+                                values.resize(values.len() + input.width - count, -1);
                             },
                             CopyTokenCount => values.push(count as i64),
                             CopyConsumedTokens => {

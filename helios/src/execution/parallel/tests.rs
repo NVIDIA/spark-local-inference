@@ -333,7 +333,7 @@ fn completed(status: i64) -> FrameCompletion {
         status,
         error_code: 0,
         reserved: 0,
-        vector: Some(super::super::TokenVector::default()),
+        vector: Some(super::super::TokenVector { tokens: vec![-1; 16], ..Default::default() }),
     };
     FrameCompletion {
         logprobs: None,
@@ -343,7 +343,7 @@ fn completed(status: i64) -> FrameCompletion {
         fence: Fence(3),
         graph_index: 2,
         timing: Default::default(),
-        records: [record; 4].into(),
+        records: vec![record.clone(); 4].into(),
     }
 }
 
@@ -382,9 +382,9 @@ fn completion_wire_preserves_the_execution_abi() {
     assert_eq!(reader.number().unwrap(), 3);
     assert_eq!(reader.number().unwrap(), 2);
     assert_eq!(timing(&mut reader).unwrap(), root.timing);
-    assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
-    assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, super::super::VECTOR_RECORD_FIELDS).unwrap();
+    assert_eq!(proposal_confidence(&mut reader, 4, 16).unwrap(), root.proposal_confidence);
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), root.speculative_survival);
+    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, 32).unwrap();
     for (expected, actual) in root.records.iter().zip(records.iter()) {
         assert_eq!(expected.fields(), actual.fields());
     }
@@ -396,22 +396,23 @@ fn speculative_survival_is_optional_and_validated_per_rank_without_numeric_conse
     for record in root.records.iter_mut() {
         record.vector = Some(crate::execution::TokenVector {
             emitted_count: 1, offered_drafts: 3, accepted_drafts: 0, verification_width: 4,
+            tokens: vec![-1; 16],
             ..Default::default()
         });
     }
-    let mut values = [[-1.; crate::execution::MAX_DRAFT_TOKENS]; 64];
-    values[..4].fill([0.75, 0.5, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.]);
-    root.speculative_survival = Some(values);
+    let mut values = vec![vec![-1.; 15]; 4];
+    values[..4].fill(vec![0.75, 0.5, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.]);
+    root.speculative_survival = Some(values.clone());
     let mut peer = completed(1);
     peer.records = root.records.clone();
     assert!(agree(&root, &peer).is_err());
-    peer.speculative_survival = Some(values);
+    peer.speculative_survival = Some(values.clone());
     peer.speculative_survival.as_mut().unwrap()[1][1] = 0.6;
     agree(&root, &peer).unwrap();
-    assert_eq!(root.speculative_survival, Some(values));
+    assert_eq!(root.speculative_survival, Some(values.clone()));
     for (slot, depth, invalid) in [(0, 0, f32::NAN), (0, 0, 1.1), (0, 0, -0.1),
-        (0, 1, 0.8), (0, 1, -1.), (0, 2, -1.), (0, 3, 0.1), (4, 0, 0.1)] {
-        peer.speculative_survival = Some(values);
+        (0, 1, 0.8), (0, 1, -1.), (0, 2, -1.), (0, 3, 0.1)] {
+        peer.speculative_survival = Some(values.clone());
         peer.speculative_survival.as_mut().unwrap()[slot][depth] = invalid;
         assert!(agree(&root, &peer).is_err(), "slot {slot}, depth {depth}, value {invalid}");
     }
@@ -420,11 +421,11 @@ fn speculative_survival_is_optional_and_validated_per_rank_without_numeric_conse
     reader.number().unwrap();
     reader.number().unwrap();
     timing(&mut reader).unwrap();
-    proposal_confidence(&mut reader).unwrap();
+    proposal_confidence(&mut reader, 4, 16).unwrap();
     let offset = bytes.len() - reader.0.len();
-    assert_eq!(speculative_survival(&mut reader).unwrap(), Some(values));
-    for length in [0, 1, 7, 8, 9, 8 + 64 * 7 * 4 - 1] {
-        assert!(speculative_survival(&mut Reader(&bytes[offset..offset + length])).is_err());
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), Some(values.clone()));
+    for length in [0, 1, 7, 8, 9, 8 + 4 * 15 * 4 - 1] {
+        assert!(speculative_survival(&mut Reader(&bytes[offset..offset + length]), 4, 16).is_err());
     }
 }
 
@@ -451,17 +452,17 @@ fn rank_timing_rejects_truncation_and_preserves_zero_duration() {
 fn rank_completion_requires_every_record() {
     let root = completed(1);
     let mut peer = completed(1);
-    peer.records = [peer.records[0]; 3].into();
+    peer.records = vec![peer.records[0].clone(); 3].into();
     assert!(agree(&root, &peer).is_err());
 }
 
 #[test]
 fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     let mut root = completed(1);
-    root.proposal_confidence = Some([[0.5; crate::execution::MAX_DRAFT_TOKENS]; 64]);
+    root.proposal_confidence = Some(vec![vec![0.5; 15]; 4]);
     let mut peer = completed(1);
     assert!(agree(&root, &peer).is_err());
-    peer.proposal_confidence = root.proposal_confidence;
+    peer.proposal_confidence = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     peer.proposal_confidence.as_mut().unwrap()[3][2] = 0.6;
     agree(&root, &peer).unwrap();
@@ -470,22 +471,22 @@ fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     reader.number().unwrap();
     reader.number().unwrap();
     timing(&mut reader).unwrap();
-    assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
-    assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    assert_eq!(reader.0.len(), 4 * super::super::VECTOR_RECORD_FIELDS * 8);
+    assert_eq!(proposal_confidence(&mut reader, 4, 16).unwrap(), root.proposal_confidence);
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), root.speculative_survival);
+    assert_eq!(reader.0.len(), 4 * 32 * 8);
 }
 
 #[test]
 fn proposal_confidence_validates_each_rank_without_changing_root_values() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.0; crate::execution::MAX_DRAFT_TOKENS]; 64]);
-    peer.proposal_confidence = root.proposal_confidence;
+    root.proposal_confidence = Some(vec![vec![0.0; 15]; 4]);
+    peer.proposal_confidence = root.proposal_confidence.clone();
     root.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79148d);
     peer.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79149e);
     agree(&root, &peer).unwrap();
     peer.proposal_confidence.as_mut().unwrap()[1][2] = 0.973;
-    let authoritative = root.proposal_confidence;
+    let authoritative = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     assert_eq!(root.proposal_confidence, authoritative);
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.000001, 1.000001] {
@@ -503,11 +504,11 @@ fn proposal_confidence_validates_each_rank_without_changing_root_values() {
 fn rank_zero_confidence_is_authoritative_without_relaxing_request_agreement() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.5; crate::execution::MAX_DRAFT_TOKENS]; 64]);
-    peer.proposal_confidence = root.proposal_confidence;
+    root.proposal_confidence = Some(vec![vec![0.5; 15]; 4]);
+    peer.proposal_confidence = root.proposal_confidence.clone();
     root.proposal_confidence.as_mut().unwrap()[2][2] = 0.51028365;
     peer.proposal_confidence.as_mut().unwrap()[2][2] = 0.5102996;
-    let authoritative = root.proposal_confidence;
+    let authoritative = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     assert_eq!(root.proposal_confidence, authoritative);
     peer.records[0].consumed_tokens += 1;

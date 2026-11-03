@@ -9,9 +9,12 @@ use std::collections::{HashMap, HashSet};
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
 pub const ABI_VERSION: u32 = 6;
-pub const VECTOR_RECORD_FIELDS: usize = 32;
-pub const MAX_OUTPUT_TOKENS: usize = 16;
-pub const MAX_DRAFT_TOKENS: usize = MAX_OUTPUT_TOKENS - 1;
+pub const COMPLETION_METADATA_FIELDS: usize = 16;
+pub const DEFAULT_COMPLETION_TOKEN_CAPACITY: usize = 8;
+
+pub fn resolve_completion_token_capacity(value: u32) -> usize {
+    if value == 0 { DEFAULT_COMPLETION_TOKEN_CAPACITY } else { value as usize }
+}
 pub const REQUEST_LANES: usize = 64;
 pub const MAX_TOP_LOGPROBS: usize = 20;
 pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
@@ -236,6 +239,7 @@ pub struct ExecutionManifest {
     /// Host prefix store resources shared by every rank, present when configured.
     pub offload: Option<crate::offload::Binding>,
     pub abi_version: u32,
+    pub completion_token_capacity: usize,
     pub context: usize,
     pub device: i32,
     pub max_active: usize,
@@ -296,7 +300,7 @@ impl ExecutionManifest {
     }
 
     pub fn completion_fields(&self) -> usize {
-        VECTOR_RECORD_FIELDS
+        COMPLETION_METADATA_FIELDS + self.completion_token_capacity
     }
 
     pub fn request_capacity(&self) -> usize {
@@ -336,7 +340,7 @@ impl ExecutionManifest {
             (None, None) if ids.is_none() && counts.is_none() => Ok(0),
             (Some(output), Some(flags)) => {
                 let fields = output.shape.last().copied().unwrap_or(0);
-                let expected = [2, self.request_capacity(), MAX_OUTPUT_TOKENS, fields];
+                let expected = [2, self.request_capacity(), self.completion_token_capacity, fields];
                 if fields < LOGPROB_PAIR_FIELDS * 2
                     || fields
                         > if ids.is_some() {
@@ -423,6 +427,11 @@ impl ExecutionManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.completion_token_capacity == 0 || self.completion_token_capacity > u32::MAX as usize
+            || self.completion_token_capacity.checked_add(COMPLETION_METADATA_FIELDS)
+                .and_then(|n| n.checked_mul(8 * REQUEST_LANES * 2)).is_none() {
+            return Err("invalid completion token capacity".into());
+        }
         if self.abi_version != ABI_VERSION {
             return Err(Error::execution(
                 ExecutionError::Manifest,
@@ -533,14 +542,14 @@ impl ExecutionManifest {
         self.prompt_logprob_capacity()?;
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
             if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
-                || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI6 and two float32 frames of fifteen prefixes per request slot".into());
+                || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1] {
+                return Err("completion_speculative_survival requires ABI6 and two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
             if buffer.dtype != Dtype::Float32 || buffer.shape.len() != 3
                 || buffer.shape[0] != 2 || buffer.shape[1] != self.request_capacity()
-                || !(1..MAX_OUTPUT_TOKENS).contains(&buffer.shape[2]) {
+                || buffer.shape[2] != self.completion_token_capacity - 1 {
                 return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
             }
         }
@@ -559,7 +568,7 @@ impl ExecutionManifest {
             if graph.kind == GraphKind::Speculative {
                 if graph.packed_token_capacity < graph.batch_capacity
                     || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)
-                    || graph.draft_tokens > MAX_DRAFT_TOKENS
+                    || graph.draft_tokens > self.completion_token_capacity - 1
                     || (graph.token_capacity == 1 && graph.draft_tokens != 0) {
                     return Err("speculative B/D/W/P geometry is invalid".into());
                 }
@@ -575,7 +584,7 @@ impl ExecutionManifest {
                     || confidence.shape[0] != 2
                     || confidence.shape[1] != self.request_capacity()
                     || confidence.shape[2] < graph.confidence_width
-                    || confidence.shape[2] > MAX_OUTPUT_TOKENS - 1 {
+                    || confidence.shape[2] > self.completion_token_capacity - 1 {
                     return Err("confidence output requires [2, request_slots, draft_capacity] float32 frames".into());
                 }
             }
@@ -590,7 +599,7 @@ impl ExecutionManifest {
                     self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && (2..=self.request_capacity()).contains(&graph.batch_capacity)
-                        && (1..=MAX_OUTPUT_TOKENS).contains(&graph.token_capacity)
+                        && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                         && graph.prefill_capacity >= 64
                         && graph.prefill_capacity.is_multiple_of(64)
                         && graph.packed_tokens() <= i32::MAX as usize
@@ -603,7 +612,7 @@ impl ExecutionManifest {
                     self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
-                        && (1..=MAX_OUTPUT_TOKENS).contains(&graph.token_capacity)
+                        && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
                 GraphKind::Prefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1

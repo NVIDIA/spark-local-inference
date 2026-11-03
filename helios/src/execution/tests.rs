@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+const MAX_OUTPUT_TOKENS: usize = 16;
+const MAX_DRAFT_TOKENS: usize = 15;
+const VECTOR_RECORD_FIELDS: usize = 32;
 use super::*;
 
 #[test]
@@ -221,7 +224,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             },
         ],
     };
-    ExecutionManifest { tuning_graphs: vec![],
+    ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![],
         engram: None,
         collectives: None,
         cache: None,
@@ -510,6 +513,7 @@ fn vector_parser_rejects_counts_tails_and_stale_epochs_without_cuda() {
         model_reserved: 65,
         draft_cache_consumed: 66,
         verification_width: 8,
+        tokens: vec![-1; 16],
         ..Default::default()
     };
     vector.tokens[..3].copy_from_slice(&[40, 41, 42]);
@@ -534,11 +538,11 @@ fn vector_parser_rejects_counts_tails_and_stale_epochs_without_cuda() {
         bytes
     };
     assert_eq!(
-        transport::decode_records(&encoded(good), Fence(9), 4, VECTOR_RECORD_FIELDS).unwrap()[0],
+        transport::decode_records(&encoded(good.clone()), Fence(9), 4, VECTOR_RECORD_FIELDS).unwrap()[0],
         good
     );
     for change in 0..8 {
-        let mut row = good;
+        let mut row = good.clone();
         let v = row.vector.as_mut().unwrap();
         match change {
             0 => v.emitted_count = 9,
@@ -932,13 +936,13 @@ fn old_execution_manifests_serve_without_logprob_outputs_and_partial_declaration
 
 #[test]
 fn logprob_readback_uses_only_emitted_positions_and_validates_chosen_ids() {
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[2] = CompletionRecord {
         generation: 9, submission_sequence: 7, consumed_tokens: 3,
         generated_tokens: 2, token_id: 8, status: 1,
         vector: Some(TokenVector {
             emitted_count: 2, offered_drafts: 1, accepted_drafts: 1, verification_width: 2,
-            tokens: [7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], ..Default::default()
+            tokens: vec![7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], ..Default::default()
         }),
         ..Default::default()
     };
@@ -1049,12 +1053,12 @@ fn prompt_catalog_storage_and_bindings_are_validated_together() {
 
 #[test]
 fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
-    let mut vector = TokenVector { verification_width: 6, ..Default::default() };
+    let mut vector = TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() };
     vector.offered_drafts = 1;
     let record = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(vector), ..Default::default() };
     let completion = || FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
-        records: [record; 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
+        records: vec![record.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     for mutation in 0..5 {
         let root = completion(); let mut peer = completion();
         match mutation {
@@ -1073,10 +1077,10 @@ fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
 #[test]
 fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload() {
     let active = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
-        token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, ..Default::default() }),
+        token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() }),
         ..Default::default() };
     let mut root = FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
-        records: [active; 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
+        records: vec![active.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     root.records[3].status = 0;
     let mut peer_records = root.records;
     peer_records[3].generated_tokens = 17;
@@ -1100,9 +1104,11 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
 fn explicit_logprob_decoding_preserves_order_appends_sample_and_honors_pitch() {
     for count in [1, 20, 21, 127, 128] {
         for fields in [2 + 2 * count.max(MAX_TOP_LOGPROBS), LOGPROB_FIELDS] {
-            let mut records = [CompletionRecord::default(); 2];
+            let mut records = vec![CompletionRecord { vector: Some(TokenVector { tokens: vec![-1; 16], ..Default::default() }), ..Default::default() }; 2];
             records[1].status = 1;
             records[1].token_id = 999;
+            records[1].vector.as_mut().unwrap().emitted_count = 1;
+            records[1].vector.as_mut().unwrap().tokens[0] = 999;
             let ids: Vec<u32> = (0..count as u32).rev().collect();
             let selections = [vec![], ids.clone()];
             let mut words = vec![-777i32; 2 * MAX_OUTPUT_TOKENS * fields];
@@ -1260,23 +1266,36 @@ fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
 }
 
 #[test]
-fn sixteen_token_completion_roundtrips_and_rejects_previous_layout() {
-    for width in [1usize, 8, 16] {
-        let mut tokens = [-1; MAX_OUTPUT_TOKENS];
-        for (position, token) in tokens[..width].iter_mut().enumerate() { *token = 100 + position as i64; }
-        let record = CompletionRecord { generation: 1, submission_sequence: 2, consumed_tokens: width as i64,
-            generated_tokens: width as i64, token_id: tokens[width - 1], status: 1,
-            vector: Some(TokenVector { emitted_count: width as i64, offered_drafts: width as i64 - 1,
-                accepted_drafts: width as i64 - 1, copy_offered_mask: (1 << (width - 1)) - 1,
-                verification_width: width as i64, tokens, ..Default::default() }), ..Default::default() };
+fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
+    for capacity in [1usize, 8, 16, 33, 65] {
+        let tokens: Vec<_> = (0..capacity).map(|i| 100 + i as i64).collect();
+        let record = CompletionRecord { generation: 1, submission_sequence: 2, consumed_tokens: capacity as i64,
+            generated_tokens: capacity as i64, token_id: *tokens.last().unwrap(), status: 1,
+            vector: Some(TokenVector { emitted_count: capacity as i64, offered_drafts: capacity as i64 - 1,
+                accepted_drafts: capacity as i64 - 1, copy_offered_mask: 0,
+                verification_width: capacity as i64, tokens, ..Default::default() }), ..Default::default() };
+        let fields = COMPLETION_METADATA_FIELDS + capacity;
         let bytes: Vec<_> = record.fields().into_iter().flat_map(i64::to_le_bytes).collect();
-        let decoded = transport::decode_records(&bytes, Fence(2), 1, VECTOR_RECORD_FIELDS).unwrap();
+        let decoded = transport::decode_records(&bytes, Fence(2), 1, fields).unwrap();
         assert_eq!(decoded[0], record);
-        assert!(transport::decode_records(&bytes[..24 * 8], Fence(2), 1, 24).is_err());
+        assert!(transport::decode_records(&bytes[..bytes.len() - 8], Fence(2), 1, fields).is_err());
         let mut invalid = record;
-        invalid.vector.as_mut().unwrap().verification_width = 17;
+        invalid.vector.as_mut().unwrap().verification_width = capacity as i64 + 1;
         assert!(invalid.validate_vector().is_err());
+        let mut manifest = manifest();
+        manifest.completion_token_capacity = capacity;
+        let output = &mut manifest.buffers[2];
+        output.address = 0x10000;
+        output.shape = vec![2, 4, fields];
+        output.strides = vec![4 * fields, fields, 1];
+        output.nbytes = 2 * 4 * fields * 8;
+        manifest.validate().unwrap();
+        manifest.completion_token_capacity += 1;
+        assert!(manifest.validate().is_err());
     }
+    assert_eq!(resolve_completion_token_capacity(0), 8);
+    assert_eq!(resolve_completion_token_capacity(1), 1);
+    assert_eq!(resolve_completion_token_capacity(65), 65);
     let mut previous = manifest();
     previous.abi_version = 5;
     assert!(previous.validate().unwrap_err().to_string().contains("re-export"));

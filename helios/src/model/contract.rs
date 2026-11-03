@@ -419,7 +419,7 @@ impl PreparedContract {
         }
         let mut names = std::collections::HashSet::new();
         for graph in &self.graphs {
-            if !names.insert(&graph.graph) || !(1..=crate::execution::MAX_OUTPUT_TOKENS).contains(&graph.state_rows_per_request) {
+            if !names.insert(&graph.graph) || graph.state_rows_per_request == 0 {
                 return Err(
                     "duplicate graph contract or invalid continuation-row requirement".into(),
                 );

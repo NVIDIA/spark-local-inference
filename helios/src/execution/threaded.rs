@@ -746,9 +746,9 @@ mod tests {
             };
             root.abi_version = super::super::ABI_VERSION;
             let records = root.buffers.iter_mut().find(|b| b.name == "completion_records").unwrap();
-            records.nbytes = 2 * 4 * super::super::VECTOR_RECORD_FIELDS * 8;
-            records.shape = vec![2, 4, super::super::VECTOR_RECORD_FIELDS];
-            records.strides = vec![4 * super::super::VECTOR_RECORD_FIELDS, super::super::VECTOR_RECORD_FIELDS, 1];
+            records.nbytes = 2 * 4 * 32 * 8;
+            records.shape = vec![2, 4, 32];
+            records.strides = vec![4 * 32, 32, 1];
             root.buffers.push(BufferDescriptor {
                 name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 5 * 4,
                 dtype: Dtype::Float32, shape: vec![2, 4, 5], strides: vec![20, 5, 1],

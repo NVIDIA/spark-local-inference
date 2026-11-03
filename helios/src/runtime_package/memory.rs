@@ -282,19 +282,21 @@ fn capacities(
     if packages.len() != available.len()
         || packages.is_empty()
         || !(1..=64).contains(&active)
-        || !(1..=crate::execution::MAX_OUTPUT_TOKENS as u64).contains(&width)
+        || width == 0
         || page_tokens == 0
     {
         return Err(invalid("invalid cache planning geometry"));
     }
-    let execution = 1 + active * width;
+    let execution = active.checked_mul(width).and_then(|rows| rows.checked_add(1))
+        .filter(|&rows| rows < u32::MAX as u64)
+        .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
     let minimum_pages = page_limit.map_or(active * 8192u64.div_ceil(page_tokens), |limit| {
         limit.minimum
     });
     if minimum_pages == 0 {
         return Err(invalid("KV cache limit leaves no physical pages"));
     }
-    let mut cached = u64::MAX;
+    let mut cached = u32::MAX as u64 - execution;
     let mut maximum_pages = page_limit.map_or(u64::MAX, |limit| limit.maximum);
     for (rank, (package, &budget)) in packages.iter().zip(available).enumerate() {
         let rows: Vec<_> = package
@@ -525,7 +527,8 @@ impl NativeModel {
                     cache_geometry(
                         package,
                         contract.cache.page_tokens as u64,
-                        1 + active as u64 * width,
+                        (active as u64).checked_mul(width).and_then(|rows| rows.checked_add(1))
+                            .ok_or_else(|| invalid("cache execution row capacity overflows"))?,
                         1,
                     )
                 })

@@ -110,6 +110,7 @@ impl LoadOptions {
         if execution.abi_version != crate::execution::ABI_VERSION {
             return Err(invalid("unsupported execution ABI version; re-export the model package"));
         }
+        let completion_token_capacity = crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity);
         let prepared = usize::try_from(execution.max_active)
             .map_err(|_| invalid("prepared concurrency exceeds usize"))?;
         let active = self.max_concurrency.unwrap_or(prepared);
@@ -198,6 +199,9 @@ impl LoadOptions {
             if execution.abi_version != crate::execution::ABI_VERSION {
                 return Err(invalid("unsupported execution ABI version; re-export the model package"));
             }
+            if crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) != completion_token_capacity {
+                return Err(invalid("rank completion token capacities differ"));
+            }
             if execution.max_active != prepared as u64 {
                 return Err(invalid("rank concurrency capacities differ"));
             }
@@ -215,9 +219,9 @@ impl LoadOptions {
                         && graph.prefill_capacity >= 64 && graph.prefill_capacity.is_multiple_of(64)
                         && graph.prefill_capacity <= config["prefill_chunk_size"].as_u64().unwrap_or(0)
                         && graph.speculation_enabled.is_some()
-                        && if speculative { (1..=16).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
+                        && if speculative { (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
                     GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
-                    GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=16).contains(&graph.token_capacity),
+                    GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) as u64).contains(&graph.token_capacity),
                     _ => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && graph.token_capacity == 1,
                 };
                 if !valid || graph.batch_capacity > prepared.next_power_of_two() as u64
@@ -231,7 +235,7 @@ impl LoadOptions {
                     || (kind == GraphKind::Decode && graph.speculation_enabled == Some(true))
                     || if speculative {
                         graph.verify_tokens != Some(graph.token_capacity as u32)
-                            || graph.draft_tokens.is_none_or(|n| n > 15)
+                            || graph.draft_tokens.is_none_or(|n| n as usize >= crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity))
                             || (kind == GraphKind::Speculative && graph.token_capacity == 1 && graph.draft_tokens != Some(0))
                             || ![1, 2].contains(&graph.draft_source)
                     } else {
