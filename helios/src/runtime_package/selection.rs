@@ -107,9 +107,6 @@ impl LoadOptions {
             .first()
             .and_then(|p| p.execution.as_ref())
             .ok_or_else(|| invalid("model package has no serving contract"))?;
-        if execution.abi_version != crate::execution::ABI_VERSION {
-            return Err(invalid("unsupported execution ABI version; re-export the model package"));
-        }
         let completion_token_capacity = crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity);
         let prepared = usize::try_from(execution.max_active)
             .map_err(|_| invalid("prepared concurrency exceeds usize"))?;
@@ -196,9 +193,6 @@ impl LoadOptions {
         let mut rank_tuning_catalog = None;
         for (rank, package) in packages.iter_mut().enumerate() {
             let execution = package.execution.as_mut().ok_or_else(|| invalid("rank lacks serving contract"))?;
-            if execution.abi_version != crate::execution::ABI_VERSION {
-                return Err(invalid("unsupported execution ABI version; re-export the model package"));
-            }
             if crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity) != completion_token_capacity {
                 return Err(invalid("rank completion token capacities differ"));
             }
@@ -1520,14 +1514,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rounds_and_obsolete_abis_reject_before_loading() {
+    fn execution_abi_labels_do_not_reject_package_selection() {
         for rank in [0usize, 1] {
-            for abi in [0, 1, 2, 3, 4, 5, 7] {
+            for abi in [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX] {
                 let mut ranks = [round_package(8, 48, false), round_package(8, 48, false)];
                 ranks[rank].execution.as_mut().unwrap().abi_version = abi;
-                assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string().contains("execution ABI"));
+                LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn malformed_rounds_reject_before_loading() {
         assert!(LoadOptions { mtp_verification_token_budget: Some(24), ..Default::default() }
             .select(&mut [round_package(8, 9, false)], &mut round_config(9)).is_err());
         for mutation in 0..10 {

@@ -184,7 +184,6 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
         6,
-        manifest.abi_version as usize,
         manifest.completion_token_capacity,
         manifest.max_active,
         manifest.input_frame_bytes,

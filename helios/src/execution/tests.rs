@@ -240,15 +240,14 @@ pub(super) fn manifest() -> ExecutionManifest {
 }
 
 #[test]
-fn execution_abi_and_unsupported_sampling_modes_reject_before_cuda() {
-    let mut value = manifest();
-    value.abi_version = 1;
-    assert!(matches!(
-        value.validate().unwrap_err(),
-        Error::Execution(ExecutionError::Manifest(_))
-    ));
-    value.abi_version = ABI_VERSION;
-    value.validate().unwrap();
+fn execution_abi_labels_do_not_reject_valid_layouts() {
+    for abi in [0, 1, 5, 6, 7, u32::MAX] {
+        let mut value = manifest();
+        value.abi_version = abi;
+        value.validate().unwrap();
+        value.buffers[2].shape[2] += 1;
+        assert!(value.validate().is_err());
+    }
     assert!(SamplingMode::try_from("greedy").is_err());
     assert!(SamplingMode::try_from("automatic").is_err());
 }
@@ -490,7 +489,7 @@ fn speculative_requires_vector_storage_and_explicit_target_geometry() {
     invalid.graphs[0].token_capacity = 17;
     assert!(invalid.validate().is_err());
     manifest.abi_version = 3;
-    assert!(manifest.validate().is_err());
+    manifest.validate().unwrap();
 }
 
 #[test]
@@ -1309,7 +1308,7 @@ fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
     assert_eq!(resolve_completion_token_capacity(65), 65);
     let mut previous = manifest();
     previous.abi_version = 5;
-    assert!(previous.validate().unwrap_err().to_string().contains("re-export"));
+    previous.validate().unwrap();
 }
 
 #[test]
@@ -1338,4 +1337,28 @@ fn package_sized_logprobs_and_survival_decode_active_and_padding_rows() {
         invalid[0].push(-1.0);
         assert!(validate_speculative_survival(&invalid, &records).is_err());
     }
+}
+
+#[test]
+fn eight_token_completions_accept_shorter_proposal_confidence() {
+    let mut value = manifest();
+    value.abi_version = 5;
+    value.completion_token_capacity = resolve_completion_token_capacity(0);
+    let output = &mut value.buffers[2];
+    output.shape = vec![2, 4, 24];
+    output.strides = vec![96, 24, 1];
+    output.nbytes = 2 * 4 * 24 * 8;
+    value.graphs[0].kind = GraphKind::Speculative;
+    value.graphs[0].token_capacity = 6;
+    value.graphs[0].draft_tokens = 5;
+    value.graphs[0].packed_token_capacity = 24;
+    value.graphs[0].confidence_width = 5;
+    value.buffers.push(BufferDescriptor { name: "proposal_confidence".into(),
+        address: 0x20000, nbytes: 2 * 4 * 5 * 4, dtype: Dtype::Float32,
+        shape: vec![2, 4, 5], strides: vec![20, 5, 1] });
+    value.validate().unwrap();
+    value.graphs[0].confidence_width = 6;
+    value.graphs[0].draft_tokens = 6;
+    value.graphs[0].token_capacity = 7;
+    assert!(value.validate().is_err());
 }

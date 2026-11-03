@@ -278,13 +278,6 @@ impl Package {
         if self.allocations.is_empty() || self.graphs.is_empty() {
             return Err(invalid("unsupported or empty runtime package"));
         }
-        if self
-            .execution
-            .as_ref()
-            .is_some_and(|execution| execution.abi_version != crate::execution::ABI_VERSION)
-        {
-            return Err(invalid("unsupported execution contract version; re-export the model package"));
-        }
         if self.context.limits.iter().any(|limit| limit[0] > 6)
             || !(0..=3).contains(&self.context.cache)
         {
@@ -665,6 +658,19 @@ mod tests {
                 edge_count: 0,
                 functions: vec![],
             }],
+        }
+    }
+
+    #[test]
+    fn execution_abi_labels_do_not_reject_package_resources() {
+        for abi in [0, 1, 5, 6, 7, u32::MAX] {
+            let mut value = package();
+            value.execution = Some(super::super::protobuf::wire::Execution {
+                abi_version: abi, ..Default::default()
+            });
+            value.validate().unwrap();
+            value.allocations.clear();
+            assert!(value.validate().is_err());
         }
     }
 

@@ -36,9 +36,10 @@ capacities fail admission.
 Payload packages use `PackageBody.format_version` 2 with a signed payload
 envelope and unsigned `LocationSet`. Each executable resource is one zstd
 level-3 frame with a signed decoded length and compressed-chunk commitments.
-Execution ABI 6, prepared model contract 3, and payload format 2 are independent
-version domains. A package with another execution ABI or prepared contract
-requires re-export with Ignition and fails loading before replay.
+Execution ABI, prepared model contract, and payload format are independent
+version domains. Execution ABI labels do not gate loading; the runtime validates
+the declared layouts and operations. Engine upgrades must preserve support for
+previously supported models without re-export.
 
 Executable resources are one mandatory zstd level-3 frame per resource. The
 signed `ExecutableResource` binds its stored frame, signed decoded length,

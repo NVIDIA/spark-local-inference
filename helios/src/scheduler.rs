@@ -2344,7 +2344,7 @@ impl RequestScheduler {
             for lane in &step.lanes {
                 let record = &records[lane.request.slot as usize];
                 record.validate_vector()?;
-                let vector = record.vector.as_ref().ok_or("speculative round completion requires ABI6")?;
+                let vector = record.vector.as_ref().ok_or("speculative round completion requires a token vector")?;
                 if record.status != 0 && record.status != 3 {
                     let offered = usize::try_from(vector.offered_drafts)
                         .map_err(|_| "negative speculative prefix offer")?;
@@ -2421,7 +2421,7 @@ impl RequestScheduler {
                     return Err("token vector does not match committed request progress".into());
                 }
             } else if matches!(kind, GraphKind::Speculative) {
-                return Err("speculative completion requires ABI6 token vector".into());
+                return Err("speculative completion requires a token vector".into());
             }
             if record.generation != lane.request.generation as i64
                 || record.submission_sequence != fence.0 as i64

@@ -15,6 +15,7 @@ fn logical_layout_excludes_process_addresses_and_detects_contract_changes() {
     let manifest = super::super::tests::manifest();
     let expected = layout(&manifest);
     let mut peer = manifest.clone();
+    peer.abi_version = 5;
     peer.context += 10;
     peer.device += 1;
     for buffer in &mut peer.buffers {

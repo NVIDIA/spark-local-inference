@@ -81,14 +81,19 @@ configurations. Outputs remain fixed during serving. Package graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
+Execution ABI numbers are descriptive metadata and do not gate loading or rank
+agreement. Engine upgrades preserve previously supported package layouts. The
+runtime validates graph operations, buffer geometry, and storage dependencies.
+
 ## Serving graph transport
 
 `Execution.completion_token_capacity` is a uint32 package field. An omitted or
 zero value resolves to eight tokens; a positive value is the token capacity T.
 All ranks use the same resolved value. Completion records have 16 metadata fields
 and T token fields. Generation logprobs have T token positions, and optional
-survival and proposal-confidence outputs have T−1 positions. Packages with T=1
-omit these zero-depth outputs. Graph verification widths cannot exceed T; model
+survival outputs have T−1 positions. Proposal-confidence buffers may have
+one through T−1 positions and must cover each graph’s confidence width. Packages
+with T=1 omit these zero-depth outputs. Graph verification widths cannot exceed T; model
 and operator limits may be smaller. Continuation-state geometry is independent
 of completion token capacity.
 

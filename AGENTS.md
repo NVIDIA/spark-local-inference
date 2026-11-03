@@ -128,8 +128,8 @@ models. For repeated exports with compatible weights, follow
 For serving-only Rust changes, rebuild Flare and load a compatible package.
 To exercise changes to prepared kernels, capacities, or the package format,
 export a package containing those changes. Packages must satisfy the declared
-[package contract](#model-package-compatibility); an execution ABI or prepared
-contract mismatch requires re-export.
+[package contract](#model-package-compatibility). Changing prepared kernels or
+capacities requires re-export; an engine upgrade does not.
 Launch an exported package with `flare/target/release/flare run PACKAGE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
@@ -241,18 +241,18 @@ architectural boundary before committing the change.
 
 ## Model package compatibility
 
-- Model packages require execution ABI 6 and prepared model contract 3. The
-  canonical carrier is payload format 2; signed format-6 logical-resource
-  containers also load when they satisfy the same execution and model contracts.
-  Packages with another execution ABI or prepared contract require re-export
-  with Ignition and fail loading before replay.
-- When replacing internal formats or execution paths, remove superseded loaders,
-  fallback paths, and migration-only tests. Backward compatibility requires an
-  explicit maintainer requirement.
-- Version semantic changes to package metadata and execution contracts. Reserve
-  removed Protobuf fields and enum values. Validate declared geometry, explicit
-  values, and required fields across every affected model contract. Tests must
-  cover unsupported-version rejection and the affected loading and serving paths.
+- Every engine version must load models supported by previous engine versions
+  without re-export, re-signing, or changes to captured graphs. Preserve loading
+  and serving compatibility when changing package metadata, storage contracts,
+  and execution code. Retain readers and tests needed by existing packages.
+- Execution ABI numbers are descriptive metadata, not loading gates. Validate
+  actual graph operations, buffer layouts, capacities, and dependencies. Protobuf
+  additions must use defaults that preserve existing package behavior; an absent
+  or zero completion token capacity means eight.
+- Version semantic changes without abandoning previously supported models.
+  Reserve removed Protobuf fields and enum values. Preserve signature, resource,
+  hardware, and structural validation. Test previous package layouts through
+  loading and serving alongside newly exported packages.
 
 ## Configuration
 

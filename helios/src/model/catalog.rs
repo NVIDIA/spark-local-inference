@@ -9,7 +9,7 @@
 use crate::{
     Result,
     execution::{
-        BATCH_CAPACITIES, ExecutionManifest, GraphKind, ABI_VERSION, SamplingMode,
+        BATCH_CAPACITIES, ExecutionManifest, GraphKind, SamplingMode,
     },
     model::ModelConfig,
     scheduler::speculation,
@@ -89,8 +89,6 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         if config.speculative_proposal_source == speculation::ProposalSource::Copy {
             return Err("copy proposal source requires speculative graphs".into());
         }
-    } else if manifest.abi_version != ABI_VERSION {
-        return Err("speculative catalog requires ABI6".into());
     }
     for graph in &manifest.graphs {
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)

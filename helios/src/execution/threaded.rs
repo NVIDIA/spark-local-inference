@@ -549,7 +549,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
     }
-    a.abi_version == b.abi_version
+    a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active
         && a.input_frame_bytes == b.input_frame_bytes
         && a.buffers.len() == b.buffers.len()
@@ -590,6 +590,16 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_layout_uses_completion_geometry_instead_of_abi_labels() {
+        let a = super::super::tests::manifest();
+        let mut b = a.clone();
+        b.abi_version = 5;
+        assert!(same_layout(&a, &b));
+        b.completion_token_capacity += 1;
+        assert!(!same_layout(&a, &b));
+    }
 
     #[test]
     fn handoff_receive_preserves_queued_messages_and_disconnects() {

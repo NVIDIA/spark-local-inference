@@ -432,12 +432,6 @@ impl ExecutionManifest {
                 .and_then(|n| n.checked_mul(8 * REQUEST_LANES * 2)).is_none() {
             return Err("invalid completion token capacity".into());
         }
-        if self.abi_version != ABI_VERSION {
-            return Err(Error::execution(
-                ExecutionError::Manifest,
-                "unsupported execution ABI version; re-export the model package",
-            ));
-        }
         if !(1..=REQUEST_LANES).contains(&self.max_active) {
             return Err(Error::execution(
                 ExecutionError::Manifest,
@@ -541,15 +535,15 @@ impl ExecutionManifest {
         let logprobs = self.max_top_logprobs()? != 0;
         self.prompt_logprob_capacity()?;
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
-            if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
+            if buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1] {
-                return Err("completion_speculative_survival requires ABI6 and two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
+                return Err("completion_speculative_survival requires two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
             if buffer.dtype != Dtype::Float32 || buffer.shape.len() != 3
                 || buffer.shape[0] != 2 || buffer.shape[1] != self.request_capacity()
-                || buffer.shape[2] != self.completion_token_capacity - 1 {
+                || !(1..self.completion_token_capacity).contains(&buffer.shape[2]) {
                 return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
             }
         }
@@ -596,8 +590,7 @@ impl ExecutionManifest {
             }
             let valid = match graph.kind {
                 GraphKind::Mixed => {
-                    self.abi_version == ABI_VERSION
-                        && BATCH_CAPACITIES.contains(&graph.batch_capacity)
+                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && (2..=self.request_capacity()).contains(&graph.batch_capacity)
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                         && graph.prefill_capacity >= 64
@@ -609,8 +602,7 @@ impl ExecutionManifest {
                             .is_some()
                 }
                 GraphKind::Speculative => {
-                    self.abi_version == ABI_VERSION
-                        && BATCH_CAPACITIES.contains(&graph.batch_capacity)
+                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
                         && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
