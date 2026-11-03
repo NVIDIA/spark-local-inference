@@ -192,7 +192,7 @@ def test_diagnostic_manifest_selects_fixed_width_without_discarding_export_graph
     lambda: GraphSignature("decode", 1, 1, ("completion_records",)),
     lambda: GraphSignature("decode", 1, 1, sampling_mode="automatic"),
     lambda: GraphSignature("speculative", 3, 4),
-    lambda: GraphSignature("speculative", 1, 17),
+    lambda: GraphSignature("speculative", 1, 1 << 31),
 ])
 def test_invalid_execution_signature_fails_before_cuda(signature):
     with pytest.raises(ValueError):
@@ -250,7 +250,7 @@ def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds()
 
 @pytest.mark.parametrize("changes", [
     {"batch_capacity": 1}, {"batch_capacity": 3}, {"prefill_capacity": 0},
-    {"prefill_capacity": 65}, {"prefill_capacity": 1 << 31}, {"prefill_capacity": True}, {"token_capacity": 17},
+    {"prefill_capacity": 65}, {"prefill_capacity": 1 << 31}, {"prefill_capacity": True}, {"token_capacity": 1 << 31},
     {"speculation_enabled": None}, {"speculation_enabled": False, "token_capacity": 2},
     {"inputs": ()}, {"kind": "prefill"},
 ])
@@ -264,7 +264,7 @@ def test_mixed_signature_rejects_ambiguous_or_invalid_row_contracts(changes):
 def test_execution_requires_vector_completions():
     buffers = dict(_execution().buffers)
     buffers["completion_records"] = _tensor("int64", (2, 4, 8))
-    with pytest.raises(ValueError, match="completion vectors"):
+    with pytest.raises(ValueError, match="completion_records"):
         _execution(buffers=buffers)
 
 
@@ -274,4 +274,4 @@ def test_native_round_metadata_retains_full_proposal_depth(width, depth):
         draft_tokens=depth, packed_token_capacity=16, confidence_width=depth)
     assert (graph.token_capacity, graph.draft_tokens, graph.confidence_width) == (width, depth, depth)
     with pytest.raises(ValueError, match="draft depth"):
-        GraphSignature("speculative", 4, width, draft_tokens=16)
+        GraphSignature("speculative", 4, width, draft_tokens=(1 << 31) - 1)

@@ -58,11 +58,11 @@ def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
     state = {name: getattr(initial, name).clone() for name in initial.__dataclass_fields__}
     expected = {name: value.clone() for name, value in state.items()}
     trace = torch.full((steps, 4), -1, dtype=torch.int64)
-    records = torch.full((2, 4, 32), -99, dtype=torch.int64)
+    records = torch.full((2, 4, 24), -99, dtype=torch.int64)
     def completion_record(epoch=0, consumed=0, generated=0, token=-1, status=0, *, active=False):
         return torch.tensor([epoch, int(active), consumed, generated, token, status, 0, 0,
             int(token >= 0), 0, 0, 0, -1, max(consumed - 1, 0) if active else 0,
-            0, 1, token, *([-1] * 15)], dtype=torch.int64)
+            0, 1, token, *([-1] * 7)], dtype=torch.int64)
     records[0].copy_(completion_record().expand(4, -1))
     emitted = torch.zeros((steps, 4), dtype=torch.int64)
     vector_tokens = torch.full((steps, 4), -1, dtype=torch.int64)
@@ -140,7 +140,7 @@ class CapturedCase:
         self.slots = torch.tensor(SLOTS[:rows], dtype=torch.int32, device="cuda")
         self.epochs = torch.tensor([31 + slot for slot in SLOTS[:rows]], dtype=torch.int64, device="cuda")
         self.live = torch.tensor([rows], dtype=torch.int32, device="cuda")
-        self.completion = CompletionOutputs.allocate((2, 4, 32), device="cuda")
+        self.completion = CompletionOutputs.allocate((2, 4, 24), device="cuda")
         self.records = self.completion.records
         self.records.fill_(-99)
         self.frame = torch.zeros(1, dtype=torch.int32, device="cuda")

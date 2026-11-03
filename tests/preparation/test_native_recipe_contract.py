@@ -84,7 +84,7 @@ def _recipe_metadata(recipe, *, all_variants=True):
         frame_index=torch.zeros(1, dtype=torch.int32),
         submission_sequence=torch.zeros(1, dtype=torch.int64),
         draft_page_tables=torch.zeros_like(inputs.page_tables))
-    buffers.update(CompletionOutputs.allocate((2, capacity, 32), device="cpu").buffers())
+    buffers.update(CompletionOutputs.allocate((2, capacity, 16 + config.completion_token_capacity), device="cpu").buffers())
     vision_buffers = _vision_buffers(recipe)
     buffers.update(vision_buffers)
     if vision_buffers:

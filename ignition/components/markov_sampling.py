@@ -26,7 +26,6 @@ from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.triton import prepare_triton
 from ignition.preparation.tuning import register_finalizer
-from .completion import MAX_OUTPUT_TOKENS
 from .draft_sampling import _selected_row
 from .speculation import _geometry, _metadata, _tensor
 
@@ -401,7 +400,7 @@ class PreparedMarkovProposals:
         if (
             base.dtype not in (torch.bfloat16, torch.float32)
             or base.stride(-1) != 1
-            or not 1 <= depth < MAX_OUTPUT_TOKENS
+            or not 1 <= depth < (1 << 31) - 1
             or not isinstance(values, torch.Tensor)
             or embedding.shape != values.shape
             or values.shape[0] != vocab

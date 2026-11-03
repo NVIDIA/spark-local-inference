@@ -631,12 +631,13 @@ def test_packed_completion_honors_explicit_absence_of_a_draft_cursor(bad_cursor)
         assert [len(r.generated) for r in requests] == [3, 2, 2]
 
 
-def test_sixteen_token_packed_round_uploads_full_ceiling_and_publishes_every_token():
+@pytest.mark.parametrize("width", [8, 13, 16, 32])
+def test_package_token_capacity_bounds_packed_upload_and_publication(width):
     graphs = {("speculative", b, 1): f"width-one-{b}" for b in (1, 2, 4)}
-    graphs[("speculative", 4, 16, 64, 15)] = "packed-sixteen"
-    scheduler = Scheduler(layout(graphs=graphs, widths=(1, 16),
-        confidence_widths={"packed-sixteen": 15}, completion_cursors={"packed-sixteen": 1}), prefix_cache=False)
-    requests = [request(0, [10, 11], limit=40), request(1, [10, 11], limit=10)]
+    graphs[("speculative", 4, width, 4 * width, width - 1)] = "packed"
+    scheduler = Scheduler(layout(graphs=graphs, widths=(1, width), record_fields=16 + width,
+        confidence_widths={"packed": width - 1}, completion_cursors={"packed": 1}), prefix_cache=False)
+    requests = [request(0, [10, 11], limit=80), request(1, [10, 11], limit=min(width, 9) + 1)]
     for current in requests:
         scheduler.submit(current)
     scheduler._admit()
@@ -645,17 +646,17 @@ def test_sixteen_token_packed_round_uploads_full_ceiling_and_publishes_every_tok
     for shape in graphs:
         scheduler.policy.costs.observe(shape, 1_000 if len(shape) == 5 else 100_000_000)
     step = scheduler.plan()
-    assert (step.width, step.draft_tokens, step.packed_tokens) == (16, 15, 64)
-    assert [lane.tokens for lane in step.lanes] == [16, 9]
-    assert uploads(scheduler, step)["speculative_prefix_limits"] == {0: [16, 9, 0, 0]}
-    tokens = list(range(100, 116))
+    assert (step.width, step.draft_tokens, step.packed_tokens) == (width, width - 1, 4 * width)
+    assert [lane.tokens for lane in step.lanes] == [width, min(width, 9)]
+    assert uploads(scheduler, step)["speculative_prefix_limits"] == {0: [width, min(width, 9), 0, 0]}
+    tokens = list(range(100, 100 + width))
     rows = records(scheduler, step, {
-        requests[0]: (1, 18, tokens, 0, 15, 15),
-        requests[1]: (2, 11, tokens[:9], 0, 8, 8),
+        requests[0]: (1, 2 + width, tokens, 0, width - 1, width - 1),
+        requests[1]: (2, 2 + min(width, 9), tokens[:9], 0, min(width, 9) - 1, min(width, 9) - 1),
     })
-    scheduler.complete(step, rows, confidence=[[1.] * 15] * 4)
+    scheduler.complete(step, rows, confidence=[[1.] * (width - 1)] * 4)
     assert requests[0].generated == [42] + tokens
-    assert requests[0].pending_token == 115 and requests[0].consumed == 18
+    assert requests[0].pending_token == 99 + width and requests[0].consumed == 2 + width
     assert requests[1].generated == [42] + tokens[:9] and requests[1].done
-    assert requests[0].acceptance.expected(16) == 16
-    assert len(requests[0].acceptance.expectations(16)) == 17
+    assert requests[0].acceptance.expected(width) == width
+    assert len(requests[0].acceptance.expectations(width)) == width + 1

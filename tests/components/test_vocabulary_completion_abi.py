@@ -5,7 +5,6 @@ from pathlib import Path
 import subprocess
 import sys
 
-import pytest
 import torch
 
 
@@ -21,10 +20,9 @@ def kernel_cases():
     from ignition.components import vocabulary_sampling as v
 
     # Triton's CPU interpreter cannot combine tensor wrappers with global constexpr wrappers.
-    v._OUTPUT_TOKENS = 16
     v._TARGET_DOMAIN = TARGET_RNG_DOMAIN
-    for width in (1, 8, 16):
-        batch, vocabulary, words = 2, 32, 64 if width == 16 else 32
+    for width in (1, 8, 13, 16, 32):
+        batch, vocabulary, words = 2, 64, max(32, 4 * (1 << (width - 1).bit_length()))
         p = torch.zeros((batch, width, vocabulary))
         q = torch.zeros((batch, width - 1, vocabulary))
         for column in range(width):
@@ -36,7 +34,7 @@ def kernel_cases():
         partials = torch.full((batch, width, 3, 1), -77.)
         selected = torch.full((batch, words), -88.)
         v._distribution_masses[(1, batch * width)](p, q, partials,
-            LOCAL=vocabulary, WIDTH=width, BLOCKS=1, BLOCK=32)
+            LOCAL=vocabulary, WIDTH=width, BLOCKS=1, BLOCK=64)
         v._selected_records[(batch,)](offset, p, q, drafts, partials, selected,
             LOCAL=vocabulary, WIDTH=width, BLOCKS=1, PAD=1, WORDS=words)
         plane = words // 4
@@ -66,7 +64,8 @@ def kernel_cases():
                 output.token_ids, output.proposed_count, output.accepted_drafts,
                 output.offered_drafts, output.valid, output.rng_increment, output.survival,
                 WIDTH=width, WORLD=1, RANK_PAD=1, CAPACITY=4, BATCH=batch,
-                VOCAB=vocabulary, RUNNING=1, RESERVATION=20, HAS_LIMITS=True, WORDS=words)
+                VOCAB=vocabulary, RUNNING=1, RESERVATION=20, HAS_LIMITS=True, WORDS=words, SURVIVAL=width - 1,
+                POSITIONS=1 << (width - 1).bit_length())
             assert output.valid.tolist() == [True, False]
             assert output.proposed_count.tolist() == [limit, 0]
             assert output.accepted_drafts.tolist() == [limit - 1, 0]

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_modes,
 )
@@ -80,6 +80,8 @@ class PreparationConfig:
     speculative_token_capacity: int | None = 128
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 16:
+            raise ValueError("Qwen dense supports at most fifteen draft tokens")
         request_capacity(self.max_active)
         selection = self.benchmark_selection
         if selection is not None:
@@ -145,6 +147,10 @@ class PreparationConfig:
         if self.benchmark_selection is not None and self.benchmark_selection.speculation_study:
             return max(samples, self.benchmark_selection.width)
         return samples
+
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width, _ in self.speculative_round_shapes), default=1)
 
 
 def _declared_weight_roots(weights):
@@ -214,7 +220,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 32), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],

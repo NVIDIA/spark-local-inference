@@ -17,14 +17,12 @@ from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.triton import prepare_triton
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from .collectives import PreparedAllGather
-from .completion import MAX_OUTPUT_TOKENS
 from .markov_sampling import _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
 from .speculation import SpeculativeAcceptance, TARGET_RNG_DOMAIN, _geometry, _metadata, _tensor
 
 SUMMARY_WORDS = 32
 _WORDS = tl.constexpr(SUMMARY_WORDS)
 _TARGET_DOMAIN = tl.constexpr(TARGET_RNG_DOMAIN)
-_OUTPUT_TOKENS = tl.constexpr(MAX_OUTPUT_TOKENS)
 
 
 @triton.jit
@@ -384,6 +382,8 @@ def _complete_block(
     RESERVATION: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
     WORDS: tl.constexpr,
+    SURVIVAL: tl.constexpr,
+    POSITIONS: tl.constexpr,
 ):
     row = tl.program_id(0)
     rank = tl.arange(0, RANK_PAD)
@@ -399,8 +399,8 @@ def _complete_block(
     offset = tl.where(tl.load(RngGeneration + slot) == tl.load(Generations + row), tl.load(RngOffset + slot), 0)
     log_prefix, survival = tl.full((), 0.0, tl.float32), tl.full((), 1.0, tl.float32)
     accepted = tl.full((), 0, tl.int32)
-    step_ids = tl.arange(0, _OUTPUT_TOKENS)
-    survivals = tl.full((_OUTPUT_TOKENS,), -1.0, tl.float32)
+    step_ids = tl.arange(0, POSITIONS)
+    survivals = tl.full((POSITIONS,), -1.0, tl.float32)
     for step in tl.static_range(WIDTH):
         if step < limit:
             mass = tl.sum(tl.load(records + 2 * (WORDS // 4) + step, rank < WORLD, other=0.0), 0)
@@ -441,7 +441,7 @@ def _complete_block(
     draft = tl.load(Drafts + row * (WIDTH - 1) + step_ids, step_ids < WIDTH - 1, other=-1)
     output = tl.where(step_ids < accepted, draft, next_token)
     tl.store(Tokens + row * WIDTH + step_ids, tl.where(valid & (step_ids <= accepted), output, -1), step_ids < WIDTH)
-    tl.store(Survival + row * (_OUTPUT_TOKENS - 1) + step_ids, tl.where(valid, survivals, -1.0), step_ids < _OUTPUT_TOKENS - 1)
+    tl.store(Survival + row * SURVIVAL + step_ids, tl.where(valid, survivals, -1.0), step_ids < SURVIVAL)
     tl.store(Valid + row, valid)
     tl.store(Offered + row, tl.minimum(tl.maximum(limit - 1, 0), WIDTH - 1))
     tl.store(Accepted + row, tl.where(valid, accepted, 0))
@@ -892,6 +892,8 @@ class PreparedVocabularyBlockVerification:
             RESERVATION=self.draw_reservation,
             HAS_LIMITS=self.limits is not None,
             WORDS=self.summary_words,
+            SURVIVAL=out.survival.shape[1],
+            POSITIONS=triton.next_power_of_2(max(w, out.survival.shape[1])),
             num_warps=4,
             enable_fp_fusion=False,
         )

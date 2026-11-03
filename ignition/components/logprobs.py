@@ -11,8 +11,8 @@ import triton.language as tl
 from ignition.preparation.triton import prepare_triton
 
 from .completion import (
-    EMITTED_COUNT_FIELD, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_OUTPUT_TOKENS,
-    MAX_LOGPROB_TOKEN_IDS, MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_RECORD_FIELDS, VECTOR_TOKENS_FIELD,
+    EMITTED_COUNT_FIELD, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
+    MAX_LOGPROB_TOKEN_IDS, MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_TOKENS_FIELD, validate_completion_buffers,
 )
 
 _VOCAB_TILE = 1024
@@ -39,7 +39,6 @@ def _sort_pair(keys):
 @triton.jit
 def _position(Records, Frame, Requested, Slots, Epochs, Live, row, col,
               SLOTS: tl.constexpr, FIELDS: tl.constexpr,
-              VECTOR_FIELDS: tl.constexpr = VECTOR_RECORD_FIELDS,
               COUNT_FIELD: tl.constexpr = EMITTED_COUNT_FIELD,
               TOKENS_FIELD: tl.constexpr = VECTOR_TOKENS_FIELD,
               CHOSEN_FIELD: tl.constexpr = TOKEN_FIELD):
@@ -136,11 +135,14 @@ def _finish(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Keys, O
 
 class PreparedLogprobs:
     def __init__(self, logits, completion, slots, epochs, live, frame):
+        validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
         batch, width, vocab = logits.shape
         if not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("raw logprob logits require contiguous BF16 or FP32 storage")
+        if not 1 <= width <= completion.token_capacity:
+            raise ValueError("raw logprob width exceeds completion token capacity")
         tiles = triton.cdiv(vocab, _VOCAB_TILE)
         cursor = completion.scratch.cursor()
         self.stats = cursor.zeros((batch, width, tiles, 2), torch.float32)  # Maximum and exponential mass.
@@ -157,7 +159,7 @@ class PreparedLogprobs:
             (_finish, (*common, self.lse, self.keys, completion.logprobs, completion.token_ids,
                 completion.token_id_counts, *dimensions,
                 triton.next_power_of_2(tiles * _TILE_CANDIDATES), _TILE_CANDIDATES,
-                MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
+                MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
                 (batch, width, 1), _MERGE_WARPS),
         )
         self.statistics = self.normalization = self.candidates = self.finish = None

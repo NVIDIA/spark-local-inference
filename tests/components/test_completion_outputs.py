@@ -10,14 +10,15 @@ import pytest
 import torch
 
 from ignition.components.completion import (
-    CompletionOutputs, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_OUTPUT_TOKENS,
+    CompletionOutputs, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
     validate_completion_buffers,
 )
 
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='CUDA opt-in')
-def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
-    outputs = CompletionOutputs.allocate((2, 4, 32), device='cuda')
+@pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32])
+def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool(tokens):
+    outputs = CompletionOutputs.allocate((2, 4, 16 + tokens), device='cuda')
     cursor = outputs.private_storage.cursor()
     prompt, decode = outputs.private(cursor), outputs.private(cursor)
     assert prompt.requested is decode.requested is outputs.requested
@@ -27,8 +28,9 @@ def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
     decode.logprobs.fill_(22)
     outputs.records.fill_(-7)
     outputs.logprobs.fill_(-8)
-    prompt.speculative_survival.fill_(.9)
-    decode.speculative_survival.fill_(.5)
+    if tokens > 1:
+        prompt.speculative_survival.fill_(.9)
+        decode.speculative_survival.fill_(.5)
     outputs.merge(prompt, decode, torch.tensor(2, device='cuda'), torch.tensor([1], dtype=torch.int32, device='cuda'))
     assert torch.all(outputs.records[0] == -7)
     assert torch.all(outputs.logprobs[0] == -8)
@@ -37,9 +39,10 @@ def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
     assert torch.all(outputs.records[1, [0, 1, 3]] == 21)
     assert torch.all(outputs.logprobs[1, [0, 1, 3], :, :42] == 22)
     assert torch.all(outputs.logprobs[1, :, :, 42:] == -8)
-    assert torch.all(outputs.speculative_survival[0] == -1)
-    assert torch.all(outputs.speculative_survival[1, 2] == -1)
-    assert torch.all(outputs.speculative_survival[1, [0, 1, 3]] == .5)
+    if tokens > 1:
+        assert torch.all(outputs.speculative_survival[0] == -1)
+        assert torch.all(outputs.speculative_survival[1, 2] == -1)
+        assert torch.all(outputs.speculative_survival[1, [0, 1, 3]] == .5)
     size = outputs.private_storage.nbytes
     for _ in range(20):
         cursor = outputs.private_storage.cursor()
@@ -63,9 +66,9 @@ def test_malformed_logprob_declarations_are_rejected(change):
         buffers['completion_logprobs'] = buffers['completion_logprobs'].float()
     else:
         shape = {
-            'wrong_frame': (1, 4, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS),
-            'wrong_slots': (2, 2, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS),
-            'wrong_k': (2, 4, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS + LOGPROB_PAIR_FIELDS),
+            'wrong_frame': (1, 4, outputs.token_capacity, LOGPROB_FIELDS),
+            'wrong_slots': (2, 2, outputs.token_capacity, LOGPROB_FIELDS),
+            'wrong_k': (2, 4, outputs.token_capacity, LOGPROB_FIELDS + LOGPROB_PAIR_FIELDS),
         }[change]
         buffers['completion_logprobs'] = torch.empty(shape, dtype=torch.int32, device='meta')
     with pytest.raises(ValueError) as raised:
@@ -90,7 +93,7 @@ def test_optional_survival_requires_two_float32_frames(shape, dtype):
                'completion_speculative_survival': torch.empty(shape, dtype=dtype, device='meta')}
     with pytest.raises(ValueError, match='completion_speculative_survival'):
         validate_completion_buffers(buffers, 4)
-    with pytest.raises(ValueError, match='32-field'):
+    with pytest.raises(ValueError, match='token_capacity'):
         CompletionOutputs.allocate((2, 4, 8), device='meta')
 
 
@@ -100,5 +103,5 @@ def test_completion_storage_covers_sixteen_tokens_and_fifteen_survival_values():
     assert outputs.logprobs.shape == (2, 4, 16, LOGPROB_FIELDS)
     assert outputs.speculative_survival.shape == (2, 4, 15)
     validate_completion_buffers(outputs.buffers(), 4)
-    with pytest.raises(ValueError, match="32-field"):
-        CompletionOutputs.allocate((2, 4, 24), device="meta")
+    with pytest.raises(ValueError, match="token_capacity"):
+        CompletionOutputs.allocate((2, 4, 16), device="meta")

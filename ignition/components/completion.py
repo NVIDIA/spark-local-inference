@@ -8,15 +8,13 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.capacity import MAX_OUTPUT_TOKENS
+from ignition.components.capacity import completion_token_capacity
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.scratch import GraphBufferPool
 
 MAX_TOP_LOGPROBS = 20
 MAX_LOGPROB_TOKEN_IDS = 128
 COMPLETION_FRAMES = 2
-RECORD_FIELDS = 32
-VECTOR_RECORD_FIELDS = 32
 TOKEN_FIELD = 4
 EMITTED_COUNT_FIELD = 8
 VECTOR_TOKENS_FIELD = 16
@@ -32,9 +30,9 @@ _POOL_CHUNK_BYTES = 256 << 10
 class CompletionOutputs:
     """Own persistent outputs shared by the serial graph catalog.
 
-    ``records`` is int64 [2, slots, 32]. The runtime
+    ``records`` is int64 [2, slots, 16 + token_capacity]. The runtime
     alternates frames so readback can retain one while the next graph writes.
-    ``logprobs`` is int32 [2, slots, 16, 258]: the chosen token followed by up to
+    ``logprobs`` is int32 [2, slots, token_capacity, 258]: the chosen token followed by up to
     128 requested alternatives, each packed as [token ID, FP32 logprob bits]. Per-slot
     int32 ``requested`` flags gate reductions; only committed positions are valid.
     ``scratch`` shares reduction storage across serial variants. ``private_storage``
@@ -51,16 +49,24 @@ class CompletionOutputs:
 
     @classmethod
     def allocate(cls, shape, *, device):
+        if len(shape) != 3:
+            raise ValueError("completion records require [2,slots,16+token_capacity]")
         frames, slots, fields = shape
-        if frames != COMPLETION_FRAMES or fields != VECTOR_RECORD_FIELDS:
-            raise ValueError("completion records require two 32-field frames")
+        if (type(frames) is not int or frames != COMPLETION_FRAMES or type(slots) is not int or slots < 1
+                or type(fields) is not int or fields <= VECTOR_TOKENS_FIELD):
+            raise ValueError("completion records require [2,slots,16+token_capacity] with positive slots and token capacity")
+        tokens = completion_token_capacity(fields - VECTOR_TOKENS_FIELD)
         return cls(torch.zeros(shape, dtype=torch.int64, device=device),
-            torch.zeros((frames, slots, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS), dtype=torch.int32, device=device),
+            torch.zeros((frames, slots, tokens, LOGPROB_FIELDS), dtype=torch.int32, device=device),
             torch.zeros(slots, dtype=torch.int32, device=device),
             torch.zeros((slots, MAX_LOGPROB_TOKEN_IDS), dtype=torch.int32, device=device),
             torch.zeros(slots, dtype=torch.int32, device=device), GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
             GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
-            torch.full((frames, slots, MAX_OUTPUT_TOKENS - 1), -1., dtype=torch.float32, device=device))
+            torch.full((frames, slots, tokens - 1), -1., dtype=torch.float32, device=device) if tokens > 1 else None)
+
+    @property
+    def token_capacity(self):
+        return completion_record_capacity(self.records)
 
     def buffers(self):
         result = dict(completion_records=self.records, completion_logprobs=self.logprobs,
@@ -86,6 +92,10 @@ class CompletionOutputs:
             if self.speculative_survival is not None else None)
 
     def merge(self, prompt, decode, prompt_slot, frame):
+        for value in (prompt, decode):
+            if value.token_capacity != self.token_capacity:
+                raise ValueError("mixed completion roles must share a token capacity")
+        tokens = self.token_capacity
         slots = torch.arange(self.records.shape[1], device=self.records.device)
         role = slots == prompt_slot
         index = frame.long()
@@ -97,22 +107,36 @@ class CompletionOutputs:
             output.index_copy_(0, index, torch.where(mask,
                 -1. if output is self.speculative_survival else a.index_select(0, index), b.index_select(0, index)))
         from .logprobs import _merge
-        torch.library.wrap_triton(_merge)[(self.records.shape[1], MAX_OUTPUT_TOKENS)](
+        torch.library.wrap_triton(_merge)[(self.records.shape[1], tokens)](
             self.logprobs, prompt.logprobs, decode.logprobs, self.token_id_counts,
             prompt_slot, frame, self.records.shape[1], LOGPROB_FIELDS,
-            MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS, 512,
+            tokens, MAX_TOP_LOGPROBS, 512,
         )
 
 
-def validate_completion_buffers(buffers, capacity):
+def completion_record_capacity(records, capacity=None):
+    shape = tuple(records.shape)
+    if (len(shape) != 3 or shape[0] != COMPLETION_FRAMES or shape[1] < 1
+            or (capacity is not None and shape[1] != capacity) or shape[2] <= VECTOR_TOKENS_FIELD
+            or str(records.dtype) != "torch.int64"):
+        raise ValueError("completion_records requires int64 [2,slots,16+token_capacity]")
+    return completion_token_capacity(shape[2] - VECTOR_TOKENS_FIELD)
+
+
+def validate_completion_buffers(buffers, capacity, token_capacity=None):
+    tokens = completion_record_capacity(buffers["completion_records"], capacity)
+    if token_capacity is not None and completion_token_capacity(token_capacity) != tokens:
+        raise ValueError("completion token capacity disagrees with completion_records geometry")
     if (survival := buffers.get("completion_speculative_survival")) is not None:
-        shape = (COMPLETION_FRAMES, capacity, MAX_OUTPUT_TOKENS - 1)
+        if tokens == 1:
+            raise ValueError("completion_speculative_survival must be omitted at token capacity one")
+        shape = (COMPLETION_FRAMES, capacity, tokens - 1)
         if tuple(survival.shape) != shape or str(survival.dtype) != "torch.float32":
             raise ValueError(f"completion_speculative_survival: expected shape {shape}, dtype torch.float32")
     names = ("completion_logprobs", "logprob_requested", "logprob_token_ids", "logprob_token_id_counts")
     present = [name in buffers for name in names]
     if not any(present):
-        return
+        return tokens
     required = names if any(present[2:]) else names[:2]
     for name in required:
         if name not in buffers:
@@ -122,7 +146,7 @@ def validate_completion_buffers(buffers, capacity):
             not any(present[2:]) and fields not in range(4, 2 * (1 + MAX_TOP_LOGPROBS) + 1, 2)):
         raise ValueError("completion_logprobs: expected shape with a valid alternative count and dtype torch.int32; "
                          f"got shape {tuple(buffers[names[0]].shape)}, dtype {buffers[names[0]].dtype}")
-    for name, shape in ((names[0], (COMPLETION_FRAMES, capacity, MAX_OUTPUT_TOKENS, fields)),
+    for name, shape in ((names[0], (COMPLETION_FRAMES, capacity, tokens, fields)),
                         (names[1], (capacity,)), (names[2], (capacity, MAX_LOGPROB_TOKEN_IDS)),
                         (names[3], (capacity,))):
         if name not in buffers:
@@ -131,3 +155,5 @@ def validate_completion_buffers(buffers, capacity):
         if tuple(tensor.shape) != shape or str(tensor.dtype) != "torch.int32":
             raise ValueError(f"{name}: expected shape {shape}, dtype torch.int32; "
                              f"got shape {tuple(tensor.shape)}, dtype {tensor.dtype}")
+
+    return tokens

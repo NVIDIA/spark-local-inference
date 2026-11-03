@@ -12,7 +12,7 @@ from ignition.preparation.triton import prepare_triton
 from .collectives import PreparedAllGather
 from .completion import (
     LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_LOGPROB_TOKEN_IDS,
-    MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS,
+    MAX_TOP_LOGPROBS, validate_completion_buffers,
 )
 from .logprobs import _position, _sort_key, _sort_pair
 
@@ -172,13 +172,14 @@ class PreparedVocabularyParallelLogprobs:
 
     def __init__(self, logits, completion, slots, epochs, live, frame, *, vocabulary,
                  offset, runtime, session, coordinator, name):
+        validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
         if logits.ndim != 3 or not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("vocabulary-sharded raw logits require contiguous BF16 or FP32 rows")
         batch, width, local = logits.shape
         world = 1 if runtime is None else runtime.world_size
-        if (min(batch, width, local, vocabulary) <= 0 or width > MAX_OUTPUT_TOKENS
+        if (min(batch, width, local, vocabulary) <= 0 or width > completion.token_capacity
                 or offset < 0 or offset % local
                 or offset >= world * local or vocabulary > world * local
                 or (world - 1) * local >= vocabulary):
@@ -213,7 +214,7 @@ class PreparedVocabularyParallelLogprobs:
                 self.gathered, self.lse, completion.logprobs, local, vocabulary, width,
                 *geometry[5:], world, _SUMMARY, _CANDIDATES,
                 triton.next_power_of_2(world * _CANDIDATES), MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS,
-                _CHOSEN, _REQUESTED, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
+                _CHOSEN, _REQUESTED, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
         )
         self.operations = ()
 

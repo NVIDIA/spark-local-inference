@@ -23,7 +23,7 @@ from ignition.components.speculation import (
 )
 
 
-def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2, vocab=16):
+def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2, vocab=16, completion_capacity=16):
     state = DeviceRequestState.allocate("cpu", vocab_size=vocab)
     state.admit(slot, RequestAdmission(generation=7, seed=2**64 - 1, max_new_tokens=budget,
         temperature=1, top_k=0, top_p=1, eos_token_ids=eos), [1, 2], consumed_tokens=2, ple_history=(1, 2))
@@ -46,7 +46,7 @@ def example(*, batch=1, width=4, consumed=2, budget=20, eos=(), slot=2, vocab=16
     acceptance.accepted_drafts.fill_(emitted - 1)
     acceptance.offered_drafts.fill_(width - 1)
     acceptance.valid.fill_(True)
-    records = torch.full((2, 4, 32), -99, dtype=torch.int64)
+    records = torch.full((2, 4, 16 + completion_capacity), -99, dtype=torch.int64)
     frame, sequence = torch.tensor([1], dtype=torch.int32), torch.tensor([37], dtype=torch.int64)
     logits = torch.zeros((*inputs.shape, state.vocab_size), device=inputs.device)
     commit = PreparedSpeculativeCommit(state, acceptance, inputs, slots, epochs, live,
@@ -270,3 +270,41 @@ def test_sixteen_token_commit_preserves_records_histogram_rng_history_and_surviv
     assert records[0].eq(-99).all()
     assert records[1, [0, 1, 3], 16:].eq(-1).all()
     assert outputs.speculative_survival[1, [0, 1, 3]].eq(-1).all()
+
+
+@pytest.mark.parametrize("capacity", [1, 8, 13, 16, 32])
+@pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("clipping", ["none", "budget", "eos", "inactive"])
+def test_package_capacity_bounds_publication_without_truncating_verified_prefix(capacity, short, clipping):
+    width = min(capacity, 4) if short else capacity
+    state, acceptance, commit, records = example(width=width, vocab=64, budget=80, completion_capacity=capacity)
+    acceptance.token_ids.copy_(commit.inputs + 1)
+    acceptance.proposed_count.fill_(width)
+    acceptance.accepted_drafts.fill_(width - 1)
+    acceptance.survival.fill_(.5)
+    if clipping == "budget":
+        state.max_new_tokens[2] = 10
+    elif clipping == "eos":
+        state.eos_count[2], state.eos_token_ids[2, 0] = 1, 3 + min(width, 10)
+    elif clipping == "inactive":
+        commit.live.zero_()
+    commit()
+    emitted = 0 if clipping == "inactive" else min(width, 9 if clipping == "budget" else 10 if clipping == "eos" else width)
+    assert state.consumed_tokens[2] == 2 + emitted
+    assert state.generated_tokens[2] == 1 + emitted
+    assert state.pending_token[2] == 3 + emitted
+    assert state.rng_counter[2] == 1 + emitted
+    assert records.shape == (2, 4, 16 + capacity)
+    assert records[1, 2, 8].item() == emitted
+    assert records[1, 2, 16:16 + emitted].tolist() == list(range(4, 4 + emitted))
+    assert records[1, 2, 16 + emitted:].eq(-1).all()
+    assert records[0].eq(-99).all()
+    if capacity > 1:
+        assert commit.survival.shape == (2, 4, capacity - 1)
+        logical = min(width - 1, 8 if clipping == "budget" else width - 1)
+        extent = 0 if not emitted else min(logical, emitted)
+        assert commit.survival[1, 2, :extent].eq(.5).all()
+        assert commit.survival[1, 2, extent:].eq(-1).all()
+        assert commit.survival[1, [0, 1, 3]].eq(-1).all()
+    else:
+        assert commit.survival is None

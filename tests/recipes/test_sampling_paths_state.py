@@ -22,9 +22,9 @@ def test_cpu_sampler_oracle_crosses_page_boundary_without_rolling_state():
     assert expected['emitted_counts'][:, slot].tolist() == [1, 1, 1]
     assert expected['vector_tokens'][:, slot].tolist() == [42, 42, 42]
     records = expected['completion_records']
-    assert records.shape == (2, 4, 32)
+    assert records.shape == (2, 4, 24)
     assert records[0, slot].tolist() == [31 + slot, 1, 65, 3, 42, 1, 0, 0,
-        1, 0, 0, 0, -1, 64, 0, 1, 42] + [-1] * 15
+        1, 0, 0, 0, -1, 64, 0, 1, 42] + [-1] * 7
     assert records[1].eq(-99).all()
     assert not any('boundary' in name for name in expected)
     assert torch.cuda.is_initialized() == initialized
@@ -43,4 +43,4 @@ def test_cpu_sampler_oracle_clears_vector_emission_after_eos():
     assert expected['state.consumed_tokens'][slot] == 63
     assert expected['state.rng_counter'][slot] == 1
     assert expected['completion_records'][0, slot].tolist() == [31 + slot, 1, 63, 1, -1, 2, 0, 0,
-        0, 0, 0, 0, -1, 62, 0, 1] + [-1] * 16
+        0, 0, 0, 0, -1, 62, 0, 1] + [-1] * 8

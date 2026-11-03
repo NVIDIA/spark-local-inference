@@ -42,15 +42,22 @@ def test_private_commit_every_accepted_prefix(width, clipping):
         assert commit.emitted_ids[0, count:].eq(-1).all()
 
 
-def test_native_signature_and_commit_reject_width_beyond_sixteen():
+def test_native_width_requires_matching_completion_capacity():
+    from ignition.components.completion import CompletionOutputs
     from ignition.components.speculation import PreparedSpeculativeCommit
     from ignition.preparation.execution import GraphSignature
+    from tests.preparation.test_execution import _execution
 
-    for width in (17, 32):
-        with pytest.raises(ValueError):
-            GraphSignature("speculative", 1, width, ())
-        with pytest.raises(ValueError, match="native speculative commit"):
-            PreparedSpeculativeCommit(None, None, torch.zeros((1, width)), None, None, None, None, None, None)
+    completion = CompletionOutputs.allocate((2, 4, 24), device="cpu")
+    for width in (13, 16, 32):
+        signature = GraphSignature("speculative", 1, width)
+        with pytest.raises(ValueError, match="completion token capacity"):
+            _execution(graphs={"round": object()}, signatures={"round": signature}, buffers={
+                **completion.buffers(), "frame_index": torch.zeros(1, dtype=torch.int32),
+                "submission_sequence": torch.zeros(1, dtype=torch.int64)})
+        with pytest.raises(ValueError, match="completion token capacity"):
+            PreparedSpeculativeCommit(None, None, torch.zeros((1, width)), None, None, None,
+                                      completion, None, None)
 
 
 def test_study_wrapper_rejects_manifest_and_closes_graphs_before_model():

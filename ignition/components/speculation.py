@@ -19,7 +19,7 @@ import torch
 from ignition.components.flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, verify_chain
 
 from ignition.components.capacity import BATCH_CAPACITIES
-from ignition.components.completion import MAX_OUTPUT_TOKENS, VECTOR_RECORD_FIELDS
+from ignition.components.completion import VECTOR_TOKENS_FIELD, validate_completion_buffers
 from ignition.components.logprobs import PreparedLogprobs
 from ignition.components.sampling import (
     DUPLICATE_SLOT,
@@ -36,7 +36,6 @@ from ignition.preparation.scratch import bind_scratch
 INVALID_SPECULATION = 6
 TARGET_RNG_DOMAIN = 0x4D54505F56455249
 DRAFT_RNG_DOMAIN = 0x4D54505F44524146
-WIDTHS = tuple(range(1, MAX_OUTPUT_TOKENS + 1))
 # Vocabulary-wide checks reduce each row in slices first, so compiled forwards spread
 # them over many programs instead of one serial program per row.
 VOCABULARY_SLICES = 128
@@ -53,8 +52,8 @@ def _tensor(value, shape, dtype, device, name):
 
 
 def _geometry(batch, width):
-    if type(batch) is not int or batch not in BATCH_CAPACITIES or type(width) is not int or width not in WIDTHS:
-        raise ValueError("speculation requires power-of-two batch capacity through 64 and width 1 through 16")
+    if type(batch) is not int or batch not in BATCH_CAPACITIES or type(width) is not int or not 1 <= width < 1 << 31:
+        raise ValueError("speculation requires power-of-two batch capacity through 64 and positive Int32 verification width")
 
 
 def _metadata(state, slots, generations, live_rows, batch, device):
@@ -89,7 +88,7 @@ class SpeculativeAcceptance:
         return dict(token_ids=((batch, width), torch.int64),
                     proposed_count=((batch,), torch.int32), accepted_drafts=((batch,), torch.int32),
                     offered_drafts=((batch,), torch.int32), valid=((batch,), torch.bool),
-                    rng_increment=((batch,), torch.int64), survival=((batch, MAX_OUTPUT_TOKENS - 1), torch.float32))
+                    rng_increment=((batch,), torch.int64), survival=((batch, width - 1), torch.float32))
 
     @classmethod
     def broadcast_layout(cls, batch, width):
@@ -151,8 +150,8 @@ class PreparedSpeculativeDistributions:
         if (grammar_masks is None) != (grammar_mask_count is None):
             raise ValueError("conditional grammar masks and counts must be provided together")
         if grammar_masks is not None:
-            if grammar_masks.ndim != 3 or not 1 <= grammar_masks.shape[1] <= MAX_OUTPUT_TOKENS:
-                raise ValueError("conditional grammar requires one through sixteen mask rows")
+            if grammar_masks.ndim != 3 or not 1 <= grammar_masks.shape[1] < 1 << 31:
+                raise ValueError("conditional grammar requires a positive Int32 mask-row capacity")
             _tensor(grammar_masks, (requests.capacity, grammar_masks.shape[1], (vocab + 31) // 32), torch.int32, device, "grammar_masks")
             _tensor(grammar_mask_count, (requests.capacity,), torch.int32, device, "grammar_mask_count")
             if width + prefix_offset > grammar_masks.shape[1]:
@@ -391,8 +390,11 @@ class PreparedSpeculativeStateCommit:
                  submission_sequence, *, logits=None, logprobs=None, rng=None, copy_offered_mask=None, draft_context_lag=1, token_limits=None, buffers=None):
         records = None if completion is None else completion.records
         batch, width = input_ids.shape
-        if completion is not None and width > MAX_OUTPUT_TOKENS:
-            raise ValueError("native speculative completion requires width at most sixteen")
+        tokens = width if completion is None else completion.token_capacity
+        if width > tokens:
+            raise ValueError("native speculative width exceeds completion token capacity")
+        self.token_capacity = tokens
+        record_fields = VECTOR_TOKENS_FIELD + tokens
         _geometry(batch, width)
         device = input_ids.device
         if draft_context_lag is not None and (type(draft_context_lag) is not int or draft_context_lag < 0):
@@ -417,7 +419,8 @@ class PreparedSpeculativeStateCommit:
         _metadata(requests, slots, generations, live_rows, batch, device)
         acceptance.validate(batch, width, device)
         if completion is not None:
-            _tensor(records, (2, requests.capacity, VECTOR_RECORD_FIELDS), torch.int64, device, "completion_records")
+            validate_completion_buffers(completion.buffers(), requests.capacity, tokens)
+            _tensor(records, (2, requests.capacity, record_fields), torch.int64, device, "completion_records")
             _tensor(frame_index, (1,), torch.int32, device, "frame_index")
             _tensor(submission_sequence, (1,), torch.int64, device, "submission_sequence")
         self.copy_offered_mask = torch.zeros(batch, dtype=torch.int64, device=device) if copy_offered_mask is None else copy_offered_mask
@@ -449,12 +452,12 @@ class PreparedSpeculativeStateCommit:
         self.history_after = zeros((requests.capacity, 2))
         # One extra entry receives the rows that own no slot.
         self.owners = zeros((requests.capacity + 1,))
-        self._records = zeros((requests.capacity, VECTOR_RECORD_FIELDS))
+        self._records = zeros((requests.capacity, record_fields))
         self.survival = None if completion is None else completion.speculative_survival
-        self._survival = zeros((requests.capacity, MAX_OUTPUT_TOKENS - 1), torch.float32) if self.survival is not None and width > 1 else None
-        self.survival_columns = torch.arange(MAX_OUTPUT_TOKENS - 1, device=device)
-        self.idle_record = torch.zeros(VECTOR_RECORD_FIELDS, dtype=torch.int64, device=device)
-        self.idle_record[[4, 12, *range(16, VECTOR_RECORD_FIELDS)]] = -1
+        self._survival = zeros((requests.capacity, tokens - 1), torch.float32) if self.survival is not None else None
+        self.survival_columns = torch.arange(tokens - 1, device=device)
+        self.idle_record = torch.zeros(record_fields, dtype=torch.int64, device=device)
+        self.idle_record[[4, 12, *range(VECTOR_TOKENS_FIELD, record_fields)]] = -1
         if draft_context_lag is None:
             self.idle_record[13] = -1
 
@@ -545,7 +548,7 @@ class PreparedSpeculativeStateCommit:
                 ((consumed - self.draft_context_lag).clamp_min(0) if self.draft_context_lag is not None
                  else torch.full_like(emitted, -1)),
                 torch.zeros_like(emitted), torch.full_like(emitted, width)), 1),
-                torch.where(take, ids, -1), torch.full((emitted.numel(), MAX_OUTPUT_TOKENS - width), -1, dtype=torch.int64, device=ids.device)), 1)
+                torch.where(take, ids, -1), torch.full((emitted.numel(), self.token_capacity - width), -1, dtype=torch.int64, device=ids.device)), 1)
 
         # Records and per-row outputs precede request-state mutation: compiled graphs must not
         # re-derive enabled/valid fields from the status and token counts this round rewrites.
@@ -565,7 +568,9 @@ class PreparedSpeculativeStateCommit:
                 logical = torch.minimum(logical, (self.token_limits[row] - 1).clamp_min(0))
             extent = torch.minimum(logical, torch.where(emitted > emitted_drafts, logical, emitted_drafts))
             observed = owned[:, None] & live[source, None] & (self.survival_columns < extent[source, None])
-            self._survival.copy_(torch.where(observed, acceptance.survival[row][source], -1.))
+            values = torch.cat((acceptance.survival[row][source],
+                torch.full((state.capacity, self.token_capacity - width), -1., device=ids.device)), 1)
+            self._survival.copy_(torch.where(observed, values, -1.))
             self.survival.index_copy_(0, self.frame.long(), self._survival.unsqueeze(0))
 
         def updated(tensor, values):
@@ -602,11 +607,11 @@ class PreparedSpeculativeStateCommit:
 
 
 class PreparedSpeculativeCommit(PreparedSpeculativeStateCommit):
-    """Commit a verified prefix and publish the native sixteen-token completion contract."""
+    """Commit a verified prefix and publish the prepared completion token vector."""
 
     def __init__(self, requests, acceptance, input_ids, slots, generations, live_rows,
                  completion, frame_index, submission_sequence, **kwargs):
-        if completion is None or input_ids.shape[1] > MAX_OUTPUT_TOKENS:
-            raise ValueError("native speculative commit requires completion storage and width at most sixteen")
+        if completion is None:
+            raise ValueError("native speculative commit requires completion storage")
         super().__init__(requests, acceptance, input_ids, slots, generations, live_rows,
                          completion, frame_index, submission_sequence, **kwargs)

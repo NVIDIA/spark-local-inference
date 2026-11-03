@@ -75,7 +75,7 @@ def test_constructor_cuda_depth_bounds_accept_fake_cuda():
         build("cpu", 1)
     with FakeTensorMode():
         build("cuda", 1)
-        build("cuda", 15)
-        for depth in (0, 16):
+        build("cuda", 32)
+        for depth in (0, (1 << 31) - 1):
             with pytest.raises(ValueError, match="depth"):
                 build("cuda", depth)

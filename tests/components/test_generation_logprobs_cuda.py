@@ -112,7 +112,7 @@ def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled, co
         _assert_entry(outputs.logprobs[0, 2, 0], logits[0], 32, ids=ids or None)
 
 
-@pytest.mark.parametrize('width', [1, 3, 8, 16])
+@pytest.mark.parametrize('width', [1, 3, 8, 13, 16, 32])
 @pytest.mark.parametrize('compiled', [False, True])
 @pytest.mark.parametrize('count', [0, 21])
 def test_speculative_logprobs_follow_committed_target_positions_and_token_limits(width, compiled, count):
@@ -123,7 +123,7 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
     device = 'cuda'
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     for slot in range(4):
-        state.admit(slot, RequestAdmission(9, 10, max_new_tokens=20), [1, 2], consumed_tokens=2)
+        state.admit(slot, RequestAdmission(9, 10, max_new_tokens=max(20, width + 1)), [1, 2], consumed_tokens=2)
         state.pending_token[slot] = 10
         state.generated_tokens[slot] = 1
     state.max_new_tokens[1] = 2
@@ -138,7 +138,7 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
     epochs = torch.tensor([9, 9, 8, 9], dtype=torch.int64, device=device)
     live = torch.tensor([3], dtype=torch.int32, device=device)
     limits = torch.tensor([width, 1, width, width], dtype=torch.int32, device=device)
-    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 16 + max(width, 8)), device=device)
     outputs.requested.fill_(1)
     ids = list(reversed(range(count)))
     outputs.token_id_counts.fill_(count)

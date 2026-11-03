@@ -27,7 +27,7 @@ def test_depth_and_physical_capacity_are_independent():
 
 
 @pytest.mark.parametrize("changes", [
-    {"draft_tokens": None}, {"draft_tokens": 0}, {"draft_tokens": 16},
+    {"draft_tokens": None}, {"draft_tokens": 0}, {"draft_tokens": (1 << 31) - 1},
     {"draft_tokens": True}, {"packed_token_capacity": 0}, {"packed_token_capacity": 31},
     {"packed_token_capacity": 193}, {"inputs": ("query_lengths", "speculative_prefix_limits")},
     {"speculation_enabled": False},
