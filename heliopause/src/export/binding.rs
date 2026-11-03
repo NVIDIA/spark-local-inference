@@ -825,55 +825,6 @@ fn export_serving<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn preflight_failure_drains_without_capturing_and_retains_owners_on_failed_drain() {
-        use std::cell::Cell;
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        struct Owner(Arc<AtomicBool>);
-        impl Drop for Owner {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        for drain_succeeds in [true, false] {
-            let released = Arc::new(AtomicBool::new(false));
-            let captured = Cell::new(false);
-            let drained = Cell::new(false);
-            let preflight: super::super::Result<()> =
-                Err(super::super::invalid("unsupported publication"));
-            let result = capture_with_owners(
-                Owner(released.clone()),
-                || {
-                    preflight?;
-                    captured.set(true);
-                    Ok(())
-                },
-                || {
-                    drained.set(true);
-                    if drain_succeeds {
-                        Ok(())
-                    } else {
-                        Err(super::super::invalid("drain failed"))
-                    }
-                },
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("unsupported publication")
-            );
-            assert!(!captured.get());
-            assert!(drained.get());
-            assert_eq!(released.load(Ordering::SeqCst), drain_succeeds);
-        }
-    }
-
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
         use super::super::wire;
         (wire::RebuildWeights {
@@ -1044,6 +995,54 @@ mod tests {
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));
         assert_eq!(parsed.graphs[0].verify_tokens, Some(3));
+    }
+
+    #[test]
+    fn preflight_failure_drains_without_capturing_and_retains_owners_on_failed_drain() {
+        use std::cell::Cell;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct Owner(Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for drain_succeeds in [true, false] {
+            let released = Arc::new(AtomicBool::new(false));
+            let captured = Cell::new(false);
+            let drained = Cell::new(false);
+            let preflight: super::super::Result<()> =
+                Err(super::super::invalid("unsupported publication"));
+            let result = capture_with_owners(
+                Owner(released.clone()),
+                || {
+                    preflight?;
+                    captured.set(true);
+                    Ok(())
+                },
+                || {
+                    drained.set(true);
+                    if drain_succeeds {
+                        Ok(())
+                    } else {
+                        Err(super::super::invalid("drain failed"))
+                    }
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported publication")
+            );
+            assert!(!captured.get());
+            assert!(drained.get());
+            assert_eq!(released.load(Ordering::SeqCst), drain_succeeds);
+        }
     }
 }
 
