@@ -33,5 +33,20 @@ def test_non_square_attention_scratch_and_proposal_views(world):
     assert view.window_key is scratch.window_key
     assert view.convolution is scratch.convolution
     assert view.selectors is scratch.selectors
-    with pytest.raises(ValueError, match='complete eight-token'):
+    with pytest.raises(ValueError, match='complete proposal blocks'):
         scratch.rows(7, 7)
+
+
+@pytest.mark.parametrize("width", [8, 13, 16])
+def test_effective_block_preserves_checkpoint_and_scratch_fields(width):
+    config = SimpleNamespace(block_size=8,
+        text=dict(hidden_size=5120, intermediate_size=17408, vocab_size=128),
+        attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
+    scratch = DraftScratch.allocate(config, TensorParallelShard(0, 1), width, "meta",
+                                   buffers=GraphBufferPool("meta").cursor(), block_size=width)
+    view = scratch.rows(width, width)
+    assert config.block_size == 8
+    assert view.block_size == width
+    assert view.query.shape == (width, 32, 128)
+    assert view.window_key.shape[0] == 17
+    assert all(not isinstance(value, int) for value in view.scratch_tensors())

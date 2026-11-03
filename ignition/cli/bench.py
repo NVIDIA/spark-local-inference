@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare a selected graph catalog and report complete GPU round latency."""
+"""Prepare a selected graph catalog and report complete GPU graph latency."""
 
 import argparse
 import json
@@ -28,18 +28,25 @@ def _integers(text):
 
 def arguments(parser):
     options = parser.add_argument_group("GPU graph latency benchmark",
-        "Qwen3.8-27B DFlash2 only. Measures complete prepared speculative graph rounds; "
-        "excludes preparation, context prefill, state restoration, scheduling, and HTTP.")
-    options.add_argument("--batches", type=_integers, default=(1, 2, 4), metavar="LIST",
-                         help="request batches selected from 1,2,4, comma-separated (default: 1,2,4)")
-    options.add_argument("--contexts", type=_integers, default=(512, 2048, 8192, 16384), metavar="LIST",
-                         help="consumed context tokens, positive multiples of 128 (default: 512,2048,8192,16384)")
+        "Qwen3.8-27B DFlash2 only for speculative rounds; --prefill also supports --no-mtp. "
+        "Measures complete captured graphs; excludes preparation, preceding context setup, "
+        "state restoration, scheduling, and HTTP.")
+    options.add_argument("--speculation-study", action="store_true",
+                         help="diagnostic single-request widths 8,13,16; does not export native graphs")
+    options.add_argument("--study-widths", type=_integers, metavar="LIST",
+                         help="private widths prepared together from one prefilled state; requires --speculation-study")
+    options.add_argument("--prefill", action="store_true",
+                         help="time one exact --prefill-chunk-size graph, compiled with Inductor by default")
+    options.add_argument("--batches", type=_integers, metavar="LIST",
+                         help="request batches from 1,2,4 (default: 1,2,4; --prefill requires 1)")
+    options.add_argument("--contexts", type=_integers, metavar="LIST",
+                         help="preceding consumed tokens, multiples of 128 (default: 512,2048,8192,16384; --prefill: 0)")
     options.add_argument("--verify-width", type=int, metavar="N",
-                         help="target tokens per request including pending token; this benchmark requires 8")
+                         help="target tokens per request including pending token: 8 or 16; 8,13,16 with --speculation-study")
     options.add_argument("--warmup", type=int, default=5, metavar="N",
-                         help="positive untimed restored rounds per case and seed (default: 5)")
+                         help="positive untimed restored replays per case and seed (default: 5)")
     options.add_argument("--repetitions", type=int, default=20, metavar="N",
-                         help="timed restored rounds per case and seed (default: 20)")
+                         help="timed restored replays per case and seed (default: 20)")
     options.add_argument("--seeds", type=_integers, default=(0, 1, 2), metavar="LIST",
                          help="independent input and sampling seeds, comma-separated (default: 0,1,2)")
     options.add_argument("--output", type=Path, metavar="PATH",
@@ -54,42 +61,66 @@ class Settings:
     warmup: int
     repetitions: int
     seeds: tuple[int, ...]
+    prefill: bool = False
+    speculation_study: bool = False
+    study_widths: tuple[int, ...] = ()
 
     @classmethod
     def from_args(cls, args):
-        width = args.verify_width
+        study = getattr(args, "speculation_study", False)
+        batches = args.batches if args.batches is not None else ((1,) if args.prefill or study else (1, 2, 4))
+        contexts = args.contexts if args.contexts is not None else ((0,) if args.prefill else (8192,) if study else (512, 2048, 8192, 16384))
+        if args.prefill and args.verify_width is not None:
+            raise UsageError("--verify-width does not apply to --prefill")
+        if args.prefill and batches != (1,):
+            raise UsageError("--prefill requires --batches 1")
+        study_widths = getattr(args, "study_widths", None)
+        if study_widths is not None:
+            if not study or any(w not in (8, 13, 16) for w in study_widths):
+                raise UsageError("--study-widths requires --speculation-study and widths from 8,13,16")
+            if args.verify_width is not None or args.mtp_draft_tokens is not None:
+                raise UsageError("--study-widths replaces --verify-width and --mtp-draft-tokens")
+            study_widths = tuple(sorted(study_widths))
+        width = max(study_widths) if study_widths else args.verify_width
         if width is None:
             width = 8 if args.mtp_draft_tokens is None else args.mtp_draft_tokens + 1
         if args.mtp_draft_tokens is not None and args.mtp_draft_tokens + 1 != width:
             raise UsageError("--verify-width must equal --mtp-draft-tokens + 1")
-        if width != 8:
-            raise UsageError("ignition bench requires --verify-width 8 and --mtp-draft-tokens 7")
-        if any(value not in (1, 2, 4) for value in args.batches):
+        if study and (args.prefill or batches != (1,) or width not in (8, 13, 16)):
+            raise UsageError("--speculation-study requires --batches 1 and --verify-width 8,13,16 without --prefill")
+        if not args.prefill and not study and width not in (8, 16):
+            raise UsageError("ignition bench requires --verify-width 8 or 16 and matching --mtp-draft-tokens 7 or 15")
+        if any(value not in (1, 2, 4) for value in batches):
             raise UsageError("--batches must select request counts from 1,2,4")
-        if any(value < 128 or value % 128 for value in args.contexts):
-            raise UsageError("--contexts must contain positive multiples of 128")
+        if any(value < (0 if args.prefill else 128) or value % 128 for value in contexts):
+            raise UsageError("--contexts must contain positive multiples of 128 (zero also allowed with --prefill)")
         if args.warmup < 1:
             raise UsageError("--warmup must be positive")
         if args.repetitions < 1:
             raise UsageError("--repetitions must be positive")
         if any(not 0 <= seed < 2**63 for seed in args.seeds):
             raise UsageError("--seeds must contain integers from 0 through 2^63 - 1")
-        if args.no_mtp:
+        if args.no_mtp and not args.prefill:
             raise UsageError("ignition bench requires DFlash2 state; --no-mtp does not apply")
         if args.mixed_prefill or args.prompt_logprobs:
-            raise UsageError("ignition bench measures speculative rounds; --mixed-prefill and --prompt-logprobs do not apply")
+            raise UsageError("ignition bench measures speculative rounds or unscored prefill; --mixed-prefill and --prompt-logprobs do not apply")
         if args.official_source is not None:
             raise UsageError("--official-source applies to package publishing; ignition bench exports no package")
-        return cls(tuple(sorted(args.batches)), tuple(sorted(args.contexts)), width,
-                   args.warmup, args.repetitions, args.seeds)
+        return cls(tuple(sorted(batches)), tuple(sorted(contexts)), 8 if args.prefill else width,
+                   args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or ())
 
 
 def table(result):
     gpu = result["device"]
-    lines = [f"GPU graph round latency · {gpu['name']} · SM{gpu['capability'][0]}{gpu['capability'][1]}",
-             " B   W    P   Context    Median ms       p25–p75 ms"]
+    prefill = result.get("metric") == "cuda_graph_prefill_latency_ms"
+    label = "prefill" if prefill else "round"
+    lines = [f"GPU graph {label} latency · {gpu['name']} · SM{gpu['capability'][0]}{gpu['capability'][1]}",
+             (" Chunk   Context    Median ms       p25–p75 ms" if prefill else
+              " B   W    P   Context    Median ms       p25–p75 ms")]
     for case in result["cases"]:
-        lines.append(f"{case['batch']:2d}  {case['width']:2d}  {case['packed_tokens']:3d}  "
+        shape = (f"{case['chunk_tokens']:6d}  " if prefill else
+                 f"{case['batch']:2d}  {case['width']:2d}  {case['packed_tokens']:3d}  ")
+        lines.append(shape +
                      f"{case['context_tokens']:8d}  {case['median_ms']:11.4f}  "
                      f"{case['p25_ms']:8.4f}–{case['p75_ms']:.4f}")
     lines.append(f"Equal-weight mean of case medians: {result['aggregate_ms']:.4f} ms (lower is better)")
@@ -105,12 +136,14 @@ def run(args):
         raise UsageError("ignition bench supports only the Qwen3.8-27B DFlash2 recipe")
     from ignition.preparation.selection import BenchmarkSelection
 
-    selection = BenchmarkSelection(batches=settings.batches, contexts=settings.contexts, width=settings.width)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, max(settings.batches), args.max_concurrency)
+    if settings.speculation_study and concurrency.value != 1:
+        raise UsageError("--speculation-study requires --max-concurrency 1")
     if concurrency.value < max(settings.batches):
         raise UsageError("--max-concurrency must cover every selected --batches value")
     args = argparse.Namespace(**vars(args))
-    args.mtp_draft_tokens = settings.width - 1
+    if not settings.prefill:
+        args.mtp_draft_tokens = 7 if settings.speculation_study else settings.width - 1
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -122,7 +155,10 @@ def run(args):
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
-    plan = replace(plan, benchmark_selection=selection)
+    plan = replace(plan, benchmark_selection=BenchmarkSelection(
+        batches=settings.batches, contexts=settings.contexts, width=settings.width,
+        prefill_chunk=plan.prefill_chunk if settings.prefill else 0, speculation_study=settings.speculation_study,
+        study_widths=settings.study_widths))
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     progress = _progress(args.verbose)
     hub_cache = configuration.directory("hub_cache")
@@ -168,7 +204,8 @@ def _progress(verbose):
 def _measure(model, plan, configuration, settings, progress, *, compile_forwards, output=None):
     import torch
     from tokenizers import Tokenizer
-    from ignition.bench.runner import BenchmarkCase, run_benchmark
+    from ignition.bench.runner import BenchmarkCase, PrefillCase, run_benchmark
+    from ignition.bench.study import StudyCase, run_study
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.tuning_replicas import prepare_recipe
 
@@ -188,14 +225,22 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
             "online_mxfp8", "language_model_only")}}
 
+    if settings.speculation_study:
+        details["configuration"]["speculation_study"] = dict(
+            widths=settings.study_widths or (settings.width,),
+            blocks={str(w): w for w in settings.study_widths or (settings.width,)},
+            shared_prefill=True)
+
     def record(result):
         result.update(details)
         save_result(result, output)
         if result["status"] == "running":
-            case = result["cases"][-1]
-            print(f"Measured B={case['batch']} W={case['width']} P={case['packed_tokens']} "
-                  f"context={case['context_tokens']} seed={case['samples'][-1]['seed']} "
-                  f"({len(case['samples'])}/{len(settings.seeds)} seeds)", file=sys.stderr, flush=True)
+            completed = [case for case in result["cases"] if case["samples"]]
+            counts = ", ".join(
+                (f"chunk={case['chunk_tokens']}" if settings.prefill else f"W={case['width']}")
+                + f" context={case['context_tokens']}: {len(case['samples'])}/{len(settings.seeds)} seeds"
+                for case in completed)
+            print(f"Measured {counts}", file=sys.stderr, flush=True)
 
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
@@ -205,9 +250,13 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
                 kernel_cache=configuration.directory("kernel_cache"), progress=progress, package_storage=storage)
         with prepared:
             tokenizer = Tokenizer.from_file(str(Path(snapshot) / "tokenizer.json"))
-            scenarios = tuple(BenchmarkCase(batch=batch, width=settings.width, packed_tokens=batch * settings.width,
-                context_tokens=context) for batch in settings.batches for context in settings.contexts)
-            result = run_benchmark(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
+            scenarios = (tuple(PrefillCase(chunk_tokens=plan.prefill_chunk, context_tokens=context)
+                               for context in settings.contexts) if settings.prefill else
+                         tuple((StudyCase if settings.speculation_study else BenchmarkCase)(batch=batch, width=width, packed_tokens=batch * width,
+                               context_tokens=context) for batch in settings.batches for context in settings.contexts
+                               for width in settings.study_widths or (settings.width,)))
+            execute = run_study if settings.speculation_study else run_benchmark
+            result = execute(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
                 repetitions=settings.repetitions, seeds=settings.seeds, progress=record)
     except FlareError:
         raise

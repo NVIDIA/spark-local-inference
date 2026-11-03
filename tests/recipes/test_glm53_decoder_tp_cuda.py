@@ -108,7 +108,7 @@ def _rank(rank, world, rendezvous, snapshot, mode, capacity, layer_index, follow
             session.freeze()
             control = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                        "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                       "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device=device)}
+                       "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64, device=device)}
             bundle = PreparedExecution(device=rank, graphs={mode: graph}, buffers=control,
                 signatures={mode: GraphSignature(mode, capacity if mode == "decode" else 1,
                                                 capacity if mode == "prefill" else 1)},

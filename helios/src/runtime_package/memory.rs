@@ -282,19 +282,21 @@ fn capacities(
     if packages.len() != available.len()
         || packages.is_empty()
         || !(1..=64).contains(&active)
-        || !(1..=8).contains(&width)
+        || width == 0
         || page_tokens == 0
     {
         return Err(invalid("invalid cache planning geometry"));
     }
-    let execution = 1 + active * width;
+    let execution = active.checked_mul(width).and_then(|rows| rows.checked_add(1))
+        .filter(|&rows| rows < u32::MAX as u64)
+        .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
     let minimum_pages = page_limit.map_or(active * 8192u64.div_ceil(page_tokens), |limit| {
         limit.minimum
     });
     if minimum_pages == 0 {
         return Err(invalid("KV cache limit leaves no physical pages"));
     }
-    let mut cached = active * 8;
+    let mut cached = u32::MAX as u64 - execution;
     let mut maximum_pages = page_limit.map_or(u64::MAX, |limit| limit.maximum);
     for (rank, (package, &budget)) in packages.iter().zip(available).enumerate() {
         let rows: Vec<_> = package
@@ -525,7 +527,9 @@ impl NativeModel {
                     cache_geometry(
                         package,
                         contract.cache.page_tokens as u64,
-                        1 + active as u64 * width,
+                        (active as u64).checked_mul(width).and_then(|rows| rows.checked_add(1))
+                            .filter(|&rows| rows < u32::MAX as u64)
+                            .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?,
                         1,
                     )
                 })
@@ -1344,13 +1348,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_capacity_grows_with_borrowable_kv_backing() {
+        let packages = [package(65536, 65536, 100000)];
+        let mut previous = 0;
+        for budget in [64 << 20, 128 << 20, 512 << 20] {
+            let (rows, pages, snapshots) =
+                capacities(&packages, &[budget], 4, 1, 64, None).unwrap();
+            assert_eq!(rows, 5 + snapshots);
+            assert_eq!(snapshots, pages.min(4096 - 5));
+            assert!(snapshots > previous.max(4 * 8));
+            previous = snapshots;
+        }
+    }
+
+    #[test]
     fn lower_concurrency_and_verification_move_physical_budget_to_kv() {
         let p = [package(100 << 20, 2 << 20, 100000)];
         let budget = [80 << 30];
         let full = capacities(&p, &budget, 32, 6, 64, None).unwrap();
         let reduced = capacities(&p, &budget, 4, 6, 64, None).unwrap();
         let target_only = capacities(&p, &budget, 4, 1, 64, None).unwrap();
-        assert!(full.0 > reduced.0 && reduced.0 > target_only.0);
+        assert!(full.0 - full.2 > reduced.0 - reduced.2);
+        assert!(reduced.0 - reduced.2 > target_only.0 - target_only.2);
         assert!(full.1 < reduced.1 && reduced.1 < target_only.1);
         assert_eq!(reduced.0, 1 + 4 * 6 + reduced.2);
         for (rows, pages, snapshots) in [full, reduced, target_only] {

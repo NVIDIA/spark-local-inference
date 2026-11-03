@@ -48,6 +48,38 @@ def test_explicit_draft_count_and_unordered_selections():
     assert value.contexts == (512, 2048)
 
 
+def test_prefill_defaults_and_target_only_selection():
+    value = settings("--prefill")
+    assert value.prefill and value.batches == (1,) and value.contexts == (0,)
+    args = _parser().parse_args(["bench", "--prefill", "--prefill-chunk-size", "2048",
+                                "--contexts", "4096,0", "--no-mtp"])
+    assert Settings.from_args(args).contexts == (0, 4096)
+    assert args.prefill_chunk_size == 2048 and args.no_mtp
+
+
+@pytest.mark.parametrize("flags,message", [
+    (("--batches", "2"), "requires --batches 1"),
+    (("--verify-width", "8"), "does not apply"),
+    (("--contexts", "-128"), "multiples of 128"),
+    (("--contexts", "129"), "multiples of 128"),
+])
+def test_prefill_rejects_unsupported_geometry(flags, message):
+    with pytest.raises(UsageError, match=message):
+        settings("--prefill", *flags)
+
+
+def test_prefill_report_names_chunk_and_prefix():
+    from ignition.bench.runner import PrefillCase, measurement_result
+
+    result = measurement_result((PrefillCase(2048, 4096),), [[dict(seed=0, times_ms=[2., 4.])]],
+                                warmup=1, repetitions=2, seeds=(0,), status="complete")
+    result["device"] = dict(name="NVIDIA GB10", capability=[12, 1])
+    rendered = table(result)
+    assert "GPU graph prefill latency" in rendered and "Chunk" in rendered
+    assert "2048" in rendered and "4096" in rendered and "3.0000" in rendered
+    assert result["metric"] == "cuda_graph_prefill_latency_ms"
+
+
 @pytest.mark.parametrize("flags,message", [
     (("--verify-width", "4", "--mtp-draft-tokens", "7"), "must equal"),
     (("--verify-width", "9"), "requires --verify-width 8"),
@@ -135,3 +167,54 @@ def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys
     assert json.loads(output.read_text()) == result
     assert "aggregate_ms" not in json.loads(output.read_text())
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("width", [8, 13, 16])
+def test_speculation_study_selects_private_mode(width):
+    value = settings("--speculation-study", "--verify-width", str(width),
+                     "--mtp-draft-tokens", str(width - 1), "--contexts", "8192")
+    assert value.speculation_study and value.batches == (1,) and value.width == width
+    if width == 13:
+        with pytest.raises(UsageError):
+            settings("--verify-width", str(width))
+
+
+@pytest.mark.parametrize("flags", [
+    ("--mtp-draft-tokens", "15"),
+    ("--verify-width", "16"),
+    ("--mtp-draft-tokens", "15", "--verify-width", "16"),
+])
+def test_fifteen_drafts_select_native_rounds(flags):
+    value = settings("--batches", "1", "--contexts", "4096", *flags)
+    assert (value.batches, value.contexts, value.width) == ((1,), (4096,), 16)
+    assert not value.speculation_study and not value.study_widths
+
+
+def test_fifteen_drafts_reject_mismatched_verification_width():
+    with pytest.raises(UsageError, match="must equal"):
+        settings("--mtp-draft-tokens", "15", "--verify-width", "8")
+
+
+@pytest.mark.parametrize("flags", [("--batches", "2"), ("--prefill",), ("--verify-width", "9")])
+def test_speculation_study_rejects_other_regimes(flags):
+    with pytest.raises(UsageError):
+        settings("--speculation-study", *flags)
+
+
+def test_study_width_catalog_uses_one_maximum_capacity():
+    value = settings("--speculation-study", "--study-widths", "16,8,13")
+    assert value.study_widths == (8, 13, 16)
+    assert value.width == 16
+    assert value.contexts == (8192,)
+    assert value.batches == (1,)
+
+
+@pytest.mark.parametrize("flags", [
+    ("--study-widths", "8,13"),
+    ("--speculation-study", "--study-widths", "8,9"),
+    ("--speculation-study", "--study-widths", "8,16", "--verify-width", "16"),
+    ("--speculation-study", "--study-widths", "8,16", "--mtp-draft-tokens", "15"),
+])
+def test_study_width_catalog_rejects_ambiguous_or_unsupported_selection(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)

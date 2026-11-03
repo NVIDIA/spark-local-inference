@@ -7,7 +7,7 @@
 use super::*;
 
 pub(super) fn measured_costs(graphs: &[crate::execution::GraphDescriptor]) -> cost::ActionCosts {
-    let mut costs = cost::ActionCosts::prepared(graphs).unwrap();
+    let mut costs = cost::ActionCosts::prepared(graphs, 16).unwrap();
     for graph in graphs {
         costs.observe(
             &ScheduledStep { draft_tokens: graph.draft_tokens, packed_token_capacity: graph.packed_token_capacity,
@@ -125,6 +125,7 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
             snapshots,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 248320,
             page_tokens,
             vision: crate::model::VisionCapabilities {
@@ -225,8 +226,8 @@ fn records(
     generated: i64,
     token: i64,
     status: i64,
-) -> [CompletionRecord; 4] {
-    let mut records = [CompletionRecord::default(); 4];
+) -> Vec<CompletionRecord> {
+    let mut records = vec![CompletionRecord::default(); 4];
     records[handle.slot as usize] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: fence as i64,
@@ -331,8 +332,8 @@ fn state_records(
     scheduler: &RequestScheduler,
     step: &ScheduledStep,
     fence: u64,
-) -> [CompletionRecord; 4] {
-    let mut output = [CompletionRecord::default(); 4];
+) -> Vec<CompletionRecord> {
+    let mut output = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let request = scheduler.request(lane.request).unwrap();
         let slot = lane.request.slot as usize;
@@ -343,7 +344,7 @@ fn state_records(
             request.generated_tokens as i64,
             -1,
             1,
-        )[slot];
+        )[slot].clone();
     }
     output
 }
@@ -358,7 +359,7 @@ fn inactive_state_completion_never_initializes_or_publishes_a_checkpoint() {
         scheduler
             .complete(
                 Fence(1),
-                &[CompletionRecord::default(); 4],
+                &vec![CompletionRecord::default(); 4],
                 Default::default()
             )
             .is_err()
@@ -403,7 +404,7 @@ fn inactive_state_completion_never_initializes_or_publishes_a_checkpoint() {
         scheduler
             .complete(
                 Fence(3),
-                &[CompletionRecord::default(); 4],
+                &vec![CompletionRecord::default(); 4],
                 Default::default()
             )
             .is_err()
@@ -497,6 +498,7 @@ fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents(
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {
@@ -576,6 +578,7 @@ fn invalid_prefill_limits_reject_before_request_resources_are_created() {
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {
@@ -1266,7 +1269,7 @@ fn vector_records(
     tokens: &[i64],
     width: i64,
     status: i64,
-) -> [CompletionRecord; 4] {
+) -> Vec<CompletionRecord> {
     let mut row = records(
         h,
         fence,
@@ -1427,7 +1430,7 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
 #[test]
 fn speculative_width_catalog_is_validated() {
     use super::speculation::validate_widths;
-    for bad in [vec![2], vec![1, 9], vec![1, 4, 2]] {
+    for bad in [vec![2], vec![0, 1], vec![1, 1], vec![1, 4, 2]] {
         assert!(validate_widths(&bad).is_err());
     }
 }
@@ -1450,12 +1453,12 @@ fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining
     s.commit(&step, Fence(4)).unwrap();
     let mut completion = vector_records(h, 4, 70, 6, &[11, 12, 13, 90, 91], 8, 1);
     completion[0].vector.as_mut().unwrap().accepted_drafts = 4;
-    let mut invalid = completion;
+    let mut invalid = completion.clone();
     invalid[0].generation += 1;
     assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
     assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).1, 0);
     s.complete(Fence(4), &completion, Default::default()).unwrap();
-    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1], 2));
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), (vec![90, 91, -1, -1, -1, -1, -1], 2));
     assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
     assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
     s.cancel(h).unwrap();
@@ -1705,7 +1708,7 @@ fn completion_learns_only_proven_acceptance_and_is_transactional() {
         s.commit(&plan, Fence(4)).unwrap();
         let mut completion = bounded_vector_records(h, 4, 66, 2, &[10], 8, status, plan.lanes[0].tokens);
         completion[0].vector.as_mut().unwrap().accepted_drafts = accepted;
-        let mut invalid = completion;
+        let mut invalid = completion.clone();
         invalid[0].generation += 1;
         assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
         assert_eq!(s.request(h).unwrap().acceptance().rounds(), 0);
@@ -1782,7 +1785,7 @@ fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
 #[test]
 fn readiness_correction_changes_shape_cost_without_changing_handoff_or_service_time() {
     use crate::execution::{ExecutionTiming, ReadinessIntervals};
-    let mut costs = cost::ActionCosts::prepared(&duration_graphs(1)).unwrap();
+    let mut costs = cost::ActionCosts::prepared(&duration_graphs(1), 16).unwrap();
     let step = ScheduledStep { draft_tokens: 0, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
         packed_token_capacity: 0, mixed: None, lanes: vec![], requires_feedback: false };
     let timestamps = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
@@ -1877,7 +1880,7 @@ fn fixed_and_adaptive_widths_are_independent_of_batch_capacity() {
 }
 
 fn copied(consumed: u64, count: usize, grammar: bool) -> speculation::CopyProposal {
-    let mut tokens = [-1; 7];
+    let mut tokens = vec![-1; 15];
     for (index, token) in tokens[..count].iter_mut().enumerate() {
         *token = index as i64 + 10;
     }
@@ -1899,7 +1902,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
         [(0, false, 1), (2, false, 3), (7, false, 8), (2, true, 3)]
     {
         let mut s = scheduler(2, 32, 4);
-        s.enable_speculation(&speculation::WIDTHS).unwrap();
+        s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
         s.proposal_source(speculation::ProposalSource::Copy)
             .unwrap();
         s.fixed_speculative_width(Some(8)).unwrap();
@@ -1931,7 +1934,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
         assert!(s.plan().is_none());
         let mut complete = bounded_vector_records(a, 6, 66, 2, &[40], 8, 1, step.lanes[0].tokens);
         let other = vector_records(b, 6, 66, 2, &[41], 8, 1);
-        complete[b.slot as usize] = other[b.slot as usize];
+        complete[b.slot as usize] = other[b.slot as usize].clone();
         for h in [a, b] {
             complete[h.slot as usize]
                 .vector
@@ -1955,7 +1958,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
 fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     let mut s = scheduler(1, 2, 2);
     s.limits.max_sequence_tokens = 128;
-    s.enable_speculation(&speculation::WIDTHS).unwrap();
+    s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
     s.proposal_source(speculation::ProposalSource::Copy)
         .unwrap();
     s.fixed_speculative_width(Some(8)).unwrap();
@@ -1978,14 +1981,14 @@ fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     // MTP requires a private draft page in addition to these two target pages.
     let mut mtp = scheduler(1, 2, 2);
     mtp.limits.max_sequence_tokens = 128;
-    mtp.enable_speculation(&speculation::WIDTHS).unwrap();
+    mtp.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
     assert!(mtp.admit(spec(64, 64)).is_err());
 }
 
 #[test]
 fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validation() {
     let capabilities = SchedulerCapabilities {
-        vocabulary: 32,
+            completion_token_capacity: 16,        vocabulary: 32,
         page_tokens: 64,
         vision: crate::model::VisionCapabilities {
             feature_slots: 4,
@@ -2047,7 +2050,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
     retain_prompt(&mut s, 4);
     let mut proposal = speculation::CopyProposal {
         consumed: 4,
-        tokens: [32, -1, -1, -1, -1, -1, -1],
+        tokens: vec![32, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
         count: 1,
         grammar_masks: vec![],
     };
@@ -2056,10 +2059,12 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
     s.set_copy_proposal(handle, proposal).unwrap();
     for bad in [
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 0,
             ..capabilities.clone()
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             draft_pages_per_request: 9,
             completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -2101,11 +2106,11 @@ fn scheduler_uses_only_loaded_verification_shapes() {
         assert!(shapes.contains(&(step.batch_capacity, step.token_capacity)));
         assert_eq!(step.kind, GraphKind::Speculative);
         s.commit(&step, Fence(12)).unwrap();
-        let mut complete = [CompletionRecord::default(); 4];
+        let mut complete = vec![CompletionRecord::default(); 4];
         for h in &handles {
             complete[h.slot as usize] =
                 vector_records(*h, 12, 66, 2, &[10], step.token_capacity as i64, 1)
-                    [h.slot as usize];
+                    [h.slot as usize].clone();
         }
         s.complete(Fence(12), &complete, Default::default())
             .unwrap();
@@ -2330,7 +2335,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     freeze(&mut scheduler, handle, 5);
     let terminal = scheduler.finish(handle).unwrap().unwrap();
     let published = scheduler.take_publications();
-    assert_eq!(published.len(), 2);
+    assert_eq!(published.len(), 1);
     let prompt = &published[0];
     assert_eq!(prompt.key, history(65).key_at(65).unwrap());
     assert_eq!(prompt.parent, Some(key));
@@ -2338,18 +2343,10 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(prompt.chain_pages, ticket.pages);
     assert_eq!(prompt.tail_pages, 0);
     assert_eq!(prompt.slot, scheduler.snapshot_slot(SnapshotId(1)));
-    let end = &published[1];
-    assert_eq!(end.id, terminal);
-    assert_eq!(
-        end.key,
-        scheduler.cache().checkpoint(terminal).unwrap().prefix()
-    );
-    assert_eq!(end.key.consumed_tokens, 66);
-    assert_eq!(end.parent, Some(prompt.key));
-    assert_eq!(end.bucket, key.digest);
-    assert_eq!(end.chain_pages, ticket.pages);
-    assert_eq!(end.tail_pages, 0);
-    assert_eq!(end.slot, scheduler.snapshot_slot(SnapshotId(2)));
+    let end = scheduler.cache().checkpoint(terminal).unwrap();
+    assert!(end.ready());
+    assert_eq!(end.prefix().consumed_tokens, 66);
+    assert_eq!(end.parent(), Some(prompt.id));
     // Three checkpoints own one page and three snapshots; evicting them frees every id.
     assert_eq!(free(&scheduler), (7, 1));
     scheduler.ensure_resources(8, 4).unwrap();
@@ -2397,16 +2394,14 @@ fn inbound_full_prompt_hit_resumes_without_prefill() {
         .unwrap();
     freeze(&mut scheduler, handle, 4);
     let terminal = scheduler.finish(handle).unwrap().unwrap();
+    assert!(scheduler.cache().checkpoint(terminal).unwrap().ready());
     assert_eq!(
         scheduler
             .take_publications()
             .iter()
             .map(|p| (p.id, p.parent, p.tail_pages, p.chain_pages.clone()))
             .collect::<Vec<_>>(),
-        [
-            (restored, None, 1, ticket.pages.clone()),
-            (terminal, Some(ticket.key), 0, ticket.pages.clone())
-        ]
+        [(restored, None, 1, ticket.pages.clone())]
     );
     assert_eq!(free(&scheduler), (3, 0));
     scheduler.ensure_resources(4, 2).unwrap();
@@ -2417,16 +2412,8 @@ fn inbound_full_prompt_hit_resumes_without_prefill() {
 fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completion() {
     let mut scheduler = host_scheduler(2, 8, 4);
     let ancestor = seed_checkpoint(&mut scheduler, 1);
-    let ancestor_key = history(64).key_at(64).unwrap();
     let ancestor_pages = scheduler.cache().page_chain(ancestor).unwrap();
-    assert_eq!(
-        scheduler
-            .take_publications()
-            .iter()
-            .map(|p| p.id)
-            .collect::<Vec<_>>(),
-        [ancestor]
-    );
+    assert!(scheduler.take_publications().is_empty());
     assert_eq!(free(&scheduler), (7, 3));
     let request = spec(130, 2);
     let plan = scheduler.plan_admission(&request).unwrap();
@@ -2487,10 +2474,10 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
         vec![PublishedCheckpoint {
             id: restored,
             key,
-            parent: Some(ancestor_key),
+            parent: None,
             bucket: key.digest,
             chain_pages: chain.clone(),
-            tail_pages: 1,
+            tail_pages: 2,
             slot: ticket.slot,
         }]
     );
@@ -2566,14 +2553,7 @@ fn finish_inbound_attaches_to_an_existing_checkpoint_and_frees_the_ticket() {
         scheduler.cache().checkpoint(existing).unwrap().prefix(),
         ticket.key
     );
-    assert_eq!(
-        scheduler
-            .take_publications()
-            .iter()
-            .map(|p| p.id)
-            .collect::<Vec<_>>(),
-        [existing]
-    );
+    assert!(scheduler.take_publications().is_empty());
     let before = free(&scheduler);
     assert!(
         scheduler
@@ -2598,7 +2578,14 @@ fn finish_inbound_attaches_to_an_existing_checkpoint_and_frees_the_ticket() {
         1
     );
     assert_eq!(scheduler.stats().cached_checkpoints, 1);
-    assert!(scheduler.take_publications().is_empty());
+    assert_eq!(
+        scheduler
+            .take_publications()
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        [existing]
+    );
     assert!(scheduler.finish_inbound(ticket.key, true).is_err());
     init(&mut scheduler, 4);
     assert_eq!(scheduler.plan().unwrap().kind, GraphKind::Resume);
@@ -2749,11 +2736,7 @@ fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
             .iter()
             .map(|p| (p.id, p.parent))
             .collect::<Vec<_>>(),
-        [
-            (restored, None),
-            (first_terminal, Some(ticket.key)),
-            (second_terminal, Some(ticket.key))
-        ]
+        [(restored, None)]
     );
     scheduler.ensure_resources(8, 4).unwrap();
     assert_eq!(free(&scheduler), (8, 4));
@@ -2909,7 +2892,7 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
 }
 
 #[test]
-fn take_publications_reports_boundary_and_terminal_checkpoints_once() {
+fn take_publications_reports_boundaries_and_defers_terminals() {
     let mut scheduler = host_scheduler(1, 8, 4);
     let handle = scheduler
         .admit(RequestSpec {
@@ -2991,31 +2974,20 @@ fn take_publications_reports_boundary_and_terminal_checkpoints_once() {
     let published = scheduler.take_publications();
     assert_eq!(
         published,
-        vec![
-            PublishedCheckpoint {
-                id: prompt,
-                key: history.key_at(130).unwrap(),
-                parent: Some(history.key_at(64).unwrap()),
-                bucket: history.key_at(128).unwrap().digest,
-                chain_pages: pages[..2].to_vec(),
-                tail_pages: 1,
-                slot: scheduler
-                    .snapshot_slot(scheduler.cache().checkpoint(prompt).unwrap().snapshot()),
-            },
-            PublishedCheckpoint {
-                id: terminal,
-                key: scheduler.cache().checkpoint(terminal).unwrap().prefix(),
-                parent: Some(history.key_at(130).unwrap()),
-                bucket: history.key_at(128).unwrap().digest,
-                chain_pages: pages[..2].to_vec(),
-                tail_pages: 0,
-                slot: scheduler
-                    .snapshot_slot(scheduler.cache().checkpoint(terminal).unwrap().snapshot()),
-            },
-        ]
+        vec![PublishedCheckpoint {
+            id: prompt,
+            key: history.key_at(130).unwrap(),
+            parent: Some(history.key_at(64).unwrap()),
+            bucket: history.key_at(128).unwrap().digest,
+            chain_pages: pages[..2].to_vec(),
+            tail_pages: 1,
+            slot: scheduler.snapshot_slot(scheduler.cache().checkpoint(prompt).unwrap().snapshot()),
+        }]
     );
-    assert_eq!(published[1].key.consumed_tokens, 131);
-    assert_eq!(published[1].tail(), &[]);
+    let terminal = scheduler.cache().checkpoint(terminal).unwrap();
+    assert!(terminal.ready());
+    assert_eq!(terminal.prefix().consumed_tokens, 131);
+    assert!(terminal.tail_pages().is_empty());
     assert!(scheduler.take_publications().is_empty());
     assert_eq!(free(&scheduler), (6, 1));
     scheduler.ensure_resources(8, 4).unwrap();
@@ -3066,7 +3038,7 @@ fn sample_round(scheduler: &mut RequestScheduler, fence: u64) -> ScheduledStep {
             .unwrap();
         return step;
     }
-    let mut output = [CompletionRecord::default(); 4];
+    let mut output = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let request = scheduler.request(lane.request).unwrap();
         output[lane.request.slot as usize] = CompletionRecord {
@@ -3114,6 +3086,7 @@ fn growable_requests_reserve_a_page_of_output_and_grow_while_decoding() {
 #[test]
 fn starved_growable_request_preempts_the_newest_and_resumes_from_its_checkpoint() {
     let mut scheduler = scheduler(2, 6, 4);
+    scheduler.enable_publications();
     let older = scheduler.admit(growable(60, 400)).unwrap();
     let newer = scheduler.admit(growable(60, 400)).unwrap();
     assert_eq!(scheduler.free_page_count(), 2);
@@ -3131,7 +3104,16 @@ fn starved_growable_request_preempts_the_newest_and_resumes_from_its_checkpoint(
     let tokens = request.tokens().to_vec();
     let remaining = 400 - request.generated_tokens;
     freeze(&mut scheduler, newer, fence);
+    scheduler.take_publications();
     let checkpoint = scheduler.finish(newer).unwrap().unwrap();
+    assert_eq!(
+        scheduler
+            .take_publications()
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        [checkpoint]
+    );
     scheduler.cancel(older).unwrap();
     // Readmitting the history restores the published checkpoint instead of recomputing it.
     let resumed = scheduler
@@ -3308,10 +3290,45 @@ fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
 }
 
 fn bounded_vector_records(h: RequestHandle, fence: u64, consumed: i64, generated: i64,
-    tokens: &[i64], width: i64, status: i64, limit: usize) -> [CompletionRecord; 4] {
+    tokens: &[i64], width: i64, status: i64, limit: usize) -> Vec<CompletionRecord> {
     let mut rows = vector_records(h, fence, consumed, generated, tokens, width, status);
     let vector = rows[h.slot as usize].vector.as_mut().unwrap();
     vector.offered_drafts = vector.offered_drafts.min(limit.saturating_sub(1) as i64);
     vector.accepted_drafts = vector.accepted_drafts.min(vector.offered_drafts);
     rows
+}
+
+#[test]
+fn package_capacity_bounds_catalog_and_request_profiles() {
+    for capacity in [8, 13, 16, 32, 257] {
+        let fixture = scheduler(1, 32, 4);
+        let mut capabilities = fixture.capabilities.clone();
+        capabilities.completion_token_capacity = capacity;
+        let mut scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
+        scheduler.enable_speculation(&[1, capacity]).unwrap();
+        assert!(scheduler.enable_speculation(&[1, capacity + 1]).is_err());
+        assert_eq!(scheduler.forecasts.population.len(), capacity - 1);
+        let handle = scheduler.admit(spec(1, 32)).unwrap();
+        let request = scheduler.request(handle).unwrap();
+        assert_eq!(request.acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        let powered = scheduler.powered_curve(request, false);
+        assert_eq!(powered.len(), capacity - 1);
+        assert_eq!(scheduler.expected_speculative_tokens(request, capacity),
+            1.0 + powered.iter().sum::<f64>());
+    }
+}
+
+#[test]
+fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity() {
+    let fixture = scheduler(1, 32, 4);
+    let mut capabilities = fixture.capabilities.clone();
+    capabilities.completion_token_capacity = 32;
+    for rows in [0, usize::MAX, u32::MAX as usize] {
+        capabilities.state_rows_per_request = Some(rows);
+        assert!(RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities.clone()).is_err());
+    }
+    capabilities.state_rows_per_request = Some(1024);
+    let scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
+    assert_eq!(scheduler.execution_rows(), 1024);
+    assert_eq!(scheduler.snapshot_slot(SnapshotId(3)).0, 1028);
 }

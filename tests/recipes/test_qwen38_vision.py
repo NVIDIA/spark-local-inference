@@ -200,7 +200,7 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
     requests = DeviceRequestState.allocate(device, capacity=1)
     requests.generation.fill_(7)
     requests.status.fill_(1)
-    records = torch.zeros((2, 1, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 1, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     handoff = PreparedVisionHandoff(inputs, features, requests, scratch.output, completion_outputs(records), frame, sequence,

@@ -339,7 +339,9 @@ projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNe
 continuations reside in device memory. The pinned BF16
 `incoai/Qwen3.8-27B-DFlash2` draft consumes residual features from target layers
 5, 19, 33, 47, and 61 before final normalization, shares the target embedding and
-vocabulary head, and proposes eight-token noncausal blocks. Speculation defaults
+vocabulary head. The prepared noncausal proposal block contains the pending token
+and the configured maximum draft count, supporting one through sixteen positions;
+the checkpoint retains its declared eight-token block metadata. Speculation defaults
 to seven draft tokens with adaptive packed verification capped at 128 physical
 target rows and a 64-graph budget. Accepted GDN corrections commit into one
 recurrent row per request. Five 2,048-token FP8 draft KV rings per continuation
@@ -352,8 +354,41 @@ architecture as the serving device:
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1.safetensors
 ```
 
-Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
-retain draft context so adaptive verification can resume wider rounds.
+`qwen3.8-27b-qad` selects the pinned
+`local-inference-lab/Qwen3.8-27B-NVFP4-QAD` checkpoint. Its calibrated NVFP4 MLPs,
+MXFP8 GDN projections, BF16 full-attention and vocabulary weights, and trained
+FP32 normalization weights retain their stored precision by default.
+`--online-mxfp8` converts eligible BF16 target attention/MLP projections and
+DFlash2 context, attention, and MLP projections to MXFP8 while loading. Existing
+packed weights, normalization, grouped-convolution parameters, and candidate
+selector weights are unchanged. With a BF16 checkpoint vocabulary head,
+`--draft-head-quantization nvfp4` or `mxfp8` creates a separate proposal head;
+the target vocabulary head retains BF16 precision. For example:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --online-mxfp8 --draft-head-quantization nvfp4 --gpus 0
+```
+
+Use `--mtp-draft-tokens N` to select zero through fifteen prepared draft tokens.
+Width-one rounds retain draft context so adaptive verification can resume wider
+rounds. The proposal block, GDN correction records, and convolution rollback
+storage derive from the configured maximum verification width. Packed target
+capacity remains independent of the logical request-by-width sampling capacity.
+Planning reserves 193,865,984 continuation bytes per row, the supported
+sixteen-position maximum; narrower preparations allocate their exact smaller
+continuation layout.
+
+For eight concurrent requests with fifteen drafts and a 64-token packed target
+budget:
+
+```sh
+.venv/bin/ignition export qwen3.8-27b-qad --gpus 0 --max-concurrency 8 \
+  --prefill-chunk-size 4096 --mtp-draft-tokens 15 \
+  --speculative-token-capacity 64 --speculative-graph-budget 64 \
+  --online-mxfp8 --draft-head-quantization mxfp8
+```
+
+The recipe context capacity is 262144 tokens.
 `--no-mtp` skips the draft download and omits its weights and state during preparation;
 `flare run PACKAGE --mtp-draft-tokens 0` selects the package's ordinary graphs.
 
@@ -370,6 +405,18 @@ cache and speculative state before each sample, outside CUDA event timing.
 The [benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines workload
 selection, repetitions, seeds, and the equal-weight latency score. Native
 serving measurements still use an exported package with `flare run`.
+
+To time a complete Inductor-compiled prefill graph at one exact chunk size:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
+  --prefill-chunk-size 4096 --contexts 0 --output /tmp/qwen38-prefill.json
+```
+
+`--contexts` specifies consumed tokens preceding the timed chunk. Admission,
+prefix preparation, and state restoration remain outside timing. DFlash2
+context assimilation is included by default; add `--no-mtp` for target-only
+prefill. This mode prepares no decode or speculative round graphs.
 
 ## Qwen3.8 Flash
 

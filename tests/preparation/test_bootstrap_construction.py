@@ -91,6 +91,7 @@ class RecordingSession:
     def __init__(self, **kwargs):
         self.requests = {}
         self.finalizers = []
+        self.context_plans = {}
         self.arena = None
         self.closed = False
         self.resources = {}
@@ -104,6 +105,11 @@ class RecordingSession:
             assert request.name not in self.requests
             self.memory[request.name] = request.plan.memory_requirements()
             self.requests[request.name] = request
+
+    def register_context_plan(self, name, plan, bind):
+        assert self.requests[name].plan is plan
+        assert name not in self.context_plans and callable(bind)
+        self.context_plans[name] = (plan, bind)
 
     def register_finalizer(self, callback):
         self.finalizers.append(callback)
@@ -140,7 +146,7 @@ def checkpoint():
 
 
 def _install_boundaries(monkeypatch, checkpoint):
-    from b12x.gemm._shared.wo_mxfp8 import MXFP8Rows
+    from b12x.quantization import mxfp8
     from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight
     from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
     from b12x.preparation import device
@@ -340,14 +346,11 @@ def _install_boundaries(monkeypatch, checkpoint):
                 n,
             )
         return MXFP8LinearWeight(
-            MXFP8Rows(
-                values.reshape(n, k, 1),
-                scales.reshape(1, n, -1),
-                torch.empty(
-                    (32, 4, (n + 127) // 128, 4, (k + 127) // 128, 1),
-                    dtype=torch.uint8,
-                    device=values.device,
-                ),
+            mxfp8.dense_rows_from_bases(
+                values.reshape(n, k),
+                scales.view(torch.uint8).reshape(1, n, k // 32),
+                torch.empty(mxfp8.dense_rows_storage_shapes(n, k)[2],
+                    dtype=torch.uint8, device=values.device),
             ),
             k,
             k,
@@ -580,6 +583,7 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     ):
         bootstrap.prepare_model(checkpoint[0].snapshot, config)
     assert session.closed
+    assert session.context_plans
     modes = 1 if proposal == "ordinary" else 2
     expected = {
         "vision": 4,

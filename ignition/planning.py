@@ -209,14 +209,16 @@ class Plan:
                 raise UsageError("benchmark selection requires explicit complete-round geometry")
             if self.recipe.name != "qwen38_dense" or self.world_size != 1:
                 raise UsageError("benchmark graph preparation is implemented for single-GPU Qwen3.8-27B only")
-            if self.speculation is None or selection.width not in self.speculation.widths:
+            if not selection.prefill_chunk and (self.speculation is None or (8 if selection.speculation_study else selection.width) not in self.speculation.widths):
                 raise UsageError("benchmark rounds require the selected speculative width")
             if selection.max_batch > self.concurrency:
                 raise UsageError("benchmark batches exceed --max-concurrency")
-            if selection.max_batch * selection.width > self.speculative_token_capacity:
+            if not selection.prefill_chunk and selection.max_batch * selection.width > self.speculative_token_capacity:
                 raise UsageError("benchmark rounds exceed the speculative token capacity")
-            if selection.max_context + selection.width > self.context:
-                raise UsageError("benchmark context plus verification width exceeds the prepared context")
+            if selection.required_context > self.context:
+                raise UsageError("benchmark workload and output allowance exceed the prepared context")
+            if selection.prefill_chunk and selection.prefill_chunk != self.prefill_chunk:
+                raise UsageError("benchmark chunk must match --prefill-chunk-size")
             if self.prompt_logprobs or self.mixed_prefill:
                 raise UsageError("benchmark graph preparation does not implement scored or mixed prefill")
         if self.collective_tuning is None:

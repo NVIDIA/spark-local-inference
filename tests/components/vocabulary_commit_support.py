@@ -39,7 +39,7 @@ class ToyCommittedModel:
         b, w, v, device = batch, self.width, self.vocabulary, torch.device("cuda", 0)
         self.requests = DeviceRequestState.allocate(device, vocab_size=v, capacity=b)
         self.requests.ple_history = torch.zeros(b, 2, device=device, dtype=torch.int64)
-        self.completion = CompletionOutputs.allocate((2, b, 24), device=device)
+        self.completion = CompletionOutputs.allocate((2, b, 32), device=device)
         self.frame = torch.zeros(1, device=device, dtype=torch.int32)
         self.sequence = torch.ones(1, device=device, dtype=torch.int64)
         self.slots = torch.arange(b, device=device, dtype=torch.int32).roll(1)

@@ -549,7 +549,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
     }
-    a.abi_version == b.abi_version
+    a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active
         && a.input_frame_bytes == b.input_frame_bytes
         && a.buffers.len() == b.buffers.len()
@@ -590,6 +590,16 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_layout_uses_completion_geometry_instead_of_abi_labels() {
+        let a = super::super::tests::manifest();
+        let mut b = a.clone();
+        b.abi_version = 5;
+        assert!(same_layout(&a, &b));
+        b.completion_token_capacity += 1;
+        assert!(!same_layout(&a, &b));
+    }
 
     #[test]
     fn handoff_receive_preserves_queued_messages_and_disconnects() {
@@ -746,12 +756,12 @@ mod tests {
             };
             root.abi_version = super::super::ABI_VERSION;
             let records = root.buffers.iter_mut().find(|b| b.name == "completion_records").unwrap();
-            records.nbytes = 2 * 4 * 24 * 8;
-            records.shape = vec![2, 4, 24];
-            records.strides = vec![4 * 24, 24, 1];
+            records.nbytes = 2 * 4 * 32 * 8;
+            records.shape = vec![2, 4, 32];
+            records.strides = vec![4 * 32, 32, 1];
             root.buffers.push(BufferDescriptor {
-                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 5 * 4,
-                dtype: Dtype::Float32, shape: vec![2, 4, 5], strides: vec![20, 5, 1],
+                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 15 * 4,
+                dtype: Dtype::Float32, shape: vec![2, 4, 15], strides: vec![60, 15, 1],
             });
             root.buffers.push(BufferDescriptor {
                 name: "prefill_row".into(), address: 0x40000, nbytes: 4,

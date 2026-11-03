@@ -24,6 +24,10 @@ fn named_external_wait_survives_export_and_native_replay() {
     let worker = unsafe { ReplayWorker::new(owner.graph_bundle(), 1).unwrap() };
     let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap()).unwrap();
+    let manifest = owner.execution_manifest().unwrap();
+    manifest.validate().unwrap();
+    assert_eq!(manifest.completion_token_capacity, expected["completion_token_capacity"].as_u64().unwrap() as usize);
+    assert_eq!(manifest.buffer("completion_records").unwrap().shape[2], 16 + manifest.completion_token_capacity);
     for generation in 1..=3 {
         unsafe {
             stream.wait_value(address, generation).unwrap();

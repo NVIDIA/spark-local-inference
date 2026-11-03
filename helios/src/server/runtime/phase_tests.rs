@@ -118,6 +118,7 @@ impl Fixture {
         std::fs::remove_dir_all(directory).unwrap();
         Self {
             config: ModelConfig {
+                completion_token_capacity: 16,
                 max_top_logprobs: 0,
                 logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
@@ -145,7 +146,7 @@ impl Fixture {
             },
             frontend,
             stop: AtomicBool::new(false),
-            metrics: Arc::new(Default::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
         }
     }
 
@@ -364,7 +365,7 @@ fn completion(
     sequence: u64,
     sampled: Option<u32>,
 ) -> FrameCompletion {
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let live = worker.scheduler.request(lane.request).unwrap();
         records[lane.request.slot as usize] = CompletionRecord {
@@ -461,7 +462,7 @@ fn budget_pass(worker: &mut Worker<'_>, sequence: &mut u64, samples: &[u32]) {
                 .prompt
                 .logprobs
         {
-            let mut values = vec![std::array::from_fn(|_| None); 4];
+            let mut values = vec![vec![None; 16]; 4];
             values[lane.request.slot as usize][0] = Some(crate::execution::TokenLogprobs {
                 token,
                 logprob: -1.,
@@ -575,7 +576,7 @@ fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
             if forced && after == 4 {
                 assert_eq!(
                     worker.scheduler.history_proposal(&[1, 1, 1, 4], 7),
-                    ([2, 2, 2, -1, -1, -1, -1], 3)
+                    (vec![2, 2, 2, -1, -1, -1, -1], 3)
                 );
             }
         }
@@ -637,7 +638,7 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
         accepted_drafts: 2,
         verification_width: 4,
         draft_cache_consumed: 15,
-        tokens: [1, 1, 1, -1, -1, -1, -1, -1],
+        tokens: vec![1, 1, 1, -1, -1, -1, -1, -1],
         ..Default::default()
     });
     worker.complete(GraphKind::Speculative, frame).unwrap();
@@ -1545,7 +1546,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
                     handle,
                     crate::scheduler::speculation::CopyProposal {
                         consumed: 13,
-                        tokens: [0, 0, 0, -1, -1, -1, -1],
+                        tokens: vec![0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                         count: 3,
                         grammar_masks: vec![],
                     },
@@ -1568,10 +1569,10 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             copy_offered_mask: if copy { 7 } else { 0 },
             verification_width: 4,
             draft_cache_consumed: if copy { -1 } else { 15 },
-            tokens: [1, 1, 2, -1, -1, -1, -1, -1],
+            tokens: vec![1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
-        let mut invalid = frame.records;
+        let mut invalid = frame.records.clone();
         invalid[step.lanes[0].request.slot as usize].generated_tokens = 20;
         assert!(
             worker
@@ -1704,7 +1705,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         (4, 8, 3)
     );
     let mut frame = completion(&worker, &step, sequence, Some(1));
-    frame.proposal_confidence = Some([[0.5; 7]; crate::execution::REQUEST_LANES]);
+    frame.proposal_confidence = Some(vec![vec![0.5; 15]; crate::execution::REQUEST_LANES]);
     for (lane, offered) in step.lanes.iter().zip([5, 1, 0]) {
         let record = &mut frame.records[lane.request.slot as usize];
         record.consumed_tokens = lane.start_position as i64 + 1;
@@ -1714,7 +1715,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
             accepted_drafts: 0,
             verification_width: 8,
             draft_cache_consumed: lane.start_position as i64,
-            tokens: [1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
     }
@@ -1798,7 +1799,7 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 } else {
                     record.consumed_tokens - 1
                 },
-                tokens: [i64::from(token), -1, -1, -1, -1, -1, -1, -1],
+                tokens: vec![i64::from(token), -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             });
             worker.complete(GraphKind::Speculative, frame).unwrap();
@@ -3504,6 +3505,7 @@ fn http_state_for(
         max_body_bytes: 65536,
         frontend_capacity: 1,
         ingress_capacity: 4,
+        run: crate::server::run_id(),
         ids: Default::default(),
         api_key,
         thinking_token_budget: None,
@@ -3723,6 +3725,24 @@ async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_t
     assert!(!body.contains("[DONE]"), "{body}");
     assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
     assert!(incoming.iter().all(|i| i.cancelled.load(Ordering::Acquire)));
+}
+
+#[tokio::test]
+async fn request_ids_differ_across_server_starts() {
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 4, "stream": true,
+        });
+        let (response, _incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        ids.push(response.headers()["x-request-id"].to_str().unwrap().to_owned());
+    }
+    assert_ne!(ids[0], ids[1]);
 }
 
 #[tokio::test]

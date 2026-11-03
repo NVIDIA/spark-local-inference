@@ -19,6 +19,7 @@ import torch
 from ignition.components.flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, verify_chain
 
 from ignition.components.capacity import BATCH_CAPACITIES
+from ignition.components.completion import VECTOR_TOKENS_FIELD, validate_completion_buffers
 from ignition.components.logprobs import PreparedLogprobs
 from ignition.components.sampling import (
     DUPLICATE_SLOT,
@@ -35,7 +36,6 @@ from ignition.preparation.scratch import bind_scratch
 INVALID_SPECULATION = 6
 TARGET_RNG_DOMAIN = 0x4D54505F56455249
 DRAFT_RNG_DOMAIN = 0x4D54505F44524146
-WIDTHS = tuple(range(1, 9))
 # Vocabulary-wide checks reduce each row in slices first, so compiled forwards spread
 # them over many programs instead of one serial program per row.
 VOCABULARY_SLICES = 128
@@ -52,8 +52,8 @@ def _tensor(value, shape, dtype, device, name):
 
 
 def _geometry(batch, width):
-    if type(batch) is not int or batch not in BATCH_CAPACITIES or type(width) is not int or width not in WIDTHS:
-        raise ValueError("speculation requires power-of-two batch capacity through 64 and width 1 through 8")
+    if type(batch) is not int or batch not in BATCH_CAPACITIES or type(width) is not int or not 1 <= width < 1 << 31:
+        raise ValueError("speculation requires power-of-two batch capacity through 64 and positive Int32 verification width")
 
 
 def _metadata(state, slots, generations, live_rows, batch, device):
@@ -88,7 +88,7 @@ class SpeculativeAcceptance:
         return dict(token_ids=((batch, width), torch.int64),
                     proposed_count=((batch,), torch.int32), accepted_drafts=((batch,), torch.int32),
                     offered_drafts=((batch,), torch.int32), valid=((batch,), torch.bool),
-                    rng_increment=((batch,), torch.int64), survival=((batch, 7), torch.float32))
+                    rng_increment=((batch,), torch.int64), survival=((batch, width - 1), torch.float32))
 
     @classmethod
     def broadcast_layout(cls, batch, width):
@@ -150,10 +150,12 @@ class PreparedSpeculativeDistributions:
         if (grammar_masks is None) != (grammar_mask_count is None):
             raise ValueError("conditional grammar masks and counts must be provided together")
         if grammar_masks is not None:
-            _tensor(grammar_masks, (requests.capacity, 8, (vocab + 31) // 32), torch.int32, device, "grammar_masks")
+            if grammar_masks.ndim != 3 or not 1 <= grammar_masks.shape[1] < 1 << 31:
+                raise ValueError("conditional grammar requires a positive Int32 mask-row capacity")
+            _tensor(grammar_masks, (requests.capacity, grammar_masks.shape[1], (vocab + 31) // 32), torch.int32, device, "grammar_masks")
             _tensor(grammar_mask_count, (requests.capacity,), torch.int32, device, "grammar_mask_count")
-            if width + prefix_offset > 8:
-                raise ValueError("conditional grammar prefix exceeds eight mask rows")
+            if width + prefix_offset > grammar_masks.shape[1]:
+                raise ValueError("conditional grammar prefix exceeds prepared mask rows")
         self.grammar_masks, self.grammar_mask_count = grammar_masks, grammar_mask_count
         self.rows = torch.arange(batch, device=device)
         self.columns = torch.arange(width, device=device)
@@ -200,7 +202,7 @@ class PreparedSpeculativeDistributions:
         if self.grammar_masks is not None:
             count = self.grammar_mask_count[safe, None]
             self.valid.logical_and_(~state.grammar_enabled[safe, None].bool()
-                                    | ((prefix[None, :] < count) & (count <= 8)))
+                                    | ((prefix[None, :] < count) & (count <= self.grammar_masks.shape[1])))
         elif columns.numel() > 1:
             self.valid.logical_and_(~state.grammar_enabled[safe, None].bool() | (prefix[None, :] == 0))
         self.packed_top_k.copy_(torch.where(state.top_k[safe] > 0, state.top_k[safe], state.vocab_size)[:, None].expand_as(self.valid).reshape(-1))
@@ -375,8 +377,8 @@ class PreparedStochasticVerification:
         return out
 
 
-class PreparedSpeculativeCommit:
-    """Commit a verified chain prefix and emit physical-slot completion vectors.
+class PreparedSpeculativeStateCommit:
+    """Commit a verified chain prefix, optionally publishing native completion vectors.
 
     A round emitting t tokens commits verification input t-1, leaving emitted
     token t-1 pending. Exact snapshot maintenance selects the committed state
@@ -386,8 +388,13 @@ class PreparedSpeculativeCommit:
     def __init__(self, requests: DeviceRequestState, acceptance: SpeculativeAcceptance,
                  input_ids, slots, generations, live_rows, completion, frame_index,
                  submission_sequence, *, logits=None, logprobs=None, rng=None, copy_offered_mask=None, draft_context_lag=1, token_limits=None, buffers=None):
-        records = completion.records
+        records = None if completion is None else completion.records
         batch, width = input_ids.shape
+        tokens = width if completion is None else completion.token_capacity
+        if width > tokens:
+            raise ValueError("native speculative width exceeds completion token capacity")
+        self.token_capacity = tokens
+        record_fields = VECTOR_TOKENS_FIELD + tokens
         _geometry(batch, width)
         device = input_ids.device
         if draft_context_lag is not None and (type(draft_context_lag) is not int or draft_context_lag < 0):
@@ -397,7 +404,10 @@ class PreparedSpeculativeCommit:
         if token_limits is not None:
             _tensor(token_limits, (batch,), torch.int32, device, "token_limits")
         self.token_limits = token_limits
-        if logprobs is None:
+        if completion is None:
+            if logits is not None or logprobs is not None:
+                raise ValueError("private state commit does not publish logprobs")
+        elif logprobs is None:
             if logits is None or logits.dtype not in (torch.bfloat16, torch.float32):
                 raise ValueError("target_logits requires BF16 or FP32 storage")
             _tensor(logits, (batch, width, requests.vocab_size), logits.dtype, device, "target_logits")
@@ -408,15 +418,17 @@ class PreparedSpeculativeCommit:
         _tensor(input_ids, (batch, width), torch.int64, device, "input_ids")
         _metadata(requests, slots, generations, live_rows, batch, device)
         acceptance.validate(batch, width, device)
-        _tensor(records, (2, requests.capacity, 24), torch.int64, device, "completion_records")
-        _tensor(frame_index, (1,), torch.int32, device, "frame_index")
-        _tensor(submission_sequence, (1,), torch.int64, device, "submission_sequence")
+        if completion is not None:
+            validate_completion_buffers(completion.buffers(), requests.capacity, tokens)
+            _tensor(records, (2, requests.capacity, record_fields), torch.int64, device, "completion_records")
+            _tensor(frame_index, (1,), torch.int32, device, "frame_index")
+            _tensor(submission_sequence, (1,), torch.int64, device, "submission_sequence")
         self.copy_offered_mask = torch.zeros(batch, dtype=torch.int64, device=device) if copy_offered_mask is None else copy_offered_mask
         _tensor(self.copy_offered_mask, (batch,), torch.int64, device, "copy_offered_mask")
         if rng is not None:
             for name in ("generation", "target_offset"):
                 _tensor(getattr(rng, name), (requests.capacity,), torch.int64, device, f"rng.{name}")
-        self.logprobs = (PreparedLogprobs(logits, completion, slots, generations, live_rows, frame_index)
+        self.logprobs = None if completion is None else (PreparedLogprobs(logits, completion, slots, generations, live_rows, frame_index)
                         if logprobs is None else logprobs)
         self.state, self.acceptance, self.inputs, self.slots = requests, acceptance, input_ids, slots
         self.generations, self.live, self.records, self.frame, self.sequence = generations, live_rows, records, frame_index, submission_sequence
@@ -440,17 +452,18 @@ class PreparedSpeculativeCommit:
         self.history_after = zeros((requests.capacity, 2))
         # One extra entry receives the rows that own no slot.
         self.owners = zeros((requests.capacity + 1,))
-        self._records = zeros((requests.capacity, 24))
-        self.survival = completion.speculative_survival
-        self._survival = zeros((requests.capacity, 7), torch.float32) if self.survival is not None and width > 1 else None
-        self.survival_columns = torch.arange(7, device=device)
-        self.idle_record = torch.zeros(24, dtype=torch.int64, device=device)
-        self.idle_record[[4, 12, *range(16, 24)]] = -1
+        self._records = zeros((requests.capacity, record_fields))
+        self.survival = None if completion is None else completion.speculative_survival
+        self._survival = zeros((requests.capacity, tokens - 1), torch.float32) if self.survival is not None else None
+        self.survival_columns = torch.arange(tokens - 1, device=device)
+        self.idle_record = torch.zeros(record_fields, dtype=torch.int64, device=device)
+        self.idle_record[[4, 12, *range(VECTOR_TOKENS_FIELD, record_fields)]] = -1
         if draft_context_lag is None:
             self.idle_record[13] = -1
 
     def prepare(self):
-        self.logprobs.prepare()
+        if self.logprobs is not None:
+            self.logprobs.prepare()
 
     def __call__(self):
         state, acceptance, columns = self.state, self.acceptance, self.columns
@@ -527,14 +540,15 @@ class PreparedSpeculativeCommit:
             rng_offset = torch.where(advance, base + increment, offset)
             rng_generation = torch.where(advance, generation, self.rng.generation[safe])
         live = enabled & valid
-        record = torch.cat((torch.stack((generation, self.sequence.expand_as(generation), consumed, generated,
-            torch.where(emitted > 0, pending, -1), status.long(), error.long(), torch.zeros_like(emitted), emitted,
-            torch.where(live, offered, 0), emitted_drafts, torch.where(live, self.copy_offered_mask[row], 0),
-            torch.full_like(emitted, -1),
-            ((consumed - self.draft_context_lag).clamp_min(0) if self.draft_context_lag is not None
-             else torch.full_like(emitted, -1)),
-            torch.zeros_like(emitted), torch.full_like(emitted, width)), 1),
-            torch.where(take, ids, -1), torch.full((emitted.numel(), 8 - width), -1, dtype=torch.int64, device=ids.device)), 1)
+        if self.records is not None:
+            record = torch.cat((torch.stack((generation, self.sequence.expand_as(generation), consumed, generated,
+                torch.where(emitted > 0, pending, -1), status.long(), error.long(), torch.zeros_like(emitted), emitted,
+                torch.where(live, offered, 0), emitted_drafts, torch.where(live, self.copy_offered_mask[row], 0),
+                torch.full_like(emitted, -1),
+                ((consumed - self.draft_context_lag).clamp_min(0) if self.draft_context_lag is not None
+                 else torch.full_like(emitted, -1)),
+                torch.zeros_like(emitted), torch.full_like(emitted, width)), 1),
+                torch.where(take, ids, -1), torch.full((emitted.numel(), self.token_capacity - width), -1, dtype=torch.int64, device=ids.device)), 1)
 
         # Records and per-row outputs precede request-state mutation: compiled graphs must not
         # re-derive enabled/valid fields from the status and token counts this round rewrites.
@@ -554,7 +568,9 @@ class PreparedSpeculativeCommit:
                 logical = torch.minimum(logical, (self.token_limits[row] - 1).clamp_min(0))
             extent = torch.minimum(logical, torch.where(emitted > emitted_drafts, logical, emitted_drafts))
             observed = owned[:, None] & live[source, None] & (self.survival_columns < extent[source, None])
-            self._survival.copy_(torch.where(observed, acceptance.survival[row][source], -1.))
+            values = torch.cat((acceptance.survival[row][source],
+                torch.full((state.capacity, self.token_capacity - width), -1., device=ids.device)), 1)
+            self._survival.copy_(torch.where(observed, values, -1.))
             self.survival.index_copy_(0, self.frame.long(), self._survival.unsqueeze(0))
 
         def updated(tensor, values):
@@ -569,7 +585,8 @@ class PreparedSpeculativeCommit:
         self.consumed_after.copy_(updated(state.consumed_tokens, consumed))
         if self.history is not None:
             self.history_after.copy_(updated(self.history, history))
-        self._records.copy_(torch.where(owned[:, None], record[source], self.idle_record))
+        if self.records is not None:
+            self._records.copy_(torch.where(owned[:, None], record[source], self.idle_record))
         state.histogram.view(-1).scatter_add_(0, (safe[:, None] * state.vocab_size
             + ids.clamp(0, state.vocab_size - 1)).view(-1), (take & leader[:, None]).to(torch.int32).view(-1))
         commit(state.generated_tokens, generated)
@@ -583,6 +600,18 @@ class PreparedSpeculativeCommit:
         state.consumed_tokens.copy_(self.consumed_after)
         if self.history is not None:
             self.history.copy_(self.history_after)
-        self.records.index_copy_(0, self.frame.long(), self._records.unsqueeze(0))
-        self.logprobs()
+        if self.records is not None:
+            self.records.index_copy_(0, self.frame.long(), self._records.unsqueeze(0))
+            self.logprobs()
         return self
+
+
+class PreparedSpeculativeCommit(PreparedSpeculativeStateCommit):
+    """Commit a verified prefix and publish the prepared completion token vector."""
+
+    def __init__(self, requests, acceptance, input_ids, slots, generations, live_rows,
+                 completion, frame_index, submission_sequence, **kwargs):
+        if completion is None:
+            raise ValueError("native speculative commit requires completion storage")
+        super().__init__(requests, acceptance, input_ids, slots, generations, live_rows,
+                         completion, frame_index, submission_sequence, **kwargs)

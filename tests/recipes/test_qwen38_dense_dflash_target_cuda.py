@@ -15,8 +15,10 @@ from ignition.recipes import resolve
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA GPU")
 
 
+@pytest.mark.parametrize("checkpoint,online_mxfp8", [("qwen3.8-27b", False), ("qwen3.8-27b-qad", False), ("qwen3.8-27b-qad", True)])
+@pytest.mark.parametrize("width", [8, 16])
 @torch.no_grad()
-def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
+def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(checkpoint, online_mxfp8, width):
     from b12x.preparation import PreparationSession
     from ignition.components.completion import CompletionOutputs
     from ignition.components.paged_batch import BatchInputs
@@ -30,22 +32,54 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
     from ignition.recipes.qwen38_dense.pool import ContinuationPool
     from ignition.recipes.qwen38_dense.weights import ModelWeights
 
-    hub = Path.home() / ".cache/huggingface/hub"
-    target = resolve("qwen3.8-27b").snapshot(hub)
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
+    target = resolve(checkpoint).snapshot(hub)
     draft = hub / "models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
     assert (target / "config.json").is_file() and (draft / "model.safetensors").is_file()
-    weights = ModelWeights.load(inspect_indexed_checkpoint(target), torch.device("cuda:0"), mtp=True, draft_snapshot=draft)
-    pool = ContinuationPool.for_model(weights.config, 3, 2, "cuda:0", mtp=True)
+    weights = ModelWeights.load(inspect_indexed_checkpoint(target), torch.device("cuda:0"), mtp=True, draft_snapshot=draft, online_mxfp8=online_mxfp8)
+    if checkpoint == "qwen3.8-27b-qad":
+        assert sum(name.endswith(".mlp.gate_up") for name in weights.projections) == 64
+        assert not any(name.endswith((".mlp.gate_proj", ".mlp.up_proj")) for name in weights.projections)
+        if online_mxfp8:
+            from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear_as_mxfp8
+
+            packed_names = [name for name in weights.projections if name.endswith(".self_attn.qgkv_proj")]
+            assert len(packed_names) == 16
+            assert not any(name.endswith((".self_attn.q_proj", ".self_attn.kv_proj")) for name in weights.projections)
+            packed_weight = weights.projections["layers.3.self_attn.qgkv_proj"]
+            prefix = "model.language_model.layers.3.self_attn."
+            with DirectWeightLoader(inspect_indexed_checkpoint(target), "cuda:0", prefixes=(prefix,)) as loader:
+                original_q = loader.load_linear(prefix + "q_proj")
+                original_kv = loader.load_linear_group((prefix + "k_proj", prefix + "v_proj"))
+            original = (quantize_bf16_linear_as_mxfp8(original_q), quantize_bf16_linear_as_mxfp8(original_kv))
+            order = torch.cat((torch.arange(12288, device="cuda").view(24, 2, 256).transpose(0, 1).reshape(-1),
+                               torch.arange(12288, 14336, device="cuda")))
+            for field in ("values", "scale_rows"):
+                rows = torch.cat([getattr(part.weight, field).view(torch.uint8).reshape(part.out_features, -1)
+                                  for part in original])
+                actual = getattr(packed_weight.weight, field).view(torch.uint8).reshape(14336, -1)
+                assert torch.equal(rows.index_select(0, order), actual)
+            del original, original_q, original_kv, rows, actual
+        from ignition.recipes.qwen38_dense.config import TEXT_PREFIX
+        from ignition.reference.qwen38_quant import CheckpointTensors
+
+        with CheckpointTensors(inspect_indexed_checkpoint(target), byte_budget=2 << 20) as reader:
+            for name in ("layers.0.input_layernorm.weight", "layers.0.post_attention_layernorm.weight", "norm.weight"):
+                actual = weights.tree.get_parameter(name)
+                original = reader.read(TEXT_PREFIX + "." + name)
+                assert actual.dtype == original.dtype == torch.float32
+                assert torch.equal(actual.cpu(), original)
+    pool = ContinuationPool.for_model(weights.config, 3, 2, "cuda:0", mtp=True, verification_width=width)
     requests = DeviceRequestState.allocate("cuda:0", vocab_size=weights.config.vocabulary, capacity=2)
-    inputs = BatchInputs.allocate(16, 1, "cuda:0", capacity=2)
+    inputs = BatchInputs.allocate(2 * width, 1, "cuda:0", capacity=2)
     inputs.live_rows.fill_(2)
     inputs.row_slot_ids.copy_(torch.tensor([1, 0], device="cuda:0", dtype=torch.int32))
     inputs.row_generations.fill_(1)
     inputs.request_state_rows[0].fill_(1)
     inputs.request_state_rows[1].fill_(2)
     inputs.page_tables.copy_(torch.tensor([[0], [1]], device="cuda:0", dtype=torch.int32))
-    inputs.query_lengths.copy_(torch.tensor([8, 1], device="cuda:0", dtype=torch.int32))
-    completion = CompletionOutputs.allocate((2, 2, 24), device="cuda:0")
+    inputs.query_lengths.copy_(torch.tensor([width, 1], device="cuda:0", dtype=torch.int32))
+    completion = CompletionOutputs.allocate((2, 2, 32), device="cuda:0")
     frame = torch.zeros(1, device="cuda:0", dtype=torch.int32)
     sequence = torch.zeros(1, device="cuda:0", dtype=torch.int64)
     graph_buffers, draft_buffers, private_buffers, target_buffers, context_buffers = (GraphBufferPool("cuda:0", chunk_bytes=2 << 20) for _ in range(5))
@@ -61,19 +95,33 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
     reset()
     with PreparationSession(device="cuda:0", autotune=False) as session:
         arena = ScratchArena("cuda:0")
-        scratch = Scratch.allocate(9, 16, weights.config, "cuda:0", buffers=graph_buffers.cursor())
+        scratch = Scratch.allocate(width + 1, 2 * width, weights.config, "cuda:0", buffers=graph_buffers.cursor())
         owner = SpeculativePreparation(weights, pool, requests, inputs, scratch, completion=completion,
             frame=frame, sequence=sequence, session=session, workspace=arena, buffers=draft_buffers.cursor(),
-            decoder_buffers=target_buffers, context_buffers=context_buffers)
-        operation = PreparedParallelDraftRound(owner, 2, 8, "qwen.actual.packed", buffers=private_buffers.cursor(),
-            target_token_capacity=9)
+            decoder_buffers=target_buffers, context_buffers=context_buffers, verification_width=width)
+        operation = PreparedParallelDraftRound(owner, 2, width, "qwen.actual.packed", buffers=private_buffers.cursor(),
+            target_token_capacity=width + 1)
         operation.prepare()
+        if checkpoint == "qwen3.8-27b-qad":
+            gdn = [layer.layer.linear_attn.operation for layer in operation.decoder.layers
+                   if layer.layer.block_type == "linear_attention"]
+            assert len(gdn) == 48
+            assert all(attention.projections[key].plan.query.allow_bf16_atomic_reduction is False
+                       for attention in gdn for key in ("in_proj_qkvzba", "out_proj"))
+        if online_mxfp8:
+            attentions = [layer.layer.self_attn for layer in operation.decoder.layers
+                          if layer.layer.block_type == "full_attention"]
+            assert len(attentions) == 16
+            for attention in attentions:
+                assert attention.input_projections == ("qgkv_proj",)
+                assert attention.query.stride() == attention.gate.stride() == (14336, 256, 1)
+                assert attention.k.stride() == attention.v.stride() == (14336, 1)
         narrow = PreparedParallelDraftRound(owner, 2, 1, "qwen.actual.width1", buffers=private_buffers.cursor())
         narrow.prepare()
         arena.finalize()
-        assert operation.decoder.auxiliary.shape == (9, 25600)
-        assert operation.decoder.scratch.hidden.shape == (16, 5120)
-        assert operation.decoder.scratch.logits.shape == (16, 248320)
+        assert operation.decoder.auxiliary.shape == (width + 1, 25600)
+        assert operation.decoder.scratch.hidden.shape == (2 * width, 5120)
+        assert operation.decoder.scratch.logits.shape == (2 * width, 248320)
         assert owner.draft_scratch.logits.untyped_storage().data_ptr() != operation.probabilities.untyped_storage().data_ptr()
         assert operation.decoder.auxiliary.untyped_storage().data_ptr() != operation.context.local.untyped_storage().data_ptr()
         compiled = compile_forward(operation)
@@ -134,8 +182,8 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
         torch.cuda.synchronize()
         baseline_eager_error = relative(operation.decoder.scratch.hidden, eager_hidden)
         feature_extraction_error = relative(operation.decoder.scratch.hidden, feature_hidden)
-        full_lengths = torch.tensor([8, 0], device="cuda:0", dtype=torch.int32)
-        for count in range(1, 9):
+        full_lengths = torch.tensor([width, 0], device="cuda:0", dtype=torch.int32)
+        for count in range(1, width + 1):
             counts = torch.tensor([count, 0], device="cuda:0", dtype=torch.int32)
             pool.clear_for_preparation()
             inactive = pool.backing[target_rows[1]].clone()
@@ -180,10 +228,10 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
         assert torch.equal(pool.backing[2], inactive)
         for name, page in inactive_pages.items():
             assert torch.equal(pool.pages[name][1], page), name
-        print(dict(physical_tokens=9, logical_samples=16, learned_acceptance=accepted.tolist(),
+        print(dict(physical_tokens=width + 1, logical_samples=2 * width, learned_acceptance=accepted.tolist(),
             tap_eager_relative_l2=tap_eager_error, target_hidden_eager_relative_l2=hidden_eager_error,
             target_without_features_eager_relative_l2=baseline_eager_error,
             round_standalone_relative_l2=standalone_error, feature_extraction_relative_l2=feature_extraction_error,
-            accepted_depths=list(range(1, 9)), width_transition=[1, 8], inactive_rows_preserved=True), flush=True)
+            accepted_depths=list(range(1, width + 1)), width_transition=[1, width], inactive_rows_preserved=True), flush=True)
         narrow_graph.reset()
         graph.reset()

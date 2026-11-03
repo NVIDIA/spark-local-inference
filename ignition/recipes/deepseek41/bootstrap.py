@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -132,6 +132,8 @@ class PreparationConfig:
     speculation_reference_graphs: bool = False
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 8:
+            raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
         from ignition.components.compressed_mla import validate_mla_compute_mode
 
@@ -228,6 +230,10 @@ class PreparationConfig:
     def all_reduce_tokens(self):
         return max(self.decode_tokens, self.request_capacity * self.draft_tokens,
                    *(capacity for capacity in self.prefill_capacities if capacity < 128))
+
+    @property
+    def completion_token_capacity(self):
+        return max(self.speculative_widths) if self.dspark else 1
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buffers,
@@ -371,7 +377,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)

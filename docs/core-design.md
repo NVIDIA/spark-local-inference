@@ -320,14 +320,13 @@ same boundary; violations must be resolved before committing.
   allowlist. Shared code derives behavior from concrete geometry and dataflow.
   Independent enum identifiers select reusable tool/reasoning parsers and image
   preparation/layout implementations only. Review every field and all consumers.
-- **Model packages enforce versioned contracts.** Serving requires payload format
-  2, execution ABI 5, and prepared model contract 3. Other execution ABI or
-  prepared contract versions fail before replay and require re-export. Semantic
-  changes require explicit versioning; removed Protobuf fields and enum values
-  remain reserved. Remove superseded loaders and migration-only tests. Backward
-  compatibility requires an explicit maintainer requirement. Validate required
-  fields, explicit values, geometry, and unsupported-version rejection across
-  affected loading and serving paths.
+- **Engine upgrades preserve model package compatibility.** Every engine version
+  must load models supported by previous versions without re-export, re-signing,
+  or graph changes. Execution ABI numbers describe exports; loading validates
+  actual operations, buffers, capacities, dependencies, signatures, and resources.
+  Protobuf additions preserve existing behavior through compatible defaults.
+  Reserve removed wire identifiers and retain readers and tests needed by existing
+  packages. Exercise previous packages through loading and serving.
 - **Numerical and performance requirements are separate.** State copies and
   metadata are exact. Arithmetic comparisons follow each operator's precision
   and reduction semantics. Complete graph and service measurements determine
@@ -976,7 +975,9 @@ writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. ABI5 uses 24-field completions for every serving operation.
+history. ABI6 completions contain 16 metadata fields plus the package-defined token
+capacity for every serving operation. An omitted or zero
+`completion_token_capacity` resolves to eight; positive values are literal.
 
 Captured operators use b12x's default numerical policy and tuned execution plans.
 MoE reductions may use arrival-ordered atomic additions, so identical graph inputs
@@ -1239,7 +1240,7 @@ manage penalties, grammar masks and request-state updates. Temperature must be
 positive; zero-temperature requests are rejected because greedy decoding
 collapses the model's probability distribution.
 
-Execution ABI 5 uses `sampling_mode="general"` as their sole
+Execution ABI 6 uses `sampling_mode="general"` as their sole
 supported manifest value. Bounded top-k optimization is deferred. Measure
 sampler cost inside the complete graph before changing it; threshold ties
 must never be truncated to a fixed number of candidates.
@@ -1395,10 +1396,10 @@ to earlier tokens cannot reuse a checkpoint for different tokens.
 
 At admission, the scheduler budgets newly captured cache snapshots from the
 loaded snapshot capacity divided by configured maximum concurrency, rounded
-down. A nonempty pool permits at least one capture per request; an empty pool
-permits none. The budget reserves a terminal capture and, when generation can
-continue beyond the prompt and the budget permits, a prompt capture. A single
-output token shares the prompt and terminal endpoint.
+down and capped at eight. A nonempty pool permits at least one capture per
+request; an empty pool permits none. The budget reserves a terminal capture and,
+when generation can continue beyond the prompt and the budget permits, a prompt
+capture. A single output token shares the prompt and terminal endpoint.
 
 The remaining budget selects message checkpoints within the uncached prompt
 suffix. If all eligible boundaries fit, retain them all. Otherwise, place token

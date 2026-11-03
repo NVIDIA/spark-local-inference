@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fixed-context latency measurements of complete captured generation rounds."""
+"""Fixed-context latency measurements of complete captured generation and prefill graphs."""
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -19,16 +19,28 @@ class BenchmarkCase:
     context_tokens: int
 
     def __post_init__(self):
-        if (self.batch not in (1, 2, 4) or self.width != 8
+        if (self.batch not in (1, 2, 4) or self.width not in (8, 16)
                 or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4, W=8, P=B*W and positive context")
+            raise ValueError("round benchmark requires B=1,2,4, W=8,16, P=B*W and positive context")
+
+
+@dataclass(frozen=True)
+class PrefillCase:
+    chunk_tokens: int
+    context_tokens: int
+    batch: int = 1
+
+    def __post_init__(self):
+        if (self.batch != 1 or self.chunk_tokens < 128 or self.chunk_tokens % 128
+                or self.context_tokens < 0 or self.context_tokens % 128):
+            raise ValueError("prefill benchmark requires batch one, a positive 128-aligned chunk and nonnegative 128-aligned context")
 
 
 def summarize_case(case, samples):
     """Use all replay samples equally within a case, and retain seed-local raw times."""
     times = [value for sample in samples for value in sample["times_ms"]]
     if not times or any(not math.isfinite(value) or value <= 0 for value in times):
-        raise ValueError("round latencies must be finite and positive")
+        raise ValueError("graph latencies must be finite and positive")
     ordered = sorted(times)
 
     def quantile(fraction):
@@ -130,19 +142,24 @@ def _prefill(model, runner, layout, case, tokenizer, seed, generation):
     scheduler.generations[:] = [generation - 1] * layout.max_active
     defaults = model.server_config.get("sampling_defaults", {})
     fields = set(SamplingParameters.__dataclass_fields__) - {"seed"}
+    prefill = isinstance(case, PrefillCase)
+    prompt_length = case.context_tokens + (case.chunk_tokens if prefill else 0)
+    output_tokens = 2 if prefill else 2 * case.width
     for lane in range(case.batch):
         sampling = SamplingParameters(seed=(seed + lane) % (1 << 64),
                                       **{key: defaults[key] for key in fields if key in defaults})
-        request = Request(lane + 1, prompt_tokens(tokenizer, case.context_tokens, seed=seed, lane=lane),
-                          2 * case.width, sampling, ignore_eos=True)
+        request = Request(lane + 1, prompt_tokens(tokenizer, prompt_length, seed=seed, lane=lane),
+                          output_tokens, sampling, ignore_eos=True)
         scheduler.submit(request)
-    while (scheduler.queue or any(request.phase != "decode" for request in scheduler.active)):
+    while (scheduler.queue or any(
+            (request.phase != "prefill" or request.consumed < case.context_tokens) if prefill
+            else request.phase != "decode" for request in scheduler.active)):
         prefilling = [request for request in scheduler.active if request.phase == "prefill"]
         if prefilling:
             from ignition.direct.scheduler import Lane
 
             request = prefilling[0]
-            count = min(len(request.prompt) - request.consumed, layout.prefill_chunk)
+            count = min(case.context_tokens - request.consumed, layout.prefill_chunk)
             step = scheduler._step("prefill", count, [Lane(request, request.consumed, count)])
         else:
             step = scheduler.plan()
@@ -167,7 +184,7 @@ def _prefill(model, runner, layout, case, tokenizer, seed, generation):
                     device_pending_token=int(state.pending_token[slot].item()),
                     device_eos_count=int(state.eos_count[slot].item()),
                     device_eos_token_ids=state.eos_token_ids[slot].cpu().tolist()))
-            raise RuntimeError("benchmark prompt completed before its first speculative round: "
+            raise RuntimeError("benchmark prompt completed before its measured graph: "
                                + json.dumps(details, sort_keys=True))
     if len(scheduler.active) != case.batch or any(request.consumed != case.context_tokens
                                                  for request in scheduler.active):
@@ -188,6 +205,19 @@ def _round(scheduler, case):
                                   packed_tokens=case.packed_tokens, draft_tokens=shape[4]))
 
 
+def _prefill_step(scheduler, case):
+    from ignition.direct.scheduler import Lane
+
+    requests = scheduler.active
+    if len(requests) != 1 or requests[0].phase != "prefill" or requests[0].consumed != case.context_tokens:
+        raise RuntimeError("prefill benchmark state does not match the requested prefix")
+    step = scheduler._step("prefill", case.chunk_tokens,
+                           [Lane(requests[0], case.context_tokens, case.chunk_tokens)])
+    if step.width != case.chunk_tokens:
+        raise ValueError("prefill benchmark requires an exact chunk graph without capacity padding")
+    return step
+
+
 def _check_request_state(model, step, records):
     requests = model.benchmark_requests
     for lane in step.lanes:
@@ -200,10 +230,18 @@ def _check_request_state(model, step, records):
                 or int(requests.seed[slot].item()) != request.sampling.seed
                 or int(requests.rng_counter[slot].item()) != len(request.generated)
                 or int(requests.histogram[slot].sum().item()) != len(request.prompt) + len(request.generated)):
-            raise RuntimeError(f"request {request.ident} device state disagrees with round completion")
+            raise RuntimeError(f"request {request.ident} device state disagrees with graph completion")
 
 
 def _check_metadata(model, step, case):
+    if isinstance(case, PrefillCase):
+        metadata = model.benchmark_prefills[step.graph]
+        if (metadata.live_counts.cpu().tolist() != [case.chunk_tokens, 1]
+                or metadata.starts.cpu().tolist() != [case.context_tokens]
+                or metadata.lengths.cpu().tolist() != [case.chunk_tokens]
+                or metadata.query_start_loc.cpu().tolist() != [0, case.chunk_tokens]):
+            raise RuntimeError("prefill metadata does not describe the exact benchmark chunk")
+        return
     forward = model.benchmark_rounds[step.graph]
     for role, metadata, width in (("target", forward.metadata, case.width),
                                   ("draft", forward.draft_metadata, forward.draft_inputs.shape[1])):
@@ -226,6 +264,29 @@ def _check_metadata(model, step, case):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
 
+def acceptance_observation(forward):
+    """Read one input/RNG draw; restored timing replays are not additional observations."""
+    _, _, verification, commit = forward.operations
+    acceptance = verification.output
+    offered = acceptance.offered_drafts.cpu().tolist()
+    accepted = acceptance.accepted_drafts.cpu().tolist()
+    committed = commit.accepted_drafts.cpu().tolist()
+    emitted = commit.emitted_count.cpu().tolist()
+    tokens = commit.emitted_ids.cpu().tolist()
+    survival = acceptance.survival.cpu().tolist()
+    valid = acceptance.valid.cpu().tolist()
+    return dict(
+        observations_per_request=1,
+        survival_semantics="cumulative acceptance probability along the sampled proposal chain",
+        requests=[dict(valid=bool(valid[row]), offered_draft_count=int(count),
+                       accepted_draft_count=int(accepted[row]),
+                       committed_draft_count=int(committed[row]), emitted_count=int(emitted[row]),
+                       emitted_token_ids=tokens[row][:emitted[row]],
+                       proposal_survival=survival[row][:count])
+                  for row, count in enumerate(offered)],
+    )
+
+
 def measurement_result(cases, measurements, *, warmup, repetitions, seeds, status, failure=None):
     results = []
     for case, samples in zip(cases, measurements):
@@ -235,7 +296,8 @@ def measurement_result(cases, measurements, *, warmup, repetitions, seeds, statu
         summary = (summarize_case(case, samples) if any(sample["times_ms"] for sample in samples)
                    else dict(asdict(case), samples=samples))
         results.append(dict(summary, complete=complete))
-    result = dict(metric="cuda_graph_round_latency_ms", status=status, ignore_eos=True,
+    metric = "cuda_graph_prefill_latency_ms" if isinstance(cases[0], PrefillCase) else "cuda_graph_round_latency_ms"
+    result = dict(metric=metric, status=status, ignore_eos=True,
                   warmup=warmup, repetitions=repetitions, seeds=list(seeds), cases=results)
     if status == "complete":
         if len(results) != len(cases) or not all(case["complete"] for case in results):
@@ -249,7 +311,7 @@ def measurement_result(cases, measurements, *, warmup, repetitions, seeds, statu
 
 
 def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
-    """Measure full captured rounds after real prefill, restoring state before every replay."""
+    """Measure captured graphs at a real prefix, restoring state before every replay."""
     import torch
 
     from ignition.direct.executor import StepRunner
@@ -264,8 +326,13 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
         raise ValueError("model preparation did not declare complete benchmark state")
     layout = Layout.of(model)
     for case in cases:
-        if case.context_tokens + 2 * case.width > layout.context or case.batch > layout.max_active:
+        required = case.chunk_tokens + 2 if isinstance(case, PrefillCase) else 2 * case.width
+        if case.context_tokens + required > layout.context or case.batch > layout.max_active:
             raise ValueError(f"benchmark case exceeds prepared capacities: {case}")
+        if isinstance(case, PrefillCase):
+            if ("prefill", 1, case.chunk_tokens) not in layout.graphs or case.chunk_tokens != layout.prefill_chunk:
+                raise ValueError(f"benchmark case has no exact prepared prefill chunk: {case}")
+            continue
         _round_shape = ("speculative", case.batch, case.width, case.packed_tokens)
         if sum(shape[:4] == _round_shape for shape in layout.packed_shapes) != 1:
             raise ValueError(f"benchmark case has no unique prepared round: {case}")
@@ -288,7 +355,7 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                 for iteration in range(-1, warmup + repetitions):
                     scheduler = deepcopy(baseline, {id(layout): layout})
                     snapshot.restore(runner.stream)
-                    step = _round(scheduler, case)
+                    step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
                     allocated = torch.cuda.memory_allocated(runner.device)
                     elapsed = runner.run(_message(scheduler, step))
                     if iteration >= warmup:
@@ -297,8 +364,14 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                         raise RuntimeError("captured benchmark replay changed allocated CUDA memory")
                     records = _complete(model, runner, scheduler, step, elapsed)
                     _check_request_state(model, step, records)
+                    if isinstance(case, PrefillCase) and any(
+                            lane.request.consumed != case.context_tokens + case.chunk_tokens
+                            or len(lane.request.generated) != 1 for lane in step.lanes):
+                        raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
                     if iteration == -1:
                         _check_metadata(model, step, case)
+                        if not isinstance(case, PrefillCase):
+                            samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
                 if progress is not None:
                     progress(result("running"))
                 snapshot.restore(runner.stream)

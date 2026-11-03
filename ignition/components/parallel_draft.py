@@ -6,8 +6,9 @@
 
 import torch
 
+from .candidate_selector import PreparedCandidateSelector
 from .collectives import PreparedAllReduce
-from .draft_sampling import PreparedDraftDistribution, PreparedDraftBlockBroadcast
+from .draft_sampling import DRAFT_CANDIDATES, PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, PreparedBatch
 from .speculation import (
     DRAFT_RNG_DOMAIN,
@@ -176,6 +177,8 @@ class PreparedParallelDraftRound:
 
             self.markov = PreparedMarkovEmbedding(o.weights, self.markov_token,
                                                   session=o.session, name=name + ".markov")
+        self.shortlisted_selector = (self.selector if self.markov is None
+            and isinstance(self.selector, PreparedCandidateSelector) else None)
         self.before = torch.zeros(b, dtype=torch.int64, device=device)
         self.active = torch.zeros(b, dtype=torch.bool, device=device)
         self.candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
@@ -237,7 +240,9 @@ class PreparedParallelDraftRound:
             target.prepare()
         for index, proposal in enumerate(proposals):
             bias = None if self.markov is None else getattr(self.markov, "logits", None)
-            if (self.draft is not None and self.selector is None
+            if self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
+                proposal.bind_shortlist(self.shortlisted_selector.ids[:, index + o.logit_offset])
+            elif (self.draft is not None and self.selector is None
                     and (self.markov is None or bias is not None)):
                 block = self.draft_inputs.shape[1]
                 proposal.bind_logits(self.draft.scratch.logits.view(b, block, -1)[:, index + o.logit_offset],
@@ -292,17 +297,21 @@ class PreparedParallelDraftRound:
         prepare_sampling_broadcasts(broadcast_proposals, verify, collectives=o.collectives, session=o.session,
                                     name=self.name, buffers=self.buffers,
                                     result_runtime=getattr(o, "result_runtime", None))
-        commit = PreparedSpeculativeCommit(
+        from .speculation import PreparedSpeculativeStateCommit
+
+        private = getattr(o, "study_width", None) is not None
+        commit_type = PreparedSpeculativeStateCommit if private else PreparedSpeculativeCommit
+        commit = commit_type(
             o.requests,
             verify.output,
             self.candidates,
             o.inputs.row_slot_ids[:b],
             o.inputs.row_generations[:b],
             o.inputs.live_rows,
-            o.completion,
+            None if private else o.completion,
             o.frame,
             o.sequence,
-            logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng,
+            logits=None if private else self.decoder.scratch.logits.view(b, w, -1), rng=o.rng,
             draft_context_lag=0,
             token_limits=o.inputs.query_lengths[:b],
         )
@@ -388,6 +397,8 @@ class PreparedParallelDraftRound:
                 o.inputs.live_rows,
             )
             self.draft()
+            if self.shortlisted_selector is not None:
+                self.shortlisted_selector.prepare_shortlists(self.draft.scratch.logits.view(b, block, -1))
             self.markov_token.copy_(torch.where(self.active, self.candidates[:, 0], 0))
             if self.full_proposal is not None:
                 self.full_proposal()
@@ -405,7 +416,9 @@ class PreparedParallelDraftRound:
                     )
                     if self.markov is not None:
                         self.logits[:, 0].add_(self.markov())
-                    if self.selector is not None:
+                    if self.shortlisted_selector is not None:
+                        self.shortlisted_selector.apply_shortlist(self.logits[:, 0], self.markov_token, i + o.logit_offset)
+                    elif self.selector is not None:
                         self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
                 if observer is not None:
                     observer.record_embedding(i, self.markov.embedding)

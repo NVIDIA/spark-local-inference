@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -72,6 +72,8 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 8:
+            raise ValueError("Muse Spark draft model supports at most seven draft tokens")
         if len(self.devices) != 8 or len(set(self.devices)) != 8 or any(d < 0 for d in self.devices):
             raise ValueError("Muse Spark preparation requires eight distinct GPUs")
         request_capacity(self.max_active)
@@ -102,6 +104,10 @@ class PreparationConfig:
     def decode_samples(self):
         return max((batch * width for batch, width, _ in self.speculative_round_shapes),
                    default=request_capacity(self.max_active))
+
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width, _ in self.speculative_round_shapes), default=1)
 
 
 @torch.no_grad()
@@ -145,7 +151,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         # Reduce each routed expert output before the replicated mixture finalizer.
         expert_width = weights.config.text["moe_hidden_size"]

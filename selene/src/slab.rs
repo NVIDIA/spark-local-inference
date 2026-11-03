@@ -95,12 +95,34 @@ pub struct RankPart {
 }
 
 impl RankPart {
+    fn offset(&self, address: usize) -> Option<usize> {
+        self.range
+            .contains(&address)
+            .then(|| address - self.identity)
+    }
+
+    /// Resolve a packed share in a registered, contiguous pool.
+    pub fn replicated_page(&self, address: usize, rank_offset: u64) -> Result<u64> {
+        let offset = self.offset(address).filter(|_| {
+            self.part_bytes == self.record_bytes && address.is_multiple_of(BLOCK_BYTES as usize)
+        });
+        let Some(offset) = offset else {
+            return Err(invalid(
+                "replicated share is outside a contiguous transfer pool",
+            ));
+        };
+        Ok((self.base + offset) as u64 - rank_offset)
+    }
+
+    pub fn record_bytes(&self) -> u64 {
+        self.record_bytes as u64
+    }
+
     /// Resolve this rank's part of a slot, rejecting misaligned identities.
     pub fn page(&self, slot: usize) -> Result<Option<u64>> {
-        if !self.range.contains(&slot) {
+        let Some(offset) = self.offset(slot) else {
             return Ok(None);
-        }
-        let offset = slot - self.identity;
+        };
         let index = offset / self.record_bytes;
         if offset.is_multiple_of(self.record_bytes) && index < self.count {
             Ok(Some((self.base + index * self.part_bytes) as u64))

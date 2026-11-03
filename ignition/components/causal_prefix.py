@@ -80,8 +80,8 @@ class PreparedCausalPrefixAllocation:
         if confidence.ndim != 2 or confidence.dtype != torch.float32:
             raise ValueError("prefix confidence requires a two-dimensional FP32 tensor")
         batch, depth = confidence.shape
-        if not 1 <= batch <= request_capacity <= 64 or not 1 <= depth <= 7:
-            raise ValueError("prefix allocation requires 1 <= batch <= request_capacity <= 64 and 1 <= depth <= 7")
+        if not 1 <= batch <= request_capacity <= 64 or not 1 <= depth < (1 << 31) - 1:
+            raise ValueError("prefix allocation requires 1 <= batch <= request_capacity <= 64 and positive depth within Int32 token lengths")
         if not isinstance(token_capacity, int) or not 0 <= token_capacity <= 2147483647:
             raise ValueError("prefix token capacity must be a nonnegative Int32 value")
         if confidence.stride(0) <= 0 or confidence.stride(1) <= 0:

@@ -86,7 +86,7 @@ pub(super) struct Candidate {
     pub duration_ns: u64,
     pub rate: ValueRate,
     pub feedback: bool,
-    pub host_lengths: Option<[u8; REQUEST_LANES]>,
+    pub host_lengths: Option<[usize; REQUEST_LANES]>,
 }
 
 impl Candidate {
@@ -103,7 +103,19 @@ impl Candidate {
 
 impl RequestScheduler {
     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
-        let rows = |candidate: Candidate| {
+        self.dominates_padding_with(&smaller, &larger,
+            || self.candidate_round_lengths(&smaller), || self.candidate_round_lengths(&larger))
+    }
+
+    fn candidate_round_lengths(&self, candidate: &Candidate) -> [usize; REQUEST_LANES] {
+        candidate.host_lengths.unwrap_or_else(||
+            self.round_lengths(candidate.mask, candidate.batch, candidate.draft_tokens,
+                candidate.capacity, candidate.packed_token_capacity))
+    }
+
+    fn dominates_padding_with(&self, smaller: &Candidate, larger: &Candidate,
+        short: impl FnOnce() -> [usize; REQUEST_LANES], long: impl FnOnce() -> [usize; REQUEST_LANES]) -> bool {
+        let rows = |candidate: &Candidate| {
             if candidate.packed_token_capacity != 0 {
                 candidate.packed_token_capacity
             } else if candidate.kind == GraphKind::Mixed {
@@ -112,7 +124,7 @@ impl RequestScheduler {
                 candidate.batch * candidate.capacity
             }
         };
-        let physical = |candidate: Candidate| [candidate.batch, candidate.capacity,
+        let physical = |candidate: &Candidate| [candidate.batch, candidate.capacity,
             candidate.prefill_capacity, rows(candidate), candidate.draft_tokens];
         let left = physical(smaller);
         let right = physical(larger);
@@ -122,12 +134,8 @@ impl RequestScheduler {
             return false;
         }
         if smaller.kind == GraphKind::Speculative {
-            let short = smaller.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
-                self.round_lengths(smaller.mask, smaller.batch, smaller.draft_tokens,
-                    smaller.capacity, smaller.packed_token_capacity));
-            let long = larger.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
-                self.round_lengths(larger.mask, larger.batch, larger.draft_tokens,
-                    larger.capacity, larger.packed_token_capacity));
+            let short = short();
+            let long = long();
             let gpu = self.gpu_prefix_allocation(smaller.batch, smaller.draft_tokens, smaller.capacity,
                 smaller.packed_token_capacity);
             if gpu && smaller.packed_token_capacity != larger.packed_token_capacity
@@ -156,10 +164,32 @@ impl RequestScheduler {
     }
 
     pub(super) fn prune_padding(&self, candidates: &mut [Candidate]) -> usize {
+        // Only candidates with the same kind, cohort, and prefill row can dominate one
+        // another. Domination does not depend on candidate order, and each candidate's
+        // round lengths are estimated at most once.
+        let dominated = {
+            let candidates = &*candidates;
+            let group = |index: &usize| {
+                let candidate = &candidates[*index];
+                (candidate.kind as u8, candidate.mask, candidate.prefill_slot)
+            };
+            let mut order: Vec<_> = (0..candidates.len()).collect();
+            order.sort_unstable_by_key(group);
+            let lengths: Vec<std::cell::OnceCell<[usize; REQUEST_LANES]>> =
+                candidates.iter().map(|_| Default::default()).collect();
+            let length = |index: usize| *lengths[index].get_or_init(|| self.candidate_round_lengths(&candidates[index]));
+            let mut dominated = vec![false; candidates.len()];
+            for peers in order.chunk_by(|a, b| group(a) == group(b)) {
+                for &index in peers {
+                    dominated[index] = peers.iter().any(|&other| self.dominates_padding_with(
+                        &candidates[other], &candidates[index], || length(other), || length(index)));
+                }
+            }
+            dominated
+        };
         let mut retained = 0;
-        for index in 0..candidates.len() {
-            let candidate = candidates[index];
-            if !candidates.iter().copied().any(|other| self.dominates_padding(other, candidate)) {
+        for (index, dominated) in dominated.into_iter().enumerate() {
+            if !dominated {
                 candidates.swap(index, retained);
                 retained += 1;
             }
@@ -278,7 +308,7 @@ impl RequestScheduler {
         }
         if request.phase == RequestPhase::Decode {
             request.scheduled_consumed < self.limits.max_sequence_tokens as u64
-                && request.generated_tokens as usize + self.pending_token_ceiling(request.handle)
+                && request.generated_tokens as usize + self.pending_ceiling(request)
                     < request.max_new_tokens as usize
                 && self.fits_next_rounds(request)
         } else {
@@ -442,6 +472,7 @@ impl RequestScheduler {
                 }
             }
         } else {
+            let mut curve = None;
             for batch in crate::execution::BATCH_CAPACITIES
                 .into_iter()
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
@@ -459,7 +490,8 @@ impl RequestScheduler {
                     for &width in &self.speculative_catalog[batch.ilog2() as usize] {
                         if let Some(ns) = self.speculative_duration(r, batch, width)
                         {
-                            let expected = self.expected_speculative_tokens(r, self.speculative_tokens(r, width));
+                            let curve = curve.get_or_insert_with(|| self.powered_curve(r, false));
+                            let expected = super::rounds::forecast_tokens(curve, self.speculative_tokens(r, width));
                             consider(ns, value.decode(expected, ns as f64 / 1e6));
                         }
                     }
@@ -1126,7 +1158,7 @@ impl RequestScheduler {
 
     fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
         let lengths = (candidate.packed_token_capacity != 0).then(||
-            candidate.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+            candidate.host_lengths.unwrap_or_else(||
                 self.round_lengths_optimistic(candidate.mask, candidate.batch, candidate.draft_tokens,
                     candidate.capacity, candidate.packed_token_capacity, origin.is_acceptance())));
         let mut lanes = Vec::with_capacity(candidate.mask.count_ones() as usize);

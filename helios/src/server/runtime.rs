@@ -443,6 +443,7 @@ impl ModelRuntime {
                 config.limits.pages,
                 config.contract.cache.page_tokens,
                 config.decode_weight_bytes,
+                config.completion_token_capacity,
             );
         metrics.history_drafts = config.history_drafts;
         metrics.engram = manifest
@@ -1491,7 +1492,7 @@ impl<'a> Worker<'a> {
                         .min(lane.tokens as u64);
                 } else if record.generated_tokens > live.generated_tokens as i64 {
                     verification_rounds += 1;
-                    if let Some(vector) = record.vector {
+                    if let Some(vector) = record.vector.as_ref() {
                         let offered =
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
                         verification_drafts += offered as u64;
@@ -1968,6 +1969,11 @@ impl<'a> Worker<'a> {
             == crate::scheduler::speculation::ProposalSource::Copy
             && outstanding == 0
         {
+            let prepared_copy_capacity = self.inputs.as_ref()
+                .ok_or("copy proposals require prepared inputs")?
+                .copy_proposal_capacity(self.config.contract.vocabulary);
+            let copy_capacity = self.config.speculative_widths.iter().copied().max()
+                .unwrap_or(1).saturating_sub(1).min(prepared_copy_capacity);
             for slot in 0..self.active.len() {
                 let Some(request) = self.active[slot].as_ref() else {
                     continue;
@@ -1977,7 +1983,7 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { 7 }),
+                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { copy_capacity }),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
                     &self.config.eos_token_ids,
@@ -2590,11 +2596,14 @@ fn cancel_stopped(
 }
 
 fn prepare_copy_proposal(
-    (mut ids, mut count): ([i64; 7], usize),
+    (mut ids, mut count): (Vec<i64>, usize),
     consumed: u64,
     grammar: Option<&crate::grammar::RequestGrammar>,
     eos_ids: &[u32],
 ) -> Result<crate::scheduler::speculation::CopyProposal> {
+    if count > ids.len() || count > crate::scheduler::speculation::COPY_DRAFT_CAPACITY {
+        return Err("copied-token count exceeds proposal storage".into());
+    }
     if let Some(end) = ids[..count]
         .iter()
         .position(|id| eos_ids.contains(&(*id as u32)))
@@ -2755,13 +2764,13 @@ mod tests {
 
     #[test]
     fn copy_preparation_trims_eos_and_preserves_empty_proposals() {
-        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
+        let copy = prepare_copy_proposal((vec![11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
         assert_eq!(copy.count, 1);
-        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1]);
+        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
         assert_eq!(copy.consumed, 11);
         assert!(copy.grammar_masks.is_empty());
-        let empty = prepare_copy_proposal(([-1; 7], 0), 11, None, &[12]).unwrap();
-        assert_eq!((empty.count, empty.tokens), (0, [-1; 7]));
+        let empty = prepare_copy_proposal((vec![-1; 15], 0), 11, None, &[12]).unwrap();
+        assert_eq!((empty.count, empty.tokens), (0, vec![-1; 15]));
     }
 
     #[test]
@@ -2779,7 +2788,7 @@ mod tests {
             let fence = Fence(sequence * 2);
             scheduler.commit(&step, fence).unwrap();
             observe_submission(metrics, scheduler, &step, outstanding).unwrap();
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             for lane in &step.lanes {
                 let live = scheduler.request(lane.request).unwrap();
                 let samples = matches!(step.kind, GraphKind::Prefill | GraphKind::Decode);
@@ -2801,7 +2810,7 @@ mod tests {
                 assert_eq!(capture.kind, GraphKind::Snapshot);
                 let copy_fence = Fence(fence.0 + 1);
                 scheduler.commit(&capture, copy_fence).unwrap();
-                let mut copies = [CompletionRecord::default(); 4];
+                let mut copies = vec![CompletionRecord::default(); 4];
                 for lane in &capture.lanes {
                     let live = scheduler.request(lane.request).unwrap();
                     copies[lane.request.slot as usize] = CompletionRecord {
@@ -2821,7 +2830,7 @@ mod tests {
             step
         }
 
-        let metrics = super::super::metrics::Metrics::default();
+        let metrics = super::super::metrics::Metrics::new(0, 0, 0, 16);
         let mut scheduler = RequestScheduler::new(
             [5; 32],
             SchedulerLimits {
@@ -2833,6 +2842,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,
@@ -2952,7 +2962,7 @@ mod tests {
             first_token: std::cell::Cell::new(Some(first_token)),
             cancelled: cancelled.clone(),
             failure: failure.clone(),
-            metrics: Arc::new(super::super::metrics::Metrics::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
             host_lookup: true,
             readmitted: false,
@@ -3072,6 +3082,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 6,
                 page_tokens: 64,
@@ -3153,7 +3164,7 @@ mod tests {
             assert_eq!(step.kind, expected);
             scheduler.commit(&step, Fence(sequence)).unwrap();
             let sampled = expected != GraphKind::Init;
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             records[failed.slot as usize] = CompletionRecord {
                 generation: failed.generation as i64,
                 submission_sequence: sequence as i64,
@@ -3178,7 +3189,7 @@ mod tests {
                 failed,
                 crate::scheduler::speculation::CopyProposal {
                     consumed: 1,
-                    tokens: [1, 2, 3, -1, -1, -1, -1],
+                    tokens: vec![1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                     count,
                     grammar_masks,
                 },
@@ -3196,7 +3207,7 @@ mod tests {
             .unwrap()
             .pages()
             .collect::<Vec<_>>();
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         records[failed.slot as usize] = CompletionRecord {
             generation: failed.generation as i64,
             submission_sequence: 4,
@@ -3210,7 +3221,7 @@ mod tests {
                 accepted_drafts: 2,
                 draft_cache_consumed: -1,
                 verification_width: 4,
-                tokens: [4, 1, 2, -1, -1, -1, -1, -1],
+                tokens: vec![4, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             }),
             ..Default::default()
@@ -3354,7 +3365,7 @@ mod tests {
         assert_eq!(scheduler.stats().retiring_slots, 1);
         assert_eq!(scheduler.free_page_count(), free_pages);
         assert_eq!(scheduler.free_snapshot_count(), free_snapshots);
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         records[handle.slot as usize] = CompletionRecord {
             generation: handle.generation as i64,
             submission_sequence: 1,
@@ -3596,6 +3607,7 @@ mod tests {
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,

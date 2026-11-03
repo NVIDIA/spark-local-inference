@@ -1,6 +1,16 @@
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
     Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
 
+[ ] After merging dev/qwen27b in Flare and FlashInfer, evaluate combined MXFP8
+    GDN QKV/Z/B/A projections for Qwen3.8 Flash Next through shared loading and
+    execution components. Preserve TP partitioning and compare complete graph
+    latency against the separate QKV/Z and B/A projections with stream overlap.
+
+[ ] After merging dev/qwen27b in Flare and FlashInfer, integrate shared fused
+    head normalization/RoPE and output gating into Qwen3.8 Flash Next's QSA
+    wrapper where arithmetic and layouts match. Preserve sparse selection,
+    cache-only execution, and TP behavior; validate replay and graph latency.
+
 [ ] Validate full-width INT64 expert IDs in b12x W4A16 route packing,
     reductions, and MoE calibration. These paths narrow IDs before range
     checks; add captured replay coverage for IDs outside the INT32 range.
@@ -159,3 +169,8 @@
 [ ] Reduce the host-bridge cost of the 512-thread selected barrier gather for
     512-byte rows at 1 MiB per rank: 20.1% above the best measured geometry.
     Raw width comparisons: ~/benchmarks/gather-byte-ladder/width-*.jsonl.
+
+[ ] Validate the shared MXFP8 projection FP32 split-reduction default on Qwen3.8
+    MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
+    Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
+    shared operator bounds. Checkpoint coverage for these other consumers remains pending.

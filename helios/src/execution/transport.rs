@@ -12,7 +12,7 @@ use crate::{
     cuda::{BATCH_BYTES, BATCH_ENTRIES, Event, PinnedHost, Stream},
 };
 
-use super::{ExecutionManifest, GraphKind, MAX_OUTPUT_TOKENS, REQUEST_LANES, VECTOR_RECORD_FIELDS, ReadinessIntervals};
+use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
 pub struct Upload<'a> {
     pub buffer: &'a str,
@@ -20,7 +20,7 @@ pub struct Upload<'a> {
     pub bytes: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenVector {
     pub emitted_count: i64,
     pub offered_drafts: i64,
@@ -29,7 +29,7 @@ pub struct TokenVector {
     pub model_reserved: i64,
     pub draft_cache_consumed: i64,
     pub verification_width: i64,
-    pub tokens: [i64; MAX_OUTPUT_TOKENS],
+    pub tokens: Vec<i64>,
 }
 impl Default for TokenVector {
     fn default() -> Self {
@@ -41,11 +41,11 @@ impl Default for TokenVector {
             model_reserved: -1,
             draft_cache_consumed: 0,
             verification_width: 1,
-            tokens: [-1; MAX_OUTPUT_TOKENS],
+            tokens: vec![-1; DEFAULT_COMPLETION_TOKEN_CAPACITY],
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionRecord {
     pub generation: i64,
     pub submission_sequence: i64,
@@ -61,15 +61,15 @@ pub struct CompletionRecord {
 impl CompletionRecord {
     pub(crate) fn validate_vector(&self) -> Result<()> {
         if self.status != 0 {
-            if let Some(v) = self.vector {
-                if !(1..=8).contains(&v.verification_width)
+            if let Some(v) = &self.vector {
+                if !(1..=v.tokens.len() as i64).contains(&v.verification_width)
                     || !(0..=v.verification_width).contains(&v.emitted_count)
                     || !(0..v.verification_width).contains(&v.offered_drafts)
                     || v.accepted_drafts < v.emitted_count.saturating_sub(1).max(0)
                     || v.accepted_drafts > v.emitted_count
                     || v.accepted_drafts > v.offered_drafts
                     || v.copy_offered_mask < 0
-                    || v.copy_offered_mask >= (1 << v.offered_drafts)
+                    || (v.offered_drafts < 63 && (v.copy_offered_mask as u64) >= (1u64 << v.offered_drafts))
                     || v.draft_cache_consumed < -1
                     || v.tokens[..v.emitted_count as usize]
                         .iter()
@@ -106,7 +106,7 @@ impl CompletionRecord {
             self.error_code,
             self.reserved,
         ];
-        let v = self.vector.expect("completion serialization requires a token vector");
+        let v = self.vector.as_ref().expect("completion serialization requires a token vector");
         values.extend([
             v.emitted_count,
             v.offered_drafts,
@@ -117,34 +117,38 @@ impl CompletionRecord {
             0,
             v.verification_width,
         ]);
-        values.extend(v.tokens);
+        values.extend_from_slice(&v.tokens);
         values
     }
 }
-/// Inline completion storage bounded by the largest supported request capacity.
-#[derive(Debug, Clone, Copy)]
+/// Completion storage sized to the prepared request and token capacities.
+#[derive(Debug, Clone)]
 pub struct CompletionRecords {
-    records: [CompletionRecord; REQUEST_LANES],
-    len: usize,
+    records: Vec<CompletionRecord>,
 }
 
 impl std::ops::Deref for CompletionRecords {
     type Target = [CompletionRecord];
     fn deref(&self) -> &Self::Target {
-        &self.records[..self.len]
+        &self.records
     }
 }
 impl std::ops::DerefMut for CompletionRecords {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.records[..self.len]
+        &mut self.records
     }
 }
 impl<const N: usize> From<[CompletionRecord; N]> for CompletionRecords {
     fn from(values: [CompletionRecord; N]) -> Self {
         assert!(N <= REQUEST_LANES);
-        let mut records = [CompletionRecord::default(); REQUEST_LANES];
-        records[..N].copy_from_slice(&values);
-        Self { records, len: N }
+        Self { records: Vec::from(values) }
+    }
+}
+
+impl From<Vec<CompletionRecord>> for CompletionRecords {
+    fn from(records: Vec<CompletionRecord>) -> Self {
+        assert!(records.len() <= REQUEST_LANES);
+        Self { records }
     }
 }
 
@@ -167,24 +171,28 @@ pub struct FrameCompletion {
     pub graph_index: usize,
     pub timing: ExecutionTiming,
     pub records: CompletionRecords,
-    pub logprobs: Option<Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]>>,
+    pub logprobs: Option<Vec<Vec<Option<TokenLogprobs>>>>,
     pub prompt_logprobs: Option<Vec<Option<PromptLogprobs>>>,
     /// Confidence by proposal batch row; rows and columns outside the graph shape are zero.
-    pub proposal_confidence: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+    pub proposal_confidence: Option<Vec<Vec<f32>>>,
     /// Verification prefix survival by physical slot; -1 marks an unobserved prefix.
-    pub speculative_survival: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+    pub speculative_survival: Option<Vec<Vec<f32>>>,
 }
 
-pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[CompletionRecord]) -> Result<()> {
-    if rows.len() < records.len() || rows.len() > REQUEST_LANES {
+pub(crate) fn validate_speculative_survival(rows: &[Vec<f32>], records: &[CompletionRecord]) -> Result<()> {
+    if rows.len() != records.len() || rows.len() > REQUEST_LANES {
         return Err("speculative survival does not cover completion slots".into());
     }
     for (slot, row) in rows.iter().enumerate() {
+        if records.get(slot).and_then(|record| record.vector.as_ref())
+            .is_some_and(|vector| row.len() + 1 != vector.tokens.len()) {
+            return Err("speculative survival width differs from completion capacity".into());
+        }
         let offered = records.get(slot).filter(|record| matches!(record.status, 1 | 2))
-            .and_then(|record| record.vector).map_or(0, |vector| {
+            .and_then(|record| record.vector.as_ref()).map_or(0, |vector| {
                 if vector.emitted_count > vector.accepted_drafts { vector.offered_drafts }
                 else { vector.accepted_drafts.min(vector.offered_drafts) }
-            }).clamp(0, 7) as usize;
+            }).clamp(0, row.len() as i64) as usize;
         let mut bound = 1.0;
         let mut missing = false;
         for (depth, &value) in row.iter().enumerate() {
@@ -820,7 +828,7 @@ impl GraphExecutor {
                     frame.logprobs.as_ref().unwrap().enqueue_pitched_copy(
                         &resources.copy, b.address + index * b.nbytes / 2,
                         b.shape[3] * 4, (2 + 2 * logprob_width) * 4,
-                        self.manifest.request_capacity() * MAX_OUTPUT_TOKENS,
+                        self.manifest.request_capacity() * self.manifest.completion_token_capacity,
                     )?;
                 }
                 if prompt_rows != 0 {
@@ -923,7 +931,7 @@ impl GraphExecutor {
                 Readback::DeviceCopy(_) => 2 + 2 * pending.logprob_width,
             };
             let bytes = unsafe { readback.bytes() };
-            let nbytes = records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<f32>();
+            let nbytes = records.len() * self.manifest.completion_token_capacity * fields * size_of::<f32>();
             match decode_logprobs(
                 &bytes[..nbytes],
                 &records,
@@ -973,9 +981,9 @@ impl GraphExecutor {
         };
         let speculative_survival = if reads_speculative_survival(&self.manifest.graphs[pending.graph_index]) {
             frame.survival.as_ref().map(|readback| {
-                let mut rows = [[-1.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
+                let mut rows = vec![vec![-1.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 // SAFETY: The completion transfer protects this frame's retained feedback bytes.
-                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact(7 * 4)) {
+                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact((self.manifest.completion_token_capacity - 1) * 4)) {
                     for (value, bytes) in row.iter_mut().zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
@@ -1025,7 +1033,7 @@ impl GraphExecutor {
             speculative_survival,
             proposal_confidence: if self.manifest.graphs[pending.graph_index].confidence_width > 0
             {
-                let mut confidence = [[0.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
+                let mut confidence = vec![vec![0.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 let graph = &self.manifest.graphs[pending.graph_index];
                 for (row, bytes) in confidence
                     .iter_mut()
@@ -1300,8 +1308,8 @@ pub(super) fn decode_records(
     fields: usize,
 ) -> Result<CompletionRecords> {
     if !(1..=REQUEST_LANES).contains(&capacity)
-        || fields != VECTOR_RECORD_FIELDS
-        || bytes.len() != capacity * fields * 8
+        || fields <= COMPLETION_METADATA_FIELDS
+        || capacity.checked_mul(fields).and_then(|n| n.checked_mul(8)) != Some(bytes.len())
     {
         return Err(Error::execution(
             ExecutionError::Completion,
@@ -1309,11 +1317,10 @@ pub(super) fn decode_records(
         ));
     }
     let mut records = CompletionRecords {
-        records: [CompletionRecord::default(); REQUEST_LANES],
-        len: capacity,
+        records: vec![CompletionRecord::default(); capacity],
     };
-    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(VECTOR_RECORD_FIELDS * 8)) {
-        let mut fields = [0i64; VECTOR_RECORD_FIELDS];
+    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(fields * 8)) {
+        let mut fields = vec![0i64; fields];
         for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(8)) {
             *field = i64::from_le_bytes(bytes.try_into().unwrap());
         }
@@ -1334,7 +1341,7 @@ pub(super) fn decode_records(
                 model_reserved: fields[12],
                 draft_cache_consumed: fields[13],
                 verification_width: fields[15],
-                tokens: fields[16..24].try_into().unwrap(),
+                tokens: fields[COMPLETION_METADATA_FIELDS..].to_vec(),
             }),
         };
         if record.status != 0 && fields[14] != 0 {
@@ -1370,20 +1377,21 @@ pub(super) fn decode_logprobs(
     fields: usize,
     requested: u64,
     selections: &[Vec<u32>],
-) -> Result<Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]>> {
+) -> Result<Vec<Vec<Option<TokenLogprobs>>>> {
+    let token_capacity = records.first().and_then(|r| r.vector.as_ref()).map_or(DEFAULT_COMPLETION_TOKEN_CAPACITY, |v| v.tokens.len());
     if !(1..=super::MAX_TOP_LOGPROBS).contains(&k)
         || fields < 2 + 2 * k
         || fields > super::LOGPROB_FIELDS
         || fields % 2 != 0
-        || bytes.len() != records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<i32>()
+        || bytes.len() != records.len() * token_capacity * fields * size_of::<i32>()
     {
         return Err(Error::execution(
             ExecutionError::Completion,
             "generation logprob frame extent mismatch",
         ));
     }
-    let mut result: Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]> = (0..records.len())
-        .map(|_| std::array::from_fn(|_| None))
+    let mut result: Vec<Vec<Option<TokenLogprobs>>> = (0..records.len())
+        .map(|_| vec![None; token_capacity])
         .collect();
     for (slot, record) in records
         .iter()
@@ -1391,22 +1399,22 @@ pub(super) fn decode_logprobs(
         .filter(|(slot, r)| matches!(r.status, 1 | 2) && requested & (1 << slot) != 0)
     {
         let count = record
-            .vector
+            .vector.as_ref()
             .map_or(usize::from(record.token_id >= 0), |v| {
                 v.emitted_count as usize
             });
-        if count > MAX_OUTPUT_TOKENS {
+        if count > token_capacity {
             return Err("generation logprob emitted count exceeds the frame".into());
         }
         for position in 0..count {
-            let start = (slot * MAX_OUTPUT_TOKENS + position) * fields * size_of::<i32>();
+            let start = (slot * token_capacity + position) * fields * size_of::<i32>();
             let int = |at: usize| {
                 let offset = start + at * size_of::<i32>();
                 i32::from_ne_bytes(bytes[offset..offset + size_of::<i32>()].try_into().unwrap())
             };
             let float = |at| f32::from_bits(int(at) as u32);
             let expected = record
-                .vector
+                .vector.as_ref()
                 .map_or(record.token_id, |v| v.tokens[position]);
             if int(0) < 0 || i64::from(int(0)) != expected || float(1).is_nan() {
                 return Err("generated token is missing its raw logprob record".into());

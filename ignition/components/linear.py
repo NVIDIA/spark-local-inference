@@ -161,12 +161,13 @@ class QuantizedProjection:
         session: PreparationSession,
         name: str,
         activation_mode: str = "quantized",
+        source_activation: str = "identity",
         bias: torch.Tensor | None = None,
         workspace: ScratchArena | torch.Tensor | None = None,
         mxfp8_min_amax: float | None = None,
         encoded=None,
         rhs_prefetch_ready: bool = False,
-        allow_bf16_atomic_reduction: bool = True,
+        allow_bf16_atomic_reduction: bool | None = None,
         buffers=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
@@ -176,6 +177,11 @@ class QuantizedProjection:
         _validate_bias(bias, out_features=weight.out_features, out_dtype=output.dtype, device=source.device)
         if bias is not None and _overlap(output, bias):
             raise ValueError("projection output must not overlap bias")
+
+        if allow_bf16_atomic_reduction is None:
+            allow_bf16_atomic_reduction = not isinstance(weight, MXFP8LinearWeight)
+        elif type(allow_bf16_atomic_reduction) is not bool:
+            raise TypeError("BF16 atomic reduction permission must be a boolean or None")
 
         self.weight = weight
         self.output = output
@@ -192,6 +198,8 @@ class QuantizedProjection:
         self.workspace = workspace
         self.encoded = self.quantizer_plan = None
         self.sm103 = sm103_projection.is_sm103(source.device)
+        if source_activation != "identity" and (self.sm103 or not isinstance(weight, NVFP4LinearWeight)):
+            raise ValueError("rounded SwiGLU projection requires b12x NVFP4 execution")
         if mxfp8_min_amax is not None or encoded is not None:
             from b12x.quantization import mxfp8
 
@@ -308,6 +316,8 @@ class QuantizedProjection:
                 weight=parts(weight)[:2])
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,
+                                               source_activation=source_activation,
+                                               allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)

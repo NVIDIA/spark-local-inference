@@ -1063,10 +1063,43 @@ fn messages_stream_reconstructs_ordered_buffered_blocks() {
     assert_eq!(frames.last().unwrap().data["type"], "message_stop");
 }
 #[test]
+fn chat_usage_reports_reasoning_tokens_and_completions_omits_them() {
+    let mut chat = encoder(Protocol::Chat);
+    let mut frames = chat.start();
+    frames.extend(chat.apply(0, events()).unwrap());
+    chat.report_reasoning_tokens(0, 5);
+    frames.extend(chat.finish(0, Termination::Eos, 12, 3, None).unwrap());
+    assert_eq!(
+        chat.response()["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        5,
+        "clients translating Chat traffic read completion_tokens_details"
+    );
+    let chat_usage = &chat.response()["usage"];
+    assert!(
+        chat_usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap()
+            <= chat_usage["completion_tokens"].as_u64().unwrap(),
+        "reasoning is a subset of generated output"
+    );
+
+    let mut plain = encoder(Protocol::Completions);
+    let mut frames = plain.start();
+    frames.extend(plain.apply(0, events()).unwrap());
+    plain.report_reasoning_tokens(0, 5);
+    frames.extend(plain.finish(0, Termination::Eos, 12, 3, None).unwrap());
+    assert!(
+        plain.response()["usage"].get("completion_tokens_details").is_none(),
+        "raw completions has no reasoning region to report"
+    );
+}
+
+#[test]
 fn responses_stream_has_stable_ids_sequence_and_terminal_output() {
     let mut encoder = encoder(Protocol::Responses);
     let mut frames = encoder.start();
     frames.extend(encoder.apply(0, events()).unwrap());
+    encoder.report_reasoning_tokens(0, 7);
     frames.extend(encoder.finish(0, Termination::Eos, 12, 3, None).unwrap());
     for (i, frame) in frames.iter().enumerate() {
         assert_eq!(frame.data["sequence_number"], i as u64);
@@ -1081,6 +1114,19 @@ fn responses_stream_has_stable_ids_sequence_and_terminal_output() {
     assert_eq!(
         encoder.response()["usage"]["input_tokens_details"]["cached_tokens"],
         3
+    );
+    assert_eq!(
+        encoder.response()["usage"]["output_tokens_details"]["reasoning_tokens"],
+        7,
+        "the Responses usage schema requires output_tokens_details"
+    );
+    let responses_usage = &encoder.response()["usage"];
+    assert!(
+        responses_usage["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap()
+            <= responses_usage["output_tokens"].as_u64().unwrap(),
+        "reasoning is a subset of generated output"
     );
     let mut history = encoder.response()["output"].as_array().unwrap().clone();
     history.push(json!({"type":"function_call_output","call_id":"call_1","output":"found"}));
@@ -1138,14 +1184,17 @@ fn usage_reports_uncached_partial_and_full_prefix_reuse() {
             let usage = &response["usage"];
             match protocol {
                 Protocol::Chat | Protocol::Completions => {
-                    assert_eq!(
-                        usage,
-                        &json!({
-                            "prompt_tokens":17,"completion_tokens":generated,
-                            "total_tokens":17 + generated,
-                            "prompt_tokens_details":{"cached_tokens":cached},
-                        })
-                    );
+                    // Chat carries a completion breakdown; Completions predates
+                    // the field and its wire shape is unchanged.
+                    let mut expected = json!({
+                        "prompt_tokens":17,"completion_tokens":generated,
+                        "total_tokens":17 + generated,
+                        "prompt_tokens_details":{"cached_tokens":cached},
+                    });
+                    if protocol == Protocol::Chat {
+                        expected["completion_tokens_details"] = json!({"reasoning_tokens": 0});
+                    }
+                    assert_eq!(usage, &expected);
                     assert_eq!(frames[frames.len() - 2].data["usage"], *usage);
                     assert_eq!(frames[frames.len() - 2].data["choices"], json!([]));
                     assert!(frames.last().unwrap().done);
@@ -1176,6 +1225,7 @@ fn usage_reports_uncached_partial_and_full_prefix_reuse() {
                             "input_tokens":17,"output_tokens":generated,
                             "total_tokens":17 + generated,
                             "input_tokens_details":{"cached_tokens":cached},
+                            "output_tokens_details":{"reasoning_tokens":0},
                         })
                     );
                     assert_eq!(frames.last().unwrap().data["response"]["usage"], *usage);
@@ -1208,7 +1258,8 @@ fn image_usage_is_a_prompt_subset_and_stream_usage_remains_opt_in() {
         frames.extend(enc.apply(0, vec![Event::Content("answer".into())]).unwrap());
         frames.extend(enc.finish(0, Termination::Eos, 4, 9, None).unwrap());
         let expected = json!({"prompt_tokens":17,"completion_tokens":4,"total_tokens":21,
-            "prompt_tokens_details":{"cached_tokens":9,"multimodal_tokens":{"image":8}}});
+            "prompt_tokens_details":{"cached_tokens":9,"multimodal_tokens":{"image":8}},
+            "completion_tokens_details":{"reasoning_tokens":0}});
         assert_eq!(enc.response()["usage"], expected);
         let usage_frames: Vec<_> = frames
             .iter()

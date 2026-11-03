@@ -10,6 +10,74 @@ import pytest
 from ignition.bench.runner import BenchmarkCase, prompt_tokens, summarize_case
 
 
+def test_fifteen_draft_round_selects_and_packs_native_graph():
+    from ignition.bench.runner import _round
+    from ignition.direct.scheduler import Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(max_active=1, widths=(1, 8, 16), graphs={
+        ("init", 1, 1): "init1", ("prefill", 1, 512): "prefill512",
+        ("speculative", 1, 8, 8, 7): "round8",
+        ("speculative", 1, 16, 16, 15): "round16"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    member = request(1, [10] * 512, limit=64)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 512, [42], 0)}))
+    step = _round(scheduler, BenchmarkCase(1, 16, 16, 512))
+    assert (step.graph, step.width, step.packed_tokens, step.draft_tokens) == ("round16", 16, 16, 15)
+    assert step.lanes[0].tokens == 16
+    assert uploads(scheduler, step)["query_lengths"][0][0] == 16
+
+
+@pytest.mark.parametrize("context", [0, 128, 1152])
+def test_prefill_step_consumes_exact_chunk_after_prefix(context):
+    from copy import deepcopy
+    from ignition.bench.runner import PrefillCase, _prefill_step
+    from ignition.direct.scheduler import Lane, Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(max_active=1, prefill_chunk=512,
+                     graphs={("init", 1, 1): "init1", ("prefill", 1, 128): "prefill128",
+                             ("prefill", 1, 512): "prefill512"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    member = request(1, [10] * (context + 512), limit=2)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    while member.consumed < context:
+        count = min(context - member.consumed, 512)
+        step = scheduler._step("prefill", count, [Lane(member, member.consumed, count)])
+        assert uploads(scheduler, step)["sample_enabled"][0][0] == 0
+        scheduler.complete(step, records(scheduler, step, {member: (1, member.consumed + count, [], 0)}))
+    baseline = deepcopy(scheduler, {id(catalog): catalog})
+    for _ in range(2):
+        scheduler = deepcopy(baseline, {id(catalog): catalog})
+        step = _prefill_step(scheduler, PrefillCase(512, context))
+        member = step.lanes[0].request
+        assert (step.graph, step.width, step.lanes[0].start, step.lanes[0].tokens) == (
+            "prefill512", 512, context, 512)
+        assert uploads(scheduler, step)["sample_enabled"][0][0] == 1
+        scheduler.complete(step, records(scheduler, step, {member: (1, context + 512, [42], 0)}))
+        assert member.phase == "decode" and member.generated == [42]
+
+
+def test_prefill_step_rejects_padded_graph():
+    from ignition.bench.runner import PrefillCase, _prefill_step
+    from ignition.direct.scheduler import Scheduler
+    from tests.direct.test_scheduler import layout, records, request
+
+    scheduler = Scheduler(layout(), prefix_cache=False)
+    member = request(1, [10] * 384)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    with pytest.raises(ValueError, match="without capacity padding"):
+        _prefill_step(scheduler, PrefillCase(384, 0))
+
+
 def test_case_estimate_keeps_raw_samples_and_uses_all_seeds():
     case = BenchmarkCase(2, 8, 16, 512)
     samples = [dict(seed=0, times_ms=[1., 3.]), dict(seed=1, times_ms=[2., 10.])]
@@ -133,3 +201,33 @@ def test_device_snapshot_restores_graph_mutations_and_aliased_views():
         assert torch.equal(counters.cpu(), expected["counters"])
         assert torch.equal(quantized.view(torch.uint8).cpu(), expected["quantized"])
     assert all(saved.device == source.device for source, saved in snapshot.entries.values())
+
+
+def test_acceptance_observation_separates_verification_from_committed_clipping():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.runner import acceptance_observation
+
+    acceptance = SimpleNamespace(
+        offered_drafts=torch.tensor([3, 0]), accepted_drafts=torch.tensor([3, 0]),
+        valid=torch.tensor([True, False]),
+        survival=torch.tensor([[.75, .5, .25, -1, -1, -1, -1], [-1.] * 7]),
+    )
+    commit = SimpleNamespace(
+        accepted_drafts=torch.tensor([1, 0]), emitted_count=torch.tensor([2, 0]),
+        emitted_ids=torch.tensor([[11, 12, -1, -1], [-1, -1, -1, -1]]),
+    )
+    forward = SimpleNamespace(operations=(None, (), SimpleNamespace(output=acceptance), commit))
+    result = acceptance_observation(forward)
+    assert result["observations_per_request"] == 1
+    assert result["requests"] == [
+        dict(valid=True, offered_draft_count=3, accepted_draft_count=3,
+             committed_draft_count=1, emitted_count=2, emitted_token_ids=[11, 12],
+             proposal_survival=[.75, .5, .25]),
+        dict(valid=False, offered_draft_count=0, accepted_draft_count=0,
+             committed_draft_count=0, emitted_count=0, emitted_token_ids=[], proposal_survival=[]),
+    ]
+    sample = dict(seed=0, times_ms=[1.] * 20, acceptance=result)
+    summary = summarize_case(BenchmarkCase(1, 8, 8, 8192), [sample])
+    assert summary["samples"][0]["acceptance"]["observations_per_request"] == 1

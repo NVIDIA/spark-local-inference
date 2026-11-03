@@ -96,9 +96,10 @@ fn check_alignment(file: File) -> io::Result<File> {
         {
             return Err(io::Error::last_os_error());
         }
+        // The performance sector size is a hint, not an unbuffered-I/O alignment requirement.
         for sector in [
             info.LogicalBytesPerSector,
-            info.PhysicalBytesPerSectorForPerformance,
+            info.PhysicalBytesPerSectorForAtomicity,
         ] {
             if sector == 0 || 4096 % sector != 0 {
                 return Err(io::Error::new(

@@ -20,7 +20,7 @@ from ignition.components.capacity import (
     speculative_shapes,
     speculative_token_capacity,
 )
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -106,6 +106,8 @@ class PreparationConfig:
         return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 8:
+            raise ValueError("Gemma 4 draft model supports at most seven draft tokens")
         if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
             raise ValueError("RoCE ring requires 2..16 ranks on separate hosts")
         if self.devices is not None:
@@ -140,6 +142,10 @@ class PreparationConfig:
             raise ValueError("minimum page capacity must be a positive integer")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
+
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width in self.speculative_shapes), default=1)
 
 
 @torch.no_grad()
@@ -217,7 +223,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None

@@ -114,6 +114,13 @@ pub(crate) fn expand(
             "record layout and cache geometry disagree on the plane count",
         ));
     }
+    if (job.replication.pages || job.replication.row)
+        && (job.direction != Direction::In || part.is_none())
+    {
+        return Err(invalid(
+            "replicated shares require a registered pool and an inbound job",
+        ));
+    }
     reject_repeats(job)?;
     for (page, slab) in &job.pages {
         let id = u64::from(page.0);
@@ -124,6 +131,7 @@ pub(crate) fn expand(
             )));
         }
         let record = match part {
+            Some(part) if job.replication.pages => part.replicated_page(*slab, rank.page_offset)?,
             Some(part) => part
                 .page(*slab)?
                 .ok_or_else(|| invalid("page slab is outside the transfer pool"))?,
@@ -148,15 +156,22 @@ pub(crate) fn expand(
             )));
         }
         if let Some(part) = part {
-            let share = geometry.page_record_bytes();
+            let share = if job.replication.row {
+                part.record_bytes()
+            } else {
+                geometry.page_record_bytes()
+            };
             let pieces = geometry.row.unit_bytes.div_ceil(share) as usize;
             if slots.len() < pieces {
                 return Err(invalid("row slots do not cover the row"));
             }
             for (piece, &slot) in slots.iter().take(pieces).enumerate() {
-                let row = part
-                    .page(slot)?
-                    .ok_or_else(|| invalid("row slot is outside the transfer pool"))?;
+                let row = if job.replication.row {
+                    part.replicated_page(slot, rank.page_offset)?
+                } else {
+                    part.page(slot)?
+                        .ok_or_else(|| invalid("row slot is outside the transfer pool"))?
+                };
                 let offset = piece as u64 * share;
                 push_unit(
                     job.direction,
@@ -679,12 +694,81 @@ mod tests {
 
     fn job(direction: Direction) -> Job {
         Job {
+            replication: Default::default(),
             id: JobId(9),
             window: 2,
             direction,
             pages: vec![(PageId(5), 0x10000), (PageId(7), 0x20000)],
             row: Some((StateSlotId(3), vec![0x30000])),
         }
+    }
+
+    #[test]
+    fn replicated_restores_fan_out_packed_pages_and_rows_through_device_aliases() {
+        let geometry = vec![geometry(64, &[("kv", 4096)], 24576); 2];
+        let layout = Layout::new(&geometry).unwrap();
+        let device = 0x200000;
+        let pool = flare_selene::slab::SlabPool::new(layout.page_record_bytes, 8, 0).unwrap();
+        let host = pool.slot_address(flare_selene::slab::Slot(0));
+        let parts = pool.registered_parts(&layout, device);
+        let mut job = Job {
+            id: JobId(1),
+            window: 0,
+            direction: Direction::In,
+            replication: Default::default(),
+            pages: vec![(PageId(5), host)],
+            row: Some((StateSlotId(3), (1..=6).map(|i| host + i * 8192).collect())),
+        };
+        for pages in [false, true] {
+            for row in [false, true] {
+                job.replication = flare_selene::record::Replication { pages, row };
+                for rank in 0..2 {
+                    let mut descriptors = Vec::new();
+                    expand(
+                        &geometry[rank],
+                        &layout.ranks[rank],
+                        Some(&parts[rank]),
+                        &job,
+                        &mut descriptors,
+                    )
+                    .unwrap();
+                    let offset = layout.ranks[rank].page_offset;
+                    assert_eq!(
+                        descriptors[0].source,
+                        device + if pages { 0 } else { offset }
+                    );
+                    assert_eq!(
+                        descriptors[0].destination,
+                        geometry[rank].planes[0].unit_address(5)
+                    );
+                    let stride = if row { 8192 } else { 4096 };
+                    assert_eq!(descriptors.len() as u64, 1 + 24576 / stride);
+                    for (piece, descriptor) in descriptors[1..].iter().enumerate() {
+                        assert_eq!(
+                            descriptor.source,
+                            device + 8192 * (piece as u64 + 1) + if row { 0 } else { offset }
+                        );
+                        assert_eq!(
+                            descriptor.destination,
+                            geometry[rank].row.unit_address(3) + stride * piece as u64
+                        );
+                        assert_eq!(descriptor.bytes, stride as usize);
+                    }
+                }
+            }
+        }
+        assert!(expand(&geometry[0], &layout.ranks[0], None, &job, &mut Vec::new()).is_err());
+        job.direction = Direction::Out;
+        assert!(
+            expand(
+                &geometry[0],
+                &layout.ranks[0],
+                Some(&parts[0]),
+                &job,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -703,6 +787,7 @@ mod tests {
         let rows: Vec<_> = (0..2).map(|_| pool.allocate_page().unwrap()).collect();
         for (rank, part) in parts.iter().enumerate() {
             let mut job = Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
@@ -817,6 +902,7 @@ mod tests {
         );
         let rows = start + 8 * page_record;
         let job = Job {
+            replication: Default::default(),
             id: JobId(4),
             window: 0,
             direction: Direction::Out,
@@ -1307,6 +1393,7 @@ mod tests {
         };
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
@@ -1366,6 +1453,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(2),
                 window: 0,
                 direction: Direction::In,
@@ -1416,6 +1504,7 @@ mod tests {
         for (id, slot) in [(capacity, 0), (0, rank.row_capacity as u32)] {
             transfers
                 .submit(Job {
+                    replication: Default::default(),
                     id: JobId(3 + u64::from(slot != 0)),
                     window: 0,
                     direction: Direction::Out,
@@ -1643,6 +1732,7 @@ mod tests {
             .sum();
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
@@ -1693,6 +1783,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(2),
                 window: 0,
                 direction: Direction::In,
@@ -1791,6 +1882,7 @@ mod tests {
         for parts in [&registered, &split] {
             for (rank, geometry) in ranks.iter().enumerate() {
                 let mut job = Job {
+                    replication: Default::default(),
                     id: JobId(1),
                     window: 0,
                     direction: Direction::Out,

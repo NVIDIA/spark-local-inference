@@ -26,8 +26,13 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
             output: torch.Tensor, scratch: list[torch.Tensor], k_descale: torch.Tensor | None,
             v_descale: torch.Tensor | None, selected_blocks: torch.Tensor | None,
             handle: int, decode: bool, window: int,
-            schedule_storage: torch.Tensor | None, schedule_slot: int) -> None:
+            schedule_storage: torch.Tensor | None, schedule_slot: int, output_gate: torch.Tensor | None) -> None:
     plan = plan_from_handle(handle)
+    if plan.component_id == "flare.paged_tma":
+        from b12x.preparation.types import require_prepared
+
+        require_prepared(plan, plan.component_id).run(q, key, value, pages, lengths, cu, output, scratch[0], output_gate)
+        return
     arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages, cache_seqlens=lengths,
                      cu_seqlens_q=cu, attention_sink_bias=sink, output=output, scratch=scratch,
                      k_descale=k_descale, v_descale=v_descale)
@@ -44,14 +49,31 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
 
 
 @_attend.register_fake
-def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot):
+def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot, output_gate):
     pass
 
 
 class PreparedPagedAttention:
     def __init__(self, q, key, value, pages, lengths, cu, output, *, sink=None, mode,
                  window=-1, width=1, causal=True, k_descale=None, v_descale=None,
-                 selected_blocks=None, session, workspace, name, schedules=None):
+                 selected_blocks=None, session, workspace, name, schedules=None, tuning_page_count=None, output_gate=None):
+        if tuning_page_count is None:
+            tuning_page_count = min(key.shape[0], value.shape[0])
+        if type(tuning_page_count) is not int or not 0 < tuning_page_count <= min(key.shape[0], value.shape[0]):
+            raise ValueError("attention tuning requires a positive backed page count within both cache views")
+        self.tuning_page_count = tuning_page_count
+        from .paged_tma import PreparedTma, supports
+
+        self.tma = None
+        self.output_gate = None
+        if (mode in ("prefill", "extend") and causal and window == -1 and sink is None
+                and selected_blocks is None and k_descale is None and v_descale is None
+                and supports(q, key, value, pages, cu, output)):
+            self.tma = PreparedTma(q, key, value, pages, lengths, cu, output,
+                session=session, workspace=workspace, name=name, output_gate=output_gate)
+            self.output_gate = output_gate
+            self.plan = self.tma.plan
+            return
         self.schedule_storage, self.schedule_slot = None, -1
         if key.dtype == torch.float8_e4m3fn:
             if k_descale is None:
@@ -138,7 +160,9 @@ class PreparedPagedAttention:
             scratch = _scratch(specs, workspace)
             kwargs = {"plan": self.plan} if self.decode else {"window_left": window}
             binding = state.bind(scratch=scratch, **arguments, **kwargs)
-            return PreparedCall(run=lambda: state.run(binding), owners=prime_owners(workspace, scratch, binding))
+            return PreparedCall(run=lambda: state.run(binding),
+                                produce=lambda: state.bind(scratch=scratch, **arguments, **kwargs),
+                                owners=prime_owners(workspace, scratch, binding))
 
         def benchmark(state):
             def inputs():
@@ -148,20 +172,28 @@ class PreparedPagedAttention:
                     arguments[field] = torch.empty_strided(value.shape, value.stride(),
                                                          dtype=value.dtype, device=value.device)
                 arguments["q"].normal_(std=.2)
-                arguments["page_table"].zero_()
-                arguments["cache_seqlens"].fill_(min(max(4096, q.shape[0]), pages.shape[1] * key.shape[1]))
+                extent = min(max(4096, q.shape[0]), pages.shape[1] * key.shape[1])
+                pages_per_row = triton.cdiv(extent, key.shape[1])
+                page_ids = (torch.arange(pages.shape[0], device=pages.device, dtype=torch.int64)[:, None]
+                            * pages_per_row + torch.arange(pages.shape[1], device=pages.device, dtype=torch.int64))
+                arguments["page_table"].copy_((page_ids % self.tuning_page_count).to(pages.dtype))
+                arguments["cache_seqlens"].fill_(extent)
                 arguments["cu_seqlens_q"].copy_((torch.arange(cu.numel(), device=cu.device, dtype=torch.int64)
                                                    * q.shape[0] // pages.shape[0]).to(cu.dtype))
                 if selected_blocks is not None:
                     blocks = torch.arange(16, dtype=torch.int32, device=q.device)
-                    extent = min(max(4096, q.shape[0]), pages.shape[1] * key.shape[1])
                     blocks = torch.where(blocks < triton.cdiv(extent, 128), blocks, -1)
                     arguments["q2k_indices"] = blocks.expand_as(selected_blocks).contiguous()
                 return arguments, arguments["q"].clone()
 
             operands, seed = benchmark_resource(session, ("paged_attention", name), inputs)
             call = prepared_call(state, operands)
-            return PreparedCall(run=call.run, produce=lambda: operands["q"].copy_(seed),
+            def produce():
+                operands["q"].copy_(seed)
+                # Candidate bindings share scratch, including their scheduling metadata.
+                call.produce()
+
+            return PreparedCall(run=call.run, produce=produce,
                                 owners=(*call.owners, operands, seed), output=operands["output"])
 
         def prime(state):
@@ -180,6 +212,11 @@ class PreparedPagedAttention:
             paged.bind(self.plan, scratch=self.scratch, **self.arguments, window_left=self.window)
 
     def __call__(self):
+        if self.tma is not None:
+            q, key, value, pages, lengths, cu, output = self.tma.arguments
+            _attend(q, key, value, pages, lengths, cu, None, output, [self.tma.scratch],
+                None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate)
+            return output
         a = self.arguments
         if self.compact_decode is not None:
             source, destination, cu, selected = self.compact_decode
@@ -191,7 +228,7 @@ class PreparedPagedAttention:
         _attend(a["q"], a["k_cache"], a["v_cache"], a["page_table"], a["cache_seqlens"],
                 a["cu_seqlens_q"], a["attention_sink_bias"], a["output"], self.scratch,
                 a["k_descale"], a["v_descale"], self.selected_blocks,
-                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot)
+                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot, None)
         if self.compact_decode is not None:
             positions = torch.arange(destination.shape[0], device=destination.device)
             requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)

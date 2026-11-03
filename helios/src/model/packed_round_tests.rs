@@ -17,8 +17,9 @@ fn packed_round_manifest(config: &mut ModelConfig) -> crate::execution::Executio
     result.buffers.push(BufferDescriptor { name: "speculative_prefix_limits".into(), address,
         nbytes: bytes, dtype: Dtype::Int32, shape: vec![config.limits.request_capacity()], strides: vec![1] });
     result.buffers.push(BufferDescriptor { name: "proposal_confidence".into(), address: address + bytes,
-        nbytes: 2 * config.limits.request_capacity() * 28, dtype: Dtype::Float32,
-        shape: vec![2, config.limits.request_capacity(), 7], strides: vec![config.limits.request_capacity() * 7, 7, 1] });
+        nbytes: 2 * config.limits.request_capacity() * (config.completion_token_capacity - 1) * 4, dtype: Dtype::Float32,
+        shape: vec![2, config.limits.request_capacity(), config.completion_token_capacity - 1],
+        strides: vec![config.limits.request_capacity() * (config.completion_token_capacity - 1), config.completion_token_capacity - 1, 1] });
     for graph in &mut result.graphs {
         if graph.kind != GraphKind::Speculative || graph.token_capacity == 1 { continue; }
         graph.kind = GraphKind::Speculative;
@@ -79,9 +80,6 @@ fn packed_combined_budget_keeps_width_one_batches_without_a_useful_packed_shape(
     value.graphs.retain(|g| g.kind != GraphKind::Speculative || g.token_capacity == 1 || g.packed_token_capacity <= 6);
     let names: std::collections::HashSet<_> = value.graphs.iter().map(|g| g.name.clone()).collect();
     config.contract.graphs.retain(|g| names.contains(&g.graph));
-    let confidence = value.buffers.iter_mut().find(|b| b.name == "proposal_confidence").unwrap();
-    confidence.shape[2] = 5; confidence.strides = vec![config.limits.request_capacity() * 5, 5, 1];
-    confidence.nbytes = 2 * config.limits.request_capacity() * 5 * 4;
     catalog::validate(&config, &value).unwrap();
     Inputs::new(&config, &value).unwrap();
     assert!(!value.graphs.iter().any(|g| g.kind == GraphKind::Speculative && g.token_capacity > 1 && g.batch_capacity == 4));
@@ -148,7 +146,7 @@ fn packed_combined_packing_preserves_sparse_slot_keys_and_ceiling_padding() {
                 "host reservations cover per-lane worst cases, not sampled allocation");
             return;
         }
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         for lane in &plan.lanes {
             let live = scheduler.request(lane.request).unwrap();
             let samples = plan.kind == GraphKind::Prefill;

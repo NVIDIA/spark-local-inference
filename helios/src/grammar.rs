@@ -611,10 +611,10 @@ impl RequestGrammar {
                 "cannot propose tokens for a stopped grammar",
             ));
         }
-        if tokens.len() > 7 {
+        if tokens.len() > crate::scheduler::speculation::COPY_DRAFT_CAPACITY {
             return Err(Error::admission(
                 AdmissionError::Grammar,
-                "copy grammar supports at most seven draft tokens",
+                "copy grammar exceeds the signed provenance mask capacity",
             ));
         }
         let mut tentative = Self {

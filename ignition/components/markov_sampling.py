@@ -400,7 +400,7 @@ class PreparedMarkovProposals:
         if (
             base.dtype not in (torch.bfloat16, torch.float32)
             or base.stride(-1) != 1
-            or not 1 <= depth <= 7
+            or not 1 <= depth < (1 << 31) - 1
             or not isinstance(values, torch.Tensor)
             or embedding.shape != values.shape
             or values.shape[0] != vocab

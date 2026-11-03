@@ -259,7 +259,7 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
     batch = BatchInputs.allocate(3, 1, device, capacity=2)
     prefill = PrefillVisionInputs.allocate(3, device)
     state = VisionState(batch, prefill, requests, image_token=154854, features=128, hidden=4096, image_slots=1)
-    completion = CompletionOutputs.allocate((2, 2, 24), device=device)
+    completion = CompletionOutputs.allocate((2, 2, 32), device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     requests.generation[1], requests.status[1] = 7, 1

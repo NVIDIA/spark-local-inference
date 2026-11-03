@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -111,6 +111,8 @@ class PreparationConfig:
     speculative_token_capacity: int | None = None
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 8:
+            raise ValueError("GLM verification storage supports at most seven draft tokens")
         if self.expert_activation not in ("auto", "a4", "a16"):
             raise ValueError("GLM expert activation must be auto, a4, or a16")
         from ignition.planning import host_shape_error
@@ -194,6 +196,10 @@ class PreparationConfig:
     def preparation_pages(self):
         """Pages held while tuning and measuring graphs; the final pools replace them before capture."""
         return min(self.page_capacity, 2 * self.request_capacity)
+
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width in self.speculative_shapes), default=1) if self.mtp else 1
 
 
 def _tensor_bytes(*owners):
@@ -319,7 +325,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         # One rank holds whole sums and vocabularies: it prepares no collectives.
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage

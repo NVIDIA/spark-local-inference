@@ -105,7 +105,7 @@ def test_expanded_local_rows_feed_target_probabilities_and_raw_logprobs():
     p = torch.empty(b, w, columns, device="cuda")
     valid = torch.empty(b, w, device="cuda", dtype=torch.bool)
     candidates = torch.zeros(b, w - 1, device="cuda", dtype=torch.int64)
-    outputs = CompletionOutputs.allocate((2, b, 24), device="cuda")
+    outputs = CompletionOutputs.allocate((2, b, 32), device="cuda")
     outputs.requested.fill_(1)
     outputs.records[0, :, 0] = 7
     outputs.records[0, :, 8] = 1

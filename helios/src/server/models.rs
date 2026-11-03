@@ -262,6 +262,7 @@ mod tests {
 
     fn config() -> ModelConfig {
         ModelConfig {
+            completion_token_capacity: 16,
             max_top_logprobs: 0,
             logprob_token_id_capacity: 0,
             prepared_sequence_tokens: 16384,

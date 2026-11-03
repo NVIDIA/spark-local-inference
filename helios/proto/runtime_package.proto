@@ -694,6 +694,7 @@ message Execution {
   repeated Buffer buffers = 4;
   repeated ExecutionGraph graphs = 5;
   repeated TuningGraph tuning_graphs = 6;
+  uint32 completion_token_capacity = 7;
 }
 message TuningGraph {
   string name = 1;

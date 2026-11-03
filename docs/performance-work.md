@@ -13,6 +13,7 @@ cache backing, and loading lifecycle differ from package serving, so its timings
 cannot establish apples-to-apples serving performance.
 
 `ignition bench qwen3.8-27b` measures complete prepared speculative graph rounds
+or, with `--prefill --prefill-chunk-size N`, exact prefill chunk graphs
 for kernel and model iteration without export or HTTP. It uses real tokenized
 contexts, restores complete state outside CUDA event timing, and records raw
 samples by case and seed. Its score is the equal-weight arithmetic mean of

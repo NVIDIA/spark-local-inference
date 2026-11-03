@@ -14,13 +14,13 @@ import torch
 from triton.testing import do_bench_cudagraph
 
 from ignition.components.completion import (
-    CompletionOutputs, EMITTED_COUNT_FIELD, VECTOR_RECORD_FIELDS, VECTOR_TOKENS_FIELD,
+    CompletionOutputs, EMITTED_COUNT_FIELD, VECTOR_TOKENS_FIELD,
 )
 from ignition.components.logprobs import PreparedLogprobs
 
 
 def benchmark(rows, width, vocab, repeats, device):
-    outputs = CompletionOutputs.allocate((2, rows, VECTOR_RECORD_FIELDS), device=device)
+    outputs = CompletionOutputs.allocate((2, rows, VECTOR_TOKENS_FIELD + width), device=device)
     outputs.records[0, :, 0] = 1
     outputs.records[0, :, 5] = 1
     outputs.records[0, :, EMITTED_COUNT_FIELD] = width

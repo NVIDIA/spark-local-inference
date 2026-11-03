@@ -10,6 +10,9 @@ use crate::execution::{ExecutionTiming, SamplingMode, TokenVector};
 
 const MS: u64 = 1_000_000;
 
+#[path = "planning_tests.rs"]
+mod planning_tests;
+
 #[test]
 fn padding_pruning_keeps_three_requests_on_batch_four_and_two_requests_on_batch_two() {
     let mut s = engine(8, false);
@@ -76,6 +79,7 @@ fn engine_with_geometry(
             snapshots: 256,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 1024,
             page_tokens,
             vision: crate::model::VisionCapabilities::disabled(),
@@ -168,7 +172,7 @@ fn completion_records(
             ..Default::default()
         };
         if kind == GraphKind::Speculative {
-            let mut tokens = [-1; 8];
+            let mut tokens = vec![-1; 16];
             tokens[..count].fill(99);
             record.vector = Some(TokenVector {
                 emitted_count: count as i64,
@@ -1098,6 +1102,7 @@ fn interactive_engine(active: usize, speculative: bool) -> RequestScheduler {
             snapshots: 256,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 1024,
             page_tokens: 64,
             vision: crate::model::VisionCapabilities::disabled(),
@@ -2524,20 +2529,20 @@ fn survival_feedback_is_transactional_and_replaces_binary_acceptance() {
     s.commit(&plan, fence).unwrap();
     let records = completion_records(&s, &plan, fence, 0);
     let before = s.request(handle).unwrap().generated_tokens;
-    for row in [[0.75, -1., -1., -1., -1., -1., -1.],
-        [0.75, 0.8, 0.25, -1., -1., -1., -1.], [f32::NAN; 7]] {
-        assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).is_err());
+    for row in [[0.75, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.],
+        [0.75, 0.8, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.], [f32::NAN; 15]] {
+        assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row.to_vec()])).is_err());
         assert_eq!(s.request(handle).unwrap().generated_tokens, before);
         assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 0);
         assert!(s.submissions.contains_key(&fence));
     }
-    let row = [0.75, 0.5, 0.25, -1., -1., -1., -1.];
-    s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).unwrap();
+    let row = [0.75, 0.5, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.];
+    s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row.to_vec()])).unwrap();
     let request = s.request(handle).unwrap();
     assert_eq!(request.generated_tokens, before + 1);
     assert_eq!(request.acceptance.rounds(), 1);
     assert!(request.acceptance.prefix_probability(speculation::ProposalSource::Mtp, 0).unwrap() > 0.5);
-    assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).is_err());
+    assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row.to_vec()])).is_err());
     assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 1);
 }
 
@@ -2738,6 +2743,7 @@ fn feedback_window_engine(rows: Option<usize>, policy: PolicyConfig) -> RequestS
             snapshots: 256,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 1024,
             page_tokens: 64,
             vision: crate::model::VisionCapabilities::disabled(),
@@ -3199,11 +3205,11 @@ fn device_prefix_completion_validates_aggregate_budget_atomically() {
     let mut records = completion_records(&scheduler, &plan, fence, 0);
     for handle in handles { records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = 2; }
     let before = scheduler.request(handles[0]).unwrap().generated_tokens;
-    assert!(scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[[0.5; 7]; 2]).is_err());
+    assert!(scheduler.complete_packed_round(fence, &records, gpu_time(MS), &vec![vec![0.5; 15]; 2]).is_err());
     assert_eq!(scheduler.request(handles[0]).unwrap().generated_tokens, before);
     assert!(scheduler.submissions.contains_key(&fence));
     records[handles[1].slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
-    let output = scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[[0.5; 7]; 2]).unwrap();
+    let output = scheduler.complete_packed_round(fence, &records, gpu_time(MS), &vec![vec![0.5; 15]; 2]).unwrap();
     assert_eq!(output.len(), 2);
 }
 
@@ -3249,6 +3255,34 @@ fn queued_completion_progress_is_bounded_by_lane_extent_not_reservation_cursor()
     let before = scheduler.request(handle).unwrap().generated_tokens;
     assert!(scheduler.complete(second_fence, &records, gpu_time(MS)).is_err());
     assert_eq!(scheduler.request(handle).unwrap().generated_tokens, before);
+}
+
+#[test]
+fn pending_advance_ceilings_follow_queued_rounds_and_retirement() {
+    let mut scheduler = engine(1, true);
+    let handle = add(&mut scheduler, 5, 64, 32);
+    ready(&mut scheduler, &[handle]);
+    for width in [1, 2, 4, 8] { set_cost(&mut scheduler, GraphKind::Speculative, 1, width, MS); }
+    assert_eq!(scheduler.pending_token_ceiling(handle), 0);
+    let first = scheduler.plan().unwrap();
+    let first_fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&first, first_fence).unwrap();
+    let second = scheduler.plan().unwrap();
+    let second_fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&second, second_fence).unwrap();
+    let ceilings = [first.lanes[0].tokens, second.lanes[0].tokens];
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[0] + ceilings[1]);
+    assert_eq!(scheduler.pending_ceiling(scheduler.request(handle).unwrap()), ceilings[0] + ceilings[1]);
+    let records = completion_records(&scheduler, &first, first_fence, 0);
+    scheduler.complete(first_fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[1]);
+    assert_eq!(scheduler.pending_ceiling(scheduler.request(handle).unwrap()), ceilings[1]);
+    let records = completion_records(&scheduler, &second, second_fence, 0);
+    scheduler.cancel(handle).unwrap();
+    // A retired handle still reports the lanes its queued round retains.
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[1]);
+    scheduler.complete(second_fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(scheduler.pending_token_ceiling(handle), 0);
 }
 
 #[test]
@@ -3359,8 +3393,8 @@ fn finished_queued_round_does_not_observe_uncomputed_confidence() {
     let mut records = completion_records(&scheduler, &first, first_fence, 0);
     records[handle.slot as usize].status = 2;
     records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
-    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &[[0.9; 7]; 2]).unwrap();
-    let population = scheduler.forecasts.population;
+    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &vec![vec![0.9; 15]; 2]).unwrap();
+    let population = scheduler.forecasts.population.clone();
     let request = scheduler.request(handle).unwrap();
     let mut records = vec![CompletionRecord::default(); scheduler.limits.request_capacity()];
     records[handle.slot as usize] = CompletionRecord {
@@ -3370,7 +3404,7 @@ fn finished_queued_round_does_not_observe_uncomputed_confidence() {
         vector: Some(TokenVector { verification_width: second.token_capacity as i64,
             draft_cache_consumed: -1, ..Default::default() }), ..Default::default()
     };
-    scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &[[0.0; 7]; 2]).unwrap();
+    scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &vec![vec![0.0; 15]; 2]).unwrap();
     assert_eq!(scheduler.forecasts.population, population);
     assert_eq!(scheduler.request(handle).unwrap().pending, 0);
 }
@@ -3386,7 +3420,7 @@ fn host_prefix_allocator_prices_the_configured_acceptance_transform() {
         *profile = Default::default();
         for _ in 0..8 {
             if index == 0 { profile.observe(speculation::ProposalSource::Mtp, 0, 1, 1, false, None); }
-            else { profile.observe(speculation::ProposalSource::Mtp, 0, 1, 0, true, Some(&[0.3; 7])); }
+            else { profile.observe(speculation::ProposalSource::Mtp, 0, 1, 0, true, Some(&[0.3; 15])); }
         }
     }
     let mask = handles.iter().fold(0, |mask, handle| mask | 1 << handle.slot);
@@ -3635,7 +3669,7 @@ fn gpu_round_reassigns_a_finished_lanes_physical_row_to_a_progressing_request() 
     records[handles[0].slot as usize].status = 2;
     records[handles[0].slot as usize].vector.as_mut().unwrap().offered_drafts = 1;
     records[handles[1].slot as usize].vector.as_mut().unwrap().offered_drafts = 2;
-    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &[[0.5; 7]; 2]).unwrap();
+    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &vec![vec![0.5; 15]; 2]).unwrap();
     let request = scheduler.request(handles[0]).unwrap();
     let finished = CompletionRecord {
         generation: handles[0].generation as i64, submission_sequence: second_fence.0 as i64,
@@ -3647,7 +3681,7 @@ fn gpu_round_reassigns_a_finished_lanes_physical_row_to_a_progressing_request() 
     let mut records = completion_records(&scheduler, &second, second_fence, 0);
     records[handles[0].slot as usize] = finished;
     records[handles[1].slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
-    let output = scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &[[0.0; 7], [0.5; 7]]).unwrap();
+    let output = scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &[vec![0.0; 15], vec![0.5; 15]]).unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].request, handles[1]);
     assert_eq!(scheduler.request(handles[0]).unwrap().pending, 0);
@@ -3663,7 +3697,7 @@ fn cached_host_prefix_ranks_match_greedy_allocation_for_every_small_cohort_order
             for (index, handle) in handles.iter().enumerate() {
                 let profile = &mut scheduler.request_mut(*handle).unwrap().acceptance;
                 let probability = [0.1, 0.9, 0.5, 0.5][index];
-                let survival = std::array::from_fn(|depth| (probability as f32).powi(depth as i32 + 1));
+                let survival: [f32; 15] = std::array::from_fn(|depth| (probability as f32).powi(depth as i32 + 1));
                 for _ in 0..8 { profile.observe(speculation::ProposalSource::Mtp, 1, 7, 0, true, Some(&survival)); }
             }
             let available: Vec<_> = handles.iter().map(|handle| handle.slot as usize).collect();
@@ -3743,7 +3777,7 @@ fn pending_packed_output_bound_preserves_wider_rounds_with_nine_tokens_remaining
     for (plan, fence) in [(&first, first_fence), (&second, second_fence)] {
         scheduler.advance_to(scheduler.submissions[&fence].expected_finish_ns).unwrap();
         let records = packed_completion_records(&scheduler, plan, fence, 2);
-        scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[[0.5; 7]]).unwrap();
+        scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[vec![0.5; 15]]).unwrap();
     }
     let tail = scheduler.plan().unwrap();
     assert_eq!((tail.token_capacity, tail.lanes[0].tokens), (8, 3));
@@ -3751,7 +3785,7 @@ fn pending_packed_output_bound_preserves_wider_rounds_with_nine_tokens_remaining
     scheduler.commit(&tail, fence).unwrap();
     assert!(scheduler.plan().is_none());
     let records = packed_completion_records(&scheduler, &tail, fence, 2);
-    scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[[0.5; 7]]).unwrap();
+    scheduler.complete_packed_round(fence, &records, gpu_time(MS), &[vec![0.5; 15]]).unwrap();
     let request = scheduler.request(handle).unwrap();
     assert_eq!(request.generated_tokens, request.max_new_tokens);
     assert_eq!(request.pending, 0);
@@ -3797,7 +3831,7 @@ fn pending_packed_advance_keeps_full_page_and_draft_storage_fenced() {
     let expected_private = second_touch.div_ceil(4) - prefix_pages + 2;
     assert_eq!(scheduler.request(handle).unwrap().private_pages.len(), expected_private);
     let records = packed_completion_records(&scheduler, &first, first_fence, 0);
-    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &[[0.5; 7]]).unwrap();
+    scheduler.complete_packed_round(first_fence, &records, gpu_time(MS), &[vec![0.5; 15]]).unwrap();
     let live = scheduler.request(handle).unwrap();
     assert_eq!(live.scheduled_consumed, live.consumed_tokens + 3);
     assert_eq!(live.private_pages.len(), expected_private);
@@ -3806,6 +3840,57 @@ fn pending_packed_advance_keeps_full_page_and_draft_storage_fenced() {
     let free = scheduler.free_pages.len();
     scheduler.cancel(handle).unwrap();
     assert_eq!(scheduler.free_pages.len(), free);
-    scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &[[0.5; 7]]).unwrap();
+    scheduler.complete_packed_round(second_fence, &records, gpu_time(MS), &[vec![0.5; 15]]).unwrap();
     assert_eq!(scheduler.free_pages.len(), free + held);
+}
+
+#[test]
+fn sixteen_wide_round_commits_fifteen_drafts_and_respects_output_limit() {
+    for remaining in [1usize, 8, 16] {
+        let mut s = engine(1, false);
+        s.enable_speculation(&[1, 8, 16]).unwrap();
+        s.fixed_speculative_width(Some(16)).unwrap();
+        let mut graph = super::tests::duration_graphs(1).into_iter()
+            .find(|g| g.kind == GraphKind::Speculative && g.token_capacity == 8).unwrap();
+        graph.token_capacity = 16;
+        graph.draft_tokens = 15;
+        graph.packed_token_capacity = 16;
+        let mut graphs = super::tests::duration_graphs(1);
+        graphs.push(graph);
+        s.measured_graph_durations(&graphs).unwrap();
+        let handle = add(&mut s, 1, 64, (remaining + 1) as u32);
+        ready(&mut s, &[handle]);
+        let plan = s.plan().unwrap();
+        assert_eq!(plan.token_capacity, 16);
+        assert_eq!(plan.lanes[0].tokens, remaining);
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        let mut records = completion_records(&s, &plan, fence, 15);
+        records[handle.slot as usize].vector.as_mut().unwrap().offered_drafts = (remaining - 1) as i64;
+        s.complete(fence, &records, gpu_time(MS)).unwrap();
+        assert_eq!(s.request(handle).unwrap().generated_tokens, (remaining + 1) as u32);
+    }
+}
+
+#[test]
+fn fixed_host_prefixes_preserve_lengths_above_255() {
+    let fixture = engine(1, false);
+    let mut capabilities = fixture.capabilities.clone();
+    capabilities.completion_token_capacity = 257;
+    let mut scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
+    scheduler.enable_speculation(&[1, 257]).unwrap();
+    scheduler.fixed_speculative_width(Some(257)).unwrap();
+    let graphs = vec![crate::execution::GraphDescriptor {
+        tuned_bindings: vec![], confidence_width: 0, name: "speculative-b1-d256-w257-p257".into(),
+        kind: GraphKind::Speculative, sampling_mode: SamplingMode::General, draft_tokens: 256,
+        handle: 1, batch_capacity: 1, token_capacity: 257, packed_token_capacity: 257,
+        prefill_capacity: 0, estimated_duration_ns: MS, input_bindings: vec![],
+    }];
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    let handles = fixed_host_requests(&mut scheduler, &[257]);
+    let plan = scheduler.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Speculative);
+    assert_eq!(plan.lanes[0].request, handles[0]);
+    assert_eq!(plan.lanes[0].tokens, 257);
+    assert_eq!(plan.token_capacity, 257);
 }

@@ -233,8 +233,8 @@ pub(super) struct Metrics {
     replay_readiness_samples: AtomicU64,
     launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
-    speculative: [[RoundMetrics; 8]; 7],
-    draft_sources: [[[AtomicU64; 2]; 2]; 7],
+    speculative: [Vec<RoundMetrics>; 7],
+    draft_sources: Vec<[[AtomicU64; 2]; 2]>,
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
     cache_lookups: AtomicU64,
@@ -273,6 +273,10 @@ pub(super) struct Metrics {
     host_store_failed: AtomicU64,
     host_held: [AtomicU64; 2],
     host_expired: [AtomicU64; 2],
+    host_rows_thinned: [AtomicU64; 2],
+    host_packed_records: [AtomicU64; 2],
+    host_per_rank_records: [AtomicU64; 2],
+    host_abandoned_stores: AtomicU64,
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 6],
     host_parked: AtomicU64,
@@ -293,11 +297,13 @@ pub(super) struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(total_pages: u32, page_tokens: usize, decode_weight_bytes: u64) -> Self {
+    pub fn new(total_pages: u32, page_tokens: usize, decode_weight_bytes: u64, token_capacity: usize) -> Self {
         Self {
             total_pages: total_pages as u64,
             page_tokens: page_tokens as u64,
             decode_weight_bytes,
+            speculative: std::array::from_fn(|_| (0..token_capacity).map(|_| RoundMetrics::default()).collect()),
+            draft_sources: (0..token_capacity.saturating_sub(1)).map(|_| Default::default()).collect(),
             ..Self::default()
         }
     }
@@ -404,7 +410,7 @@ impl Metrics {
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         for record in records.iter().filter(|r| r.status != 0) {
-            let Some(v) = record.vector else {
+            let Some(v) = record.vector.as_ref() else {
                 continue;
             };
             counters
@@ -417,7 +423,8 @@ impl Metrics {
                 .accepted
                 .fetch_add(v.accepted_drafts as u64, Ordering::Relaxed);
             for depth in 0..v.offered_drafts as usize {
-                let source = usize::from(v.copy_offered_mask & (1 << depth) != 0);
+                let source = usize::from(depth < crate::scheduler::speculation::COPY_DRAFT_CAPACITY
+                    && v.copy_offered_mask & (1i64 << depth) != 0);
                 self.draft_sources[depth][source][0].fetch_add(1, Ordering::Relaxed);
                 if depth < v.accepted_drafts as usize {
                     self.draft_sources[depth][source][1].fetch_add(1, Ordering::Relaxed);
@@ -521,18 +528,25 @@ impl Metrics {
             .iter()
             .chain(&self.host_dropped)
             .chain(&self.host_expired)
+            .chain(&self.host_rows_thinned)
+            .chain(&self.host_packed_records)
+            .chain(&self.host_per_rank_records)
             .zip(
                 stats
                     .held
                     .into_iter()
                     .chain(stats.dropped)
-                    .chain(stats.expired),
+                    .chain(stats.expired)
+                    .chain(stats.rows_thinned)
+                    .chain(stats.packed_records)
+                    .chain(stats.per_rank_records),
             )
         {
             counter.store(value, Ordering::Relaxed);
         }
         for (target, value) in [
             (&self.host_stored, stats.stored),
+            (&self.host_abandoned_stores, stats.abandoned_stores),
             (&self.host_row_refills, stats.row_refills),
             (&self.host_store_skipped, stats.store_skipped),
             (&self.host_store_failed, stats.store_failed),
@@ -567,7 +581,29 @@ impl Metrics {
         let mut text = String::with_capacity(4096);
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
+        text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
+        text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
+        let _ = writeln!(
+            text,
+            "flare_host_cache_abandoned_stores_total {}",
+            self.host_abandoned_stores.load(Ordering::Relaxed)
+        );
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            for (name, counters) in [
+                ("packed_records", &self.host_packed_records),
+                ("per_rank_records", &self.host_per_rank_records),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_{name}_total{{tier=\"{tier}\"}} {}",
+                    counters[i].load(Ordering::Relaxed)
+                );
+            }
+            let _ = writeln!(
+                text,
+                "flare_host_cache_rows_thinned_total{{tier=\"{tier}\"}} {}",
+                self.host_rows_thinned[i].load(Ordering::Relaxed)
+            );
             let _ = writeln!(
                 text,
                 "flare_host_cache_expired_total{{tier=\"{tier}\"}} {}",
@@ -744,7 +780,7 @@ impl Metrics {
                 .into_iter()
                 .zip(&self.speculative)
             {
-                for (width, counts) in (1..=8).zip(widths) {
+                for (width, counts) in (1..).zip(widths) {
                     let value = match metric {
                         "rounds_total" => &counts.rounds,
                         "gpu_nanoseconds_total" => &counts.gpu_ns,
@@ -1158,7 +1194,7 @@ mod tests {
     fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {
         use flare_selene::{HostHit, StoreOutcome, StoreReason, Tier};
         use crate::offload::LookupOutcome;
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         for outcome in [
             LookupOutcome::NoMatch,
             LookupOutcome::CostRejected,
@@ -1240,7 +1276,7 @@ mod tests {
 
     #[test]
     fn readiness_metrics_retain_raw_gpu_time_and_count_only_measured_waits() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         let mut timing = crate::execution::ExecutionTiming::default();
         timing.gpu_ns[0] = Some(10_000);
         timing.gpu_ns[1] = Some(9_000);
@@ -1260,7 +1296,7 @@ mod tests {
 
     #[test]
     fn scheduler_host_gauges_reset_after_inbound_requests_finish() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         let mut stats = SchedulerStats::default();
         metrics.scheduler(stats);
         assert_eq!(metrics.host_inbound_waiting.load(Ordering::Relaxed), 0);
@@ -1280,8 +1316,8 @@ mod tests {
 
     #[test]
     fn speculative_metrics_preserve_depth_source_and_clipped_progress() {
-        let metrics = Metrics::default();
-        let mut records = [CompletionRecord::default(); 4];
+        let metrics = Metrics::new(0, 0, 0, 16);
+        let mut records = vec![CompletionRecord::default(); 4];
         records[2] = CompletionRecord {
             status: 2,
             vector: Some(crate::execution::TokenVector {
@@ -1316,7 +1352,7 @@ mod tests {
 
     #[test]
     fn complete_round_metrics_count_actual_draft_depth_once() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         metrics.speculative_completed(2, 8, 5, 300, &[]);
         metrics.speculative_completed(2, 1, 0, 100, &[]);
         let snapshot = metrics.snapshot(true);
@@ -1328,7 +1364,7 @@ mod tests {
 
     #[test]
     fn snapshot_json_round_trips_beside_the_prometheus_counters() {
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 16);
         metrics.progress(40, 3, 2, 1, 5, 2);
         metrics.scheduler(SchedulerStats {
             active_requests: 2,
@@ -1412,7 +1448,7 @@ mod tests {
 
     #[test]
     fn counters_expose_fixed_names_without_request_payloads() {
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 16);
         metrics.scheduler(SchedulerStats {
             cache_lookups: 5,
             cache_hits: 2,
@@ -1436,6 +1472,10 @@ mod tests {
             slots_total: 8,
             intake_slots: 2,
             expired: [7, 9],
+            rows_thinned: [5, 6],
+            packed_records: [7, 8],
+            per_rank_records: [9, 10],
+            abandoned_stores: 11,
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6],
             outbound_rate: 2.5e9,
@@ -1465,6 +1505,13 @@ mod tests {
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"dram\"} 7\n"));
         assert!(text.contains("flare_host_cache_expired_total{tier=\"nvme\"} 9\n"));
+        assert!(text.contains("flare_host_cache_packed_records_total{tier=\"dram\"} 7\n"));
+        assert!(text.contains("flare_host_cache_packed_records_total{tier=\"nvme\"} 8\n"));
+        assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"dram\"} 9\n"));
+        assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"nvme\"} 10\n"));
+        assert!(text.contains("flare_host_cache_abandoned_stores_total 11\n"));
+        assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"dram\"} 5\n"));
+        assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"nvme\"} 6\n"));
         for reason in [
             "inflight", "slabs", "queue", "budget", "oversize", "io_error",
         ] {
@@ -1505,5 +1552,39 @@ mod tests {
                 .count(),
             9
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sixteen_width_metrics_include_fifteenth_draft() {
+    let metrics = Metrics::new(0, 0, 0, 16);
+    let record = CompletionRecord { status: 1,
+        vector: Some(crate::execution::TokenVector { verification_width: 16, emitted_count: 16,
+            offered_drafts: 15, accepted_drafts: 15, copy_offered_mask: 1 << 14,
+            ..Default::default() }), ..Default::default() };
+    metrics.speculative_completed(1, 16, 15, 1000, &[record]);
+    let text = metrics.render();
+    assert!(text.contains("flare_speculative_rounds_total{batch=\"1\",width=\"16\"} 1"));
+    assert!(text.contains("flare_speculative_drafts_total{depth=\"15\",source=\"copy\",outcome=\"accepted\"} 1"));
+}
+
+#[cfg(test)]
+#[test]
+fn package_capacity_sizes_metrics_beyond_copy_mask_depth() {
+    for capacity in [8, 13, 16, 32, 65] {
+        let metrics = Metrics::new(0, 0, 0, capacity);
+        let drafts = capacity - 1;
+        let record = CompletionRecord { status: 1,
+            vector: Some(crate::execution::TokenVector {
+                verification_width: capacity as i64, emitted_count: capacity as i64,
+                offered_drafts: drafts as i64, accepted_drafts: drafts as i64,
+                copy_offered_mask: 0, tokens: vec![7; capacity], ..Default::default()
+            }), ..Default::default() };
+        metrics.speculative_completed(1, capacity, drafts, 1000, &[record]);
+        assert_eq!(metrics.speculative[0].len(), capacity);
+        assert_eq!(metrics.draft_sources.len(), drafts);
+        assert_eq!(metrics.draft_sources[drafts - 1][0][1].load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.draft_sources[drafts - 1][1][1].load(Ordering::Relaxed), 0);
     }
 }

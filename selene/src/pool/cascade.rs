@@ -268,6 +268,8 @@ mod tests {
                 ranks: vec![crate::geometry::RankLayout {
                     page_offset: 0,
                     plane_offsets: vec![0],
+                    plane_bytes: vec![64],
+                    row_bytes: 64,
                     row_offset: 0,
                 }],
             }),

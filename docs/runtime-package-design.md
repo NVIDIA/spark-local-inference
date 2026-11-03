@@ -4,9 +4,8 @@ Flare serves a prepared model from a runtime package containing everything a Rus
 process needs to rebuild the model's CUDA graphs and storage without a Python
 interpreter. The [package format](package-format-design.md) defines a packed
 `.safetensors` file and a directory form with `model.safetensors` plus immutable
-payload companions. The Flare model cache stores the directory form. Serving
-requires execution ABI 5 and prepared model contract 3; other versions require
-re-export. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
+payload companions. The Flare model cache stores the directory form. Engine upgrades preserve previously supported models without re-export.
+Execution ABI labels do not gate loading; declared operations and layouts are validated. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
 the package, the Rust `flare` executable, and its system library dependencies
 (including libturbojpeg). Python and preparation tools are not required.
 The [core design](core-design.md) defines the model contracts, scheduling,
@@ -150,9 +149,8 @@ bytes in the preparation allocator. Weight tensors, MTP weights, rotary
 tables, pointer tables, and required initialized metadata retain their contents.
 
 Serving accepts payload format 2 and signed format-6 logical-resource containers,
-with execution ABI 5 and prepared model contract 3 required in both carriers.
-Packages with another execution ABI or prepared contract require re-export with
-Ignition and fail loading before graph replay. Unsigned rank staging cannot load.
+with structural contract validation in both carriers. Execution ABI numbers
+do not gate loading. Engine upgrades must preserve previously supported models. Unsigned rank staging cannot load.
 The canonical format uses signed content IDs, payload-relative initializers,
 and unsigned physical locations; see [payload packages](package-format-design.md).
 
@@ -160,7 +158,7 @@ and unsigned physical locations; see [payload packages](package-format-design.md
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
 completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
-`Struct` configuration is not accepted. Execution ABI 5, model contract 3, and
+`Struct` configuration is not accepted. Execution ABI 6, model contract 3, and
 payload format 2 are independent version domains.
 
 Two prepared-contract fields fail validation when absent or out of
@@ -302,8 +300,8 @@ with the total elapsed time.
 ### File placement and addressing
 
 Payload packages use signed content IDs and unsigned locations. Signed format-6
-logical-resource containers use the archive reader and must declare execution
-ABI 5 and prepared model contract 3. Payload conversion accepts only payload
+logical-resource containers use the archive reader and structural contract
+validation. Payload conversion accepts only payload
 packages; converting logical-resource containers requires re-export with Ignition.
 
 Canonical payload packages do not use logical filenames, layout segments, or
@@ -352,7 +350,7 @@ rather than selecting a recipe default.
 Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
 `--all` includes the tensor catalogs. Absent manifests are reported as null.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
-catalog versions. Serving still requires execution ABI 5 and model contract 3.
+catalog versions. Serving validates the execution layout and prepared model contract independently.
 Changing signed rebuild metadata requires signing the package again.
 
 ### Publisher authentication and executable access
@@ -515,6 +513,15 @@ power-of-two request bucket has width-one execution. Wider programs fit the
 prepared aggregate target envelope. A package must include its configured
 maximum prefill chunk; intermediate prefill capacities are optional.
 
+`Execution.completion_token_capacity` (uint32 field 7) declares the maximum
+tokens per completion. Zero or omission resolves to eight; positive values are
+literal. ABI6 records contain 16 metadata fields followed by that many token
+fields. Logprob storage uses the same token capacity. Optional survival storage
+uses one fewer position. Proposal-confidence buffers may have one through T−1
+positions and must cover every graph’s confidence width, where T is the completion
+token capacity. Capacity one omits these zero-depth outputs. All ranks must agree on the resolved capacity. Graph widths
+fit this capacity; continuation-state storage has independently declared geometry.
+
 Execution metadata identifies complete speculative programs by B/D/W/P: request
 capacity, captured proposal depth, per-request target capacity including the pending
 token, and physical aggregate target rows. P is explicit for rectangular programs
@@ -584,8 +591,8 @@ the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and
 requires at least 8,192 cached tokens per active request.
 
-Up to eight immutable snapshot slots per active request share physical backing
-with KV pages. At load, CUDA virtual mappings expose the same allocation chunks
+Immutable snapshot capacity is bounded by borrowable KV backing and the prepared
+virtual extent. At load, CUDA virtual mappings expose the same allocation chunks
 through the page planes and the snapshot part of the continuation range. Small
 interleaved runs of dense page planes keep each snapshot's conflicting page range
 close to its byte cost. Planes whose allocation granules span more pages than a

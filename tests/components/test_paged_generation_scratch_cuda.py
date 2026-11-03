@@ -27,7 +27,7 @@ def test_sampling_rank_preserves_subsequent_shared_graph_aliases():
     device = torch.device("cuda:0")
     requests = DeviceRequestState.allocate(device, vocab_size=128896, capacity=16)
     inputs = BatchInputs.allocate(16, 1, device, capacity=16)
-    records = torch.zeros(2, 16, 24, dtype=torch.int64, device=device)
+    records = torch.zeros(2, 16, 32, dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     logits = torch.zeros(16, requests.vocab_size, dtype=torch.bfloat16, device=device)

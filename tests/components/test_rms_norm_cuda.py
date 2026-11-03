@@ -181,3 +181,125 @@ def test_residual_normalization_candidates_share_activation_storage(tmp_path):
         eviction_bytes = max(2 * torch.cuda.get_device_properties(device).L2_cache_size, 64 << 20)
         assert torch.cuda.max_memory_allocated(device) - before < fixture_bytes + eviction_bytes + (16 << 20)
         assert torch.cuda.memory_allocated(device) - before < 1 << 20
+
+
+@torch.no_grad()
+def test_prefill_residual_norm_retains_sum_on_captured_replay():
+    from ignition.preparation.compilation import compile_forward
+
+    source = torch.randn((4096, 5120), device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(source)
+    weight = torch.zeros(5120, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty_like(source)
+    with PreparationSession(device="cuda:0", autotune=False) as session:
+        operation = PreparedRMSNorm(source, weight, output, eps=1e-6, zero_centered=True,
+            residual=residual, session=session, name="prefill.residual_norm")
+        forward = compile_forward(lambda: operation(source, residual))
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            forward()
+        for seed in (0, 1, 2):
+            torch.manual_seed(seed)
+            source.normal_()
+            residual.normal_()
+            preserved = residual.clone()
+            expected_sum = source + residual
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            assert torch.equal(residual, preserved)
+            assert torch.equal(source, expected_sum)
+            assert torch.isfinite(output).all()
+        graph.reset()
+
+
+@torch.no_grad()
+def test_prefill_cross_layer_residual_tap_survives_buffer_reuse():
+    from ignition.preparation.compilation import compile_forward
+
+    shape = (4096, 5120)
+    projected = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(projected)
+    normalized = torch.empty_like(projected)
+    attended = torch.empty_like(projected)
+    tap = torch.empty((2048, 5120), device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(5120, device="cuda", dtype=torch.bfloat16)
+    with PreparationSession(device="cuda:0", autotune=False) as session:
+        input_norm = PreparedRMSNorm(projected, weight, normalized, eps=1e-6, zero_centered=True,
+            residual=residual, session=session, name="prefill.cross_layer_input")
+        post_norm = PreparedRMSNorm(attended, weight, normalized, eps=1e-6, zero_centered=True,
+            residual=projected, session=session, name="prefill.cross_layer_post")
+
+        def forward():
+            input_norm(projected, residual)
+            tap.copy_(projected[-2048:])
+            attended.copy_(normalized)
+            post_norm(attended, projected)
+            projected.zero_()
+
+        compiled = compile_forward(forward)
+        compiled()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        for seed in (0, 1, 2):
+            torch.manual_seed(seed)
+            projected.normal_()
+            residual.normal_()
+            expected_sum = projected + residual
+            preserved = residual.clone()
+            tap.fill_(float("nan"))
+            normalized.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            assert torch.equal(tap, expected_sum[-2048:])
+            assert torch.equal(residual, preserved)
+            assert not projected.any()
+            assert torch.isfinite(attended).all()
+            assert torch.isfinite(normalized).all()
+        graph.reset()
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 17])
+@torch.no_grad()
+def test_bf16_residual_normalization_preserves_rounded_decoder_sum(tokens):
+    from ignition.preparation.compilation import compile_forward
+
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device=device).manual_seed(9027 + tokens)
+    source = torch.randn(tokens, 5120, device=device, generator=generator).bfloat16()
+    residual = torch.randn(tokens, 5120, device=device, generator=generator).bfloat16()
+    initial_source, initial_residual = source.clone(), residual.clone()
+    weight = torch.randn(5120, device=device, generator=generator) * .1
+    output = torch.empty_like(source)
+    with PreparationSession(device=device, autotune=False) as session:
+        operation = PreparedRMSNorm(source, weight, output, eps=1e-6, zero_centered=True,
+                                   residual=residual, session=session, name="decoder_residual_rms")
+        forward = compile_forward(lambda: operation(source, residual))
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            forward()
+        for gain in (0., .5, 1.5):
+            source.copy_(initial_source * gain)
+            residual.copy_(initial_residual * (2 - gain))
+            expected_source = source + residual
+            values = expected_source.float()
+            expected = (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+                        * (1 + weight)).bfloat16()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(source, expected_source, atol=0, rtol=0)
+            lower = torch.nextafter(expected, torch.full_like(expected, -torch.inf))
+            upper = torch.nextafter(expected, torch.full_like(expected, torch.inf))
+            assert ((output >= lower) & (output <= upper)).all()
+            assert (output != expected).float().mean() < .001
+        graph.reset()

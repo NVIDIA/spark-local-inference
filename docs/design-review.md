@@ -48,7 +48,7 @@ before committing; a design acknowledgment cannot authorize them.
    consumers for a concrete meaning independent of model identity.
 4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM103/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
-   Remove superseded internal paths unless compatibility is explicitly required.
+   Retain internal paths required to load and serve previously supported models.
    Package version validation is required by principle 13.
 5. **Finish preparation before capture.** Constructors declare operations; one
    preparation batch tunes the complete shape catalog. Size scratch from tuned
@@ -99,15 +99,14 @@ before committing; a design acknowledgment cannot authorize them.
     `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
-13. **Validate the supported model package contract.** Serving requires execution
-    ABI 5 and prepared model contract 3. Payload format 2 is the canonical carrier;
-    signed format-6 logical-resource containers require the same contracts. Reject unsupported
-    execution ABI and prepared contract versions before replay with a clear
-    re-export error. Version semantic contract changes, reserve removed Protobuf
-    fields and enum values, and validate required data and explicit values in
-    every affected consumer. Remove superseded loaders and migration-only tests;
-    backward compatibility requires an explicit maintainer requirement. Validate
-    affected loading and serving paths and unsupported-version rejection.
+13. **Preserve model package compatibility.** Every engine version must load
+    models supported by previous engine versions without re-export, re-signing,
+    or graph changes. Execution ABI numbers are descriptive metadata, not loading
+    gates. Validate actual operations, buffers, capacities, dependencies, signatures,
+    and resources. Protobuf additions must preserve existing behavior through
+    compatible defaults; an absent or zero completion token capacity means eight.
+    Reserve removed wire identifiers and retain readers and tests needed by
+    existing packages. Validate previous packages through loading and serving.
 14. **Restrict Claude Opus 5.5 authorship of CUDA kernels and model optimizations.**
     Claude Opus 5.5 has repeatedly produced defective low-level kernel changes
     in this project. It must not design or implement low-level CUDA kernels

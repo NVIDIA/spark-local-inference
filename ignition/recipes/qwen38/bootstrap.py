@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -198,6 +198,9 @@ class PreparationConfig:
 
         return prefill_capacities(self.prefill_chunk_size)
 
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width in self.speculative_shapes), default=1) if self.mtp else 1
 
 
 def _identity(manifest, world_size=1):
@@ -345,7 +348,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             table.sequence = sequence
             from ignition.components.readiness import ReadinessTimings
             table.timings = ReadinessTimings.allocate(frame, 1)
-            completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+            completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
             features = VisionFeatureState.allocate(device, capacity=slots, image_slots=config.image_concurrency,
                 feature_slot=inputs.vision_feature_slot)
             vision_inputs = VisionInputs.allocate(device)

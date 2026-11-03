@@ -12,11 +12,11 @@ from ignition.components.candidate_selector import PreparedCandidateSelector
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.grouped_convolution import PreparedGroupedConvolution
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import prepare_projection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.vocabulary import PreparedVocabularyProjection
-from ignition.components.window_attention import stage_windows
+from ignition.components.window_staging import PreparedWindowStaging
 
 PAGE_TOKENS = 128
 
@@ -41,35 +41,79 @@ def _rotary(values, positions, inverse):
     return values * cos[:, None] + rotate_half(values) * sin[:, None]
 
 
+class PreparedContextCapture:
+    """Capture target features that can survive in a draft context ring.
+
+    Compact prefill accepts every live input row. Verification retains all rows
+    until its accepted prefix is known.
+    """
+
+    def __init__(self, metadata, columns, window, *, compact_prefill=False, buffers=None):
+        self.metadata = metadata
+        rows = metadata.positions.numel()
+        self.offsets = self.indices = self.live = None
+        def zeros(shape, dtype):
+            return (torch.zeros(shape, dtype=dtype, device=metadata.positions.device)
+                    if buffers is None else buffers.zeros(shape, dtype))
+        if compact_prefill and metadata.starts.numel() == 1 and rows > window:
+            rows = window
+            self.offsets = torch.arange(rows, device=metadata.positions.device)
+            self.indices = zeros((rows,), torch.int64)
+            self.live = zeros((rows,), torch.bool)
+        self.output = zeros((rows, columns), torch.bfloat16)
+
+    def begin(self):
+        if self.indices is not None:
+            m = self.metadata
+            count = m.lengths[0].long()
+            kept = count.clamp(max=self.output.shape[0])
+            self.indices.copy_((m.query_start_loc[0] + count - kept + self.offsets).clamp(
+                0, m.positions.numel() - 1))
+            self.live.copy_((self.offsets < kept) & (m.positions[self.indices] >= 0))
+
+    def __call__(self, hidden, column):
+        values = hidden if self.indices is None else torch.where(
+            self.live[:, None], hidden[self.indices], 0)
+        self.output[:, column:column + hidden.shape[-1]].copy_(values)
+
+
 class PreparedContext:
     """Write accepted target features into independent draft KV rings.
 
     The supplied cursor is dedicated to context scratch. Each graph variant forks
     its starting position; target auxiliary features must occupy disjoint storage.
+    Compact prefill consumes a suffix captured from all live input rows; counts
+    must equal the metadata lengths used by PreparedContextCapture.
     """
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 runtime, coordinator, buffers):
+                 runtime, coordinator, buffers, compact_prefill=False):
         self.metadata = metadata
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         tokens, hidden = auxiliary.shape[0], c.text["hidden_size"]
         scratch = buffers.fork()
+        self.compact_offsets = self.compact_positions = None
+        if compact_prefill and metadata.starts.numel() == 1 and metadata.positions.numel() > self.window:
+            if tokens != self.window:
+                raise ValueError("compact prefill context requires one retained window of auxiliary rows")
+            self.compact_offsets = torch.arange(tokens, device=auxiliary.device)
+            self.compact_positions = scratch.full((tokens,), -1, metadata.positions.dtype)
         self.local = scratch.zeros((tokens, hidden // weights.shard.world_size), torch.bfloat16)
         self.projected = scratch.zeros((tokens, hidden), torch.bfloat16)
-        self.kv = scratch.zeros((tokens, weights.draft.context_kv.shape[0]), torch.bfloat16)
         _, kv_heads = a.local(weights.shard)
+        self.kv = scratch.zeros((tokens, c.layers * kv_heads * (a.key_dim + a.value_dim)), torch.bfloat16)
         self.key = scratch.zeros((tokens, kv_heads, a.key_dim), torch.bfloat16)
         self.value = scratch.zeros((tokens, kv_heads, a.value_dim), torch.bfloat16)
         self.slots = scratch.full((tokens,), -1, torch.int64)
         self.inverse = _inverse(a, auxiliary.device)
-        self.project = UnquantizedProjection(auxiliary, weights.draft.projection, self.local,
-            session=session, name=name + ".project")
+        self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
+            session=session, name=name + ".project", workspace=workspace)
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".gather")
         self.norm = _norm(weights.draft.hidden_norm, c.text["rms_norm_eps"])
-        self.project_kv = UnquantizedProjection(self.projected, weights.draft.context_kv, self.kv,
-            session=session, name=name + ".kv")
+        self.project_kv = prepare_projection(self.projected, weights.draft.context_kv, self.kv,
+            session=session, name=name + ".kv", workspace=workspace)
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             norm = _norm(layer.key_norm, c.text["rms_norm_eps"])
@@ -80,24 +124,38 @@ class PreparedContext:
 
     def __call__(self, auxiliary, counts):
         m = self.metadata
-        offset = m.positions - m.starts[m.requests]
-        count = counts[m.requests]
-        valid = (m.positions >= 0) & (offset >= 0) & (offset < count)
-        valid &= offset >= (count - self.window).clamp_min(0)
+        if self.compact_positions is None:
+            positions = m.positions
+            offset = positions - m.starts[m.requests]
+            count = counts[m.requests]
+            valid = (positions >= 0) & (offset >= 0) & (offset < count)
+            valid &= offset >= (count - self.window).clamp_min(0)
+            states = m.state_rows[m.requests]
+        else:
+            count = counts[0].long()
+            kept = count.clamp(max=self.window)
+            indices = (m.query_start_loc[0] + count - kept + self.compact_offsets).clamp(
+                0, m.positions.numel() - 1)
+            positions = m.positions[indices]
+            valid = (self.compact_offsets < kept) & (positions >= 0)
+            self.compact_positions.copy_(torch.where(valid, positions, -1))
+            positions = self.compact_positions
+            states = m.state_rows[0]
         self.slots.copy_(torch.where(valid,
-            m.state_rows[m.requests] * self.window + m.positions.remainder(self.window), -1))
+            states * self.window + positions.remainder(self.window), -1))
         self.projected.copy_(self.norm(self.gather(self.project(auxiliary))))
         self.project_kv(self.projected)
         width = self.key.shape[1] * self.key.shape[2]
         chunks = self.kv.view(self.kv.shape[0], len(self.layers), 2 * width)
         for index, (norm, writer) in enumerate(self.layers):
             key = norm(chunks[:, index, :width].view_as(self.key))
-            self.key.copy_(_rotary(key, m.positions, self.inverse))
+            self.key.copy_(_rotary(key, positions, self.inverse))
             self.value.copy_(chunks[:, index, width:].view_as(self.value))
             writer()
 
     def scratch_tensors(self):
-        return self.local, self.projected, self.kv, self.key, self.value, self.slots
+        tensors = self.local, self.projected, self.kv, self.key, self.value, self.slots
+        return tensors if self.compact_positions is None else (*tensors, self.compact_positions)
 
 
 @dataclass(frozen=True)
@@ -122,16 +180,18 @@ class DraftScratch:
     convolution: dict
     retained: list = field(default_factory=list)
     selectors: dict = field(default_factory=dict)
+    block_size: int = 8
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device, *, buffers):
-        if tokens <= 0 or tokens % config.block_size:
+    def allocate(cls, config, shard, tokens, device, *, buffers, block_size=None):
+        block_size = config.block_size if block_size is None else block_size
+        if tokens <= 0 or tokens % block_size:
             raise ValueError("DFlash2 scratch requires complete proposal blocks")
         s = buffers.fork()
         a, c = config.attention, config.text
         heads, kv_heads = a.local(shard)
-        rows = tokens // config.block_size
-        pages = rows * ((a.window + config.block_size + PAGE_TOKENS - 1) // PAGE_TOKENS)
+        rows = tokens // block_size
+        pages = rows * ((a.window + block_size + PAGE_TOKENS - 1) // PAGE_TOKENS)
         hidden = c["hidden_size"]
         vocab_width = ((c["vocab_size"] + shard.world_size - 1) // shard.world_size + 63) // 64 * 64
         def zeros(*shape, dtype=torch.bfloat16):
@@ -147,18 +207,18 @@ class DraftScratch:
             zeros(pages, PAGE_TOKENS, kv_heads, a.value_dim, dtype=torch.float8_e4m3fn),
             MLPScratch.allocate(tokens, hidden, c["intermediate_size"] // shard.world_size, device, buffers=s),
             zeros(tokens, hidden), zeros(tokens, vocab_width), zeros(tokens, vocab_width * shard.world_size),
-            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution)
+            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution, block_size=block_size)
 
     def rows(self, tokens, samples):
         if (not 0 < tokens <= self.embedding.shape[0] or samples != tokens
-                or tokens % 8):
-            raise ValueError("DFlash2 scratch requires complete eight-token proposal blocks")
+                or tokens % self.block_size):
+            raise ValueError("DFlash2 scratch requires complete proposal blocks")
         return type(self)(*(getattr(self, name) if name in
-            ("window_key", "window_value", "convolution", "retained", "selectors") else self.mlp.rows(tokens) if name == "mlp"
+            ("window_key", "window_value", "convolution", "retained", "selectors", "block_size") else self.mlp.rows(tokens) if name == "mlp"
             else getattr(self, name)[:tokens] for name in self.__dataclass_fields__))
 
     def scratch_tensors(self):
-        return tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "selectors")
+        return tuple(getattr(self, name) for name in self.__dataclass_fields__ if name not in ("selectors", "block_size"))
 
 
 class DraftAttention:
@@ -168,23 +228,26 @@ class DraftAttention:
                  runtime, coordinator, session, name, workspace, buffers):
         self.scratch, self.metadata = scratch, metadata
         a, self.window = config.attention, config.attention.window
-        self.qkv = UnquantizedProjection(source, weights.qkv, scratch.qkv, session=session, name=name + ".qkv")
+        self.qkv = prepare_projection(source, weights.qkv, scratch.qkv, session=session, name=name + ".qkv", workspace=workspace)
         self.q_norm = _norm(weights.query_norm, config.text["rms_norm_eps"])
         self.k_norm = _norm(weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = _inverse(a, source.device)
         self.history_key, self.history_value = (pool.reserved_region(f"draft{index}.{kind}")
                                                for kind in ("key", "value"))
         rows = metadata.lengths.numel()
-        count = (a.window + config.block_size + PAGE_TOKENS - 1) // PAGE_TOKENS
+        block_size = scratch.block_size
+        count = (a.window + block_size + PAGE_TOKENS - 1) // PAGE_TOKENS
         self.staged_key, self.staged_value = scratch.window_key[:rows * count], scratch.window_value[:rows * count]
+        self.staging = PreparedWindowStaging(self.history_key, self.history_value, scratch.key, scratch.value,
+            self.staged_key, self.staged_value, metadata, session=session, name=name + ".staging")
         self.pages = torch.arange(rows * count, device=source.device, dtype=torch.int32).view(rows, count)
         self.lengths = buffers.zeros(metadata.lengths.shape, metadata.lengths.dtype)
         self.attention = PreparedPagedAttention(scratch.query, self.staged_key, self.staged_value,
             self.pages, self.lengths, metadata.query_start_loc, scratch.attended,
-            mode="verify", width=config.block_size, window=a.window - 1, causal=False,
+            mode="verify", width=scratch.block_size, window=a.window - 1, causal=False,
             session=session, workspace=workspace, name=name + ".attention")
-        self.output = UnquantizedProjection(scratch.attended.flatten(1), weights.output, scratch.partial,
-            session=session, name=name + ".output")
+        self.output = prepare_projection(scratch.attended.flatten(1), weights.output, scratch.partial,
+            session=session, name=name + ".output", workspace=workspace)
         self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".reduce")
 
@@ -194,8 +257,7 @@ class DraftAttention:
         s.query.copy_(_rotary(self.q_norm(q.view_as(s.query)), m.positions, self.inverse))
         s.key.copy_(_rotary(self.k_norm(k.view_as(s.key)), m.positions, self.inverse))
         s.value.copy_(v.view_as(s.value))
-        stage_windows(self.history_key, s.key, self.staged_key, m)
-        stage_windows(self.history_value, s.value, self.staged_value, m)
+        self.staging()
         self.lengths.copy_(torch.where(m.lengths > 0, m.starts.clamp(max=self.window) + m.lengths, 0).int())
         self.attention()
         return self.reduce(self.output(s.attended.flatten(1)))
@@ -214,7 +276,7 @@ class PreparedDraft:
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             prefix = f"{name}.layer{index}"
-            conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=c.block_size,
+            conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=s.block_size,
                 group_size=16, session=session, name=prefix + "." + kind, buffers=s.convolution,
                 token_capacity=s.convolution["before"].shape[0]) for kind in ("attention_conv", "mlp_conv")}
             attention = DraftAttention(index, layer, conv["attention_conv"].before, c, weights.shard, s, metadata, pool,
@@ -232,7 +294,7 @@ class PreparedDraft:
             activation_mode="a16", workspace=workspace)
         selector_key = (s.hidden.shape[0], id(weights.draft.selector))
         if selector_key not in s.selectors:
-            selector = PreparedCandidateSelector(s.hidden.view(-1, c.block_size, s.hidden.shape[-1]),
+            selector = PreparedCandidateSelector(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]),
                 weights.draft.selector, top_k=c.text["dflash_config"]["selector_top_k"], session=session,
                 name=name + ".selector")
             s.selectors[selector_key] = selector
@@ -254,7 +316,7 @@ class PreparedDraft:
         # The unary transform consumes the head result in FP32.
         unary = s.gathered_logits[:, :c.text["vocab_size"]].float() * self.multiplier
         s.logits.copy_(unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
-        self.selector.prepare(s.hidden.view(-1, c.block_size, s.hidden.shape[-1]))
+        self.selector.prepare(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]))
 
     def scratch_tensors(self):
         return self.scratch.scratch_tensors(), self.selector.projected

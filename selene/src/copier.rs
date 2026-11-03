@@ -33,6 +33,8 @@ pub struct Job {
     pub id: JobId,
     pub window: u32,
     pub direction: Direction,
+    /// Inbound pages and row contain one verified share, reused by every local rank.
+    pub replication: crate::record::Replication,
     pub pages: Vec<(PageId, usize)>,
     pub row: Option<(StateSlotId, Vec<usize>)>,
 }

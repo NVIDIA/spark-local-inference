@@ -44,7 +44,7 @@ def test_native_replay_reorders_every_slot_without_allocation(capacity):
     slots = torch.arange(capacity - 1, -1, -1, dtype=torch.int32, device="cuda")
     epochs = torch.ones(capacity, dtype=torch.int64, device="cuda")
     live = torch.tensor([capacity], dtype=torch.int32, device="cuda")
-    records = torch.full((2, capacity, 24), -99, dtype=torch.int64, device="cuda")
+    records = torch.full((2, capacity, 32), -99, dtype=torch.int64, device="cuda")
     frame = torch.zeros(1, dtype=torch.int32, device="cuda")
     sequence = torch.ones(1, dtype=torch.int64, device="cuda")
     for row in range(capacity):

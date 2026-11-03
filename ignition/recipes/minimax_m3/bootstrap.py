@@ -17,7 +17,7 @@ from ignition.components.capacity import (batch_capacities, prefill_capacities, 
     image_capacity, speculative_shapes, speculative_token_capacity)
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.paged_maintenance import PreparedMaintenance
 from ignition.components.paged_resume import PreparedResume
 from ignition.components.parallel import TensorParallelShard
@@ -137,6 +137,10 @@ class PreparationConfig:
         return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
             self.speculative_token_capacity, self.speculative_graph_budget) if self.packed_verification else ()
 
+    @property
+    def completion_token_capacity(self):
+        return max(self.speculative_widths) if self.dspark else 1
+
 
 def _verification_variants(shapes, selected):
     for batch, width in sorted(shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
@@ -202,7 +206,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         if coordinator.spans_hosts:
             sample_rows = max(decode_samples, draft_tokens)

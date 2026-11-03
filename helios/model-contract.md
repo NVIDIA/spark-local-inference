@@ -36,9 +36,10 @@ capacities fail admission.
 Payload packages use `PackageBody.format_version` 2 with a signed payload
 envelope and unsigned `LocationSet`. Each executable resource is one zstd
 level-3 frame with a signed decoded length and compressed-chunk commitments.
-Execution ABI 5, prepared model contract 3, and payload format 2 are independent
-version domains. A package with another execution ABI or prepared contract
-requires re-export with Ignition and fails loading before replay.
+Execution ABI, prepared model contract, and payload format are independent
+version domains. Execution ABI labels do not gate loading; the runtime validates
+the declared layouts and operations. Engine upgrades must preserve support for
+previously supported models without re-export.
 
 Executable resources are one mandatory zstd level-3 frame per resource. The
 signed `ExecutableResource` binds its stored frame, signed decoded length,
@@ -204,7 +205,7 @@ readmission, and offload consume the same storage contract.
 A completion cursor names committed state and its lag behind target consumption.
 For a successful speculative lane, the reported draft cursor must equal
 `max(consumed_tokens - lag_tokens, 0)`. A graph with no draft cursor reports -1.
-Sampled IDs must fit the vocabulary; the ABI5 reserved model field remains -1.
+Sampled IDs must fit the vocabulary; the ABI6 reserved model field remains -1.
 The scheduler independently validates generations, submission order, accepted
 counts, and request endpoints before retiring any lane.
 

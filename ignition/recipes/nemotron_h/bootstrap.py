@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -112,6 +112,10 @@ class PreparationConfig:
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width, _ in self.speculative_round_shapes), default=1)
+
 
 @torch.no_grad()
 @with_autotune_effort
@@ -148,7 +152,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "draft": weights.config.draft.text if drafting else None,

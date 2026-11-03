@@ -100,6 +100,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
         manifest.validate()?;
+        wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
         let mut peers = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
@@ -296,8 +297,8 @@ impl TensorParallelExecutor {
                         let graph = reader.number()?;
                         let frame = completion_frame(&mut self.pending, index, fence, graph)?;
                         let timing = wire::timing(&mut reader)?;
-                        let proposal_confidence = wire::proposal_confidence(&mut reader)?;
-                        let speculative_survival = wire::speculative_survival(&mut reader)?;
+                        let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
+                        let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
                         if reader.0.len() != self.local.manifest().completion_bytes() {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
@@ -405,6 +406,12 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
     match (&root.proposal_confidence, &peer.proposal_confidence) {
         (None, None) => {}
         (Some(root_values), Some(peer_values)) => {
+            for (values, records) in [(root_values, &root.records), (peer_values, &peer.records)] {
+                if values.len() != records.len() || values.iter().zip(records.iter()).any(|(row, record)|
+                    record.vector.as_ref().is_none_or(|vector| row.len() + 1 != vector.tokens.len())) {
+                    return Err(invalid("proposal confidence geometry differs from completion capacity"));
+                }
+            }
             // Only the root completion is returned to the shared scheduler.
             // Peer estimates do not select execution or enter the root's curve;
             // their floating-point agreement is not a control-plane invariant.
@@ -496,6 +503,9 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
+    if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
+        return Shutdown { drained: true, error: Some(error) };
+    }
     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
         Ok(executor) => executor,
         Err(error) => {

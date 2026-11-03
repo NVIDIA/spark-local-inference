@@ -143,7 +143,7 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
             session.freeze()
             control = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                        "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                       "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device=device)}
+                       "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64, device=device)}
             bundle = PreparedExecution(device=0, graphs={mode: graph}, buffers=control,
                 signatures={mode: GraphSignature(mode, sequences, capacity if mode == "prefill" else 1)},
                 resources=(compiled, attention, session, arena, source, scratch, state, metadata))

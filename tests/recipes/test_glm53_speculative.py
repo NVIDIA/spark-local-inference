@@ -32,7 +32,7 @@ def test_shared_commit_without_previous_token_embeddings():
     acceptance.accepted_drafts.fill_(2)
     acceptance.offered_drafts.fill_(5)
     acceptance.valid.fill_(True)
-    records = torch.zeros((2, 2, 24), dtype=torch.int64)
+    records = torch.zeros((2, 2, 32), dtype=torch.int64)
     commit = PreparedSpeculativeCommit(state, acceptance, torch.tensor([[3, 4, 5, 6, 7, 8]]),
         torch.tensor([1], dtype=torch.int32), torch.tensor([7]), torch.tensor([1], dtype=torch.int32),
         completion_outputs(records), torch.tensor([0], dtype=torch.int32), torch.tensor([1]), logits=torch.zeros((1, 6, state.vocab_size)))

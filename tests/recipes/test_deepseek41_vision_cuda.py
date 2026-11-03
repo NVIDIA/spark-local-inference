@@ -99,7 +99,7 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     state = VisionState(weights, batch, PrefillVisionInputs.allocate(512, device), requests, features=4096,
         token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"), feature_type=1,
         image_slots=2)
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     frame, sequence = (
         torch.zeros(1, dtype=torch.int32, device=device),
         torch.ones(1, dtype=torch.int64, device=device),

@@ -262,8 +262,10 @@ executor.drained -> whether close confirmed both streams drained
 executor.close()
 ```
 
-`ExecutionCompletion.records` contains one 24-field ABI5 record per captured
-physical request slot. `consumed_tokens` and `generated_tokens` are cumulative.
+`ExecutionCompletion.records` contains one ABI6 record per captured physical
+request slot, with 16 metadata fields followed by the package-defined number of
+token fields. An omitted or zero `completion_token_capacity` resolves to eight.
+`consumed_tokens` and `generated_tokens` are cumulative.
 Submission failure poisons the executor. `close` drains both streams before
 releasing pinned memory or the Python owner; failed drain retains both. Owner
 release happens outside the ownership mutex, permitting a Python finalizer to

@@ -54,8 +54,8 @@ def prepare(root, shard_size=64 << 30, table_world=1):
         transfer_target = torch.empty_like(transfer_source)
         mailbox = storage.host_allocate("engram_1_requests", (4 * 24 + 1,), torch.int64)
         mailbox.host_view.zero_()
-        records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
-        record = torch.zeros((4, 24), dtype=torch.int64, device=device)
+        records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
+        record = torch.zeros((4, 32), dtype=torch.int64, device=device)
         with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
             lookup = PreparedEngramLookup(inputs, output, count, layer=1, token_map=tuple(range(32)),
                 geometry=geometry, session=session, name='engram')

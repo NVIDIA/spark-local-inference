@@ -61,7 +61,7 @@ for patch application in standalone Python tools.
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
-ignition bench [MODEL] [flags]                   measure complete prepared GPU graph round latency
+ignition bench [MODEL] [flags]                   measure prepared decode-round or prefill graph latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
@@ -186,9 +186,9 @@ verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
 record no history preference. Package defaults fill omitted settings; explicit
-startup settings win. Serving requires execution ABI 5 and prepared model
-contract 3; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
-graphs and required kernels load. Continuation rows and KV pages receive physical
+startup settings win. Execution ABI labels do not gate loading; engine upgrades
+preserve previously supported model packages. Omitted capacity flags use package
+defaults. Only selected graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
 ### GPU graph latency benchmark
@@ -203,13 +203,19 @@ other recipes fail explicitly.
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 \
   --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
+  --prefill-chunk-size 4096 --contexts 0,4096 --output /tmp/qwen38-prefill.json
 ```
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4` | `1,2,4` |
-| `--contexts LIST` | Distinct consumed context lengths before each measured round; positive multiples of 128 | `512,2048,8192,16384` |
-| `--verify-width N` | Target tokens per request, including the pending token; only eight is supported, with seven draft tokens | `8` |
+| `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
+| `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
+| `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
+| `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
+| `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
+| `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
 | `--repetitions N` | Timed restored rounds per case and seed | `20` |
 | `--seeds LIST` | Distinct input and sampling seeds | `0,1,2` |
@@ -224,9 +230,88 @@ autotuning, precision, and overlap settings. Omitted concurrency defaults to the
 largest selected batch; configured and explicit capacities must cover it.
 The prepared request capacity is the largest selected batch. JSON distinguishes
 that capacity from the concurrency requested through configuration or flags.
-`--no-mtp`, mixed prefill, and prompt-logprob graphs do not apply.
+`--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
+are unsupported.
 
-Each case starts from a real tokenized and prefilled context. Context length
+For fifteen drafts plus the pending token, select `--mtp-draft-tokens 15` or
+`--verify-width 16`. Specifying both requires matching values. This measures the
+native width-sixteen graph, including verification, commit, and completion
+publication, with package-defined ABI 6 completion capacity:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --gpus 0 \
+  --batches 1 --max-concurrency 1 --contexts 4096 \
+  --mtp-draft-tokens 15 --verify-width 16 --speculative-token-capacity 16 \
+  --online-mxfp8 --draft-head-quantization mxfp8 \
+  --output /tmp/qwen38-depth15-rounds.json
+```
+
+With `--speculation-study`, batches and concurrency must be one; the default
+context is 8192. Widths 8, 13, and 16 prepare respectively 7, 12, and 15 drafts.
+The effective DFlash2 proposal block equals the selected width, independently
+of the checkpoint's eight-token block declaration. Weights and checkpoint
+configuration remain unchanged. For example:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --gpus 0 --speculation-study \
+  --contexts 8192 --batches 1 --max-concurrency 1 --verify-width 13 \
+  --mtp-draft-tokens 12 --speculative-token-capacity 64 \
+  --online-mxfp8 --draft-head-quantization mxfp8 \
+  --warmup 5 --repetitions 20 --seeds 0,1,2 --output /tmp/qwen38-study13.json
+```
+
+For a depth comparison with shared preparation, replace `--verify-width 13
+--mtp-draft-tokens 12` with `--study-widths 8,13,16`. All selected graphs share
+weights, one tuning session, a native prefill graph, and a pool sized for the
+largest width. Each context and seed is prefilled once with an output budget of
+twice the largest width. Every measured width restores that same request, cache,
+recurrent state, and all proposal/target RNG state before replay. JSON records
+shared sampling defaults, each sample's initial pending token and generation,
+and each graph's effective block. Independently prepared single-width runs can
+select different kernels and produce different prefill state; their acceptance
+counts do not isolate the effect of depth.
+
+Study graphs retain full draft generation, target verification, rejection
+sampling, request and recurrent-state commit, draft-context update, and saved
+hidden-state update. Caller-owned tensors expose their results; the timed graph
+omits native completion-record publication. Study graphs have private capture
+and compilation identities and cannot produce native package metadata. Native
+exports declare the completion capacity required by the recipe's verification
+catalog;
+ordinary round benchmarks use width eight. Establish a width-eight study control
+before comparing deeper studies; native and study latencies have different
+publication boundaries.
+
+JSON identifies study timing as `cuda_graph_speculation_study_latency_ms`, with
+`native_completion_publication=false` and per-case `effective_draft_block`. Each seeded
+sample contains one `acceptance` observation: offered and accepted draft counts,
+committed draft and emitted token counts after clipping, emitted token IDs, and
+cumulative acceptance probabilities along the sampled proposal chain. Restored
+timing repetitions reuse the same RNG draw and are not independent acceptance
+observations. `useful_tokens_per_gpu_second` divides that input's emitted count
+by its median graph time; it does not measure serving throughput. Three default
+seeds provide an initial screen, not a robust acceptance estimate.
+
+With `--prefill`, each request has `context + chunk` prompt tokens. Admission
+and the preceding context run outside timing; each measured replay processes
+the final chunk and samples its pending token. For example, chunk 4096 at
+context 4096 measures positions 4096–8191 after an untimed 4096-token prefix.
+The selected graph has exactly the requested token capacity, without padding
+to a larger bucket. Preparation includes that capacity and any smaller capacity
+needed for a prefix remainder, and omits decode and speculative round graphs.
+Complete-forward Inductor compilation is enabled by default; `--no-compile`
+retains the diagnostic uncompiled capture path and JSON records
+`configuration.compiled_forwards`.
+
+Prefill timing includes target computation, vocabulary projection, sampling,
+state commit, and DFlash2 context assimilation when speculation is enabled.
+Use `--no-mtp` to omit the draft model and its context work. `--verify-width`
+does not apply to prefill. The request and every persistent cache are restored
+before each replay, outside timing. JSON uses metric
+`cuda_graph_prefill_latency_ms` and records `chunk_tokens` and
+`context_tokens` for each case; the table reports chunk and preceding context.
+
+Each speculative case starts from a real tokenized and prefilled context. Context length
 counts consumed positions before the pending token. Complete cache and
 speculative state restoration occurs outside CUDA timing before every round.
 A same-device snapshot retains one additional complete mutable-state copy
@@ -307,6 +392,7 @@ explicit flags take precedence.
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing packages retain their captured catalog. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
+| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. This does not quantize the draft body. | Checkpoint precision |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
@@ -323,7 +409,7 @@ explicit flags take precedence.
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
-| `--online-mxfp8` | Store the recipe's eligible BF16 projections as MXFP8 while loading (Kimi K3: KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark draft context, outputs and MLPs), trading checkpoint precision for decode bandwidth. MLA's batched key/value projections retain BF16. Recipes that name no such projections reject it. | Checkpoint precision |
+| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
 Speculative token capacity and packed graph budget also accept configuration-file
@@ -920,9 +1006,9 @@ package; the local development profile is loaded automatically. `--output`
 selects a destination and `--form` selects packed or directory form. Conversion
 leaves its source intact. Conversion rejects logical-resource containers;
 export them again with Ignition to obtain a payload package. Serving accepts
-payload format 2 and signed format-6 logical-resource containers, both requiring
-execution ABI 5 and prepared model contract 3. Other execution ABI or prepared
-contract versions require re-export.
+payload format 2 and signed format-6 logical-resource containers, with structural
+contract validation in both carriers. Execution ABI labels do not gate loading,
+and engine upgrades preserve previously supported models.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's
 repository with the Hugging Face upload client as either canonical form. Export
@@ -1118,9 +1204,9 @@ value in preference to that recorded reserve.
 
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
-recomputing it. A finished exchange can retain its prompt and answer states, so the
-engine exposes up to eight snapshot slots per concurrent request, about four
-recent exchanges each. Snapshot slots share physical backing with KV pages and
+recomputing it. Immutable snapshot capacity is bounded by borrowable KV backing
+and the prepared virtual extent. The per-request capture budget is capped at
+eight. Snapshot slots share physical backing with KV pages and
 acquire it only when retaining a checkpoint. Unpinned checkpoints are evicted
 to admit requests. If active requests or transfers own all suitable backing,
 the engine skips optional checkpoint retention. There is no dedicated snapshot
@@ -1190,7 +1276,7 @@ every rank and have no configuration-file key. See
 | Tensor-parallel size | Count of `--gpus`, or the smallest recipe-supported size whose estimate fits the first GPUs with enough free memory |
 | Context limit | The smaller of the prepared context ceiling and loaded KV capacity after per-request draft-page storage; admission also checks available shared capacity |
 | KV pages | Remaining supply after the runtime memory limit or package reserve, engine headroom, weights, graphs, scratch, and execution rows; bounded by `--kv-cache-limit` and prepared virtual extents. Retained snapshot rows borrow page backing; the load display reports total KV capacity |
-| Prefix cache | Up to eight snapshot slots per `--max-concurrency` request, acquired on demand from shared KV backing and evicted under pressure |
+| Prefix cache | Immutable snapshot capacity bounded by borrowable KV backing and the prepared virtual extent, acquired on demand and evicted under pressure; per-request capture budget capped at eight |
 | Live state | One null row plus the recipe's execution rows per active request slot; GLM verification commits into one live row |
 | Decode graph capacities | 1 through `--max-concurrency`, rounded to the recipe's captured set |
 | Image feature arena | Prepared image concurrency times per-request feature capacity and embedding width; slots remain owned through request retirement |

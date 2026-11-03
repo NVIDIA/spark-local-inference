@@ -79,3 +79,41 @@ def test_kimi_parallel_rounds_have_packed_target_capacity():
                                speculative_token_capacity=4, draft_checkpoint="/tmp/dspark")
     assert (2, 4, 3) in config.speculative_round_shapes
     assert config.decode_tokens == 4 and config.decode_samples == 8
+
+
+def test_shared_catalogs_cover_fifteen_drafts_with_bounded_target_rows():
+    from ignition.components.capacity import parallel_speculative_shapes
+
+    widths = tuple(range(1, 17))
+    shapes = speculative_shapes(4, widths, 32)
+    assert (1, 16) in shapes and (2, 16) in shapes and (4, 16) not in shapes
+    assert set(proposal_shapes(4, 15)) == {(1, 15), (2, 15), (4, 15)}
+    rounds = parallel_speculative_shapes(4, widths, 32)
+    assert (1, 16, 16) in rounds and (2, 16, 32) in rounds and (4, 16, 32) in rounds
+    assert all(width == 1 or batch < packed <= min(32, batch * width)
+               for batch, width, packed in rounds)
+    with pytest.raises(ValueError, match="Int32"):
+        speculative_shapes(4, (*widths, 1 << 31), 32)
+    with pytest.raises(ValueError, match="proposal depth"):
+        proposal_shapes(4, (1 << 31) - 1)
+
+
+@pytest.mark.parametrize("recipe,flag", [(Qwen, "mtp"), (Glm, "mtp"), (DeepSeek4, "dspark"),
+    (DeepSeek41, "dspark"), (Mimo, "dflash"), (Step5, "mtp")])
+def test_recipe_completion_capacity_tracks_enabled_native_catalog(recipe, flag):
+    widths = (1, 2, 3, 4)
+    active = recipe(speculative_widths=widths, **{flag: True})
+    assert active.completion_token_capacity == 4
+    ordinary = recipe(speculative_widths=widths, **{flag: False})
+    assert ordinary.completion_token_capacity == 1
+
+
+@pytest.mark.parametrize("width", [1, 8, 13, 16])
+def test_qwen_dense_native_capacity_remains_independent_of_recurrent_state_columns(width):
+    from pathlib import Path
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    settings = PreparationConfig(draft_snapshot=Path("/tmp/dflash"), speculative_widths=tuple(range(1, width + 1)))
+    assert settings.completion_token_capacity == width
+    with pytest.raises(ValueError, match="fifteen"):
+        PreparationConfig(draft_snapshot=Path("/tmp/dflash"), speculative_widths=(1, 32))

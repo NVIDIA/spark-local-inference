@@ -15,6 +15,7 @@ fn logical_layout_excludes_process_addresses_and_detects_contract_changes() {
     let manifest = super::super::tests::manifest();
     let expected = layout(&manifest);
     let mut peer = manifest.clone();
+    peer.abi_version = 5;
     peer.context += 10;
     peer.device += 1;
     for buffer in &mut peer.buffers {
@@ -33,6 +34,14 @@ fn logical_layout_excludes_process_addresses_and_detects_contract_changes() {
     peer = manifest;
     peer.graphs[0].input_bindings[2].host_offset += 8;
     assert_ne!(expected, layout(&peer));
+}
+
+#[test]
+fn rank_layout_includes_resolved_completion_capacity() {
+    let manifest = crate::execution::tests::manifest();
+    let mut peer = manifest.clone();
+    peer.completion_token_capacity = 33;
+    assert_ne!(layout(&manifest), layout(&peer));
 }
 
 #[test]
@@ -333,7 +342,7 @@ fn completed(status: i64) -> FrameCompletion {
         status,
         error_code: 0,
         reserved: 0,
-        vector: Some(super::super::TokenVector::default()),
+        vector: Some(super::super::TokenVector { tokens: vec![-1; 16], ..Default::default() }),
     };
     FrameCompletion {
         logprobs: None,
@@ -343,7 +352,7 @@ fn completed(status: i64) -> FrameCompletion {
         fence: Fence(3),
         graph_index: 2,
         timing: Default::default(),
-        records: [record; 4].into(),
+        records: vec![record.clone(); 4].into(),
     }
 }
 
@@ -382,9 +391,9 @@ fn completion_wire_preserves_the_execution_abi() {
     assert_eq!(reader.number().unwrap(), 3);
     assert_eq!(reader.number().unwrap(), 2);
     assert_eq!(timing(&mut reader).unwrap(), root.timing);
-    assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
-    assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, super::super::VECTOR_RECORD_FIELDS).unwrap();
+    assert_eq!(proposal_confidence(&mut reader, 4, 16).unwrap(), root.proposal_confidence);
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), root.speculative_survival);
+    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, 32).unwrap();
     for (expected, actual) in root.records.iter().zip(records.iter()) {
         assert_eq!(expected.fields(), actual.fields());
     }
@@ -396,22 +405,23 @@ fn speculative_survival_is_optional_and_validated_per_rank_without_numeric_conse
     for record in root.records.iter_mut() {
         record.vector = Some(crate::execution::TokenVector {
             emitted_count: 1, offered_drafts: 3, accepted_drafts: 0, verification_width: 4,
+            tokens: vec![-1; 16],
             ..Default::default()
         });
     }
-    let mut values = [[-1.; 7]; 64];
-    values[..4].fill([0.75, 0.5, 0.25, -1., -1., -1., -1.]);
-    root.speculative_survival = Some(values);
+    let mut values = vec![vec![-1.; 15]; 4];
+    values[..4].fill(vec![0.75, 0.5, 0.25, -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1.]);
+    root.speculative_survival = Some(values.clone());
     let mut peer = completed(1);
     peer.records = root.records.clone();
     assert!(agree(&root, &peer).is_err());
-    peer.speculative_survival = Some(values);
+    peer.speculative_survival = Some(values.clone());
     peer.speculative_survival.as_mut().unwrap()[1][1] = 0.6;
     agree(&root, &peer).unwrap();
-    assert_eq!(root.speculative_survival, Some(values));
+    assert_eq!(root.speculative_survival, Some(values.clone()));
     for (slot, depth, invalid) in [(0, 0, f32::NAN), (0, 0, 1.1), (0, 0, -0.1),
-        (0, 1, 0.8), (0, 1, -1.), (0, 2, -1.), (0, 3, 0.1), (4, 0, 0.1)] {
-        peer.speculative_survival = Some(values);
+        (0, 1, 0.8), (0, 1, -1.), (0, 2, -1.), (0, 3, 0.1)] {
+        peer.speculative_survival = Some(values.clone());
         peer.speculative_survival.as_mut().unwrap()[slot][depth] = invalid;
         assert!(agree(&root, &peer).is_err(), "slot {slot}, depth {depth}, value {invalid}");
     }
@@ -420,11 +430,11 @@ fn speculative_survival_is_optional_and_validated_per_rank_without_numeric_conse
     reader.number().unwrap();
     reader.number().unwrap();
     timing(&mut reader).unwrap();
-    proposal_confidence(&mut reader).unwrap();
+    proposal_confidence(&mut reader, 4, 16).unwrap();
     let offset = bytes.len() - reader.0.len();
-    assert_eq!(speculative_survival(&mut reader).unwrap(), Some(values));
-    for length in [0, 1, 7, 8, 9, 8 + 64 * 7 * 4 - 1] {
-        assert!(speculative_survival(&mut Reader(&bytes[offset..offset + length])).is_err());
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), Some(values.clone()));
+    for length in [0, 1, 7, 8, 9, 8 + 4 * 15 * 4 - 1] {
+        assert!(speculative_survival(&mut Reader(&bytes[offset..offset + length]), 4, 16).is_err());
     }
 }
 
@@ -451,17 +461,17 @@ fn rank_timing_rejects_truncation_and_preserves_zero_duration() {
 fn rank_completion_requires_every_record() {
     let root = completed(1);
     let mut peer = completed(1);
-    peer.records = [peer.records[0]; 3].into();
+    peer.records = vec![peer.records[0].clone(); 3].into();
     assert!(agree(&root, &peer).is_err());
 }
 
 #[test]
 fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     let mut root = completed(1);
-    root.proposal_confidence = Some([[0.5; 7]; 64]);
+    root.proposal_confidence = Some(vec![vec![0.5; 15]; 4]);
     let mut peer = completed(1);
     assert!(agree(&root, &peer).is_err());
-    peer.proposal_confidence = root.proposal_confidence;
+    peer.proposal_confidence = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     peer.proposal_confidence.as_mut().unwrap()[3][2] = 0.6;
     agree(&root, &peer).unwrap();
@@ -470,30 +480,30 @@ fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     reader.number().unwrap();
     reader.number().unwrap();
     timing(&mut reader).unwrap();
-    assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
-    assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    assert_eq!(reader.0.len(), 4 * super::super::VECTOR_RECORD_FIELDS * 8);
+    assert_eq!(proposal_confidence(&mut reader, 4, 16).unwrap(), root.proposal_confidence);
+    assert_eq!(speculative_survival(&mut reader, 4, 16).unwrap(), root.speculative_survival);
+    assert_eq!(reader.0.len(), 4 * 32 * 8);
 }
 
 #[test]
 fn proposal_confidence_validates_each_rank_without_changing_root_values() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.0; 7]; 64]);
-    peer.proposal_confidence = root.proposal_confidence;
+    root.proposal_confidence = Some(vec![vec![0.0; 15]; 4]);
+    peer.proposal_confidence = root.proposal_confidence.clone();
     root.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79148d);
     peer.proposal_confidence.as_mut().unwrap()[1][2] = f32::from_bits(0x3f79149e);
     agree(&root, &peer).unwrap();
     peer.proposal_confidence.as_mut().unwrap()[1][2] = 0.973;
-    let authoritative = root.proposal_confidence;
+    let authoritative = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     assert_eq!(root.proposal_confidence, authoritative);
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.000001, 1.000001] {
-        root.proposal_confidence = authoritative;
-        peer.proposal_confidence = authoritative;
+        root.proposal_confidence = authoritative.clone();
+        peer.proposal_confidence = authoritative.clone();
         root.proposal_confidence.as_mut().unwrap()[1][2] = invalid;
         assert!(agree(&root, &peer).is_err());
-        root.proposal_confidence = authoritative;
+        root.proposal_confidence = authoritative.clone();
         peer.proposal_confidence.as_mut().unwrap()[1][2] = invalid;
         assert!(agree(&root, &peer).is_err());
     }
@@ -503,11 +513,11 @@ fn proposal_confidence_validates_each_rank_without_changing_root_values() {
 fn rank_zero_confidence_is_authoritative_without_relaxing_request_agreement() {
     let mut root = completed(1);
     let mut peer = completed(1);
-    root.proposal_confidence = Some([[0.5; 7]; 64]);
-    peer.proposal_confidence = root.proposal_confidence;
+    root.proposal_confidence = Some(vec![vec![0.5; 15]; 4]);
+    peer.proposal_confidence = root.proposal_confidence.clone();
     root.proposal_confidence.as_mut().unwrap()[2][2] = 0.51028365;
     peer.proposal_confidence.as_mut().unwrap()[2][2] = 0.5102996;
-    let authoritative = root.proposal_confidence;
+    let authoritative = root.proposal_confidence.clone();
     agree(&root, &peer).unwrap();
     assert_eq!(root.proposal_confidence, authoritative);
     peer.records[0].consumed_tokens += 1;
@@ -641,4 +651,22 @@ fn startup_tuning_rank_agreement_includes_producers_bindings_and_buffer_schemas(
         }
         assert_ne!(layout(&peer), expected, "mutation {mutation}");
     }
+}
+
+#[test]
+fn socket_completion_capacity_is_checked_before_rank_startup() {
+    let mut manifest = crate::execution::tests::manifest();
+    manifest.max_active = 64;
+    manifest.completion_token_capacity = 65;
+    validate_completion_packet(&manifest).unwrap();
+    manifest.completion_token_capacity = 131072;
+    assert!(validate_completion_packet(&manifest).unwrap_err().to_string().contains("packet capacity"));
+    manifest.completion_token_capacity = 65536;
+    validate_completion_packet(&manifest).unwrap();
+    manifest.graphs[0].confidence_width = 1;
+    manifest.buffers.push(crate::execution::BufferDescriptor {
+        name: "completion_speculative_survival".into(), address: 1, nbytes: 1,
+        dtype: crate::execution::Dtype::Float32, shape: vec![2, 64, 65535], strides: vec![64 * 65535, 65535, 1],
+    });
+    assert!(validate_completion_packet(&manifest).is_err());
 }

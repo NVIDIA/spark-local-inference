@@ -102,6 +102,7 @@ impl NativeResources {
             cache: self.cache.clone(),
             offload: None,
             abi_version: execution.abi_version,
+            completion_token_capacity: crate::execution::resolve_completion_token_capacity(execution.completion_token_capacity),
             context: self.context as usize,
             device: self.device,
             max_active: size(execution.max_active)?,

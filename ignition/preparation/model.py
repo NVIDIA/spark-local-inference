@@ -23,7 +23,8 @@ class PreparedModel(PreparedExecution):
 
     def __init__(self, *, server_config, memory_report, session, close_resources=(), package_data=None,
                  forwards=None, embedding_catalog=None, rebuild_weights=None,
-                 benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None, **kwargs):
+                 benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None,
+                 benchmark_prefills=None, **kwargs):
         registry = getattr(session, "_startup_collectives", None)
         if registry is not None:
             buffers, tuners, bindings, owners = registry.catalog(kwargs["graphs"])
@@ -49,6 +50,7 @@ class PreparedModel(PreparedExecution):
         self.benchmark_pool = benchmark_pool
         self.benchmark_requests = benchmark_requests
         self.benchmark_rounds = None if benchmark_rounds is None else MappingProxyType(dict(benchmark_rounds))
+        self.benchmark_prefills = None if benchmark_prefills is None else MappingProxyType(dict(benchmark_prefills))
         self.embedding_catalog = embedding_catalog
         self.embedding_tables = self._embedding_binding = None
         self._close_resources = tuple(close_resources)
@@ -156,6 +158,7 @@ class PreparedModel(PreparedExecution):
         self.serving_graphs = self.tuning_graphs = self.tuned_bindings = MappingProxyType({})
         self.forwards = None
         self.benchmark_state = self.benchmark_pool = self.benchmark_requests = self.benchmark_rounds = None
+        self.benchmark_prefills = None
         self.session = None
         self._close_resources = ()
         self.runtime = None

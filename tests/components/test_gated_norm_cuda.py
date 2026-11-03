@@ -88,3 +88,50 @@ def test_prepared_gate_before_grouped_norm_graph(weight_dtype):
             assert not output[count:].any()
             del x, expected
             assert torch.cuda.memory_allocated() == allocated
+
+
+@pytest.mark.parametrize("encoded_only", [False, True])
+def test_gated_norm_mxfp8_prefill_graph_live_rows_and_storage(encoded_only):
+    from b12x.quantization import mxfp8
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+
+    torch.manual_seed(0)
+    rows, heads, dim = 4096, 48, 128
+    hidden = torch.randn((rows, heads, dim), device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn((rows, 16384), device="cuda", dtype=torch.bfloat16)
+    gate = packed[:, 10240:].view(rows, heads, dim)
+    weight = torch.ones(dim, device="cuda", dtype=torch.float32)
+    output = torch.empty_like(hidden)
+    live = torch.tensor([rows], device="cuda", dtype=torch.int32)
+    bases = tuple(torch.zeros(shape, dtype=dtype, device="cuda") for shape, dtype in zip(
+        mxfp8.dense_rows_storage_shapes(rows, heads * dim),
+        (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    encoded = mxfp8.dense_rows_from_bases(*bases)
+    output.fill_(17)
+    norm = PreparedGatedRMSNorm(hidden, gate, weight, None if encoded_only else output, live, eps=1e-6,
+        round_normalized=True, activation="silu", encoded=encoded)
+    norm()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        norm()
+    graph.replay()
+    torch.cuda.synchronize()
+    prior = encoded.values.clone()
+    hidden.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(prior.view(torch.uint8), encoded.values.view(torch.uint8))
+    assert torch.isfinite(encoded.values.float()).all()
+    del prior
+    allocated = torch.cuda.memory_allocated()
+    for count in (rows // 2, 0, rows):
+        live.fill_(count)
+        graph.replay()
+        torch.cuda.synchronize()
+        if encoded_only:
+            assert (output == 17).all()
+        else:
+            assert not output[count:].any()
+        assert not encoded.values.view(torch.uint8)[count:].any()
+        assert (encoded.scale_rows.view(torch.uint8).reshape(rows, -1)[count:] == 127).all()
+        assert torch.cuda.memory_allocated() == allocated

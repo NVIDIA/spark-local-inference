@@ -87,7 +87,7 @@ __global__ void no_arguments() {}
     return module, function, empty
 
 
-def prepare(root, shard_size=64 << 30, legacy=False):
+def prepare(root, shard_size=64 << 30, legacy=False, completion_token_capacity=8):
     with ModuleImages() as images:
         torch.cuda.set_device(0)
         with PackageStorage() as storage:
@@ -115,7 +115,7 @@ def prepare(root, shard_size=64 << 30, legacy=False):
             ready.record()
             buffers = {"frame_index": torch.zeros(1, device="cuda", dtype=torch.int32),
                        "submission_sequence": torch.zeros(1, device="cuda", dtype=torch.int64),
-                       "completion_records": torch.zeros((2, 1, 24), device="cuda", dtype=torch.int64),
+                       "completion_records": torch.zeros((2, 1, 16 + completion_token_capacity), device="cuda", dtype=torch.int64),
                        "source": source, "output": output}
             records = buffers["completion_records"]
             records[..., 4] = -1
@@ -188,6 +188,7 @@ def prepare(root, shard_size=64 << 30, legacy=False):
     else:
         combine(root / "package", [root / "rank.json"], [], publisher=publisher())
     (root / "expected.json").write_text(json.dumps({
+        "completion_token_capacity": completion_token_capacity,
         "reference": allocation_reference(package.allocations, output), "bytes": list(expected),
         "addresses": {allocation.name: allocation.address for allocation in package.allocations},
         "zero_reference": zero_reference,
@@ -205,8 +206,11 @@ if __name__ == "__main__":
     parser.add_argument("executable", nargs="?")
     parser.add_argument("--shard-size", type=int, default=64 << 30)
     parser.add_argument("--legacy", action="store_true")
+    parser.add_argument("--completion-token-capacity", type=int, default=8)
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size, args.legacy)
+    if args.completion_token_capacity < 1:
+        parser.error("completion token capacity must be positive")
+    prepare(args.directory, args.shard_size, args.legacy, args.completion_token_capacity)
     if args.executable:
         os.execv(args.executable, [args.executable, str(args.directory)])

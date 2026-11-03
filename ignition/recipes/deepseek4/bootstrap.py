@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.completion import CompletionOutputs
+from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -92,6 +92,8 @@ class PreparationConfig:
     stream_overlap: bool = True
 
     def __post_init__(self):
+        if self.speculative_widths and max(self.speculative_widths) > 8:
+            raise ValueError("DeepSeek V4 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
         from ignition.recipes.declaration import Speculation
 
@@ -155,6 +157,10 @@ class PreparationConfig:
     def draft_tokens(self):
         return max(self.speculative_widths) - 1 if self.dspark else 0
 
+    @property
+    def completion_token_capacity(self):
+        return max((width for _, width, _ in self.speculative_round_shapes), default=1)
+
 
 @torch.no_grad()
 @with_autotune_effort
@@ -202,7 +208,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
+        completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         ipc = package_storage.peer_storage
         tokens = max(config.prefill_chunk_size, config.decode_tokens, slots * config.draft_tokens)
