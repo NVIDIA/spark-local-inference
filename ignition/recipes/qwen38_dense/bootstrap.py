@@ -368,7 +368,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         page_tokens=PAGE_TOKENS, frontend=prepare_frontend(snapshot, eos_token_ids=eos_ids),
         sampling_defaults=RECIPE.sampling_defaults.as_dict(), assets=assets,
         model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary))
-    if config.mtp:
+    if config.mtp and config.speculative_round_shapes:
         server_config.update(speculative_widths=config.speculative_widths,
             speculative_fixed_width=config.speculative_fixed_width,
             speculative_token_capacity=speculative_token_capacity(
