@@ -693,6 +693,16 @@ pub struct RequestScheduler {
     admissions: u64,
 }
 
+fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
+    let extent = limits.max_active.checked_mul(rows)
+        .and_then(|live| live.checked_add(1))
+        .and_then(|live| live.checked_add(limits.snapshots as usize));
+    if rows == 0 || extent.is_none_or(|extent| extent - 1 > u32::MAX as usize) {
+        return Err("execution and snapshot state rows exceed state-slot identifiers".into());
+    }
+    Ok(())
+}
+
 impl RequestScheduler {
     pub fn new(
         identity: [u8; 32],
@@ -718,6 +728,7 @@ impl RequestScheduler {
         {
             return Err("invalid live request capacities".into());
         }
+        validate_state_slot_extent(&limits, capabilities.state_rows_per_request.unwrap_or(1))?;
         let cache = PrefixCheckpointCache::new(
             identity,
             limits.pages,
@@ -873,6 +884,8 @@ impl RequestScheduler {
         {
             return Err("speculation must be configured before mixed graphs and admission".into());
         }
+        validate_state_slot_extent(&self.limits, self.capabilities.state_rows_per_request
+            .unwrap_or_else(|| widths.last().copied().unwrap_or(1)))?;
         self.speculative_widths = widths.to_vec();
         self.refresh_speculative_catalog();
         Ok(())

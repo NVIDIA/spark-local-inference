@@ -3312,3 +3312,18 @@ fn package_capacity_bounds_catalog_and_request_profiles() {
         assert_eq!(scheduler.request(handle).unwrap().acceptance.curve(speculation::ProposalSource::Mtp, 0, false).len(), capacity - 1);
     }
 }
+
+#[test]
+fn state_slot_extent_uses_storage_geometry_independently_of_completion_capacity() {
+    let fixture = scheduler(1, 32, 4);
+    let mut capabilities = fixture.capabilities.clone();
+    capabilities.completion_token_capacity = 32;
+    for rows in [0, usize::MAX, u32::MAX as usize] {
+        capabilities.state_rows_per_request = Some(rows);
+        assert!(RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities.clone()).is_err());
+    }
+    capabilities.state_rows_per_request = Some(1024);
+    let scheduler = RequestScheduler::new([0; 32], fixture.limits.clone(), capabilities).unwrap();
+    assert_eq!(scheduler.execution_rows(), 1024);
+    assert_eq!(scheduler.snapshot_slot(SnapshotId(3)).0, 1028);
+}
