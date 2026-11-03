@@ -52,18 +52,20 @@ impl HostPrefixRanking {
     }
 }
 
+fn rank_prefixes(positions: &mut [(f64, usize, usize)]) {
+    // Survival is nonincreasing with depth; ties keep predecessors before successors.
+    positions.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+}
+
 impl RequestScheduler {
-    pub(super) fn pending_token_ceiling(&self, handle: RequestHandle) -> usize {
-        self.request(handle).map_or_else(|_| self.submitted_token_ceiling(handle), |request| self.pending_ceiling(request))
-    }
-
-    /// The live request's tracked advance ceiling across submitted, uncompleted steps.
     pub(super) fn pending_ceiling(&self, request: &LiveRequest) -> usize {
-        debug_assert_eq!(request.pending_ceiling, self.submitted_token_ceiling(request.handle));
-        request.pending_ceiling
+        // Completion reconciles the scheduled cursor with the remaining submissions.
+        let pending = (request.scheduled_consumed - request.consumed_tokens) as usize;
+        debug_assert_eq!(pending, self.pending_token_ceiling(request.handle));
+        pending
     }
 
-    fn submitted_token_ceiling(&self, handle: RequestHandle) -> usize {
+    pub(super) fn pending_token_ceiling(&self, handle: RequestHandle) -> usize {
         self.submissions.values().map(|submission| submission.lanes.iter()
             .filter(|lane| lane.request == handle)
             .map(|lane| submission.lane_advance_ceiling(lane)).sum::<usize>()).sum()
@@ -125,7 +127,8 @@ impl RequestScheduler {
         if (gpu && preserve_gpu_ceilings) || (!gpu && self.speculative_fixed_width.is_some())
             || ceiling.iter().sum::<usize>() <= packed { return ceiling; }
         for slot in bits(mask) { lengths[slot] = 1; }
-        // Prefix probabilities stay fixed while the lengths grow.
+        let remaining = packed.saturating_sub(mask.count_ones() as usize);
+        if remaining == 0 { return lengths; }
         let probabilities: [[f64; 7]; REQUEST_LANES] = std::array::from_fn(|slot| {
             if mask & (1 << slot) == 0 { return [0.0; 7]; }
             let request = self.slots[slot].request.as_ref().unwrap();
@@ -133,15 +136,15 @@ impl RequestScheduler {
             else { request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
                 .map(|probability| probability.powf(self.policy.adaptive_verification_alpha) * values[slot].output_token) }
         });
-        let mut remaining = packed.saturating_sub(mask.count_ones() as usize);
-        while remaining != 0 {
-            let best = bits(mask).filter(|&slot| lengths[slot] < ceiling[slot]).max_by(|&a, &b| {
-                probabilities[a][lengths[a] - 1].total_cmp(&probabilities[b][lengths[b] - 1])
-                    .then_with(|| lengths[b].cmp(&lengths[a])).then_with(|| b.cmp(&a))
-            });
-            let Some(slot) = best else { break; };
+        let mut positions = Vec::new();
+        for slot in bits(mask) {
+            for depth in 0..ceiling[slot].saturating_sub(1) {
+                positions.push((probabilities[slot][depth], depth, slot));
+            }
+        }
+        rank_prefixes(&mut positions);
+        for (_, _, slot) in positions.into_iter().take(remaining) {
             lengths[slot] += 1;
-            remaining -= 1;
         }
         lengths
     }
@@ -159,7 +162,7 @@ impl RequestScheduler {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
             }
         }
-        scores.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        rank_prefixes(&mut scores);
         let mut ranks_by_slot = std::array::from_fn(|_| Vec::new());
         let mut slots_by_rank = Vec::with_capacity(scores.len());
         for (rank, &(_, _, slot)) in scores.iter().enumerate() {

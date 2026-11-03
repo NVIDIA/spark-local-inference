@@ -37,7 +37,7 @@ impl RequestScheduler {
             })
         };
         let ordinary_widths = widths(ordinary, false);
-        let probes: Vec<_> = candidates[..count].iter().copied()
+        candidates[..count].iter().copied()
             .filter(|candidate| candidate.rate.duration_ns != 0 && candidate.rate.compare(ordinary.rate).is_gt())
             .map(|candidate| (candidate, widths(candidate, true)))
             .filter(|(candidate, widths)| bits(candidate.mask).any(|slot| {
@@ -46,8 +46,7 @@ impl RequestScheduler {
                 width > ordinary_widths[slot]
                     && request.max_new_tokens - request.generated_tokens > width as u32
                     && self.limits.max_sequence_tokens - request.scheduled_consumed as usize > width
-            })).collect();
-        probes.into_iter().max_by(|(a, a_widths), (b, b_widths)| {
+            })).max_by(|(a, a_widths), (b, b_widths)| {
             let gain = |candidate: &Candidate| (candidate.rate.score - ordinary.rate.score) / candidate.rate.duration_ns as f64;
             let information = |candidate: &Candidate, widths: &[usize; REQUEST_LANES]| bits(candidate.mask).flat_map(|slot| {
                 (ordinary_widths[slot] - 1..widths[slot] - 1)
