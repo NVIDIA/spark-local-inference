@@ -765,25 +765,36 @@ fn partial_marker(text: &str, markers: &[&str]) -> usize {
 }
 
 pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
+    // Tool schemas guide tag-to-JSON conversion; non-strict calls retain invalid values.
+    Ok(match declared_value(raw, schema)? {
+        Some(value) => value,
+        None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into())),
+    })
+}
+
+fn declared_value(raw: &str, schema: Option<&Value>) -> Result<Option<Value>> {
     let Some(schema) = schema else {
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     };
     let types = schema.get("type");
     if types == Some(&Value::String("string".into())) {
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     }
     if types.is_none() {
         for key in ["anyOf", "oneOf"] {
             if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+                let mut invalid = None;
                 for branch in branches {
-                    if let Ok(value) = parameter_value(raw, Some(branch)) {
-                        return Ok(value);
+                    match declared_value(raw, Some(branch)) {
+                        Ok(Some(value)) => return Ok(Some(value)),
+                        Ok(None) => {}
+                        Err(error) => invalid = invalid.or(Some(error)),
                     }
                 }
-                return Err("tool parameter does not match any declared type".into());
+                return invalid.map_or(Ok(None), Err);
             }
         }
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     }
     let kinds: Vec<_> = match types {
         Some(Value::String(kind)) => vec![kind.as_str()],
@@ -793,7 +804,7 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
     let parsed: std::result::Result<Value, _> = serde_json::from_str(raw);
     for kind in kinds {
         if kind == "string" {
-            return Ok(Value::String(raw.into()));
+            return Ok(Some(Value::String(raw.into())));
         }
         if let Ok(value) = &parsed {
             let valid = match kind {
@@ -806,9 +817,9 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
                 _ => false,
             };
             if valid {
-                return Ok(value.clone());
+                return Ok(Some(value.clone()));
             }
         }
     }
-    Err("tool parameter value does not match its declared JSON type".into())
+    Ok(None)
 }
