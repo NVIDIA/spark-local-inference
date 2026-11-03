@@ -3252,6 +3252,32 @@ fn queued_completion_progress_is_bounded_by_lane_extent_not_reservation_cursor()
 }
 
 #[test]
+fn pending_advance_ceilings_follow_queued_rounds_and_retirement() {
+    let mut scheduler = engine(1, true);
+    let handle = add(&mut scheduler, 5, 64, 32);
+    ready(&mut scheduler, &[handle]);
+    for width in [1, 2, 4, 8] { set_cost(&mut scheduler, GraphKind::Speculative, 1, width, MS); }
+    assert_eq!(scheduler.pending_token_ceiling(handle), 0);
+    let first = scheduler.plan().unwrap();
+    let first_fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&first, first_fence).unwrap();
+    let second = scheduler.plan().unwrap();
+    let second_fence = Fence(scheduler.submitted.0 + 1);
+    scheduler.commit(&second, second_fence).unwrap();
+    let ceilings = [first.lanes[0].tokens, second.lanes[0].tokens];
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[0] + ceilings[1]);
+    let records = completion_records(&scheduler, &first, first_fence, 0);
+    scheduler.complete(first_fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[1]);
+    let records = completion_records(&scheduler, &second, second_fence, 0);
+    scheduler.cancel(handle).unwrap();
+    // A retired handle still reports the lanes its queued round retains.
+    assert_eq!(scheduler.pending_token_ceiling(handle), ceilings[1]);
+    scheduler.complete(second_fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(scheduler.pending_token_ceiling(handle), 0);
+}
+
+#[test]
 fn queued_generation_acknowledges_a_finished_predecessor_without_more_output() {
     let mut scheduler = engine(1, true);
     let handle = add(&mut scheduler, 5, 64, 32);

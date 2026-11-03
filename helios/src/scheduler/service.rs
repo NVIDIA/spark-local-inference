@@ -180,6 +180,7 @@ impl RequestScheduler {
                 );
             }
         } else {
+            let mut curve = None;
             for batch in crate::execution::BATCH_CAPACITIES {
                 if batch > self.limits.max_active.next_power_of_two() {
                     break;
@@ -193,11 +194,12 @@ impl RequestScheduler {
                         for &width in &self.speculative_catalog[batch.ilog2() as usize] {
                             let tokens = self.speculative_tokens(request, width);
                             if tokens > 0 {
+                                let curve = curve.get_or_insert_with(|| self.powered_curve(request, false));
                                 consider(
                                     GraphKind::Speculative,
                                     batch,
                                     width,
-                                    self.expected_speculative_tokens(request, tokens),
+                                    super::rounds::forecast_tokens(curve, tokens),
                                     true,
                                 );
                             }

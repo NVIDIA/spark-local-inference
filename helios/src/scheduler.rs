@@ -271,6 +271,8 @@ pub struct LiveRequest {
     scheduled_consumed: u64,
     last_use: Fence,
     pending: usize,
+    /// Advance ceilings of this request's lanes in submitted, uncompleted steps.
+    pending_ceiling: usize,
     terminal_snapshot_ready: bool,
     vision_patches: VecDeque<usize>,
     prefill_spans: Vec<std::ops::Range<usize>>,
@@ -1634,6 +1636,7 @@ impl RequestScheduler {
             scheduled_consumed: consumed,
             last_use: Fence(0),
             pending: 0,
+            pending_ceiling: 0,
             terminal_snapshot_ready: false,
             vision_patches: VecDeque::new(),
             prefill_spans: Vec::new(),
@@ -2087,7 +2090,7 @@ impl RequestScheduler {
     fn speculative_tokens(&self, request: &LiveRequest, width: usize) -> usize {
         let context = self.limits.max_sequence_tokens - request.scheduled_consumed as usize;
         let output = (request.max_new_tokens - request.generated_tokens) as usize;
-        let output = output.saturating_sub(self.pending_token_ceiling(request.handle));
+        let output = output.saturating_sub(self.pending_ceiling(request));
         let proposal = if request.host_stops
             || (request.grammar_constrained
                 && self.proposal_source == speculation::ProposalSource::Mtp)
@@ -2161,10 +2164,11 @@ impl RequestScheduler {
             if pages > request.reserved_pages.len() {
                 return Err("scheduled step exceeds the request's reserved page budget".into());
             }
+            let ceiling = step.lane_advance_ceiling(lane);
             let next_consumed_ceiling = lane.start_position
-                .checked_add(step.lane_advance_ceiling(lane) as u64)
+                .checked_add(ceiling as u64)
                 .ok_or("consumed token overflow")?;
-            needed.push((lane.request, pages, next_consumed_ceiling));
+            needed.push((lane.request, pages, next_consumed_ceiling, ceiling));
         }
         let expected_lengths = (step.kind == GraphKind::Speculative && self.gpu_prefix_allocation(step.batch_capacity,
             step.draft_tokens, step.token_capacity, step.packed_token_capacity)).then(|| {
@@ -2196,7 +2200,7 @@ impl RequestScheduler {
                 _ => None,
             },
         };
-        for (handle, pages, next_consumed_ceiling) in needed {
+        for (handle, pages, next_consumed_ceiling, ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
@@ -2205,6 +2209,7 @@ impl RequestScheduler {
             request.scheduled_consumed = next_consumed_ceiling;
             request.last_use = fence;
             request.pending += 1;
+            request.pending_ceiling += ceiling;
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
             }
@@ -2451,10 +2456,12 @@ impl RequestScheduler {
         let mut window_snapshots = Vec::new();
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
+            let ceiling = step.lane_advance_ceiling(lane);
             let Ok(request) = self.request_mut(lane.request) else {
                 continue;
             };
             request.pending -= 1;
+            request.pending_ceiling -= ceiling;
             if matches!(
                 kind,
                 GraphKind::Init
