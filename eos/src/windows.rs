@@ -96,10 +96,7 @@ fn check_alignment(file: File) -> io::Result<File> {
         {
             return Err(io::Error::last_os_error());
         }
-        // Unbuffered I/O requires the sector size for atomicity to divide the reader's 4096-byte
-        // granularity. `PhysicalBytesPerSectorForPerformance` is a performance hint, not a
-        // constraint: this NVMe reports 32768 there, and measured 4096-byte unbuffered reads
-        // complete, so rejecting the volume on it makes every direct read unusable.
+        // The performance sector size is a hint, not an unbuffered-I/O alignment requirement.
         for sector in [
             info.LogicalBytesPerSector,
             info.PhysicalBytesPerSectorForAtomicity,

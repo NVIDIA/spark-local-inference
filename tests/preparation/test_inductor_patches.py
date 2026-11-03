@@ -116,14 +116,40 @@ def test_file_replacement_preserves_permissions_and_wheel_cache_hardlinks(instal
         assert target.stat().st_ino != (links / target.name).stat().st_ino
 
 
+@pytest.mark.parametrize("target_platform", ["linux", "win32"])
 @pytest.mark.parametrize("name, version", [("torch", "2.14.0+cu132"), ("triton", "3.7.0")])
-def test_incompatible_dependency_versions_fail_before_writes(installation, name, version):
+def test_incompatible_dependency_versions_fail_before_writes(installation, monkeypatch, name, version,
+                                                           target_platform):
+    monkeypatch.setattr(patches, "sys", SimpleNamespace(platform=target_platform, modules=sys.modules))
     metadata = next(installation.root.glob(f"{name}-*.dist-info/METADATA"))
     metadata.write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
     with pytest.raises(PreparationError, match=f"require {name}=="):
         patches.apply()
     for relative, source in installation.sources.items():
         assert (installation.root / relative).read_bytes() == source
+
+
+@pytest.mark.parametrize("target_platform", ["linux", "win32"])
+@pytest.mark.parametrize("name", ["torch", "triton"])
+def test_missing_dependency_is_allowed_only_for_triton_on_windows(installation, monkeypatch, name,
+                                                                target_platform):
+    shutil.rmtree(next(installation.root.glob(f"{name}-*.dist-info")))
+    monkeypatch.setattr(patches, "sys", SimpleNamespace(platform=target_platform, modules=sys.modules))
+    # Restrict distribution discovery to this installation, excluding the test runner's dependencies.
+    monkeypatch.setattr(sys, "path", [str(installation.root)])
+    if name == "triton" and target_platform == "win32":
+        assert len(patches.apply()) == 2
+        assert patches.apply() == ()
+        for relative, expected in installation.expected.items():
+            if relative.startswith("torch/"):
+                assert (installation.root / relative).read_text() == expected
+            else:
+                assert (installation.root / relative).read_bytes() == installation.sources[relative]
+    else:
+        with pytest.raises(PreparationError, match="require the preparation dependencies"):
+            patches.apply()
+        for relative, source in installation.sources.items():
+            assert (installation.root / relative).read_bytes() == source
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
