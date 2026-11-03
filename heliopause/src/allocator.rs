@@ -117,6 +117,26 @@ impl RetainedBacking {
         self.active = false;
         self.aborted = true;
     }
+
+    /// Take a retained handle backing exactly `size` bytes for remapping, so
+    /// warmup retention stays bounded by distinct transient sizes instead of
+    /// the warmup count. Only an active scope donates handles; aborted scopes
+    /// keep their handles untouched.
+    fn take(&mut self, size: usize) -> Option<u64> {
+        if !self.active {
+            return None;
+        }
+        let index = self.handles.iter().position(|&(_, bytes)| bytes == size)?;
+        let (handle, bytes) = self.handles.swap_remove(index);
+        self.bytes -= bytes;
+        Some(handle)
+    }
+
+    /// Return a handle that failed to remap so it stays retained.
+    fn put_back(&mut self, size: usize, handle: u64) {
+        self.bytes += size;
+        self.handles.push((handle, size));
+    }
 }
 
 struct Arena {
@@ -284,20 +304,47 @@ extern "C" fn flare_package_allocate(
             .position(|(_, n)| *n >= size)
             .ok_or_else(|| invalid("native package address range exhausted"))?;
         let (address, available) = a.free[index];
+        // During warmup retention, prefer remapping a donated physical backing
+        // over fresh storage so retained memory stays bounded by distinct
+        // transient sizes rather than the warmup count. A donated handle was
+        // retained after its mapping was unmapped, so remapping it preserves
+        // the physical allocation the retention workaround keeps alive.
+        let donated = a.retained.take(size);
         let mut physical = 0;
-        unsafe {
-            a.driver.check(
-                "cuMemCreate",
-                (a.driver.physical_create)(
-                    &mut physical,
-                    size,
-                    &properties(device, a.gpudirect),
-                    0,
-                ),
-            )?;
-            let mapped = (a.driver.map)(address, size, 0, physical, 0);
-            (a.driver.physical_release)(physical);
+        let mapped = if let Some(handle) = donated {
+            physical = handle;
+            let mapped = unsafe { (a.driver.map)(address, size, 0, handle, 0) };
+            if mapped == 0 {
+                // The mapping now holds the only reference, as with fresh
+                // storage; a later transient free re-derives a handle.
+                unsafe { (a.driver.physical_release)(handle) };
+            }
+            mapped
+        } else {
+            unsafe {
+                a.driver.check(
+                    "cuMemCreate",
+                    (a.driver.physical_create)(
+                        &mut physical,
+                        size,
+                        &properties(device, a.gpudirect),
+                        0,
+                    ),
+                )?;
+                let mapped = (a.driver.map)(address, size, 0, physical, 0);
+                (a.driver.physical_release)(physical);
+                mapped
+            }
+        };
+        if mapped != 0 {
+            if donated.is_some() {
+                // The mapping failed, so the handle still holds the only
+                // physical reference; keep it retained rather than release it.
+                a.retained.put_back(size, physical);
+            }
             a.driver.check("cuMemMap", mapped)?;
+        }
+        unsafe {
             let access = Access {
                 location: Location { kind: 1, device },
                 flags: 3,
@@ -562,6 +609,34 @@ mod tests {
                 .retain(1, || panic!("overflow must precede retain"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn donation_takes_exact_sizes_and_reaccounts_failed_maps() {
+        let mut retained = RetainedBacking::default();
+        assert_eq!(retained.take(4), None, "inactive scope donates nothing");
+        retained.begin().unwrap();
+        retained.retain(4, || Ok(7)).unwrap();
+        retained.retain(8, || Ok(8)).unwrap();
+        assert_eq!(retained.take(16), None, "no best-fit, exact sizes only");
+        assert_eq!(retained.take(8), Some(8));
+        assert_eq!(retained.bytes, 4);
+        // A failed map must leave the handle retained and accounted.
+        retained.put_back(8, 8);
+        assert_eq!(retained.bytes, 12);
+        assert_eq!(retained.take(8), Some(8));
+        retained.put_back(8, 8);
+        // A complete drain still releases every handle, including donated ones.
+        let mut released = Vec::new();
+        retained
+            .finish(|handle| {
+                released.push(handle);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![8, 7]);
+        assert_eq!(retained.bytes, 0);
+        assert_eq!(retained.take(4), None, "finished scope donates nothing");
     }
 
     #[test]
