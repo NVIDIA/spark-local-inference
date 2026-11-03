@@ -70,6 +70,10 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         return Err("invalid prepared model configuration".into());
     }
     speculation::validate_widths(&config.speculative_widths)?;
+    if config.completion_token_capacity != manifest.completion_token_capacity
+        || config.speculative_widths.iter().any(|&width| width > manifest.completion_token_capacity) {
+        return Err("model widths exceed the declared completion capacity".into());
+    }
     if !config.speculative_widths.is_empty() && config.speculative_token_capacity == 0 {
         return Err("speculative token capacity must be positive".into());
     }
@@ -249,7 +253,7 @@ pub fn select_shape_with_drafts(
             }
             GraphKind::Speculative => {
                 config.speculative_widths.contains(&tokens)
-                    && drafts <= crate::execution::MAX_DRAFT_TOKENS
+                    && drafts < config.completion_token_capacity
                     && packed >= batch && packed <= batch.saturating_mul(tokens)
                     && (tokens == 1 || packed <= config.speculative_token_capacity)
             }

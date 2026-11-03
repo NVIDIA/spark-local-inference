@@ -118,6 +118,7 @@ impl Fixture {
         std::fs::remove_dir_all(directory).unwrap();
         Self {
             config: ModelConfig {
+                completion_token_capacity: 16,
                 max_top_logprobs: 0,
                 logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
@@ -364,7 +365,7 @@ fn completion(
     sequence: u64,
     sampled: Option<u32>,
 ) -> FrameCompletion {
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let live = worker.scheduler.request(lane.request).unwrap();
         records[lane.request.slot as usize] = CompletionRecord {
@@ -1545,7 +1546,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
                     handle,
                     crate::scheduler::speculation::CopyProposal {
                         consumed: 13,
-                        tokens: [0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+                        tokens: vec![0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                         count: 3,
                         grammar_masks: vec![],
                     },
@@ -1568,7 +1569,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             copy_offered_mask: if copy { 7 } else { 0 },
             verification_width: 4,
             draft_cache_consumed: if copy { -1 } else { 15 },
-            tokens: [1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
         let mut invalid = frame.records;
@@ -1704,7 +1705,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         (4, 8, 3)
     );
     let mut frame = completion(&worker, &step, sequence, Some(1));
-    frame.proposal_confidence = Some([[0.5; crate::execution::MAX_DRAFT_TOKENS]; crate::execution::REQUEST_LANES]);
+    frame.proposal_confidence = Some(vec![vec![0.5; 15]; crate::execution::REQUEST_LANES]);
     for (lane, offered) in step.lanes.iter().zip([5, 1, 0]) {
         let record = &mut frame.records[lane.request.slot as usize];
         record.consumed_tokens = lane.start_position as i64 + 1;
@@ -1714,7 +1715,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
             accepted_drafts: 0,
             verification_width: 8,
             draft_cache_consumed: lane.start_position as i64,
-            tokens: [1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
     }
@@ -1798,7 +1799,7 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 } else {
                     record.consumed_tokens - 1
                 },
-                tokens: [i64::from(token), -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+                tokens: vec![i64::from(token), -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             });
             worker.complete(GraphKind::Speculative, frame).unwrap();

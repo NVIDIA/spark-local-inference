@@ -9,31 +9,32 @@ use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_coho
 
 const POPULATION_WEIGHT: f32 = 1.0 / 64.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Forecast {
     request: RequestHandle,
-    prefixes: [speculation::PrefixEstimate; crate::execution::MAX_DRAFT_TOKENS],
+    prefixes: Vec<speculation::PrefixEstimate>,
 }
 
 impl Forecast {
-    fn new(request: RequestHandle, prior: [f32; crate::execution::MAX_DRAFT_TOKENS], generated: u32) -> Self {
-        Self { request, prefixes: prior.map(|p| speculation::PrefixEstimate::new(f64::from(p), generated)) }
+    fn new(request: RequestHandle, prior: &[f32], generated: u32) -> Self {
+        Self { request, prefixes: prior.iter().map(|&p| speculation::PrefixEstimate::new(f64::from(p), generated)).collect() }
     }
 }
 
 pub(super) struct Forecasts {
     requests: [Option<Forecast>; REQUEST_LANES],
-    pub(super) population: [f32; crate::execution::MAX_DRAFT_TOKENS],
+    pub(super) population: Vec<f32>,
 }
 
-impl Default for Forecasts {
-    fn default() -> Self {
-        Self { requests: [None; REQUEST_LANES], population: std::array::from_fn(|i| 0.5f32.powi(i as i32 + 1)) }
+impl Forecasts {
+    pub(super) fn new(token_capacity: usize) -> Self {
+        Self { requests: std::array::from_fn(|_| None), population: (0..token_capacity - 1)
+            .map(|i| 0.5f32.powi(i as i32 + 1)).collect() }
     }
 }
 
 pub(super) struct HostPrefixRanking {
-    probabilities: [[f64; crate::execution::MAX_DRAFT_TOKENS]; REQUEST_LANES],
+    probabilities: Vec<Vec<f64>>,
     ranks_by_slot: [Vec<usize>; REQUEST_LANES],
     slots_by_rank: Vec<usize>,
 }
@@ -71,17 +72,17 @@ impl RequestScheduler {
             .map(|lane| submission.lane_advance_ceiling(lane)).sum::<usize>()).sum()
     }
 
-    pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> [f64; crate::execution::MAX_DRAFT_TOKENS] {
+    pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
         if self.proposal_source == speculation::ProposalSource::Mtp
             && self.capabilities.speculative_allocations.iter().any(|shape| shape.4 == crate::execution::PrefixAllocation::Gpu) {
-            let forecast = self.forecasts.requests[request.handle.slot as usize]
+            let forecast = self.forecasts.requests[request.handle.slot as usize].as_ref()
                 .filter(|forecast| forecast.request == request.handle)
-                .unwrap_or_else(|| Forecast::new(request.handle, self.forecasts.population, request.generated_tokens));
+                .cloned().unwrap_or_else(|| Forecast::new(request.handle, &self.forecasts.population, request.generated_tokens));
             let mut bound = 1.0f64;
-            forecast.prefixes.map(|estimate| {
+            forecast.prefixes.iter().map(|estimate| {
                 bound = bound.min(if optimistic { estimate.upper(request.generated_tokens) } else { estimate.mean() });
                 bound
-            })
+            }).collect()
         } else {
             request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
         }
@@ -151,13 +152,13 @@ impl RequestScheduler {
 
     pub(super) fn host_prefix_ranking(&self, available: &[usize], drafts: usize, width: usize,
         values: &[LaneValue; REQUEST_LANES], optimistic: bool) -> HostPrefixRanking {
-        let mut probabilities = [[0.0; crate::execution::MAX_DRAFT_TOKENS]; REQUEST_LANES];
+        let mut probabilities = vec![vec![0.0; self.capabilities.completion_token_capacity - 1]; REQUEST_LANES];
         let mut scores = Vec::new();
         for &slot in available {
             let request = self.slots[slot].request.as_ref().unwrap();
             let limit = self.speculative_tokens(request, width.min(drafts + 1));
             probabilities[slot] = request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
-                .map(|probability| probability.powf(self.policy.adaptive_verification_alpha));
+                .into_iter().map(|probability| probability.powf(self.policy.adaptive_verification_alpha)).collect();
             for position in 0..limit.saturating_sub(1) {
                 scores.push((probabilities[slot][position] * values[slot].output_token, position, slot));
             }
@@ -173,7 +174,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn speculative_information(&self, request: &LiveRequest, depth: usize) -> f64 {
-        self.forecasts.requests[request.handle.slot as usize].filter(|forecast| forecast.request == request.handle)
+        self.forecasts.requests[request.handle.slot as usize].as_ref().filter(|forecast| forecast.request == request.handle)
             .map_or_else(|| request.acceptance.information(self.proposal_source, depth, request.generated_tokens),
                 |forecast| forecast.prefixes[depth].weight_at(request.generated_tokens))
     }
@@ -203,16 +204,16 @@ impl RequestScheduler {
     }
 
     pub(super) fn observe_packed_forecasts(&mut self, step: &ScheduledStep,
-        records: &[CompletionRecord], confidence: &[[f32; crate::execution::MAX_DRAFT_TOKENS]]) {
+        records: &[CompletionRecord], confidence: &[Vec<f32>]) {
         for (row, lane) in step.lanes.iter().enumerate() {
             let record = &records[lane.request.slot as usize];
-            let Some(vector) = record.vector else { continue; };
+            let Some(vector) = record.vector.as_ref() else { continue; };
             if !matches!(record.status, 1 | 2) || vector.emitted_count == 0
                 || self.request(lane.request).is_err() { continue; }
             let generated = (record.generated_tokens - vector.emitted_count) as u32;
-            let mut forecast = self.forecasts.requests[lane.request.slot as usize]
+            let mut forecast = self.forecasts.requests[lane.request.slot as usize].take()
                 .filter(|forecast| forecast.request == lane.request)
-                .unwrap_or_else(|| Forecast::new(lane.request, self.forecasts.population, generated));
+                .unwrap_or_else(|| Forecast::new(lane.request, &self.forecasts.population, generated));
             let mut prefix = 1.0f32;
             for depth in 0..lane.tokens.saturating_sub(1).min(step.draft_tokens) {
                 prefix *= confidence[row][depth];
@@ -284,7 +285,7 @@ impl RequestScheduler {
             .map(|offer| offer.2).sum();
         let mut host_lengths = [0; REQUEST_LANES];
         for &(slot, length, _) in &offers {
-            if mask & (1 << slot) != 0 { host_lengths[slot] = length as u8; }
+            if mask & (1 << slot) != 0 { host_lengths[slot] = length; }
         }
         Some(Candidate { host_lengths: Some(host_lengths), draft_tokens: shape.drafts, kind: GraphKind::Speculative,
             mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
@@ -369,7 +370,7 @@ impl RequestScheduler {
                     .map(|&rank| gains[rank]).sum::<f64>();
                 limits[slot] = self.speculative_tokens(request, (shape.drafts + 1).min(shape.width));
             }
-            let mut best: Option<(u64, f64, Option<[u8; REQUEST_LANES]>)> = None;
+            let mut best: Option<(u64, f64, Option<[usize; REQUEST_LANES]>)> = None;
             // Alternate bounded orderings expose long useful prefixes, delivery
             // fairness, and short tails. Every cohort is priced by its causal
             // prefix allocation and the full measured physical B/D/W/P round.
@@ -420,7 +421,7 @@ impl RequestScheduler {
                         value > old_value || (value == old_value &&
                             (mask.count_ones(), std::cmp::Reverse(mask)) >
                             (old_mask.count_ones(), std::cmp::Reverse(old_mask)))) {
-                        best = Some((mask, value, host_ranking.as_ref().map(|_| host_lengths.map(|length| length as u8))));
+                        best = Some((mask, value, host_ranking.as_ref().map(|_| host_lengths)));
                     }
                 }
             }

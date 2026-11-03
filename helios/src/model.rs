@@ -85,6 +85,7 @@ impl VisionCapabilities {
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
+    pub completion_token_capacity: usize,
     pub max_top_logprobs: usize,
     pub logprob_token_id_capacity: usize,
     /// Context extent of captured page tables and workspaces; serving may use a smaller limit.
@@ -300,6 +301,7 @@ pub struct PreparedInput {
 
 pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
     SchedulerCapabilities {
+        completion_token_capacity: config.completion_token_capacity,
         vocabulary: config.contract.vocabulary,
         page_tokens: config.contract.cache.page_tokens,
         vision: config.contract.vision.clone(),
@@ -337,6 +339,9 @@ pub fn scheduler_capabilities_with_manifest(
     manifest: &ExecutionManifest,
 ) -> Result<SchedulerCapabilities> {
     use contract::ValueSource;
+    if config.completion_token_capacity != manifest.completion_token_capacity {
+        return Err("model completion capacity differs from its execution manifest".into());
+    }
     let mut capabilities = scheduler_capabilities(config);
     for graph in &manifest.graphs {
         let semantics = config.contract.graph(&graph.name)?;
@@ -372,7 +377,7 @@ pub fn validate_completion(
 ) -> Result<()> {
     if ((record.status == 1 || record.status == 2)
         && record.token_id >= config.contract.vocabulary as i64)
-        || record.vector.is_some_and(|v| {
+        || record.vector.as_ref().is_some_and(|v| {
             v.model_reserved != -1
                 || v.tokens
                     .iter()

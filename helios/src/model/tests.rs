@@ -28,6 +28,7 @@ fn prompt_scoring_recognizes_features_without_protected_image_spans() {
 
 pub(super) fn config() -> ModelConfig {
     ModelConfig {
+        completion_token_capacity: 16,
         max_top_logprobs: 0,
         logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 2048,
@@ -141,7 +142,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
         );
         assert_eq!(config.eos_token_ids, [248046, 248044]);
     }
-    let mut initialized = [CompletionRecord::default(); 4];
+    let mut initialized = vec![CompletionRecord::default(); 4];
     initialized[0] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: 1,
@@ -166,7 +167,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
             .len(),
         8
     );
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[0] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: 2,
@@ -247,7 +248,7 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
     });
     let step = scheduler.plan().unwrap();
     scheduler.commit(&step, Fence(1)).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[handle.slot as usize] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: 1,
@@ -372,7 +373,7 @@ fn retain_prompt(s: &mut RequestScheduler, fence: u64) {
     let step = s.plan().unwrap();
     assert_eq!(step.kind, GraphKind::Snapshot);
     s.commit(&step, Fence(fence)).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let request = s.request(lane.request).unwrap();
         records[lane.request.slot as usize] = CompletionRecord {
@@ -405,7 +406,7 @@ fn completion_frontiers_follow_declared_history_cursor() {
         status: 1,
         vector: Some(crate::execution::TokenVector {
             emitted_count: 1,
-            tokens: [7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             draft_cache_consumed: 64,
             ..Default::default()
         }),
@@ -680,7 +681,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
         .collect::<Vec<_>>();
     let step = scheduler.plan().unwrap();
     scheduler.commit(&step, Fence(1)).unwrap();
-    let mut completed = [CompletionRecord::default(); 4];
+    let mut completed = vec![CompletionRecord::default(); 4];
     for h in &handles {
         completed[h.slot as usize] = CompletionRecord {
             generation: h.generation as i64,
@@ -744,7 +745,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             handle,
             CopyProposal {
                 consumed: 65,
-                tokens: [8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+                tokens: vec![8, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 count: 2,
                 grammar_masks: masks.clone(),
             },
@@ -799,7 +800,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             copy_offered_mask: 3,
             draft_cache_consumed: -1,
             verification_width: 8,
-            tokens: [10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         }),
         ..Default::default()
@@ -812,7 +813,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
             handle,
             CopyProposal {
                 consumed: 66,
-                tokens: [-1; crate::execution::MAX_DRAFT_TOKENS],
+                tokens: vec![-1; 15],
                 count: 0,
                 grammar_masks: vec![16; words],
             },
@@ -936,7 +937,7 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
         ] {
             let plan = scheduler.phase_plan(kind, Some(d));
             scheduler.commit(&plan, Fence(fence)).unwrap();
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             records[d.slot as usize] = CompletionRecord {
                 generation: d.generation as i64,
                 submission_sequence: fence as i64,
@@ -954,7 +955,7 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
         let p = admit(&mut scheduler, 129, 11);
         let init = scheduler.phase_plan(GraphKind::Init, Some(p));
         scheduler.commit(&init, Fence(4)).unwrap();
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         records[p.slot as usize] = CompletionRecord {
             generation: p.generation as i64,
             submission_sequence: 4,
@@ -1187,7 +1188,7 @@ fn state_transfer_and_resume_upload_fixture() {
                     );
                 }
             }
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             records[handle.slot as usize] = CompletionRecord {
                 generation: handle.generation as i64,
                 submission_sequence: fence.0 as i64,
@@ -1589,7 +1590,7 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
     });
     let init = scheduler.plan().unwrap();
     scheduler.commit(&init, Fence(1)).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[handle.slot as usize] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: 1,
@@ -1698,7 +1699,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
                     consumed_tokens: consumed, generated_tokens: live.generated_tokens as i64 + i64::from(emits),
                     token_id: if emits { 7 } else { -1 }, status: 1, vector: Some(vector), ..Default::default() };
                 scheduler.commit(&plan, fence).unwrap();
-                let mut records = [CompletionRecord::default(); 4]; records[handle.slot as usize] = record;
+                let mut records = vec![CompletionRecord::default(); 4]; records[handle.slot as usize] = record;
                 scheduler.complete(fence, &records, timing).unwrap();
             };
             scheduler.observe_execution(&generation, timing);
@@ -1719,7 +1720,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
                 let mut vector = TokenVector { emitted_count: 1, verification_width: width as i64,
                     offered_drafts: generation.lanes[0].tokens as i64 - 1, ..Default::default() };
                 vector.tokens[0] = 7;
-                let mut records = [CompletionRecord::default(); 4];
+                let mut records = vec![CompletionRecord::default(); 4];
                 records[handle.slot as usize] = CompletionRecord { generation: handle.generation as i64,
                     submission_sequence: fence.0 as i64, consumed_tokens: consumed as i64 + 1,
                     generated_tokens: generated as i64 + 1, token_id: 7, status: 1,

@@ -131,6 +131,7 @@ impl Bootstrap {
         let prepared_sequence_tokens = usize::try_from(integer("max_sequence_tokens", None)?)
             .map_err(|_| "prepared context extent overflow")?;
         let mut model = ModelConfig {
+            completion_token_capacity: manifest.completion_token_capacity,
             max_top_logprobs: manifest.max_top_logprobs()?,
             logprob_token_id_capacity: manifest.logprob_token_id_capacity(),
             prepared_sequence_tokens,

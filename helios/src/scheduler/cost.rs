@@ -91,7 +91,7 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [[Option<u64>; crate::execution::MAX_OUTPUT_TOKENS + 1]; 7],
+    packed_round_durations: [Vec<Option<u64>>; 7],
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -119,7 +119,7 @@ impl ActionCosts {
         self.refresh_packed_durations();
     }
 
-    pub fn prepared(graphs: &[GraphDescriptor]) -> Result<Self> {
+    pub fn prepared(graphs: &[GraphDescriptor], token_capacity: usize) -> Result<Self> {
         let mut entries = Vec::with_capacity(graphs.len());
         let mut index = std::collections::HashMap::with_capacity(graphs.len());
         for graph in graphs {
@@ -147,6 +147,7 @@ impl ActionCosts {
         }
         let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
         let mut costs = Self { entries, index,
+            packed_round_durations: std::array::from_fn(|_| vec![None; token_capacity + 1]),
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
         costs.refresh_packed_durations();
         Ok(costs)
@@ -162,7 +163,7 @@ impl ActionCosts {
     }
 
     fn refresh_packed_durations(&mut self) {
-        self.packed_round_durations = Default::default();
+        for row in &mut self.packed_round_durations { row.fill(None); }
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);

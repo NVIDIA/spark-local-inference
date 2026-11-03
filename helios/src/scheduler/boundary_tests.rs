@@ -26,6 +26,7 @@ fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, act
             snapshots,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 248320,
             page_tokens,
             vision: crate::model::VisionCapabilities {
@@ -65,7 +66,7 @@ fn run_step(s: &mut RequestScheduler) -> ScheduledPlan {
     let step = s.plan().unwrap();
     let fence = Fence(s.submitted.0 + 1);
     s.commit(&step, fence).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let r = s.request(lane.request).unwrap();
         let end = lane.start_position + lane.tokens as u64;
@@ -358,7 +359,7 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
     s.commit(&step, fence).unwrap();
     s.cancel(h).unwrap();
     assert_eq!(s.free_snapshot_count(), 2);
-    let mut record = [CompletionRecord::default(); 4];
+    let mut record = vec![CompletionRecord::default(); 4];
     record[h.slot as usize] = CompletionRecord {
         generation: h.generation as i64,
         submission_sequence: fence.0 as i64,
@@ -399,7 +400,7 @@ fn failed_boundary_copy_is_not_published_and_all_reservations_retire() {
     let step = s.plan().unwrap();
     let fence = Fence(s.submitted.0 + 1);
     s.commit(&step, fence).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[h.slot as usize] = CompletionRecord {
         generation: h.generation as i64,
         submission_sequence: fence.0 as i64,

@@ -7,7 +7,7 @@
 use super::*;
 
 pub(super) fn measured_costs(graphs: &[crate::execution::GraphDescriptor]) -> cost::ActionCosts {
-    let mut costs = cost::ActionCosts::prepared(graphs).unwrap();
+    let mut costs = cost::ActionCosts::prepared(graphs, 16).unwrap();
     for graph in graphs {
         costs.observe(
             &ScheduledStep { draft_tokens: graph.draft_tokens, packed_token_capacity: graph.packed_token_capacity,
@@ -125,6 +125,7 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
             snapshots,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 248320,
             page_tokens,
             vision: crate::model::VisionCapabilities {
@@ -225,8 +226,8 @@ fn records(
     generated: i64,
     token: i64,
     status: i64,
-) -> [CompletionRecord; 4] {
-    let mut records = [CompletionRecord::default(); 4];
+) -> Vec<CompletionRecord> {
+    let mut records = vec![CompletionRecord::default(); 4];
     records[handle.slot as usize] = CompletionRecord {
         generation: handle.generation as i64,
         submission_sequence: fence as i64,
@@ -331,8 +332,8 @@ fn state_records(
     scheduler: &RequestScheduler,
     step: &ScheduledStep,
     fence: u64,
-) -> [CompletionRecord; 4] {
-    let mut output = [CompletionRecord::default(); 4];
+) -> Vec<CompletionRecord> {
+    let mut output = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let request = scheduler.request(lane.request).unwrap();
         let slot = lane.request.slot as usize;
@@ -358,7 +359,7 @@ fn inactive_state_completion_never_initializes_or_publishes_a_checkpoint() {
         scheduler
             .complete(
                 Fence(1),
-                &[CompletionRecord::default(); 4],
+                &vec![CompletionRecord::default(); 4],
                 Default::default()
             )
             .is_err()
@@ -403,7 +404,7 @@ fn inactive_state_completion_never_initializes_or_publishes_a_checkpoint() {
         scheduler
             .complete(
                 Fence(3),
-                &[CompletionRecord::default(); 4],
+                &vec![CompletionRecord::default(); 4],
                 Default::default()
             )
             .is_err()
@@ -497,6 +498,7 @@ fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents(
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {
@@ -576,6 +578,7 @@ fn invalid_prefill_limits_reject_before_request_resources_are_created() {
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {
@@ -1266,7 +1269,7 @@ fn vector_records(
     tokens: &[i64],
     width: i64,
     status: i64,
-) -> [CompletionRecord; 4] {
+) -> Vec<CompletionRecord> {
     let mut row = records(
         h,
         fence,
@@ -1782,7 +1785,7 @@ fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
 #[test]
 fn readiness_correction_changes_shape_cost_without_changing_handoff_or_service_time() {
     use crate::execution::{ExecutionTiming, ReadinessIntervals};
-    let mut costs = cost::ActionCosts::prepared(&duration_graphs(1)).unwrap();
+    let mut costs = cost::ActionCosts::prepared(&duration_graphs(1), 16).unwrap();
     let step = ScheduledStep { draft_tokens: 0, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
         packed_token_capacity: 0, mixed: None, lanes: vec![], requires_feedback: false };
     let timestamps = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
@@ -1877,7 +1880,7 @@ fn fixed_and_adaptive_widths_are_independent_of_batch_capacity() {
 }
 
 fn copied(consumed: u64, count: usize, grammar: bool) -> speculation::CopyProposal {
-    let mut tokens = [-1; crate::execution::MAX_DRAFT_TOKENS];
+    let mut tokens = vec![-1; 15];
     for (index, token) in tokens[..count].iter_mut().enumerate() {
         *token = index as i64 + 10;
     }
@@ -1899,7 +1902,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
         [(0, false, 1), (2, false, 3), (7, false, 8), (2, true, 3)]
     {
         let mut s = scheduler(2, 32, 4);
-        s.enable_speculation(&speculation::WIDTHS).unwrap();
+        s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
         s.proposal_source(speculation::ProposalSource::Copy)
             .unwrap();
         s.fixed_speculative_width(Some(8)).unwrap();
@@ -1955,7 +1958,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
 fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     let mut s = scheduler(1, 2, 2);
     s.limits.max_sequence_tokens = 128;
-    s.enable_speculation(&speculation::WIDTHS).unwrap();
+    s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
     s.proposal_source(speculation::ProposalSource::Copy)
         .unwrap();
     s.fixed_speculative_width(Some(8)).unwrap();
@@ -1978,14 +1981,14 @@ fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     // MTP requires a private draft page in addition to these two target pages.
     let mut mtp = scheduler(1, 2, 2);
     mtp.limits.max_sequence_tokens = 128;
-    mtp.enable_speculation(&speculation::WIDTHS).unwrap();
+    mtp.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
     assert!(mtp.admit(spec(64, 64)).is_err());
 }
 
 #[test]
 fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validation() {
     let capabilities = SchedulerCapabilities {
-        vocabulary: 32,
+            completion_token_capacity: 16,        vocabulary: 32,
         page_tokens: 64,
         vision: crate::model::VisionCapabilities {
             feature_slots: 4,
@@ -2047,7 +2050,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
     retain_prompt(&mut s, 4);
     let mut proposal = speculation::CopyProposal {
         consumed: 4,
-        tokens: [32, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
+        tokens: vec![32, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
         count: 1,
         grammar_masks: vec![],
     };
@@ -2056,10 +2059,12 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
     s.set_copy_proposal(handle, proposal).unwrap();
     for bad in [
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 0,
             ..capabilities.clone()
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             draft_pages_per_request: 9,
             completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -2101,7 +2106,7 @@ fn scheduler_uses_only_loaded_verification_shapes() {
         assert!(shapes.contains(&(step.batch_capacity, step.token_capacity)));
         assert_eq!(step.kind, GraphKind::Speculative);
         s.commit(&step, Fence(12)).unwrap();
-        let mut complete = [CompletionRecord::default(); 4];
+        let mut complete = vec![CompletionRecord::default(); 4];
         for h in &handles {
             complete[h.slot as usize] =
                 vector_records(*h, 12, 66, 2, &[10], step.token_capacity as i64, 1)
@@ -3033,7 +3038,7 @@ fn sample_round(scheduler: &mut RequestScheduler, fence: u64) -> ScheduledStep {
             .unwrap();
         return step;
     }
-    let mut output = [CompletionRecord::default(); 4];
+    let mut output = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let request = scheduler.request(lane.request).unwrap();
         output[lane.request.slot as usize] = CompletionRecord {
@@ -3285,7 +3290,7 @@ fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
 }
 
 fn bounded_vector_records(h: RequestHandle, fence: u64, consumed: i64, generated: i64,
-    tokens: &[i64], width: i64, status: i64, limit: usize) -> [CompletionRecord; 4] {
+    tokens: &[i64], width: i64, status: i64, limit: usize) -> Vec<CompletionRecord> {
     let mut rows = vector_records(h, fence, consumed, generated, tokens, width, status);
     let vector = rows[h.slot as usize].vector.as_mut().unwrap();
     vector.offered_drafts = vector.offered_drafts.min(limit.saturating_sub(1) as i64);

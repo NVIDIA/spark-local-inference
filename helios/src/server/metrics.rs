@@ -233,8 +233,8 @@ pub(super) struct Metrics {
     replay_readiness_samples: AtomicU64,
     launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
-    speculative: [[RoundMetrics; crate::execution::MAX_OUTPUT_TOKENS]; 7],
-    draft_sources: [[[AtomicU64; 2]; 2]; crate::execution::MAX_DRAFT_TOKENS],
+    speculative: [Vec<RoundMetrics>; 7],
+    draft_sources: Vec<[[AtomicU64; 2]; 2]>,
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
     cache_lookups: AtomicU64,
@@ -297,11 +297,13 @@ pub(super) struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(total_pages: u32, page_tokens: usize, decode_weight_bytes: u64) -> Self {
+    pub fn new(total_pages: u32, page_tokens: usize, decode_weight_bytes: u64, token_capacity: usize) -> Self {
         Self {
             total_pages: total_pages as u64,
             page_tokens: page_tokens as u64,
             decode_weight_bytes,
+            speculative: std::array::from_fn(|_| (0..token_capacity).map(|_| RoundMetrics::default()).collect()),
+            draft_sources: (0..token_capacity.saturating_sub(1)).map(|_| Default::default()).collect(),
             ..Self::default()
         }
     }
@@ -408,7 +410,7 @@ impl Metrics {
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         for record in records.iter().filter(|r| r.status != 0) {
-            let Some(v) = record.vector else {
+            let Some(v) = record.vector.as_ref() else {
                 continue;
             };
             counters
@@ -421,7 +423,8 @@ impl Metrics {
                 .accepted
                 .fetch_add(v.accepted_drafts as u64, Ordering::Relaxed);
             for depth in 0..v.offered_drafts as usize {
-                let source = usize::from(v.copy_offered_mask & (1 << depth) != 0);
+                let source = usize::from(depth < crate::scheduler::speculation::COPY_DRAFT_CAPACITY
+                    && v.copy_offered_mask & (1i64 << depth) != 0);
                 self.draft_sources[depth][source][0].fetch_add(1, Ordering::Relaxed);
                 if depth < v.accepted_drafts as usize {
                     self.draft_sources[depth][source][1].fetch_add(1, Ordering::Relaxed);
@@ -777,7 +780,7 @@ impl Metrics {
                 .into_iter()
                 .zip(&self.speculative)
             {
-                for (width, counts) in (1..=crate::execution::MAX_OUTPUT_TOKENS).zip(widths) {
+                for (width, counts) in (1..).zip(widths) {
                     let value = match metric {
                         "rounds_total" => &counts.rounds,
                         "gpu_nanoseconds_total" => &counts.gpu_ns,
@@ -1191,7 +1194,7 @@ mod tests {
     fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {
         use flare_selene::{HostHit, StoreOutcome, StoreReason, Tier};
         use crate::offload::LookupOutcome;
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         for outcome in [
             LookupOutcome::NoMatch,
             LookupOutcome::CostRejected,
@@ -1273,7 +1276,7 @@ mod tests {
 
     #[test]
     fn readiness_metrics_retain_raw_gpu_time_and_count_only_measured_waits() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         let mut timing = crate::execution::ExecutionTiming::default();
         timing.gpu_ns[0] = Some(10_000);
         timing.gpu_ns[1] = Some(9_000);
@@ -1293,7 +1296,7 @@ mod tests {
 
     #[test]
     fn scheduler_host_gauges_reset_after_inbound_requests_finish() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         let mut stats = SchedulerStats::default();
         metrics.scheduler(stats);
         assert_eq!(metrics.host_inbound_waiting.load(Ordering::Relaxed), 0);
@@ -1313,8 +1316,8 @@ mod tests {
 
     #[test]
     fn speculative_metrics_preserve_depth_source_and_clipped_progress() {
-        let metrics = Metrics::default();
-        let mut records = [CompletionRecord::default(); 4];
+        let metrics = Metrics::new(0, 0, 0, 16);
+        let mut records = vec![CompletionRecord::default(); 4];
         records[2] = CompletionRecord {
             status: 2,
             vector: Some(crate::execution::TokenVector {
@@ -1349,7 +1352,7 @@ mod tests {
 
     #[test]
     fn complete_round_metrics_count_actual_draft_depth_once() {
-        let metrics = Metrics::default();
+        let metrics = Metrics::new(0, 0, 0, 16);
         metrics.speculative_completed(2, 8, 5, 300, &[]);
         metrics.speculative_completed(2, 1, 0, 100, &[]);
         let snapshot = metrics.snapshot(true);
@@ -1361,7 +1364,7 @@ mod tests {
 
     #[test]
     fn snapshot_json_round_trips_beside_the_prometheus_counters() {
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 16);
         metrics.progress(40, 3, 2, 1, 5, 2);
         metrics.scheduler(SchedulerStats {
             active_requests: 2,
@@ -1445,7 +1448,7 @@ mod tests {
 
     #[test]
     fn counters_expose_fixed_names_without_request_payloads() {
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 16);
         metrics.scheduler(SchedulerStats {
             cache_lookups: 5,
             cache_hits: 2,
@@ -1555,7 +1558,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn sixteen_width_metrics_include_fifteenth_draft() {
-    let metrics = Metrics::default();
+    let metrics = Metrics::new(0, 0, 0, 16);
     let record = CompletionRecord { status: 1,
         vector: Some(crate::execution::TokenVector { verification_width: 16, emitted_count: 16,
             offered_drafts: 15, accepted_drafts: 15, copy_offered_mask: 1 << 14,

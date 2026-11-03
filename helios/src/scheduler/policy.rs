@@ -86,7 +86,7 @@ pub(super) struct Candidate {
     pub duration_ns: u64,
     pub rate: ValueRate,
     pub feedback: bool,
-    pub host_lengths: Option<[u8; REQUEST_LANES]>,
+    pub host_lengths: Option<[usize; REQUEST_LANES]>,
 }
 
 impl Candidate {
@@ -108,7 +108,7 @@ impl RequestScheduler {
     }
 
     fn candidate_round_lengths(&self, candidate: &Candidate) -> [usize; REQUEST_LANES] {
-        candidate.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+        candidate.host_lengths.unwrap_or_else(||
             self.round_lengths(candidate.mask, candidate.batch, candidate.draft_tokens,
                 candidate.capacity, candidate.packed_token_capacity))
     }
@@ -1158,7 +1158,7 @@ impl RequestScheduler {
 
     fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
         let lengths = (candidate.packed_token_capacity != 0).then(||
-            candidate.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+            candidate.host_lengths.unwrap_or_else(||
                 self.round_lengths_optimistic(candidate.mask, candidate.batch, candidate.draft_tokens,
                     candidate.capacity, candidate.packed_token_capacity, origin.is_acceptance())));
         let mut lanes = Vec::with_capacity(candidate.mask.count_ones() as usize);

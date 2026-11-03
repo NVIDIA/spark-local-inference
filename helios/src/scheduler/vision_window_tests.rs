@@ -31,6 +31,7 @@ fn scheduler_with_resources(
             snapshots,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 248_320,
             page_tokens,
             vision: crate::model::VisionCapabilities {
