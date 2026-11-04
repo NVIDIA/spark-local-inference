@@ -1307,7 +1307,7 @@ class DirectWeightLoader:
                          weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
                          global_scale_name="weight_scale_2", global_scale_kind="multiplier",
                          input_scale_name=None, activation_outer_scale="expert",
-                         swiglu_alpha=None, swiglu_beta=None):
+                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
 
         The first two projection names fill the first and second w13 halves in that
@@ -1326,6 +1326,9 @@ class DirectWeightLoader:
         self._require_open()
         prefixes = tuple(prefixes)
         sm103 = is_sm103(self.device)
+        if a4_prefill and (sm103 or format != "nvfp4" or activation_mode != "a16"
+                           or activation != "silu" or activation_outer_scale != "expert"):
+            raise ValueError("calibrated A4 prefill requires SM120/121 packed NVFP4 A16 SiLU experts")
         if global_scale_kind not in ("multiplier", "reciprocal"):
             raise ValueError("expert global scale kind must be multiplier or reciprocal")
         if activation_outer_scale not in ("expert", "token"):
@@ -1415,7 +1418,7 @@ class DirectWeightLoader:
             record_numeric_tensor(w2)
             record_numeric_tensor(s2)
             shared.exchange()
-        if activation_mode == "a4" and activation_outer_scale == "expert":
+        if (activation_mode == "a4" or a4_prefill) and activation_outer_scale == "expert":
             if scale_vectors is None or len(scale_vectors) != 4:
                 raise ValueError("NVFP4 A4 experts require weight and activation scale vectors")
             vectors = scale_vectors
@@ -1442,6 +1445,8 @@ class DirectWeightLoader:
             return _sm103_fp4_experts(w13, s13, w2, s2, vectors, format=format,
                                       activation_mode=activation_mode, swiglu_limit=swiglu_limit)
         activation_options = {}
+        if a4_prefill is not None:
+            activation_options["a4_prefill"] = a4_prefill
         if swiglu_alpha is not None:
             activation_options["swiglu_alpha"] = swiglu_alpha
         if swiglu_beta is not None:
@@ -1458,7 +1463,7 @@ class DirectWeightLoader:
             geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local),
             constraints=moe.WeightPlanConstraints(scale_compression=scale_compression))
         gains = {} if not device_scales else dict(w13_global_scales=device_scales[0], w2_global_scales=device_scales[1])
-        if activation_mode == "a4" and activation_outer_scale == "expert":
+        if (activation_mode == "a4" or a4_prefill) and activation_outer_scale == "expert":
             gains.update(input_scale=device_scales[2], intermediate_scale=device_scales[3], immutable_input_scales=True)
         packed = moe.PackedWeights(
             w13=w13, w2=w2,
@@ -1597,13 +1602,14 @@ class DirectWeightLoader:
 
     def load_nvfp4_experts(
         self, prefixes, *, hidden_size, intermediate_size, scale_vectors,
-        intermediate_range=None, scale_scratch=None, swiglu_limit=None, activation_mode="a4",
+        intermediate_range=None, scale_scratch=None, swiglu_limit=None, activation_mode="a4", a4_prefill=None,
     ):
-        """Prepare routed A4 experts from packed rank-local checkpoint views.
+        """Prepare routed NVFP4 experts from packed rank-local checkpoint views.
 
         ``scale_vectors`` supplies up/gate and down global multipliers followed
         by their activation reciprocal scales. Gate/up scalar compatibility is
-        the recipe's responsibility. Without ``scale_scratch`` (and always on
+        the recipe's responsibility. ``a4_prefill=True`` retains calibrated A4
+        prefill execution on the A16 packed weight owner. Without ``scale_scratch`` (and always on
         SM103) the CSF scales expand once here into persistent storage. With it,
         each call expands them into the scratch, which serialized layers can
         share; both buffers remain caller-owned through replay.
@@ -1626,6 +1632,8 @@ class DirectWeightLoader:
         # Expanding once at load spends the expanded scales' memory to keep the expansion,
         # its scratch writes and their rereads off every forward's critical path.
         expand = sm103 or scale_scratch is None
+        if a4_prefill and (sm103 or activation_mode != "a16"):
+            raise ValueError("calibrated A4 prefill requires SM120/121 packed NVFP4 A16 experts")
         for scratch, shape in zip(() if scale_scratch is None else scale_scratch,
                                   () if scale_scratch is None else shapes, strict=True):
             if (scratch.device != self.device or scratch.dtype != torch.float8_e4m3fn
@@ -1692,7 +1700,8 @@ class DirectWeightLoader:
         plan = moe.plan_weights(
             source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
             activation=moe.ActivationSpec(mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
-                                          swiglu_limit=swiglu_limit),
+                                          swiglu_limit=swiglu_limit,
+                                          **({} if a4_prefill is None else {"a4_prefill": a4_prefill})),
             geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local),
         )
         packed = moe.PackedWeights(

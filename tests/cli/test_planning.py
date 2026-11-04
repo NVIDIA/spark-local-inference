@@ -721,3 +721,27 @@ def test_collective_ladder_plan_and_rebuild_round_trip():
     with pytest.raises(UsageError, match="compute capability"):
         replace(base, gpus=tuple(replace(g, capability=(12, 1)) for g in base.gpus),
                 collective_tuning="runtime", collective_ladder=ladder)
+
+
+def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="qwen38"))
+    for enabled in (False, True):
+        plan = replace(ordinary, force_moe_decode_a16=enabled)
+        assert plan.to_dict()["force_moe_decode_a16"] is enabled
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).force_moe_decode_a16 is enabled
+    assert not proto.RebuildManifest().force_moe_decode_a16
+    with pytest.raises(UsageError, match="Qwen3.8 Flash NVFP4"):
+        replace(derive(), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="SM120/121"):
+        replace(ordinary, gpus=(gpu(0, 95, (10, 3)),), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="intermediate width divisible by 64"):
+        replace(ordinary, gpus=tuple(gpu(i, 95) for i in range(4)), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="mixed-prefill"):
+        replace(ordinary, mixed_prefill=True, force_moe_decode_a16=True)

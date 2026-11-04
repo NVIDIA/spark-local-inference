@@ -93,5 +93,7 @@ class ConcurrentAttention:
         bindings.update(zip(_MUTABLE_BINDING_FIELDS, writes, strict=True))
         binding = qsa.bind(self.attention.plan, scratch=workspace, **bindings,
                            selection_stream=self.stream, selection_done=self.done)
+        # Compiled metadata can be materialized after the projection-stream fork.
+        self.stream.wait_stream(torch.cuda.current_stream(workspace.device))
         self.ready.record(self.stream)
         qsa.run(binding, **dict(zip(self.dynamic_names, reads[count:], strict=True)), index_ready=self.ready)

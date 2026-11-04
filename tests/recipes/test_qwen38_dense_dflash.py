@@ -67,8 +67,8 @@ def target():
 
 @pytest.fixture
 def config(target):
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
-    return replace(target, draft=DraftConfig.from_dict(copy.deepcopy(DRAFT_CONFIG), target))
+    from ignition.recipes.qwen38_dense import draft_config
+    return replace(target, draft=draft_config.from_dict(copy.deepcopy(DRAFT_CONFIG), target))
 
 
 def test_pinned_draft_geometry_and_raw_logits(config):
@@ -91,11 +91,11 @@ def test_pinned_draft_geometry_and_raw_logits(config):
     ("num_target_layers", 63), ("rope_parameters", {"rope_type": "default", "rope_theta": 500000}),
 ])
 def test_incompatible_draft_decoder_rejected(target, key, value):
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
+    from ignition.recipes.qwen38_dense import draft_config
     raw = copy.deepcopy(DRAFT_CONFIG)
     raw[key] = value
     with pytest.raises(ValueError):
-        DraftConfig.from_dict(raw, target)
+        draft_config.from_dict(raw, target)
 
 
 @pytest.mark.parametrize("key,value", [
@@ -104,11 +104,11 @@ def test_incompatible_draft_decoder_rejected(target, key, value):
     ("conv_kernel_size", 3), ("block_size", 16),
 ])
 def test_incompatible_draft_projector_rejected(target, key, value):
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
+    from ignition.recipes.qwen38_dense import draft_config
     raw = copy.deepcopy(DRAFT_CONFIG)
     raw["dflash_config"][key] = value
     with pytest.raises(ValueError):
-        DraftConfig.from_dict(raw, target)
+        draft_config.from_dict(raw, target)
 
 
 def test_complete_ring_and_target_page_geometry(config):
@@ -159,11 +159,11 @@ def test_parallel_speculative_catalog_and_explicit_ordinary_mode():
 @pytest.mark.parametrize("location", ["decoder", "projector"])
 @pytest.mark.parametrize("key,value", [("output_multiplier", .5), ("final_logit_softcapping", 20.)])
 def test_nonraw_draft_logits_rejected(target, location, key, value):
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
+    from ignition.recipes.qwen38_dense import draft_config
     raw = copy.deepcopy(DRAFT_CONFIG)
     (raw if location == "decoder" else raw["dflash_config"])[key] = value
     with pytest.raises(ValueError):
-        DraftConfig.from_dict(raw, target)
+        draft_config.from_dict(raw, target)
 
 
 def test_pinned_checkpoint_metadata_rejects_precision_and_non_square_shape_errors(config):

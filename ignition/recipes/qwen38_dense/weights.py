@@ -35,8 +35,8 @@ class ModelWeights:
         if draft_head_quantization is not None and "lm_head" in config.quantization:
             raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
         if mtp:
-            from .draft_config import DraftConfig
-            config = replace(config, draft=DraftConfig.load(draft_snapshot, config))
+            from .draft_config import load as load_draft_config
+            config = replace(config, draft=load_draft_config(draft_snapshot, config))
         tree = canonical_tree(Qwen3_5TextModel, Qwen3_5TextConfig.from_dict(config.text))
         projections = {}
         before = torch.cuda.memory_allocated(device)

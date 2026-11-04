@@ -21,20 +21,21 @@ _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str},
     "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int},
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
-                 "speculative_token_capacity": int, "speculative_graph_budget": int},
+                 "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str},
+    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
 _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
-               "speculative_token_capacity": int, "speculative_graph_budget": int}
+               "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str}
 # Empty prefix-cache values leave the decision to Flare, which derives them from the host.
 _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "server.thinking_token_budget": None,
     "memory.reserve": "0",
+    "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
     "preparation.collective_tuning": None,
@@ -176,10 +177,12 @@ class Configuration:
             f'# model = "{model}"',
             f"# max_concurrency = {max_concurrency}",
             '# image_concurrency = 4          # active image requests; bounded by max_concurrency',
+            '# speculative_method = "mtp"    # proposal method; Qwen Flash also supports dflash2',
             '# speculative_token_capacity = 8  # wider target graphs require batch * width within this limit',
             '# speculative_graph_budget = 64  # packed round graphs; excludes width-one and ordinary graphs',
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
+            '# force_moe_decode_a16 = false   # Qwen Flash NVFP4 decode/verify A16, calibrated A4 prefill',
             '# autotune_effort = "default"    # off, default, audit',
             '# collective_tuning = "static"  # static, runtime; omitted uses recipe default',
             "", "[memory]",

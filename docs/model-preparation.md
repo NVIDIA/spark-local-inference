@@ -440,6 +440,31 @@ rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
 
+`ignition export qwen3.8-flash --speculative-method dflash2` selects
+[`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
+at revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6` instead of the checkpoint's
+MTP module. Draft proposals use an eight-token block and up to seven verified
+drafts; the default remains five drafts and 128 target-token rows. The target
+captures completed zero-based layers 5, 15, 25, 35, and 45 after averaging its four
+hyperconnection streams. Five independent draft attention layers retain the last
+2,048 accepted target positions. These rings are included in continuation
+snapshots and restored with the target's GDN, QSA, PLE, and position state.
+Mixed prefill is rejected; separate prefill and verification graphs retain the
+same target arithmetic. `--online-mxfp8` converts the draft's eligible BF16
+projections, and `--draft-head-quantization nvfp4` or `mxfp8` prepares a separate
+proposal vocabulary head. Target weights retain checkpoint precision.
+
+`ignition export qwen3.8-flash --force-moe-decode-a16` prepares the NVFP4 target
+routed experts as one packed W4A16 weight owner. Decode and speculative
+verification use A16 at every row count; separate prefill graphs use calibrated
+A4 from the checkpoint activation scales. The option requires SM120/121 and
+rank-local intermediate width divisible by 64 (TP1/2); mixed prefill is rejected
+because its prompt and decode rows share one expert call. Shared experts and MTP
+retain their declared precision. `[preparation] force_moe_decode_a16 = true`
+sets the default, and `--no-force-moe-decode-a16` overrides it. Preparation records
+the resolved option in the plan and rebuild metadata; compatible weight reuse
+requires the packed layouts and activation scales prepared for that option.
+
 `ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
 the 320-wide hyperconnection bottleneck across ranks, including target and MTP
 final mixers. Each rank loads its down-projection rows and up-projection columns;

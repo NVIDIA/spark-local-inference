@@ -182,6 +182,8 @@ def declared_views(declaration):
                                 _storage(declared_group, declaration), frozenset())
 
     for root, value in sorted(declaration.roots.items()):
+        if root in components:
+            continue
         for declared in declaration.layer_fields:
             try:
                 layers = resolve(value, declared)
@@ -228,6 +230,8 @@ def from_plan(model, plan, *, compiled_forwards):
         result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
+    if plan.force_moe_decode_a16:
+        result['force_moe_decode_a16'] = True
     if plan.shard_hyperconnections:
         result['shard_hyperconnections'] = True
     if plan.joint_tuning:
@@ -238,6 +242,8 @@ def from_plan(model, plan, *, compiled_forwards):
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
             draft_prefix_selection=s.draft_prefix_selection,
             vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
+        if s.method is not None:
+            result['speculation']['method'] = s.method
         if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:

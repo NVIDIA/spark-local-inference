@@ -192,6 +192,7 @@ class Plan:
     shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
+    force_moe_decode_a16: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -234,6 +235,15 @@ class Plan:
             if self.world_size != ladder["world_size"] or any(
                     tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
                 raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
+        if self.force_moe_decode_a16:
+            if self.recipe.name != "qwen38":
+                raise UsageError("--force-moe-decode-a16 requires Qwen3.8 Flash NVFP4")
+            if any(gpu.capability not in ((12, 0), (12, 1)) for gpu in self.gpus):
+                raise UsageError("--force-moe-decode-a16 requires SM120/121 packed NVFP4 experts")
+            if (640 // self.world_size) % 64:
+                raise UsageError("--force-moe-decode-a16 requires rank-local expert intermediate width divisible by 64")
+            if self.mixed_prefill:
+                raise UsageError("--force-moe-decode-a16 cannot accompany --mixed-prefill: combined rows share one expert precision")
         if self.shard_hyperconnections:
             if self.recipe.name != "qwen38":
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
@@ -356,11 +366,13 @@ class Plan:
             "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
+            "force_moe_decode_a16": self.force_moe_decode_a16,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
+                **({} if self.speculation.method is None else {"method": self.speculation.method}),
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
@@ -407,6 +419,10 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
     if speculation is not None:
+        default_method = None if recipe.speculation is None else recipe.speculation.method
+        if (speculation.method is not None and speculation.method != default_method
+                and speculation.method not in recipe.speculative_methods):
+            raise UsageError(f"--speculative-method {speculation.method}: {checkpoint.alias} does not prepare this proposal method")
         if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
         if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
@@ -506,6 +522,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     across the ranks of recipes that declare context-parallel page costs. Without
     `stream_overlap`, recipes that declare stream overlap run every branch serially.
     """
+    if mixed_prefill and speculation is not None and speculation.method == "dflash2":
+        raise UsageError("--speculative-method dflash2 requires separate prefill and verification graphs")
     if mixed_prefill and not recipe.mixed_prefill:
         raise UsageError(f"--mixed-prefill: {checkpoint.alias} does not capture mixed prefill/decode graphs")
     if online_mxfp8 and not recipe.online_mxfp8:

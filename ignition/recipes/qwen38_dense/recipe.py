@@ -63,7 +63,8 @@ RECIPE = Recipe(
         stored_bytes=25_578_292_192, device_bytes=27_761_099_776, draft_bytes=3_953_666_560,
         expansion_bytes=1_619_001_344)),
     context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=15, verification_rows=0,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64,
+                            method="dflash2"), max_draft_tokens=15, verification_rows=0,
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
     # Reserve continuation memory for the supported sixteen-token verification capacity.
     ranks=MappingProxyType({1: RankCosts(193_865_984, 4_194_304, 4 << 30)}),

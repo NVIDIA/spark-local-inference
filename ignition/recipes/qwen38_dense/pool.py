@@ -34,9 +34,10 @@ def continuation_layout(config, *, mtp=False, verification_width=8):
                             (f"layer{index}.recurrent", (48, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, mtp=mtp))
     if mtp:
-        for layer in range(config.draft.layers):
-            for field in ("key", "value"):
-                regions.append((f"draft{layer}.{field}", (2048, 8, 128), torch.float8_e4m3fn))
+        from ignition.components.dflash2_geometry import draft_context_specs
+        from ignition.components.parallel import TensorParallelShard
+
+        regions.extend(draft_context_specs(config.draft, TensorParallelShard(0, 1)))
     regions.extend((("last_hidden", (config.hidden,), torch.bfloat16),
                     ("consumed_tokens", (1,), torch.int64)))
     return StateLayout.from_specs(regions)
