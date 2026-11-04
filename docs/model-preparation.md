@@ -983,16 +983,27 @@ weight budget for this encoding; loading reports its actual allocation.
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
 
-## Inkling-Small
+## Inkling-Small NVFP4
 
-The `inkling-small` alias selects the BF16
-[`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small)
-checkpoint at revision `8cc5877b44d343f88b92086aa1fb72897950f06a`.
-This text recipe prepares eight GPUs on one host, a default 262144-token context,
-four concurrent requests, and 4096-token prefill chunks. This initial recipe caps
-prepared context at 262144 tokens of the checkpoint's 1048576-token limit. Image, audio, video, and
-MTP graphs are not prepared. The indexed download includes the publisher's MTP
-weights; only `model.llm` tensors become serving weights.
+The `inkling-small-nvfp4` alias selects
+[`thinkingmachines/Inkling-Small-NVFP4`](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4)
+at revision `b6a99534467840620d411e4cd4ad5819b2610d9c`. This text recipe
+targets tensor parallelism two on SM120/SM121, using two local GPUs or one GPU
+on each of two DGX Sparks through the shared RoCE transport. Defaults are a
+262144-token context, four concurrent requests, and 4096-token prefill chunks.
+Prepared context is capped at 262144 tokens of the checkpoint's 1048576-token
+limit. Image, audio, video, and MTP graphs are not prepared. The indexed download
+includes the publisher's MTP weights; only `model.llm` tensors become serving
+weights.
+
+Quantization comes from the checkpoint's `hf_quant_config.json`. Its exclusions
+retain BF16 attention, dense/shared experts, and the first routed layer; the
+remaining routed experts use the original packed NVFP4 weights, E4M3 block
+scales, FP32 global scales, and calibrated NVFP4 activations. Interleaved gate/up
+rows are reordered with their matching scales before intermediate sharding.
+Activation calibration preserves the FP32 scale boundary in the publisher-supported
+[checkpoint loader](https://github.com/sgl-project/sglang/blob/dff6a0c3accf310f70eab81be1220a27b732c96b/python/sglang/srt/models/inkling.py#L1241).
+Unweighted expert outputs are reduced across ranks before route weights apply.
 
 The 42-layer decoder retains 35 local 512-token KV rings and seven global paged
 histories in BF16. Query-dependent relative logits, head RMS normalization,
@@ -1002,24 +1013,25 @@ and arithmetic. Every continuation row includes those histories, local rings,
 partial global pages, the consumed cursor, and the normalized and scaled hidden
 vector used by resume.
 
-The BF16 checkpoint stores router correction biases and global scales in FP32.
-They remain FP32, as do router logits and route normalization. Dense and expert
-SwiGLU arithmetic uses FP32 before rounding the final intermediate to BF16;
-shared sink weights apply before the down projection. These precision boundaries
-follow the publisher-supported SGLang
+Router correction biases and global scales remain FP32, as do router logits and
+route normalization. Unquantized SwiGLU uses FP32 activation arithmetic after
+BF16 projections; shared sink weights apply before the down projection. NVFP4
+experts retain FP32 scaled accumulators through SwiGLU, then round the intermediate
+to BF16 before its calibrated NVFP4 activation quantizer. Routing and shared
+sink placement follow the publisher-supported SGLang
 [router](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/moe.py)
 and [MLP implementation](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/dense_mlp.py).
 Transformers supplies the reference attention, normalization, and checkpoint
 layout; loading it with a blanket BF16 dtype also narrows the FP32 router
 parameters, so that load mode is not the precision reference for routing.
 
-At tensor parallelism eight, resident text weights occupy 65,993,544,868 bytes
-per rank, including replicated parameters and FP32 convolution weights. Each
-continuation row occupies 14,024,704 bytes; each 128-token global KV page occupies
-458,752 bytes per rank. The planner reserves additional space for preparation,
-graphs, and caches. The complete indexed source tensors occupy 531,912,898,740
-bytes on disk. This BF16 recipe therefore requires GPUs with substantially more
-memory than the 8 GB device used for the reduced model tests.
+The indexed checkpoint contains 170,733,074,592 bytes of tensors, including
+166,130,594,960 bytes of text weights. The planner conservatively budgets the
+whole checkpoint for weights, plus preparation scratch and caches. At TP2,
+each continuation row occupies 43,515,904 bytes and each 128-token global KV page
+occupies 1,835,008 bytes per rank. One full 262144-token global KV history needs
+3.5 GiB per rank. Spark's CPU, GPU, compiler processes, and OS share physical
+memory; follow the [DGX Spark memory guidance](#dgx-spark).
 
 The publisher's [Inkling sampling guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md)
 recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
@@ -1027,16 +1039,23 @@ recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
 owns the thinking-effort system message and content-header/tool syntax.
 
 ```sh
-.venv/bin/ignition export inkling-small --gpus 0-7 --prompt-logprobs
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-tp8.safetensors
-flare/target/release/flare run /data/flare-runtime/inkling-small-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
+.venv/bin/ignition export inkling-small-nvfp4 --gpus 0,1 --prompt-logprobs
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-nvfp4-tp2.safetensors
+flare/target/release/flare run /data/flare-runtime/inkling-small-nvfp4-tp2.safetensors --gpus 0,1
 ```
+
+For two Sparks, prepare with `--gpus 0 --ranks 2 --rendezvous ZERO:29630` on
+rank zero and `ignition join ZERO:29630 --rank 1 --ranks 2` on its peer. Follow
+[multi-host preparation and serving](multi-host.md#prepare-the-package) for
+checkpoint access, transport setup, and launching the resulting two-host package.
 
 Reduced model validation covers original-format weight loading, learned relative
 attention, FP32 residual convolution, complete compiled decoder replay across
 prefill/decode and page/window boundaries, state restoration, inactive rows, and
-allocation stability on SM120. Full-checkpoint TP8 export and native serving,
-long-context behavior, and SM103/SM121 execution remain unqualified. Run
+allocation stability on SM120. Full-checkpoint TP2 export and native serving,
+RoCE execution, long-context behavior, and SM121 execution remain unqualified.
+SM103's current expert implementation does not expose the unweighted route
+outputs this recipe requires. Run
 `tests/server/test_inkling.py` against the exported package with
 `FLARE_RUN_CUDA_TESTS=1`, `FLARE_INKLING_TEST_URL`, and
 `FLARE_INKLING_SNAPSHOT` set before promoting this draft recipe.

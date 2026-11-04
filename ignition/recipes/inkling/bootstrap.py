@@ -24,7 +24,7 @@ from ignition.preparation.capture import capture_forwards
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime,
-    create_dma_all_reduce_runtime,
+    create_dma_all_reduce_runtime, create_roce_runtime,
 )
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -54,7 +54,9 @@ class PreparationConfig:
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
-    devices: tuple[int, ...] = tuple(range(8))
+    devices: tuple[int, ...] = (0, 1)
+    hosts: tuple[str, ...] | None = None
+    roce_ring: bool = False
     context: int = 262144
     prefill_chunk_size: int = 4096
     max_active: int = 4
@@ -66,8 +68,13 @@ class PreparationConfig:
     stream_overlap: bool = True
 
     def __post_init__(self):
-        if len(self.devices) != 8 or len(set(self.devices)) != 8 or any(d < 0 for d in self.devices):
-            raise ValueError("Inkling-Small BF16 preparation requires eight distinct GPUs")
+        if (not isinstance(self.devices, tuple) or len(self.devices) != 2
+                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 2)
+                or len(set(zip(self.hosts or ("",) * 2, self.devices))) != 2
+                or any(type(device) is not int or device < 0 for device in self.devices)):
+            raise ValueError("Inkling-Small NVFP4 preparation requires two distinct host/device placements")
+        if self.roce_ring and self.hosts is None:
+            raise ValueError("RoCE ring requires ranks on separate hosts")
         request_capacity(self.max_active)
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
             raise ValueError("Inkling context must be 128-aligned in [128,262144]")
@@ -86,6 +93,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
+    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+        raise ValueError("Inkling NVFP4 preparation requires SM120 or SM121: "
+                         "the A4 expert kernels must expose unweighted per-route outputs")
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
         headers = [s.header_sha256 for s in manifest.shards]
@@ -116,15 +126,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + 1), device=device)
         coordinator = CollectivePreparation(group)
         routed_width = weights.config.text["num_experts_per_tok"] * weights.config.hidden
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
-            max_tokens=slots, hidden_size=routed_width, ipc=package_storage.peer_storage)
-        prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
-            hidden_size=routed_width, ipc=package_storage.peer_storage)
-        vocabulary_collective = create_all_gather_runtime(group, device, max_rows=slots,
-            columns=weights.config.vocabulary_partition(shard)[2] * shard.world_size, ipc=package_storage.peer_storage)
-        embedding_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
-            columns=weights.config.hidden, ipc=package_storage.peer_storage)
-        identity = hashlib.sha256(json.dumps(dict(config=weights.config.text, headers=headers,
+        if coordinator.spans_hosts:
+            gather_bytes = max(slots * weights.config.vocabulary_partition(shard)[2] * 2,
+                               tokens * (weights.config.hidden // shard.world_size) * 2)
+            collective = prefill_collective = vocabulary_collective = embedding_collective = create_roce_runtime(
+                group, device, max_tokens=slots, pipe_tokens=tokens, hidden_size=routed_width,
+                gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage)
+        else:
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+                max_tokens=slots, hidden_size=routed_width, ipc=package_storage.peer_storage)
+            prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
+                hidden_size=routed_width, ipc=package_storage.peer_storage)
+            vocabulary_collective = create_all_gather_runtime(group, device, max_rows=slots,
+                columns=weights.config.vocabulary_partition(shard)[2] * shard.world_size, ipc=package_storage.peer_storage)
+            embedding_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
+                columns=weights.config.hidden, ipc=package_storage.peer_storage)
+        identity = hashlib.sha256(json.dumps(dict(config=weights.config.text, quantization=weights.config.quantization,
+            headers=headers,
             kv_dtype="bfloat16", world_size=shard.world_size, contract="inkling.text.v1"), sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort,
@@ -229,7 +247,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         total_device_bytes=total, headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    channels = collective, prefill_collective, vocabulary_collective, embedding_collective
+    channels = tuple(dict.fromkeys((collective, prefill_collective, vocabulary_collective, embedding_collective)))
     disposable = [prefill_storage, decode_storage, arena.tensor, metadata, graph_buffers.chunks, private_buffers.chunks]
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):

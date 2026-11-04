@@ -16,23 +16,24 @@ from ignition.recipes.inkling.contract import prepare
 from ignition.recipes.inkling.model import route, mix_routes
 from ignition.recipes.inkling.pool import ContinuationPool, continuation_layout, page_bytes
 from ignition.recipes.inkling.recipe import RECIPE
-from .inkling_helpers import configuration
+from .inkling_helpers import configuration, quantization
 
 
 def test_checkpoint_alias_and_canonical_geometry():
     from ignition.recipes import resolve
     from ignition.recipes.inkling.bootstrap import PreparationConfig
 
-    assert resolve("inkling-small").recipe is RECIPE
-    model = ModelConfig.from_dict(configuration())
-    assert model.text["mlp_layer_types"] == ["dense", "sparse"]
+    assert resolve("inkling-small-nvfp4").recipe is RECIPE
+    model = ModelConfig.from_dict(configuration(), quantization())
+    assert model.text["mlp_layer_types"] == ["dense", "sparse", "sparse"]
     assert model.text["intermediate_size"] == 256
     assert model.text["moe_intermediate_size"] == 128
-    assert [model.attention(i).window for i in range(2)] == [128, -1]
+    assert [model.attention(i).window for i in range(3)] == [128, -1, -1]
+    assert model.quantized_routed_layers == (2,)
     assert model.vocabulary == 250
     assert RECIPE.speculation is None and RECIPE.max_draft_tokens == 0
     assert PreparationConfig(prefill_chunk_size=64).prefill_chunk_size == 64
-    with pytest.raises(ValueError, match="eight distinct"):
+    with pytest.raises(ValueError):
         PreparationConfig(devices=(0,))
 
 
@@ -44,11 +45,33 @@ def test_rejects_changed_arithmetic(change):
     raw = configuration()
     raw["text_config"].update(change)
     with pytest.raises(ValueError):
-        ModelConfig.from_dict(raw)
+        ModelConfig.from_dict(raw, quantization())
     raw = configuration()
     raw["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-    with pytest.raises(ValueError, match="BF16"):
-        ModelConfig.from_dict(raw)
+    with pytest.raises(ValueError, match="hf_quant_config"):
+        ModelConfig.from_dict(raw, quantization())
+
+
+def test_checkpoint_quantization_requires_both_calibration_and_exclusions(tmp_path):
+    import json
+
+    raw, quant = configuration(), quantization()
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(FileNotFoundError, match="hf_quant_config"):
+        ModelConfig.load(tmp_path)
+    for key, value in (("group_size", 32), ("quant_algo", "W4A16_NVFP4"), ("kv_cache_quant_algo", "FP8")):
+        with pytest.raises(ValueError):
+            ModelConfig.from_dict(raw, dict(quant, **{key: value}))
+    quant["modelopt_quant_config"]["quant_cfg"]["*input_quantizer"]["enable"] = False
+    with pytest.raises(ValueError, match="weight and input"):
+        ModelConfig.from_dict(raw, quant)
+    quant = quantization()
+    quant["exclude_modules"].remove("model.llm.layers.1.mlp.shared_experts")
+    with pytest.raises(ValueError, match="shared experts"):
+        ModelConfig.from_dict(raw, quant)
+    quant = quantization()
+    quant["exclude_modules"].remove("model.llm.layers.1.mlp.experts")
+    assert ModelConfig.from_dict(raw, quant).quantized_routed_layers == (1, 2)
 
 
 def test_fp32_router_keeps_shared_sinks_and_unrounded_checkpoint_scale():
@@ -83,9 +106,9 @@ def test_routed_sum_uses_checkpoint_expert_order_and_bf16_boundaries():
 
 
 def test_contract_snapshots_every_history_and_retains_bf16_pages():
-    config, shard = ModelConfig.from_dict(configuration()), TensorParallelShard(0, 1)
+    config, shard = ModelConfig.from_dict(configuration(), quantization()), TensorParallelShard(0, 1)
     pool = ContinuationPool.allocate(config, shard, 4, 3, "cpu")
-    assert page_bytes(config, shard) == 2 * 128 * 128 * 2
+    assert page_bytes(config, shard) == 4 * 128 * 128 * 2
     for layer in range(config.layers):
         for kind, channels in (("key", 128), ("value", 128), ("attention", 256), ("mlp", 256)):
             view = pool.convolution(layer, kind)
@@ -103,6 +126,6 @@ def test_contract_snapshots_every_history_and_retains_bf16_pages():
     assert contract.frontend.tools.kind == p.TML_JSON
     assert contract.frontend.reasoning.kind == p.CONTENT_HEADERS
     histories = [r for r in contract.cache.regions if r.kind == p.PAGED_KEY_VALUE]
-    assert len(histories) == 2 and all(r.storage.stride == 32768 for r in histories)
+    assert len(histories) == 4 and all(r.storage.stride == 32768 for r in histories)
     assert all(any(state.view.nbytes == pool.layout.row_bytes for state in graph.state) for graph in contract.graphs)
     assert all(not graph.HasField("draft_cursor") for graph in contract.graphs)

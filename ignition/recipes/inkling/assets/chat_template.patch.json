@@ -1,7 +1,7 @@
 {
   "source": {
-    "repository": "thinkingmachines/Inkling-Small",
-    "revision": "8cc5877b44d343f88b92086aa1fb72897950f06a",
+    "repository": "thinkingmachines/Inkling-Small-NVFP4",
+    "revision": "b6a99534467840620d411e4cd4ad5819b2610d9c",
     "filename": "chat_template.jinja"
   },
   "source_sha256": "0aa1aa0c729d90176dcaa00c440c8faffca2957ffb2cc4b79456ee6d02bcf43b",

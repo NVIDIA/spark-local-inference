@@ -19,6 +19,7 @@ from ignition.recipes.inkling.decoder import PreparedDecoder, Scratch
 from ignition.recipes.inkling.model import norm
 from ignition.recipes.inkling.pool import ContinuationPool
 from ignition.recipes.inkling.weights import ModelWeights
+from tests.components.inkling_nvfp4_helpers import nvfp4_routes
 from .inkling_helpers import checkpoint
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA GPU")
@@ -29,7 +30,17 @@ def convolution(x, weight):
     return (y[0, :, :x.shape[0]].T + x.float()).to(x.dtype)
 
 
-def reference(weights, tokens):
+def assert_decoder_close(actual, expected):
+    # Tiled and dense FP32 softmax reductions can straddle a BF16 probability
+    # rounding boundary. Residuals and later KV history propagate that difference;
+    # normalize error by the vector scale so cancellation near zero stays meaningful.
+    epsilon = torch.finfo(torch.bfloat16).eps
+    reference = expected.float()
+    torch.testing.assert_close(actual, expected, atol=epsilon * reference.abs().max().item(), rtol=0)
+    assert (actual.float() - reference).norm().item() <= (epsilon / 2) * reference.norm().item()
+
+
+def reference(weights, tokens, original):
     from transformers.models.inkling.configuration_inkling import InklingTextConfig
     from transformers.models.inkling.modeling_inkling import InklingAttention
 
@@ -75,11 +86,19 @@ def reference(weights, tokens):
             logp = F.logsigmoid(selected)
             probabilities = (logp - logp.logsumexp(-1, keepdim=True)).exp() * c["route_scale"] * w.scale
             routed = torch.zeros_like(source)
+            quantized = index in weights.config.quantized_routed_layers
+            if quantized:
+                routes = nvfp4_routes(source, ids, original, f"model.llm.layers.{index}.mlp.experts")
             for expert in range(c["n_routed_experts"]):
-                expert_out = mlp(w.experts.gate_up[expert], w.experts.down[expert])
                 selection = ids == expert
-                weight = (probabilities[:, :c["num_experts_per_tok"]] * selection).sum(-1)
-                routed += (expert_out * weight[:, None]).bfloat16()
+                if quantized:
+                    for slot in range(ids.shape[1]):
+                        weight = probabilities[:, slot] * selection[:, slot]
+                        routed += (routes[:, slot] * weight[:, None]).bfloat16()
+                else:
+                    expert_out = mlp(w.experts.gate_up[expert], w.experts.down[expert])
+                    weight = (probabilities[:, :c["num_experts_per_tok"]] * selection).sum(-1)
+                    routed += (expert_out * weight[:, None]).bfloat16()
             shared = torch.stack([mlp(expert.gate_up, expert.down,
                 probabilities[:, c["num_experts_per_tok"] + i]) for i, expert in enumerate(w.shared)])
             out = routed + shared.float().sum(0).bfloat16()
@@ -104,9 +123,31 @@ def test_original_checkpoint_loader_shards_interleaved_rows_without_losing_preci
     assert torch.equal(layer.key_conv.cpu(), original["model.llm.layers.1.attn.k_sconv.weight"].float().flatten(1))
 
 
+@pytest.mark.parametrize("layer,excluded,error", [(1, False, "incomplete NVFP4"), (2, True, "interleaved BF16")])
+@torch.no_grad()
+def test_loader_rejects_checkpoint_precision_disagreeing_with_exclusions(tmp_path, layer, excluded, error):
+    import json
+    from ignition.recipes.inkling.weights import InklingWeightLoader
+
+    checkpoint(tmp_path)
+    path = tmp_path / "hf_quant_config.json"
+    metadata = json.loads(path.read_text())
+    prefix = f"model.llm.layers.{layer}.mlp.experts"
+    exclusions = metadata["quantization"]["exclude_modules"]
+    if excluded:
+        exclusions.append(prefix)
+        exclusions.remove("model.llm.layers.1.mlp.experts")
+    else:
+        exclusions.remove(prefix)
+    path.write_text(json.dumps(metadata))
+    with InklingWeightLoader(inspect_indexed_checkpoint(tmp_path), "cuda:0", shard=TensorParallelShard(0, 1)) as loader:
+        with pytest.raises(ValueError, match=error):
+            loader.load_layer(layer)
+
+
 @torch.no_grad()
 def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
-    checkpoint(tmp_path)
+    _, original = checkpoint(tmp_path)
     device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
     weights = ModelWeights.load(inspect_indexed_checkpoint(tmp_path), device, shard=shard)
     pool = ContinuationPool.allocate(weights.config, shard, 4, 5, device)
@@ -141,7 +182,7 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
         session.freeze()
         pool.clear_for_preparation()
         tokens = (torch.arange(259, device=device) * 17 % weights.config.vocabulary).long()
-        expected, expected_hidden = reference(weights, tokens)
+        expected, expected_hidden = reference(weights, tokens, original)
         start = 0
         for mode, count in (("prefill", 63), ("decode", 1), ("decode", 1), ("prefill", 62),
                             ("decode", 1), ("decode", 1), ("prefill", 64), ("prefill", 64), ("decode", 1), ("decode", 1)):
@@ -157,9 +198,8 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             start += count
-            # The fixed reduced checkpoint matches exactly across these BF16 boundaries.
-            torch.testing.assert_close(scratch.logits[0], expected[start - 1], atol=0, rtol=0)
-            torch.testing.assert_close(scratch.hidden[0], expected_hidden[start - 1], atol=0, rtol=0)
+            assert_decoder_close(scratch.logits[0], expected[start - 1])
+            assert_decoder_close(scratch.hidden[0], expected_hidden[start - 1])
         assert start == tokens.numel()
         saved = pool.backing.clone()
         pages = {name: value.clone() for name, value in pool.pages.items()}
@@ -189,7 +229,7 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
 
 @torch.no_grad()
 def test_decoder_batched_decode_with_inactive_rows_after_window_wrap(tmp_path):
-    checkpoint(tmp_path)
+    _, original = checkpoint(tmp_path)
     device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
     weights = ModelWeights.load(inspect_indexed_checkpoint(tmp_path), device, shard=shard)
     pool = ContinuationPool.allocate(weights.config, shard, 5, 10, device)
@@ -249,5 +289,5 @@ def test_decoder_batched_decode_with_inactive_rows_after_window_wrap(tmp_path):
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
         assert torch.equal(untouched, pool.backing[[0, 3, 4]])
         for row, sequence in zip((0, 2), sequences):
-            expected, _ = reference(weights, sequence)
-            torch.testing.assert_close(s.logits[row], expected[-1], atol=0, rtol=0)
+            expected, _ = reference(weights, sequence, original)
+            assert_decoder_close(s.logits[row], expected[-1])

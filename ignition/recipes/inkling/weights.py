@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct BF16 loading of the original interleaved Inkling checkpoint layout."""
+"""Direct loading of Inkling's interleaved NVFP4 and unquantized checkpoint tensors."""
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -38,7 +38,7 @@ class LayerWeights:
     dense: MLPWeights | None
     router: torch.Tensor | None
     correction: torch.Tensor | None
-    experts: Experts | None
+    experts: object | None
     shared: tuple[MLPWeights, ...]
 
 
@@ -106,6 +106,62 @@ class InklingWeightLoader(DirectWeightLoader):
         self._session.flush()
         return MLPWeights(target, output)
 
+    def _nvfp4_experts(self, prefix, inter):
+        from b12x._lib.intrinsics.reference import swizzle_block_scale
+        from b12x.moe import fused_moe as moe
+        from ignition.preparation.tensor_metadata import record_numeric_tensor
+
+        first, last = self.shard.partition(inter, alignment=64)
+        local, count, hidden = last - first, self.config.text["n_routed_experts"], self.config.hidden
+        packed, blocks, globals_, inputs = [], [], [], []
+        for projection, rows, columns in (("w13_weight", 2 * inter, hidden), ("w2_weight", hidden, inter)):
+            name = prefix + "." + projection
+            if any(name + suffix not in self._sources for suffix in ("", ".scale", ".scale2", ".input_amax", ".original_shape")):
+                raise ValueError(f"{name}: incomplete NVFP4 checkpoint tensors")
+            source, scale = self._sources[name], self._sources[name + ".scale"]
+            shape = self._session.materialize(self._sources[name + ".original_shape"])
+            global_scale = self.load_tensor(name + ".scale2")
+            amax = self._session.materialize(self._sources[name + ".input_amax"])
+            if (source.dtype != torch.uint8 or source.shape != (count, rows, columns // 2)
+                    or scale.dtype != torch.float8_e4m3fn or scale.shape != (count, rows, columns // 16)
+                    or shape.dtype != torch.int64 or shape.shape != (3,) or shape.tolist() != [count, rows, columns]):
+                raise ValueError(f"{name}: invalid packed NVFP4 weight or block-scale geometry")
+            if (global_scale.dtype != torch.float32 or global_scale.shape != (count,)
+                    or not bool((torch.isfinite(global_scale) & (global_scale > 0)).all())
+                    or amax.dtype != torch.bfloat16 or amax.shape != (1,)
+                    or not bool((torch.isfinite(amax) & (amax > 0)).all())):
+                raise ValueError(f"{name}: expected positive FP32 per-expert scale2 and BF16 input_amax")
+            down = projection == "w2_weight"
+            output_shape = (count, hidden, local // 2) if down else (count, 2 * local, hidden // 2)
+            scale_shape = (count, hidden, local // 16) if down else (count, 2 * local, hidden // 16)
+            values = torch.empty(output_shape, dtype=torch.uint8, device=self.device)
+            scales = torch.empty(scale_shape, dtype=torch.float8_e4m3fn, device=self.device)
+            for expert in range(count):
+                if down:
+                    self._copy(values[expert], source[expert, :, first // 2:last // 2])
+                    self._copy(scales[expert], scale[expert, :, first // 16:last // 16])
+                else:
+                    for offset in (0, 1):
+                        target = slice(offset * local, (offset + 1) * local)
+                        self._copy(values[expert, target], source[expert, 2 * first + offset:2 * last:2])
+                        self._copy(scales[expert, target], scale[expert, 2 * first + offset:2 * last:2])
+            globals_.append(global_scale)
+            # Preserve ModelOpt's FP32 amax/(448*6) boundary before b12x's reciprocal.
+            activation_scale = (amax.float() / 2688.).reciprocal().to(self.device).expand(count).clone()
+            record_numeric_tensor(activation_scale)
+            inputs.append(activation_scale)
+            self._session.flush()
+            packed.append(values)
+            blocks.append(swizzle_block_scale(scales))
+            del scales
+        plan = moe.plan_weights(source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w31"),
+            activation=moe.ActivationSpec(mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16),
+            geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden, intermediate_size=local))
+        return moe.prepare_weights(plan=plan, weights=moe.PackedWeights(
+            w13=packed[0], w2=packed[1], w13_block_scales=blocks[0], w2_block_scales=blocks[1],
+            w13_global_scales=globals_[0], w2_global_scales=globals_[1],
+            input_scale=inputs[0], intermediate_scale=inputs[1], immutable_input_scales=True))
+
     def load_layer(self, layer):
         c, shard = self.config.text, self.shard
         prefix = f"{PREFIX}.layers.{layer}"
@@ -130,14 +186,17 @@ class InklingWeightLoader(DirectWeightLoader):
             scale = tensor("mlp.global_scale")
         else:
             router, correction, scale = (tensor("mlp.gate." + n) for n in ("weight", "bias", "global_scale"))
-            count, local = c["n_routed_experts"], c["moe_intermediate_size"] // shard.world_size
-            experts = Experts(
-                torch.empty((count, 2 * local, self.config.hidden), dtype=torch.bfloat16, device=self.device),
-                torch.empty((count, self.config.hidden, local), dtype=torch.bfloat16, device=self.device))
-            for expert in range(count):
-                self._interleaved(mlp + ".experts.w13_weight", mlp + ".experts.w2_weight",
-                    c["moe_intermediate_size"], expert=expert,
-                    destination=MLPWeights(experts.gate_up[expert], experts.down[expert]))
+            if layer in self.config.quantized_routed_layers:
+                experts = self._nvfp4_experts(mlp + ".experts", c["moe_intermediate_size"])
+            else:
+                count, local = c["n_routed_experts"], c["moe_intermediate_size"] // shard.world_size
+                experts = Experts(
+                    torch.empty((count, 2 * local, self.config.hidden), dtype=torch.bfloat16, device=self.device),
+                    torch.empty((count, self.config.hidden, local), dtype=torch.bfloat16, device=self.device))
+                for expert in range(count):
+                    self._interleaved(mlp + ".experts.w13_weight", mlp + ".experts.w2_weight",
+                        c["moe_intermediate_size"], expert=expert,
+                        destination=MLPWeights(experts.gate_up[expert], experts.down[expert]))
             shared = tuple(self._interleaved(mlp + ".shared_experts.shared_w13_weight",
                 mlp + ".shared_experts.shared_w2_weight", c["moe_intermediate_size"], expert=i)
                 for i in range(c["n_shared_experts"]))

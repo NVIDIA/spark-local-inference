@@ -12,7 +12,7 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SNAPSHOT = Path(os.environ.get("FLARE_INKLING_SNAPSHOT", "/data/models/Inkling-Small"))
+SNAPSHOT = Path(os.environ.get("FLARE_INKLING_SNAPSHOT", "/data/models/Inkling-Small-NVFP4"))
 
 
 def test_native_inkling_matches_checkpoint(tmp_path):
@@ -22,7 +22,7 @@ def test_native_inkling_matches_checkpoint(tmp_path):
     from ignition.recipes.inkling.frontend import prepare_frontend, runtime_assets
 
     if not (SNAPSHOT / "tokenizer.json").is_file():
-        pytest.skip("requires pinned Inkling-Small frontend assets")
+        pytest.skip("requires pinned Inkling-Small-NVFP4 frontend assets")
     assets = runtime_assets(SNAPSHOT)
     settings = prepare_frontend(SNAPSHOT, eos_token_ids=[200006])
     tokenizer = Tokenizer.from_file(str(SNAPSHOT / "tokenizer.json"))

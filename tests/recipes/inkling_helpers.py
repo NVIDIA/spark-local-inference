@@ -13,7 +13,7 @@ from ignition.recipes.inkling.config import ModelConfig
 
 def configuration():
     return dict(architectures=["InklingForConditionalGeneration"], model_type="inkling_mm_model", eos_token_id=200006,
-        text_config=dict(hidden_size=256, num_hidden_layers=2, vocab_size=256, unpadded_vocab_size=250,
+        text_config=dict(hidden_size=256, num_hidden_layers=3, vocab_size=256, unpadded_vocab_size=250,
             num_attention_heads=2, num_key_value_heads=1, head_dim=128, swa_head_dim=128,
             swa_num_attention_heads=2, swa_num_key_value_heads=1, sliding_window_size=128,
             d_rel=16, rel_extent=256, local_layer_ids=[0], dense_mlp_idx=1,
@@ -26,10 +26,30 @@ def configuration():
             log_scaling_n_floor=128, log_scaling_alpha=.1, rms_norm_eps=1e-6, torch_dtype="bfloat16"))
 
 
-def checkpoint(path):
+def quantization():
+    excluded = ["model.llm." + name for name in ("embed", "embed_norm", "norm", "unembed")]
+    for layer in range(3):
+        prefix = f"model.llm.layers.{layer}."
+        excluded.extend(prefix + name for name in ("attn", "attn_norm", "attn_sconv", "mlp_norm", "mlp_sconv"))
+        excluded.extend(prefix + name for name in
+            (("mlp.w13_dn", "mlp.w2_md", "mlp.global_scale") if layer == 0
+             else ("mlp.gate", "mlp.shared_experts")))
+    excluded.append("model.llm.layers.1.mlp.experts")
+    quantizer = dict(num_bits=[2, 1], block_sizes={"-1": 16, "type": "dynamic", "scale_bits": [4, 3]},
+                     axis=None, enable=True)
+    return dict(quant_algo="NVFP4", kv_cache_quant_algo="none", group_size=16, exclude_modules=excluded,
+        modelopt_quant_config=dict(algorithm="max", quant_cfg={"*weight_quantizer": quantizer,
+            "*input_quantizer": quantizer.copy(), "default": {"enable": False}}))
+
+
+def checkpoint(path, *, moe_intermediate=128, routed_experts=4, top_k=2):
     torch.manual_seed(7821)
     raw = configuration()
-    config = ModelConfig.from_dict(raw)
+    raw["text_config"]["intermediate_size"] = moe_intermediate
+    raw["text_config"]["n_routed_experts"] = routed_experts
+    raw["text_config"]["num_experts_per_tok"] = top_k
+    quant = quantization()
+    config = ModelConfig.from_dict(raw, quant)
     c, h = config.text, config.hidden
     tensors = {}
     def rand(name, shape, scale=.025, dtype=torch.bfloat16):
@@ -70,6 +90,20 @@ def checkpoint(path):
             rand(p + ".mlp.gate.weight", (c["n_routed_experts"] + c["n_shared_experts"], h))
             rand(p + ".mlp.gate.bias", (c["n_routed_experts"],), .01, torch.float32)
             tensors[p + ".mlp.gate.global_scale"] = torch.tensor([.14234226942062378], dtype=torch.float32)
+            if i in config.quantized_routed_layers:
+                for projection in ("w13_weight", "w2_weight"):
+                    name = p + ".mlp.experts." + projection
+                    original = tensors[name]
+                    count, rows, columns = original.shape
+                    # Independent exact checkpoint bytes: signed E2M1 codes, distinct
+                    # block scales and per-expert gains expose row/column packing errors.
+                    codes = torch.randint(0, 16, original.shape, dtype=torch.uint8)
+                    tensors[name] = codes[..., ::2] | (codes[..., 1::2] << 4)
+                    tensors[name + ".scale"] = (torch.rand(count, rows, columns // 16) * 2 + 1).to(torch.float8_e4m3fn)
+                    tensors[name + ".scale2"] = torch.linspace(.001, .0025, count, dtype=torch.float32)
+                    tensors[name + ".input_amax"] = torch.tensor([1.8359375 if projection == "w13_weight" else 187.], dtype=torch.bfloat16)
+                    tensors[name + ".original_shape"] = torch.tensor(original.shape, dtype=torch.int64)
     (path / "config.json").write_text(json.dumps(raw))
+    (path / "hf_quant_config.json").write_text(json.dumps(dict(quantization=quant)))
     save_file(tensors, path / "model.safetensors")
     return config, tensors

@@ -12,11 +12,13 @@ from ignition.components.collectives import PreparedChunkedAllReduce
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
+from ignition.components.moe import PreparedRoutedExperts
 from ignition.components.paged_resume import PreparedResume
 from ignition.components.residual_short_conv import PreparedResidualShortConvolution
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from .attention import AttentionScratch, PreparedAttention
 from .model import decoder_layer, mix_routes, norm, route
+from .weights import Experts
 
 
 @dataclass(frozen=True)
@@ -95,8 +97,12 @@ class PreparedFeedForward(torch.nn.Module):
         if self.dense is None:
             self.router = UnquantizedProjection(s.normalized, weights.router, s.router_logits,
                 session=session, name=name + ".router")
-            self.experts = PreparedBF16Experts(s.normalized, weights.experts.gate_up, weights.experts.down,
-                s.route_ids, s.route_weights, s.routes, metadata.live_counts[:1], scratch=s.bf16, round_silu=False)
+            if isinstance(weights.experts, Experts):
+                self.experts = PreparedBF16Experts(s.normalized, weights.experts.gate_up, weights.experts.down,
+                    s.route_ids, s.route_weights, s.routes, metadata.live_counts[:1], scratch=s.bf16, round_silu=False)
+            else:
+                self.experts = PreparedRoutedExperts(s.normalized, weights.experts, s.route_ids,
+                    s.route_weights, s.routes, session=session, name=name + ".experts", workspace=workspace)
             self.reduce_routes = PreparedChunkedAllReduce(s.routes.flatten(1), s.reduced_routes.flatten(1),
                 runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduce_routes")
             self.shared = tuple(mlp(w, s.shared, f".shared{index}") for index, w in enumerate(weights.shared))
@@ -115,6 +121,7 @@ class PreparedFeedForward(torch.nn.Module):
         s.route_weights.copy_(torch.where(valid, weights, 0.))
         s.gammas.copy_(torch.where(valid, gammas, 0.))
         self.experts()
+        s.routes.copy_(torch.where(s.route_ids[..., None] >= 0, s.routes, 0.))
         self.reduce_routes(s.routes.flatten(1))
         routed = mix_routes(s.reduced_routes, weights, ids)
         shared = torch.zeros_like(s.output, dtype=torch.float32)
