@@ -8,6 +8,7 @@ import copy
 import os
 import pickle
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -480,6 +481,55 @@ def test_long_generated_kernel_names_freeze_and_restore(tmp_path, monkeypatch):
     assert restored.cache_hit
     assert selected(restored) == winners
     _replay(restored, fresh)
+
+
+@torch.no_grad()
+def test_unreferenced_bundled_candidates_are_dropped_and_named_kernels_still_bind(tmp_path, monkeypatch):
+    """Epilogue-fusion benchmarking can bundle a template candidate that final code never names."""
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+    from torch._inductor.utils import Placeholder
+
+    bundled = {}
+
+    def probe(candidate):
+        class Probe(inductor_tuning.InductorSelections):
+            def register(self, bound):
+                entries = bound.artifact._artifacts.compiled_fn.artifact._flare_graph._triton_bundle.static_autotuners
+                if not bound.cache_hit:
+                    entries.append(candidate(entries[0]))
+                bundled[bound.cache_hit] = {entry.cache_key for entry in entries}
+                super().register(bound)
+        return Probe
+
+    def cache(name):
+        return ForwardCache(namespace={'model': name}, device='cuda:0', root=tmp_path / name, compile_workers=1,
+            options=dict(_OPTIONS, autotune_local_cache=False, autotune_remote_cache=False))
+
+    signature = GraphSignature('decode', 1, 1)
+    monkeypatch.setattr(inductor_tuning, 'InductorSelections', probe(lambda entry: replace(
+        entry, cache_key='unreferenced-candidate', kernel_name=str(Placeholder.DESCRIPTIVE_NAME))))
+    accepted = cache('unreferenced-candidate')
+    forward = ArithmeticForward()
+    bound = accepted.prepare(forward, name='decode', signature=signature)
+    assert 'unreferenced-candidate' in bundled[False]
+    _replay(bound, forward)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('frozen kernel compiled or benchmarked on restore')
+
+    with monkeypatch.context() as frozen:
+        frozen.setattr(CachingAutotuner, 'bench', forbidden)
+        frozen.setattr(CachingAutotuner, '_precompile_config', forbidden)
+        fresh = ArithmeticForward()
+        restored = accepted.prepare(fresh, name='decode', signature=signature)
+    assert restored.cache_hit
+    assert bundled[True] == bundled[False] - {'unreferenced-candidate'}
+    _replay(restored, fresh)
+
+    monkeypatch.setattr(inductor_tuning, 'InductorSelections', probe(lambda entry: replace(
+        entry, cache_key='named-unbound-kernel')))
+    with pytest.raises(ValueError, match='unbound static Inductor kernels'):
+        cache('named-unbound-kernel').prepare(ArithmeticForward(), name='decode', signature=signature)
 
 
 @pytest.fixture(scope='module')
