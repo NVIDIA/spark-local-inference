@@ -92,7 +92,7 @@ pub struct Snapshot {
     pub completed: u64,
     /// Requests whose reasoning was closed by their hard token budget.
     pub reasoning_budget_cuts: u64,
-    /// Requests failed by admission, execution, grammar, or output backpressure.
+    /// Requests failed by admission, execution, grammar, or output processing.
     pub failed: u64,
     /// Sum of maximum rank-local CUDA intervals of completed graphs, including readiness waits.
     pub replay_gpu_ns: u64,
@@ -862,7 +862,7 @@ impl Metrics {
             ),
             (
                 "requests_failed_total",
-                "Model requests failed by admission, execution, grammar, or output backpressure.",
+                "Model requests failed by admission, execution, grammar, or output processing.",
                 &self.failed,
             ),
             (

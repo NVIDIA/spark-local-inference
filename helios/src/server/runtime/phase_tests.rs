@@ -257,6 +257,7 @@ impl Fixture {
             },
             Generation {
                 events: receiver,
+                _capacity: None,
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -3085,6 +3086,90 @@ fn group_runtime(
     )
 }
 #[test]
+fn unread_responses_finish_and_release_model_resources_but_retain_admission_capacity() {
+    for logprobs in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.prepared_sequence_tokens = 1024;
+        fixture.config.limits.max_sequence_tokens = 1024;
+        fixture.config.limits.pages = 64;
+        fixture.config.max_top_logprobs = 20;
+        let (runtime, receiver) = group_runtime(&fixture, 2);
+        let prompt = |limit| Fixture::prompt_for(vec![0], limit, PromptData {
+            positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
+        });
+        let mut slow_prompt = prompt(512);
+        slow_prompt.logprobs = logprobs;
+        slow_prompt.stop_sequences = vec![vec![2, 3]];
+        let mut slow = runtime.generate_observed(slow_prompt, true).unwrap();
+        let mut worker = fixture.worker(receiver);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let mut tokens = vec![1; 512];
+        tokens[511] = 2; // An unfinished stop prefix must flush before Finished.
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &tokens);
+        assert!(worker.active.iter().all(Option::is_none));
+        assert!(worker.admissions.iter().all(Option::is_none));
+        assert!(!slow.cancelled.load(Ordering::Acquire));
+        assert_eq!(runtime.capacity.available_permits(), 1);
+
+        // A completed response whose reader is paused cannot hold a model slot
+        // or prevent another admitted request from producing its answer.
+        let mut fast = runtime.generate(prompt(2)).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        budget_pass(&mut worker, &mut sequence, &[3, 1]);
+        assert_eq!(budget_events(&mut fast).0, vec![3, 1]);
+        assert!(runtime.generate(prompt(1)).is_err());
+        drop(fast);
+        assert_eq!(runtime.capacity.available_permits(), 1);
+
+        let mut presented = Vec::new();
+        let mut observed = Vec::new();
+        let mut finished = false;
+        while let Ok(event) = slow.events.try_recv() {
+            assert!(!finished, "event after terminal completion");
+            match event {
+                GenerationEvent::Token(token) => presented.push(token),
+                GenerationEvent::LogprobToken(value) => presented.push(value.token),
+                GenerationEvent::ObservedToken { token, timestamp_ns: Some(_) } => observed.push(token),
+                GenerationEvent::Finished { generated_tokens: 512, reason: "length", .. } => finished = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(presented, tokens);
+        assert_eq!(observed, tokens);
+        assert_eq!(fixture.metrics.failed.load(Ordering::Relaxed), 0);
+        drop(slow);
+        assert_eq!(runtime.capacity.available_permits(), 2);
+    }
+}
+
+#[test]
+fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
+    let mut fixture = Fixture::new();
+    fixture.config.prepared_sequence_tokens = 256;
+    fixture.config.limits.max_sequence_tokens = 256;
+    let (runtime, receiver) = group_runtime(&fixture, 1);
+    let mut prompt = Fixture::prompt_for(vec![0], 80, PromptData {
+        positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
+    });
+    prompt.reasoning_cut = Some(budget_cut(4, 81));
+    let mut generation = runtime.generate_observed(prompt, false).unwrap();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let mut sequence = 0;
+    budget_pass(&mut worker, &mut sequence, &[1; 80]);
+    assert_eq!(worker.parked.len(), 1);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    budget_pass(&mut worker, &mut sequence, &[2; 80]);
+    let (tokens, finished, _) = budget_events(&mut generation);
+    assert_eq!(tokens, [vec![1; 80], vec![4], vec![2; 80]].concat());
+    assert_eq!(finished, vec![(1, 161, "length")]);
+    assert_eq!(fixture.metrics.failed.load(Ordering::Relaxed), 0);
+    assert!(!generation.cancelled.load(Ordering::Acquire));
+}
+
+#[test]
 fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacity() {
     let fixture = Fixture::new();
     let (runtime, receiver) = group_runtime(&fixture, 4);
@@ -3560,6 +3645,57 @@ async fn http_generation_request(
     .await
     .unwrap();
     (response, incoming)
+}
+
+#[tokio::test]
+async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
+    for fail in [false, true] {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 100, "stream": true, "return_token_ids": true,
+        });
+        let (response, incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        incoming[0].notify_admission(Ok(()));
+        // An unpolled response body models socket backpressure without relying on
+        // kernel send-buffer sizes or wall-clock delays to make the test fail.
+        let expected = (0..100).map(|i| 1 + i % 3).collect::<Vec<_>>();
+        for &token in &expected {
+            incoming[0].observe_token(token);
+            incoming[0].emit_token(token);
+        }
+        if fail {
+            incoming[0].fail(Error::execution(ExecutionError::Worker, "test worker failure"));
+        } else {
+            incoming[0].emit(GenerationEvent::Finished {
+                prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 100,
+                reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+                termination: crate::output::Termination::OutputLimit,
+            });
+        }
+        assert!(!incoming[0].cancelled.load(Ordering::Acquire));
+        drop(incoming);
+        let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = body.lines().filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let observed = events.iter().filter_map(|event| event["choices"][0]["token_ids"].as_array())
+            .flatten().map(|token| token.as_u64().unwrap() as u32).collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        let text = events.iter().filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "bcd".repeat(33) + "b");
+        if fail {
+            assert_eq!(events.last().unwrap()["error"]["message"], "test worker failure");
+            assert!(!body.contains("[DONE]"));
+        } else {
+            assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "length");
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+    }
 }
 
 #[tokio::test]

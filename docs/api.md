@@ -248,7 +248,12 @@ Each completion batch reserves one admission slot per generated choice. Every
 child is prepared and validated before the group is submitted to the native
 worker. An oversized group is rejected; temporary admission exhaustion returns
 429. Disconnecting a stream cancels all unfinished children, and native work
-drains before its resources are reclaimed. Output queues remain bounded.
+drains before its resources are reclaimed. A connected reader can pause and
+resume without losing generated output. Each response buffers up to its allowed
+output length, including requested token observations and prompt scores. Storage
+grows with queued data; large paused responses can retain more CPU memory.
+Finished responses awaiting delivery still count toward the admission limit,
+but no longer occupy a model execution slot or its live KV cache.
 
 ## Health and metrics
 
@@ -293,7 +298,7 @@ instantaneous gauges.
 | `pending` | Requests waiting in the model scheduler | `flare_pending_requests` |
 | `completed` | Requests whose generation completed successfully | `flare_requests_completed_total` |
 | `reasoning_budget_cuts` | Requests whose reasoning was closed by their hard token budget | `flare_reasoning_budget_cuts_total` |
-| `failed` | Requests failed by admission, execution, grammar, or output backpressure | `flare_requests_failed_total` |
+| `failed` | Requests failed by admission, execution, grammar, or output processing | `flare_requests_failed_total` |
 | `replay_gpu_ns` | Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits | `flare_replay_gpu_nanoseconds_total` |
 | `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for both RAM and disk delivery | `flare_replay_readiness_wait_nanoseconds_total` |
 | `replay_readiness_samples` | Completed graphs with prepared readiness timing outputs; zero for packages without them | `flare_replay_readiness_samples_total` |
