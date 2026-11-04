@@ -17,7 +17,7 @@ def prepare_projection(source, weight, output, *, session, name, workspace=None)
     if isinstance(weight, torch.Tensor):
         return UnquantizedProjection(source, weight, output, session=session, name=name)
     if isinstance(weight, TensorFP8Weight):
-        return TensorFP8Projection(source, weight, output, session=session, name=name)
+        return TensorFP8Projection(source, weight, output, session=session, name=name, workspace=workspace)
     return QuantizedProjection(
         source, weight, output, activation_mode="auto", session=session, workspace=workspace, name=name
     )

@@ -1071,6 +1071,11 @@ Use the FlashInfer revision pinned in `pyproject.toml` and `uv.lock`,
 activation and reduction arguments used by the shared NVFP4 preparation path.
 Run the standard locked environment setup before preparing this recipe.
 
+On DGX Station (GB300/SM103), calibrated tensor-FP8 projections use FlashInfer's
+SM100 CUTLASS FP8 GEMM with caller-owned scratch. This preserves the checkpoint's
+E4M3 values and combined FP32 calibration scale; the b12x blockscaled GEMM used
+on SM120/SM121 does not support SM103.
+
 All 52 layers retain BF16 paged keys and values. Sliding layers apply the
 checkpoint's 2048-token attention window; full layers use the entire history.
 One 128-token page occupies 6,815,744 bytes and a continuation row occupies
@@ -1093,9 +1098,15 @@ Muse Spark's parser; `<|eom|>` is an internal boundary, while `<|eot|>` and
 flare/target/release/flare run /data/flare-runtime/muse-glimmer.safetensors --gpus 0
 ```
 
-The recipe has reduced-shape CUDA and checkpoint-tokenizer frontend tests.
-Full-checkpoint export, native serving, and quality validation require a GPU
-with enough memory for the checkpoint and have not been qualified by these tests.
+The pinned full checkpoint exports 29 graphs and loads through native `flare run`
+on one DGX Station (GB300/SM103) at the default capacities above. Component and
+reduced-model CUDA checks pass on SM103 and SM120. Native API acceptance is
+incomplete: 31 checks pass, including 131008-token inputs, concurrency four,
+prefix reuse, streaming, prompt logprobs and cancellation. At the required
+64-token output budget, four text and ten JSON cases reach the output limit,
+and twelve forced-tool cases fail without a completed call. Keep these cases
+in `tests/server/test_muse_glimmer.py` when completing generation qualification.
+No latency or throughput measurements have been made.
 
 ## Storage and graph capacities
 

@@ -45,10 +45,14 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
     nvfp4('lm_head', c.vocab_size, c.hidden_size)
     nvfp4('model.language_model.layers.0.self_attn.v_proj', 128, c.hidden_size)
     nvfp4('model.language_model.layers.1.mlp.down_proj', c.hidden_size, c.intermediate_size)
-    prefix = 'model.language_model.layers.0.self_attn.q_proj'
-    tensors[prefix + '.weight'] = tensors[prefix + '.weight'].float().mul(32).to(torch.float8_e4m3fn)
-    tensors[prefix + '.weight_scale'], tensors[prefix + '.input_scale'] = torch.tensor(1/32), torch.tensor(.031)
-    declarations[prefix] = {'quant_algo': 'FP8'}
+    for suffix, weight_scale, input_scale in [
+            ('0.self_attn.q_proj', 1/32, .031),
+            ('0.self_attn.k_proj', 1/16, .017),
+            ('1.mlp.up_proj', 1/64, .045)]:
+        prefix = 'model.language_model.layers.' + suffix
+        tensors[prefix + '.weight'] = (tensors[prefix + '.weight'].float() / weight_scale).to(torch.float8_e4m3fn)
+        tensors[prefix + '.weight_scale'], tensors[prefix + '.input_scale'] = torch.tensor(weight_scale), torch.tensor(input_scale)
+        declarations[prefix] = {'quant_algo': 'FP8'}
     # Vision tensors are deliberately present: text preparation must not load them.
     tensors['model.vision_model.unused.weight'] = torch.ones(256, dtype=torch.bfloat16)
     raw = dict(model_type='muse_glimmer', architectures=['MuseGlimmerForConditionalGeneration'],
@@ -64,7 +68,7 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
     del canonical, tensors
     config = PreparationConfig(context=256, prefill_chunk_size=128, max_active=1,
         snapshot_budget_bytes=continuation_layout(ModelConfig.from_dict(raw)).row_bytes,
-        compile_workers=1, autotune_effort='off', headroom_bytes=1 << 30, prompt_logprobs=True)
+        compile_workers=1, headroom_bytes=1 << 30, prompt_logprobs=True)
     with PackageStorage(device=0) as storage:
         with prepare(tmp_path, config, package_storage=storage) as model:
             assert {s.kind for s in model.signatures.values()} == {

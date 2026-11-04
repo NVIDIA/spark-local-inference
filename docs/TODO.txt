@@ -174,3 +174,11 @@
     MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
+
+[ ] Defer SM103 TRTLLM MoE module loading until materialization.
+    ignition/components/moe_sm103.py::_trtllm_tactics loads during scratch
+    envelope enumeration, before preparation compiler resource limits apply.
+
+[ ] Complete Muse Glimmer's 64-token generation qualification on GB300.
+    tests/server/test_muse_glimmer.py: four text and ten JSON cases exhaust
+    the output budget; twelve forced-tool cases have no completed call.

@@ -38,7 +38,8 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
     if isinstance(weight, TensorFP8Weight):
-        return TensorFP8Projection(source, weight, output, session=session, name=name, staging=quantized_staging)
+        return TensorFP8Projection(source, weight, output, session=session, name=name, staging=quantized_staging,
+                                   workspace=workspace)
     return QuantizedProjection(source, weight, output, session=session, name=name,
                                workspace=workspace, activation_mode=activation_mode)
 

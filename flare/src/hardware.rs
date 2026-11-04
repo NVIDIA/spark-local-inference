@@ -112,7 +112,7 @@ pub fn detect(count: usize) -> Result<&'static str> {
                 })?;
                 if selected.is_some_and(|value| value != detected) {
                     return Err(
-                        "selected GPUs span gb10 and gb202; select one platform or specify --revision"
+                        "selected GPUs span different platforms; select one platform or specify --revision"
                             .into(),
                     );
                 }
@@ -186,6 +186,9 @@ mod tests {
         assert_eq!(platform(0x2bb110de), Some("gb202"));
         assert_eq!(platform(0x2bb510de), Some("gb202"));
         assert_eq!(platform(0x2b8510de), Some("gb202"));
+        assert_eq!(platform(0x31c210de), Some("gb300"));
+        assert_eq!(platform(0x31c310de), None);
+        assert_eq!(platform(0x31c21234), None);
         assert_eq!(platform(0x26b110de), None);
         assert_eq!(platform(0x2bb41234), None);
     }
