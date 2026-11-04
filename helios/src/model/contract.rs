@@ -60,8 +60,8 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7, TmlJson = 8 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5, ContentHeaders = 6 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
@@ -628,6 +628,11 @@ impl FrontendContract {
         {
             return Err("ATEM recipient framing requires recipient-header reasoning syntax".into());
         }
+        if self.tools.as_ref().is_some_and(|t| t.kind == ToolParserKind::TmlJson)
+            != self.reasoning.as_ref().is_some_and(|r| r.kind == ReasoningParserKind::ContentHeaders)
+        {
+            return Err("TML JSON framing requires content-header reasoning syntax".into());
+        }
         if let Some(reasoning) = &self.reasoning {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
@@ -635,6 +640,7 @@ impl FrontendContract {
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
                 ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
                 ReasoningParserKind::RecipientHeaders => ("<|start|>assistant to=self<|message|>", "<|eom|>"),
+                ReasoningParserKind::ContentHeaders => ("<|content_thinking|>", "<|end_message|>"),
             };
             let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
                 ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
@@ -650,7 +656,7 @@ impl FrontendContract {
                             .tools
                             .as_ref()
                             .is_none_or(|tool| tool.kind != ToolParserKind::Xtml)))
-                || (reasoning.kind == ReasoningParserKind::RecipientHeaders
+                || (matches!(reasoning.kind, ReasoningParserKind::RecipientHeaders | ReasoningParserKind::ContentHeaders)
                     && (reasoning.wrapping_newlines != 0 || !reasoning.terminal_markers.is_empty()))
                 || reasoning.wrapping_newlines > 1
                 || reasoning
@@ -680,8 +686,8 @@ mod tests {
     fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
         assert_eq!(ToolParserKind::try_from(7).unwrap(), ToolParserKind::Atem);
         assert_eq!(ReasoningParserKind::try_from(5).unwrap(), ReasoningParserKind::RecipientHeaders);
-        for value in [0, 8, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
-        for value in [0, 6, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
+        for value in [0, 9, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
+        for value in [0, 7, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
         let mut syntax = crate::model::testing::metadata().frontend;
         syntax.tools = Some(ToolParser {kind: ToolParserKind::Atem, wrapping_newlines: 0, tag_separator: String::new()});
         assert!(syntax.validate().is_err());
@@ -694,6 +700,29 @@ mod tests {
         reasoning.terminal_markers.clear();
         syntax.tools.as_mut().unwrap().wrapping_newlines = 0;
         assert!(syntax.validate().is_ok());
+    }
+
+    #[test]
+    fn content_header_syntax_requires_matching_json_tools_and_delimiters() {
+        assert_eq!(ToolParserKind::try_from(8).unwrap(), ToolParserKind::TmlJson);
+        assert_eq!(ReasoningParserKind::try_from(6).unwrap(), ReasoningParserKind::ContentHeaders);
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser { kind: ToolParserKind::TmlJson,
+            wrapping_newlines: 0, tag_separator: String::new() });
+        assert!(syntax.validate().is_err());
+        syntax.reasoning = Some(ReasoningParser { kind: ReasoningParserKind::ContentHeaders,
+            open: "<|content_thinking|>".into(), close: "<|end_message|>".into(),
+            wrapping_newlines: 0, terminal_markers: vec![] });
+        assert!(syntax.validate().is_ok());
+        let encoded = serde_json::to_value(&syntax).unwrap();
+        assert_eq!(encoded["tools"]["kind"], 8);
+        assert_eq!(encoded["reasoning"]["kind"], 6);
+        assert!(serde_json::from_value::<FrontendContract>(encoded).unwrap().validate().is_ok());
+        syntax.reasoning.as_mut().unwrap().close = "</think>".into();
+        assert!(syntax.validate().is_err());
+        syntax.reasoning.as_mut().unwrap().close = "<|end_message|>".into();
+        syntax.tools = None;
+        assert!(syntax.validate().is_err());
     }
 
     #[test]

@@ -1,0 +1,15 @@
+{
+  "source": {
+    "repository": "thinkingmachines/Inkling-Small",
+    "revision": "8cc5877b44d343f88b92086aa1fb72897950f06a",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "0aa1aa0c729d90176dcaa00c440c8faffca2957ffb2cc4b79456ee6d02bcf43b",
+  "result_sha256": "15794c8e135ef68c22a1428c1b4d56791070fdf0b7cc32eb0a6ad56afbdb9661",
+  "insertions": [
+    1827,
+    2156,
+    6113,
+    6200
+  ]
+}

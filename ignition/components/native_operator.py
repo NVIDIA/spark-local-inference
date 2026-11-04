@@ -10,7 +10,22 @@ from dataclasses import dataclass, fields
 
 import torch
 from b12x._lib.scratch import scratch_buffer_spec
+from b12x._lib.compile_plan import launch_triton
+from b12x._lib.program_cache import register_program_cache
 from b12x.preparation import Knob, MemoryRequirements, Plan, TuningContract
+
+
+def compile_triton(kernel, grid, *args, **kwargs):
+    """Make an Ignition Triton factory's executable cache reclaimable by b12x.
+
+    b12x discovers its own JIT functions automatically. Its mapping registration
+    also covers local functions, so deferred planning entries and losing tactics
+    are reclaimed at the same preparation boundaries.
+    """
+    program = launch_triton(kernel, grid, *args, **kwargs)
+    for executable_cache, *_ in kernel.device_caches.values():
+        register_program_cache(executable_cache)
+    return program
 
 
 def _tactic(value):

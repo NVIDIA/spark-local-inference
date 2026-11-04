@@ -118,6 +118,7 @@ def _moe_bf16_stage1_kernel(
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
     SILU: tl.constexpr = False,
+    ROUND_SILU: tl.constexpr = True,
 ):
     tile_id = tl.program_id(0)
     n_id = tl.program_id(1)
@@ -158,7 +159,9 @@ def _moe_bf16_stage1_kernel(
 
     gate = gate_acc.to(tl.bfloat16).to(tl.float32)
     if SILU:
-        gate_val = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+        gate_val = gate * tl.sigmoid(gate)
+        if ROUND_SILU:
+            gate_val = gate_val.to(tl.bfloat16).to(tl.float32)
     else:
         gate_val = _gelu_tanh(gate).to(tl.bfloat16).to(tl.float32)
     up_val = up_acc.to(tl.bfloat16).to(tl.float32)
@@ -258,7 +261,8 @@ class BF16ExpertScratch:
 class PreparedBF16Experts:
     """Execute intermediate-sharded BF16 experts into unweighted route rows."""
 
-    def __init__(self, source, gate_up, down, ids, weights, output, valid_tokens, *, buffers=None, scratch=None):
+    def __init__(self, source, gate_up, down, ids, weights, output, valid_tokens, *,
+                 buffers=None, scratch=None, round_silu=True):
         tokens, hidden = source.shape
         count, twice_inter, width = gate_up.shape
         inter = twice_inter // 2
@@ -269,7 +273,7 @@ class PreparedBF16Experts:
                 or output.shape != (tokens, top_k, hidden) or output.dtype != source.dtype
                 or ids.dtype != torch.int32 or weights.dtype != torch.float32
                 or valid_tokens.dtype != torch.int32 or valid_tokens.numel() != 1
-                or count <= 0 or count & (count - 1) or twice_inter % 2
+                or count <= 0 or count & (count - 1) or twice_inter % 2 or type(round_silu) is not bool
                 or any(t.device != source.device or not t.is_contiguous()
                        for t in (source, gate_up, down, ids, weights, output, valid_tokens))):
             raise ValueError("BF16 experts require matched source, weights, routes, and raw output geometry")
@@ -295,7 +299,7 @@ class PreparedBF16Experts:
         )
         self.first = prepare_triton(_moe_bf16_stage1_kernel,
             (source, gate_up, sorted_ids, tile_experts, self.intermediate,
-             top_k, hidden, inter, tile_m, tile_n, tile_k, True),
+             top_k, hidden, inter, tile_m, tile_n, tile_k, True, round_silu),
             (tiles, triton.cdiv(inter, tile_n), 1), num_warps=4)
         self.second = prepare_triton(_moe_bf16_stage2_kernel,
             (self.intermediate, down, weights, sorted_ids, tile_experts, output,

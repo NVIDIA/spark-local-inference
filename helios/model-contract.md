@@ -256,6 +256,16 @@ continuation starts inside the prepared reasoning, content, or tool body.
 Structured-output grammars preserve recipient frames and constrain the user
 answer while allowing the registered tool recipients.
 
+Content-header reasoning pairs with TML JSON tool syntax. A model message begins
+with `<|message_model|>`, followed by `<|content_text|>` for visible text,
+`<|content_thinking|>` for reasoning, or a registered tool name followed by
+`<|content_invoke_tool_json|>`. Tool bodies contain exactly `name` and object-valued
+`args` fields; the name must match the header. `<|end_message|>` closes a frame
+without ending generation, and `<|content_model_end_sampling|>` ends the turn.
+Consecutive frames can carry parallel tool calls. Delimiters affect parsing only
+when generated as their control tokens; ordinary text spellings remain content.
+Structured-output grammars constrain the answer document within these frames.
+
 `OutputPipeline` selects reusable parsers. The shared presentation layer emits
 JSON or SSE while preserving streamed tool IDs and argument fragments. The same
 reasoning/tool envelope constrains structured output through llguidance; literal

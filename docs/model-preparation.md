@@ -58,6 +58,7 @@ Flare loads the package files without Python. Helios is a Rust library;
 
 Recipes default to FP8 E4M3 KV storage, including learned draft-model caches. Qwen Flash retains BF16 selector keys;
 GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
+Inkling retains BF16 KV pages and local histories.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
 scales where required, and memory planning includes each cache's declared page
@@ -981,6 +982,64 @@ weight budget for this encoding; loading reports its actual allocation.
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
+
+## Inkling-Small
+
+The `inkling-small` alias selects the BF16
+[`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small)
+checkpoint at revision `8cc5877b44d343f88b92086aa1fb72897950f06a`.
+This text recipe prepares eight GPUs on one host, a default 262144-token context,
+four concurrent requests, and 4096-token prefill chunks. This initial recipe caps
+prepared context at 262144 tokens of the checkpoint's 1048576-token limit. Image, audio, video, and
+MTP graphs are not prepared. The indexed download includes the publisher's MTP
+weights; only `model.llm` tensors become serving weights.
+
+The 42-layer decoder retains 35 local 512-token KV rings and seven global paged
+histories in BF16. Query-dependent relative logits, head RMS normalization,
+`1 / head_dim` attention scaling, and global logarithmic position scaling follow
+the checkpoint. Four residual short convolutions per layer retain FP32 history
+and arithmetic. Every continuation row includes those histories, local rings,
+partial global pages, the consumed cursor, and the normalized and scaled hidden
+vector used by resume.
+
+The BF16 checkpoint stores router correction biases and global scales in FP32.
+They remain FP32, as do router logits and route normalization. Dense and expert
+SwiGLU arithmetic uses FP32 before rounding the final intermediate to BF16;
+shared sink weights apply before the down projection. These precision boundaries
+follow the publisher-supported SGLang
+[router](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/moe.py)
+and [MLP implementation](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/dense_mlp.py).
+Transformers supplies the reference attention, normalization, and checkpoint
+layout; loading it with a blanket BF16 dtype also narrows the FP32 router
+parameters, so that load mode is not the precision reference for routing.
+
+At tensor parallelism eight, resident text weights occupy 65,993,544,868 bytes
+per rank, including replicated parameters and FP32 convolution weights. Each
+continuation row occupies 14,024,704 bytes; each 128-token global KV page occupies
+458,752 bytes per rank. The planner reserves additional space for preparation,
+graphs, and caches. The complete indexed source tensors occupy 531,912,898,740
+bytes on disk. This BF16 recipe therefore requires GPUs with substantially more
+memory than the 8 GB device used for the reduced model tests.
+
+The publisher's [Inkling sampling guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md)
+recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
+`top_k=-1`, `min_p=0`) and penalties are neutral. The pinned checkpoint template
+owns the thinking-effort system message and content-header/tool syntax.
+
+```sh
+.venv/bin/ignition export inkling-small --gpus 0-7 --prompt-logprobs
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-tp8.safetensors
+flare/target/release/flare run /data/flare-runtime/inkling-small-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
+```
+
+Reduced model validation covers original-format weight loading, learned relative
+attention, FP32 residual convolution, complete compiled decoder replay across
+prefill/decode and page/window boundaries, state restoration, inactive rows, and
+allocation stability on SM120. Full-checkpoint TP8 export and native serving,
+long-context behavior, and SM103/SM121 execution remain unqualified. Run
+`tests/server/test_inkling.py` against the exported package with
+`FLARE_RUN_CUDA_TESTS=1`, `FLARE_INKLING_TEST_URL`, and
+`FLARE_INKLING_SNAPSHOT` set before promoting this draft recipe.
 
 ## Muse Spark Open
 

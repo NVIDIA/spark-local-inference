@@ -279,10 +279,13 @@ pub fn prepare_output(
     let mut control_tokens = if syntax
         .tools
         .as_ref()
-        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem))
+        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem | super::contract::ToolParserKind::TmlJson))
     {
         let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
             vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+        } else if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::TmlJson {
+            vec!["<|message_model|>", "<|content_text|>", "<|content_thinking|>",
+                "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>"]
         } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
         markers.into_iter()
             .map(|marker| {
@@ -313,8 +316,13 @@ pub fn prepare_output(
     if recipient {
         reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
     }
-    let start = if recipient && !open_assistant {
+    let content_headers = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::TmlJson);
+    let start = if (recipient || content_headers) && !open_assistant {
         crate::output::tagged::OutputStart::RecipientFrame
+    } else if content_headers && prefix.is_some_and(|p| !["<|content_text|>", "<|content_thinking|>", "<|content_invoke_tool_json|>"].iter().any(|m| p.contains(m))) {
+        crate::output::tagged::OutputStart::RecipientHeader
+    } else if content_headers && prefix.is_some_and(|p| p.contains("<|content_invoke_tool_json|>")) {
+        crate::output::tagged::OutputStart::ToolBody
     } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
         crate::output::tagged::OutputStart::RecipientHeader
     } else if recipient && prefix.is_some_and(|p| {
