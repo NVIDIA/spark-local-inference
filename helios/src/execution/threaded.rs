@@ -188,7 +188,6 @@ impl ThreadedExecutor {
             }
             result.peers.push(peer);
         }
-        let tuning_started = Instant::now();
         let startup = (|| -> Result<()> {
             for index in result.local.manifest().referenced_tuning_graphs() {
                 for (sent, peer) in result.peers.iter().enumerate() {
@@ -258,7 +257,6 @@ impl ThreadedExecutor {
             result.shutdown = Some(shutdown);
             return Err(error);
         }
-        result.local.report_startup(tuning_started);
         Ok(result)
     }
     #[cfg(feature = "server")]

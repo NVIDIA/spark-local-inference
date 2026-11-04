@@ -129,39 +129,6 @@ fn completion_wire_decodes_every_configured_lane() {
 use crate::cache::Fence;
 use crate::{Error, ExecutionError};
 
-#[test]
-fn collective_overview_uses_graph_geometry_and_individual_bindings() {
-    let mut value = manifest();
-    let mut packed = value.graphs[0].clone();
-    packed.name = "arbitrary-target-name".into();
-    packed.kind = GraphKind::Speculative;
-    packed.batch_capacity = 4;
-    packed.token_capacity = 6;
-    packed.packed_token_capacity = 16;
-    packed.draft_tokens = 5;
-    packed.tuned_bindings = vec![TunedBinding { buffer: "target-choice".into(), tuning_graph: "choose".into() }];
-    let mut mixed = packed.clone();
-    mixed.name = "arbitrary-mixed-name".into();
-    mixed.kind = GraphKind::Mixed;
-    mixed.token_capacity = 1;
-    mixed.packed_token_capacity = 0;
-    mixed.prefill_capacity = 128;
-    mixed.draft_tokens = 0;
-    mixed.tuned_bindings[0].buffer = "mixed-choice".into();
-    value.graphs[0].name = "arbitrary-decode-name".into();
-    value.graphs[0].tuned_bindings = packed.tuned_bindings.clone();
-    value.graphs.extend([packed, mixed]);
-    let choices = vec![vec![
-        ("target-choice".into(), 4u32.to_ne_bytes().to_vec()),
-        ("mixed-choice".into(), ((1u32 << 16) | 64).to_ne_bytes().to_vec()),
-    ]];
-    let text = super::transport::collective_choices_overview(&value, &choices);
-    assert!(text.contains("0x00000004, 0x00010040: 1 group\n"));
-    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · 0x00000004\n"));
-    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · 0x00000004\n"));
-    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · 0x00010040\n"));
-}
-
 pub(super) fn manifest() -> ExecutionManifest {
     let buffers = vec![
         BufferDescriptor {
