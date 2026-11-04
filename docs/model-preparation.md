@@ -988,9 +988,10 @@ flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safete
 The `inkling-small-nvfp4` alias selects
 [`thinkingmachines/Inkling-Small-NVFP4`](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4)
 at revision `b6a99534467840620d411e4cd4ad5819b2610d9c`. This text recipe
-targets tensor parallelism two on SM120/SM121, using two local GPUs or one GPU
-on each of two DGX Sparks through the shared RoCE transport. Defaults are a
-262144-token context, four concurrent requests, and 4096-token prefill chunks.
+targets one SM103 GPU on DGX Station, or tensor parallelism two on SM120/SM121,
+using two local GPUs or one GPU on each of two DGX Sparks through the shared
+RoCE transport. A single rank prepares complete weights and no collectives.
+Defaults are a 262144-token context, four concurrent requests, and 4096-token prefill chunks.
 Prepared context is capped at 262144 tokens of the checkpoint's 1048576-token
 limit. Image, audio, video, and MTP graphs are not prepared. The indexed download
 includes the publisher's MTP weights; only `model.llm` tensors become serving
@@ -1027,11 +1028,17 @@ parameters, so that load mode is not the precision reference for routing.
 
 The indexed checkpoint contains 170,733,074,592 bytes of tensors, including
 166,130,594,960 bytes of text weights. The planner conservatively budgets the
-whole checkpoint for weights, plus preparation scratch and caches. At TP2,
-each continuation row occupies 43,515,904 bytes and each 128-token global KV page
-occupies 1,835,008 bytes per rank. One full 262144-token global KV history needs
-3.5 GiB per rank. Spark's CPU, GPU, compiler processes, and OS share physical
-memory; follow the [DGX Spark memory guidance](#dgx-spark).
+whole checkpoint for weights, plus preparation scratch and caches. Cache costs
+per GPU are:
+
+| Tensor parallelism | Continuation row | 128-token global KV page | One 262144-token global KV history |
+|---|---:|---:|---:|
+| 1 | 82,837,504 bytes | 3,670,016 bytes | 7 GiB |
+| 2 | 43,515,904 bytes | 1,835,008 bytes | 3.5 GiB |
+
+The planner uses detected free GPU memory for admission. Spark's CPU, GPU,
+compiler processes, and OS share physical memory; follow the
+[DGX Spark memory guidance](#dgx-spark).
 
 The publisher's [Inkling sampling guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md)
 recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
@@ -1039,10 +1046,13 @@ recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
 owns the thinking-effort system message and content-header/tool syntax.
 
 ```sh
-.venv/bin/ignition export inkling-small-nvfp4 --gpus 0,1 --prompt-logprobs
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-nvfp4-tp2.safetensors
-flare/target/release/flare run /data/flare-runtime/inkling-small-nvfp4-tp2.safetensors --gpus 0,1
+.venv/bin/ignition export inkling-small-nvfp4 --gpus 0 --prompt-logprobs
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-nvfp4-tp1.safetensors
+flare/target/release/flare run /data/flare-runtime/inkling-small-nvfp4-tp1.safetensors --gpus 0
 ```
+
+For two local GPUs, use `--gpus 0,1` for export and serving, and convert that
+export to a separate TP2 package. Each tensor-parallel size requires its own export.
 
 For two Sparks, prepare with `--gpus 0 --ranks 2 --rendezvous ZERO:29630` on
 rank zero and `ignition join ZERO:29630 --rank 1 --ranks 2` on its peer. Follow
@@ -1052,13 +1062,22 @@ checkpoint access, transport setup, and launching the resulting two-host package
 Reduced model validation covers original-format weight loading, learned relative
 attention, FP32 residual convolution, complete compiled decoder replay across
 prefill/decode and page/window boundaries, state restoration, inactive rows, and
-allocation stability on SM120. Full-checkpoint TP2 export and native serving,
-RoCE execution, long-context behavior, and SM121 execution remain unqualified.
-SM103's current expert implementation does not expose the unweighted route
-outputs this recipe requires. Run
-`tests/server/test_inkling.py` against the exported package with
-`FLARE_RUN_CUDA_TESTS=1`, `FLARE_INKLING_TEST_URL`, and
-`FLARE_INKLING_SNAPSHOT` set before promoting this draft recipe.
+allocation stability on SM120 and SM103. Reduced TP1 preparation and replay of
+the complete graph catalog, including scored prefill, also pass on both GPUs.
+SM103 expert checks cover calibrated activation quantization, reduced unweighted
+route capture/replay at 1, 129, and 4096 tokens, and execution of an actual
+checkpoint expert layer with 256 experts, hidden size 4096, and intermediate
+size 2048.
+Full-checkpoint TP1 export and native `flare run` pass on one GB300 DGX
+Station with the default capacities above. All 29 endpoint acceptance cases pass,
+including text/Unicode, reasoning effort, tools, concurrent cached-prefix branches,
+prompt scoring, and media rejection. Native loading uses 158.2 GiB before the
+runtime sizes its cache from available GPU memory. The tested environment uses
+the locked FlashInfer revision `776facfd`.
+Full-checkpoint TP2/RoCE execution, 262144-token context behavior, and SM121
+execution remain unqualified. Reproduce endpoint acceptance with
+`tests/server/test_inkling.py`, setting `FLARE_RUN_CUDA_TESTS=1`,
+`FLARE_INKLING_TEST_URL`, and `FLARE_INKLING_SNAPSHOT`.
 
 ## Muse Spark Open
 

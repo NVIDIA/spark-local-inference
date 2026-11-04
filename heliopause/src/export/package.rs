@@ -720,7 +720,7 @@ pub(crate) fn publish_payload(
             .iter()
             .find_map(|rank| rank.hardware.clone())
             .ok_or_else(|| {
-                invalid("export naming requires the capture device identity (gb10 or gb202)")
+                invalid("export naming requires the capture device identity (gb10, gb202, or gb300)")
             })?;
         let deployment_id = cluster
             .as_ref()
@@ -4199,6 +4199,39 @@ mod payload_export_tests {
         let body = pwire::PackageBody::decode(envelope.package_body.as_slice()).unwrap();
         assert_eq!(body.hardware_identity, "gb202");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gb300_export_names_and_signs_the_station_platform() {
+        use helios_core::package::cache::Root;
+        use helios_core::package::schema::wire as pwire;
+        let sources = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut rank = staged_rank(sources.path());
+        rank.hardware =
+            helios_core::package::naming::platform_from_pci(0x31c2_10de).map(str::to_string);
+        rank.index.ranks[0].architecture = vec![10, 3];
+        let published = publish_payload(
+            Path::new(""),
+            &[rank],
+            vec![],
+            None,
+            &publisher(),
+            Some(cache.path().to_path_buf()),
+            false,
+            "directory",
+        )
+        .unwrap();
+        let entry = published["entry"].as_str().unwrap();
+        assert!(entry.starts_with("gb300-tp1-"), "{entry}");
+        let root = Root::open(cache.path()).unwrap();
+        let committed = root
+            .entry(published["model"].as_str().unwrap(), entry)
+            .unwrap();
+        let metadata = Metadata::open(committed.directory()).unwrap();
+        let envelope = helios_core::package::protection::envelope(&metadata.envelope).unwrap();
+        let body = pwire::PackageBody::decode(envelope.package_body.as_slice()).unwrap();
+        assert_eq!(body.hardware_identity, "gb300");
     }
 
     #[test]

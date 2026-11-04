@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inkling-Small NVFP4 text preparation on two local GPUs or DGX Sparks."""
+"""Inkling-Small NVFP4 text preparation on one or two GPUs."""
 
 from types import MappingProxyType
 
@@ -24,6 +24,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, stream_overlap=plan.stream_overlap)
+    if plan.world_size == 1:
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
@@ -41,4 +43,5 @@ RECIPE = Recipe(name="inkling", served_model_name="Inkling-Small-NVFP4",
         # Include unused multimodal/MTP tensors in the estimate to cover replicated text weights.
         stored_bytes=170_733_074_592, device_bytes=170_733_074_592, expansion_bytes=1 << 30),),
     context=262144, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=0, prefill_chunk=4096,
-    ranks=MappingProxyType({2: RankCosts(43_515_904, 1_835_008, 8 << 30)}))
+    ranks=MappingProxyType({1: RankCosts(82_837_504, 3_670_016, 8 << 30),
+                           2: RankCosts(43_515_904, 1_835_008, 8 << 30)}))

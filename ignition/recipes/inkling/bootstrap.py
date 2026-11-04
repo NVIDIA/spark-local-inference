@@ -54,7 +54,7 @@ class PreparationConfig:
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
-    devices: tuple[int, ...] = (0, 1)
+    devices: tuple[int, ...] = (0,)
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
     context: int = 262144
@@ -68,12 +68,12 @@ class PreparationConfig:
     stream_overlap: bool = True
 
     def __post_init__(self):
-        if (not isinstance(self.devices, tuple) or len(self.devices) != 2
-                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 2)
-                or len(set(zip(self.hosts or ("",) * 2, self.devices))) != 2
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2)
+                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
+                or len(set(zip(self.hosts or ("",) * len(self.devices), self.devices))) != len(self.devices)
                 or any(type(device) is not int or device < 0 for device in self.devices)):
-            raise ValueError("Inkling-Small NVFP4 preparation requires two distinct host/device placements")
-        if self.roce_ring and self.hosts is None:
+            raise ValueError("Inkling-Small NVFP4 preparation requires one or two distinct host/device placements")
+        if self.roce_ring and (self.hosts is None or len(set(self.hosts)) < 2):
             raise ValueError("RoCE ring requires ranks on separate hosts")
         request_capacity(self.max_active)
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
@@ -91,10 +91,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
+    if (shard.world_size > 1) != (group is not None):
+        raise ValueError("an Inkling rank group exists exactly when more than one rank prepares")
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
-    if torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
-        raise ValueError("Inkling NVFP4 preparation requires SM120 or SM121: "
+    if torch.cuda.get_device_capability(device) not in ((10, 3), (12, 0), (12, 1)):
+        raise ValueError("Inkling NVFP4 preparation requires SM103, SM120, or SM121: "
                          "the A4 expert kernels must expose unweighted per-route outputs")
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
@@ -124,15 +126,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + 1), device=device)
-        coordinator = CollectivePreparation(group)
+        coordinator = CollectivePreparation(group) if group is not None else None
+        collective = prefill_collective = vocabulary_collective = embedding_collective = None
         routed_width = weights.config.text["num_experts_per_tok"] * weights.config.hidden
-        if coordinator.spans_hosts:
+        if coordinator is not None and coordinator.spans_hosts:
             gather_bytes = max(slots * weights.config.vocabulary_partition(shard)[2] * 2,
                                tokens * (weights.config.hidden // shard.world_size) * 2)
             collective = prefill_collective = vocabulary_collective = embedding_collective = create_roce_runtime(
                 group, device, max_tokens=slots, pipe_tokens=tokens, hidden_size=routed_width,
                 gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage)
-        else:
+        elif group is not None:
             collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
                 max_tokens=slots, hidden_size=routed_width, ipc=package_storage.peer_storage)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
@@ -247,7 +250,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         total_device_bytes=total, headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    channels = tuple(dict.fromkeys((collective, prefill_collective, vocabulary_collective, embedding_collective)))
+    channels = tuple(dict.fromkeys(channel for channel in
+        (collective, prefill_collective, vocabulary_collective, embedding_collective) if channel is not None))
     disposable = [prefill_storage, decode_storage, arena.tensor, metadata, graph_buffers.chunks, private_buffers.chunks]
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):

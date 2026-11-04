@@ -88,7 +88,11 @@ def reference(weights, tokens, original):
             routed = torch.zeros_like(source)
             quantized = index in weights.config.quantized_routed_layers
             if quantized:
-                routes = nvfp4_routes(source, ids, original, f"model.llm.layers.{index}.mlp.experts")
+                # Native SM103 and b12x use different FP32 reciprocal evaluation
+                # orders at the same calibrated NVFP4 quantization boundary.
+                quant_scale_math = "flashinfer" if torch.cuda.get_device_capability(tokens.device) == (10, 3) else "b12x"
+                routes = nvfp4_routes(source, ids, original, f"model.llm.layers.{index}.mlp.experts",
+                                      quant_scale_math=quant_scale_math)
             for expert in range(c["n_routed_experts"]):
                 selection = ids == expert
                 if quantized:

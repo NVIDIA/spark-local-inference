@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Acceptance for a TP2 Inkling NVFP4 package exported with prompt logprobs and served by Flare.
+"""Acceptance for an Inkling NVFP4 package exported with prompt logprobs and served by Flare.
 
 Set FLARE_RUN_CUDA_TESTS=1, FLARE_INKLING_TEST_URL and FLARE_INKLING_SNAPSHOT.
 The package uses the default 262144-token context and concurrency four.

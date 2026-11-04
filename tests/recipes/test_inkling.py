@@ -34,7 +34,7 @@ def test_checkpoint_alias_and_canonical_geometry():
     assert RECIPE.speculation is None and RECIPE.max_draft_tokens == 0
     assert PreparationConfig(prefill_chunk_size=64).prefill_chunk_size == 64
     with pytest.raises(ValueError):
-        PreparationConfig(devices=(0,))
+        PreparationConfig(devices=(0, 1, 2))
 
 
 @pytest.mark.parametrize("change", [

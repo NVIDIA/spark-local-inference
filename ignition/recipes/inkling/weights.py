@@ -109,8 +109,10 @@ class InklingWeightLoader(DirectWeightLoader):
     def _nvfp4_experts(self, prefix, inter):
         from b12x._lib.intrinsics.reference import swizzle_block_scale
         from b12x.moe import fused_moe as moe
+        from ignition.components.sm103 import is_sm103
         from ignition.preparation.tensor_metadata import record_numeric_tensor
 
+        sm103 = is_sm103(self.device)
         first, last = self.shard.partition(inter, alignment=64)
         local, count, hidden = last - first, self.config.text["n_routed_experts"], self.config.hidden
         packed, blocks, globals_, inputs = [], [], [], []
@@ -142,7 +144,8 @@ class InklingWeightLoader(DirectWeightLoader):
                     self._copy(scales[expert], scale[expert, :, first // 16:last // 16])
                 else:
                     for offset in (0, 1):
-                        target = slice(offset * local, (offset + 1) * local)
+                        half = 1 - offset if sm103 else offset
+                        target = slice(half * local, (half + 1) * local)
                         self._copy(values[expert, target], source[expert, 2 * first + offset:2 * last:2])
                         self._copy(scales[expert, target], scale[expert, 2 * first + offset:2 * last:2])
             globals_.append(global_scale)
@@ -152,8 +155,13 @@ class InklingWeightLoader(DirectWeightLoader):
             inputs.append(activation_scale)
             self._session.flush()
             packed.append(values)
-            blocks.append(swizzle_block_scale(scales))
+            blocks.append(scales if sm103 else swizzle_block_scale(scales))
             del scales
+        if sm103:
+            from ignition.components.moe_sm103 import prepare_cute_nvfp4_experts
+
+            return prepare_cute_nvfp4_experts(packed[0], blocks[0], packed[1], blocks[1],
+                                              (*globals_, *inputs))
         plan = moe.plan_weights(source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w31"),
             activation=moe.ActivationSpec(mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16),
             geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden, intermediate_size=local))

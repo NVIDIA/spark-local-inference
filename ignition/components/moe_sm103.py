@@ -13,6 +13,8 @@ the same checkpoint storage runs through FlashInfer:
   checkpoint scale, quantizing separate routed rows when scales differ. FC2 inputs are quantized per
   expert in trtllm-gen's FC1 epilogue with each expert's FC2 input scale.
 * W4A16 NVFP4 experts use FlashInfer's CuTe-DSL NVFP4xBF16 grouped GEMMs.
+* Calibrated W4A4 experts requiring a BF16 SwiGLU boundary use CuTe-DSL
+  grouped GEMMs around that explicit intermediate and return raw BF16 routes.
 
 Weights are re-laid out once, in place. Routing remains b12x's portable
 ``route_topk``. Native kernels allocate their graph-local intermediates from
@@ -31,6 +33,7 @@ import triton.language as tl
 from b12x._lib.compile_plan import _NATIVE_JITS, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
+from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
@@ -132,6 +135,15 @@ class CuteW4A16Experts(Sm103Experts):
     # SwiGLU clamp: min(gate, limit) and up within +-limit; None for plain SwiGLU.
     swiglu_limit: float | None = None
     kind = "cute_w4a16"
+
+
+@dataclass(frozen=True, eq=False, kw_only=True)
+class CuteNvfp4Experts(CuteW4A16Experts):
+    """Calibrated W4A4 experts with BF16 SwiGLU intermediates and raw route output."""
+
+    input_global_scale: torch.Tensor
+    intermediate_global_scale: torch.Tensor
+    kind = "cute_nvfp4"
 
 
 def _check_packed(w13, s13, w2, s2):
@@ -249,6 +261,24 @@ def prepare_cute_w4a16_experts(w13, s13, w2, s2, w13_global, w2_global, *, swigl
         swiglu_limit=None if swiglu_limit is None else float(swiglu_limit))
 
 
+def prepare_cute_nvfp4_experts(w13, s13, w2, s2, scale_vectors) -> CuteNvfp4Experts:
+    """Preserve packed values and calibration while preparing BF16-intermediate W4A4."""
+    count, hidden, intermediate = _check_packed(w13, s13, w2, s2)
+    if len(scale_vectors) != 4:
+        raise ValueError("NVFP4 A4 experts require weight and activation global scales")
+    if hidden % 128 or intermediate % 64:
+        raise ValueError("CuTe NVFP4 experts require 128-aligned hidden and 64-aligned intermediate dimensions")
+    globals_ = tuple(_vector(v, count, w13.device, "NVFP4 global scales") for v in scale_vectors)
+    if any(not bool((v == v[0]).all()) for v in globals_[2:]):
+        raise ValueError("CuTe BF16-intermediate NVFP4 requires shared activation calibration per projection")
+    e = prepare_cute_w4a16_experts(w13, s13, w2, s2, *globals_[:2])
+    a1, a2 = (v[:1].to(device=w13.device, dtype=torch.float32) for v in globals_[2:])
+    return CuteNvfp4Experts(
+        w13=e.w13, w13_scale=e.w13_scale, w13_alpha=e.w13_alpha / a1,
+        w2=e.w2, w2_scale=e.w2_scale, w2_alpha=e.w2_alpha / a2,
+        scale_storage=e.scale_storage, input_global_scale=a1, intermediate_global_scale=a2)
+
+
 @dataclass(frozen=True)
 class RoutedExpertsQuery:
     """Exact routed-expert invocation; tactics depend only on these values."""
@@ -297,6 +327,31 @@ def _w4a16_tactics(query: RoutedExpertsQuery):
     return tuple(tactics)
 
 
+@cache
+def _cute_nvfp4_tactics(query: RoutedExpertsQuery):
+    import cutlass
+    from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel as FC1,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel as FC2,
+    )
+    from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_permuted_tokens
+    from flashinfer.fused_moe.cute_dsl.tuner import get_blackwell_moe_valid_tactics
+
+    tactics = []
+    for tile, fc1, fc2 in get_blackwell_moe_valid_tactics():
+        rows = get_max_num_permuted_tokens(query.num_tokens, query.top_k, query.num_experts, tile)
+        types = (cutlass.Float4E2M1FN, cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16, cutlass.BFloat16)
+        if (FC1.can_implement(*types, fc1[0], fc1[1], rows, 2 * query.intermediate_size,
+                              query.hidden_size, query.num_experts, "k", "k", "n")
+                and FC2.can_implement(*types, cutlass.Float32, fc2[0], fc2[1], rows,
+                                      query.hidden_size, query.intermediate_size,
+                                      query.num_experts, "k", "k", "n")):
+            tactics.append((tile, fc1, fc2))
+    return tuple(tactics)
+
+
 TRTLLM_CONTRACT = native_contract(component_id="flare.moe.sm103_trtllm_nvfp4",
                                   query_type=RoutedExpertsQuery, tactics=_trtllm_tactics,
                                   semantic_version=3)
@@ -305,6 +360,9 @@ TRTLLM_CONTRACT = native_contract(component_id="flare.moe.sm103_trtllm_nvfp4",
 W4A16_CONTRACT = native_contract(component_id="flare.moe.sm103_cute_w4a16",
                                  query_type=RoutedExpertsQuery, tactics=_w4a16_tactics,
                                  semantic_version=3)
+CUTE_NVFP4_CONTRACT = native_contract(component_id="flare.moe.sm103_cute_nvfp4_routes",
+                                      query_type=RoutedExpertsQuery, tactics=_cute_nvfp4_tactics,
+                                      semantic_version=2)
 
 
 def _aligned(nbytes):
@@ -317,6 +375,36 @@ def _scratch_bytes(query):
         return 0
     tokens, hidden = query.num_tokens * (query.top_k if query.routed_inputs else 1), query.hidden_size
     return _aligned(tokens * hidden // 2) + _aligned((tokens + 15) // 16 * 16 * hidden // 16)
+
+
+def _cute_nvfp4_scratch(query, tactic, storage=None):
+    """One planned arena for routing, packed activations, and BF16 SwiGLU rows."""
+    from math import prod
+    from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+    q, tile = query, tactic[0]
+    tiles = get_max_num_tiles(q.num_tokens, q.top_k, q.num_experts, tile)
+    rows = tiles * tile
+    shapes = (
+        ("values", (q.num_tokens, q.hidden_size // 2), torch.uint8),
+        ("scales", ((q.num_tokens + 15) // 16 * 16 * q.hidden_size // 16,), torch.uint8),
+        ("activated", (rows, q.intermediate_size), torch.bfloat16),
+        ("intermediate", (rows, q.intermediate_size // 2), torch.uint8),
+        ("intermediate_scales", (rows * q.intermediate_size // 16,), torch.uint8),
+        ("out_tile_idx_to_expert_idx", (tiles,), torch.int32),
+        ("out_tile_idx_to_mn_limit", (tiles,), torch.int32),
+        ("out_expanded_idx_to_permuted_idx", (q.num_tokens, q.top_k), torch.int32),
+        ("out_permuted_idx_to_expanded_idx", (rows,), torch.int32),
+        ("out_total_num_padded_tokens", (1,), torch.int32),
+        ("out_num_non_exiting_tiles", (1,), torch.int32),
+    )
+    offset, views = 0, {}
+    for name, shape, dtype in shapes:
+        size = prod(shape) * dtype.itemsize
+        if storage is not None:
+            views[name] = storage[offset:offset + size].view(dtype).view(shape)
+        offset += _aligned(size)
+    return offset if storage is None else views
 
 
 _REDUCE_BLOCK = 512
@@ -523,9 +611,68 @@ class _CuteW4A16State:
                     use_fused_finalize=False, enable_pdl=True, tactic=self.tactic, **clamp)
 
 
+class _CuteNvfp4State:
+    """Calibrated A4 GEMMs with BF16 activation and independently rounded route outputs."""
+
+    implementation = "cute_nvfp4_routes"
+
+    def __init__(self, experts: CuteNvfp4Experts, query: RoutedExpertsQuery, tactic):
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+        from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion,
+        )
+        from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+            blockscaled_contiguous_grouped_gemm_finalize_fusion,
+        )
+
+        self.experts, self.query, self.tactic = experts, query, tactic
+        self.quantize = _fp4_quantizer().fp4_quantize
+        self.scale_view, self.sort = convert_sf_to_mma_layout, moe_sort
+        self.fc1 = blockscaled_contiguous_gather_grouped_gemm_act_fusion
+        self.fc2 = blockscaled_contiguous_grouped_gemm_finalize_fusion
+
+    def scratch_bytes(self):
+        return _cute_nvfp4_scratch(self.query, self.tactic)
+
+    def run(self, a, topk_ids, topk_weights, output, scratch):
+        e, q = self.experts, self.query
+        tile, fc1, fc2 = self.tactic
+        s = _cute_nvfp4_scratch(q, self.tactic, scratch)
+        metadata = self.sort(topk_ids, topk_weights, q.num_experts, q.top_k,
+            num_local_experts=q.num_experts, tile_tokens_dim=tile, enable_pdl=True,
+            **{name: value for name, value in s.items() if name.startswith("out_")})
+        expert_tiles, limits, _, mapping, _, active_tiles = metadata
+        self.quantize(a, e.input_global_scale, s["values"], s["scales"],
+                      16, False, False, False, False, True, 0)
+        # Gather GEMM1 reads source scales in row-major order; its weight scales
+        # and GEMM2's contiguous activation scales use the 128x4 MMA layout.
+        scales = s["scales"][:q.num_tokens * q.hidden_size // 16].view(q.num_tokens, q.hidden_size // 16)
+        self.fc1(s["values"], e.w13, scales, e.w13_scale, e.w13_alpha,
+            expert_tiles, limits, mapping, active_tiles, out=s["activated"],
+            topk=q.top_k, c_dtype="bfloat16", quantize_output=False,
+            mma_tiler_mn=fc1[0], cluster_shape_mn=fc1[1], raster_along_m=fc1[2], enable_pdl=True)
+        # This explicit BF16 tensor is the arithmetic boundary before the calibrated FC2 input.
+        self.quantize(s["activated"], e.intermediate_global_scale,
+                      s["intermediate"], s["intermediate_scales"],
+                      16, False, True, False, False, True, 0)
+        scales = self.scale_view(s["intermediate_scales"], m=s["activated"].shape[0],
+                                 k=q.intermediate_size, num_groups=1, sf_vec_size=16)
+        # Non-local/negative routes have no FC2 store. Clear their caller-owned rows each replay.
+        output.zero_()
+        self.fc2(s["intermediate"], e.w2, scales, e.w2_scale, e.w2_alpha,
+            expert_tiles, active_tiles, limits, mapping, topk_weights,
+            out=output.view(q.num_tokens * q.top_k, q.hidden_size),
+            a_dtype="float4_e2m1fn", b_dtype="float4_e2m1fn",
+            mma_tiler_mn=fc2[0], cluster_shape_mn=fc2[1], raster_along_m=fc2[2],
+            enable_pdl=True, use_fused_finalize=False)
+
+
 def _state_type(experts):
     if isinstance(experts, TrtllmNvfp4Experts):
         return TRTLLM_CONTRACT, _TrtllmNvfp4State
+    if isinstance(experts, CuteNvfp4Experts):
+        return CUTE_NVFP4_CONTRACT, _CuteNvfp4State
     if isinstance(experts, CuteW4A16Experts):
         return W4A16_CONTRACT, _CuteW4A16State
     raise TypeError("SM103 routed experts require FlashInfer-prepared expert storage")
@@ -547,7 +694,8 @@ def plan_routed_experts(experts: Sm103Experts, *, tokens: int, top_k: int):
             CompileJob.create("ignition.components.moe_sm103:compile_route_quantization",
                 query.num_tokens, query.hidden_size, query.top_k, detected.ordinal))
     return native_plan(contract=contract, query=query, device=experts.device,
-                       scratch_bytes=lambda tactic: _scratch_bytes(query),
+                       scratch_bytes=(lambda tactic: _cute_nvfp4_scratch(query, tactic))
+                       if state_type is _CuteNvfp4State else (lambda tactic: _scratch_bytes(query)),
                        materialize=lambda tactic: state_type(experts, query, tactic), compile_jobs=jobs)
 
 
@@ -648,8 +796,9 @@ def _bind(plan, state, a, topk_ids, topk_weights, output, scratch):
     for tensor, dtype in ((topk_ids, torch.int32), (topk_weights, torch.float32)):
         if tensor.dtype != dtype or tensor.shape != (tokens, query.top_k) or not tensor.is_contiguous():
             raise ValueError("SM103 routes require contiguous int32 IDs and FP32 weights per token")
-    if output.dtype != torch.bfloat16 or output.shape != a.shape or not output.is_contiguous():
-        raise ValueError("SM103 routed output must be contiguous BF16 matching the source")
+    output_shape = ((tokens, query.top_k, hidden) if query.kind == "cute_nvfp4" else (tokens, hidden))
+    if output.dtype != torch.bfloat16 or output.shape != output_shape or not output.is_contiguous():
+        raise ValueError(f"SM103 routed output must be contiguous BF16 with shape {output_shape}")
     if scratch.dtype != torch.uint8 or scratch.ndim != 1 or scratch.numel() < state.scratch_bytes():
         raise ValueError("SM103 routed-expert scratch is smaller than its plan")
     if any(t.device != a.device for t in (topk_ids, topk_weights, output, scratch)):
@@ -657,14 +806,21 @@ def _bind(plan, state, a, topk_ids, topk_weights, output, scratch):
     return Sm103Binding(plan, state, a, topk_ids, topk_weights, output, scratch, state.implementation)
 
 
+def _state_scratch(plan, state, workspace):
+    # During tuning the plan has no installed selection. Its default tactic can
+    # require less storage than the candidate whose call is being bound.
+    specs = (scratch_buffer_spec(plan.component_id, nbytes=state.scratch_bytes(), device=state.experts.device),)
+    return planned_scratch(specs, workspace)
+
+
 def _benchmark_call(state, *, plan, source, experts, top_k, session, name, workspace,
-                    allocate_router, router_plan):
+                    allocate_router, router_plan, output_template):
     from ignition.preparation.fixtures.fused_moe import ExpertBenchmarkInputs
 
     operands = benchmark_resource(session, ("moe_inputs", name),
         lambda: ExpertBenchmarkInputs(source, experts=experts.num_experts, top_k=top_k,
-            allocate_router=allocate_router, router_plan=router_plan))
-    scratch = planned_scratch(plan.memory_requirements().scratch, workspace)
+            allocate_router=allocate_router, router_plan=router_plan, output_template=output_template))
+    scratch = _state_scratch(plan, state, workspace)
     binding = _bind(plan, state, operands.source, operands.router.ids, operands.router.weights,
                     operands.output, scratch)
     return PreparedCall(run=binding.run, output=operands.output, produce=operands.producers[0],
@@ -691,7 +847,7 @@ class Sm103RoutedExperts:
             raise ValueError("SM103 routed experts require [tokens, hidden] source and [tokens, top_k] routes")
         for field in ("w13", "w13_scale", "w2", "w2_scale", "w13_alpha", "w2_alpha",
                       "input_global_scale", "output1_scale", "output1_gate_scale", "output2_scale",
-                      "gate_alpha", "gate_beta", "clamp_limit"):
+                      "intermediate_global_scale", "gate_alpha", "gate_beta", "clamp_limit"):
             tensor = getattr(experts, field, None)
             if tensor is not None:
                 record_numeric_tensor(tensor)
@@ -702,7 +858,7 @@ class Sm103RoutedExperts:
         plan = self.plan
 
         def prepare_call(state):
-            scratch = planned_scratch(plan.memory_requirements().scratch, workspace)
+            scratch = _state_scratch(plan, state, workspace)
             self.scratch = scratch
             binding = _bind(plan, state, source, ids, weights, output, scratch)
             return PreparedCall(run=binding.run, owners=prime_owners(workspace, scratch, binding))
@@ -710,7 +866,7 @@ class Sm103RoutedExperts:
         declare(session, (plan.request(name=name, prepare_call=prepare_call,
             benchmark_call=partial(_benchmark_call, plan=plan, source=source, experts=experts,
                 top_k=ids.shape[1], session=session, name=name, workspace=workspace,
-                allocate_router=RouterScratch.allocate, router_plan=router_plan)),))
+                allocate_router=RouterScratch.allocate, router_plan=router_plan, output_template=output)),))
 
         def finalize():
             self.scratch = planned_scratch(plan.scratch_specs(), workspace)
