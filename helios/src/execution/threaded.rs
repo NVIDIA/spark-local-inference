@@ -7,7 +7,7 @@
 //! Coordinated CUDA ranks sharing one process address space.
 
 use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
-use crate::{Error, ExecutionError, Result, Shutdown, cache::Fence};
+use crate::{Error, ExecutionError, Result, Shutdown, cache::{Fence, PageId}};
 use std::{
     collections::VecDeque,
     sync::{Arc, mpsc},
@@ -50,6 +50,7 @@ struct Step {
     graph: usize,
     grammar: bool,
     uploads: Vec<OwnedUpload>,
+    cleared_pages: Vec<PageId>,
 }
 impl Step {
     fn uploads(&self) -> Vec<Upload<'_>> {
@@ -290,13 +291,14 @@ impl ThreadedExecutor {
         &mut self,
         graph: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar: bool,
     ) -> Result<Option<Fence>> {
         self.next_fence()?;
         let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
             Some(super::GraphKind::Decode | super::GraphKind::Speculative));
         if !self.can_submit(barrier) { return Ok(None); }
-        let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
+        let Some(fence) = self.local.validate_submission(graph, uploads, cleared_pages, grammar)? else {
             return Ok(None);
         };
         let step = Arc::new(Step {
@@ -304,6 +306,7 @@ impl ThreadedExecutor {
             uploads: uploads.iter().map(|u| OwnedUpload {
                 buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
             }).collect(),
+            cleared_pages: cleared_pages.to_vec(),
         });
         let queued = !self.pending.is_empty();
         self.pending.push_back(Pending {
@@ -361,12 +364,13 @@ impl ThreadedExecutor {
             if frame.committed { continue; }
             if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.step.uploads();
-            if self.local.validate_submission(frame.step.graph, &uploads, frame.step.grammar)?
-                != Some(frame.step.fence) {
+            if self.local.validate_submission(frame.step.graph, &uploads, &frame.step.cleared_pages,
+                frame.step.grammar)? != Some(frame.step.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
             protocol::dispatch_commit(&self.peers, frame.step.fence, frame.step.graph)?;
-            if self.local.submit(frame.step.graph, &uploads, frame.step.grammar)? != Some(frame.step.fence) {
+            if self.local.submit(frame.step.graph, &uploads, &frame.step.cleared_pages, frame.step.grammar)?
+                != Some(frame.step.fence) {
                 return Err(invalid("rank-zero fence changed after validation"));
             }
             frame.committed = true;
@@ -468,7 +472,8 @@ fn rank_loop(
             }
             Some(Command::Prepare(step)) => {
                 if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                if executor.validate_submission(step.graph, &step.uploads(), step.grammar)? != Some(step.fence) {
+                if executor.validate_submission(step.graph, &step.uploads(), &step.cleared_pages, step.grammar)?
+                    != Some(step.fence) {
                     return Err(invalid("rank submission fence differs"));
                 }
                 send(Reply::Ready(step.fence, step.graph))?;
@@ -479,7 +484,7 @@ fn rank_loop(
                 prepared_at = None;
                 let step = prepared.take().ok_or_else(|| invalid("rank commit arrived without preparation"))?;
                 if step.fence != fence || step.graph != graph { return Err(invalid("rank commit identity differs")); }
-                if executor.submit(graph, &step.uploads(), step.grammar)? != Some(fence) {
+                if executor.submit(graph, &step.uploads(), &step.cleared_pages, step.grammar)? != Some(fence) {
                     return Err(invalid("rank fence changed after validation"));
                 }
                 started.push_back(Instant::now());

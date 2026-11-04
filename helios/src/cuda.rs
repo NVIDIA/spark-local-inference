@@ -24,6 +24,7 @@ type HostFree = unsafe extern "C" fn(Handle) -> c_int;
 type Upload = unsafe extern "C" fn(u64, *const c_void, usize, Handle) -> c_int;
 type Download = unsafe extern "C" fn(Handle, u64, usize, Handle) -> c_int;
 type Download2D = unsafe extern "C" fn(*const Copy2D, Handle) -> c_int;
+type Fill = unsafe extern "C" fn(u64, u8, usize, Handle) -> c_int;
 type EventCreate = unsafe extern "C" fn(*mut Handle, c_uint) -> c_int;
 type EventRecord = unsafe extern "C" fn(Handle, Handle) -> c_int;
 type EventElapsed = unsafe extern "C" fn(*mut f32, Handle, Handle) -> c_int;
@@ -158,6 +159,7 @@ struct Driver {
     upload: Upload,
     download: Download,
     download_2d: Download2D,
+    fill: Fill,
     event_create: EventCreate,
     event_record: EventRecord,
     event_elapsed: EventElapsed,
@@ -222,6 +224,7 @@ impl Driver {
                 upload: symbol!("cuMemcpyHtoDAsync_v2"),
                 download: symbol!("cuMemcpyDtoHAsync_v2"),
                 download_2d: symbol!("cuMemcpy2DAsync_v2"),
+                fill: symbol!("cuMemsetD8Async"),
                 event_create: symbol!("cuEventCreate"),
                 event_record: symbol!("cuEventRecord"),
                 event_elapsed: symbol!("cuEventElapsedTime"),
@@ -907,6 +910,13 @@ impl Stream {
         };
         self.driver.check("cuMemcpy2DAsync_v2", unsafe {
             (self.driver.download_2d)(&copy, self.handle as Handle)
+        })
+    }
+
+    /// No queued or concurrent work may access the range until this stream passes the fill.
+    pub(crate) unsafe fn zero(&self, device: u64, nbytes: usize) -> Result<()> {
+        self.driver.check("cuMemsetD8Async", unsafe {
+            (self.driver.fill)(device, 0, nbytes, self.handle as Handle)
         })
     }
 

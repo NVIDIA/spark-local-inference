@@ -564,6 +564,7 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    cleared_pages: Vec<PageId>,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
@@ -664,6 +665,8 @@ pub struct RequestScheduler {
     free_snapshots: BTreeSet<SnapshotId>,
     snapshot_pages: Vec<std::ops::Range<u32>>,
     page_snapshot_refs: Vec<u32>,
+    /// Released alias pages whose bytes are snapshot rows, not KV, until cleared.
+    page_holds_row_bytes: Vec<bool>,
     retired: Vec<RetiredRequest>,
     submissions: BTreeMap<Fence, Submission>,
     completed: Fence,
@@ -754,6 +757,7 @@ impl RequestScheduler {
             free_snapshots: (0..limits.snapshots).map(SnapshotId).collect(),
             snapshot_pages: Vec::new(),
             page_snapshot_refs: vec![0; limits.pages as usize],
+            page_holds_row_bytes: vec![false; limits.pages as usize],
             retired: Vec::new(),
             submissions: BTreeMap::new(),
             completed: Fence(0),
@@ -1100,6 +1104,13 @@ impl RequestScheduler {
         self.submissions
             .get(&fence)
             .map(|submission| &submission.step)
+            .ok_or_else(|| "unknown scheduled submission".into())
+    }
+    /// Pages whose snapshot-row bytes every rank clears before the submission's graph.
+    pub fn cleared_pages(&self, fence: Fence) -> Result<&[PageId]> {
+        self.submissions
+            .get(&fence)
+            .map(|submission| submission.cleared_pages.as_slice())
             .ok_or_else(|| "unknown scheduled submission".into())
     }
     pub fn cache(&self) -> &PrefixCheckpointCache {
@@ -2218,17 +2229,23 @@ impl RequestScheduler {
                 _ => None,
             },
         };
+        let mut cleared_pages = Vec::new();
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
                 .collect();
-            request.private_pages.extend(allocated);
+            request.private_pages.extend_from_slice(&allocated);
             request.scheduled_consumed = next_consumed_ceiling;
             request.last_use = fence;
             request.pending += 1;
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
+            }
+            for page in allocated {
+                if std::mem::take(&mut self.page_holds_row_bytes[page.0 as usize]) {
+                    cleared_pages.push(page);
+                }
             }
         }
         self.submitted = fence;
@@ -2245,6 +2262,7 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                cleared_pages,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,

@@ -2159,6 +2159,7 @@ impl<'a> Worker<'a> {
         if executor.submit(
             graph,
             &uploads,
+            self.scheduler.cleared_pages(fence)?,
             feedback,
         )? != Some(fence)
         {
