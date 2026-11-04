@@ -50,7 +50,6 @@ pub(super) struct PackedRoundShape {
 struct Estimate {
     nanos: u64,
     replays: ReplayTimes,
-    handoff_ns: u64,
     observed_at_ns: u64,
     last_attempt_ns: u64,
 }
@@ -114,7 +113,6 @@ impl ActionCosts {
         let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
         estimate.replays.observe(nanos, false);
-        estimate.handoff_ns = 0;
         estimate.observed_at_ns = self.now_ns;
         self.refresh_packed_durations();
     }
@@ -139,7 +137,6 @@ impl ActionCosts {
                 Estimate {
                     nanos: 0,
                     replays: ReplayTimes::default(),
-                    handoff_ns: 0,
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
                 },
@@ -167,7 +164,7 @@ impl ActionCosts {
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
-            let nanos = estimate.nanos.saturating_add(estimate.handoff_ns);
+            let nanos = estimate.nanos;
             for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
                 *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
             }
@@ -183,7 +180,7 @@ impl ActionCosts {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
                 batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
-                nanos: estimate.nanos.saturating_add(estimate.handoff_ns),
+                nanos: estimate.nanos,
             })
     }
 
@@ -206,11 +203,11 @@ impl ActionCosts {
             prefill,
             packed: if kind == GraphKind::Speculative { batch * tokens } else { packed },
         })
-        .map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        .map(|estimate| estimate.nanos)
     }
 
     pub fn duration_key(&self, key: Key) -> Option<u64> {
-        self.entry(key).map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        self.entry(key).map(|estimate| estimate.nanos)
     }
 
     pub fn is_fresh(&self, key: Key) -> bool {
@@ -234,7 +231,7 @@ impl ActionCosts {
     }
 
     pub fn observation(&self, key: Key) -> Option<(u64, Option<u64>, bool)> {
-        self.entry(key).map(|estimate| (estimate.nanos.saturating_add(estimate.handoff_ns),
+        self.entry(key).map(|estimate| (estimate.nanos,
             (estimate.nanos != 0).then_some(estimate.observed_at_ns),
             estimate.fresh(self.now_ns, self.ttl_ns)))
     }
@@ -266,14 +263,6 @@ impl ActionCosts {
         if let Some(&index) = self.index.get(&key) {
             let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);
-            if !timing.queued {
-                let handoff = timing.wall_ns.saturating_sub(raw_sample);
-                estimate.handoff_ns = if fresh {
-                    ((7 * u128::from(estimate.handoff_ns) + u128::from(handoff) + 4) / 8) as u64
-                } else { handoff };
-            } else if !fresh {
-                estimate.handoff_ns = 0;
-            }
             estimate.nanos = estimate.replays.observe(sample, fresh);
             estimate.observed_at_ns = self.now_ns;
             self.refresh_packed_durations();

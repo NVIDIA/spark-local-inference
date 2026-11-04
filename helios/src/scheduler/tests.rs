@@ -1727,7 +1727,7 @@ fn completion_learns_only_proven_acceptance_and_is_transactional() {
 }
 
 #[test]
-fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
+fn graph_duration_median_excludes_host_delay_and_queue_wait() {
     use crate::execution::ExecutionTiming;
     let mut s = scheduler(2, 64, 8);
     let graphs = duration_graphs(2);
@@ -1763,11 +1763,11 @@ fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
             },
         );
     }
-    assert_eq!(s.estimated_duration_ns(&plan), Some(14075));
+    assert_eq!(s.estimated_duration_ns(&plan), Some(1800));
     let mut same_graph = (*plan).clone();
     same_graph.lanes[0].start_position = 32769;
     same_graph.lanes[0].tokens = 1;
-    assert_eq!(s.estimated_duration_ns(&same_graph), Some(14075));
+    assert_eq!(s.estimated_duration_ns(&same_graph), Some(1800));
     same_graph.batch_capacity = 2;
     assert_eq!(s.estimated_duration_ns(&same_graph), Some(1000));
     s.observe_execution(
@@ -1779,11 +1779,11 @@ fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
             queued: false,
         },
     );
-    assert_eq!(s.estimated_duration_ns(&plan), Some(14075));
+    assert_eq!(s.estimated_duration_ns(&plan), Some(1800));
 }
 
 #[test]
-fn readiness_correction_changes_shape_cost_without_changing_handoff_or_service_time() {
+fn readiness_correction_changes_shape_cost_without_changing_service_time() {
     use crate::execution::{ExecutionTiming, ReadinessIntervals};
     let mut costs = cost::ActionCosts::prepared(&duration_graphs(1), 16).unwrap();
     let step = ScheduledStep { draft_tokens: 0, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
@@ -1795,12 +1795,12 @@ fn readiness_correction_changes_shape_cost_without_changing_handoff_or_service_t
     let mut timing = ExecutionTiming { gpu_ns, readiness: Some(ReadinessIntervals::decode(&timestamps).unwrap()),
         wall_ns: 12_000, queued: false };
     costs.observe(&step, timing);
-    assert_eq!(costs.get(&step), Some(10_000));
+    assert_eq!(costs.get(&step), Some(8_000));
     assert_eq!(cost::observed_duration_ns(timing), Some(12_000));
     timing.queued = true;
     timing.wall_ns = 100_000;
     costs.observe(&step, timing);
-    assert_eq!(costs.get(&step), Some(10_000));
+    assert_eq!(costs.get(&step), Some(8_000));
     assert_eq!(cost::observed_duration_ns(timing), Some(10_000));
     assert_eq!(timing.gpu_ns[0], Some(10_000));
 }
