@@ -62,3 +62,59 @@ def test_tensor_fp8_calibration_survives_loading_and_replay(tmp_path, rows, shar
             quantized = ((source * factor).float() / input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
             expected = (quantized.float() @ values.float()[128:256, 32:320].T) * (weight_scale * input_scale)
             torch.testing.assert_close(output.float().cpu(), expected, rtol=.015, atol=.03)
+
+
+@torch.no_grad()
+def test_mixed_group_retains_distinct_fp8_calibration(tmp_path):
+    from ignition.components.linear import prepare_projection
+    from ignition.components.weights import GroupedLinearWeights
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    torch.manual_seed(375)
+    tensors, declarations, references = {}, {}, []
+    source = torch.randn((17, 256), dtype=torch.bfloat16, device='cuda')
+    for name, scale in [('q', .013), ('k', .071)]:
+        values = torch.randn((128, 256)).mul(20).to(torch.float8_e4m3fn)
+        tensors.update({name + '.weight': values, name + '.weight_scale': torch.tensor(.017),
+                        name + '.input_scale': torch.tensor(scale)})
+        declarations[name] = {'quant_algo': 'FP8'}
+        quantized = (source.cpu().float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        references.append((quantized.float() @ values.float().T) * (scale * .017))
+    tensors['v.weight'] = torch.randn((128, 256), dtype=torch.bfloat16) * .03
+    references.append(source.cpu().float() @ tensors['v.weight'].float().T)
+    save_file(tensors, str(tmp_path / 'weights.safetensors'))
+    (tmp_path / 'model.safetensors.index.json').write_text(json.dumps(dict(
+        metadata={'total_size': sum(t.nbytes for t in tensors.values())},
+        weight_map={name: 'weights.safetensors' for name in tensors})))
+    (tmp_path / 'config.json').write_text(json.dumps({'quantization_config': {
+        'quant_method': 'modelopt', 'quant_algo': 'MIXED_PRECISION', 'quantized_layers': declarations}}))
+    with DirectWeightLoader(inspect_indexed_checkpoint(tmp_path), 'cuda:0') as loader:
+        weight = loader.load_mixed_linear_group(('q', 'k', 'v'))
+    assert isinstance(weight, GroupedLinearWeights)
+    assert weight.widths == (128, 128, 128)
+    output = torch.empty((17, 384), dtype=torch.bfloat16, device='cuda')
+    with RecordedPreparationSession(device=source.device, checkpoint='mixed-fp8', workload_schema='mixed-fp8',
+            numerical_policy='default', compile_workers=1) as session:
+        arena = ScratchArena(source.device)
+        session.register_scratch(arena)
+        staging = torch.empty(source.numel(), dtype=torch.uint8, device=source.device)
+        projection = prepare_projection(source, weight, output, session=session, name='mixed', workspace=arena,
+                                        quantized_staging=staging)
+        assert all(p.quantized.data_ptr() == staging.data_ptr() for p in projection.projections[:2])
+        session.tune()
+        compiled = compile_forward(lambda: projection(source))
+        compiled()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output.float().cpu(), torch.cat(references, -1), rtol=.015, atol=.03)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        output.zero_()
+        allocations = torch.cuda.memory_stats()['allocation.all.allocated']
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocations
+        torch.testing.assert_close(output.float().cpu(), torch.cat(references, -1), rtol=.015, atol=.03)
+        graph.reset()

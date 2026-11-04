@@ -18,7 +18,18 @@ mod support;
 #[test]
 #[ignore = "requires FLARE_MUSE_SPARK_SNAPSHOT checkpoint tokenizer"]
 fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
-    let snapshot = std::path::PathBuf::from(std::env::var_os("FLARE_MUSE_SPARK_SNAPSHOT").unwrap());
+    recipient_request_preparation("muse_spark", "FLARE_MUSE_SPARK_SNAPSHOT");
+}
+
+#[test]
+#[ignore = "requires FLARE_MUSE_GLIMMER_SNAPSHOT checkpoint tokenizer"]
+fn glimmer_request_preparation_preserves_protocols_tools_and_continuation() {
+    recipient_request_preparation("muse_glimmer", "FLARE_MUSE_GLIMMER_SNAPSHOT");
+}
+
+fn recipient_request_preparation(recipe: &str, snapshot_variable: &str) {
+    let glimmer = recipe == "muse_glimmer";
+    let snapshot = std::path::PathBuf::from(std::env::var_os(snapshot_variable).unwrap());
     let asset = |path: std::path::PathBuf| {
         let bytes = std::fs::read(&path).unwrap();
         Asset {
@@ -34,9 +45,10 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
                 snapshot.join("tokenizer_config.json"),
             ))
             .unwrap(),
-            chat_template: Some(asset(
-                crate::template_fixtures::path("muse_spark", "chat_template"),
-            )),
+            chat_template: Some(asset(crate::template_fixtures::path(
+                recipe,
+                "chat_template",
+            ))),
         },
         json!({"add_generation_prompt":true,"current_date":"2026-10-27"})
             .as_object()
@@ -99,7 +111,11 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
         "messages":[{"role":"user","content":"Reply with only PROTOCOL-MESSAGES."}],
         "model":"Muse-Spark-Open-816B-A42B",
         "temperature":1,"top_p":1,"top_k":-1,
-        "chat_template_kwargs":{"reasoning_effort":"low","current_date":"2026-10-27"}
+        "chat_template_kwargs": if glimmer {
+            json!({"reasoning_strength":"low","current_date":"2026-10-27"})
+        } else {
+            json!({"reasoning_effort":"low","current_date":"2026-10-27"})
+        }
     });
     let decoded = decode(Protocol::Messages, messages_body.clone(), false).unwrap();
     let crate::server::inference::Input::Conversation(messages) = &decoded.request.input else {
@@ -140,15 +156,34 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
         14757, 73965, 38, 392, 2540, 706, 392, 13929, 811, 706, 392, 1556, 4205, 200008, 200022,
         1556, 200023, 33692, 517, 1809, 198964, 4872, 132753, 26, 200008, 200022, 140680,
     ];
-    assert_eq!(request.prompt.tokens.as_slice(), &expected_tokens);
+    // NVIDIA Muse-Glimmer-30B-NVFP4 at 47818374517751c48c55cde2621594926b1888b6.
+    let glimmer_tokens = [
+        200000, 200022, 15651, 200023, 4662, 583, 262, 19933, 12133, 43910, 335, 111198, 67059, 38,
+        220, 837, 34, 25, 1761, 25, 2468, 335, 8048, 4282, 38, 220, 837, 34, 25, 580, 25, 1704,
+        1574, 34956, 300, 9762, 38, 4463, 1574, 15, 14757, 73965, 38, 392, 2540, 706, 392, 1556,
+        4205, 200008, 200022, 1556, 200023, 33692, 517, 1809, 198964, 4872, 132753, 26, 200008,
+        200022, 140680,
+    ];
+    assert_eq!(
+        request.prompt.tokens.as_slice(),
+        if glimmer {
+            &glimmer_tokens[..]
+        } else {
+            &expected_tokens[..]
+        }
+    );
     assert_eq!(request.prompt.max_new_tokens, 2048);
-    assert!(request.rendered_prompt.contains("Reasoning strength: 8."));
+    assert!(request.rendered_prompt.contains(if glimmer {
+        "Reasoning strength: low."
+    } else {
+        "Reasoning strength: 8."
+    }));
     assert!(
         request
             .rendered_prompt
             .ends_with("Reply with only PROTOCOL-MESSAGES.<|eot|><|start|>assistant")
     );
-    let tools = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]);
+    let tools = json!([{"type":"function","function":{"name":"lookup","description":"Look up a value","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]);
     for choice in [
         json!("none"),
         json!("auto"),
@@ -217,9 +252,17 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
         closed.output.unwrap().content.start,
         OutputStart::RecipientFrame
     );
-    let image = prepare(
-        Protocol::Chat,
-        json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}),
-    );
-    assert!(image.is_err());
+    for part in [
+        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}),
+        json!({"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}),
+        json!({"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA=="}}),
+    ] {
+        assert!(
+            prepare(
+                Protocol::Chat,
+                json!({"messages":[{"role":"user","content":[part]}]})
+            )
+            .is_err()
+        );
+    }
 }

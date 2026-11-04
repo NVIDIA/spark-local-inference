@@ -22,18 +22,23 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
 
 
-def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
+def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None,
+                       quantized_staging=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
+    from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
     from .weights import GroupedLinearWeights
 
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
-                                       activation_mode=activation_mode, staging=staging)
+                                       activation_mode=activation_mode, staging=staging,
+                                       quantized_staging=quantized_staging)
     if isinstance(weight, torch.Tensor):
         return UnquantizedProjection(source, weight, output, session=session, name=name)
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
+    if isinstance(weight, TensorFP8Weight):
+        return TensorFP8Projection(source, weight, output, session=session, name=name, staging=quantized_staging)
     return QuantizedProjection(source, weight, output, session=session, name=name,
                                workspace=workspace, activation_mode=activation_mode)
 
@@ -41,20 +46,23 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
 class PreparedProjectionGroup:
     """Project one source into ordered output slices with compatible weights fused."""
 
-    def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging):
+    def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging,
+                 quantized_staging=None):
         from .block_fp8 import BlockFP8Weight
+        from .tensor_fp8 import TensorFP8Weight
 
         self.output = output
         self.projections, self.copies = [], []
         for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
             destination = target
-            if not isinstance(part, (torch.Tensor, BlockFP8Weight)) and not target.is_contiguous():
+            if not isinstance(part, (torch.Tensor, BlockFP8Weight, TensorFP8Weight)) and not target.is_contiguous():
                 if (staging is None or not staging.is_contiguous() or staging.numel() < target.numel()
                         or staging.dtype != target.dtype or staging.device != target.device):
                     raise ValueError("mixed packed projections require caller-owned contiguous staging")
                 destination = staging.view(-1)[:target.numel()].view(target.shape)
             self.projections.append(prepare_projection(source, part, destination, session=session,
-                name=f"{name}.part{index}", workspace=workspace, activation_mode=activation_mode))
+                name=f"{name}.part{index}", workspace=workspace, activation_mode=activation_mode,
+                quantized_staging=quantized_staging))
             self.copies.append(None if destination is target else target)
         self.plans = tuple(projection.plan for projection in self.projections)
 

@@ -1055,9 +1055,51 @@ the canonical control-sequence escaping.
 flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
 ```
 
+## Muse Glimmer
+
+The `muse-glimmer-30b-nvfp4` alias selects
+[`nvidia/Muse-Glimmer-30B-NVFP4`](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4)
+at revision `47818374517751c48c55cde2621594926b1888b6`. Preparation targets one
+GPU, a 131072-token context, four concurrent requests and 4096-token prefill
+chunks. It loads text weights at their checkpoint precision: NVFP4 W4A16,
+calibrated tensor FP8, and excluded BF16 projections. Image, audio and video
+requests are rejected; no vision encoder or speculative draft is prepared.
+
+Use the FlashInfer revision pinned in `pyproject.toml` and `uv.lock`,
+`42ba2f16b94f592798d166a66fb60330d12e860a`. The previous declared revision
+`560fef16648e4953bf39b701a226c322a0ab6c7c` lacks the packed-projection
+activation and reduction arguments used by the shared NVFP4 preparation path.
+Run the standard locked environment setup before preparing this recipe.
+
+All 52 layers retain BF16 paged keys and values. Sliding layers apply the
+checkpoint's 2048-token attention window; full layers use the entire history.
+One 128-token page occupies 6,815,744 bytes and a continuation row occupies
+6,829,312 bytes, including every partial page and the normalized hidden state.
+A full 131072-token KV history occupies 6.5 GiB, in addition to weights,
+continuations and graph scratch. The planning weight estimate conservatively
+uses the full 24.67 GB checkpoint size, including its unused vision tensors.
+
+Sampling follows the model card: temperature 1.0, top-p 0.95 and top-k 64.
+The checkpoint template defaults `reasoning_strength` to `high`; set
+`chat_template_kwargs.reasoning_strength` to change this prompt option.
+The insertion-only template patch preserves checkpoint-rendered bytes and
+adds exact message boundaries. Native recipient headers and ATEM tools share
+Muse Spark's parser; `<|eom|>` is an internal boundary, while `<|eot|>` and
+`<|end_of_text|>` end generation.
+
+```sh
+.venv/bin/ignition export muse-glimmer-30b-nvfp4 --gpus 0 --prompt-logprobs
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/muse-glimmer.safetensors
+flare/target/release/flare run /data/flare-runtime/muse-glimmer.safetensors --gpus 0
+```
+
+The recipe has reduced-shape CUDA and checkpoint-tokenizer frontend tests.
+Full-checkpoint export, native serving, and quality validation require a GPU
+with enough memory for the checkpoint and have not been qualified by these tests.
+
 ## Storage and graph capacities
 
-Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
+Gemma 4, Muse Spark, and Muse Glimmer default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
 one, giving six rows at its default settings. Muse Spark declares 32 packed
 target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
