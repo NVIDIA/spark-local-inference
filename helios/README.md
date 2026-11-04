@@ -102,8 +102,11 @@ the default two workers can prepare four simultaneous generation requests.
 `ignition` packages set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's images plus 1 MiB.
 An admission permit survives CPU preparation and the streamed response lifetime.
-Disconnects cancel model scheduling, and slow consumers still face the bounded
-per-request event queue. HTTP capacity and physical GPU slots are independent.
+Disconnects cancel model scheduling. A paused reader keeps its response: each
+event queue holds the request's complete output budget, allocated as events
+arrive. Finished, unread responses release their model slot and live KV cache
+but still count toward the admission limit. HTTP capacity and physical GPU slots
+are independent.
 Tool-call history accepts OpenAI JSON-string arguments and object arguments;
 strings must parse as JSON objects before checkpoint-template rendering.
 
