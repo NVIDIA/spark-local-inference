@@ -11,6 +11,8 @@ pub mod catalog;
 pub mod contract;
 pub(crate) mod inputs;
 mod packing;
+#[cfg(kani)]
+mod kani_proofs;
 #[cfg(feature = "server")]
 mod prompt;
 

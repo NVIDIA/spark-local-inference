@@ -20,6 +20,9 @@ pub struct Upload<'a> {
     pub bytes: &'a [u8],
 }
 
+#[cfg(kani)]
+mod kani_proofs;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenVector {
     pub emitted_count: i64,

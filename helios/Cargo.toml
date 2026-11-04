@@ -10,6 +10,9 @@ publish = false
 name = "flare_helios"
 crate-type = ["rlib"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 default = []
 test-tools = []

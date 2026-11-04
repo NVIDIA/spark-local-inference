@@ -11,6 +11,24 @@
     wrapper where arithmetic and layouts match. Preserve sparse selection,
     cache-only execution, and TP behavior; validate replay and graph latency.
 
+[ ] Review threaded-rank rejection state in helios/src/execution/threaded.rs
+    and helios/src/execution/threaded/protocol.rs. Duplicate rank-zero completions
+    overwrite stored payloads before rejection; frames leave the queue before
+    agreement and timing validation. Verify ownership and poison handling through
+    poll_ranks and close, beyond the existing bookkeeping-helper tests.
+
+[ ] Qualify actual threaded executor completion and shutdown on assigned CUDA
+    devices after partial Prepare/Commit dispatch, failure after local enqueue,
+    cancellation, and poison. Verify completion/drain signals cover every
+    participating rank and protect graph/cache/input-frame storage through its
+    final use. Extend helios/src/execution/threaded/cuda_tests.rs; see
+    verification/helios-lifecycle/README.md#assumptions-and-limits.
+
+[ ] Check socket rank coordination in helios/src/execution/parallel.rs against
+    readiness, completion identity/order, partial dispatch, and drain/release
+    invariants. TLA+ correspondence covers the threaded helpers; extend coverage
+    to the socket coordinator and peer control loop.
+
 [ ] Validate full-width INT64 expert IDs in b12x W4A16 route packing,
     reductions, and MoE calibration. These paths narrow IDs before range
     checks; add captured replay coverage for IDs outside the INT32 range.

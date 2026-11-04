@@ -294,6 +294,13 @@ are permitted when they do not design or change the restricted mechanisms above.
 
 ## Validation and performance
 
+Choose verification by the property at risk, following
+[verification guidance](docs/verification.md). Use ordinary tests for observable
+behavior and regressions, Kani for properties of sequential Rust over an input
+domain, and TLA+ for protocol states and asynchronous ordering. Add only the
+checks the affected behavior needs. A passing model does not establish Rust
+conformance or CUDA correctness; validate those boundaries separately.
+
 - Compare other runtimes against an exported package running through `flare run`.
   Timings from `ignition debug-serve` are diagnostic measurements and cannot
   establish comparative serving performance.

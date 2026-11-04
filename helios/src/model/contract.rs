@@ -9,8 +9,11 @@
 use super::VisionCapabilities;
 use crate::{
     Result,
-    execution::{ExecutionManifest, GraphKind, TunedBinding},
+    execution::{BufferDescriptor, ExecutionManifest, GraphKind, TunedBinding},
 };
+
+#[cfg(kani)]
+mod kani_proofs;
 
 macro_rules! contract_enum {
     ($name:ident { $($variant:ident = $value:literal),+ $(,)? }) => {
@@ -587,24 +590,27 @@ impl StateView {
 
     fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
         let buffer = manifest.buffer(&self.buffer)?;
-        if self.nbytes == 0
-            || buffer.shape.is_empty()
-            || buffer
-                .strides
-                .first()
-                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
-                != Some(self.stride)
-            || self
-                .offset
-                .checked_add(self.nbytes)
-                .is_none_or(|end| end > self.stride)
-            || buffer.shape[0]
-                .checked_mul(self.stride)
-                .is_none_or(|end| end > buffer.nbytes)
-        {
+        if !self.fits_storage(buffer) {
             return Err("persistent state view exceeds its prepared storage".into());
         }
         Ok(())
+    }
+
+    fn fits_storage(&self, buffer: &BufferDescriptor) -> bool {
+        self.nbytes != 0
+            && !buffer.shape.is_empty()
+            && buffer
+                .strides
+                .first()
+                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
+                == Some(self.stride)
+            && self
+                .offset
+                .checked_add(self.nbytes)
+                .is_some_and(|end| end <= self.stride)
+            && buffer.shape[0]
+                .checked_mul(self.stride)
+                .is_some_and(|end| end <= buffer.nbytes)
     }
 }
 
@@ -675,6 +681,63 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_view_validation_resolves_buffers_and_preserves_storage_errors() {
+        use crate::{Error, ExecutionError, execution::Dtype};
+        let view = StateView { buffer: "state".into(), offset: 4, stride: 16, nbytes: 12 };
+        let buffer = BufferDescriptor {
+            name: "state".into(), address: 4096, nbytes: 32,
+            dtype: Dtype::Int32, shape: vec![2], strides: vec![4],
+        };
+        let mut manifest = ExecutionManifest {
+            engram: None, collectives: None, cache: None, offload: None,
+            abi_version: crate::execution::ABI_VERSION, context: 0, device: 0,
+            completion_token_capacity: 8,
+            max_active: 1, input_frame_bytes: 8,
+            buffers: vec![BufferDescriptor {
+                name: "other".into(), shape: vec![], ..buffer.clone()
+            }, buffer],
+            graphs: vec![], tuning_graphs: vec![],
+        };
+        view.validate(&manifest).unwrap();
+        let mut missing = view.clone();
+        missing.buffer = "missing".into();
+        missing.nbytes = 0;
+        let error = missing.validate(&manifest).unwrap_err();
+        assert!(matches!(&error, Error::Execution(ExecutionError::Manifest(_))));
+        assert_eq!(error.to_string(), "unknown buffer \"missing\"");
+
+        type Invalid = (&'static str, fn(&mut StateView, &mut BufferDescriptor));
+        let cases: [Invalid; 9] = [
+            ("zero extent", |v, _| v.nbytes = 0),
+            ("empty shape", |_, b| b.shape.clear()),
+            ("missing element stride", |_, b| b.strides.clear()),
+            ("mismatched byte stride", |_, b| b.strides[0] = 5),
+            ("element stride overflow", |_, b| b.strides[0] = usize::MAX),
+            ("view extent overflow", |v, _| v.offset = usize::MAX),
+            ("view extends past its row", |v, _| v.offset = 5),
+            ("row extent overflow", |_, b| b.shape[0] = usize::MAX),
+            ("rows extend past storage", |_, b| b.nbytes = 31),
+        ];
+        for (name, invalidate) in cases {
+            let mut invalid_view = view.clone();
+            let saved = manifest.buffers[1].clone();
+            invalidate(&mut invalid_view, &mut manifest.buffers[1]);
+            let error = invalid_view.validate(&manifest).unwrap_err();
+            assert!(matches!(&error, Error::Execution(ExecutionError::State(_))), "{name}");
+            assert_eq!(error.to_string(), "persistent state view exceeds its prepared storage", "{name}");
+            manifest.buffers[1] = saved;
+        }
+        let exact = StateView {
+            buffer: "state".into(), offset: usize::MAX - 1, stride: usize::MAX, nbytes: 1,
+        };
+        manifest.buffers[1].dtype = Dtype::Uint8;
+        manifest.buffers[1].shape = vec![1];
+        manifest.buffers[1].strides = vec![usize::MAX];
+        manifest.buffers[1].nbytes = usize::MAX;
+        exact.validate(&manifest).unwrap();
+    }
 
     #[test]
     fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
