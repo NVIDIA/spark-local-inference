@@ -62,6 +62,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub queue_capacity: usize,
+    /// Minimum event-channel capacity; each request also reserves room for its
+    /// complete output budget, observations, prompt scores, and terminal events.
     pub event_capacity: usize,
     pub frontend_workers: usize,
     pub max_body_bytes: usize,

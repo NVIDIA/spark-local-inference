@@ -102,8 +102,16 @@ the default two workers can prepare four simultaneous generation requests.
 `ignition` packages set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's images plus 1 MiB.
 An admission permit survives CPU preparation and the streamed response lifetime.
-Disconnects cancel model scheduling, and slow consumers still face the bounded
-per-request event queue. HTTP capacity and physical GPU slots are independent.
+Disconnects cancel model scheduling. Each native output queue can hold the
+accepted response's complete token budget, optional observations and prompt
+scores, and terminal events. Channel storage grows as events arrive; accepting a
+large output limit does not allocate its entire queue. A paused reader does not
+block the model worker or lose its response. Completed, unread responses retain
+native admission capacity until their `Generation` is dropped, while their GPU
+slots and request-owned cache references retire normally. Thus output storage is
+bounded by accepted prompt/output limits and the number of admitted choices;
+logprobs and decoded stop-filtered text add their per-token payloads. HTTP
+capacity and physical GPU slots are independent.
 Tool-call history accepts OpenAI JSON-string arguments and object arguments;
 strings must parse as JSON objects before checkpoint-template rendering.
 

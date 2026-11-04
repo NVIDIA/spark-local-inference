@@ -256,6 +256,7 @@ impl Fixture {
                 pool_plan: None,
             },
             Generation {
+                _capacity: None,
                 events: receiver,
                 admission: admitted,
                 first_token: first_token_ready,
@@ -3560,6 +3561,162 @@ async fn http_generation_request(
     .await
     .unwrap();
     (response, incoming)
+}
+
+#[test]
+fn unread_completions_release_gpu_slots_but_retain_admission_capacity() {
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let fixture = Fixture::new();
+    let (_worker_sender, worker_receiver) = mpsc::channel();
+    let mut worker = fixture.worker(worker_receiver);
+    let prompt = || {
+        let mut prompt = Fixture::prompt_for(
+            vec![0],
+            100,
+            PromptData {
+                positions: vec![[0; 3]],
+                vision_token_indices: vec![-1],
+                ..Default::default()
+            },
+        );
+        prompt.sampling.top_k = -1;
+        prompt
+    };
+    let mut generations = Vec::new();
+    let mut sequence = 0;
+    for _ in 0..4 {
+        generations.push(state.model.generate_observed(prompt(), false).unwrap());
+        worker.enqueue(receiver.try_recv().unwrap());
+        let _ = worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &vec![1; 100]);
+        assert!(worker.active.iter().all(Option::is_none));
+        assert!(worker.admissions.iter().all(Option::is_none));
+        assert_eq!(worker.scheduler.stats().free_slots, 4);
+        assert_eq!(worker.metrics.failed.load(Ordering::Relaxed), 0);
+    }
+    assert_eq!(state.model.capacity.available_permits(), 0);
+    assert!(matches!(
+        state.model.generate(prompt()),
+        Err(Error::Admission(AdmissionError::Capacity(_)))
+    ));
+    // A completed response's ownership ends when the reader is dropped, not
+    // when its GPU slot is retired. Other responses remain intact.
+    drop(generations.pop());
+    let generation = state.model.generate(prompt()).unwrap();
+    let incoming = receiver.try_recv().unwrap();
+    drop(generation);
+    assert!(incoming[0].cancelled.load(Ordering::Acquire));
+    assert_eq!(state.model.capacity.available_permits(), 0);
+    drop(incoming);
+    assert_eq!(state.model.capacity.available_permits(), 1);
+    for mut generation in generations {
+        assert_eq!(
+            budget_events(&mut generation),
+            (vec![1; 100], vec![(1, 100, "length")], vec![])
+        );
+    }
+    assert_eq!(state.model.capacity.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() {
+    use axum::{Extension, extract::State};
+    use futures_util::StreamExt;
+    use serde_json::json;
+    for (path, mut body, terminal) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":3000}),
+            "\"finish_reason\":\"length\"",
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt":"a", "max_tokens":3000}),
+            "\"finish_reason\":\"length\"",
+        ),
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":3000}),
+            "message_stop",
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"a", "max_output_tokens":3000}),
+            "response.incomplete",
+        ),
+    ] {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut fixture = Fixture::new();
+        fixture.config.limits.max_sequence_tokens = 4096;
+        fixture.config.prepared_sequence_tokens = 4096;
+        let state = http_state_for(fixture, sender, None);
+        body["model"] = json!("qwen-worker-phases");
+        body["stream"] = json!(true);
+        let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response =
+            super::super::http::generate(State(state.clone()), Extension(ingress), request).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+        let incoming = receiver.try_recv().unwrap().remove(0);
+        incoming.notify_admission(Ok(()));
+        incoming.observe_token(1);
+        incoming.emit_token(1);
+        let mut reader = response.into_body().into_data_stream();
+        let first = reader.next().await.unwrap().unwrap();
+        // Not polling the body reproduces transport backpressure deterministically,
+        // without depending on the OS TCP send-buffer size or a timed sleep.
+        for _ in 1..3000 {
+            incoming.observe_token(1);
+            incoming.emit_token(1);
+        }
+        incoming.emit(GenerationEvent::Finished {
+            prompt_tokens: incoming.prompt.tokens.len(),
+            generated_tokens: 3000,
+            reused_prompt_tokens: 0,
+            reason: "length",
+            termination: crate::output::Termination::OutputLimit,
+            stop_sequence: None,
+        });
+        assert!(!incoming.cancelled.load(Ordering::Acquire));
+        assert_eq!(incoming.publications.get(), 3000);
+        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 0);
+        drop(incoming);
+        assert_eq!(state.model.capacity.available_permits(), 3);
+        let mut bytes = first.to_vec();
+        while let Some(chunk) = reader.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains(terminal), "{path}: missing {terminal}");
+        let mut content = String::new();
+        for value in text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            assert!(value["error"].is_null(), "{path}: {value}");
+            assert_ne!(value["type"], "error", "{path}: {value}");
+            let delta = match path {
+                "/v1/chat/completions" => value["choices"][0]["delta"]["content"].as_str(),
+                "/v1/completions" => value["choices"][0]["text"].as_str(),
+                "/v1/messages" => value["delta"]["text"].as_str(),
+                _ if value["type"] == "response.output_text.delta" => value["delta"].as_str(),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                content.push_str(delta);
+            }
+        }
+        assert_eq!(content, "b".repeat(3000), "{path}");
+        assert_eq!(state.model.capacity.available_permits(), 4);
+    }
 }
 
 #[tokio::test]

@@ -248,7 +248,11 @@ Each completion batch reserves one admission slot per generated choice. Every
 child is prepared and validated before the group is submitted to the native
 worker. An oversized group is rejected; temporary admission exhaustion returns
 429. Disconnecting a stream cancels all unfinished children, and native work
-drains before its resources are reclaimed. Output queues remain bounded.
+drains before its resources are reclaimed. Pausing reads does not cancel a
+response: its output queue can retain the accepted token limit, requested
+observations and prompt logprobs, and completion. Storage grows with produced
+output. Unread responses continue to occupy admission capacity, even after
+inference finishes and releases its GPU slot.
 
 ## Health and metrics
 
