@@ -3809,7 +3809,31 @@ mod payload_package_tests {
                     description["rebuild"]["source_identity"].as_str(),
                     expected_source
                 );
+                let unverified = crate::runtime_package::unverified_metadata_selected(
+                    path,
+                    crate::runtime_package::InspectionOptions::default(),
+                    rank.map(|value| value as usize),
+                    Some(tp),
+                )
+                .unwrap();
+                assert_eq!(unverified["package"]["signatures_verified"], false);
+                assert_eq!(unverified["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    unverified["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
             }
+            let catalog = crate::runtime_package::unverified_metadata_selected(
+                path,
+                crate::runtime_package::InspectionOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(catalog["rebuild"].is_null());
+            let deployments = catalog["deployments"].as_array().unwrap();
+            let tp2 = deployments.iter().find(|d| d["tensor_parallel"] == 2).unwrap();
+            assert_eq!(tp2["rebuild"]["source_identity"], "tp2-source");
         }
         std::fs::remove_file(packed).unwrap();
         std::fs::remove_dir_all(root).unwrap();
