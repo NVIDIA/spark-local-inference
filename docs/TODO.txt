@@ -1,6 +1,3 @@
-[ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
-    Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
-
 [ ] After merging dev/qwen27b in Flare and FlashInfer, evaluate combined MXFP8
     GDN QKV/Z/B/A projections for Qwen3.8 Flash Next through shared loading and
     execution components. Preserve TP partitioning and compare complete graph

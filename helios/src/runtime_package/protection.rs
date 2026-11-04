@@ -1945,6 +1945,10 @@ impl PayloadVerifiedPackage {
     /// not carry them, and a destination offset is never a payload source offset.
     fn inspection_descriptor(&self) -> Result<wire::ModelIndex> {
         let mut index = self.descriptor()?;
+        index.rebuild = self
+            .verified
+            .deployment()
+            .and_then(|body| body.rebuild.clone());
         for (bundle, (body, package)) in index
             .ranks
             .iter_mut()
@@ -3160,7 +3164,11 @@ mod payload_package_tests {
                     ..Default::default()
                 }),
                 cluster: None,
-                rebuild: None,
+                rebuild: (tp == 2).then(|| crate::runtime_package::wire::RebuildManifest {
+                    version: 99,
+                    source_identity: "tp2-source".into(),
+                    ..Default::default()
+                }),
                 engram: None,
                 payloads: vec![],
                 ranks: vec![],
@@ -3778,6 +3786,33 @@ mod payload_package_tests {
         assert!(!names.contains(&"weights/rank-0.safetensors"), "{names:?}");
         assert!(!names.contains(&"globals/rank-0.safetensors"), "{names:?}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn payload_inspection_reports_selected_deployment_rebuild_metadata() {
+        let (root, publishers, _) = two_deployment_package();
+        let packed = root.with_extension("safetensors");
+        crate::package::conversion::pack(&root, &packed).unwrap();
+        for path in [&root, &packed] {
+            for (tp, rank, expected_version, expected_source) in [
+                (1, None, None, None),
+                (2, None, Some(99), Some("tp2-source")),
+                (2, Some(1), Some(99), Some("tp2-source")),
+            ] {
+                let verified =
+                    VerifiedPackage::open_tensor_parallel(path, &publishers, tp, rank).unwrap();
+                let description = verified
+                    .describe(crate::runtime_package::InspectionOptions::default())
+                    .unwrap();
+                assert_eq!(description["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    description["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
+            }
+        }
+        std::fs::remove_file(packed).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
