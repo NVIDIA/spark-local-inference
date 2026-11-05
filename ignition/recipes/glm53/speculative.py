@@ -173,11 +173,14 @@ class PreparedRound:
         self.sampling_scratch = prepare_sampling_scratch(b, w, o.requests.vocab_size, device, buffers=buffers)
         self.rows, self.columns = torch.arange(b, device=device), torch.arange(w, device=device)
         self.offsets = torch.arange(b * w, device=device)
-        self.state_columns = torch.arange(8, device=device)
+        # Width one carries no drafts to roll back, so its KDA layers decode in place through one state column.
+        recorded = w > 1
+        self.state_columns = torch.arange(8 if recorded else 1, device=device)
         self.convolution_regions = convolution_regions(o.pool)
         self.metadata = DecoderMetadata.allocate(b * w, b, blocks, device)
         self.metadata = DecoderMetadata(self.metadata.token_ids, torch.arange(b * w, device=device),
-            DeltaMetadata.allocate(b, device, verification_columns=8), self.metadata.indexed)
+            DeltaMetadata.allocate(b, device, verification_columns=self.state_columns.numel()),
+            self.metadata.indexed)
         self.validator = PreparedBatch(o.inputs, o.requests, DecoderMetadata.allocate(b, b, blocks, device),
             mode="decode", shard=o.weights.shard, pages=o.pool.memory_capacity[1:], shards=o.shards)
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
@@ -186,11 +189,13 @@ class PreparedRound:
         self.decoder = PreparedDecoder(o.weights, o.scratch.rows(b * w, "decode", sample_rows=b * w),
             o.pool.decoder, self.metadata, mode="decode", session=o.session, name=f"{name}.target",
             workspace=o.workspace, max_cache_pages=o.max_cache_pages, context=o.context,
-            kda_records=o.kda_records, **o.collectives)
-        first = self.decoder.layers[o.kda_records.layers[0]].attention
-        self.kda_commit = PreparedKDACommit(o.pool, o.kda_records, first.recurrent_plan,
-            self.metadata.recurrent.state_indices[:, 0], self.metadata.recurrent.num_seqs,
-            session=o.session, workspace=o.workspace)
+            kda_records=o.kda_records if recorded else None, **o.collectives)
+        self.kda_commit = None
+        if recorded:
+            first = self.decoder.layers[o.kda_records.layers[0]].attention
+            self.kda_commit = PreparedKDACommit(o.pool, o.kda_records, first.recurrent_plan,
+                self.metadata.recurrent.state_indices[:, 0], self.metadata.recurrent.num_seqs,
+                session=o.session, workspace=o.workspace)
         self.draft_metadata = DraftMetadata(b, b, blocks, device, shards=o.shards)
         self.draft = o.draft(self.draft_metadata, f"{name}.draft") if w > 1 else None
         self.draft_logits = (buffers.zeros(self.draft.logits.shape, self.draft.logits.dtype)
@@ -206,7 +211,8 @@ class PreparedRound:
         self.probabilities = buffers.zeros((b, w - 1, o.requests.vocab_size), torch.float32)
         self.valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
         self.seed, self.offset, self.base_offset, self.sampled = (torch.zeros_like(self.before) for _ in range(4))
-        self.tail_backup = torch.empty_like(o.pool.draft.index.tail[:b])
+        # Draft passes advance the draft C4 tail ring, which is restored before absorbing the accepted tokens.
+        self.tail_backup = torch.empty_like(o.pool.draft.index.tail[:b]) if self.draft is not None else None
         self.broadcast_buffers, self.name = buffers, name
         self.operations = None
 
@@ -256,8 +262,9 @@ class PreparedRound:
         g.convolution_slots.copy_(torch.where(self.active, states[:, 0], -1))
         g.fresh.zero_()
         g.accepted_tokens.fill_(1)
-        # Verification reads each request's live row in column zero and records its tokens.
-        states = torch.where(self.state_columns < 1, states, 0)
+        # Verification reads each request's live row in column zero and records its tokens; width one
+        # advances that row in place.
+        states = torch.where(self.state_columns < 1, states[:, :self.state_columns.numel()], 0)
         g.state_indices.copy_(torch.where(self.active[:, None], states, 0))
         g.num_seqs.copy_(o.inputs.live_rows.clamp(0, b))
         g.num_tokens.copy_(ends[-1:])
@@ -276,20 +283,25 @@ class PreparedRound:
         m.sample_indices.copy_((starts[:, None] + self.columns).clamp(0, b * w - 1).reshape(-1))
 
     def commit_state(self, slots, counts):
-        """Replay each live KDA row's accepted records for every layer, then shift its convolution history."""
+        """Replay each live KDA row's accepted records for every layer, then shift its convolution history.
+
+        Width one has already advanced each live KDA row, and its single token leaves the convolution
+        history in place, so it saves only the target output.
+        """
         o, w = self.owner, self.width
         states = o.inputs.request_state_rows[slots.clamp(0, o.requests.capacity - 1)]
         live = torch.where(counts > 0, states[:, 0], 0).long()
-        self.kda_commit(counts)
-        backing = o.pool.backing
-        halves, channels, columns = self.convolution_regions
-        args = (backing.view(torch.bfloat16), slots, counts, o.inputs.request_state_rows, halves,
-                backing.shape[1] // 2, channels, columns, 128)
-        grid = (halves.numel(), self.batch, triton.cdiv(channels, 128))
-        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
-            torch.library.wrap_triton(_shift_convolution)[grid](*args, num_warps=4)
-        else:
-            _shift_convolution[grid](*args, num_warps=4)
+        if self.kda_commit is not None:
+            self.kda_commit(counts)
+            backing = o.pool.backing
+            halves, channels, columns = self.convolution_regions
+            args = (backing.view(torch.bfloat16), slots, counts, o.inputs.request_state_rows, halves,
+                    backing.shape[1] // 2, channels, columns, 128)
+            grid = (halves.numel(), self.batch, triton.cdiv(channels, 128))
+            if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+                torch.library.wrap_triton(_shift_convolution)[grid](*args, num_warps=4)
+            else:
+                _shift_convolution[grid](*args, num_warps=4)
         hidden = self.decoder.scratch.hidden.view(self.batch, w, 4096)
         selected_hidden = hidden[self.rows, (counts - 1).clamp_min(0).long()]
         save_hidden(selected_hidden, o.pool.last_hidden,
@@ -315,7 +327,8 @@ class PreparedRound:
         self.before.copy_(o.requests.consumed_tokens[safe])
         self.pending.copy_(o.requests.pending_token[safe])
         gather_rows(o.pool.last_hidden, o.inputs.request_state_rows[safe, 0], self.previous)
-        gather_rows(o.pool.draft.index.tail, o.inputs.request_state_rows[safe, 0], self.tail_backup)
+        if self.tail_backup is not None:
+            gather_rows(o.pool.draft.index.tail, o.inputs.request_state_rows[safe, 0], self.tail_backup)
         self.base_offset.copy_(torch.where(o.draft_generation[safe] == o.requests.generation[safe], o.draft_offset[safe], 0))
         self.seed.copy_(o.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN)
         for i, proposal in enumerate(proposals):
@@ -346,9 +359,10 @@ class PreparedRound:
         verify()
         commit()
         self.commit_state(slots, commit.emitted_count)
-        tail = o.pool.draft.index.tail
-        save_hidden(self.tail_backup.view(b, -1), tail.view(tail.shape[0], -1),
-                    o.inputs.request_state_rows[safe, 0], self.active)
+        if self.tail_backup is not None:
+            tail = o.pool.draft.index.tail
+            save_hidden(self.tail_backup.view(b, -1), tail.view(tail.shape[0], -1),
+                        o.inputs.request_state_rows[safe, 0], self.active)
         hidden = torch.cat((self.previous[:, None], self.decoder.scratch.hidden.view(b, w, 4096)[:, :-1]), dim=1)
         self.absorb_metadata.set(slots, commit.emitted_count.long(), self.before - 1,
             self.candidates, hidden, o.draft_tables, state_rows=o.inputs.request_state_rows, capacity=w)
