@@ -63,6 +63,7 @@ ignition export  [MODEL] [flags]                prepare a model in the shared ca
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
 ignition bench [MODEL] [flags]                   measure prepared decode-round or prefill graph latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
+ignition edit PACKAGE --output PATH [flags]      edit frontend metadata without preparing the model
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
@@ -1017,6 +1018,34 @@ repository with the Hugging Face upload client as either canonical form. Export
 and conversion do not upload or change publisher trust. Removing an entry removes
 its hard links; shared payload objects remain available for other entries, and
 `flare models gc` reclaims objects nothing references.
+
+### Editing package frontend metadata
+
+`ignition edit` creates a development-signed copy of a payload-format package.
+`--served-model-name NAME` replaces the served alias in every deployment while
+preserving the canonical model identity. `--chat-template FILE` replaces the
+packaged UTF-8 Jinja template. The native renderer validates its syntax and
+message-boundary marks; templates for non-Jinja prompt encoders cannot be replaced.
+At least one edit is required, and `--output` must not exist.
+
+```sh
+ignition edit /data/flare-runtime/model --output /data/flare-runtime/model-medium \
+  --served-model-name nvidia/Qwen3.8-27B-NVFP4 \
+  --chat-template /data/flare-runtime/chat-template-medium.jinja \
+  --development-publisher /data/flare-runtime/development-publisher.json
+```
+
+The source stays unchanged. Stored weights, compressed kernels, CUDA graphs, and
+execution capacities retain their exact bytes. Editing does not load a model,
+compile, capture, or recompress executables. Companions are hardlinked on the same
+filesystem and copied otherwise. Source signatures and structural metadata are
+validated; unchanged weight bytes are not rehashed.
+
+`--publisher-keys PATH` adds source public profiles and can be repeated.
+`--development-publisher PATH` supplies a development source profile; it defaults
+to `development-publisher.json` beside the configuration file. The output always
+uses the local development key beside that configuration, regardless of configured
+production publishing settings. Use `ignition sign` afterward for publication.
 
 ### Signing and local development
 

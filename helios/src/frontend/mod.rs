@@ -25,6 +25,12 @@ use tokenizers::Tokenizer;
 
 use crate::{Error, Failure, FrontendError, Result};
 
+pub(crate) fn validate_chat_template(source: &str) -> Result<()> {
+    templates::compile(source).map(|_| ()).map_err(|error| {
+        Error::frontend(FrontendError::Template(Failure::caused_by(error.to_string(), error)))
+    })
+}
+
 pub struct Asset {
     pub path: PathBuf,
     pub sha256: String,
