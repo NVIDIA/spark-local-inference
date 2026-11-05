@@ -786,10 +786,10 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare packages, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `gb10` and `gb202`. Automatic selection
+are separate Hugging Face revisions named `gb10`, `gb202`, and `gb300`. Automatic selection
 queries the selected GPUs' PCI device identifiers through NVML without initializing
 CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`. All selected GPUs must belong to the same family.
+6000 Blackwell, select `gb202`; GB300 selects `gb300`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -820,7 +820,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
