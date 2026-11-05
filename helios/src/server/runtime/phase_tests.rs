@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 use std::ops::ControlFlow;
 use std::sync::atomic::AtomicUsize;
 
+#[path = "response_lifecycle_tests.rs"]
+mod response_lifecycle_tests;
+
 struct Fixture {
     config: ModelConfig,
     frontend: Frontend,
