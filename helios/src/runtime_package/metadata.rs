@@ -57,8 +57,8 @@ pub fn unverified_metadata_selected(
     let (file, _, payload_bytes, bytes) = Archive::envelope(path)?;
     let envelope = wire::ProtectedIndex::decode(bytes.as_slice())
         .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
-    if envelope.version != 6
-        || envelope.groups.len() != 3
+    super::protection::ExecutableEncoding::from_version(envelope.version)?;
+    if envelope.groups.len() != 3
         || envelope
             .groups
             .iter()

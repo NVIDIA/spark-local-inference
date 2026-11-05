@@ -5,14 +5,15 @@ owned until their final submitted use completes or shutdown confirms a drain.
 Early reuse can corrupt another request's state.
 Rank-control checks cover readiness and completion predicates guarding
 tensor-parallel submission and queue removal.
-Additional checks cover prefix-checkpoint ownership, speculative scheduling
-arithmetic, snapshot backing aliases, and multi-rank offload reply aggregation.
+Additional checks cover native response admission and buffered events,
+prefix-checkpoint ownership, speculative scheduling arithmetic, snapshot backing
+aliases, and multi-rank offload reply aggregation.
 
 ## Run the check
 
 Install Java 11 or later and download the
 [TLA+ tools 1.7.4 jar](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4).
-The check uses Python 3, Cargo, `protoc`, and the default Helios library test dependencies.
+The check uses Python 3, Cargo, `protoc`, and Helios's `server` test dependencies.
 It requires no CUDA device or model checkpoint. Java 21.0.13 and Rust 1.94.1
 are tested tool versions.
 
@@ -86,6 +87,51 @@ pending submission counts, stale handles and plans, malformed generation
 completions, and duplicate or out-of-order completion rejection. Retained plans
 exercise commit rejection with a full window or pending feedback barrier. Rejected
 operations preserve the test's observed state.
+
+## Response ownership
+
+`ResponseLifecycle.tla` checks three reusable response cells, two host admission
+permits, and one- or two-choice generation groups. Each response has independent
+producer and reader owners, a bounded event queue, publication and consumption
+counts, cancellation, and a terminal marker. A group retains its entire permit
+reservation while any producer or reader in that group survives. Producer
+retirement and reader release are separate actions; reading an event does not
+release admission. Cells and group reservations can be reused without an
+admission-count cutoff.
+
+The invariants independently derive required admission from the owner sets and
+compare it with observed semaphore availability. They also require event
+conservation while a reader survives, bounded total retained events, and
+cancellation of a producer whose reader was dropped. The producer contract in
+this model allows two nonterminal events and one terminal event per response,
+with queue capacity five. It does not prove the scheduler's output-limit
+arithmetic, payload byte sizes, or Tokio's internal queue implementation.
+
+`server::runtime::phase_tests::response_lifecycle_tests::native_responses_match_lifecycle_model`
+replays operation sequences through depth ten against production
+`ModelRuntime::generate_many`, `Incoming::emit` and `fail`, native event receivers,
+and the `Incoming` and `Generation` destructors. It observes semaphore permits,
+actual producer/reader ownership, and queue lengths. A 28-integer projection
+contains available permits, three group reservation sizes, and each cell's group,
+producer, reader, publication, consumption, queue, terminal, and cancellation
+fields. All observed edges are checked against `ResponseLifecycle.AllowedEdge`.
+Equivalent projected states are pruned; this is bounded conformance, not
+exhaustive exploration of all Rust state. Repeated grouped admission and release
+also exercises reuse of the same runtime.
+
+The runner separately drives worker completion through synthetic completion
+records to check that unread output releases model slots while retaining host
+admission, including a reasoning continuation. An HTTP test checks all four
+streaming protocols while terminal frames retain ingress admission after native
+generation handles have been released. These checks exercise the production
+host paths without a GPU. HTTP encoder state is outside the TLA+ projection.
+The non-streaming JSON path releases admission before its serialized body is
+consumed. The response ownership model does not cover that path.
+
+Response mutations remove either producer or reader permit ownership, undercount
+a generation group's admission, shrink the queue below its promised budget, and
+release a model reservation when only its producer has retired. Each fault must
+fail the corresponding Rust assertion or TLA+ admission invariant.
 
 ## Rank coordination
 

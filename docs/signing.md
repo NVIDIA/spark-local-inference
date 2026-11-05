@@ -121,8 +121,15 @@ Invalid packages fail before publication, and existing destinations are never
 overwritten. Weight identities remain independent of executable resources.
 
 No checkpoint reload, compilation, graph capture, or GPU access is required.
-The operation reads source payloads to verify them, including the weight bytes.
-Allow disk space for the output and temporary decoded executable resources.
+The operation hashes every source payload once, including the weight bytes, as
+it installs the payload in the output. A source companion that is already the
+payload's deterministic wrapper is hard-linked into the output on the same
+filesystem and hashed through the link; other payloads, and every payload on
+another filesystem, are copied and the written bytes hashed. Up to eight
+payloads install concurrently. Combining several source deployments first
+hashes their payloads with progress, because derivation planning reads them.
+Allow disk space for temporary decoded executable resources, and for copied
+payloads when the output is on another filesystem.
 Temporary files reside in a private directory beside the destination and are
 removed on normal completion or error. A forced kill can leave that directory;
 remove it only after confirming no signing process is using it. The source

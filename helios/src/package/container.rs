@@ -478,6 +478,19 @@ fn header_bytes(format: &str, layout: &[(String, u64, u64, Source<'_>)]) -> Resu
     Ok(header)
 }
 
+/// Bytes that precede the payload in the deterministic companion wrapper for
+/// `nbytes` payload bytes: the header length and the padded header.
+pub(crate) fn companion_prefix(nbytes: u64) -> Result<Vec<u8>> {
+    if nbytes == 0 {
+        return Err(invalid("package payload tensors must not be empty"));
+    }
+    let layout = [(COMPANION_TENSOR.to_owned(), 0, nbytes, Source::Zero(nbytes))];
+    let header = header_bytes(PAYLOAD_FORMAT, &layout)?;
+    let mut prefix = (header.len() as u64).to_le_bytes().to_vec();
+    prefix.extend_from_slice(&header);
+    Ok(prefix)
+}
+
 fn write_source<W: Write>(
     output: &mut W,
     name: &str,

@@ -1,6 +1,6 @@
 ---
 name: helios-lifecycle
-description: Check Helios scheduler, checkpoint cache, offload, and threaded rank lifecycles with TLA+ and Rust conformance, and completion/state-view validators with Kani. Use when changing admission, speculation, cancellation, fences, generations, cache compaction, snapshot aliases, offload aggregation, drain handling, readiness, or validation arithmetic.
+description: Check Helios scheduler, response ownership, checkpoint cache, offload, and threaded rank lifecycles with TLA+ and Rust conformance, and completion/state-view validators with Kani. Use when changing admission, output buffering, response lifetime, speculation, cancellation, fences, generations, cache compaction, snapshot aliases, offload aggregation, drain handling, readiness, or validation arithmetic.
 ---
 
 # Helios lifecycle
@@ -9,8 +9,10 @@ Read `verification/helios-lifecycle/README.md` for the covered Rust functions,
 state projection, bounds, assumptions, tool setup, and command. This check covers
 scheduler ownership under an executor completion/drain contract and the actual
 threaded rank bookkeeping helpers, checkpoint ownership, speculative accounting,
-snapshot backing aliases, and offload aggregation. CUDA execution, the surrounding controller,
-and coordinated drain require their own execution checks. Kani harnesses cover
+snapshot backing aliases, offload aggregation, and native response admission and
+event ownership. Response checks also exercise worker completion, reasoning
+continuation, and HTTP admission through terminal stream frames. CUDA execution,
+the surrounding controller, and coordinated drain require their own execution checks. Kani harnesses cover
 sequential validator properties. Use `docs/verification.md` to select the checks
 for an affected property.
 

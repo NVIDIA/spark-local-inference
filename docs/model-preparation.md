@@ -194,6 +194,12 @@ SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
 ```
 
+Startup races in one preparation share fixture and timing storage. Cold races
+read an existing checkpoint allocation on the same GPU when it is at least
+twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
+enough, the races use one shared eviction buffer. Re-export a package to reduce
+its resident startup storage with this preparation path.
+
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving

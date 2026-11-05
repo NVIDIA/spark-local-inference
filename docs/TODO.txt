@@ -1,3 +1,8 @@
+[ ] Restore loading and serving for packages with separate proposal and verification
+    graphs, whose operation identifiers 10, 11, and 13 are reserved in
+    helios/proto/runtime_package.proto. Validate their original captured graphs
+    through native serving without re-export or re-signing.
+
 [ ] After merging dev/qwen27b in Flare and FlashInfer, evaluate combined MXFP8
     GDN QKV/Z/B/A projections for Qwen3.8 Flash Next through shared loading and
     execution components. Preserve TP partitioning and compare complete graph

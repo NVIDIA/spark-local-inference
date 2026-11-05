@@ -16,7 +16,7 @@ use crate::Result;
 use crate::os::FileReadAt;
 use crate::package::{protection as payload_auth, reader as payload_reader};
 use prost::Message;
-use ring::{digest, signature};
+use ring::{aead, digest, hkdf, signature};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
@@ -140,9 +140,10 @@ impl PackageClaim {
         let (_, _, _, bytes) = Archive::envelope(path)?;
         let envelope = wire::ProtectedIndex::decode(bytes.as_slice())
             .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
-        if envelope.version != 6 || envelope.signer.len() != 32 || envelope.groups.is_empty() {
+        ExecutableEncoding::from_version(envelope.version)?;
+        if envelope.signer.len() != 32 || envelope.groups.is_empty() {
             return Err(invalid(
-                "signed format-6 package required; re-export the checkpoint",
+                "invalid signed package envelope",
             ));
         }
         let metadata = wire::PublisherMetadata::decode(envelope.groups[0].body.as_slice())
@@ -181,16 +182,37 @@ fn fields(values: &[&[u8]]) -> Vec<u8> {
     }
     result
 }
-fn signature_message(package: &[u8], signer: &[u8], kind: u32, body: &[u8]) -> Vec<u8> {
-    fields(&[
-        b"flare-package-signature-v6",
-        &6u32.to_le_bytes(),
-        package,
-        signer,
-        &kind.to_le_bytes(),
-        body,
-    ])
+#[derive(Clone, Copy)]
+pub(super) enum ExecutableEncoding {
+    EncryptedV4,
+    CompressedV6,
 }
+impl ExecutableEncoding {
+    pub(super) fn from_version(version: u32) -> Result<Self> {
+        match version {
+            4 => Ok(Self::EncryptedV4),
+            6 => Ok(Self::CompressedV6),
+            _ => Err(invalid(format!(
+                "unsupported signed package format {version}"
+            ))),
+        }
+    }
+    fn signature_message(self, package: &[u8], signer: &[u8], kind: u32, body: &[u8]) -> Vec<u8> {
+        let (domain, version): (&[u8], u32) = match self {
+            Self::EncryptedV4 => (b"flare-package-signature-v4", 4),
+            Self::CompressedV6 => (b"flare-package-signature-v6", 6),
+        };
+        fields(&[
+            domain,
+            &version.to_le_bytes(),
+            package,
+            signer,
+            &kind.to_le_bytes(),
+            body,
+        ])
+    }
+}
+
 pub struct LegacyVerified {
     pub(super) archive: Archive,
     pub(super) index: wire::ModelIndex,
@@ -769,6 +791,8 @@ pub(super) struct Protection {
     license: Option<PackageLicense>,
     /// The explicitly accepted publisher namespace.
     accepted: Option<String>,
+    encoding: ExecutableEncoding,
+    package_id: Vec<u8>,
     resources: BTreeMap<u64, (bool, wire::ProtectedResource)>,
     /// Stored-data ranges: what every rank shares, then each verified rank's in index order.
     data: Vec<wire::StoredData>,
@@ -847,32 +871,46 @@ fn initializer_spans(
 fn add_catalog(
     resources: &mut BTreeMap<u64, (bool, wire::ProtectedResource)>,
     catalog: wire::ResourceCatalog,
-    compressed: bool,
+    executable: bool,
+    encoding: ExecutableEncoding,
     payload_size: u64,
 ) -> Result<()> {
     for entry in catalog.resources {
         let maximum = crate::package::schema::MAX_EXECUTABLE_CHUNKS * CHUNK as u64;
-        let count = if compressed {
-            entry.stored_bytes.div_ceil(CHUNK as u64)
-        } else {
-            1
+        let (count, stored_size_valid) = match (executable, encoding) {
+            (true, ExecutableEncoding::EncryptedV4) => {
+                let count = entry.plain_bytes.div_ceil(CHUNK as u64);
+                let stored = count
+                    .checked_mul(16)
+                    .and_then(|tags| entry.plain_bytes.checked_add(tags));
+                (count, stored == Some(entry.stored_bytes))
+            }
+            (true, ExecutableEncoding::CompressedV6) => {
+                (entry.stored_bytes.div_ceil(CHUNK as u64), true)
+            }
+            (false, _) => (1, entry.stored_bytes == entry.plain_bytes),
         };
-        if entry.plain_bytes == 0 || entry.stored_bytes == 0
-            || entry.plain_bytes > maximum || entry.stored_bytes > maximum
-            || (!compressed && entry.stored_bytes != entry.plain_bytes)
+        if entry.plain_bytes == 0
+            || entry.stored_bytes == 0
+            || entry.plain_bytes > maximum
+            || entry.stored_bytes > maximum
+            || !stored_size_valid
             || count != entry.sha256.len() as u64
             || entry.sha256.iter().any(|h| h.len() != 32)
             || entry
                 .offset
                 .checked_add(entry.stored_bytes)
                 .is_none_or(|end| end > payload_size)
-            || resources.insert(entry.offset, (compressed, entry)).is_some()
+            || resources
+                .insert(entry.offset, (executable, entry))
+                .is_some()
         {
             return Err(invalid("invalid protected resource catalog"));
         }
     }
     Ok(())
 }
+
 fn stored_data(
     mut data: wire::StoredData,
     payload_size: u64,
@@ -935,14 +973,14 @@ impl Protection {
     ) -> Result<(Self, wire::ModelIndex)> {
         let envelope = wire::ProtectedIndex::decode(bytes)
             .map_err(|e| invalid(format!("invalid signed envelope: {e}")))?;
-        if envelope.version != 6
-            || envelope.package_id.len() != 32
+        let encoding = ExecutableEncoding::from_version(envelope.version)?;
+        if envelope.package_id.len() != 32
             || envelope.signer.len() != 32
             || envelope.groups.len() != 3
             || envelope.ranks.is_empty()
         {
             return Err(invalid(
-                "signed format-6 package required; re-export the checkpoint",
+                "invalid signed package envelope",
             ));
         }
         let publisher = publishers
@@ -961,7 +999,7 @@ impl Protection {
             }
             signature::UnparsedPublicKey::new(&signature::ED25519, publisher.public_key)
                 .verify(
-                    &signature_message(
+                    &encoding.signature_message(
                         &envelope.package_id,
                         &envelope.signer,
                         group.kind,
@@ -1029,7 +1067,7 @@ impl Protection {
         let mut resources = BTreeMap::new();
         let shared = wire::ResourceCatalog::decode(envelope.groups[1].body.as_slice())
             .map_err(|e| invalid(e.to_string()))?;
-        add_catalog(&mut resources, shared, false, payload_size)?;
+        add_catalog(&mut resources, shared, false, encoding, payload_size)?;
         let shared = wire::StoredData::decode(envelope.groups[2].body.as_slice())
             .map_err(|e| invalid(e.to_string()))?;
         let mut data = vec![stored_data(shared, payload_size, index.version)?];
@@ -1048,12 +1086,14 @@ impl Protection {
                 &mut resources,
                 signed.executables.unwrap_or_default(),
                 true,
+                encoding,
                 payload_size,
             )?;
             add_catalog(
                 &mut resources,
                 signed.support.unwrap_or_default(),
                 false,
+                encoding,
                 payload_size,
             )?;
             data.push(stored_data(stored, payload_size, index.version)?);
@@ -1064,6 +1104,8 @@ impl Protection {
             official_source: metadata.official_source,
             license,
             accepted: None,
+            encoding,
+            package_id: envelope.package_id,
             resources,
             data,
             rank,
@@ -1205,11 +1247,11 @@ impl Protection {
                 primary_end = end;
             }
             if kind != 4 {
-                let (compressed, entry) = self
+                let (executable, entry) = self
                     .resources
                     .get(&span.offset)
                     .ok_or_else(|| invalid("unsigned executable or supporting resource"))?;
-                if *compressed != (kind == 2) || entry.stored_bytes != span.nbytes {
+                if *executable != (kind == 2) || entry.stored_bytes != span.nbytes {
                     return Err(invalid("resource signature classification mismatch"));
                 }
                 if ranges.iter().any(|range| {
@@ -1261,7 +1303,7 @@ impl Protection {
         Ok(())
     }
     pub fn reader(&self, file: Arc<File>, start: u64, span: &wire::Span) -> Result<ResourceReader> {
-        let (compressed, entry) = self
+        let (executable, entry) = self
             .resources
             .get(&span.offset)
             .ok_or_else(|| invalid("resource lacks publisher authentication"))?;
@@ -1269,9 +1311,27 @@ impl Protection {
             return Err(invalid("resource length mismatch"));
         }
         if self.accepted.as_deref() != Some(self.publisher.namespace.as_str()) {
-            return Err(invalid("publisher acceptance required before resource access"));
+            return Err(invalid(
+                "publisher acceptance required before resource access",
+            ));
         }
-        let inner = if *compressed {
+        let inner = if *executable && matches!(self.encoding, ExecutableEncoding::EncryptedV4) {
+            ResourceContents::Encrypted(EncryptedResourceReader {
+                file,
+                start,
+                entry: entry.clone(),
+                package_id: self.package_id.clone(),
+                key: encrypted_resource_key(
+                    &self.publisher.public_key,
+                    &self.package_id,
+                    entry.offset,
+                    self.publisher.namespace.as_str(),
+                )?,
+                chunk: 0,
+                buffer: Vec::new(),
+                position: 0,
+            })
+        } else if *executable {
             ResourceContents::Compressed(payload_auth::open_compressed_reader(
                 PinnedSlice::new(&file, start, entry.stored_bytes)?,
                 entry.stored_bytes,
@@ -1280,17 +1340,22 @@ impl Protection {
             )?)
         } else {
             let mut bytes = vec![0; super::protobuf::size(entry.stored_bytes)?];
-            file.read_exact_at(&mut bytes, start).map_err(|error| error.to_string())?;
+            file.read_exact_at(&mut bytes, start)
+                .map_err(|error| error.to_string())?;
             if entry.sha256.len() != 1 || sha256(&bytes) != entry.sha256[0] {
                 return Err(invalid("publisher resource content verification failed"));
             }
             ResourceContents::Plain(io::Cursor::new(bytes))
         };
-        Ok(ResourceReader { length: entry.plain_bytes, inner })
+        Ok(ResourceReader {
+            length: entry.plain_bytes,
+            inner,
+        })
     }
 }
 
 enum ResourceContents {
+    Encrypted(EncryptedResourceReader),
     Compressed(payload_auth::ResourceReader<PinnedSlice>),
     Plain(io::Cursor<Vec<u8>>),
 }
@@ -1307,11 +1372,115 @@ impl ResourceReader {
 impl Read for ResourceReader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
+            ResourceContents::Encrypted(reader) => reader.read(output),
             ResourceContents::Compressed(reader) => reader.read(output),
             ResourceContents::Plain(reader) => reader.read(output),
         }
     }
 }
+
+fn encrypted_resource_key(
+    public_key: &[u8],
+    package: &[u8],
+    offset: u64,
+    namespace: &str,
+) -> Result<aead::LessSafeKey> {
+    let info = fields(&[
+        b"flare-executable-v3",
+        &offset.to_le_bytes(),
+        namespace.as_bytes(),
+    ]);
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, package).extract(public_key);
+    let parts = [info.as_slice()];
+    let mut key = [0; 32];
+    prk.expand(&parts, hkdf::HKDF_SHA256)
+        .map_err(|_| invalid("derive executable key"))?
+        .fill(&mut key)
+        .map_err(|_| invalid("derive executable key"))?;
+    Ok(aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, &key)
+            .map_err(|_| invalid("invalid executable key"))?,
+    ))
+}
+fn encrypted_aad(package: &[u8], offset: u64, size: u64, chunk: u64) -> Vec<u8> {
+    fields(&[
+        b"flare-executable-chunk-v3",
+        package,
+        &offset.to_le_bytes(),
+        &size.to_le_bytes(),
+        &chunk.to_le_bytes(),
+    ])
+}
+
+struct EncryptedResourceReader {
+    file: Arc<File>,
+    start: u64,
+    entry: wire::ProtectedResource,
+    package_id: Vec<u8>,
+    key: aead::LessSafeKey,
+    chunk: usize,
+    buffer: Vec<u8>,
+    position: usize,
+}
+impl EncryptedResourceReader {
+    fn refill(&mut self) -> Result<bool> {
+        if self.chunk == self.entry.sha256.len() {
+            return Ok(false);
+        }
+        let plain_offset = self.chunk as u64 * CHUNK as u64;
+        let count = (self.entry.plain_bytes - plain_offset).min(CHUNK as u64) + 16;
+        self.buffer.resize(super::protobuf::size(count)?, 0);
+        self.file
+            .read_exact_at(
+                &mut self.buffer,
+                self.start + plain_offset + self.chunk as u64 * 16,
+            )
+            .map_err(|e| e.to_string())?;
+        if sha256(&self.buffer) != self.entry.sha256[self.chunk] {
+            return Err(invalid("publisher resource content verification failed"));
+        }
+        let key = &self.key;
+        let mut nonce = [0; 12];
+        nonce[4..].copy_from_slice(&(self.chunk as u64).to_be_bytes());
+        let length = key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(encrypted_aad(
+                    &self.package_id,
+                    self.entry.offset,
+                    self.entry.plain_bytes,
+                    self.chunk as u64,
+                )),
+                &mut self.buffer,
+            )
+            .map_err(|_| invalid("executable decryption failed"))?
+            .len();
+        self.buffer.truncate(length);
+        self.chunk += 1;
+        self.position = 0;
+        Ok(true)
+    }
+}
+impl Read for EncryptedResourceReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.position == self.buffer.len()
+            && !self.refill().map_err(|e| io::Error::other(e.to_string()))?
+        {
+            return Ok(0);
+        }
+        let n = output.len().min(self.buffer.len() - self.position);
+        output[..n].copy_from_slice(&self.buffer[self.position..self.position + n]);
+        self.position += n;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+#[path = "protection/legacy_tests.rs"]
+mod legacy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -118,11 +118,20 @@ weight loading. Successful single-request generation does not cover these cases.
 
 On RTX Spark, CUDA's free and total memory include the dedicated GPU carveout
 and shared system memory. Windows reports only CPU-visible RAM through its
-physical-memory API; NVML reports only the dedicated carveout. GPU planning and
-cache sizing use CUDA's combined budget. Compiler and tuning worker budgets are
-also bounded by available CPU-visible RAM. The configured reserve, driver margin,
-and integrated-GPU host headroom are subtracted before allocating caches.
-Page-file capacity is not GPU memory.
+physical-memory API; NVML reports only the dedicated carveout. GPU planning uses
+CUDA's combined budget. Compiler and tuning worker budgets are also bounded by
+available CPU-visible RAM.
+
+WDDM charges every CUDA allocation, including the dedicated carveout, against the
+system commit limit: CPU-visible RAM plus the page files. Windows grows a
+system-managed page file on demand up to a maximum it chooses, about three times
+RAM. Serving sizes caches from the smaller of CUDA's free memory and the commit the
+process can obtain once every page file reaches its maximum size, then subtracts the
+configured reserve, driver margin, and integrated-GPU host headroom, so the reserve
+remains available to other processes as commit. Page-file capacity is not GPU
+memory, but it bounds GPU allocations: when RAM plus the maximum page-file size is
+smaller than the server's footprint plus other processes' commit, KV capacity
+shrinks to fit. A custom page-file maximum raises that limit without consuming RAM.
 
 The runtime preserves the package's recorded virtual addresses. Linux registers
 host pages for mapped graph storage. Windows uses host-backed CUDA VMM with CPU

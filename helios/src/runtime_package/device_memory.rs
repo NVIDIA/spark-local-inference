@@ -123,10 +123,12 @@ impl NativeResources {
                         "cuDeviceGetPCIBusId",
                         (driver.device_pci_bus_id)(pci.as_mut_ptr(), pci.len() as c_int, device),
                     )?;
+                    // Both remain bounded by the commit this process can obtain.
                     status
                         .ullAvailPhys
                         .saturating_add(discrete_free(&pci)?)
                         .min(total as u64)
+                        .min(super::memory::commit_available()?)
                 }
             };
             Ok(MemorySnapshot {

@@ -20,7 +20,9 @@ CHECKS = [("Lifecycle", TEST, "LIFECYCLE_EDGE ", 14),
           ("CacheOwnership", "cache::lifecycle_tests::bounded_cache_ownership_matches_tla",
            "CACHE_OWNERSHIP_EDGE ", 29),
           ("Speculation", "scheduler::speculative_lifecycle_tests::scheduler_matches_speculative_accounting_model",
-           "SPECULATION_EDGE ", 6)]
+           "SPECULATION_EDGE ", 6),
+          ("ResponseLifecycle", "server::runtime::phase_tests::response_lifecycle_tests::native_responses_match_lifecycle_model",
+           "RESPONSE_EDGE ", 28)]
 MODELS = [check[0] for check in CHECKS] + ["RankDispatch"]
 
 
@@ -140,7 +142,8 @@ def main():
         for module in MODELS:
             run(tlc(args.java, jar, directory, module), cwd=directory)
         run(tlc(args.java, jar, directory, "Speculation", "Speculation16.cfg"), cwd=directory)
-        cargo = ["cargo", "test", "--locked", "--manifest-path", "helios/Cargo.toml", "--lib"]
+        cargo = ["cargo", "test", "--locked", "--manifest-path", "helios/Cargo.toml", "--lib",
+                 "--features", "server"]
         if args.target_dir:
             cargo.extend(["--target-dir", str(args.target_dir.resolve())])
         for module, test, prefix, width in CHECKS:
@@ -150,7 +153,10 @@ def main():
         for test in ["cache::lifecycle_tests::reclaimable_projection_matches_eviction_with_pins",
                      "scheduler::speculative_lifecycle_tests::packed_two_lane_completions_validate_atomically_for_bounded_geometry",
                      "scheduler::speculative_lifecycle_tests::terminal_noop_and_cancel_preserve_queued_speculative_storage",
-                     "scheduler::cache_memory::tests::all_two_snapshot_alias_layouts_preserve_page_ownership_and_reservation_budget"]:
+                     "scheduler::cache_memory::tests::all_two_snapshot_alias_layouts_preserve_page_ownership_and_reservation_budget",
+                     "server::runtime::phase_tests::unread_responses_finish_and_release_model_resources_but_retain_admission_capacity",
+                     "server::runtime::phase_tests::unread_response_keeps_its_budget_through_a_reasoning_continuation",
+                     "server::runtime::phase_tests::response_lifecycle_tests::terminal_stream_frames_retain_http_admission_after_native_retirement"]:
             output = run(cargo + [test, "--", "--exact"])
             if "1 passed; 0 failed" not in output:
                 raise RuntimeError(f"{test} did not execute successfully")
@@ -168,6 +174,8 @@ def main():
                  "!.nodes[child][6] = U(before, child)]", "InheritedLastUse"),
                 ("Speculation", "Advance(st, ceiling) == Min(ceiling, Geometry(st)[7])",
                  "Advance(st, ceiling) == ceiling", "PendingUsesPhysicalCapacity"),
+                ("ResponseLifecycle", "rows[r].group = group /\\ Owned(rows[r])",
+                 "rows[r].group = group /\\ rows[r].producer = 1", "AdmissionRetained"),
             ]:
                 check_model_mutation(directory, args.java, jar, module, needle, replacement, invariant)
             check_mutations(cargo, ROOT / "helios/src/scheduler.rs", TEST, [
@@ -197,6 +205,18 @@ def main():
             check_mutations(cargo, ROOT / "helios/src/offload/transfer.rs", CHECKS[2][1], [
                 ("premature transfer aggregation", "if pending.remaining > 0 {", "if pending.remaining > 1 {",
                  "accepted rank replies must retain pending ownership until the final reply"),
+            ])
+            check_mutations(cargo, ROOT / "helios/src/server/runtime.rs", CHECKS[5][1], [
+                ("unread response admission", "_capacity: Some(capacity.clone()),\n                admission: admitted,",
+                 "_capacity: None,\n                admission: admitted,",
+                 "retained output lost its admission reservation"),
+                ("unfinished producer admission", "_capacity: Some(capacity.clone()),\n                arrival_ns:",
+                 "_capacity: None,\n                arrival_ns:",
+                 "retained output lost its admission reservation"),
+                ("generation group admission", ".try_acquire_many_owned(count)",
+                 ".try_acquire_many_owned(1)", "retained output lost its admission reservation"),
+                ("undersized response queue", "async_mpsc::channel(event_capacity);",
+                 "async_mpsc::channel(2);", "response queue must cover its complete output allowance"),
             ])
             check_mutations(cargo, ROOT / "helios/src/scheduler.rs", CHECKS[4][1], [
                 ("physical pending capacity", "lane.tokens.min(self.packed_token_capacity)", "lane.tokens",

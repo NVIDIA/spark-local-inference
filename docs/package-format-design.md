@@ -694,8 +694,8 @@ A published cache entry is named for its selected deployments:
 `<platform>-tp<N>-<UTC timestamp>`, for example `gb202-tp1-202610170923`.
 An entry containing several TP sizes joins their labels in ascending order,
 without duplicates: `gb202-tp1+tp2-202610170923`.
-The platform is the device identifier recorded by preparation (`gb10` or
-`gb202`), never an SM architecture name. Downloads use the authenticated device
+The platform is the device identifier recorded by preparation (`gb10`,
+`gb202`, or `gb300`), never an SM architecture name. Downloads use the authenticated device
 identity; packages without one use `unknown-device`, including union names such
 as `unknown-device-tp1+tp2-202610170923`. The timestamp records entry creation in
 UTC with minute resolution.
