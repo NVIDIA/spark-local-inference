@@ -1,6 +1,3 @@
-[ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
-    Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
-
 [ ] Restore loading and serving for packages with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in
     helios/proto/runtime_package.proto. Validate their original captured graphs
