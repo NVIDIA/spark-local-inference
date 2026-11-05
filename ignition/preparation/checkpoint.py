@@ -390,11 +390,16 @@ def _inspect_indexed_checkpoint(snapshot: Path, index: dict) -> IndexedCheckpoin
     if missing:
         raise CheckpointError(f"indexed tensor missing from shards: {min(missing)}")
     total = sum(tensor.nbytes for tensor in tensors.values())
-    if (
-        not isinstance(index.get("metadata"), dict)
-        or index["metadata"].get("total_size") != total
-    ):
-        raise CheckpointError(f"index total_size does not match tensor payload bytes: {total}")
+    # TrellisMX packs index separately-shipped sidecars (Engram tables, expert
+    # streams) but declare only the model shards' bytes as total_size.
+    model_total = sum(tensor.nbytes for tensor in tensors.values()
+                      if tensor.shard.startswith("model-"))
+    declared = index.get("metadata", {}).get("total_size") if isinstance(index.get("metadata"), dict) else None
+    trellis = (snapshot / "trellismx" / "manifest.json").is_file()
+    if declared != total and not (trellis and declared == model_total):
+        raise CheckpointError(
+            f"index total_size does not match tensor payload bytes: declared {declared}, "
+            f"all tensors {total}, model shards {model_total}")
     return IndexedCheckpoint(snapshot, MappingProxyType(tensors), tuple(shards))
 
 
