@@ -425,6 +425,13 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
             raise UsageError(f"--speculative-method {speculation.method}: {checkpoint.alias} does not prepare this proposal method")
         if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
+        sampling = recipe.sampling_defaults
+        # Vocabulary-parallel distributions invalidate rows whose requests filter tokens.
+        if speculation.vocabulary_parallel_sampling and (
+                sampling.top_p != 1 or sampling.top_k > 0 or sampling.min_p != 0
+                or {"top_p", "top_k", "min_p"} & sampling.ranges.keys()):
+            raise UsageError("--vocabulary-parallel-sampling requires a sampling policy without"
+                             " top-k, top-p, or min-p filtering")
         if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
             raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
         for head in ("draft", "markov"):

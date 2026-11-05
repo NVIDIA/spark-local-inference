@@ -14,7 +14,7 @@ import pytest
 from ignition import planning
 from ignition.cli import display
 from ignition.errors import CapacityError, UsageError
-from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
+from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, SamplingRange, Speculation
 from ignition.recipes import ResolvedModel, recipes
 
 GIB, MIB = 1 << 30, 1 << 20
@@ -113,6 +113,18 @@ def test_vocabulary_sampling_selects_tp4_and_rejects_tp3_hosts():
         derive(model=RECIPE, gpus=gpus, selected=(0, 1, 2), speculation=speculation)
     with pytest.raises(CapacityError, match="needs 4"):
         derive(model=RECIPE, gpus=gpus[:3], speculation=speculation)
+
+
+@pytest.mark.parametrize("filtering", [{"ranges": {"top_p": SamplingRange(.95, 1.)}}, {"top_p": .95},
+                                       {"top_k": 20}, {"min_p": .05}])
+def test_vocabulary_sampling_rejects_declared_token_filtering(filtering):
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    speculation = replace(RECIPE.speculation, vocabulary_parallel_sampling=True)
+    gpus = tuple(gpu(i, 140) for i in range(4))
+    filtered = replace(RECIPE, sampling_defaults=replace(RECIPE.sampling_defaults, **filtering))
+    with pytest.raises(UsageError, match="without top-k, top-p, or min-p filtering"):
+        derive(model=filtered, gpus=gpus, speculation=speculation)
 
 
 @pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"),
