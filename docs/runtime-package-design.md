@@ -615,6 +615,9 @@ and page capacities that all ranks can back.
 An owned snapshot excludes all conflicting page ids; overlapping exclusions
 are reference-counted. A snapshot fitting entirely in execution-allocation
 alignment padding excludes no pages. Execution rows never alias KV pages.
+A page whose last exclusion is released still holds snapshot row bytes. Before
+a request first writes it as KV, every rank clears that page's local cache
+planes on the model stream ahead of the step's graph.
 
 Admission reserves the request's KV pages. System, prompt, and terminal snapshots
 acquire backing at their capture boundaries, evicting unpinned checkpoints when

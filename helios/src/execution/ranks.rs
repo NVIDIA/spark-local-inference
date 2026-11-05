@@ -9,7 +9,7 @@
 use super::{
     ExecutionManifest, FrameCompletion, GraphExecutor, RankStream, TensorParallelExecutor, Upload,
 };
-use crate::{Result, Shutdown, cache::Fence};
+use crate::{Result, Shutdown, cache::{Fence, PageId}};
 
 pub enum RankPeers {
     Processes(Vec<RankStream>),
@@ -48,12 +48,13 @@ impl RankExecutor {
         &mut self,
         graph: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar: bool,
     ) -> Result<Option<Fence>> {
         match self {
-            Self::Local(executor) => executor.submit(graph, uploads, grammar),
-            Self::Parallel(executor) => executor.submit(graph, uploads, grammar),
-            Self::Threaded(executor) => executor.submit(graph, uploads, grammar),
+            Self::Local(executor) => executor.submit(graph, uploads, cleared_pages, grammar),
+            Self::Parallel(executor) => executor.submit(graph, uploads, cleared_pages, grammar),
+            Self::Threaded(executor) => executor.submit(graph, uploads, cleared_pages, grammar),
         }
     }
 

@@ -208,14 +208,11 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires an assigned CUDA_VISIBLE_DEVICES GPU"]
-    fn cuda_aliases_preserve_rows_while_unowned_pages_are_rewritten() {
-        use super::super::{
-            driver::Driver,
-            format::{Allocation, Context},
-        };
-        let driver = Driver::load().unwrap();
+    /// Maps seven rows, three for execution, over three KV planes of 128 pages on device 0.
+    unsafe fn aliased_cache(
+        driver: &super::super::driver::Driver,
+    ) -> (NativeResources, CacheGeometry, Layout) {
+        use super::super::format::{Allocation, Context};
         unsafe {
             driver.check("cuInit", (driver.init)(0)).unwrap();
             let mut device = 0;
@@ -292,6 +289,16 @@ mod tests {
             owner
                 .allocate_shared_cache(&package, &geometry, &layout)
                 .unwrap();
+            (owner, geometry, layout)
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an assigned CUDA_VISIBLE_DEVICES GPU"]
+    fn cuda_aliases_preserve_rows_while_unowned_pages_are_rewritten() {
+        let driver = super::super::driver::Driver::load().unwrap();
+        let (_owner, geometry, layout) = unsafe { aliased_cache(&driver) };
+        unsafe {
             for row in 0..7 {
                 driver
                     .check(
@@ -348,6 +355,111 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires an assigned CUDA_VISIBLE_DEVICES GPU"]
+    fn cuda_clearing_released_alias_pages_removes_row_bytes_and_preserves_live_rows() {
+        use crate::cache::PageId;
+        use std::collections::BTreeSet;
+        let driver = super::super::driver::Driver::load().unwrap();
+        let (owner, geometry, layout) = unsafe { aliased_cache(&driver) };
+        let row_bytes = geometry.row.unit_bytes;
+        let fill = |address: u64, value: u8, bytes: u64| unsafe {
+            driver
+                .check(
+                    "cuMemsetD8_v2",
+                    (driver.zero)(address, value, bytes as usize),
+                )
+                .unwrap();
+        };
+        let read = |address: u64, bytes: u64| {
+            let mut contents = vec![0u8; bytes as usize];
+            unsafe {
+                driver
+                    .check("cuCtxSynchronize", (driver.context_sync)())
+                    .unwrap();
+                driver
+                    .check(
+                        "cuMemcpyDtoH_v2",
+                        (driver.download)(contents.as_mut_ptr().cast(), address, contents.len()),
+                    )
+                    .unwrap();
+            }
+            contents
+        };
+        let plane_bytes = |plane: &flare_selene::Plane| plane.unit_bytes * geometry.page_capacity;
+        let unit = |bytes: &[u8], plane: &flare_selene::Plane, page: u32| {
+            let start = (u64::from(page) * plane.unit_bytes) as usize;
+            bytes[start..start + plane.unit_bytes as usize].to_vec()
+        };
+        // KV bytes everywhere, then FP8 E4M3 NaN bytes through three snapshot
+        // rows that are released and a distinct pattern through one that stays live.
+        for plane in &geometry.planes {
+            fill(plane.address, 0x11, plane_bytes(plane));
+        }
+        for row in 3..6 {
+            fill(geometry.row.address + row * row_bytes, 0xFF, row_bytes);
+        }
+        fill(geometry.row.address + 6 * row_bytes, 0x5A, row_bytes);
+        let before: Vec<_> = geometry
+            .planes
+            .iter()
+            .map(|plane| read(plane.address, plane_bytes(plane)))
+            .collect();
+        let released: BTreeSet<u32> = layout.aliases[..3].iter().flat_map(Clone::clone).collect();
+        let cleared: Vec<_> = released
+            .iter()
+            .filter(|page| !layout.aliases[3].contains(page))
+            .map(|&page| PageId(page))
+            .collect();
+        let poisoned: BTreeSet<u32> = (0..geometry.page_capacity as u32)
+            .filter(|&page| {
+                geometry
+                    .planes
+                    .iter()
+                    .zip(&before)
+                    .any(|(plane, bytes)| unit(bytes, plane, page).contains(&0xFF))
+            })
+            .collect();
+        assert!(
+            poisoned.is_subset(&released),
+            "row bytes escaped their alias ranges"
+        );
+        assert!(
+            cleared.iter().any(|page| poisoned.contains(&page.0)),
+            "no freed page holds row bytes"
+        );
+
+        let stream = crate::cuda::Stream::open(owner.context as usize, 0).unwrap();
+        unsafe { crate::execution::clear_pages(&stream, &geometry, &cleared).unwrap() };
+        stream.synchronize().unwrap();
+        for (plane, before) in geometry.planes.iter().zip(&before) {
+            let after = read(plane.address, plane_bytes(plane));
+            for page in 0..geometry.page_capacity as u32 {
+                let contents = unit(&after, plane, page);
+                if cleared.contains(&PageId(page)) {
+                    assert!(
+                        contents.iter().all(|&b| b == 0),
+                        "{} page {page} kept row bytes",
+                        plane.name
+                    );
+                } else {
+                    assert_eq!(
+                        contents,
+                        unit(before, plane, page),
+                        "{} page {page} changed",
+                        plane.name
+                    );
+                }
+            }
+        }
+        assert!(
+            read(geometry.row.address + 6 * row_bytes, row_bytes)
+                .iter()
+                .all(|&b| b == 0x5A),
+            "live snapshot row changed"
+        );
     }
 
     #[test]

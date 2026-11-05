@@ -34,6 +34,7 @@ fn frame(fence: u64, graph: usize, grammar: bool) -> Pending {
             graph,
             grammar,
             uploads: Vec::new(),
+            cleared_pages: Vec::new(),
         }),
         dispatched: Instant::now(),
         committed: false,
@@ -323,6 +324,7 @@ fn rank_coordinator_matches_model_pending_window() {
         graph: 0,
         grammar: true,
         uploads: Vec::new(),
+        cleared_pages: Vec::new(),
     });
     assert!(!can_submit_pending(&pending, false, &manifest));
     pending[0].step = Arc::new(Step {
@@ -330,6 +332,7 @@ fn rank_coordinator_matches_model_pending_window() {
         graph: 0,
         grammar: false,
         uploads: Vec::new(),
+        cleared_pages: Vec::new(),
     });
     pending.push_back(frame(2, 1, false));
     pending[1].committed = true;

@@ -20,7 +20,7 @@ mod threaded;
 pub use rank_stream::RankStream;
 pub use ranks::RankPeers;
 mod transport;
-pub(crate) use transport::validate_speculative_survival;
+pub(crate) use transport::{clear_pages, validate_speculative_survival};
 mod worker;
 pub use parallel::{TensorParallelExecutor, serve_rank};
 pub(crate) use ranks::RankExecutor;

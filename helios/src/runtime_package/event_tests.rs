@@ -190,6 +190,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
                             bytes: &transfer,
                         },
                     ],
+                    &[],
                     false,
                 )
                 .unwrap()
@@ -210,6 +211,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
                         bytes: &transfer,
                     },
                 ],
+                &[],
                 false,
             ) {
                 Ok(Some(_)) => {}
@@ -276,6 +278,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
                                 bytes: &transfer,
                             },
                         ],
+                        &[],
                         false,
                     )
                     .unwrap()
