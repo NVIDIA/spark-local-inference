@@ -557,7 +557,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
-| `deepseek41` | 1 | 1 | Disabled | Top-p [0.95, 1]; repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 defaults](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference); [V4.1-Flash top-p recommendations and benchmarks](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference) |
+| `deepseek41` | 1 | 1 | Disabled | Repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
