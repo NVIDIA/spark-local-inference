@@ -248,7 +248,12 @@ Each completion batch reserves one admission slot per generated choice. Every
 child is prepared and validated before the group is submitted to the native
 worker. An oversized group is rejected; temporary admission exhaustion returns
 429. Disconnecting a stream cancels all unfinished children, and native work
-drains before its resources are reclaimed. Output queues remain bounded.
+drains before its resources are reclaimed. A connected reader can pause and
+resume without losing generated output. Each response buffers up to its allowed
+output length, including requested token observations and prompt scores. Storage
+grows with queued data; large paused responses can retain more CPU memory.
+Finished responses awaiting delivery still count toward the admission limit,
+but no longer occupy a model execution slot or its live KV cache.
 
 ## Health and metrics
 
@@ -293,7 +298,7 @@ instantaneous gauges.
 | `pending` | Requests waiting in the model scheduler | `flare_pending_requests` |
 | `completed` | Requests whose generation completed successfully | `flare_requests_completed_total` |
 | `reasoning_budget_cuts` | Requests whose reasoning was closed by their hard token budget | `flare_reasoning_budget_cuts_total` |
-| `failed` | Requests failed by admission, execution, grammar, or output backpressure | `flare_requests_failed_total` |
+| `failed` | Requests failed by admission, execution, grammar, or output processing | `flare_requests_failed_total` |
 | `replay_gpu_ns` | Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits | `flare_replay_gpu_nanoseconds_total` |
 | `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for both RAM and disk delivery | `flare_replay_readiness_wait_nanoseconds_total` |
 | `replay_readiness_samples` | Completed graphs with prepared readiness timing outputs; zero for packages without them | `flare_replay_readiness_samples_total` |
@@ -364,6 +369,25 @@ The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
+
+The terminal event carries a termination cause, and each protocol maps the
+cause to its finish reason. An output limit reports `length` on Chat
+Completions and Completions, `max_tokens` on Messages, and `incomplete` with
+`incomplete_details.reason` `max_output_tokens` on Responses, even when parsed
+calls completed the answer. Otherwise, when parsed calls complete an answer the
+user did not stop, Chat Completions reports `tool_calls` and Messages
+`tool_use`; raw Completions rejects tool parameters. Any other cause reports
+`stop` on Chat Completions and Completions, `stop_sequence` on Messages for a
+matched string stop and `end_turn` for every other cause, including an honored
+end-of-sequence token and an explicit token stop, and `completed` on Responses.
+The cause is decided at the terminal token: an honored end-of-sequence token or
+a matched string stop that lands on the final allowed token is the cause, so
+the response reports the stop reason rather than the limit reason. A request
+admitted with `ignore_eos` does not treat end-of-sequence tokens as
+terminating, so one that exhausts its output limit reports the limit reason
+even when its last generated token is end-of-sequence. A request the scheduler
+cannot grow past page capacity also reports the limit reason before the
+declared limit is reached.
 
 A reasoning delimiter that the tokenizer encodes as one token, such as
 `<think>`, `</think>`, `</mm:think>`, or Gemma 4's `<channel|>`, opens or
@@ -552,7 +576,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
-| `deepseek41` | 1 | 1 | Disabled | Top-p [0.95, 1]; repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 defaults](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference); [V4.1-Flash top-p recommendations and benchmarks](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference) |
+| `deepseek41` | 1 | 1 | Disabled | Repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |

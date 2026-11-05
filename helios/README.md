@@ -102,8 +102,11 @@ the default two workers can prepare four simultaneous generation requests.
 `ignition` packages set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's images plus 1 MiB.
 An admission permit survives CPU preparation and the streamed response lifetime.
-Disconnects cancel model scheduling, and slow consumers still face the bounded
-per-request event queue. HTTP capacity and physical GPU slots are independent.
+Disconnects cancel model scheduling. A paused reader keeps its response: each
+event queue holds the request's complete output budget, allocated as events
+arrive. Finished, unread responses release their model slot and live KV cache
+but still count toward the admission limit. HTTP capacity and physical GPU slots
+are independent.
 Tool-call history accepts OpenAI JSON-string arguments and object arguments;
 strings must parse as JSON objects before checkpoint-template rendering.
 
@@ -339,8 +342,8 @@ lane's logical token limit even when the completion reports physical padding.
 update it with the median of up to nine replay observations. After 30 seconds without a valid observation,
 the cost becomes stale but remains available for selection. The next valid
 observation replaces the stale estimate. Tensor-parallel observations use the
-maximum positive rank interval. Isolated executions also measure host handoff;
-queued executions exclude queue wait from the timing updates. Unmeasured
+maximum positive rank interval, with measured embedding-readiness waits subtracted
+when available. Host delays and queue wait do not enter graph estimates. Unmeasured
 candidates compete by useful work and can beat measured candidates. Both
 unmeasured and stale physical dispatches require an empty queue and completion
 before another submission.

@@ -161,6 +161,8 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     speculative = running.add_argument_group("speculative decoding",
         "MTP flags configure speculative decoding, including DSpark and DFlash.\n"
         "Recipe defaults and limits: ignition export MODEL --help.")
+    speculative.add_argument("--speculative-method", choices=("mtp", "dflash2"),
+                          help="learned proposal method; supported choices and the default depend on MODEL")
     speculative.add_argument("--no-mtp", action="store_true",
                           help="disable multi-token speculation: load no draft model and decode one token"
                                " per step; cannot accompany other speculation flags")
@@ -179,13 +181,16 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
+                          help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
+                               " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
-                               " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense with a BF16 checkpoint head;"
+                               " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense and Flash Next DFlash2 with a BF16 checkpoint head;"
                                " default: checkpoint precision)")
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
@@ -235,7 +240,7 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading"
                                " (Kimi K3 KDA, MLA except batched key/value, shared"
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
-                               " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs;"
+                               " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"

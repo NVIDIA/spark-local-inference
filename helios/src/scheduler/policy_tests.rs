@@ -327,6 +327,30 @@ fn prefix_restore_earns_no_credit_for_reused_prompt_tokens() {
 }
 
 #[test]
+fn host_delays_do_not_change_speculative_graph_selection() {
+    for queued in [false, true] {
+        for stale in [false, true] {
+            let mut s = engine(1, true);
+            s.configure_policy(PolicyConfig::throughput()).unwrap();
+            let handle = add(&mut s, 1, 64, 4096);
+            ready(&mut s, &[handle]);
+            if stale {
+                s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
+            }
+            let plan = s.plan().unwrap();
+            let key = cost::Key::from_step(&plan);
+            let gpu_ns = plan.estimated_duration_ns();
+            let mut timing = gpu_time(gpu_ns);
+            timing.wall_ns = 100 * gpu_ns;
+            timing.queued = queued;
+            s.observe_execution(&plan, timing);
+            assert_eq!(s.estimated_duration_ns(&plan), Some(gpu_ns));
+            assert_eq!(cost::Key::from_step(&s.plan().unwrap()), key);
+        }
+    }
+}
+
+#[test]
 fn a_plan_keeps_its_duration_when_the_graph_estimate_changes() {
     let mut s = engine(1, false);
     add(&mut s, 1, 1, 32);

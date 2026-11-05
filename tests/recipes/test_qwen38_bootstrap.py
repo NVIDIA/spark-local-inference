@@ -310,3 +310,14 @@ def test_snapshot_budget_covers_the_selected_speculative_layout():
     config = PreparationConfig(mtp=True,
                                snapshot_budget_bytes=speculative)
     assert config.snapshot_budget_bytes == speculative
+
+
+def test_moe_decode_a16_requires_separate_graph_roles_and_aligned_experts():
+    from ignition.recipes.qwen38.bootstrap import PreparationConfig
+
+    assert PreparationConfig(force_moe_decode_a16=True).force_moe_decode_a16
+    assert PreparationConfig(devices=(0, 1), force_moe_decode_a16=True).force_moe_decode_a16
+    with pytest.raises(ValueError, match="separate prefill and decode graphs"):
+        PreparationConfig(force_moe_decode_a16=True, mixed_prefill=True)
+    with pytest.raises(ValueError, match="intermediate width divisible by 64"):
+        PreparationConfig(devices=(0, 1, 2, 3), force_moe_decode_a16=True)

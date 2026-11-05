@@ -50,7 +50,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
-           joint_tuning: bool = False, shard_hyperconnections: bool = False) -> planning.Plan:
+           joint_tuning: bool = False, shard_hyperconnections: bool = False,
+           force_moe_decode_a16: bool | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     from ignition.preparation.collective_ladder import resolve as resolve_ladder
 
@@ -67,6 +68,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
+                     force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", force_moe_decode_a16).value,
                      joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
@@ -151,6 +153,12 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     """Apply the command line's speculation overrides to the recipe's settings; None disables speculation."""
     recipe, alias = model.recipe, model.checkpoint.alias
     default, limit = recipe.speculation, recipe.max_draft_tokens
+    method_flag = getattr(args, "speculative_method", None)
+    method = None if default is None else default.method
+    if configuration is not None:
+        method = configuration.model_setting(alias, "speculative_method", method, method_flag).value
+    elif method_flag is not None:
+        method = method_flag
     graph_budget = Setting(args.speculative_graph_budget, "flag")
     if configuration is not None:
         graph_budget = configuration.model_setting(alias, "speculative_graph_budget",
@@ -159,6 +167,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         graph_budget = Setting(None if default is None else default.graph_budget, "recipe")
     explicit_graph_budget = graph_budget.value is not None and graph_budget.source not in ("recipe", "[defaults]")
     given = [flag for flag, value in (
+        ("--speculative-method", method_flag),
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
@@ -176,6 +185,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
             raise UsageError(f"--no-mtp disables speculation; {', '.join(given)} cannot accompany it")
         return None
 
+    if method is not None and method != default.method and method not in recipe.speculative_methods:
+        raise UsageError(f"--speculative-method {method}: {alias} does not prepare this proposal method")
     drafts = default.draft_tokens if args.mtp_draft_tokens is None else args.mtp_draft_tokens
     if not 0 <= drafts <= limit:
         raise UsageError(f"--mtp-draft-tokens must be 0 through {limit}; --no-mtp disables speculation")
@@ -204,7 +215,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
                        draft_head_quantization=draft_head, markov_head_quantization=markov_head,
-                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False))
+                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

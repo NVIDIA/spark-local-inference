@@ -9,15 +9,36 @@ Heliopause depend on Helios; Helios has no Python or preparation-tool dependency
 
 ## Required setup and commit review
 
-On entering a clone or worktree, and after pulling changes, re-read this file and
-[the design self-review](docs/design-review.md). Before committing, ensure the
-repository's `.githooks/commit-msg` hook is enabled by following that document's
-installation instructions. Preserve any existing active hooks when installing.
+On entering a clone or worktree, and after pulling changes, re-read this file,
+[the design self-review](docs/design-review.md), and
+[the repository prose skill](.agents/skills/repo-prose/SKILL.md). Before committing,
+enable the repository's `.githooks/commit-msg` hook by following the
+[hook installation instructions](docs/design-review.md#hook-installation).
+Preserve any existing active hooks when installing.
 
 Before every commit, follow the staged-diff review and acknowledgment instructions
 in `docs/design-review.md`. A rejected acknowledgment requires reading that
 document and reviewing the staged change before retrying; do not treat the
 rejection as a formatting repair.
+
+## Required prose review
+
+Before writing or reviewing repository prose, read and apply
+[the repository prose skill](.agents/skills/repo-prose/SKILL.md). It applies to
+documentation, code comments, docstrings, names, errors, commit messages, PR titles
+and descriptions, issue and review comments, plans, and technical reports. Code
+tasks are included whenever they produce prose, including progress messages and
+completion reports.
+
+Before committing or publishing, review the final text against the skill. Rewrite
+passages that require conversation history, introduce unexplained identifiers, or
+claim results beyond the stated evidence. Review edited PR descriptions and
+comments before publishing them, even when no repository files change.
+
+Every delegated task must include the skill's resolved absolute path and require
+the delegate to read and follow it. Pass this requirement to further delegates,
+and review returned prose before incorporating or publishing it. A review
+acknowledgment does not substitute for reading the skill and reviewing the text.
 
 ## Contribution scope and rejection criteria
 
@@ -293,6 +314,13 @@ processing, preparation orchestration, CLI/runtime work, tests, and documentatio
 are permitted when they do not design or change the restricted mechanisms above.
 
 ## Validation and performance
+
+Choose verification by the property at risk, following
+[verification guidance](docs/verification.md). Use ordinary tests for observable
+behavior and regressions, Kani for properties of sequential Rust over an input
+domain, and TLA+ for protocol states and asynchronous ordering. Add only the
+checks the affected behavior needs. A passing model does not establish Rust
+conformance or CUDA correctness; validate those boundaries separately.
 
 - Compare other runtimes against an exported package running through `flare run`.
   Timings from `ignition debug-serve` are diagnostic measurements and cannot

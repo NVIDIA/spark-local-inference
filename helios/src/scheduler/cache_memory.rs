@@ -190,6 +190,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_two_snapshot_alias_layouts_preserve_page_ownership_and_reservation_budget() {
+        fn check(s: &RequestScheduler, ranges: &[std::ops::Range<u32>; 2], live: &[bool; 2]) {
+            let refs: Vec<_> = (0..4)
+                .map(|page| (0..2).filter(|&id| live[id] && ranges[id].contains(&page)).count())
+                .collect();
+            for (page, &count) in refs.iter().enumerate() {
+                assert_eq!(s.page_snapshot_refs[page] as usize, count);
+                assert_eq!(s.free_pages.contains(&PageId(page as u32)), count == 0);
+            }
+            assert_eq!(s.stats().snapshot_backing_pages as usize,
+                refs.iter().filter(|&&count| count != 0).count());
+            for (id, &allocated) in live.iter().enumerate() {
+                assert_eq!(s.free_snapshots.contains(&SnapshotId(id as u32)), !allocated);
+            }
+        }
+
+        fn reserve(s: &mut RequestScheduler, ranges: &[std::ops::Range<u32>; 2],
+                   live: &mut [bool; 2], keep: usize) {
+            let eligible: Vec<_> = (0..2).filter(|&id| {
+                !live[id] && (0..4).filter(|page| {
+                    !ranges[id].contains(page)
+                        && !(0..2).any(|owner| live[owner] && ranges[owner].contains(page))
+                }).count() >= keep
+            }).collect();
+            match s.reserve_snapshot(keep) {
+                Some(id) => {
+                    assert!(eligible.contains(&(id.0 as usize)));
+                    live[id.0 as usize] = true;
+                    assert!(s.free_page_count() >= keep);
+                }
+                None => assert!(eligible.is_empty()),
+            }
+            check(s, ranges, live);
+        }
+
+        let ranges: Vec<_> = (0..=4).flat_map(|start| (start..=4).map(move |end| start..end)).collect();
+        for a in &ranges {
+            for b in &ranges {
+                let aliases = [a.clone(), b.clone()];
+                for first_keep in 0..=5 {
+                    for second_keep in 0..=5 {
+                        for release_first in 0..2 {
+                            let mut s = super::super::tests::scheduler(1, 4, 2);
+                            s.share_snapshot_pages(&aliases).unwrap();
+                            let mut live = [false; 2];
+                            reserve(&mut s, &aliases, &mut live, first_keep);
+                            reserve(&mut s, &aliases, &mut live, second_keep);
+                            if live[release_first] {
+                                s.release_snapshot(SnapshotId(release_first as u32));
+                                live[release_first] = false;
+                                check(&s, &aliases, &live);
+                            }
+                            reserve(&mut s, &aliases, &mut live, first_keep);
+                            for id in [1 - release_first, release_first] {
+                                if live[id] {
+                                    s.release_snapshot(SnapshotId(id as u32));
+                                    live[id] = false;
+                                    check(&s, &aliases, &live);
+                                }
+                            }
+                            assert_eq!(s.free_page_count(), 4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn snapshots_in_execution_alignment_padding_do_not_exclude_pages() {
         let mut s = super::super::tests::scheduler(1, 16, 1);
         s.share_snapshot_pages(&[0..0]).unwrap();

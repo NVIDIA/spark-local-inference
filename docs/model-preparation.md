@@ -194,6 +194,12 @@ SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
 ```
 
+Startup races in one preparation share fixture and timing storage. Cold races
+read an existing checkpoint allocation on the same GPU when it is at least
+twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
+enough, the races use one shared eviction buffer. Re-export a package to reduce
+its resident startup storage with this preparation path.
+
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving
@@ -439,6 +445,31 @@ rows, with explicit flags and configuration taking precedence. Verification is
 rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
+
+`ignition export qwen3.8-flash --speculative-method dflash2` selects
+[`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
+at revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6` instead of the checkpoint's
+MTP module. Draft proposals use an eight-token block and up to seven verified
+drafts; the default remains five drafts and 128 target-token rows. The target
+captures completed zero-based layers 5, 15, 25, 35, and 45 after averaging its four
+hyperconnection streams. Five independent draft attention layers retain the last
+2,048 accepted target positions. These rings are included in continuation
+snapshots and restored with the target's GDN, QSA, PLE, and position state.
+Mixed prefill is rejected; separate prefill and verification graphs retain the
+same target arithmetic. `--online-mxfp8` converts the draft's eligible BF16
+projections, and `--draft-head-quantization nvfp4` or `mxfp8` prepares a separate
+proposal vocabulary head. Target weights retain checkpoint precision.
+
+`ignition export qwen3.8-flash --force-moe-decode-a16` prepares the NVFP4 target
+routed experts as one packed W4A16 weight owner. Decode and speculative
+verification use A16 at every row count; separate prefill graphs use calibrated
+A4 from the checkpoint activation scales. The option requires SM120/121 and
+rank-local intermediate width divisible by 64 (TP1/2); mixed prefill is rejected
+because its prompt and decode rows share one expert call. Shared experts and MTP
+retain their declared precision. `[preparation] force_moe_decode_a16 = true`
+sets the default, and `--no-force-moe-decode-a16` overrides it. Preparation records
+the resolved option in the plan and rebuild metadata; compatible weight reuse
+requires the packed layouts and activation scales prepared for that option.
 
 `ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
 the 320-wide hyperconnection bottleneck across ranks, including target and MTP
@@ -1066,9 +1097,7 @@ calibrated tensor FP8, and excluded BF16 projections. Image, audio and video
 requests are rejected; no vision encoder or speculative draft is prepared.
 
 Use the FlashInfer revision pinned in `pyproject.toml` and `uv.lock`,
-`42ba2f16b94f592798d166a66fb60330d12e860a`. The previous declared revision
-`560fef16648e4953bf39b701a226c322a0ab6c7c` lacks the packed-projection
-activation and reduction arguments used by the shared NVFP4 preparation path.
+`1f8ed8a3c46e27d03cff54e08f23e9bc50476d57`.
 Run the standard locked environment setup before preparing this recipe.
 
 On DGX Station (GB300/SM103), calibrated tensor-FP8 projections use FlashInfer's
@@ -1099,14 +1128,26 @@ flare/target/release/flare run /data/flare-runtime/muse-glimmer.safetensors --gp
 ```
 
 The pinned full checkpoint exports 29 graphs and loads through native `flare run`
-on one DGX Station (GB300/SM103) at the default capacities above. Component and
-reduced-model CUDA checks pass on SM103 and SM120. Native API acceptance is
-incomplete: 31 checks pass, including 131008-token inputs, concurrency four,
-prefix reuse, streaming, prompt logprobs and cancellation. At the required
-64-token output budget, four text and ten JSON cases reach the output limit,
-and twelve forced-tool cases fail without a completed call. Keep these cases
-in `tests/server/test_muse_glimmer.py` when completing generation qualification.
-No latency or throughput measurements have been made.
+on one DGX Station (GB300/SM103) at the default capacities above. With locked
+FlashInfer `1f8ed8a3`, twelve FP8 CUDA checks and one reduced-model capture check
+pass. Native API acceptance remains incomplete: `tests/server/test_muse_glimmer.py`
+has 30 passing and 27 failing cases. At its fixed 64-token output budget, four
+text cases, ten JSON cases and one concurrency case reach the output limit;
+twelve required or named tool cases end without a completed call.
+
+Supplemental generations for the 26 fixed text/JSON/tool cases preserve their
+exact first 64 tokens and complete correctly after 68–121 tokens. These results
+do not replace the failed acceptance checks. The concurrency check passes with
+a different timestamped prompt; the original failure remains unresolved.
+A previously exported package loads unchanged and passes text and prompt-scoring
+checks, while its concurrency check also reaches the output limit.
+Python diagnostic replay and native completion serving match five of six
+64-token cold/restored sequences. The required-tool case `tool-1` differs at
+token 21 during cold replay, including with an independent Python preparation.
+Decode graph capacities were not controlled, so this comparison does not
+isolate a runtime defect. Exact replay parity remains unqualified.
+Full-checkpoint SM120/SM121 validation and latency/throughput measurements remain
+unperformed.
 
 ## Storage and graph capacities
 

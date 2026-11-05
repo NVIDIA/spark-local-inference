@@ -155,7 +155,8 @@ class InductorSelections:
                 instances[id(tuner)] = tuner
                 if identity in self.winners:
                     _install(tuner, self.winners[identity])
-        if set(bindings) != set(entries):
+        # Epilogue-fusion benchmarking bundles template candidates that final code never names.
+        if any(entries[key].kernel_name in graph.source_code for key in set(entries) - set(bindings)):
             raise ValueError("compiled forward has unbound static Inductor kernels")
         self.forwards[id(bound)] = backend, graph, bindings
 

@@ -319,3 +319,11 @@ def test_collective_tuning_preparation_flag_is_explicit(command):
     assert _parser().parse_args([command, "qwen3.8-flash"]).collective_tuning is None
     for mode in ("static", "runtime"):
         assert _parser().parse_args([command, "qwen3.8-flash", "--collective-tuning", mode]).collective_tuning == mode
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+@pytest.mark.parametrize("flag,expected", [([], None), (["--force-moe-decode-a16"], True),
+                                          (["--no-force-moe-decode-a16"], False)])
+def test_moe_decode_a16_parser(command, flag, expected):
+    args = _parser().parse_args([command, "qwen3.8-flash", *flag])
+    assert args.force_moe_decode_a16 is expected

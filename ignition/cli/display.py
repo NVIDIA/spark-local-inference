@@ -39,4 +39,5 @@ def speculation(settings, *, brief: bool = False) -> str:
     precision = " · " + ", ".join(heads) if heads else ""
     if brief:
         return depth + selection + precision + parallel
-    return f"{depth} per round · MTP module" + selection + precision + parallel
+    source = "DFlash2" if settings.method == "dflash2" else "MTP module"
+    return f"{depth} per round · {source}" + selection + precision + parallel

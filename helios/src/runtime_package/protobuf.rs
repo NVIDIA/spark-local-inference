@@ -39,7 +39,7 @@ pub(super) fn serving_contract(
     value: wire::ServingContract,
     _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 3) {
+    if value.model_contract.as_ref().is_none_or(|contract| !(1..=3).contains(&contract.version)) {
         return Err(invalid("unsupported prepared model contract version; re-export the model package"));
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -236,7 +236,15 @@ pub(super) fn node(value: wire::Node) -> Result<Node> {
     })
 }
 
-pub(super) fn decode(value: wire::BundleIndex) -> Result<Package> {
+pub(super) fn decode(mut value: wire::BundleIndex) -> Result<Package> {
+    if let Some(execution) = &mut value.execution {
+        for graph in &mut execution.graphs {
+            if graph.kind == "speculative" && graph.packed_token_capacity == 0 {
+                graph.packed_token_capacity = graph.batch_capacity.checked_mul(graph.token_capacity)
+                    .ok_or_else(|| invalid("rectangular speculative capacity overflow"))?;
+            }
+        }
+    }
     let context = required(value.context, "CUDA context")?;
     let package = Package {
         resources: value.resources,
@@ -325,6 +333,41 @@ pub(super) fn edge(value: wire::Edge) -> Result<Edge> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn supported_contract_versions_preserve_their_declared_version() {
+        for version in [1, 2, 3] {
+            let contract = wire::ServingContract {
+                model_contract: Some(wire::ModelContract { version, ..Default::default() }),
+                ..Default::default()
+            };
+            let config = serving_contract(contract, 8).unwrap();
+            assert_eq!(config["model_contract"]["version"], version);
+        }
+    }
+
+    #[test]
+    fn omitted_speculative_target_capacity_preserves_rectangular_geometry() {
+        let bundle = |batch, width, packed| wire::BundleIndex {
+            architecture: vec![12, 1],
+            context: Some(wire::Context::default()),
+            execution: Some(wire::Execution {
+                abi_version: 3,
+                graphs: vec![wire::ExecutionGraph {
+                    kind: "speculative".into(), batch_capacity: batch,
+                    token_capacity: width, packed_token_capacity: packed,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (batch, width, packed, expected) in [(2, 4, 0, 8), (8, 1, 0, 8), (2, 4, 6, 6)] {
+            let package = decode(bundle(batch, width, packed)).unwrap();
+            assert_eq!(package.execution.unwrap().graphs[0].packed_token_capacity, expected);
+        }
+        assert!(decode(bundle(u64::MAX, 2, 0)).is_err());
+    }
 
     #[test]
     fn rebuild_catalogs_do_not_change_native_bundle_loading() {
@@ -715,8 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn prepared_contract_versions_require_reexport() {
-        for version in [0, 1, 2, 4] {
+    fn unknown_prepared_contract_versions_are_rejected() {
+        for version in [0, 4, u32::MAX] {
             let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
                 version, ..Default::default()
             }), ..Default::default() };

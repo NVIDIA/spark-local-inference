@@ -42,6 +42,8 @@ def recipe_help(model=None):
     speculation = recipe.speculation
     if speculation is not None:
         lines.extend((
+            *([] if speculation.method is None else [
+                f"  --speculative-method: {', '.join(dict.fromkeys((speculation.method, *recipe.speculative_methods)))}; default {speculation.method}"]),
             f"  --mtp-draft-tokens: 0..{recipe.max_draft_tokens}; default {speculation.draft_tokens}",
             f"  Verification: {'adaptive' if speculation.adaptive else 'fixed width'} by default;"
             " --no-mtp excludes draft weights and state.",

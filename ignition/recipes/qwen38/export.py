@@ -20,7 +20,11 @@ def disposable_ranges(*, cache, scratch, workspaces, vision_scratch, decoders, o
             sampler = getattr(owner, name, None)
             if sampler is not None:
                 values.append(sampler.scratch_tensors)
-    if speculation is not None:
+    from ignition.components.dflash2_preparation import DFlash2Preparation
+
+    if isinstance(speculation, DFlash2Preparation):
+        values.append(speculation.scratch_tensors())
+    elif speculation is not None:
         from .speculative_model import PreparedPrefillAbsorption, PreparedSpeculativeRound
 
         values.append(speculation.mtp_scratch)

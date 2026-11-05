@@ -404,3 +404,88 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
                               "iteration": iteration, "selected_experts": cpu_ids.unique().numel(),
                               "reference_payload_bytes": read_bytes, "native_reduction": metrics,
                               "canonical_bf16_reduction": canonical_metrics}))
+
+
+@torch.no_grad()
+def test_actual_packed_a16_decode_and_calibrated_a4_prefill_graphs(manifest):
+    from ignition.preparation.compilation import compile_forward
+    from ignition.reference.qwen38_quant import nvfp4_linear_reference
+
+    prefix = f"{TEXT_PREFIX}.layers.0.mlp"
+    with QwenWeightLoader(manifest, "cuda:0", prefixes=(prefix + ".",),
+                          force_moe_decode_a16=True) as loader:
+        weights = QwenMoeWeights.load(loader, 0)
+    experts = weights.experts
+    assert experts.num_experts == 512 and experts.intermediate_size == 640
+    assert experts.plan.activation.mode.value == "a16"
+    assert experts.plan.activation.a4_prefill is True
+    assert experts._impl.plan.quant_modes == {"w4a16"}
+    assert weights.experts_a4_prefill and not experts.has_csf_blocks
+    representation = experts._impl.representation_for("w4a16")
+    assert representation is not None
+    input_scale = experts._impl.a1_gscale.cpu().reciprocal().reshape(())
+    generator = torch.Generator().manual_seed(713)
+    cases = {}
+    with PreparationSession(device=experts.device, autotune=False, compile_workers=0) as session:
+        for name, tokens, prefill in (("decode", 1, False), ("verify", 128, False), ("prefill", 4096, True)):
+            source = torch.zeros((tokens, 2560), dtype=torch.bfloat16, device=experts.device)
+            operator = PreparedQwenMoe(source, weights, session=session, name=f"packed_precision.{name}",
+                                       prefill=prefill)
+            cases[name] = SimpleNamespace(source=source, operator=operator, prefill=prefill)
+        session.freeze()
+        for case in cases.values():
+            operator, source = case.operator, case.source
+            assert operator.experts.binding.experts is experts._impl
+            assert (operator.experts.binding.a4_prefill_launches is not None) is case.prefill
+            assert operator.experts.plan.query.a4_prefill is case.prefill
+            assert experts._impl.representation_for("w4a16") is representation
+
+            def run(operator=operator, source=source):
+                operator(source)
+
+            run()
+            case.run = compile_forward(run)
+            case.run()
+            torch.cuda.synchronize()
+            case.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(case.graph):
+                case.run()
+        for name in ("decode", "verify", "prefill", "verify", "decode", "prefill"):
+            case = cases[name]
+            cpu_source = (torch.randn(case.source.shape, generator=generator) * .1).to(torch.bfloat16)
+            case.source.copy_(cpu_source)
+            case.operator.routed_output.fill_(float("nan"))
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            case.graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            assert torch.isfinite(case.operator.output).all()
+            rows = min(3, len(cpu_source))
+            ids, probabilities = case.operator.router.ids[:rows].cpu(), case.operator.router.weights[:rows].cpu()
+            expected = torch.zeros((rows, 2560), dtype=torch.float64)
+            with CheckpointTensors(manifest, byte_budget=128 << 20) as reader:
+                for expert in ids.unique(sorted=True).tolist():
+                    selected, slots = (ids == expert).nonzero(as_tuple=True)
+                    gate, up, down = (read_nvfp4_projection(reader, f"{prefix}.experts.{expert}.{projection}")
+                                      for projection in ("gate_proj", "up_proj", "down_proj"))
+                    if case.prefill:
+                        gate, up = (replace(projection, input_scale=input_scale) for projection in (gate, up))
+                    else:
+                        gate, up, down = (replace(projection, input_scale=None) for projection in (gate, up, down))
+                    values = cpu_source[selected]
+                    gate_output = nvfp4_linear_reference(values, gate)
+                    up_output = nvfp4_linear_reference(values, up)
+                    if case.prefill:
+                        gate_output, up_output = (value.to(torch.bfloat16) for value in (gate_output, up_output))
+                        intermediate = F.silu(gate_output) * up_output
+                    else:
+                        intermediate = (F.silu(gate_output) * up_output).to(torch.bfloat16)
+                    projected = nvfp4_linear_reference(intermediate, down).to(torch.bfloat16)
+                    expected[selected] += projected.double() * probabilities[selected, slots, None].double()
+            actual = case.operator.routed_output[:rows].double().cpu()
+            relative = ((actual - expected).norm() / expected.norm()).item()
+            assert relative < (.004 if case.prefill else .008), (name, relative)
+            print(json.dumps({"component": "actual_layer0_packed_precision_512_experts_top10",
+                              "role": name, "tokens": len(cpu_source), "reference_rows": rows,
+                              "relative_l2_error": relative}))

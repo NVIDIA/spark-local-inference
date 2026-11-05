@@ -42,11 +42,11 @@ def weights():
     from ignition.components.dflash2_weights import DraftWeights
     from ignition.components.parallel import TensorParallelShard
     from ignition.recipes.qwen38_dense.config import ModelConfig
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
+    from ignition.recipes.qwen38_dense import draft_config
     if not all((path / "config.json").is_file() for path in (TARGET, DRAFT)):
         pytest.skip("requires pinned Qwen3.8-27B target and DFlash2 checkpoints")
     target = ModelConfig.load(TARGET)
-    config = replace(target, draft=DraftConfig.load(DRAFT, target))
+    config = replace(target, draft=draft_config.load(DRAFT, target))
     shard = TensorParallelShard(0, 1)
     draft = DraftWeights.load(DRAFT, config.draft, torch.device("cuda:0"), shard)
     return SimpleNamespace(config=config, draft=draft, shard=shard)

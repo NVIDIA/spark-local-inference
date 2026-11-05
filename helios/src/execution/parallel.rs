@@ -118,7 +118,6 @@ impl TensorParallelExecutor {
         }
         // SAFETY: The caller retains all rank-local prepared resources through drain.
         let mut local = unsafe { GraphExecutor::new_unstarted(manifest)? };
-        let tuning_started = Instant::now();
         let startup = (|| -> Result<()> {
             for index in local.manifest().referenced_tuning_graphs() {
                 let mut bytes = Vec::new();
@@ -180,7 +179,6 @@ impl TensorParallelExecutor {
             }
             return Err(error);
         }
-        local.report_startup(tuning_started);
         Ok(Self {
             local,
             peers,

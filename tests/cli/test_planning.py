@@ -14,7 +14,7 @@ import pytest
 from ignition import planning
 from ignition.cli import display
 from ignition.errors import CapacityError, UsageError
-from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
+from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, SamplingRange, Speculation
 from ignition.recipes import ResolvedModel, recipes
 
 GIB, MIB = 1 << 30, 1 << 20
@@ -113,6 +113,18 @@ def test_vocabulary_sampling_selects_tp4_and_rejects_tp3_hosts():
         derive(model=RECIPE, gpus=gpus, selected=(0, 1, 2), speculation=speculation)
     with pytest.raises(CapacityError, match="needs 4"):
         derive(model=RECIPE, gpus=gpus[:3], speculation=speculation)
+
+
+@pytest.mark.parametrize("filtering", [{"ranges": {"top_p": SamplingRange(.95, 1.)}}, {"top_p": .95},
+                                       {"top_k": 20}, {"min_p": .05}])
+def test_vocabulary_sampling_rejects_declared_token_filtering(filtering):
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    speculation = replace(RECIPE.speculation, vocabulary_parallel_sampling=True)
+    gpus = tuple(gpu(i, 140) for i in range(4))
+    filtered = replace(RECIPE, sampling_defaults=replace(RECIPE.sampling_defaults, **filtering))
+    with pytest.raises(UsageError, match="without top-k, top-p, or min-p filtering"):
+        derive(model=filtered, gpus=gpus, speculation=speculation)
 
 
 @pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"),
@@ -721,3 +733,27 @@ def test_collective_ladder_plan_and_rebuild_round_trip():
     with pytest.raises(UsageError, match="compute capability"):
         replace(base, gpus=tuple(replace(g, capability=(12, 1)) for g in base.gpus),
                 collective_tuning="runtime", collective_ladder=ladder)
+
+
+def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="qwen38"))
+    for enabled in (False, True):
+        plan = replace(ordinary, force_moe_decode_a16=enabled)
+        assert plan.to_dict()["force_moe_decode_a16"] is enabled
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).force_moe_decode_a16 is enabled
+    assert not proto.RebuildManifest().force_moe_decode_a16
+    with pytest.raises(UsageError, match="Qwen3.8 Flash NVFP4"):
+        replace(derive(), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="SM120/121"):
+        replace(ordinary, gpus=(gpu(0, 95, (10, 3)),), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="intermediate width divisible by 64"):
+        replace(ordinary, gpus=tuple(gpu(i, 95) for i in range(4)), force_moe_decode_a16=True)
+    with pytest.raises(UsageError, match="mixed-prefill"):
+        replace(ordinary, mixed_prefill=True, force_moe_decode_a16=True)

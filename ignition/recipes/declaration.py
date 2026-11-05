@@ -116,8 +116,11 @@ class Speculation:
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
     vocabulary_parallel_sampling: bool = False
+    method: str | None = None
 
     def __post_init__(self):
+        if self.method not in (None, "mtp", "dflash2"):
+            raise ValueError("speculative method must be omitted, mtp or dflash2")
         if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
             raise ValueError("vocabulary-parallel sampling requires positive learned draft depth")
         if self.vocabulary_parallel_sampling and self.markov_head_quantization == "nvfp4":
@@ -169,6 +172,14 @@ class RankUsage:
 
 
 @dataclass(frozen=True)
+class SpeculativeMethod:
+    """Physical preparation costs for a recipe's learned proposal source."""
+
+    ranks: Mapping[int, RankCosts]
+    draft_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class Recipe:
     """One model family's qualified checkpoints, serving range, costs, and bootstrap.
 
@@ -217,6 +228,7 @@ class Recipe:
     max_images: int = 0
     image_bytes: int = 0
     speculation: Speculation | None = None
+    speculative_methods: Mapping[str, SpeculativeMethod] = field(default_factory=lambda: MappingProxyType({}))
     plain_ranks: Mapping[int, RankCosts] = field(default_factory=lambda: MappingProxyType({}))
     verification_rows: int | None = None
     stream_overlap: bool = False
@@ -252,6 +264,11 @@ class Recipe:
             raise ValueError("b12x settings name B12X_ variables with string values")
         if self.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
+        for name, method in self.speculative_methods.items():
+            if name not in ("mtp", "dflash2") or set(method.ranks) != set(self.ranks):
+                raise ValueError("speculative methods require known names and every declared tensor-parallel size")
+            if method.draft_bytes is not None and method.draft_bytes <= 0:
+                raise ValueError("speculative draft bytes must be positive")
         for checkpoint in self.checkpoints:
             if any(costs is not None and set(costs) != set(self.ranks)
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
@@ -267,7 +284,8 @@ class Recipe:
         plain = self.plain_ranks if checkpoint is None or checkpoint.plain_ranks is None else checkpoint.plain_ranks
         if speculation is None:
             return (plain or ranks)[world_size]
-        return ranks[world_size]
+        method = self.speculative_methods.get(speculation.method)
+        return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
                       expert_scale_compression: str | None = None) -> int:
@@ -275,8 +293,12 @@ class Recipe:
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
-        return -(-(device_bytes + checkpoint.expansion_bytes
-                   - (0 if learned else checkpoint.draft_bytes)) // world_size)
+        draft_bytes = checkpoint.draft_bytes
+        method = None if speculation is None else self.speculative_methods.get(speculation.method)
+        if method is not None and method.draft_bytes is not None:
+            draft_bytes = method.draft_bytes
+        return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
+                   + (draft_bytes if learned else 0)) // world_size)
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""

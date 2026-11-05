@@ -80,10 +80,10 @@ products of `min(1, p(token)/q(token))` for evaluated prefixes. These replace
 binary acceptance observations at those depths. They affect future selection,
 never the proposals or allocation of the completed program.
 
-Costs use the full graph, including proposal work, allocation, verification,
-commit, collectives, and readiness stalls. GPU replay and serial host handoff
-have separate estimates; queued completion wall time does not become an isolated
-handoff sample. A trace attaches physical B/D/W/P, selected cost, observation
+Cost samples use GPU replay intervals for the full graph, including proposal
+work, allocation, verification, commit, and collectives, with the embedding-readiness
+correction described below. Host delays and queue wait do not enter graph estimates.
+A trace attaches physical B/D/W/P, selected cost, observation
 age, selection reason, and exploration credit to each committed plan.
 `flare_speculative_*` counters cover complete speculative programs rather than
 separate producer and target calls.
@@ -265,11 +265,9 @@ When the prepared graphs expose frame-owned readiness timestamps, the cost sampl
 subtracts exposed embedding-delivery delay after aggregating the ranks' intervals.
 This covers RAM and disk delivery, including CPU mailbox coordination. Raw replay
 and wall durations remain unchanged for service charges and reported throughput.
-An isolated execution also measures host handoff as wall time minus device time,
-clamped at zero, using the raw device observation before readiness correction.
-Host handoff uses a separate EMA with weight 1/8. Queued
-executions update device time without treating queue wait as handoff. Missing
-or zero device intervals neither change an estimate nor make it fresh.
+Graph estimates use these GPU observations for both isolated and queued executions.
+Host dispatch, completion delivery, and polling time do not enter a graph's cost.
+Missing or zero device intervals neither change an estimate nor make it fresh.
 
 Prefill exploration excludes a larger unmeasured graph when a smaller prepared
 capacity consumes the same tokens up to the next message or prompt endpoint.

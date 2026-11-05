@@ -333,8 +333,8 @@ pub fn package_companions(path: &Path) -> Result<Vec<String>> {
     }
     let envelope =
         wire::ProtectedIndex::decode(bytes.as_slice()).map_err(|e| invalid(e.to_string()))?;
-    if envelope.version != 6
-        || envelope.groups.len() != 3
+    super::protection::ExecutableEncoding::from_version(envelope.version)?;
+    if envelope.groups.len() != 3
         || envelope.groups[0].kind != 1
         || envelope.ranks.is_empty()
     {
