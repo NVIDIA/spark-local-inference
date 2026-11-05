@@ -130,6 +130,14 @@ before committing; a design acknowledgment cannot authorize them.
     behavior, weaken numerical or lifetime contracts, or shift model computation
     or policy across the preparation/runtime boundary. Do not make a violating
     contribution acceptable by weakening its governing rule.
+16. **Write without hidden context.** Read and apply the
+    [repository prose skill](../.agents/skills/repo-prose/SKILL.md). Review changed
+    prose and the final commit message for an audience without the development
+    conversation. Reject descriptions whose affected component, resulting
+    behavior, or supporting evidence depends on unexplained references or
+    development history. Identify the missing context or unsupported claim and
+    rewrite it before committing. PR descriptions, comments, and agent reports
+    require the same review before publication.
 
 ## Review and acknowledgment
 
@@ -139,6 +147,9 @@ before committing; a design acknowledgment cannot authorize them.
    apply to the affected behavior; documentation changes do not require GPU tests.
 2. Read the staged checklist with `git show :docs/design-review.md`. When changing
    this document, stage the intended version before reviewing and acknowledging it.
+   Also read the staged prose skill with
+   `git show :.agents/skills/repo-prose/SKILL.md` and apply it to the staged prose
+   and final commit message.
 3. Compute SHA-256 over the exact staged document bytes and take its first two
    bytes as four lowercase hex characters:
 
@@ -160,9 +171,10 @@ before committing; a design acknowledgment cannot authorize them.
    ```
 
    Use the reviewing agent's name and model, or the human reviewer's identity.
-   The acknowledgment means: **I read the staged checklist, reviewed the staged
-   diff against every applicable principle, found no unapproved design violations,
-   and accurately disclosed validation and material limitations.**
+   The acknowledgment means: **I read the staged checklist and prose skill,
+   reviewed the staged diff and final commit message against every applicable
+   principle, found no unapproved design violations, and accurately disclosed
+   validation and material limitations.**
 
 Read and review before acknowledging. Do not automatically insert the footer or
 copy an acknowledgment from another commit. A missing or rejected acknowledgment
