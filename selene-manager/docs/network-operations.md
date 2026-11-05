@@ -32,7 +32,7 @@ For TCP clients, `Hello.encryption` must match the selected mode; a mismatch
 or a certificate failure disables the pool for that process with one diagnostic,
 without downgrading. A missing manager at instance startup produces one warning
 after the startup wait, then local tiers only; see
-[pool attachment](../../docs/prefix-cache-offload.md#215-sharing-through-a-pool).
+[pool attachment](../../docs/prefix-cache-offload.md#214-sharing-through-a-pool).
 
 ## Turning it on
 

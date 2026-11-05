@@ -12,7 +12,7 @@ in both local and pool modes. Pooled instances announce the GPU holding at
 publication and cascade retained records under host pressure: DRAM to local
 NVMe, then the manager. A handover drops the source only after the destination
 commits. Refusals, unavailable destinations and repeated failures keep records
-local and retry after progress; see [host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
+local and retry after progress; see [host retention](../docs/prefix-cache-offload.md#214-sharing-through-a-pool). GPU eviction does not initiate a late copy.
 The [shutdown drain](../docs/prefix-cache-offload.md#25-transfers-slabs-and-record-files)
 is opt-in and off by default; ordinary shutdown still drains accesses before releasing memory.
 A GPU cache hit refreshes an existing local host record's recency, but cannot

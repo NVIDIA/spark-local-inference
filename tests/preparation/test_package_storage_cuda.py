@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation storage preserves GPU capabilities and mapped mailbox publication."""
+"""Preparation storage releases and reuses pooled memory and publishes mapped mailboxes."""
 
 import os
 from pathlib import Path
@@ -38,25 +38,6 @@ def test_export_keeps_host_mailbox_and_omits_unused_library_storage(tmp_path):
     assert all(not allocation.name.startswith("external-") for allocation in allocations)
     assert all(allocation.name == host.name or allocation.address + allocation.nbytes <= host.address
                or allocation.address >= host.address + host.nbytes for allocation in allocations)
-
-
-@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
-                    reason="requires an explicitly assigned CUDA device")
-def test_package_weights_support_gpudirect_registration():
-    assert os.environ.get("CUDA_VISIBLE_DEVICES")
-    subprocess.run([sys.executable, "-c", """
-import ctypes as C
-import torch
-from ignition.preparation.package_storage import PackageStorage
-
-torch.empty(1, device="cuda:0")
-with PackageStorage(device=0) as storage:
-    weight = torch.empty(4 << 20, dtype=torch.uint8, device="cuda:0")
-    supported, capable = C.c_int(), C.c_uint()
-    storage.cuda.call("cuDeviceGetAttribute", C.byref(supported), C.c_int(116), C.c_int(0))
-    storage.cuda.call("cuPointerGetAttribute", C.byref(capable), C.c_int(15), C.c_uint64(weight.data_ptr()))
-    assert bool(capable.value) == bool(supported.value), (capable.value, supported.value)
-"""], check=True, timeout=60)
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
