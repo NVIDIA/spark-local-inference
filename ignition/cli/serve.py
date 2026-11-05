@@ -61,12 +61,13 @@ def _keep_reserve(plan, usage) -> None:
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
+    declared_context = checkpoint.context or recipe.context
     return {
         "model_id": model.model_id, "served_names": [recipe.served_model_name],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
-        "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
+        "max_body_bytes": plan.max_images * recipe.image_bytes + declared_context * _BODY_BYTES_PER_TOKEN,
         "context_hint": "context is limited by the checkpoint and available cache capacity",
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
@@ -127,7 +128,7 @@ def export(args) -> int:
     from .publishing import validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
-    model = resolve_model(configuration, args.model)
+    model = resolve_model(configuration, args.model, getattr(args, "rope_parameters", None))
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
         validate_repository(repository)
@@ -173,7 +174,7 @@ def _export_hosts(args):
     progress = _serving_progress(args.verbose)
     configuration = Configuration.load(args.config)
     hub_cache = configuration.directory("hub_cache")
-    model = resolve_model(configuration, args.model)
+    model = resolve_model(configuration, args.model, getattr(args, "rope_parameters", None))
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; a single-host export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -262,7 +263,7 @@ def _prepare(args):
     _publisher(configuration, args)
     hub_cache = configuration.directory("hub_cache")
     with phase(progress, "Resolve checkpoint") as stage:
-        model = resolve_model(configuration, args.model)
+        model = resolve_model(configuration, args.model, getattr(args, "rope_parameters", None))
         cached = model.cached(hub_cache)
         stage.update(f"{model.checkpoint.alias} · {model.source} · {'cached' if cached else 'not cached'}")
     with phase(progress, "Select GPUs") as stage:
@@ -424,7 +425,7 @@ def debug_serve(args) -> int:
     progress = _serving_progress(args.verbose)
     configuration = Configuration.load(args.config)
     hub_cache = configuration.directory("hub_cache")
-    model = resolve_model(configuration, args.model)
+    model = resolve_model(configuration, args.model, getattr(args, "rope_parameters", None))
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
