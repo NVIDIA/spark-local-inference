@@ -66,7 +66,7 @@ A multi-host instance can use a Selene prefix cache pool (see
 - Build with `rdma` only if the manager offers RDMA.
 - Restarting with wiped local disks restores nothing unless records had already
   cascaded to the manager; see
-  [sharing through a pool](prefix-cache-offload.md#215-sharing-through-a-pool).
+  [sharing through a pool](prefix-cache-offload.md#214-sharing-through-a-pool).
 
 ### Network connections
 
@@ -413,7 +413,7 @@ holds. In `/metrics`, `flare_host_cache_stored_total` counts copy-outs,
 `flare_host_cache_hits_total` counts restores, and
 `flare_host_cache_reused_tokens_total` counts the tokens those restores
 covered. See
-[prefix cache offload](prefix-cache-offload.md#214-ranks-on-separate-hosts).
+[prefix cache offload](prefix-cache-offload.md#213-ranks-on-separate-hosts).
 
 A printed URL or successful `--detach` means rank processes started; wait for
 a successful health response before sending inference requests. The default

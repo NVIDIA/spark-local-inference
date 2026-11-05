@@ -12,7 +12,7 @@
 //! planes. The single `STATE_ROWS` allocation holds one continuation row per
 //! state slot. A record stores every plane of every page and the row of every
 //! rank with each plane padded to [`BLOCK_BYTES`], so direct I/O can address any
-//! plane at an aligned offset and the same bytes serve staged and direct transports.
+//! plane at an aligned offset.
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
 

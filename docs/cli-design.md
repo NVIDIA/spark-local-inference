@@ -1271,7 +1271,7 @@ a different encryption setting disables the pool for TCP clients. Unix-socket
 clients trust filesystem permissions and can use the same TLS manager. The CA
 requires the pool flag. These command-line options are forwarded to
 every rank and have no configuration-file key. See
-[the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
+[the pool section](prefix-cache-offload.md#214-sharing-through-a-pool).
 
 ## 4. Derived settings
 

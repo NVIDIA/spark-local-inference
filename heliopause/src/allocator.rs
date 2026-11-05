@@ -189,7 +189,6 @@ struct Arena {
     driver: Driver,
     device: i32,
     granularity: usize,
-    gpudirect: bool,
     host_base: u64,
     free: Vec<(u64, usize)>,
     mappings: BTreeMap<u64, usize>,
@@ -239,14 +238,13 @@ pub(crate) fn memory_inventory() -> Result<MemoryInventory> {
     })
 }
 
-fn properties(device: i32, gpudirect: bool) -> AllocationProperties {
+fn properties(device: i32) -> AllocationProperties {
     AllocationProperties {
         kind: 1,
         handles: i32::from(cfg!(target_os = "linux")),
         location: Location { kind: 1, device },
         windows: null_mut(),
-        // cuFile registration requires gpuDirectRDMACapable on VMM allocations.
-        flags: [0, u8::from(gpudirect), 0, 0, 0, 0, 0, 0],
+        flags: [0; 8],
     }
 }
 
@@ -278,15 +276,11 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
             ));
         }
         let driver = Driver::load()?;
-        let (mut address, mut granularity, mut gpudirect) = (0, 0, 0);
+        let (mut address, mut granularity) = (0, 0);
         unsafe {
             driver.check(
-                "cuDeviceGetAttribute(GPU_DIRECT_RDMA_SUPPORTED)",
-                (driver.device_attribute)(&mut gpudirect, 116, device),
-            )?;
-            driver.check(
                 "cuMemGetAllocationGranularity",
-                (driver.granularity)(&mut granularity, &properties(device, gpudirect != 0), 0),
+                (driver.granularity)(&mut granularity, &properties(device), 0),
             )?;
             let mut reserved = Vec::new();
             for peer in 0..world {
@@ -311,7 +305,6 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
             driver,
             device,
             granularity,
-            gpudirect: gpudirect != 0,
             host_base: host_base + u64::from(rank) * EXTENT as u64,
             free: vec![(BASE + u64::from(rank) * EXTENT as u64, EXTENT / 2)],
             mappings: BTreeMap::new(),
@@ -380,7 +373,7 @@ fn package_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
                 (a.driver.physical_create)(
                     &mut physical,
                     size,
-                    &properties(device, a.gpudirect),
+                    &properties(device),
                     0,
                 ),
             )?;
@@ -1078,7 +1071,6 @@ mod tests {
                 driver,
                 device: 0,
                 granularity: 4096,
-                gpudirect: false,
                 host_base: 0,
                 free: Vec::new(),
                 mappings: BTreeMap::new(),
@@ -1156,7 +1148,6 @@ mod tests {
                 driver,
                 device: 0,
                 granularity: 4096,
-                gpudirect: false,
                 host_base: 0,
                 free: Vec::new(),
                 mappings: BTreeMap::new(),
@@ -1199,7 +1190,6 @@ mod tests {
                 driver,
                 device: 0,
                 granularity: 4096,
-                gpudirect: false,
                 host_base: 0,
                 free: Vec::new(),
                 mappings: BTreeMap::from([(0x10000, 4096)]),

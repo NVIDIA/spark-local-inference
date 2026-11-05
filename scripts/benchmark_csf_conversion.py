@@ -73,7 +73,7 @@ def main():
                     assert torch.equal(actual.storage, reference.storage)
                 del result
         print(f'Layer {args.layer}: 512 experts, hidden=2560, intermediate=640, '
-              f'TP={args.tp_size} rank={args.tp_rank}, reader={loader._session.read_mode}')
+              f'TP={args.tp_size} rank={args.tp_rank}')
         print(f'Checkpoint CSF: {sum(t.nbytes for p in planes for t in p.components) / 2**20:.3f} MiB')
         print(f'Resident CSF: {sum(p.storage.nbytes for p in expected) / 2**20:.3f} MiB')
         for name, values in timings.items():

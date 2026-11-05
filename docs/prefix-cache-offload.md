@@ -3,8 +3,8 @@
 Helios keeps immutable prefix checkpoints in GPU memory and evicts them under
 pressure. Host retention stores complete model checkpoints and reusable CPU
 input records in memory, on disk, or in both tiers. Checkpoint disk transfers
-use bounded registered host staging; CPU input records use a separate bounded
-ordinary-memory window. GPUDirect Storage support is deferred.
+always pass through bounded registered host staging; CPU input records use a
+separate bounded ordinary-memory window.
 
 Every checkpoint tier stores immutable page chains and a complete
 endpoint row across all ranks. Recipes define the bytes needed to resume;
@@ -35,7 +35,7 @@ defines configuration precedence.
 - Every model contract is covered through the package's runtime-sized
   allocation groups. The offload path contains no model-specific code.
 - Offload work never blocks the model worker thread or the model stream.
-  Section 2.10 states the isolation mechanisms and section 4 the measurements
+  Section 2.9 states the isolation mechanisms and section 4 the measurements
   that gate the default.
 
 The local tier dispatch keeps `MemoryStore`, `DiskStore`, and `CompositeStore`,
@@ -83,8 +83,6 @@ memory that `capacities` leaves after weights and live state. A retained
 memory store there would duplicate bytes within the same pool, so disk-only
 retention avoids that duplication. Its intake exists because direct I/O needs a
 CPU-mapped destination and the page planes are mapped only on the GPU side.
-A GPUDirect Storage transport could remove payload staging; its indexes and
-I/O control structures would still occupy host memory.
 
 Host checkpoint memory uses equal page-record-sized slots. Rows occupy several
 slots (for example, 23 for DeepSeek and 135 for Qwen TP1), with each rank's row
@@ -277,7 +275,6 @@ backend, and a transport. The transport is a crate-private trait,
   With warm zero and disk enabled, the pool contains only intake slots.
   `write_from(key, metadata, buffers)` and `read_into(key, buffers)` move records
   between files and caller-owned registered slots for the composite.
-The deferred direct transport requirements are in section 2.6.
 
 `CompositeStore` owns a `MemoryStore` and a `DiskStore` and implements the
 trait by orchestrating them:
@@ -402,10 +399,10 @@ one 64-bit xxh3 over each stored page record, padded to
 4 KiB, so a restore that reads only a suffix of the pages verifies each page
 it read. The page segment follows, page-major: page `i`, then rank `r`, then
 planes in geometry order, with every plane padded to 4 KiB. The row segment
-follows, rank-major, with every row padded to 4 KiB. Per-plane padding is
-what lets the direct transport address each plane at an aligned file offset,
-so one file format serves both transports; the cost is small because the
-large planes are already multiples of 4 KiB and only small index planes pad.
+follows, rank-major, with every row padded to 4 KiB. Per-plane padding lets
+direct I/O address each plane at an aligned file offset; the cost is small
+because the large planes are already multiples of 4 KiB and only small index
+planes pad.
 The row exists when the file length covers the row segment; compaction
 truncates the file at the row segment offset and changes nothing else. Writes
 go to a temporary name in the same directory (preallocated to its final length
@@ -413,8 +410,7 @@ with `fallocate` on Linux, so direct writes overlap), use direct I/O, optionally
 `fdatasync`, and rename into place. Deletion is `unlink`. Checksums are
 64-bit xxh3 over each page record and over the row record to detect torn or
 corrupted files; the staged transport computes and verifies them on the disk
-thread. A direct transport requires a prepared GPU reduction over record
-planes to preserve the same payload verification.
+thread.
 
 The loader acquires an exclusive nonblocking lock on the record directory
 before scanning it. The store retains that directory descriptor through all
@@ -493,61 +489,7 @@ which the loader's driver binding already has; and `cuMemAddressReserve`,
 `cuMemAddressFree`, and `cuMemGetAllocationGranularity` for split pools. The installed driver 610.57.04 exports the
 batched copy, and `/opt/cuda/include/cuda.h` declares it.
 
-### 2.6 Deferred GPUDirect Storage transport
-
-Direct transport is not implemented. Its integration requires bindings for
-`libcufile.so` through `libloading`, the way
-`helios/src/cuda.rs` binds the driver, in `helios/src/offload/cufile.rs`.
-The b12x weight loader in the sibling FlashInfer checkout
-(`flashinfer/experimental/b12x/loader/_gds_reader.c`) already uses the same
-API on this class of host and is the reference for call patterns.
-
-- Startup: `cuFileDriverOpen`, then `cuFileDriverGetProperties` to confirm
-  the direct path. Compat mode, in which cuFile bounces through its own host
-  pool, is refused for serving because it is an uncontrolled host copy; the
-  store reports the reason and uses the staged transport instead. `direct`
-  requires the `nvidia-fs` kernel module, a filesystem cuFile supports with
-  `O_DIRECT`, and a PCIe path on which peer DMA between the NVMe devices and
-  the GPUs is permitted.
-- Registration: every page plane allocation and the row allocation on each
-  rank is registered once with `cuFileBufRegister`, so transfers address the
-  planes and rows in place with no copy. These are VMM allocations mapped
-  with `cuMemMap`; cuFile support for them must be verified on the installed
-  release, with `cuMemAlloc`-backed staging as the fallback if it is absent.
-- Files: each record file is opened with `O_DIRECT` and registered with
-  `cuFileHandleRegister` for the duration of a transfer. Plane offsets and
-  sizes are 4 KiB aligned by the file format, so every I/O takes the direct
-  path.
-- Transfers: each rank's transfer thread submits one cuFile batch per window
-  through `cuFileBatchIOSetUp`, `cuFileBatchIOSubmit`, and
-  `cuFileBatchIOGetStatus`, with one entry per plane, and reports completion
-  the way it reports a memcpy batch. Writes read the GPU pages directly, so
-  the pinned GPU checkpoint is the only lifetime requirement. Reads land in
-  the ticket's page ids and state slot directly, so the inbound completes when
-  the batch completes on every rank. The stream-ordered `cuFileReadAsync` and
-  `cuFileWriteAsync` variants are an alternative that records completion on
-  the offload stream's event; the batch API is preferred because it reports
-  per-entry failures.
-- Isolation: the same bounds apply, at most 16 MiB per batch and the lowest
-  stream priority, and cuFile's own worker threads are confined with the same
-  scheduling priority as the disk thread. GPU memory bandwidth consumed by
-  the NVMe DMA is measured by the section 4 interference measurements.
-- Host configuration: the development host runs with the IOMMU off, clears
-  every ACS control bit on every PCIe bridge at boot through
-  `disable-acs.service`, loads `nvidia-fs` at boot, and serves `/data` as XFS
-  on an `md` RAID 0 over eight PCIe 5 NVMe devices under root complexes
-  separate from the GPUs. `gdscheck -p` reports the NVMe path as `nvfs`, and
-  `gdsio` with compat mode forbidden completes direct transfers across that
-  fabric. The transport probe repeats the same check at startup on any host
-  before accepting the direct path.
-- cuFile configuration: Flare supplies its own `cufile.json` through
-  `CUFILE_ENV_PATH_JSON` before opening the driver, as fixed policy like the
-  JIT and preload variables: compat mode disallowed, `max_direct_io_size_kb`
-  raised so a 16 MiB entry is one I/O, and `max_batch_io_size` raised from
-  its default of 128 entries within cuFile's limit, since one 64-page window
-  of Qwen's 36 planes is 2,304 entries.
-
-### 2.7 Scheduler integration
+### 2.6 Scheduler integration
 
 `helios/src/scheduler.rs` changes:
 
@@ -587,7 +529,7 @@ Ticket resources are owned by the scheduler rather than by any request, so
 cancellation during inbound needs no special retirement rule, and several
 requests sharing a prefix share one transfer.
 
-### 2.8 Worker integration
+### 2.7 Worker integration
 
 `Worker` in `helios/src/server/runtime.rs` holds the optional store.
 `ModelRuntime::start` constructs the configured store on the model thread
@@ -595,7 +537,7 @@ after the executor exists, from the per-rank contexts, devices, and cache
 geometry in the local and peer manifests and from the pools and indexes the
 loader created. Process-peer tensor parallelism accepts the option only for a
 disk-only store whose ranks each keep their own records; see
-[section 2.14](#214-ranks-on-separate-hosts).
+[section 2.13](#213-ranks-on-separate-hosts).
 
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
@@ -607,7 +549,7 @@ stores receive logical eviction notices, including compaction. Every store
 call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
-GPU hit, the policy in section 2.10 decides whether to fetch, and
+GPU hit, the policy in section 2.9 decides whether to fetch, and
 `admit_planned` receives the inbound request. A newly created ticket starts
 the inbound job through `fetch`. On inbound failure the worker cancels each
 waiter and pushes its `Incoming` to the front of the pending queue with host
@@ -619,7 +561,7 @@ its threads, and finishes pending disk writes within a bound, before
 owners remain alive together with the model resources; host registrations
 and device allocations are never released beneath outstanding transfers.
 
-### 2.9 Loader integration
+### 2.8 Loader integration
 
 `NativeModel::load` in `helios/src/runtime_package/model.rs` skips host-store
 preparation entirely when memory and disk retention are disabled. Otherwise,
@@ -632,7 +574,7 @@ context current, and scans the directory. `manifests` attaches a `Binding` to ea
 rank's geometry and context, which the model worker takes once to construct
 the store and its transfer threads.
 
-### 2.10 Policy and isolation
+### 2.9 Policy and isolation
 
 Policy:
 
@@ -674,17 +616,15 @@ Offload limits interference through bounded work and explicit ownership:
 - Page cache: all record I/O is direct, so disk writes neither grow the page
   cache nor evict the package file's mappings.
 - Memory: every slab pool is fixed at startup and sized by the defaults in
-  section 2.11. Descriptor arrays, rings, and events are preallocated.
+  section 2.10. Descriptor arrays, rings, and events are preallocated.
 - Backpressure: every queue is bounded. When the disk thread falls behind,
   records awaiting their write stay pinned; when a pool is exhausted by pinned
   records, copy-out is skipped and counted, never waited for. Inbound waits
   are per request and visible as the `Inbound` phase.
 - A noted publication submits no copy job. A queued copy carries page ids;
   address expansion runs on the transfer threads.
-- Direct NVMe DMA uses the same per-batch byte limit. Section 4 measures
-  contention for GPU memory bandwidth and its effect on serving latency.
 
-### 2.11 Configuration and defaults
+### 2.10 Configuration and defaults
 
 - Memory size: `flare run --prefix-cache-memory SIZE` or `[prefix_cache] memory`
   sets the warm budget, shared by checkpoints and prepared CPU inputs as described
@@ -706,10 +646,10 @@ Offload limits interference through bounded work and explicit ownership:
   warning described in section 1.
 - Pool: `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-ca FILE`,
   the CA only with the pool; see
-  [section 2.15](#215-sharing-through-a-pool). Unset, the instance uses its
+  [section 2.14](#214-sharing-through-a-pool). Unset, the instance uses its
   local tiers only.
 - `LoadOptions` gains `prefix_cache: PrefixCacheOffload` with the resolved
-  memory size, directory, limit, transport, and pool.
+  memory size, directory, limit, and pool.
 - The startup phase reports the selected store, transport, pool sizes, the
   directory, the limit, and the scanned record count.
 - Metrics expose `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total`
@@ -720,7 +660,7 @@ Offload limits interference through bounded work and explicit ownership:
   retention is explicit until the default-enablement criteria pass; host
   memory and disk are shared with other software.
 
-### 2.12 Invariants
+### 2.11 Invariants
 
 - Only published, GPU-ready checkpoints are copied out; their pages and rows
   are immutable, so device-to-host copies need no model-stream ordering.
@@ -750,10 +690,10 @@ Offload limits interference through bounded work and explicit ownership:
 - Offload copies are bounded per issue, and offload threads run below the
   serving threads' priority.
 - Steady-state serving allocates no device memory, no pinned memory, and no
-  threads for offload; slabs, descriptor arrays, rings, events, and cuFile
-  registrations are created at startup.
+  threads for offload; slabs, descriptor arrays, rings, and events are created
+  at startup.
 
-### 2.13 Reusable CPU inputs
+### 2.12 Reusable CPU inputs
 
 Source-description records map an encoded input key to its semantic identity
 and geometry. Prepared-input records map that semantic identity to serialized
@@ -816,7 +756,7 @@ semantic identity. Existing packages use these paths without re-export.
 Per-image graph capacities and live feature storage stay fixed; total image
 tokens across a conversation are bounded by context rather than one window.
 
-### 2.14 Ranks on separate hosts
+### 2.13 Ranks on separate hosts
 
 When a multi-host package's ranks run as separate processes, no process can
 copy another host's GPU memory, so each host keeps the records of its own rank
@@ -888,7 +828,7 @@ memory its transfers may still use.
 Rank event framing and aggregation preserve filesystem-space pressure so a
 failed copy can defer until progress after every rank drains.
 
-### 2.15 Sharing through a pool
+### 2.14 Sharing through a pool
 
 `--prefix-cache-pool ADDRESS` attaches the instance to a pool manager. See
 [address forms, trust and startup warnings](../selene-manager/docs/network-operations.md#addresses-and-startup-warnings).
@@ -897,7 +837,7 @@ The manager's
 renamed pool has a distinct namespace, so its cache starts cold. Without the
 pool flag none of the sharing code below runs: the worker builds no pool lookup history and
 sees no export requests. Local and pooled instances use the same copy-at-publish
-and GPU eviction policy from section 2.10. A pooled instance still reads
+and GPU eviction policy from section 2.9. A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
 The loader attaches once before sizing and allocating GPU caches. The
@@ -1103,10 +1043,7 @@ on a single host too.
 Each step is independently testable and leaves the build green. Steps 1
 through 9 touch no scheduling behavior. Through step 12 the host store is
 enabled only by explicit sizes; step 13 turns on the derived defaults after
-the isolation measurements pass. Steps 15 through 17 add the direct transport
-on the file format fixed in step 5.
-
-### 3.1 Stores with the staged transport
+the isolation measurements pass.
 
 1. **Cache geometry and layout fingerprint.** Add `CacheGeometry` and the
    fingerprint in `selene/src/geometry.rs`. Collect it in
@@ -1212,11 +1149,11 @@ on the file format fixed in step 5.
 
 13. **Isolation measurement and default-on.** Run the measurements in
     section 4 with explicit sizes, baseline first. When every threshold holds,
-    enable the derived defaults of section 2.11, including the
+    enable the derived defaults of section 2.10, including the
     integrated-memory check, replace the initial policy rates with measured
     values, and update `docs/core-design.md` section 4, `docs/cli-design.md`
     sections 3 and 4, and `docs/runtime-package-design.md` section 4. A
-    threshold that fails is attributed to its channel in section 2.10 and
+    threshold that fails is attributed to its channel in section 2.9 and
     fixed before the default changes.
 
 14. **Parallel ranks and other models.** Qwen TP2, GLM TP4, and DeepSeek TP4
@@ -1224,32 +1161,6 @@ on the file format fixed in step 5.
     DeepSeek with Engram tables in disk mode, which shares the NVMe and PCIe
     paths. Acceptance: identical results on every rank, and transfer byte
     counts matching the geometry.
-
-### 3.2 Direct transport
-
-15. **cuFile bindings and probe.** `helios/src/offload/cufile.rs`: driver
-    open and close, properties, buffer and handle registration, and the batch
-    API, loaded lazily so hosts without `libcufile.so` are unaffected. A
-    startup probe reports whether the direct path is available and why not,
-    refusing compat mode. Acceptance: an ignored GPU test that registers a
-    `cuMemMap` allocation, writes it to a file with one batch, reads it back
-    into a second allocation, and compares byte-exact; a CPU test of the
-    probe's decision table over recorded property values.
-
-16. **Direct transport.** `Direct` implementing `DiskTransport`: plane
-    registration at startup, per-window batches from the transfer threads,
-    per-entry failure handling, the composite's concurrent fan-out on
-    `store`, and memory warming through the publication path on `fetch`.
-    Acceptance: the step 8 and 9 GPU tests repeated with the direct transport;
-    cuFile statistics confirm that every byte took the direct path.
-
-17. **Direct transport measurement.** Run the section 4 measurements with
-    the direct transport, including inbound latency against the staged
-    transport on the same prefixes and the fabric bandwidth from each NVMe
-    root complex to each GPU root complex. When the thresholds hold, the
-    transport default becomes direct where the probe accepts it. Document the
-    host requirements, `nvidia-fs`, ACS control cleared on the bridges, and
-    an IOMMU that is off or in passthrough, in `docs/cli-design.md`.
 
 ## 4. Validation
 
@@ -1282,8 +1193,8 @@ speculative records, restore prefixes exceeding RAM retention, reject corrupted
 payloads, and check GPU prefix reuse with offload disabled. Pytest owns and clears
 its `--basetemp` directory; use a dedicated test path.
 
-CPU tests cover steps 3 through 6, 8 through 10, 15's decision table, and
-the worker's use of the trait without a GPU. GPU tests are ignored by default
+CPU tests cover steps 3 through 6 and 8 through 10, and the worker's use of
+the trait without a GPU. GPU tests are ignored by default
 and keyed by environment variables that locate a package, following
 `helios/src/runtime_package/event_tests.rs`. Each package-backed test loads
 the whole package, so they run one at a time:
@@ -1363,5 +1274,4 @@ A correctness failure in any scenario blocks performance claims.
   compacted ancestor's row can be restored onto pages its child still holds
   without copying pages.
 - Page-granular matching in the GPU cache once rows are cheap to refetch.
-- A prepared GPU checksum over record planes for the direct transport.
 - Remote or shared stores, prefetch of likely continuations, and compression.

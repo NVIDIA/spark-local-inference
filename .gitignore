@@ -5,5 +5,4 @@ __pycache__/
 *.egg-info/
 /build/
 /dist/
-/cufile.log
 /.claude/worktrees/
