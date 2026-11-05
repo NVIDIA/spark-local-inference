@@ -322,9 +322,9 @@ queue. Both timestamps use the token timestamp origin.
 `choices=[]` before `[DONE]`; preceding chunks have `usage=null`. Otherwise an
 observed stream includes usage on its terminal choice chunk. Observation flags
 and `include_usage` accept only booleans or null; null is equivalent to false.
-The existing bounded event queue also bounds observation events. A slow reader
-can cancel an observed request through the same backpressure policy as normal
-generation. Observation changes no CUDA graph, device allocation or replay ABI.
+The response event budget includes one observation per generated token when
+requested, in addition to presentation events. Observation changes no CUDA
+graph, device allocation or replay ABI.
 
 `stop_token_ids` and `stop_token_sequences` accept explicit vocabulary IDs.
 At most sixteen sequences of at most 64 tokens are supported. Matching tokens
@@ -336,9 +336,16 @@ HTTP admission allows at most `queue_capacity + max_active` requests, including
 CPU preparation, queued generation, and streamed responses awaiting delivery. Admitted
 requests wait asynchronously for one of `frontend_workers` CPU preparation
 slots. The native ingress channel and pending admission deque each hold at most
-`queue_capacity` requests. A dropped response cancels its request. A slow reader that fills its
-bounded event queue cancels generation and receives an error if still
-connected. Neither case blocks graph scheduling. HTTP shutdown allows five
+`queue_capacity` requests. A dropped response cancels its request. Each response's
+event queue can hold its complete validated output budget, optional token
+observations and prompt scores, and terminal events. Queue storage grows as
+events arrive; it is not allocated at the full capacity on admission. A connected
+reader may pause and resume without losing output or blocking graph scheduling.
+Finished responses release model slots and KV resources but retain their host
+admission permit until the reader releases the response. This bounds retained
+output by admitted requests and their prompt and output limits. The native
+`event_capacity` setting is a minimum, not a cap on a response's event budget.
+HTTP shutdown allows five
 seconds for connection drain, then drops remaining connections; CUDA ownership
 remains governed by its separate stream-drain confirmation.
 
