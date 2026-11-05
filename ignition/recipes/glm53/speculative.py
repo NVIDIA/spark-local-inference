@@ -112,6 +112,10 @@ class SpeculativePreparation:
         self.draft_tables = torch.full_like(inputs.page_tables, -1)
         self.draft_generation = torch.zeros_like(requests.generation)
         self.draft_offset = torch.zeros_like(requests.generation)
+        # A checkpoint declaring index_share_for_mtp_iteration attends every draft pass of a round through
+        # its first pass's sparse selection.
+        self.share_draft_selection = bool(getattr(weights.tree.config.text_config,
+                                                  "index_share_for_mtp_iteration", False))
         # Verification records every KDA layer's tokens, so each request keeps one recurrent row.
         layers = delta_layers(pool)
         recurrent = pool.decoder.layers[layers[0]].recurrent
@@ -195,6 +199,11 @@ class PreparedRound:
         self.draft = o.draft(self.draft_metadata, f"{name}.draft") if w > 1 else None
         self.draft_logits = (buffers.zeros(self.draft.logits.shape, self.draft.logits.dtype)
                              if self.draft is not None else None)
+        self.selection = None
+        if o.share_draft_selection and w > 2:
+            index = self.draft.attention.scratch.index
+            self.selection = (buffers.zeros(index.physical.shape, index.physical.dtype),
+                              buffers.zeros(index.selected_lengths.shape, index.selected_lengths.dtype))
         self.absorb_metadata = DraftMetadata(b * w, b, blocks, device, shards=o.shards)
         self.absorb = o.draft(self.absorb_metadata, f"{name}.absorb", cache_only=True)
         self.before = torch.zeros(b, dtype=torch.int64, device=device)
@@ -243,6 +252,24 @@ class PreparedRound:
             if draft is not None:
                 draft.rebind_pages()
         self.validator.pages = self.owner.pool.memory_capacity[1:]
+
+    def retain_selection(self):
+        """Keep each request's first-pass selection from its output row.
+
+        Requests that propose a later draft proposed the first one; other requests' copies are never read.
+        """
+        index, rows = self.draft.attention.scratch.index, self.draft_metadata.output_indices
+        physical, lengths = self.selection
+        torch.index_select(index.physical, 0, rows, out=physical)
+        torch.index_select(index.selected_lengths, 0, rows, out=lengths)
+
+    def reuse_selection(self):
+        """Place each proposing request's first-pass selection in its packed draft row; idle rows select nothing."""
+        index, m = self.draft.attention.scratch.index, self.draft_metadata.indexed
+        physical, lengths = self.selection
+        requests = m.requests.long()
+        torch.index_select(physical, 0, requests, out=index.physical)
+        index.selected_lengths.copy_(torch.where(m.positions >= 0, lengths[requests], 0))
 
     def target_metadata(self, slots, limits):
         o, b, w, m = self.owner, self.batch, self.width, self.metadata
@@ -324,7 +351,12 @@ class PreparedRound:
             proposing = self.active & (i < limits - 1)
             self.draft_metadata.set(slots, proposing.long(), self.before - 1 + i,
                 token, hidden, o.draft_tables, state_rows=o.inputs.request_state_rows, capacity=1)
-            self.draft()
+            reuse = self.selection is not None and i > 0
+            if reuse:
+                self.reuse_selection()
+            self.draft(select=not reuse)
+            if self.selection is not None and i == 0:
+                self.retain_selection()
             torch.index_select(self.draft.logits, 0, self.draft_metadata.output_indices, out=self.draft_logits)
             self.offset.copy_(self.base_offset + 4 * i)
             proposal()

@@ -238,7 +238,8 @@ class PreparedMTP:
     def rebind_pages(self):
         self.attention.rebind_pages()
 
-    def __call__(self):
+    def __call__(self, *, select=True):
+        """Without `select`, attention reuses the sparse selection already in its index scratch."""
         w, m = self.weights.tensors, self.metadata
         self.embedding()
         self.embedded.masked_fill_((m.indexed.positions == 0)[:, None], 0)
@@ -257,7 +258,7 @@ class PreparedMTP:
             index.gate_projection(self.normalized)
             glm_pool.update_pools(*index.pool_arguments, plan=index.pool_plan)
             return
-        self.attention_reduce(self.attention(self.normalized))
+        self.attention_reduce(self.attention(self.normalized, select=select))
         rms_norm_add_residual(self.attention_output, self.residual, w["post_attention_layernorm"],
                               self.eps, x_out=self.normalized)
         self.mlp_reduce(self.moe(self.normalized))
