@@ -41,8 +41,10 @@ version domains. Execution ABI labels do not gate loading; the runtime validates
 the declared layouts and operations. Engine upgrades must preserve support for
 previously supported models without re-export.
 
-Executable resources are one mandatory zstd level-3 frame per resource. The
-signed `ExecutableResource` binds its stored frame, signed decoded length,
+Payload format 2 and signed format 6 encode each executable resource as one
+mandatory zstd level-3 frame. Signed format 4 retains its authenticated AES-GCM
+chunk reader. In payload packages, the signed `ExecutableResource` binds its
+stored frame, signed decoded length,
 resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
 compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
 capped at 8 MiB and rejects truncated or extra frames, trailing bytes, and
@@ -70,7 +72,7 @@ serving contract and replay path unchanged.
 
 | Field | Meaning |
 |---|---|
-| `version` | Semantic contract version, 3 |
+| `version` | Semantic contract version, 1, 2, or 3; exporters write 3 |
 | `vocabulary` | Valid sampled token range and histogram/mask geometry |
 | `input_vocabulary` | Valid input range, including declared nonsampled image sentinels |
 | `vision` | Feature-slot and per-window feature capacities, patch-to-feature ratio, and captured patch capacities |

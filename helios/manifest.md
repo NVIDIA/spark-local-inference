@@ -113,6 +113,8 @@ verification, and commit work. It declares B/D/W/P explicitly: request capacity,
 captured proposal depth, per-request target capacity, and aggregate target rows.
 W is from 1 through T, the resolved completion token capacity; P is from B
 through B × W, including rectangular P = B × W.
+An omitted or zero packed token capacity resolves to B × W for speculative
+graphs, preserving packages exported before that field was added.
 Width-one speculative graphs have D = 0 and maintain draft context. No standalone
 proposal, verification, or packed-speculative graph kind exists.
 Prefill has batch capacity 1. Token capacities are 1, 16, or a multiple of 64

@@ -156,7 +156,7 @@ impl ModelPackage {
 /// On-disk prepared-package formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageFormat {
-    /// Signed format-6 logical-resource packages read through the archive.
+    /// Signed format-4 and format-6 logical-resource packages read through the archive.
     Legacy,
     /// Payload-identity packages read through pinned payload containers.
     Payload,
