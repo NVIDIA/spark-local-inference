@@ -59,7 +59,7 @@ def test_glm_shared_expert_overlaps_routing_or_follows_routed_experts(monkeypatc
     gate = SimpleNamespace(num_group=1, topk_group=1, top_k=8, num_experts=288, norm_topk_prob=True,
                            routed_scaling_factor=2.5)
     weights = SimpleNamespace(router=torch.zeros((288, 4096), dtype=torch.bfloat16), correction=torch.zeros(288),
-                              shared=None, experts_a4_prefill=False,
+                              shared=None, experts_a4_prefill=False, trellismx_release=None,
                               experts=SimpleNamespace(num_experts=288, hidden_size=4096, intermediate_size=1024))
     source = torch.zeros((rows, 4096), dtype=torch.bfloat16)
     prepared = moe.PreparedGlmMoe(SimpleNamespace(gate=gate, config=SimpleNamespace(swiglu_limit=None)), source,

@@ -92,6 +92,13 @@ class Checkpoint:
     # contract without the value, and dashboards then show no weight bandwidth.
     decode_weight_bytes: int = 0
     plain_ranks: Mapping[int, "RankCosts"] | None = None
+    # The tensor-parallel sizes that can load this checkpoint when its storage fixes them, such
+    # as weights published as per-rank shards; empty means every size its recipe declares.
+    tensor_parallel: tuple[int, ...] = ()
+    # The schema of the overlay manifest this checkpoint is published with, when its storage
+    # overlays a carrier checkpoint. A local directory resolves to a checkpoint declaring the
+    # overlay its manifest names, and a directory without one to a checkpoint declaring none.
+    overlay: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,10 +280,19 @@ class Recipe:
             if any(costs is not None and set(costs) != set(self.ranks)
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
                 raise ValueError(f"{checkpoint.alias} declares costs for other tensor-parallel sizes than its recipe")
+            sizes = checkpoint.tensor_parallel
+            if (not isinstance(sizes, tuple) or any(type(size) is not int for size in sizes)
+                    or list(sizes) != sorted(set(sizes)) or not set(sizes) <= set(self.ranks)):
+                raise ValueError(f"{checkpoint.alias} must declare its tensor-parallel sizes as an increasing tuple"
+                                 " of sizes its recipe declares")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:
         return tuple(sorted(self.ranks))
+
+    def checkpoint_tensor_parallel(self, checkpoint: Checkpoint) -> tuple[int, ...]:
+        """The tensor-parallel sizes that can load `checkpoint`."""
+        return checkpoint.tensor_parallel or self.tensor_parallel
 
     def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None) -> RankCosts:
         """Return one rank's costs under the given speculation settings, for `checkpoint` when it declares its own."""

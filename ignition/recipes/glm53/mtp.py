@@ -201,6 +201,19 @@ class PreparedMTP:
             attention = Glm5NextTextAttention(config, 45).eval()
             moe = Glm5NextTextMoE(config).eval()
         self.metadata, self.weights, self.cache_only = metadata, weights.mtp, cache_only
+        if weights.mtp.mlp.trellismx_release is not None:
+            from .weights import MoEWeights
+
+            # Layer 45's sidecars are shape-identical to the routed layers': its draft MoE must
+            # cover the same experts and the same rank's intermediate slice as the target.
+            target = next((layer.mlp for layer in reversed(weights.layers)
+                           if isinstance(layer.mlp, MoEWeights)), None)
+            if (target is None or target.trellismx_release is None
+                    or (target.experts.num_experts, target.experts.hidden_size,
+                        target.experts.intermediate_size)
+                    != (weights.mtp.mlp.experts.num_experts, weights.mtp.mlp.experts.hidden_size,
+                        weights.mtp.mlp.experts.intermediate_size)):
+                raise ValueError("GLM TrellisMX draft layer 45 must match the target's routed expert geometry")
         self.eps = config.rms_norm_eps
         rows, device = metadata.token_ids.numel(), metadata.hidden.device
         def buffer(*shape):

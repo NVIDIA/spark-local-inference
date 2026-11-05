@@ -6,6 +6,7 @@
 
 from types import MappingProxyType
 
+from ignition.preparation.trellismx_release import MANIFEST_SCHEMA
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
 # Each sparse-attention layer stores four latent blocks and one index block per
@@ -80,7 +81,23 @@ RECIPE = Recipe(
         # Language model, draft layer, output head, and replicated vision tower.
         device_bytes=177_421_592_008,
         # Decoder layer 45, the MTP module.
-        draft_bytes=4_301_658_112),),
+        draft_bytes=4_301_658_112),
+        # The TrellisMX release overlays its routed experts on the pinned carrier: the
+        # carrier's 19_339_670_136 payload bytes plus 165_721_576_928 bytes of sidecars,
+        # one per layer and rank of a TP4 partition, so only TP4 can load it. Tensors stay
+        # as stored, but preparation keeps more than the stored bytes: each sidecar's b12x
+        # bundle holds 1_021_002_880 bytes (its payload, one repacked copy of both UE8M0
+        # scale planes, and the intermediate rotations; measured on the CPU-prepared
+        # bundle). The attached P8 runtime's repacked planes replace the bundle's
+        # byte-identical copies, and the runtime adds 905_348 bytes of its own, almost all
+        # its packed boundary vectors (measured on a CPU-attached runtime). The 172 sidecars
+        # thus occupy 1_021_908_228 bytes each, 58 MB beyond their stored size.
+        Checkpoint(
+            alias="glm-5.3-flash-trellismx", repository="brandonmusic/glm-5.3-flash-tr3-fp8",
+            revision="80cbe535eabbeddfbd567e376a09ac559bcbac75", architecture="Glm5NextForConditionalGeneration",
+            stored_bytes=185_061_247_064, device_bytes=185_061_247_064, expansion_bytes=10_046_638_288,
+            # Layer 45's four sidecars, as prepared, plus its 25 non-expert tensors.
+            draft_bytes=4_457_303_696, tensor_parallel=(4,), overlay=MANIFEST_SCHEMA)),
     context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.

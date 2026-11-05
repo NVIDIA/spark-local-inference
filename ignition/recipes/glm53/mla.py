@@ -220,10 +220,13 @@ class PreparedGlmMLA:
             raise ValueError("canonical MLA geometry differs from GLM 5.3 Flash")
         if module.indexer is None or module.skip_topk or heads not in (16, 32, 64):
             raise ValueError("GLM MLA requires a full indexer and TP1, TP2 or TP4 head partitions")
+        # A plain BF16 tensor states its rows in its shape; a packed weight states them in out_features.
+        def output_rows(weight):
+            return weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
+
         if (state.cache.shape != (state.index.cache.shape[0] * 4, 64, 528)
-                or weights["q_b_proj"].out_features != heads * 256
-                or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
-                    else weights["kv_b_proj"].out_features) != heads * 512):
+                or output_rows(weights["q_b_proj"]) != heads * 256
+                or output_rows(weights["kv_b_proj"]) != heads * 512):
             raise ValueError("GLM MLA cache or head partition geometry mismatch")
         self.module, self.scratch, self.state, self.metadata = module, scratch, state, metadata
         # Decode projects and absorbs queries while records are selected; shared RoCE gathers follow the join.

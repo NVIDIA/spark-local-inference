@@ -72,6 +72,13 @@ def _csf_stored_bytes(container, snapshot):
 def _snapshot_cached(snapshot: Path) -> bool:
     """Report whether the index and every tensor file it names are present."""
     try:
+        from ignition.preparation.trellismx_release import trellismx_assets_root, trellismx_files_present
+
+        # A TrellisMX release overlays a carrier: its index and tokenizer live under carrier/, and
+        # it is complete only with every sidecar its manifest names.
+        if not trellismx_files_present(snapshot):
+            return False
+        snapshot = trellismx_assets_root(snapshot)
         if _csf_container(snapshot) is not None:
             from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
@@ -116,6 +123,18 @@ class ResolvedModel:
     def verify(self, hub_cache: Path) -> None:
         """Check index metadata; recipes validate tensor storage and geometry."""
         snapshot = self.snapshot(hub_cache)
+        from ignition.preparation.trellismx_release import (overlay_schema, trellismx_files_present,
+                                                            trellismx_stored_bytes)
+
+        try:
+            if overlay_schema(snapshot) is not None:
+                # An overlay release keeps its index under carrier/ and needs every file its manifest names.
+                trellismx_stored_bytes(snapshot)
+                if not trellismx_files_present(snapshot):
+                    raise UsageError(f"{snapshot} lacks files its TrellisMX release manifest names")
+                return
+        except ValueError as error:
+            raise UsageError(f"{snapshot} has an unreadable TrellisMX release: {error}") from error
         try:
             container = _csf_container(snapshot)
             if container is not None:
@@ -148,16 +167,23 @@ def _unsupported(reason: str) -> UsageError:
     return UsageError(f"{reason}; supported models: {', '.join(aliases())}")
 
 
-def _supporting(config_path: Path, source: str) -> tuple[Recipe, Checkpoint]:
+def _supporting(config_path: Path, source: str, overlay: str | None = None) -> tuple[Recipe, Checkpoint]:
+    """The first declared checkpoint of the named architecture packaged like ``source``.
+
+    A directory carrying an overlay manifest matches only checkpoints declaring that overlay,
+    and any other directory only checkpoints declaring none.
+    """
     try:
         architectures = json.loads(config_path.read_text())["architectures"]
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise _unsupported(f"{source} has no readable config.json architecture") from error
     for recipe in recipes():
         for checkpoint in recipe.checkpoints:
-            if isinstance(architectures, list) and checkpoint.architecture in architectures:
+            if (isinstance(architectures, list) and checkpoint.architecture in architectures
+                    and checkpoint.overlay == (overlay or "")):
                 return recipe, checkpoint
-    raise _unsupported(f"no recipe supports architecture {architectures!r} in {source}")
+    packaging = f" packaged as {overlay}" if overlay else ""
+    raise _unsupported(f"no recipe supports architecture {architectures!r}{packaging} in {source}")
 
 
 def _stored_bytes(index_path: Path, source: str) -> int:
@@ -215,12 +241,22 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
                 # A directory that a recipe declares keeps its declared placement.
                 if Path(checkpoint.repository).is_absolute() and Path(checkpoint.repository).resolve() == directory:
                     return ResolvedModel(recipe, checkpoint, directory)
-        recipe, qualified = _supporting(metadata / "config.json", str(directory))
+        from ignition.preparation.trellismx_release import overlay_schema, trellismx_stored_bytes
+
+        # An overlay release is placed like the checkpoint declared with its packaging, and stores
+        # its carrier's payload plus every file its manifest names.
+        try:
+            overlay = overlay_schema(directory)
+            overlay_stored = None if overlay is None else trellismx_stored_bytes(directory)
+        except ValueError as error:
+            raise UsageError(f"{directory} has an unreadable release manifest: {error}") from error
+        recipe, qualified = _supporting(metadata / "config.json", str(directory), overlay)
         # The directory's path identifies its measurements on this host.
         revision = hashlib.sha256(str(directory).encode()).hexdigest()[:40]
         index = directory / "model.safetensors.index.json"
         single = directory / "model.safetensors"
         stored = (_csf_stored_bytes(container, directory) if container is not None else
+                  overlay_stored if overlay_stored is not None else
                   _stored_bytes(index, str(directory)) if index.exists() else
                   single.stat().st_size if single.is_file() else qualified.stored_bytes)
         return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)

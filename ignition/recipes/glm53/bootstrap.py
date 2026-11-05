@@ -271,7 +271,22 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
     with phase(progress, "Inspect checkpoint"):
-        manifest = inspect_indexed_checkpoint(snapshot)
+        # A TrellisMX release is a routed-expert overlay: the checkpoint argument is the
+        # release root, whose carrier holds every tensor the sidecars do not replace.
+        from .trellismx import is_trellismx_overlay
+
+        release = is_trellismx_overlay(snapshot)
+        assets_root = snapshot if release is None else release.carrier_root
+        manifest = inspect_indexed_checkpoint(assets_root)
+    from .trellismx import agree_on_release
+
+    # Every rank must have detected the same release bytes before any of them loads.
+    agree_on_release(release, group)
+    if release is not None:
+        from .trellismx import p8_settings
+
+        # Resolving b12x's in-tree P8 backend here fails before loading when this b12x lacks it.
+        report(f"TrellisMX release {release.manifest_sha256[:12]} · P8 settings {p8_settings()}")
     from ignition.components.sm103 import is_sm103
 
     expert_activation = config.expert_activation
@@ -287,7 +302,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         transient.enter_context(package_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp,
                                 expert_activation=expert_activation,
-                                expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only)
+                                expand_expert_scales=config.expand_expert_scales,
+                                language_model_only=config.language_model_only, release=release)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -364,9 +380,13 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                                                hidden_size=4096, ipc=ipc)
             vocabulary_collective = create_all_gather_runtime(group, device,
                 max_rows=sample_rows, columns=154880, ipc=ipc)
-        identity = hashlib.sha256(json.dumps({"config": json.loads((snapshot / "config.json").read_text()),
+        identity_document = {"config": json.loads((snapshot / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
-            "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
+            "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}
+        if release is not None:
+            # The routed experts' bytes live in the release's sidecars, not in the carrier's shards.
+            identity_document["trellismx_manifest_sha256"] = release.manifest_sha256
+        identity = hashlib.sha256(json.dumps(identity_document, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
@@ -645,11 +665,18 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         "state_row_bytes": pool.backing.nbytes // max(1, state_rows + 1)}
     if scoring is not None:
         memory.update(scoring.memory_report())
-    assets = {role: {"path": str(snapshot / filename)}
+    if release is not None:
+        from .trellismx import p8_attachments, p8_settings
+
+        # The release prepared, the P8 settings its routed experts were compiled and captured with, and
+        # the attachment identities and effective options of the runtimes b12x verified.
+        memory["trellismx"] = {"manifest_sha256": release.manifest_sha256, "p8": p8_settings(),
+                               "attachments": p8_attachments(weights)}
+    assets = {role: {"path": str(assets_root / filename)}
         for role, filename in (("tokenizer", "tokenizer.json"),)}
     assets["chat_template"] = annotated_template_asset(
-        (snapshot / "chat_template.jinja").read_bytes(), Path(__file__).with_name("assets") / "chat_template.patch.json")
-    generation = json.loads((snapshot / "generation_config.json").read_text())
+        (assets_root / "chat_template.jinja").read_bytes(), Path(__file__).with_name("assets") / "chat_template.patch.json")
+    generation = json.loads((assets_root / "generation_config.json").read_text())
     from .mla import MLAState
     cache_regions = []
     for layer, value in enumerate((*pool.decoder.layers, *((pool.draft,) if pool.draft is not None else ()))):
@@ -661,8 +688,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name, "max_sequence_tokens": config.context,
         "prefill_chunk_size": config.prefill_chunk_size, "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": config.page_tokens,
-        "frontend": prepare_frontend(snapshot, eos_token_ids=generation["eos_token_id"],
-            image_profile="glm" if vision_state is not None else None, preprocessor=snapshot / "processor_config.json"),
+        "frontend": prepare_frontend(assets_root, eos_token_ids=generation["eos_token_id"],
+            image_profile="glm" if vision_state is not None else None, preprocessor=assets_root / "processor_config.json"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, page_tokens=config.page_tokens, draft_lag=1 if config.mtp else None, regions=cache_regions, image_slots=config.image_concurrency)}
     if config.mtp:

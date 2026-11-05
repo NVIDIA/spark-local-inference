@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ignition.components.parallel import TensorParallelShard
@@ -18,6 +19,8 @@ from ignition.preparation.checkpoint import IndexedCheckpoint
 if TYPE_CHECKING:
     import torch
     from b12x.moe.fused_moe import PreparedExperts
+
+    from .trellismx import TrellisMxRelease
 
 TEXT_PREFIX = "model.language_model"
 
@@ -30,6 +33,10 @@ class MoEWeights:
     shared: MLPWeights
     # A16 experts prepared with A4 capability: prefill may bind quantized activations.
     experts_a4_prefill: bool = False
+    # The TrellisMX release whose sidecars supplied the routed experts, or None for the
+    # carrier's own experts. A sidecar is one rank's contiguous slice of the
+    # checkpoint-global intermediate axis, executed by the trellismx source format.
+    trellismx_release: TrellisMxRelease | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +76,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
-             expand_expert_scales=False, language_model_only=False):
+             expand_expert_scales=False, language_model_only=False, release=None):
         import torch
 
         from .model import create_model_tree
@@ -85,7 +92,7 @@ class ModelWeights:
         layers = []
         with GlmWeightLoader(manifest, device, shard=shard,
                              progress=progress if shard.rank == 0 else None,
-                             expert_activation=expert_activation) as loader:
+                             expert_activation=expert_activation, release=release) as loader:
             names = [f"{TEXT_PREFIX}.embed_tokens.weight", f"{TEXT_PREFIX}.norm.weight"]
             for name in names:
                 path, attribute = name.rsplit(".", 1)
@@ -95,12 +102,16 @@ class ModelWeights:
             if isinstance(head, torch.Tensor):
                 tree.lm_head.weight = torch.nn.Parameter(head, requires_grad=False)
             tree.lm_head.out_features = head.shape[0] if isinstance(head, torch.Tensor) else head.out_features
-            scales = None if expand_expert_scales else loader.allocate_expert_scale_scratch()
+            # TrellisMX experts carry UE8M0/K32 weight scales; they have no NVFP4 CSF planes to expand.
+            scales = (None if expand_expert_scales or release is not None
+                      else loader.allocate_expert_scale_scratch())
             for index in range(len(tree.model.language_model.layers)):
                 layers.append(LayerWeights(loader.load_attention(index), loader.load_mlp(index, scale_scratch=scales),
                                            loader.load_residual(index)))
             draft = loader.load_mtp(scales) if mtp else None
-            if draft is not None and isinstance(head, torch.Tensor):
+            # A TrellisMX release is served as released: its BF16 head stays BF16, so draft
+            # proposals use the target's own projection instead of an NVFP4 re-encoding.
+            if draft is not None and isinstance(head, torch.Tensor) and release is None:
                 from ignition.components.vocabulary import nvfp4_draft_head
 
                 draft = replace(draft, draft_head=nvfp4_draft_head(head))
@@ -126,7 +137,7 @@ class GlmWeightLoader(DirectWeightLoader):
     """
 
     def __init__(self, manifest: IndexedCheckpoint, device, *, shard: TensorParallelShard,
-                 prefixes=None, progress=None, expert_activation="a4"):
+                 prefixes=None, progress=None, expert_activation="a4", release=None):
         super().__init__(manifest, device, prefixes=prefixes,
                          progress=progress)
         self.shard = shard
@@ -134,6 +145,16 @@ class GlmWeightLoader(DirectWeightLoader):
             raise ValueError("GLM NVFP4-CSF experts execute with A4 or A16 activations")
         # A16 keeps calibrated activation scales so prefill can still bind A4 launches.
         self.expert_activation = expert_activation
+        self.trellismx = release
+        if release is not None:
+            # The inspected manifest must be the carrier this release overlays, and the
+            # sidecars describe exactly this many ranks' slices of the intermediate axis.
+            if Path(manifest.snapshot).resolve() != release.carrier_root.resolve():
+                raise ValueError(f"GLM TrellisMX release {release.root} overlays {release.carrier_root},"
+                                 f" not the inspected checkpoint {manifest.snapshot}")
+            if release.world_size != shard.world_size:
+                raise ValueError(f"GLM TrellisMX release {release.root} ships {release.world_size}"
+                                 f" tensor-parallel ranks, got {shard.world_size}")
         config = json.loads((manifest.snapshot / "config.json").read_text())
         if (config.get("model_type") != "glm5_next"
                 or config.get("architectures") != ["Glm5NextForConditionalGeneration"]):
@@ -223,12 +244,14 @@ class GlmWeightLoader(DirectWeightLoader):
         )
         from ignition.preparation.quantization import expert_format
 
-        csf = expert_format(self.quantization, prefix + ".experts")[0] == "nvfp4_csf"
+        csf = (self.trellismx is None
+               and expert_format(self.quantization, prefix + ".experts")[0] == "nvfp4_csf")
         return MoEWeights(
             self.load_tensor(f"{prefix}.gate.weight"),
             self.load_tensor(f"{prefix}.gate.e_score_correction_bias"),
             self.load_experts(layer, scale_scratch=scale_scratch), shared,
             experts_a4_prefill=csf and self.expert_activation == "a16",
+            trellismx_release=self.trellismx,
         )
 
     def load_experts(self, layer, *, expert_ids=None, scale_scratch=None):
@@ -239,6 +262,19 @@ class GlmWeightLoader(DirectWeightLoader):
         if (not ids or len(set(ids)) != len(ids)
                 or any(type(i) is not int or not 0 <= i < 288 for i in ids)):
             raise ValueError("GLM expert IDs must be distinct integers in [0, 288)")
+        if self.trellismx is not None:
+            # The carrier omits the routed tensors its sidecars replace, so the sidecar
+            # payloads are the only source for this layer's experts.
+            if ids != tuple(range(288)):
+                raise ValueError("GLM TrellisMX experts prepare all 288 experts together")
+            import torch
+
+            from .trellismx import load_trellis_experts
+
+            return load_trellis_experts(
+                self.trellismx, layer=layer, rank=self.shard.rank, world_size=self.shard.world_size,
+                hidden_size=4096, global_intermediate_size=2048, num_experts=288, top_k=8,
+                swiglu_limit=10.0, device=self.device, params_dtype=torch.bfloat16)
         prefixes = tuple(f"{prefix}.{i}" for i in ids)
         from ignition.preparation.quantization import expert_format
 
