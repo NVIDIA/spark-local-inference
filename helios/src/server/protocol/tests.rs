@@ -609,6 +609,75 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
 }
 
 #[test]
+fn glm_arguments_that_mismatch_declared_types_complete_every_protocol() {
+    use crate::{
+        model::contract::{ToolParser, ToolParserKind},
+        output::{Input as OutputInput, OutputConfig, OutputPipeline, tagged},
+    };
+
+    let text = "<tool_call>lookup<arg_key>enabled</arg_key><arg_value>\"true\"</arg_value><arg_key>count</arg_key><arg_value>two</arg_value></tool_call>";
+    let expected = json!({"enabled":"true","count":"two"});
+    for protocol in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::GlmArgumentTags,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let mut parser = OutputPipeline::new(OutputConfig {
+            syntax,
+            control_tokens: vec![],
+            content: tagged::OutputConfig {
+                structured: false,
+                start: tagged::OutputStart::Content,
+                tools: vec![json!({"type":"function","function":{
+                    "name":"lookup","parameters":{"type":"object","properties":{
+                        "enabled":{"type":"boolean"},"count":{"type":"integer"}
+                    }}
+                }})],
+            },
+        });
+        let mut enc = encoder(protocol);
+        let mut frames = enc.start();
+        for (at, ch) in text.char_indices() {
+            let parsed = parser
+                .push(OutputInput::Text(&text[at..at + ch.len_utf8()]))
+                .unwrap();
+            frames.extend(enc.apply(0, parsed).unwrap());
+        }
+        let parsed = parser.finish(Termination::Eos).unwrap();
+        frames.extend(enc.apply(0, parsed).unwrap());
+        frames.extend(enc.finish(0, Termination::Eos, 12, 0, None).unwrap());
+        let response = enc.response();
+        let arguments = match protocol {
+            Protocol::Chat => {
+                assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                assert!(frames.last().unwrap().done);
+                let call = &response["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["function"]["name"], "lookup");
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap()
+            }
+            Protocol::Messages => {
+                assert_eq!(response["stop_reason"], "tool_use");
+                assert_eq!(frames.last().unwrap().data["type"], "message_stop");
+                assert_eq!(response["content"][0]["name"], "lookup");
+                response["content"][0]["input"].clone()
+            }
+            Protocol::Responses => {
+                assert_eq!(response["status"], "completed");
+                assert_eq!(frames.last().unwrap().data["type"], "response.completed");
+                let call = &response["output"][0];
+                assert_eq!(call["name"], "lookup");
+                serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(arguments, expected, "{protocol:?}");
+    }
+}
+
+#[test]
 fn parallel_tool_controls_decode_to_the_same_limit() {
     for (protocol, body) in [
         (
