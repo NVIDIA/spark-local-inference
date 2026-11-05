@@ -71,20 +71,26 @@ class GraphSignature:
                 or (self.packed_token_capacity and (self.kind != "speculative"
                     or not self.batch_capacity <= self.packed_token_capacity <= self.batch_capacity * self.token_capacity))):
             raise ValueError("packed verification capacity must fit the batch and per-request prefix bounds")
-        if self.kind == "speculative":
-            if "speculative_prefix_limits" in self.inputs and (
-                    type(self.draft_tokens) is not int or self.draft_tokens < 0 or not self.packed_token_capacity):
-                raise ValueError("device prefix allocation requires explicit nonnegative draft depth and positive target capacity")
+        # A speculative round and the round a mixed graph embeds both propose width - 1 tokens;
+        # the package binding requires that depth and Helios selects both kinds by it.
+        proposing = self.kind == "speculative" or (self.kind == "mixed" and self.speculation_enabled)
+        if self.kind == "speculative" and "speculative_prefix_limits" in self.inputs and (
+                self.draft_tokens is None or not self.packed_token_capacity):
+            raise ValueError("device prefix allocation requires explicit draft depth and positive target capacity")
+        if proposing:
             depth = self.token_capacity - 1 if self.draft_tokens is None else self.draft_tokens
-            packed = self.batch_capacity * self.token_capacity if not self.packed_token_capacity else self.packed_token_capacity
             if type(depth) is not int or not 0 <= depth < (1 << 31) - 1 or (self.token_capacity == 1 and depth != 0):
-                raise ValueError("speculative rounds require nonnegative Int32 draft depth and width-one rounds require zero")
+                raise ValueError("proposing rounds require nonnegative Int32 draft depth and width-one rounds require zero")
+            if self.kind == "mixed" and depth != self.token_capacity - 1:
+                raise ValueError("a mixed round's embedded round proposes width - 1 tokens; declare that depth or none")
             object.__setattr__(self, "draft_tokens", depth)
+        elif self.draft_tokens is not None:
+            raise ValueError("explicit draft depth belongs to proposing rounds")
+        if self.kind == "speculative":
+            packed = self.batch_capacity * self.token_capacity if not self.packed_token_capacity else self.packed_token_capacity
             object.__setattr__(self, "packed_token_capacity", packed)
             if "query_lengths" in self.inputs and "speculative_prefix_limits" in self.inputs:
                 raise ValueError("speculative rounds cannot bind both query lengths and prefix limits")
-        elif self.draft_tokens is not None:
-            raise ValueError("explicit draft depth belongs to speculative rounds")
         if (type(self.confidence_width) is not int or self.confidence_width < 0
                 or (self.confidence_width and (self.kind != "speculative"
                     or self.confidence_width != self.draft_tokens))):
