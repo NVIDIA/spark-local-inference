@@ -70,8 +70,10 @@ class PreparedMixedRound:
             full_scratch = owner.scratch.rows(self.packing.tokens, sample_rows)
             injection = MixedEmbeddingInjection(self.packing, features, self.prompt_state,
                 full_scratch.embedding, scratch.prompt_gdn.output[:prefill])
+            # Not verification mode: the roles' states gather the packed hidden rows into the
+            # b*w+1 sample rows, and the round's own samplers read the logits.
             self.decoder = PreparedDecoder(weights, full_scratch, state, cache, rotary, table, workspaces,
-                completion, frame, sequence, verification=True, embedding_injection=injection, **kwargs)
+                completion, frame, sequence, verification=False, sampler=False, embedding_injection=injection, **kwargs)
             self.prompt_sampler = PreparedSampling(full_scratch.logits[-1:], owner.requests,
                 self.prompt_inputs.row_slot_ids[:1], self.prompt_inputs.row_generations[:1],
                 self.prompt_inputs.live_rows, self.prompt_completion, frame, sequence,

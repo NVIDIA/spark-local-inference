@@ -33,7 +33,8 @@ The Python representation is a dictionary with these fields:
             "handle": int,          # Instantiated CUgraphExec handle.
             "batch_capacity": int,
             "token_capacity": int,  # W, including the pending token.
-            "draft_tokens": int,    # Captured proposal depth D for speculative graphs.
+            "draft_tokens": int,    # Captured proposal depth D for speculative graphs and for mixed graphs
+                                    # that embed a speculative round (a load-time selection key; mixed plans run at depth 0).
             "packed_token_capacity": int,  # P, explicit for speculative graphs.
             "confidence_width": int,  # Produced confidence prefixes, otherwise zero.
             "input_bindings": [

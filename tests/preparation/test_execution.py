@@ -236,6 +236,23 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
     assert (decoded.batch_capacity, decoded.token_capacity, decoded.prefill_capacity) == (4, width, prefill)
     assert decoded.speculation_enabled == enabled
     assert "prefill_row" in [b.buffer_name for b in decoded.input_bindings]
+    # A mixed round with speculation carries its embedded round's proposal depth, which the
+    # package export requires and the runtime selects mixed rounds by; a plain one carries none.
+    assert decoded.draft_tokens == (width - 1 if enabled else 0)
+    assert signature.draft_tokens == (width - 1 if enabled else None)
+
+
+def test_mixed_signature_depth_follows_the_speculative_rules():
+    # A mixed round's embedded round always proposes width - 1 tokens, so an explicit depth must say
+    # so; a mixed round without speculation carries none.
+    signature = GraphSignature("mixed", 4, 6, ("prefill_row",), speculation_enabled=True, prefill_capacity=64, draft_tokens=5)
+    assert signature.draft_tokens == 5
+    assert GraphSignature("mixed", 4, 1, ("prefill_row",), speculation_enabled=False, prefill_capacity=64).draft_tokens is None
+    with pytest.raises(ValueError):
+        GraphSignature("mixed", 4, 1, ("prefill_row",), speculation_enabled=False, prefill_capacity=64, draft_tokens=0)
+    for depth in (-1, 1 << 31, 2.0, 2, 6):
+        with pytest.raises(ValueError):
+            GraphSignature("mixed", 4, 6, ("prefill_row",), speculation_enabled=True, prefill_capacity=64, draft_tokens=depth)
 
 
 def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds():
