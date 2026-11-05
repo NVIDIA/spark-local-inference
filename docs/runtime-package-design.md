@@ -289,7 +289,8 @@ weight materialization, and frontend assets. Coordinators report export peer wai
 rank transfers, and preparation-resource release before publication.
 Publication reports payload assembly, validation, frontend verification, each rank's
 executable compression and installation, each rank's data verification and
-installation, shared data, metadata signing, and final package commit.
+installation, shared data, metadata signing, and final package commit. Combining
+several source deployments first reports source payload verification.
 
 Native phases animate and update elapsed time independently of Python. Byte totals
 count plaintext executable inputs or data source occurrences, including duplicate
