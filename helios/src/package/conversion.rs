@@ -604,16 +604,30 @@ impl Verified {
 
     /// Opens and hashes every located payload against its signed identity.
     fn payloads(&self) -> Result<reader::PayloadFiles> {
+        let payloads = self.payload_files()?;
+        payloads.verify()?;
+        Ok(payloads)
+    }
+
+    /// Opens every located payload without hashing its bytes.
+    fn payload_files(&self) -> Result<reader::PayloadFiles> {
         let ids: Vec<&[u8]> = self
             .locations
             .locations
             .iter()
             .map(|location| location.payload_id.as_slice())
             .collect();
-        let payloads = self.metadata.payloads(&self.catalog, ids)?;
-        payloads.verify()?;
-        Ok(payloads)
+        self.metadata.payloads(&self.catalog, ids)
     }
+}
+
+/// How `combine` checks a source deployment's payloads before planning.
+#[derive(Clone, Copy)]
+enum SourceVerification {
+    /// Hash every payload, reporting progress; planning reads these bytes.
+    Hash,
+    /// Open payloads without hashing; publication hashes every byte it installs.
+    Defer,
 }
 
 fn rank_consumers(body: &wire::RankBody, out: &mut BTreeSet<Vec<u8>>) {
@@ -772,7 +786,29 @@ pub struct RankPlan {
 /// Reads the prepared weight owners of one deployment with their payload bytes.
 pub fn prepared_ranks(source: &Path, deployment: usize) -> Result<Vec<PreparedRank>> {
     let verified = Verified::open(source, Some(&[deployment]))?;
-    let files = verified.payloads()?;
+    prepared_rank_owners(&verified, verified.payloads()?)
+}
+
+/// Reads one combine source deployment, hashing its payloads only when planning
+/// will read their bytes.
+fn combine_prepared_ranks(
+    source: &Path,
+    deployment: usize,
+    verification: SourceVerification,
+) -> Result<Vec<PreparedRank>> {
+    let verified = Verified::open(source, Some(&[deployment]))?;
+    let files = verified.payload_files()?;
+    if let SourceVerification::Hash = verification {
+        let total: u64 = files.iter().map(|(_, slice)| slice.len()).sum();
+        let progress = crate::startup::StartupProgress::stderr_rows();
+        let phase = progress.phase("Verify source payloads", Some(total));
+        files.verify_with_progress(&|bytes| phase.advance_bytes(bytes))?;
+        phase.finish(format!("{total} source bytes verified"));
+    }
+    prepared_rank_owners(&verified, files)
+}
+
+fn prepared_rank_owners(verified: &Verified, files: reader::PayloadFiles) -> Result<Vec<PreparedRank>> {
     let mut payloads = BTreeMap::new();
     for (id, slice) in files.iter() {
         payloads.insert(
@@ -2864,9 +2900,13 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
             }
             let _ = source_index;
         }
-        let canonical_prepared = prepared_ranks(
+        // Derivation planning reads canonical bytes only when another deployment
+        // is compared against them. A single deployment's payloads are hashed
+        // once, when publication installs them.
+        let canonical_prepared = combine_prepared_ranks(
             &request.sources[canonical_source_index],
             canonical_deployment_index,
+            if entries.len() > 1 { SourceVerification::Hash } else { SourceVerification::Defer },
         )?;
         let canonical_entry = (canonical_source_index, canonical_deployment_index);
         let mut deployments = Vec::with_capacity(entries.len());
@@ -2905,9 +2945,10 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
             let independent = if canonical_ref.is_none() {
                 None
             } else {
-                Some(prepared_ranks(
+                Some(combine_prepared_ranks(
                     &request.sources[source_index],
                     deployment_index,
+                    SourceVerification::Hash,
                 )?)
             };
             let prepared = independent.as_ref().unwrap_or(&canonical_prepared);
@@ -5150,6 +5191,69 @@ mod tests {
         };
         crate::package::export::publish(&request, key, Destination::Directory(&root)).unwrap();
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn promotion_links_unchanged_payloads_and_hashes_them_once() {
+        use std::os::unix::fs::MetadataExt;
+        let scratch = Scratch::new("promote-link");
+        let rng = SystemRandom::new();
+        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Example".into(),
+            namespace: "example".into(),
+            public_key,
+            development: false,
+        };
+        let matrix: Vec<u8> = (10..18).collect();
+        let full: Vec<u8> = (0..8).collect();
+        let source = publish_source(
+            &scratch,
+            "promote-link-source",
+            1,
+            &[full.as_slice()],
+            &[matrix.as_slice()],
+            &key,
+            &publisher,
+            "model",
+            false,
+        );
+        let file_of = |metadata: &Metadata, id: PayloadId| {
+            let location = metadata
+                .locations
+                .locations
+                .iter()
+                .find(|location| location.payload_id == id.as_bytes())
+                .unwrap();
+            metadata.path.parent().unwrap().join(&location.file)
+        };
+        let canonical = PayloadId::of(&full);
+        let source_file = file_of(&Metadata::open(&source).unwrap(), canonical);
+        let output = scratch.join("promoted");
+        let (promoted, read) = container::count_payload_reads(std::slice::from_ref(&source_file), || {
+            promote(
+                &source,
+                &output,
+                std::slice::from_ref(&publisher),
+                "example",
+                "example",
+                None,
+                &key,
+            )
+        });
+        promoted.unwrap();
+        // Promotion keeps payload bytes, so the signed output links the source
+        // object and hashes it once instead of verifying, copying and rehashing.
+        assert_eq!(read, full.len() as u64);
+        let promoted_file = file_of(&Metadata::open(&output).unwrap(), canonical);
+        let (before, after) = (
+            std::fs::metadata(&source_file).unwrap(),
+            std::fs::metadata(&promoted_file).unwrap(),
+        );
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
     }
 
     #[test]

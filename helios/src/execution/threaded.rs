@@ -18,6 +18,10 @@ use std::{
 const TIMEOUT: Duration = Duration::from_secs(120);
 const HANDOFF_POLL: Duration = Duration::from_micros(500);
 
+mod protocol;
+#[cfg(test)]
+mod protocol_tests;
+
 // Prepare/commit and completion/prepare exchanges are brief. Poll that interval
 // before parking a rank, while retaining blocking waits for idle serving.
 fn receive<T>(receiver: &mpsc::Receiver<T>, timeout: Option<Duration>) -> std::result::Result<T, mpsc::RecvTimeoutError> {
@@ -184,7 +188,6 @@ impl ThreadedExecutor {
             }
             result.peers.push(peer);
         }
-        let tuning_started = Instant::now();
         let startup = (|| -> Result<()> {
             for index in result.local.manifest().referenced_tuning_graphs() {
                 for (sent, peer) in result.peers.iter().enumerate() {
@@ -254,7 +257,6 @@ impl ThreadedExecutor {
             result.shutdown = Some(shutdown);
             return Err(error);
         }
-        result.local.report_startup(tuning_started);
         Ok(result)
     }
     #[cfg(feature = "server")]
@@ -267,12 +269,7 @@ impl ThreadedExecutor {
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
-            && self.pending.len() < 2
-            && self.pending.back().is_none_or(|frame| frame.committed)
-            && (!grammar || self.pending.is_empty())
-            && !self.pending.iter().any(|frame| frame.step.grammar || !matches!(
-                self.local.manifest().graphs[frame.step.graph].kind,
-                super::GraphKind::Decode | super::GraphKind::Speculative))
+            && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
     pub fn next_fence(&self) -> Result<Fence> {
@@ -338,11 +335,7 @@ impl ThreadedExecutor {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
         if let Some(completion) = self.local.poll()? {
-            let frame = self.pending.iter_mut().find(|frame| frame.step.fence == completion.fence)
-                .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
-            if frame.completions[0].replace(completion).is_some() {
-                return Err(invalid("duplicate rank-zero completion"));
-            }
+            protocol::record_local_completion(&mut self.pending, completion)?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             loop {
@@ -353,22 +346,10 @@ impl ThreadedExecutor {
                 };
                 match reply {
                     Reply::Ready(fence, graph) => {
-                        let frame = self.pending.iter_mut().find(|f| f.step.fence == fence)
-                            .ok_or_else(|| invalid("unexpected rank readiness fence"))?;
-                        if frame.step.graph != graph || frame.ready[index] || frame.committed {
-                            return Err(invalid("rank readiness identity or state differs"));
-                        }
-                        frame.ready[index] = true;
+                        protocol::record_ready(&mut self.pending, index, fence, graph)?;
                     }
                     Reply::Complete(completion) => {
-                        let expected = self.pending.iter_mut()
-                            .find(|f| f.completions[index + 1].is_none())
-                            .ok_or_else(|| invalid("unexpected rank completion"))?;
-                        if !expected.committed || expected.step.fence != completion.fence
-                            || expected.step.graph != completion.graph_index {
-                            return Err(invalid("rank completion order or identity differs"));
-                        }
-                        expected.completions[index + 1] = Some(completion);
+                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
                     }
                     _ => return Err(invalid("unexpected rank thread reply")),
                 }
@@ -376,24 +357,19 @@ impl ThreadedExecutor {
         }
         for frame in &mut self.pending {
             if frame.committed { continue; }
-            if !frame.ready.iter().all(|ready| *ready) { break; }
+            if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.step.uploads();
             if self.local.validate_submission(frame.step.graph, &uploads, frame.step.grammar)?
                 != Some(frame.step.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
-            for peer in &self.peers {
-                peer.send(Command::Commit(frame.step.fence, frame.step.graph))?;
-            }
+            protocol::dispatch_commit(&self.peers, frame.step.fence, frame.step.graph)?;
             if self.local.submit(frame.step.graph, &uploads, frame.step.grammar)? != Some(frame.step.fence) {
                 return Err(invalid("rank-zero fence changed after validation"));
             }
             frame.committed = true;
         }
-        if !self.pending.front().is_some_and(|frame| frame.completions.iter().all(Option::is_some)) {
-            return Ok(None);
-        }
-        let mut frame = self.pending.pop_front().unwrap();
+        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else { return Ok(None); };
         let mut root = frame.completions[0].take().unwrap();
         for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
             let completion = completion.unwrap();

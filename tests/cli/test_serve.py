@@ -691,3 +691,26 @@ def test_runtime_collective_policy_requires_ladder_before_preparation(host, caps
     assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
     assert "requires --collective-ladder PATH" in capsys.readouterr().err
     assert "prepared" not in host and host["exports"] == 0
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+@pytest.mark.parametrize("configured,flag,expected", [
+    (False, [], False), (False, ["--force-moe-decode-a16"], True),
+    (True, [], True), (True, ["--no-force-moe-decode-a16"], False),
+])
+def test_moe_decode_a16_configuration_and_flag_reach_preparation(host, tmp_path, monkeypatch,
+                                                               command, configured, flag, expected):
+    config = tmp_path / "config.toml"
+    config.write_text(f"[preparation]\nforce_moe_decode_a16 = {str(configured).lower()}\n")
+    monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
+    assert main([command, "qwen3.8-flash", "--config", str(config), *flag]) == 0
+    assert host["plan"].force_moe_decode_a16 is expected
+    assert host["plan"].to_dict()["force_moe_decode_a16"] is expected
+    if command == "export":
+        assert host["options"]["rebuild_manifest"].get("force_moe_decode_a16", False) is expected
+
+
+def test_moe_decode_a16_rejects_mixed_before_preparation(host, capsys):
+    assert export("qwen3.8-flash", "--force-moe-decode-a16", "--mixed-prefill") == 2
+    assert "cannot accompany --mixed-prefill" in capsys.readouterr().err
+    assert "prepared" not in host

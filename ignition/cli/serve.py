@@ -206,6 +206,7 @@ def _export_hosts(args):
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
@@ -272,6 +273,7 @@ def _prepare(args):
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
@@ -304,6 +306,8 @@ def _prepare(args):
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
                      f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
+                     f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
+                     f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
                      f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}")
     if args.config is None and not configuration.exists:
@@ -464,6 +468,7 @@ def debug_serve(args) -> int:
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)

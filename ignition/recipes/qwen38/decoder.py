@@ -51,13 +51,15 @@ class ModelWeights:
     def load(cls, manifest: CheckpointManifest, device: torch.device,
              *, progress: Callable[[str], None] | None = None,
              shard: TensorParallelShard = TensorParallelShard(0, 1),
-             shard_hyperconnections: bool = False) -> ModelWeights:
+             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False) -> ModelWeights:
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("model weights require a CUDA device")
         device = torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
         if torch.cuda.get_device_capability(device) not in SUPPORTED_CAPABILITIES:
             raise ValueError(f"the Qwen recipe requires {SUPPORTED_ARCHITECTURES}")
+        if force_moe_decode_a16 and torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+            raise ValueError("force_moe_decode_a16 requires SM120/121 packed NVFP4 experts")
         free_bytes, _ = device_memory_info(device)
         stored = sum(tensor.nbytes for tensor in manifest.tensors.values()
                      if tensor.component not in ("mtp", "ple_tables"))
@@ -67,7 +69,8 @@ class ModelWeights:
         tree = create_model_tree(manifest)
         before = torch.cuda.memory_allocated(device)
         layers = []
-        with QwenWeightLoader(manifest, device, progress=progress, shard=shard) as loader:
+        with QwenWeightLoader(manifest, device, progress=progress, shard=shard,
+                              force_moe_decode_a16=force_moe_decode_a16) as loader:
             def parameters(paths, extents=None):
                 for path, value in zip(paths, loader.load_tensors(paths, extents=extents), strict=True):
                     parent, _, attribute = path.rpartition(".")
@@ -227,9 +230,7 @@ class PreparedDecoder:
         from .moe import PreparedQwenMoe
         from .ple import PreparedPLE
 
-        if verification:
-            if scratch.sample_hidden.shape != scratch.hidden.shape:
-                raise ValueError("verification requires one sample row per hidden row")
+        if verification and scratch.sample_hidden.shape == scratch.hidden.shape:
             scratch = replace(scratch, sample_hidden=scratch.hidden)
         self.weights, self.scratch, self.state = weights, scratch, state
         self.verification = verification
@@ -243,6 +244,7 @@ class PreparedDecoder:
                 or layer_outputs.dtype != torch.bfloat16 or layer_outputs.device != scratch.hidden.device):
             raise ValueError("layer trace requires BF16 [48,token_capacity,10240] on the model device")
         self.layer_outputs = layer_outputs
+        self.context_capture, self.context_layers = None, ()
         self.embedding_injection = embedding_injection
         self.stage_outputs = {} if stage_outputs is None else stage_outputs
         self.workspaces, self.ple_table, self.qsa_states = workspaces, ple_table, qsa_states
@@ -273,7 +275,7 @@ class PreparedDecoder:
                     partitions=getattr(state, "gdn_partitions", None))
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=scratch.moe, workspace=workspaces,
-                projection_workspace=workspaces)
+                projection_workspace=workspaces, prefill=state.mode == "prefill")
             self.layers.append((attn_hc, attention, mlp_hc, moe))
             if runtime is not None:
                 from ignition.components.collectives import PreparedAllReduce
@@ -325,12 +327,23 @@ class PreparedDecoder:
             self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
                 coordinator=coordinator, name=name + ".sampling")
 
+    def capture_context(self, metadata, draft_config, *, buffers=None, compact_prefill=False):
+        from ignition.components.dflash2 import PreparedContextCapture
+
+        self.context_layers = draft_config.target_layers
+        self.context_capture = PreparedContextCapture(metadata,
+            2560 * len(self.context_layers), draft_config.attention.window,
+            compact_prefill=compact_prefill, buffers=buffers)
+        self.auxiliary = self.context_capture.output
+
     def __call__(self):
         sampler = self.sampler
         s = self.scratch
         if self.embedding_injection is not None:
             self.embedding_injection.validate()
         self.state.begin()
+        if self.context_capture is not None:
+            self.context_capture.begin()
         self.ple.embedding_lookup.publish()
         self.embedding()
         if self.embedding_injection is not None:
@@ -381,6 +394,9 @@ class PreparedDecoder:
                 self.stage_outputs["mlp_residual"].copy_(s.residual)
             if self.layer_outputs is not None:
                 self.layer_outputs[index].copy_(s.residual)
+            if index in self.context_layers:
+                features = s.residual.view(-1, 4, 2560).mean(dim=1)
+                self.context_capture(features, self.context_layers.index(index) * 2560)
         if self.residual_output is not None:
             self.residual_output.copy_(s.residual)
         self.final_mixer.mix(s.residual, pre_normalized=True)

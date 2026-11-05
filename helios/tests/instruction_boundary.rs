@@ -64,6 +64,7 @@ impl Fixture {
         )
         .unwrap();
         let config = ModelConfig {
+            completion_token_capacity: 8,
             max_top_logprobs: 0,
             logprob_token_id_capacity: 0,
             prepared_sequence_tokens: 262144,

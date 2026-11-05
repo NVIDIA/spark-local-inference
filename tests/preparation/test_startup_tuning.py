@@ -71,10 +71,14 @@ def test_registry_reuses_producer_until_its_consumers_change(monkeypatch):
     from b12x.comm import pcie
     from ignition.preparation.startup_tuning import CollectiveStartupTuning
 
-    prepared = []
-    def prepare(specs, *, cache_policy):
+    prepared, storage_owners = [], []
+    def storage(device):
+        owner = SimpleNamespace(device=device)
+        storage_owners.append(owner)
+        return owner
+    def prepare(specs, *, cache_policy, storage):
         assert cache_policy == "cold"
-        producer = SimpleNamespace(specs=tuple(specs))
+        producer = SimpleNamespace(specs=tuple(specs), storage=storage)
         prepared.append(producer)
         return producer
     def spec(plan, *, profiles):
@@ -82,6 +86,7 @@ def test_registry_reuses_producer_until_its_consumers_change(monkeypatch):
         return plan
     monkeypatch.setattr(pcie, "joint_startup_spec", spec, raising=False)
     monkeypatch.setattr(pcie, "prepare_joint_startup_tuner", prepare, raising=False)
+    monkeypatch.setattr(pcie, "StartupTuningStorage", storage)
     registry = CollectiveStartupTuning(object())
     state = SimpleNamespace(runtime=object())
     first = SimpleNamespace(key=("latency", 256), selector=torch.zeros(1), state=state)
@@ -104,6 +109,12 @@ def test_registry_reuses_producer_until_its_consumers_change(monkeypatch):
     assert len(prepared) == 3
     assert len(registry.groups) == 2
     assert registry.groups[(separate.key, id(separate.state.runtime))].specs == (separate,)
+    assert len(storage_owners) == 1
+    assert all(producer.storage is registry.startup_storage for producer in prepared)
+    another = CollectiveStartupTuning(object())
+    another.owners = [registry.owners[0]]
+    another.prepare()
+    assert another.startup_storage is not registry.startup_storage
 
 
 def test_standalone_registration_prepares_each_declared_consumer(monkeypatch):
@@ -167,9 +178,10 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     selector = torch.tensor([7], dtype=torch.uint32)
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
     producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
-        status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
+        status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"), cache_policy="warm")
     registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
-        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)),
+                                          numeric_storage=SimpleNamespace(entries={}))))
     serving = object()
     registry.owners = [owner]
     registry.groups = {"key": producer}
@@ -233,3 +245,35 @@ def test_memory_report_deduplicates_shared_producer_allocations():
     registry = CollectiveStartupTuning(object())
     registry.groups = {"a": producer("a"), "b": producer("b")}
     assert registry.memory_report() == dict(startup_tuning_bytes=4352, startup_tuning_producers=2)
+
+
+@pytest.mark.parametrize("cache_policy", ["cold", "warm"])
+@pytest.mark.parametrize("eligible_weights", [False, True])
+def test_catalog_names_eligible_resident_weights_before_capture(monkeypatch, cache_policy, eligible_weights):
+    from ignition.preparation import startup_tuning
+    from ignition.preparation.startup_tuning import CollectiveStartupTuning
+
+    events, weights = [], object()
+    device = torch.device("cuda", 0)
+    def resident(numeric, *, device, minimum_bytes):
+        assert cache_policy == "cold"
+        assert device == torch.device("cuda", 0) and minimum_bytes == 256 << 20
+        return weights if eligible_weights else None
+    monkeypatch.setattr(startup_tuning, "resident_numeric_storage", resident)
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=0),
+        benchmark_storage=SimpleNamespace(numeric_storage=SimpleNamespace(entries={}))))
+    serving, owner = object(), SimpleNamespace()
+    producer = SimpleNamespace(specs=(SimpleNamespace(selector=torch.tensor([7], dtype=torch.uint32)),),
+                               status=torch.ones(1, dtype=torch.int32), cache_policy=cache_policy)
+    registry.startup_storage = SimpleNamespace(device=device, eviction_bytes=256 << 20,
+        use_eviction=lambda source: events.append(("eviction", source)))
+    registry.owners, registry.groups = [owner], {"key": producer}
+    registry.owner_groups = {id(owner): "key"}
+    registry.captures[id(serving)] = {id(owner)}
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("capture")
+    monkeypatch.setattr(torch.cuda, "device", stop)
+    with pytest.raises(RuntimeError, match="capture"):
+        registry.catalog({"decode": serving})
+    assert events == ([("eviction", weights)] if cache_policy == "cold" and eligible_weights else [])

@@ -27,7 +27,7 @@ from ignition.preparation.qwen38 import FRONTEND_SHA256, MODEL_ID, REVISION, TRA
 
 
 TORCH_COMMIT = "cf30153c4c131c8164ee7798e5022d810682e2cb"
-CONFIG_SHA256 = "d850114fb40b435bf94724cbf1b3825dc52b8f841dbad733b56fcd3a56fdb7aa"
+CONFIG_SHA256 = "b50dbc52a0c83b0cd2a44a372c1fb6b5e0e6827d22f2611c97d4d030f92f6b28"
 
 
 def pattern(width: int, height: int, seed: int) -> np.ndarray:

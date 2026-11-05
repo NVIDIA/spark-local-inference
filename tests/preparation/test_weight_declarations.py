@@ -59,6 +59,30 @@ def test_layers_and_components_group_by_declaration():
     assert all(storage == STABLE for _n, _o, _t, _g, storage in views)
 
 
+def test_named_draft_root_keeps_layers_in_its_component_once():
+    from ignition.components.dflash2_weights import DraftLayerWeights, DraftWeights
+    from ignition.components.weights import MLPWeights
+
+    def tensor():
+        return torch.zeros(2, 2)
+
+    layer = DraftLayerWeights(tensor(), tensor(), tensor(), tensor(), tensor(), tensor(),
+        MLPWeights(tensor(), tensor()), {"base": tensor()}, {"base": tensor()})
+    draft = DraftWeights(tensor(), tensor(), tensor(), tensor(), (layer,), {"projection": tensor()})
+    declaration = declare_weights({"weights": build(), "draft": draft},
+        components=COMPONENTS, tuned=("draft",))
+    views = list(declared_views(declaration))
+    names = [name for name, *_ in views]
+    assert len(names) == len(set(names)), [name for name in names if names.count(name) > 1]
+    groups = {name: (group, storage) for name, _owner, _tensor, group, storage in views}
+    assert groups["draft.layers[0].qkv"] == ("misc", TUNED)
+    assert groups["draft.layers[0].mlp.gate_up"] == ("misc", TUNED)
+    assert groups["weights.layers[0].attention['q']"] == ("layer-000", STABLE)
+    assert len([name for name in names if name.startswith("draft.")]) == 15
+    payload = weight_payload_declaration(declaration)
+    assert [view["name"] for view in payload["views"]] == names
+
+
 def test_undeclared_fields_are_not_weight_views():
     views = list(declared_views(declare_weights(build(), components=('embedding',), layers=())))
     names = {name for name, _owner, _tensor, _group, _storage in views}

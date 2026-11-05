@@ -20,6 +20,9 @@ pub struct Upload<'a> {
     pub bytes: &'a [u8],
 }
 
+#[cfg(kani)]
+mod kani_proofs;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenVector {
     pub emitted_count: i64,
@@ -368,48 +371,6 @@ impl InputCopyBatches {
     }
 }
 
-pub(super) fn collective_choices_overview(
-    manifest: &ExecutionManifest,
-    choices: &[Vec<(String, Vec<u8>)>],
-) -> String {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::fmt::Write;
-
-    fn describe_value(bytes: &[u8]) -> String {
-        let Ok(word) = <[u8; 4]>::try_from(bytes) else {
-            return format!("raw={bytes:02x?}");
-        };
-        format!("0x{:08x}", u32::from_ne_bytes(word))
-    }
-    fn describe<'a>(values: impl Iterator<Item = &'a [u8]>) -> String {
-        values.map(describe_value).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")
-    }
-    let mut totals = BTreeMap::new();
-    let mut outputs = BTreeMap::new();
-    for group in choices {
-        let name = describe(group.iter().map(|(_, bytes)| bytes.as_slice()));
-        *totals.entry(name).or_insert(0usize) += 1;
-        outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
-    }
-    let mut text = format!("  Collective choices · device {} · diagnostic\n", manifest.device);
-    let counts = totals.iter().map(|(name, count)| {
-        format!("{name}: {count} group{}", if *count == 1 { "" } else { "s" })
-    }).collect::<Vec<_>>().join(" · ");
-    writeln!(text, "  {counts}").unwrap();
-    let mut graphs = manifest.graphs.iter().filter(|graph| !graph.tuned_bindings.is_empty()).collect::<Vec<_>>();
-    graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
-        graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
-    for graph in graphs {
-        let values = graph.tuned_bindings.iter().filter_map(|binding| outputs.get(binding.buffer.as_str()).copied());
-        let selected = describe(values);
-        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
-            graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
-            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,
-            if selected.is_empty() { "unavailable" } else { &selected }).unwrap();
-    }
-    text
-}
-
 struct Resources {
     model: Stream,
     copy: Stream,
@@ -426,7 +387,6 @@ pub struct GraphExecutor {
     resolved_uploads: Vec<ResolvedUpload>,
     startup_next: usize,
     startup_ready: bool,
-    diagnostic_choices: Vec<Vec<(String, Vec<u8>)>>,
     next_sequence: u64,
     completed: Fence,
     poison: Option<Error>,
@@ -442,12 +402,10 @@ impl GraphExecutor {
     /// these inputs, graph executables, scratch or completion rows concurrently.
     pub unsafe fn new(manifest: ExecutionManifest) -> Result<Self> {
         let mut executor = unsafe { Self::new_unstarted(manifest)? };
-        let started = Instant::now();
         for index in executor.manifest.referenced_tuning_graphs() {
             executor.run_tuning_graph(index)?;
         }
         executor.finish_startup()?;
-        executor.report_startup(started);
         Ok(executor)
     }
 
@@ -526,7 +484,6 @@ impl GraphExecutor {
             resolved_uploads: Vec::with_capacity(upload_capacity),
             startup_next: 0,
             startup_ready: false,
-            diagnostic_choices: Vec::new(),
             next_sequence: 1,
             completed: Fence(0),
             poison: None,
@@ -546,10 +503,6 @@ impl GraphExecutor {
         let mut reset = resources.model.host_buffer(4)?;
         reset.bytes_mut().copy_from_slice(&(-1i32).to_ne_bytes());
         let readback = resources.model.host_buffer(4)?;
-        let outputs = graph.outputs.iter().map(|name| {
-            let buffer = self.manifest.buffer(name)?;
-            Ok((buffer, resources.model.host_buffer(buffer.nbytes.min(64))?))
-        }).collect::<Result<Vec<_>>>()?;
         let completed = resources.model.event()?;
         let started = Instant::now();
         let result = (|| -> Result<()> {
@@ -557,9 +510,6 @@ impl GraphExecutor {
             unsafe { resources.model.upload(status.address, &reset, 0, 4)?; }
             resources.model.launch(graph.handle)?;
             unsafe { resources.model.download(&readback, status.address, 4)?; }
-            for (buffer, host) in &outputs {
-                unsafe { resources.model.download(host, buffer.address, buffer.nbytes.min(64))?; }
-            }
             resources.model.record(&completed)?;
             while !completed.completed()? {
                 if started.elapsed() > std::time::Duration::from_secs(120) {
@@ -592,22 +542,8 @@ impl GraphExecutor {
         if status != 0 {
             return Err(format!("startup tuning graph {:?} failed with status {status}", graph.name).into());
         }
-        self.diagnostic_choices.push(outputs.iter().map(|(buffer, host)| {
-            (buffer.name.clone(), host.bytes().to_vec())
-        }).collect());
         self.startup_next += 1;
         Ok(())
-    }
-
-    pub(super) fn report_startup(&self, started: Instant) {
-        if self.startup_next != 0 {
-            eprintln!("Startup tuning: {} graphs completed in {:.2}s", self.startup_next, started.elapsed().as_secs_f64());
-            self.report_collective_choices();
-        }
-    }
-
-    fn report_collective_choices(&self) {
-        eprint!("{}", collective_choices_overview(&self.manifest, &self.diagnostic_choices));
     }
 
     pub(super) fn finish_startup(&mut self) -> Result<()> {

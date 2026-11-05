@@ -32,6 +32,87 @@ pub(super) fn shared_available(meminfo: &str, total: usize) -> Result<usize> {
     Ok(flare_selene::offload::available_memory(meminfo, total)?)
 }
 
+/// Memory this process can commit once every page file reaches its maximum size.
+///
+/// WDDM charges CUDA allocations on an integrated GPU, including the dedicated carveout,
+/// against the system commit limit: CPU-visible RAM plus the page files. Windows grows a
+/// system-managed page file on demand, so the current limit understates what serving can
+/// commit; each page file's growth to its maximum size is added to the available commit.
+#[cfg(windows)]
+pub(super) fn commit_available() -> Result<u64> {
+    use windows_sys::{
+        Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
+        Win32::System::SystemInformation::{
+            GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+        },
+    };
+    const SYSTEM_PAGE_FILE_INFORMATION_EX: SYSTEM_INFORMATION_CLASS = 144;
+    // SAFETY: each structure is zero-initialized with any required length before its call.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return Err(std::io::Error::last_os_error().to_string().into());
+        }
+        let mut system: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut system);
+        // Windows supports at most 16 page files; their entries and names fit in 16 KiB.
+        let mut entries = vec![0u64; 2048];
+        let mut returned = 0u32;
+        let code = NtQuerySystemInformation(
+            SYSTEM_PAGE_FILE_INFORMATION_EX,
+            entries.as_mut_ptr().cast(),
+            (entries.len() * size_of::<u64>()) as u32,
+            &mut returned,
+        );
+        if code < 0 {
+            return Err(format!(
+                "NtQuerySystemInformation(SystemPageFileInformationEx) failed with NTSTATUS {:#010x}",
+                code as u32
+            )
+            .into());
+        }
+        let returned = std::slice::from_raw_parts(
+            entries.as_ptr().cast::<u8>(),
+            (returned as usize).min(entries.len() * size_of::<u64>()),
+        );
+        Ok(status
+            .ullAvailPageFile
+            .saturating_add(page_file_growth(returned, u64::from(system.dwPageSize))))
+    }
+}
+
+/// ntdll's SYSTEM_PAGEFILE_INFORMATION_EX, which reports sizes in pages.
+#[cfg(windows)]
+#[repr(C)]
+struct PageFile {
+    next_entry_offset: u32,
+    total_size: u32,
+    total_in_use: u32,
+    peak_usage: u32,
+    name: windows_sys::Win32::Foundation::UNICODE_STRING,
+    minimum_size: u32,
+    maximum_size: u32,
+}
+
+/// Bytes the page files in `entries` can still grow before reaching their maximum sizes.
+#[cfg(windows)]
+fn page_file_growth(entries: &[u8], page_bytes: u64) -> u64 {
+    let (mut growth, mut offset) = (0u64, 0usize);
+    while offset.saturating_add(size_of::<PageFile>()) <= entries.len() {
+        // SAFETY: the entry lies within `entries`; unaligned reads accept any offset.
+        let entry = unsafe { entries.as_ptr().add(offset).cast::<PageFile>().read_unaligned() };
+        growth = growth.saturating_add(
+            u64::from(entry.maximum_size.saturating_sub(entry.total_size)) * page_bytes,
+        );
+        if entry.next_entry_offset == 0 {
+            break;
+        }
+        offset = offset.saturating_add(entry.next_entry_offset as usize);
+    }
+    growth
+}
+
 impl NativeResources {
     /// Memory the driver reports in total for the rank's device: on an integrated GPU, the
     /// system's memory.
@@ -67,8 +148,9 @@ impl NativeResources {
         } else {
             #[cfg(windows)]
             {
-                // CUDA includes both the dedicated carveout and shared system memory.
-                Ok(free.min(total))
+                // CUDA includes both the dedicated carveout and shared system memory, and
+                // WDDM charges allocations from either against the system commit limit.
+                Ok(free.min(total).min(commit_available()? as usize))
             }
             #[cfg(unix)]
             {
@@ -995,6 +1077,36 @@ mod tests {
         ] {
             assert!(shared_available(invalid, usize::MAX).is_err());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_adds_each_page_file_growth() {
+        let entry = |next, total, maximum| PageFile {
+            next_entry_offset: next,
+            total_size: total,
+            total_in_use: 0,
+            peak_usage: 0,
+            name: unsafe { std::mem::zeroed() },
+            minimum_size: 0,
+            maximum_size: maximum,
+        };
+        // Names follow each entry, so the second entry starts beyond the first one's size.
+        let mut entries = vec![0u8; 64 + size_of::<PageFile>()];
+        unsafe {
+            entries.as_mut_ptr().cast::<PageFile>().write_unaligned(entry(64, 100, 300));
+            entries.as_mut_ptr().add(64).cast::<PageFile>().write_unaligned(entry(0, 50, 80));
+        }
+        assert_eq!(page_file_growth(&entries, 4096), (200 + 30) * 4096);
+        // A page file larger than its maximum contributes no growth, and the walk stops
+        // at the returned length.
+        unsafe {
+            entries.as_mut_ptr().add(64).cast::<PageFile>().write_unaligned(entry(0, 90, 80));
+        }
+        assert_eq!(page_file_growth(&entries, 4096), 200 * 4096);
+        assert_eq!(page_file_growth(&entries[..64], 4096), 200 * 4096);
+        assert_eq!(page_file_growth(&[], 4096), 0);
+        assert!(commit_available().unwrap() > 0);
     }
 
     #[test]

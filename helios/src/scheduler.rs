@@ -2913,3 +2913,9 @@ mod policy_tests;
 
 #[cfg(test)]
 mod vision_window_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
+mod speculative_lifecycle_tests;

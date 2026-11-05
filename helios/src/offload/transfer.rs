@@ -681,6 +681,9 @@ impl Drop for Transfers {
 }
 
 #[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

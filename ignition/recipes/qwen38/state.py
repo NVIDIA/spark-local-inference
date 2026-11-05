@@ -34,7 +34,7 @@ class HybridStateLayout(StateLayout):
     draft_ring_capacity: int = 0
 
     @classmethod
-    def build(cls, *, speculative_tokens: int = 0, world_size: int = 1) -> HybridStateLayout:
+    def build(cls, *, speculative_tokens: int = 0, world_size: int = 1, draft_config=None) -> HybridStateLayout:
         if type(speculative_tokens) is not int or not 0 <= speculative_tokens <= 7:
             raise ValueError("hybrid state supports zero through seven speculative tokens")
         from ignition.components.parallel import TensorParallelShard
@@ -66,7 +66,7 @@ class HybridStateLayout(StateLayout):
             add(f"qsa.{layer}.boundary_value", geometry.main_v_page_shape, geometry.kv_dtype)
             add(f"qsa.{layer}.boundary_selector", geometry.compressed_page_shape, torch.bfloat16)
         ring = 0
-        if speculative_tokens:
+        if speculative_tokens and draft_config is None:
             ring = geometry.raw_ring_capacity
             add("target_residual", (10240,), torch.bfloat16)
             add("target_residual_position", (3,), torch.int64)
@@ -80,6 +80,10 @@ class HybridStateLayout(StateLayout):
             add("draft_boundary_key_extra", geometry.main_k_page_shape, geometry.kv_dtype)
             add("draft_boundary_value_extra", geometry.main_v_page_shape, geometry.kv_dtype)
             add("draft_boundary_selector_extra", geometry.compressed_page_shape, torch.bfloat16)
+        if draft_config is not None:
+            from ignition.components.dflash2_geometry import draft_context_specs
+
+            specifications.extend(draft_context_specs(draft_config, TensorParallelShard(0, world_size)))
         layout = StateLayout.from_specs(specifications)
         return cls(layout.regions, layout.row_bytes, speculative_tokens, ring)
 
@@ -106,10 +110,11 @@ class HybridStatePool(StateStorage):
     ple_history: torch.Tensor
     rope_delta: torch.Tensor
     backed_slots: int | None = None
+    reserved_backing: torch.Tensor | None = None
 
     @classmethod
     def allocate(cls, slots: int, device, *, speculative_tokens: int = 0, world_size: int = 1,
-                 storage=None, backed_slots: int | None = None) -> HybridStatePool:
+                 storage=None, backed_slots: int | None = None, draft_config=None) -> HybridStatePool:
         if type(slots) is not int or slots < 2:
             raise ValueError("hybrid state requires null and live slots")
         backed_slots = slots if backed_slots is None else backed_slots
@@ -117,10 +122,18 @@ class HybridStatePool(StateStorage):
             raise ValueError("backed state slots must include null and live slots within the virtual extent")
         if backed_slots != slots and storage is None:
             raise ValueError("partial state backing requires package storage")
-        layout = HybridStateLayout.build(speculative_tokens=speculative_tokens, world_size=world_size)
+        layout = HybridStateLayout.build(speculative_tokens=speculative_tokens, world_size=world_size, draft_config=draft_config)
         backing = (torch.zeros((slots, layout.row_bytes), dtype=torch.uint8, device=device) if storage is None else
             storage.device_allocate("continuations", (slots, layout.row_bytes), torch.uint8, group="STATE_ROWS",
                                     maximum=torch.cuda.mem_get_info(device)[1] // layout.row_bytes, units=backed_slots))
+
+        reserved = backing
+        if storage is not None:
+            from b12x.sequence._shared.disk_table import _tensor_from_pointer
+
+            region = next(region for region in storage.dynamic_regions if region.address == backing.data_ptr())
+            reserved = _tensor_from_pointer(region.address, shape=(region.maximum, layout.row_bytes),
+                dtype=torch.uint8, device=device, nbytes=region.maximum * layout.row_bytes)
 
         def view(name):
             region = layout.region(name)
@@ -151,7 +164,14 @@ class HybridStatePool(StateStorage):
             history,
             view("rope_delta"),
             backed_slots,
+            reserved,
         )
+
+    def reserved_region(self, name):
+        region = self.layout.region(name)
+        backing = self.backing if self.reserved_backing is None else self.reserved_backing
+        return backing[:, region.offset:region.offset + region.nbytes].view(region.dtype).view(
+            backing.shape[0], *region.shape)
 
     def reset_for_preparation(self):
         """Restore empty unpublished model state after serialized benchmark use."""

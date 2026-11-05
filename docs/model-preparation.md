@@ -195,6 +195,12 @@ SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
 ```
 
+Startup races in one preparation share fixture and timing storage. Cold races
+read an existing checkpoint allocation on the same GPU when it is at least
+twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
+enough, the races use one shared eviction buffer. Re-export a package to reduce
+its resident startup storage with this preparation path.
+
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving
@@ -440,6 +446,31 @@ rows, with explicit flags and configuration taking precedence. Verification is
 rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
+
+`ignition export qwen3.8-flash --speculative-method dflash2` selects
+[`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
+at revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6` instead of the checkpoint's
+MTP module. Draft proposals use an eight-token block and up to seven verified
+drafts; the default remains five drafts and 128 target-token rows. The target
+captures completed zero-based layers 5, 15, 25, 35, and 45 after averaging its four
+hyperconnection streams. Five independent draft attention layers retain the last
+2,048 accepted target positions. These rings are included in continuation
+snapshots and restored with the target's GDN, QSA, PLE, and position state.
+Mixed prefill is rejected; separate prefill and verification graphs retain the
+same target arithmetic. `--online-mxfp8` converts the draft's eligible BF16
+projections, and `--draft-head-quantization nvfp4` or `mxfp8` prepares a separate
+proposal vocabulary head. Target weights retain checkpoint precision.
+
+`ignition export qwen3.8-flash --force-moe-decode-a16` prepares the NVFP4 target
+routed experts as one packed W4A16 weight owner. Decode and speculative
+verification use A16 at every row count; separate prefill graphs use calibrated
+A4 from the checkpoint activation scales. The option requires SM120/121 and
+rank-local intermediate width divisible by 64 (TP1/2); mixed prefill is rejected
+because its prompt and decode rows share one expert call. Shared experts and MTP
+retain their declared precision. `[preparation] force_moe_decode_a16 = true`
+sets the default, and `--no-force-moe-decode-a16` overrides it. Preparation records
+the resolved option in the plan and rebuild metadata; compatible weight reuse
+requires the packed layouts and activation scales prepared for that option.
 
 `ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
 the 320-wide hyperconnection bottleneck across ranks, including target and MTP
@@ -1059,24 +1090,19 @@ rank zero and `ignition join ZERO:29630 --rank 1 --ranks 2` on its peer. Follow
 [multi-host preparation and serving](multi-host.md#prepare-the-package) for
 checkpoint access, transport setup, and launching the resulting two-host package.
 
-Reduced model validation covers original-format weight loading, learned relative
-attention, FP32 residual convolution, complete compiled decoder replay across
-prefill/decode and page/window boundaries, state restoration, inactive rows, and
-allocation stability on SM120 and SM103. Reduced TP1 preparation and replay of
-the complete graph catalog, including scored prefill, also pass on both GPUs.
-SM103 expert checks cover calibrated activation quantization, reduced unweighted
-route capture/replay at 1, 129, and 4096 tokens, and execution of an actual
-checkpoint expert layer with 256 experts, hidden size 4096, and intermediate
-size 2048.
-Full-checkpoint TP1 export and native `flare run` pass on one GB300 DGX
-Station with the default capacities above. All 29 endpoint acceptance cases pass,
-including text/Unicode, reasoning effort, tools, concurrent cached-prefix branches,
-prompt scoring, and media rejection. Native loading uses 158.2 GiB before the
-runtime sizes its cache from available GPU memory. The tested environment uses
-the locked FlashInfer revision `776facfd`.
-Full-checkpoint TP2/RoCE execution, 262144-token context behavior, and SM121
-execution remain unqualified. Reproduce endpoint acceptance with
-`tests/server/test_inkling.py`, setting `FLARE_RUN_CUDA_TESTS=1`,
+With locked FlashInfer `1f8ed8a3c46e27d03cff54e08f23e9bc50476d57`, the full
+checkpoint exports all 29 graphs and serves through native `flare run` on one
+GB300 DGX Station at the default capacities above. All 22 numerical CUDA checks
+pass, including an actual checkpoint expert layer, complete decoder replay,
+state restoration, inactive rows, and allocation stability. All 79 native API
+checks pass. The 50-prompt text/tool/long-context workload uses
+`reasoning_effort=none` and a fixed 64-token output budget; the longest input
+contains 262080 tokens. Other checks cover all five reasoning efforts, cached
+prefix branches, prompt logprobs, and media rejection.
+
+Full-checkpoint TP2/RoCE and SM120/SM121 execution remain unqualified. Reproduce
+endpoint acceptance with `tests/server/test_inkling.py` and
+`tests/server/test_inkling_generation.py`, setting `FLARE_RUN_CUDA_TESTS=1`,
 `FLARE_INKLING_TEST_URL`, and `FLARE_INKLING_SNAPSHOT`.
 
 ## Muse Spark Open

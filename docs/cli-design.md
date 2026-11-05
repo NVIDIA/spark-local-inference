@@ -391,8 +391,9 @@ explicit flags take precedence.
 | `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, a multiple of 64. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing packages retain their captured catalog. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
+| `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
-| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. This does not quantize the draft body. | Checkpoint precision |
+| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. This does not quantize the draft body. | Checkpoint precision |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
@@ -408,8 +409,9 @@ explicit flags take precedence.
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
+| `--force-moe-decode-a16` / `--no-force-moe-decode-a16` | Prepare Qwen3.8 Flash NVFP4 target routed experts as one packed weight owner: decode and speculative verification use W4A16 at every token-row count, and separate prefill graphs use calibrated A4. Requires SM120/121, checkpoint activation scales, and rank-local expert intermediate width divisible by 64 (TP1/2). Mixed prefill and other recipes/precisions reject the flag. Shared experts and stored A16 MTP experts retain their precision. Overrides `[preparation] force_moe_decode_a16`; the resolved value is recorded in the plan and package rebuild metadata. | off |
 | `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
-| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
+| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
 Speculative token capacity and packed graph budget also accept configuration-file
@@ -784,10 +786,10 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare packages, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `gb10` and `gb202`. Automatic selection
+are separate Hugging Face revisions named `gb10`, `gb202`, and `gb300`. Automatic selection
 queries the selected GPUs' PCI device identifiers through NVML without initializing
 CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`. All selected GPUs must belong to the same family.
+6000 Blackwell, select `gb202`; GB300 selects `gb300`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -818,7 +820,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
@@ -1145,8 +1147,10 @@ api_key = ""                      # Empty: no authentication.
 [defaults]
 model = "qwen3.8-flash"
 max_concurrency = 4
+# speculative_method = "mtp"      # Flash Next also supports dflash2.
 
 [preparation]
+# force_moe_decode_a16 = false    # Qwen Flash NVFP4: A16 decode/verify, calibrated A4 prefill.
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
 # collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
