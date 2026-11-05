@@ -370,6 +370,25 @@ or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
 
+The terminal event carries a termination cause, and each protocol maps the
+cause to its finish reason. An output limit reports `length` on Chat
+Completions and Completions, `max_tokens` on Messages, and `incomplete` with
+`incomplete_details.reason` `max_output_tokens` on Responses, even when parsed
+calls completed the answer. Otherwise, when parsed calls complete an answer the
+user did not stop, Chat Completions reports `tool_calls` and Messages
+`tool_use`; raw Completions rejects tool parameters. Any other cause reports
+`stop` on Chat Completions and Completions, `stop_sequence` on Messages for a
+matched string stop and `end_turn` for every other cause, including an honored
+end-of-sequence token and an explicit token stop, and `completed` on Responses.
+The cause is decided at the terminal token: an honored end-of-sequence token or
+a matched string stop that lands on the final allowed token is the cause, so
+the response reports the stop reason rather than the limit reason. A request
+admitted with `ignore_eos` does not treat end-of-sequence tokens as
+terminating, so one that exhausts its output limit reports the limit reason
+even when its last generated token is end-of-sequence. A request the scheduler
+cannot grow past page capacity also reports the limit reason before the
+declared limit is reached.
+
 A reasoning delimiter that the tokenizer encodes as one token, such as
 `<think>`, `</think>`, `</mm:think>`, or Gemma 4's `<channel|>`, opens or
 closes reasoning only when the model generates that token. When a model writes
