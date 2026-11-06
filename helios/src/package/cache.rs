@@ -45,8 +45,8 @@ thread_local! {
 }
 use crate::Result;
 use crate::package::container::{
-    COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer, open_relative,
-    validate_relative_path, write_companion,
+    COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer, link_companion,
+    open_relative, validate_relative_path, write_companion,
 };
 
 const MAX_NAME: usize = 128;
@@ -1503,11 +1503,7 @@ impl Root {
             )
             .into());
         }
-        if let Some(object) = self.payload(id)? {
-            if object.length() != slice.len() {
-                return Err(format!("cached object {id} has a different length").into());
-            }
-            verify_slice(object.slice(), id, None)?;
+        if let Some(object) = self.cached_slice(id, slice.len())? {
             return Ok(object);
         }
         let transaction = Transaction::begin(self)?;
@@ -1527,6 +1523,48 @@ impl Root {
             let _ = remove_file(&staged);
         }
         result
+    }
+
+    /// Adopt the complete, durable companion wrapper file that holds `slice` as
+    /// a payload object without copying it.
+    ///
+    /// The opened file is linked into staging only when it is byte-for-byte
+    /// the wrapper `store_slice` would write; the linked file must then hash to
+    /// `declared`, and publication verifies the installed object again. `None`
+    /// means the file is not that canonical wrapper or the filesystem refuses
+    /// the link, and the caller stores its slice instead. A mismatched identity
+    /// is an error. An already cached identity returns the cached object. The
+    /// caller must have synced the file under `slice` and must not modify it
+    /// afterwards: it becomes the object. `label` names the payload in errors.
+    pub fn adopt_companion(
+        &self,
+        declared: PayloadId,
+        slice: &Slice,
+        label: &str,
+    ) -> Result<Option<PayloadObject>> {
+        let transaction = Transaction::begin(self)?;
+        let staged = transaction.staging_file("wrapped")?;
+        if !link_companion(slice, declared, &staged, label)? {
+            return Ok(None);
+        }
+        let cached = self.cached_slice(declared, slice.len());
+        if !matches!(cached, Ok(None)) {
+            let _ = fs::remove_file(&staged);
+            return cached;
+        }
+        self.publish_payload(&transaction, &staged, declared, slice.len()).map(Some)
+    }
+
+    /// A cached object for `id`, verified, when one is already installed.
+    fn cached_slice(&self, id: PayloadId, length: u64) -> Result<Option<PayloadObject>> {
+        let Some(object) = self.payload(id)? else {
+            return Ok(None);
+        };
+        if object.length() != length {
+            return Err(format!("cached object {id} has a different length").into());
+        }
+        verify_slice(object.slice(), id, None)?;
+        Ok(Some(object))
     }
 
     /// Insert an optional retention source while distinguishing a corrupt
@@ -4853,6 +4891,74 @@ mod tests {
         drop(object);
         drop(again);
         assert_eq!(root.collect().unwrap().objects, 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn adopt_companion_links_canonical_wrappers_and_declines_others() {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 77).map(|i| (i % 241) as u8).collect();
+        let raw = temporary.0.join("slice.bin");
+        fs::write(&raw, &bytes).unwrap();
+        let slice = Slice::new(Arc::new(File::open(&raw).unwrap()), 0, bytes.len() as u64).unwrap();
+        let id = PayloadId::of(&bytes);
+        let adopt = |declared: PayloadId, path: &Path| {
+            let slice = Container::open(path).unwrap().tensor(COMPANION_TENSOR).unwrap();
+            root.adopt_companion(declared, &slice, "test")
+        };
+        let staging_is_empty = || {
+            fs::read_dir(root.root.join("staging").join("wrapped"))
+                .unwrap()
+                .count()
+                == 0
+        };
+
+        // A framing that is not the canonical wrapper is left to store_slice.
+        let framed = temporary.0.join("framed.safetensors");
+        let mut writer = Writer::new(File::create(&framed).unwrap(), PAYLOAD_FORMAT).unwrap();
+        writer.add(COMPANION_TENSOR, bytes.len() as u64, Source::Slice(slice.clone())).unwrap();
+        writer.add("extra.tail", 3, Source::Bytes(vec![1, 2, 3])).unwrap();
+        writer.finish().unwrap();
+        assert!(adopt(id, &framed).unwrap().is_none());
+
+        // Same length as the canonical wrapper, but its header padding differs.
+        let padded = temporary.0.join("padded.safetensors");
+        write_companion(&mut File::create(&padded).unwrap(), &slice).unwrap();
+        let mut wrapper = fs::read(&padded).unwrap();
+        let header_end = 8 + u64::from_le_bytes(wrapper[..8].try_into().unwrap()) as usize;
+        assert_eq!(wrapper[header_end - 1], b' ');
+        wrapper[header_end - 1] = b'\n';
+        fs::write(&padded, &wrapper).unwrap();
+        assert!(adopt(id, &padded).unwrap().is_none());
+        assert!(staging_is_empty());
+
+        let received = temporary.0.join("received.safetensors");
+        write_companion(&mut File::create(&received).unwrap(), &slice).unwrap();
+        assert!(adopt(PayloadId::of(b"other"), &received).is_err());
+        assert!(root.payload(id).unwrap().is_none());
+        assert!(staging_is_empty());
+
+        // The canonical wrapper becomes the object itself: no copy is written.
+        let object = adopt(id, &received).unwrap().unwrap();
+        assert_eq!(object.id(), id);
+        assert_eq!(object.length(), bytes.len() as u64);
+        assert_eq!(
+            fs::metadata(object.path()).unwrap().ino(),
+            fs::metadata(&received).unwrap().ino()
+        );
+        fs::remove_file(&received).unwrap();
+        let mut copy = vec![0; bytes.len()];
+        object.slice().read_at(0, &mut copy).unwrap();
+        assert_eq!(copy, bytes);
+
+        // A second arrival of a cached identity returns the cached object.
+        let again_path = temporary.0.join("again.safetensors");
+        write_companion(&mut File::create(&again_path).unwrap(), &slice).unwrap();
+        let again = adopt(id, &again_path).unwrap().unwrap();
+        assert_eq!(again.path(), object.path());
+        assert!(staging_is_empty());
     }
 
     #[test]
