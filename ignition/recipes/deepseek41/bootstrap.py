@@ -168,11 +168,11 @@ class PreparationConfig:
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
                 or len(set(placements)) != len(self.devices)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("DeepSeek V4.1 Flash preparation requires three or four distinct GPUs")
+            raise ValueError("DeepSeek V4.1 Flash preparation requires three, four, or six distinct GPUs")
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -632,7 +632,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
         "target_logits_dtype": "float32",
         "draft_logits_dtype": "bfloat16" if config.dspark else None,
-        "offloaded_bytes": sum(source.nbytes for pair in tables.sources.values() for source in pair),
+        "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264
+                               for ordinal in range(len(tables.sources))),
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
         "preparation_state_bytes": int(pool.memory_capacity[0].item()) * layout.row_bytes,
