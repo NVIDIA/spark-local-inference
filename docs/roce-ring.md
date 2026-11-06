@@ -145,11 +145,19 @@ every peer's output alone does not release a rank's own send buffer.
 ## Preparation and serving
 
 Follow the [multi-host requirements](multi-host.md#requirements)
-first. Use the same Flare revision and locked preparation dependencies on every
-host. From each checkout root:
+first. Use the same Flare revision on every host. The first host resolves the
+head commit of `local-inference-lab/flashinfer` main and records it in `uv.lock`;
+copy that file to every peer and sync it with `--frozen` so every host installs
+the same commit. Confirm the commit on each host from
+`.venv/lib/python3.12/site-packages/flashinfer_python-*.dist-info/direct_url.json`
+as described in the [FlashInfer dependency](model-preparation.md#flashinfer-dependency)
+section. From each checkout root:
 
 ```sh
-uv sync --locked --extra prepare --extra test
+# first host
+uv sync --extra prepare --extra test
+# each peer, after copying the first host's uv.lock
+uv sync --frozen --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 

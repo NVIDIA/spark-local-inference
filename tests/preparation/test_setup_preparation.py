@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation setup installs locked dependencies with the native build policy."""
+"""Preparation setup command construction and failure handling."""
 
 from __future__ import annotations
 
@@ -18,13 +18,20 @@ setup = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(setup)
 
 
-def test_setup_runs_locked_sync(monkeypatch):
+def test_setup_runs_upgrade_sync(monkeypatch):
+    """Command-construction test; it does not run uv or prove resolution."""
     calls = []
     monkeypatch.setattr(setup.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert setup.main() == 0
     assert len(calls) == 2
     command = calls[0][0][0]
-    assert command[:3] == ["uv", "sync", "--locked"]
+    assert command == [
+        "uv", "sync", "--upgrade-package", "flashinfer-python",
+        "--extra", "prepare", "--extra", "test",
+        "--reinstall-package", "flashinfer-python", "--reinstall-package", "flare-heliopause",
+    ]
+    assert "--locked" not in command
+    assert "--frozen" not in command
     assert calls[0][1]["env"]["BUILD_NVEP"] == "0"
     assert calls[1][0][0] == ["uv", "run", "--no-sync", "python", "-m", "ignition.patches"]
     assert calls[1][1] == {"cwd": ROOT, "check": True}

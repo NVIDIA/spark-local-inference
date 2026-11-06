@@ -6,12 +6,17 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import sys
 import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+FLASHINFER_REQUIREMENT = re.compile(
+    r"flashinfer-python\[b12x\] @ git\+(?P<repository>https://\S+)@main"
+)
 
 
 def test_pyproject_declares_preparation_entrypoint_and_packages():
@@ -23,6 +28,45 @@ def test_pyproject_declares_preparation_entrypoint_and_packages():
     assert not any(name.startswith(("flare", "serve")) for name in includes)
     assert pyproject["project"]["dependencies"] == []
     assert pyproject["project"]["scripts"] == {"ignition": "ignition.__main__:main"}
+
+
+def test_flashinfer_declaration_tracks_main_statically():
+    """Static declaration check. `.github/workflows/flashinfer-main.yml` proves
+    resolution, installation, and import; this test only rejects a hand-edited
+    revision."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    requirements = [
+        requirement
+        for requirement in pyproject["project"]["optional-dependencies"]["prepare"]
+        if requirement.startswith("flashinfer-python")
+    ]
+    assert len(requirements) == 1, requirements
+    match = FLASHINFER_REQUIREMENT.fullmatch(requirements[0])
+    assert match, requirements
+    repository = match["repository"]
+    assert "flashinfer-python" in pyproject["tool"]["uv"]["upgrade-package"]
+
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+    flashinfer = [package for package in lock["package"] if package["name"] == "flashinfer-python"]
+    assert len(flashinfer) == 1
+    locked_source = re.compile(re.escape(f"{repository}?rev=main") + r"#[0-9a-f]{40}")
+    assert locked_source.fullmatch(flashinfer[0]["source"]["git"]), flashinfer[0]["source"]
+
+    ignition = [package for package in lock["package"] if package["name"] == "ignition"]
+    assert len(ignition) == 1
+    requires_dist = [
+        requirement
+        for requirement in ignition[0]["metadata"]["requires-dist"]
+        if requirement["name"] == "flashinfer-python"
+    ]
+    assert requires_dist == [
+        {
+            "name": "flashinfer-python",
+            "extras": ["b12x"],
+            "marker": "extra == 'prepare'",
+            "git": f"{repository}?rev=main",
+        }
+    ]
 
 
 def test_package_import_has_no_runtime_or_cuda_side_effects():
