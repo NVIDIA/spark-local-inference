@@ -41,9 +41,14 @@ fn export_payload_convert(
 ) -> PyResult<String> {
     py.detach(|| {
         let (source, destination) = (Path::new(&source), Path::new(&destination));
+        // Verification and copying of a large package take minutes; report them as the
+        // export does, on standard error, and keep standard output for the result lines.
+        let progress = helios_core::startup::StartupProgress::stderr_rows();
         match form.as_str() {
-            "packed" => helios_core::package::conversion::pack(source, destination)?,
-            "directory" => helios_core::package::conversion::unpack(source, destination)?,
+            "packed" => helios_core::package::conversion::pack_with(source, destination, None, &progress)?,
+            "directory" => {
+                helios_core::package::conversion::unpack_with(source, destination, None, &progress)?
+            }
             other => {
                 return Err(super::invalid(format!(
                     "unknown payload package form {other:?}"

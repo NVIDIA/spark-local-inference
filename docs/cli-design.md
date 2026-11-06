@@ -964,7 +964,10 @@ Export always writes the directory canonical form in the cache.
 single-file package; `ignition convert CACHE_ENTRY --output DIR` writes a
 standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
 the same metadata, payloads, signatures, and location records. Converting between them
-needs no signing key or GPU. `--output` refuses an existing destination. A
+needs no signing key or GPU. Conversion reports its work as the export does, on
+standard error with elapsed time and byte counts: `Verify package`, `Verify stored
+data`, `Write packed package` or `Write package companions`, and the final
+publication of the destination. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
 inodes where it can. Payload-format packages keep the semantic payload boundaries their export declared. No
