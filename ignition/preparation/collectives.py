@@ -4,6 +4,7 @@
 
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
+from contextlib import contextmanager
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -53,6 +54,35 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
     if package_storage is not None:
         package_storage.transports.append(runtime)
     return runtime
+
+# RoCEnante kernels poll a peer's flag about once per microsecond and give up after this many
+# polls, so a dead peer surfaces as an error instead of a hung kernel. b12x's default of 20
+# million polls, about 20 s, suits serving. Compiled warmup's first pass builds and benchmarks each
+# forward's Triton kernels between collective launches, and the rank that compiled a forward meets
+# its kernels warm while its peer builds them, so one rank can trail the other by minutes within
+# one forward. Warmup waits about ten minutes instead; captured graphs keep the serving wait.
+WARMUP_SPIN_LIMIT = 600_000_000
+
+
+@contextmanager
+def warmup_wait(runtime, coordinator):
+    """Widen `runtime`'s collective wait while compiled forwards warm on ranks spanning hosts.
+
+    The wait is a RoCEnante launch argument, so the widened value applies to warmup launches
+    and the value restored on exit is what capture bakes into serving graphs. Runtimes without
+    a poll limit, such as PCIe reductions, are left unchanged.
+    """
+    limit = None if runtime is None or coordinator is None or not coordinator.spans_hosts else getattr(
+        runtime, "spin_limit", None)
+    if limit is None:
+        yield
+        return
+    runtime.spin_limit = max(limit, WARMUP_SPIN_LIMIT)
+    try:
+        yield
+    finally:
+        runtime.spin_limit = limit
+
 
 def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
                               collective_tuning="static"):

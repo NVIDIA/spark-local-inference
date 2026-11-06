@@ -12,6 +12,7 @@ import torch
 from ignition.progress import graph_catalog, phase
 
 from .aot import ForwardCache
+from .collectives import warmup_wait
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
 
@@ -64,7 +65,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 raise ValueError("grouped forwards require one type and graph signature")
         stream.wait_stream(torch.cuda.current_stream(device))
         retention = nullcontext() if warmup_storage is None else warmup_storage.retain_transient_backing()
-        with retention:
+        with retention, warmup_wait(collective, coordinator):
             with torch.cuda.stream(stream):
                 if compile_group is None:
                     compiled = cache.prepare_many(forwards, signatures, progress=progress,
