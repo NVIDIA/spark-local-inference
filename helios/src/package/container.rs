@@ -43,6 +43,51 @@ pub const MAX_HEADER: u64 = 128 << 20;
 pub const MAX_TENSORS: usize = 1 << 20;
 /// Bounded streaming buffer for payload copies and digests.
 pub const IO_CHUNK: usize = 1 << 20;
+/// Block size the digest readers fetch ahead of the hasher.
+const DIGEST_BLOCK: usize = 8 << 20;
+/// Positional readers feeding one digest, so the hasher does not wait on storage between blocks.
+const DIGEST_READERS: usize = 4;
+/// Blocks each digest reader may hold, bounding one digest's buffers to 64 MiB.
+const DIGEST_LANE_BLOCKS: usize = 2;
+/// Digests that may read ahead at once in the process, bounding read-ahead to 64 reader threads
+/// and 1 GiB of buffers however many export workers and transfer streams hash concurrently.
+/// Further digests use the single-buffer loop.
+const MAX_READ_AHEAD_DIGESTS: usize = 16;
+static READ_AHEAD_SLOTS: DigestSlots = DigestSlots::new(MAX_READ_AHEAD_DIGESTS);
+
+/// A bounded count of digests reading ahead.
+struct DigestSlots {
+    held: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+/// One held read-ahead slot, released on drop.
+struct DigestSlot<'a>(&'a DigestSlots);
+
+impl DigestSlots {
+    const fn new(limit: usize) -> Self {
+        Self {
+            held: std::sync::atomic::AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn acquire(&self) -> Option<DigestSlot<'_>> {
+        use std::sync::atomic::Ordering;
+        self.held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < self.limit).then_some(held + 1)
+            })
+            .ok()
+            .map(|_| DigestSlot(self))
+    }
+}
+
+impl Drop for DigestSlot<'_> {
+    fn drop(&mut self) {
+        self.0.held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 /// Maximum bytes in one relative package path.
 pub const MAX_PATH: usize = 1024;
 
@@ -188,6 +233,18 @@ impl Slice {
         &self,
         progress: Option<&crate::package::progress::AcquisitionProgress>,
     ) -> Result<PayloadId> {
+        if self.length >= (DIGEST_READERS * DIGEST_BLOCK) as u64
+            && let Some(_slot) = READ_AHEAD_SLOTS.acquire()
+        {
+            return self.digest_read_ahead(progress);
+        }
+        self.digest_single_buffer(progress)
+    }
+    /// Hashes the slice through one `IO_CHUNK` buffer, reading and hashing in turn.
+    fn digest_single_buffer(
+        &self,
+        progress: Option<&crate::package::progress::AcquisitionProgress>,
+    ) -> Result<PayloadId> {
         let mut context = digest::Context::new(&digest::SHA256);
         let mut buffer = vec![0u8; IO_CHUNK];
         let mut offset = 0;
@@ -201,6 +258,62 @@ impl Slice {
             offset += count as u64;
         }
         Ok(PayloadId::from_digest(context.finish()))
+    }
+    /// Hashes blocks in order while `DIGEST_READERS` threads read ahead: block `b` comes from
+    /// reader `b % DIGEST_READERS`, so each reader's channel already yields its blocks in order.
+    /// When hashing stops early, dropping the channels ends the readers before the scope joins.
+    fn digest_read_ahead(
+        &self,
+        progress: Option<&crate::package::progress::AcquisitionProgress>,
+    ) -> Result<PayloadId> {
+        use std::sync::mpsc::sync_channel;
+        let block = DIGEST_BLOCK as u64;
+        let blocks = self.length.div_ceil(block);
+        std::thread::scope(|scope| {
+            let mut lanes = Vec::with_capacity(DIGEST_READERS);
+            for first in 0..DIGEST_READERS as u64 {
+                let (fill, filled) = sync_channel::<Result<(Vec<u8>, usize)>>(DIGEST_LANE_BLOCKS);
+                let (recycle, spare) = sync_channel::<Vec<u8>>(DIGEST_LANE_BLOCKS);
+                for _ in 0..DIGEST_LANE_BLOCKS {
+                    recycle
+                        .send(vec![0u8; DIGEST_BLOCK])
+                        .expect("digest lane has room");
+                }
+                std::thread::Builder::new()
+                    .name("payload-digest".into())
+                    .spawn_scoped(scope, move || {
+                        let mut index = first;
+                        while index < blocks {
+                            let Ok(mut buffer) = spare.recv() else { return };
+                            let offset = index * block;
+                            let count = (self.length - offset).min(block) as usize;
+                            let read = self
+                                .read_at(offset, &mut buffer[..count])
+                                .map(|()| (buffer, count));
+                            let failed = read.is_err();
+                            if fill.send(read).is_err() || failed {
+                                return;
+                            }
+                            index += DIGEST_READERS as u64;
+                        }
+                    })
+                    .map_err(|e| io("spawn payload digest reader", e))?;
+                lanes.push((filled, recycle));
+            }
+            let mut context = digest::Context::new(&digest::SHA256);
+            for index in 0..blocks {
+                let (filled, recycle) = &lanes[(index % DIGEST_READERS as u64) as usize];
+                let (buffer, count) = filled
+                    .recv()
+                    .map_err(|_| invalid("payload digest reader stopped"))??;
+                context.update(&buffer[..count]);
+                if let Some(progress) = progress {
+                    progress.record_verification_bytes(count as u64);
+                }
+                let _ = recycle.send(buffer);
+            }
+            Ok(PayloadId::from_digest(context.finish()))
+        })
     }
 }
 
@@ -1235,6 +1348,53 @@ mod tests {
             slice.digest().unwrap().as_bytes(),
             digest::digest(&digest::SHA256, &payload).as_ref()
         );
+    }
+
+    #[test]
+    fn read_ahead_digest_matches_one_pass_hash() {
+        let scratch = Scratch::new("read-ahead");
+        // Past the read-ahead threshold, with a partial last block and a nonzero slice offset.
+        let length = DIGEST_READERS * DIGEST_BLOCK + DIGEST_BLOCK / 2 + 4099;
+        let payload: Vec<u8> = (0..length as u64)
+            .map(|value| (value * 2654435761 >> 13) as u8)
+            .collect();
+        let (_, container) = container_with(&scratch, "large.safetensors", &payload);
+        let slice = container.tensor(COMPANION_TENSOR).unwrap();
+        assert!(slice.offset() > 0);
+        let expected = digest::digest(&digest::SHA256, &payload);
+        // Both paths, whichever one `digest` takes under the process-wide limit.
+        assert_eq!(slice.digest_read_ahead(None).unwrap().as_bytes(), expected.as_ref());
+        assert_eq!(slice.digest_single_buffer(None).unwrap().as_bytes(), expected.as_ref());
+        assert_eq!(slice.digest().unwrap().as_bytes(), expected.as_ref());
+    }
+
+    #[test]
+    fn read_ahead_digest_reports_a_short_file() {
+        let scratch = Scratch::new("read-ahead-short");
+        let length = DIGEST_READERS * DIGEST_BLOCK + 1;
+        let (path, container) = container_with(&scratch, "short.safetensors", &vec![3u8; length]);
+        let slice = container.tensor(COMPANION_TENSOR).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(slice.offset() + DIGEST_BLOCK as u64)
+            .unwrap();
+        assert!(slice.digest_read_ahead(None).is_err());
+        assert!(slice.digest_single_buffer(None).is_err());
+    }
+
+    #[test]
+    fn digest_slots_admit_at_most_their_limit() {
+        let slots = DigestSlots::new(2);
+        let first = slots.acquire().unwrap();
+        let second = slots.acquire().unwrap();
+        assert!(slots.acquire().is_none());
+        drop(first);
+        let third = slots.acquire().unwrap();
+        assert!(slots.acquire().is_none());
+        drop((second, third));
+        assert_eq!(slots.held.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]
