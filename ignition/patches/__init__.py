@@ -67,7 +67,7 @@ def apply() -> tuple[Path, ...]:
             if package.version != expected:
                 raise PreparationError(
                     f"Preparation patches require {name}=={expected}; found {package.version}. "
-                    "Install the locked preparation dependencies with uv sync --locked --extra prepare.")
+                    "Install the preparation dependencies with uv sync --extra prepare.")
             packages[name] = package
 
         sources, patched, modules = {}, {}, {}
@@ -88,7 +88,7 @@ def apply() -> tuple[Path, ...]:
                 elif counts != (0, 1):
                     raise PreparationError(
                         f"Cannot apply {name} to {path}: patch context is missing or ambiguous. "
-                        f"Reinstall {package} with uv sync --locked --extra prepare --reinstall-package {package}.")
+                        f"Reinstall {package} with uv sync --extra prepare --reinstall-package {package}.")
 
         changed = tuple(path for path in sources if patched[path] != sources[path])
         for path in changed:
@@ -110,6 +110,6 @@ def apply() -> tuple[Path, ...]:
     except PackageNotFoundError as error:
         raise PreparationError(
             "Preparation patches require the preparation dependencies; "
-            "install them with uv sync --locked --extra prepare.") from error
+            "install them with uv sync --extra prepare.") from error
     except OSError as error:
         raise PreparationError(f"Cannot apply preparation patches in the preparation environment: {error}") from error

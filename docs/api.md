@@ -728,7 +728,7 @@ temporary repositories.
 Install SDK test dependencies and run against an idle native service:
 
 ```sh
-uv sync --locked --extra api-test
+uv sync --frozen --extra api-test
 FLARE_API_TEST_URL=http://127.0.0.1:8000 \
   .venv/bin/python -m pytest tests/server/test_protocols.py -q
 FLARE_API_TEST_URL=http://127.0.0.1:8000 FLARE_RUN_CLIENT_TESTS=1 \

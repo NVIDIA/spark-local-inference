@@ -1,0 +1,119 @@
+name: FlashInfer main
+
+# Flare prepares models against the head of local-inference-lab/flashinfer main.
+# This workflow proves that the dependency declared in pyproject.toml and
+# uv.lock resolves to that exact commit and that the commit builds, installs,
+# and imports on a GPU-less runner. It does not install Flare's full preparation
+# environment: that pins torch 2.14.1+cu132 and builds Heliopause, which needs
+# CUDA and Rust. The standalone install below uses FlashInfer's own resolved
+# dependencies, so it proves the FlashInfer commit, not the complete preparation
+# environment. The install sets FLASHINFER_BUILD_NO_PIP=1 and BUILD_NVEP=0,
+# matching the setup script's build policy.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flashinfer-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  main:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        run: python -m pip install uv==0.11.30
+      - name: Resolve FlashInfer main
+        id: main
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/local-inference-lab/flashinfer.git refs/heads/main | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Declarations and lock must resolve FlashInfer to main
+        env:
+          MAIN_SHA: ${{ steps.main.outputs.sha }}
+        run: |
+          set -euo pipefail
+          uv lock
+          locked=$(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as pyproject_file:
+              pyproject = tomllib.load(pyproject_file)
+          requirements = [
+              requirement
+              for requirement in pyproject["project"]["optional-dependencies"]["prepare"]
+              if requirement.startswith("flashinfer-python")
+          ]
+          assert len(requirements) == 1, requirements
+          assert requirements[0] == (
+              "flashinfer-python[b12x] @ "
+              "git+https://github.com/local-inference-lab/flashinfer.git@main"
+          ), requirements
+          assert "flashinfer-python" in pyproject["tool"]["uv"]["upgrade-package"]
+
+          with open("uv.lock", "rb") as lock_file:
+              lock = tomllib.load(lock_file)
+          packages = [package for package in lock["package"] if package["name"] == "flashinfer-python"]
+          assert len(packages) == 1, packages
+          source = packages[0]["source"]["git"]
+          repository, separator, commit = source.partition("?rev=main#")
+          assert separator == "?rev=main#", source
+          assert repository == "https://github.com/local-inference-lab/flashinfer.git", source
+          print(commit)
+          PY
+          )
+          echo "FlashInfer main: $MAIN_SHA"
+          echo "uv.lock:        $locked"
+          test "$locked" = "$MAIN_SHA"
+      - name: Install and import the resolved commit
+        env:
+          MAIN_SHA: ${{ steps.main.outputs.sha }}
+          FLASHINFER_BUILD_NO_PIP: '1'
+          BUILD_NVEP: '0'
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/flashinfer-venv"
+          uv venv --python 3.12 "$venv"
+          uv pip install --python "$venv/bin/python" \
+            "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@${MAIN_SHA}"
+          CUDA_VISIBLE_DEVICES= "$venv/bin/python" -I - "$MAIN_SHA" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import sysconfig
+
+          import b12x
+          import flashinfer
+          import torch
+          from b12x.comm.pcie import (
+              StartupTuningStorage,
+              joint_startup_spec,
+              prepare_joint_startup_tuner,
+          )
+
+          assert not torch.cuda.is_available()
+          expected = sys.argv[1]
+          direct_url = next(
+              pathlib.Path(sysconfig.get_paths()["purelib"]).glob(
+                  "flashinfer_python-*.dist-info/direct_url.json"
+              )
+          )
+          installed = json.loads(direct_url.read_text())["vcs_info"]["commit_id"]
+          assert installed == expected, (installed, expected)
+          assert flashinfer.__git_commit__ == expected, (flashinfer.__git_commit__, expected)
+          print(f"installed flashinfer {flashinfer.__version__} at {installed}")
+          PY

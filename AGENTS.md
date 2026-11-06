@@ -103,9 +103,18 @@ encoders must satisfy the [renderer contract and validation requirements](docs/m
 Run commands from the repository root:
 
 ```sh
-uv sync --locked --extra prepare --extra test
+uv sync --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
+
+Plain `uv sync`, `uv run`, and `scripts/setup_preparation.py` resolve the head
+commit of `local-inference-lab/flashinfer` main and rewrite the FlashInfer entry
+in `uv.lock`. `.venv/bin/ignition`, an activated environment, `--frozen`, and
+`--no-sync` use the last synced commit. `--offline` cannot resolve main; combine
+it with `--frozen` to reproduce a recorded lock. Run `uv sync` or the setup
+script before preparing a model that must use main's head, and commit the
+rewritten `uv.lock` only with a change that needs that FlashInfer commit.
+See [environment setup](docs/model-preparation.md#environment-setup).
 
 After changing `heliopause/` or Helios code used by the extension, rebuild the
 installed extension:
