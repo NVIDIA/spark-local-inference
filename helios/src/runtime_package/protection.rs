@@ -2000,24 +2000,29 @@ fn build_descriptor<F: Fn(&crate::package::schema::wire::PayloadUse) -> Result<w
                     encoding: table.encoding,
                     request_buffer: table.request_buffer.clone(),
                     global_scale: table.global_scale,
+                    // A rank-selective copy holds only the partitions of the ranks it verifies:
+                    // keep every shard's geometry, but resolve planes only for those ranks.
                     shards: table
                         .shards
                         .iter()
                         .map(|shard| {
+                            let owned = verified
+                                .ranks()
+                                .iter()
+                                .any(|rank| rank.rank == shard.rank);
+                            let plane = |value: &Option<crate::package::schema::wire::PayloadUse>| {
+                                value
+                                    .as_ref()
+                                    .filter(|_| owned)
+                                    .map(|use_| token_span(use_))
+                                    .transpose()
+                            };
                             Ok(wire::EngramTableShard {
                                 rank: shard.rank,
                                 first_row: shard.first_row,
                                 rows: shard.rows,
-                                weights: shard
-                                    .weights
-                                    .as_ref()
-                                    .map(|use_| token_span(use_))
-                                    .transpose()?,
-                                scales: shard
-                                    .scales
-                                    .as_ref()
-                                    .map(|use_| token_span(use_))
-                                    .transpose()?,
+                                weights: plane(&shard.weights)?,
+                                scales: plane(&shard.scales)?,
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -3946,6 +3951,38 @@ mod payload_package_tests {
         }
         assert!(!names.contains(&"weights/rank-0.safetensors"), "{names:?}");
         assert!(!names.contains(&"globals/rank-0.safetensors"), "{names:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rank_selected_descriptor_resolves_only_the_selected_engram_shard() {
+        let (root, publishers) = engram_package();
+        let shards = |rank| {
+            let selected = PayloadVerifiedPackage::open(
+                &root,
+                &publishers,
+                payload_auth::Selection::Deployment { deployment: 0, rank },
+            )
+            .unwrap();
+            let engram = selected.descriptor().unwrap().engram.unwrap();
+            assert!(engram.tables[0].weights.is_some() && engram.tables[0].scales.is_some());
+            engram.tables[1]
+                .shards
+                .iter()
+                .map(|shard| {
+                    (
+                        shard.rank,
+                        shard.first_row,
+                        shard.rows,
+                        shard.weights.is_some(),
+                        shard.scales.is_some(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shards(None), vec![(0, 0, 2, true, true), (1, 2, 2, true, true)]);
+        assert_eq!(shards(Some(0)), vec![(0, 0, 2, true, true), (1, 2, 2, false, false)]);
+        assert_eq!(shards(Some(1)), vec![(0, 0, 2, false, false), (1, 2, 2, true, true)]);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -72,7 +72,9 @@ fn validate_shards(table: &wire::EngramTable, world: usize) -> Result<()> {
         end = end
             .checked_add(shard.rows)
             .ok_or_else(|| invalid("embedding partition overflow"))?;
-        if shard.weights.is_none() || shard.scales.is_none() {
+        // Sibling partitions absent from a rank-selective copy carry neither plane; the
+        // owning rank still requires both (decode and `spans` reject a missing plane).
+        if shard.weights.is_none() != shard.scales.is_none() {
             return Err(invalid("missing embedding partition plane"));
         }
     }
@@ -340,6 +342,22 @@ mod tests {
             }
             assert!(validate_shards(&invalid, 4).is_err(), "mutation {change}");
         }
+    }
+
+    #[test]
+    fn rank_selected_partitions_omit_sibling_planes_but_keep_their_rows() {
+        let mut table = partitioned();
+        for rank in [0, 2, 3] {
+            table.shards[rank].weights = None;
+            table.shards[rank].scales = None;
+        }
+        assert!(validate_shards(&table, 4).is_ok());
+        let mut one_plane = table.clone();
+        one_plane.shards[0].weights = Some(wire::Span::default());
+        assert!(validate_shards(&one_plane, 4).is_err());
+        let mut gap = table;
+        gap.shards[2].first_row += 1;
+        assert!(validate_shards(&gap, 4).is_err());
     }
 
     #[test]

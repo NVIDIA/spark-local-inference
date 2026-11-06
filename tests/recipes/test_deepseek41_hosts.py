@@ -21,7 +21,7 @@ def test_four_hosts_may_each_use_their_own_gpu_zero():
         bootstrap.PreparationConfig(devices=(0,) * 4, hosts=("hertz",) * 4)
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 6])
 @pytest.mark.parametrize("draft_tokens", [5, 7])
 @pytest.mark.parametrize("remote", [False, True])
 def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remote, draft_tokens, world):
@@ -33,7 +33,7 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
         reserve_bytes=6 << 30, speculation=Speculation(draft_tokens=draft_tokens, token_capacity=128,
             packed_verification=True, draft_prefix_selection="gpu"),
         expert_scale_compression="csf")
-    ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell")[:world]) if remote else None
+    ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell", "kelvin", "curie")[:world]) if remote else None
     calls, result, storage = [], object(), object()
     monkeypatch.setattr(rank_group, "prepare_group", lambda *args, **kwargs: calls.append((args, kwargs)) or result)
     assert recipe.prepare("checkpoint", plan, compile_forwards=True, kernel_cache=None, progress=None,
