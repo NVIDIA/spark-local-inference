@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Canonical text geometry and checkpoint-declared mixed projection precision."""
+"""Checkpoint geometry and per-projection precision."""
 
 from dataclasses import dataclass
 import json

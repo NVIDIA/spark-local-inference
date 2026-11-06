@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Checkpoint tokenizer parity for recipient headers, message boundaries, and ATEM history."""
+"""Checkpoint tokenizer parity for recipient headers, escaping, and ATEM history."""
 
 import copy
 import hashlib
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -13,24 +14,30 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SNAPSHOT = Path(os.environ.get('FLARE_MUSE_GLIMMER_SNAPSHOT', '/data/cache/huggingface/hub/models--nvidia--Muse-Glimmer-30B-NVFP4/snapshots/47818374517751c48c55cde2621594926b1888b6'))
 
 
-def test_native_muse_chat_matches_checkpoint(tmp_path):
+@pytest.mark.parametrize('recipe,checkpoint', [
+    ('muse_spark', 'models--meta-models--Muse-Spark-Open-816B-A42B-NVFP4/snapshots/4239e4db19376904f2e82c167e78f70abb5455fe'),
+    ('muse_glimmer', 'models--nvidia--Muse-Glimmer-30B-NVFP4/snapshots/47818374517751c48c55cde2621594926b1888b6'),
+], ids=['muse_spark', 'muse_glimmer'])
+def test_native_muse_chat_matches_checkpoint(tmp_path, recipe, checkpoint):
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
     from transformers.utils.chat_template_utils import _compile_jinja_template
-    from ignition.recipes.muse_glimmer.frontend import prepare_frontend, runtime_assets
 
-    if not (SNAPSHOT / 'tokenizer.json').is_file():
-        pytest.skip('requires pinned Muse Glimmer checkpoint frontend assets')
-    assets = runtime_assets(SNAPSHOT)
-    special = prepare_frontend(SNAPSHOT, eos_token_ids=[200001, 200008])['tokenizer']
-    configured_eos = json.loads((SNAPSHOT / 'config.json').read_text())['text_config']['eos_token_id']
-    assert prepare_frontend(SNAPSHOT, eos_token_ids=configured_eos) == prepare_frontend(SNAPSHOT, eos_token_ids=[200001, 200008])
-    tokenizer = Tokenizer.from_file(str(SNAPSHOT / 'tokenizer.json'))
-    hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(SNAPSHOT)
-    source = (SNAPSHOT / 'chat_template.jinja').read_text()
+    frontend = import_module(f'ignition.recipes.{recipe}.frontend')
+    snapshot = Path(os.environ.get(f'FLARE_{recipe.upper()}_SNAPSHOT', '/data/cache/huggingface/hub/' + checkpoint))
+    if not (snapshot / 'tokenizer.json').is_file():
+        pytest.skip(f'requires pinned {recipe} checkpoint frontend assets')
+    glimmer = recipe == 'muse_glimmer'
+    reasoning_option = 'reasoning_strength' if glimmer else 'reasoning_effort'
+    assets = frontend.runtime_assets(snapshot)
+    special = frontend.prepare_frontend(snapshot, eos_token_ids=[200001, 200008])['tokenizer']
+    configured_eos = json.loads((snapshot / 'config.json').read_text())['text_config']['eos_token_id']
+    assert frontend.prepare_frontend(snapshot, eos_token_ids=configured_eos) == frontend.prepare_frontend(snapshot, eos_token_ids=[200001, 200008])
+    tokenizer = Tokenizer.from_file(str(snapshot / 'tokenizer.json'))
+    hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(snapshot)
+    source = (snapshot / 'chat_template.jinja').read_text()
     annotated = assets['chat_template']['text']
     assert annotated.replace('{%- mark -%}', '') == source
     template = _compile_jinja_template(source)
@@ -85,8 +92,8 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     for content in ['café 世界', ' repeated repeated ']:
         add('continuation_'+content, [user, dict(role='assistant', content=content)],
             continue_final_message=True, add_generation_prompt=False)
-    for effort in ['low', 'medium', 'high']:
-        add(effort, [user], reasoning_strength=effort)
+    for effort in (['low', 'medium', 'high'] if glimmer else ['low', 'medium', 'high', 'xhigh']):
+        add(effort, [user], **{reasoning_option: effort})
     for role in ['system', 'developer']:
         add(role, [dict(role=role, content='Reasoning effort should be precise.'), user])
     add('history', [user, dict(role='assistant', reasoning_content='Plan 世界', content='Answer'), user])
@@ -103,6 +110,8 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
             if hinted:
                 message['_checkpoint_hints'] = [2]
             add(f'hints_{suffix}_{hinted}', [message])
+    if not glimmer:
+        add('empty_schema', [user], tools=[dict(type='function', function=dict(name='empty'))])
     calls = [dict(id='one', type='function', function=dict(name='lookup', arguments=dict(
         query=' 世界 <|eom|> & "quotes" \n', n=3, enabled=True, absent=None,
         nested=dict(text='中文'), items=[1, False], empty=[]))),
@@ -113,6 +122,17 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     add('escaping_headers', [user, dict(role='assistant', content='', tool_calls=[dict(id='x', type='function',
         function=dict(name='a\r\n"<&', arguments={'k"<&': '<|start|>'}))]),
         dict(role='tool', tool_call_id='x', content='')], tools=tools)
+    if not glimmer:
+        for effort in ['none', 'minimal', 'max']:
+            cases.append(dict(name='invalid_'+effort, messages=[user], options=dict(reasoning_effort=effort),
+                              error=f'Unsupported reasoning_effort: {effort}. Expected one of: low, medium, high, xhigh.'))
+        incompatible = [user, dict(role='assistant', content='<|eom|> content')]
+        with pytest.raises(ValueError, match='final message does not appear'):
+            hf_tokenizer.apply_chat_template(incompatible, tokenize=False, chat_template=source,
+                continue_final_message=True, add_generation_prompt=False)
+        cases.append(dict(name='escaped_continuation_error', messages=incompatible,
+            options=dict(continue_final_message=True, add_generation_prompt=False),
+            error='continue_final_message is set but the final message does not appear in the chat after applying the chat template!'))
     samples = ['Hello café 世界 á 👨‍👩‍👧‍👦', ' to=self<|message|>Plan<|eom|><|start|>assistant to=user<|message|>Done']
     encode_cases = [dict(name=f'encode{i}', text=text, add_special_tokens=False,
         token_ids=tokenizer.encode(text, add_special_tokens=False).ids) for i, text in enumerate(samples)]
@@ -128,16 +148,16 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     runtime = tmp_path / 'runtime'
     runtime.mkdir()
     for name in ['tokenizer.json', 'tokenizer_config.json']:
-        (runtime / name).symlink_to(SNAPSHOT / name)
+        (runtime / name).symlink_to(snapshot / name)
     (runtime / 'chat_template.jinja').write_text(assets['chat_template']['text'])
     fingerprints = {'tokenizer.json': assets['tokenizer']['sha256'],
                     'chat_template.jinja': assets['chat_template']['sha256'],
                     'tokenizer_config.json': hashlib.sha256((runtime / 'tokenizer_config.json').read_bytes()).hexdigest()}
     fixture = tmp_path / 'chat.json'
     fixture.write_text(json.dumps(dict(assets=fingerprints, cases=cases, encode_cases=encode_cases, decode_cases=decode_cases,
-        template_defaults=dict(reasoning_strength='high', current_date='2026-10-27', add_generation_prompt=True),
-        default_overrides=[['high', {}], ['low', dict(reasoning_strength='low')],
-                           ['closed_header', dict(reasoning_strength='high', add_generation_prompt=False)]])))
+        template_defaults=dict(current_date='2026-10-27', add_generation_prompt=True, **{reasoning_option: 'high'}),
+        default_overrides=[['high', {}], ['low', {reasoning_option: 'low'}],
+                           ['closed_header', {reasoning_option: 'high' if glimmer else 'xhigh', 'add_generation_prompt': False}]])))
     result = subprocess.run([str(Path(target) / 'debug/test_frontend'), str(runtime), str(fixture)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

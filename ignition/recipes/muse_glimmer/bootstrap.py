@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare a single-GPU text graph catalog using existing paged-cache operations."""
+"""Prepare single-GPU Muse Glimmer text graphs."""
 
 import contextlib
 from dataclasses import dataclass

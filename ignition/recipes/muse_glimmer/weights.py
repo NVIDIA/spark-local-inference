@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct text-only loading that preserves per-projection NVFP4 and FP8 calibration."""
+"""Text weights with checkpoint NVFP4 and FP8 calibration."""
 
 from contextlib import nullcontext
 from dataclasses import dataclass

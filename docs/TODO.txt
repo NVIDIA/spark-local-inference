@@ -200,9 +200,6 @@
     envelope enumeration, before preparation compiler resource limits apply.
 
 [ ] Complete Muse Glimmer's 64-token generation qualification on GB300.
-    tests/server/test_muse_glimmer.py: four text, ten JSON and one concurrency
-    case exhaust the output budget; twelve tool cases have no completed call.
-    Longer completions preserve the 26 fixed-case prefixes; they do not satisfy
-    the original budget. Reproduce the timestamped concurrency input exactly.
-    Control decode graph capacities before attributing the Python/native cold
-    replay discrepancy described in docs/model-preparation.md#muse-glimmer.
+    Retain the failing API cases, reproduce the timestamped concurrency input,
+    and control decode capacities before attributing Python/native differences.
+    See docs/model-preparation.md#muse-glimmer for the measured limitations.

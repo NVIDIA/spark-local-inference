@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared dense decoder preserving canonical normalization, SwiGLU and logit softcapping."""
+"""Prepared decoder with centered norms and softcapped logits."""
 
 from dataclasses import dataclass
 import torch

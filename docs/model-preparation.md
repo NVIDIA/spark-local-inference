@@ -1088,66 +1088,46 @@ flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --
 
 ## Muse Glimmer
 
-The `muse-glimmer-30b-nvfp4` alias selects
+`muse-glimmer-30b-nvfp4` selects
 [`nvidia/Muse-Glimmer-30B-NVFP4`](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4)
-at revision `47818374517751c48c55cde2621594926b1888b6`. Preparation targets one
-GPU, a 131072-token context, four concurrent requests and 4096-token prefill
-chunks. It loads text weights at their checkpoint precision: NVFP4 W4A16,
-calibrated tensor FP8, and excluded BF16 projections. Image, audio and video
-requests are rejected; no vision encoder or speculative draft is prepared.
+at revision `47818374517751c48c55cde2621594926b1888b6`. It prepares one GPU with
+a 131072-token context, concurrency four and 4096-token prefill chunks. Weights
+retain checkpoint NVFP4 W4A16, calibrated FP8 and excluded BF16 precision.
+Image, audio and video requests are rejected; no vision encoder or draft is prepared.
 
-Use the FlashInfer revision pinned in `pyproject.toml` and `uv.lock`,
-`1f8ed8a3c46e27d03cff54e08f23e9bc50476d57`.
-Run the standard locked environment setup before preparing this recipe.
+Use the locked FlashInfer revision `1f8ed8a3`. On GB300/SM103, calibrated FP8
+projections use its SM100 CUTLASS GEMM with caller-owned scratch and original
+E4M3 values/FP32 scales. SM120/SM121 use b12x blockscaled GEMM.
+All 52 layers retain BF16 KV; sliding layers use the 2048-token window.
+A 128-token KV page occupies 6,815,744 bytes, a continuation row 6,829,312 bytes,
+and a full-context KV history 6.5 GiB. The planner budgets the full 24.67 GB
+checkpoint, including unused vision tensors, plus scratch and caches.
 
-On DGX Station (GB300/SM103), calibrated tensor-FP8 projections use FlashInfer's
-SM100 CUTLASS FP8 GEMM with caller-owned scratch. This preserves the checkpoint's
-E4M3 values and combined FP32 calibration scale; the b12x blockscaled GEMM used
-on SM120/SM121 does not support SM103.
-
-All 52 layers retain BF16 paged keys and values. Sliding layers apply the
-checkpoint's 2048-token attention window; full layers use the entire history.
-One 128-token page occupies 6,815,744 bytes and a continuation row occupies
-6,829,312 bytes, including every partial page and the normalized hidden state.
-A full 131072-token KV history occupies 6.5 GiB, in addition to weights,
-continuations and graph scratch. The planning weight estimate conservatively
-uses the full 24.67 GB checkpoint size, including its unused vision tensors.
-
-Sampling follows the model card: temperature 1.0, top-p 0.95 and top-k 64.
-The checkpoint template defaults `reasoning_strength` to `high`; set
-`chat_template_kwargs.reasoning_strength` to change this prompt option.
-The insertion-only template patch preserves checkpoint-rendered bytes and
-adds exact message boundaries. Native recipient headers and ATEM tools share
-Muse Spark's parser; `<|eom|>` is an internal boundary, while `<|eot|>` and
-`<|end_of_text|>` end generation.
+Sampling defaults are temperature 1.0, top-p 0.95 and top-k 64. Set
+`chat_template_kwargs.reasoning_strength` to override the template's `high` default.
+The annotated template preserves canonical bytes and exact message boundaries.
+Muse Spark's shared recipient/ATEM parser handles output; `<|eom|>` separates
+messages, while `<|eot|>` and `<|end_of_text|>` end generation.
 
 ```sh
 .venv/bin/ignition export muse-glimmer-30b-nvfp4 --gpus 0 --prompt-logprobs
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/muse-glimmer.safetensors
-flare/target/release/flare run /data/flare-runtime/muse-glimmer.safetensors --gpus 0
+flare/target/release/flare run CACHE_ENTRY --gpus 0
 ```
 
-The pinned full checkpoint exports 29 graphs and loads through native `flare run`
-on one DGX Station (GB300/SM103) at the default capacities above. With locked
-FlashInfer `1f8ed8a3`, twelve FP8 CUDA checks and one reduced-model capture check
-pass. Native API acceptance remains incomplete: `tests/server/test_muse_glimmer.py`
-has 30 passing and 27 failing cases. At its fixed 64-token output budget, four
-text cases, ten JSON cases and one concurrency case reach the output limit;
-twelve required or named tool cases end without a completed call.
+On GB300, full-checkpoint export captures 29 graphs and native loading succeeds;
+12 FP8 CUDA checks and one reduced-model capture check pass. Native acceptance
+in `tests/server/test_muse_glimmer.py` remains **30 passed, 27 failed** at its
+unchanged 64-token budget: four text, ten JSON and one concurrency case reach
+the limit; twelve tool cases end without a completed call. The 26 fixed-case
+continuations preserve their first 64 tokens and complete correctly at 68–121
+tokens. A concurrency rerun passes with a different timestamped input; the
+original failure remains unresolved. A previous package loads unchanged, with
+text/scoring passing and concurrency reaching the limit.
 
-Supplemental generations for the 26 fixed text/JSON/tool cases preserve their
-exact first 64 tokens and complete correctly after 68–121 tokens. These results
-do not replace the failed acceptance checks. The concurrency check passes with
-a different timestamped prompt; the original failure remains unresolved.
-A previously exported package loads unchanged and passes text and prompt-scoring
-checks, while its concurrency check also reaches the output limit.
-Python diagnostic replay and native completion serving match five of six
-64-token cold/restored sequences. The required-tool case `tool-1` differs at
-token 21 during cold replay, including with an independent Python preparation.
-Decode graph capacities were not controlled, so this comparison does not
-isolate a runtime defect. Exact replay parity remains unqualified.
-Full-checkpoint SM120/SM121 validation and latency/throughput measurements remain
-unperformed.
+Python/native replay matches five of six sequences. Cold `tool-1` replay differs
+at token 21, including after independent preparation; uncontrolled decode graph
+selection leaves the cause unresolved. Full-checkpoint SM120/SM121 validation
+and performance measurements remain unperformed.
 
 ## Storage and graph capacities
 
