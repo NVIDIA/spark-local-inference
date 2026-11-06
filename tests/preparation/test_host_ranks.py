@@ -34,7 +34,7 @@ def join(address, rank, world=2, *, identity="same", boot=None, results=None):
             results.append(error)
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 6])
 def test_admits_every_peer_rank_with_its_executor_connection(world):
     owner, address = rendezvous(world)
     results = []
