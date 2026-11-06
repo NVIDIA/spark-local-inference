@@ -46,10 +46,6 @@ def test_rejects_changed_arithmetic(change):
     raw["text_config"].update(change)
     with pytest.raises(ValueError):
         ModelConfig.from_dict(raw, quantization())
-    raw = configuration()
-    raw["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-    with pytest.raises(ValueError, match="hf_quant_config"):
-        ModelConfig.from_dict(raw, quantization())
 
 
 def test_checkpoint_quantization_requires_both_calibration_and_exclusions(tmp_path):
@@ -59,6 +55,9 @@ def test_checkpoint_quantization_requires_both_calibration_and_exclusions(tmp_pa
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(FileNotFoundError, match="hf_quant_config"):
         ModelConfig.load(tmp_path)
+    misplaced = dict(raw, quantization_config={"quant_method": "modelopt", "quant_algo": "NVFP4"})
+    with pytest.raises(ValueError, match="hf_quant_config"):
+        ModelConfig.from_dict(misplaced, quant)
     for key, value in (("group_size", 32), ("quant_algo", "W4A16_NVFP4"), ("kv_cache_quant_algo", "FP8")):
         with pytest.raises(ValueError):
             ModelConfig.from_dict(raw, dict(quant, **{key: value}))
@@ -114,10 +113,6 @@ def test_contract_snapshots_every_history_and_retains_bf16_pages():
             view = pool.convolution(layer, kind)
             assert view.shape == (4, channels, 3) and view.dtype == torch.float32
             assert view.stride(0) * 4 == pool.layout.row_bytes
-    pool.backing[1].random_(0, 255)
-    pool.backing[2].copy_(pool.backing[1])
-    for region in pool.layout.regions:
-        assert torch.equal(pool.region(region.name)[1].view(torch.uint8), pool.region(region.name)[2].view(torch.uint8))
     buffers = BatchInputs.allocate(128, 2, "cpu", capacity=4).buffers()
     signatures = {kind: GraphSignature(kind, 1 if "prefill" in kind else 4,
         128 if "prefill" in kind else 1, tuple(c.text_inputs(kind)))

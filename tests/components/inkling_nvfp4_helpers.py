@@ -50,16 +50,10 @@ def unpack_weight(values, scales):
 
 
 def quantize_activation(value, amax, *, quant_scale_math="b12x"):
-    """Calibrated per-16 NVFP4 inner values and their FP32 reciprocal outer scale.
-
-    The packed MMA consumes E2M1 values times E4M3 block scales. Its outer
-    calibration multiplies the accumulator, not each input value. Reciprocal
-    multiplication preserves the selected quantizer's E2M1 tie evaluation order.
-    """
+    """Return E2M1 values times E4M3 block scales, and separate FP32 calibration."""
     value = value.float()
     blocks = value.reshape(*value.shape[:-1], -1, 16)
-    # The publisher first stores amax/2688 in FP32, then reciprocates that
-    # stored value. Directly rounding 2688/amax skips an observable boundary.
+    # Round amax/2688 before reciprocating, as the publisher does.
     dequant = torch.tensor(float(amax.item()) / 2688., dtype=torch.float32, device=value.device)
     encode = dequant.reciprocal()
     sixth = (_reciprocal_approximate(torch.full_like(encode, 6.))
@@ -69,10 +63,8 @@ def quantize_activation(value, amax, *, quant_scale_math="b12x"):
     if quant_scale_math == "b12x":
         inverse = scales.reciprocal() * encode
     elif quant_scale_math == "flashinfer":
-        # FlashInfer's native fast quantizer reciprocates the product of the
-        # rounded E4M3 scale and reciprocal calibration using rcp.approx.ftz.
-        # Either reassociation or correctly-rounded reciprocal changes E2M1
-        # ties, including the publisher's amax=187 (quantization_utils.cuh).
+        # Preserve rcp.approx.ftz ordering from quantization_utils.cuh; reassociation
+        # or correctly-rounded reciprocal changes E2M1 ties, including amax=187.
         inverse = _reciprocal_approximate(scales * _reciprocal_approximate(encode))
     else:
         raise ValueError(f"unknown NVFP4 quantizer arithmetic: {quant_scale_math}")
@@ -88,11 +80,7 @@ def quantize_activation(value, amax, *, quant_scale_math="b12x"):
 
 def nvfp4_routes(source, ids, tensors, prefix, *, intermediate_range=None,
                  quant_scale_math="b12x"):
-    """FP32 FC1 -> FP32 SwiGLU -> BF16 -> calibrated NVFP4 -> FP32 FC2 -> BF16.
-
-    Decode checkpoint bytes only for the test oracle. Production kernels consume
-    packed weights directly. Route weights and TP reductions belong to the caller.
-    """
+    """Unweighted routes: FP32 FC1/SwiGLU -> BF16 -> NVFP4 -> FP32 FC2 -> BF16."""
     first = prefix + ".w13_weight"
     second = prefix + ".w2_weight"
     tensors = {name: value.to(source.device) for name, value in tensors.items() if name.startswith(prefix + ".")}
@@ -106,8 +94,7 @@ def nvfp4_routes(source, ids, tensors, prefix, *, intermediate_range=None,
         if tokens.numel() == 0:
             continue
         rows = slice(2 * begin, 2 * end)
-        # Apply the outer multiplier after the dot product, matching the scaled
-        # FP4 MMA arithmetic rather than changing every weight before summation.
+        # Scaled FP4 MMA applies the outer multiplier after the dot product.
         up_gate = unpack_weight(tensors[first][expert, rows], tensors[first + ".scale"][expert, rows])
         projected = (source_quantized[tokens] @ up_gate.T) * (tensors[first + ".scale2"][expert] / input_scale)
         gate, up = projected[:, ::2], projected[:, 1::2]

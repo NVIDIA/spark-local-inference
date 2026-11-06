@@ -1016,94 +1016,58 @@ flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safete
 
 ## Inkling-Small NVFP4
 
-The `inkling-small-nvfp4` alias selects
+`inkling-small-nvfp4` selects
 [`thinkingmachines/Inkling-Small-NVFP4`](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4)
-at revision `b6a99534467840620d411e4cd4ad5819b2610d9c`. This text recipe
-targets one SM103 GPU on DGX Station, or tensor parallelism two on SM120/SM121,
-using two local GPUs or one GPU on each of two DGX Sparks through the shared
-RoCE transport. A single rank prepares complete weights and no collectives.
-Defaults are a 262144-token context, four concurrent requests, and 4096-token prefill chunks.
-Prepared context is capped at 262144 tokens of the checkpoint's 1048576-token
-limit. Image, audio, video, and MTP graphs are not prepared. The indexed download
-includes the publisher's MTP weights; only `model.llm` tensors become serving
-weights.
+at revision `b6a99534467840620d411e4cd4ad5819b2610d9c`. It targets one
+GB300 DGX Station (SM103), or TP2 on SM120/SM121 using local GPUs or two
+DGX Sparks over RoCE. Defaults are a 262144-token context, concurrency four,
+and 4096-token prefill chunks. The prepared context is capped below the
+checkpoint's 1048576-token limit. Image, audio, video and MTP are not prepared;
+only `model.llm` weights are loaded from the indexed checkpoint.
 
-Quantization comes from the checkpoint's `hf_quant_config.json`. Its exclusions
-retain BF16 attention, dense/shared experts, and the first routed layer; the
-remaining routed experts use the original packed NVFP4 weights, E4M3 block
-scales, FP32 global scales, and calibrated NVFP4 activations. Interleaved gate/up
-rows are reordered with their matching scales before intermediate sharding.
-Activation calibration preserves the FP32 scale boundary in the publisher-supported
-[checkpoint loader](https://github.com/sgl-project/sglang/blob/dff6a0c3accf310f70eab81be1220a27b732c96b/python/sglang/srt/models/inkling.py#L1241).
-Unweighted expert outputs are reduced across ranks before route weights apply.
-
-The 42-layer decoder retains 35 local 512-token KV rings and seven global paged
-histories in BF16. Query-dependent relative logits, head RMS normalization,
-`1 / head_dim` attention scaling, and global logarithmic position scaling follow
-the checkpoint. Four residual short convolutions per layer retain FP32 history
-and arithmetic. Every continuation row includes those histories, local rings,
-partial global pages, the consumed cursor, and the normalized and scaled hidden
-vector used by resume.
-
-Router correction biases and global scales remain FP32, as do router logits and
-route normalization. Unquantized SwiGLU uses FP32 activation arithmetic after
-BF16 projections; shared sink weights apply before the down projection. NVFP4
-experts retain FP32 scaled accumulators through SwiGLU, then round the intermediate
-to BF16 before its calibrated NVFP4 activation quantizer. Routing and shared
-sink placement follow the publisher-supported SGLang
+Quantization follows `hf_quant_config.json`: excluded projections retain BF16;
+routed NVFP4 experts retain their packed weights, block/global scales and
+calibrated activations. Router biases/scales, logits and normalization stay FP32,
+as do residual-convolution history and arithmetic. Expert packing, activation
+precision, shared sink placement and TP reduction follow the publisher-supported
+SGLang [loader](https://github.com/sgl-project/sglang/blob/dff6a0c3accf310f70eab81be1220a27b732c96b/python/sglang/srt/models/inkling.py#L1241),
 [router](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/moe.py)
-and [MLP implementation](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/dense_mlp.py).
-Transformers supplies the reference attention, normalization, and checkpoint
-layout; loading it with a blanket BF16 dtype also narrows the FP32 router
-parameters, so that load mode is not the precision reference for routing.
+and [MLP](https://github.com/sgl-project/sglang/blob/a4bef204c51e1c1b7ed59593b85993a940367591/python/sglang/srt/models/inkling_common/dense_mlp.py).
+Transformers provides the attention and normalization reference; blanket BF16
+loading narrows router parameters and is not the routing precision reference.
 
-The indexed checkpoint contains 170,733,074,592 bytes of tensors, including
-166,130,594,960 bytes of text weights. The planner conservatively budgets the
-whole checkpoint for weights, plus preparation scratch and caches. Cache costs
-per GPU are:
+Continuation rows preserve all 35 local 512-token BF16 KV rings, seven global
+paged histories, four convolution histories per layer, partial pages, consumed
+cursor and resume hidden state. The planner budgets the full 170,733,074,592-byte
+checkpoint, including 166,130,594,960 bytes of text weights, plus scratch and caches.
 
 | Tensor parallelism | Continuation row | 128-token global KV page | One 262144-token global KV history |
 |---|---:|---:|---:|
 | 1 | 82,837,504 bytes | 3,670,016 bytes | 7 GiB |
 | 2 | 43,515,904 bytes | 1,835,008 bytes | 3.5 GiB |
 
-The planner uses detected free GPU memory for admission. Spark's CPU, GPU,
-compiler processes, and OS share physical memory; follow the
-[DGX Spark memory guidance](#dgx-spark).
-
-The publisher's [Inkling sampling guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md)
-recommends temperature 1.0. Unspecified filters remain disabled (`top_p=1`,
-`top_k=-1`, `min_p=0`) and penalties are neutral. The pinned checkpoint template
-owns the thinking-effort system message and content-header/tool syntax.
+Admission uses detected free GPU memory. On Spark, CPU and GPU allocations share
+physical memory; follow the [DGX Spark memory guidance](#dgx-spark).
+The publisher's [guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md)
+recommends temperature 1.0. Unspecified filters stay disabled (`top_p=1`,
+`top_k=-1`, `min_p=0`) and penalties stay neutral. The checkpoint template controls reasoning effort and tool syntax.
 
 ```sh
 .venv/bin/ignition export inkling-small-nvfp4 --gpus 0 --prompt-logprobs
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/inkling-small-nvfp4-tp1.safetensors
-flare/target/release/flare run /data/flare-runtime/inkling-small-nvfp4-tp1.safetensors --gpus 0
+flare/target/release/flare run CACHE_ENTRY --gpus 0
 ```
 
-For two local GPUs, use `--gpus 0,1` for export and serving, and convert that
-export to a separate TP2 package. Each tensor-parallel size requires its own export.
+TP2 requires a separate export. Use `--gpus 0,1` for two local GPUs, or follow
+[multi-host preparation and serving](multi-host.md#prepare-the-package) for two Sparks.
 
-For two Sparks, prepare with `--gpus 0 --ranks 2 --rendezvous ZERO:29630` on
-rank zero and `ignition join ZERO:29630 --rank 1 --ranks 2` on its peer. Follow
-[multi-host preparation and serving](multi-host.md#prepare-the-package) for
-checkpoint access, transport setup, and launching the resulting two-host package.
-
-With locked FlashInfer `1f8ed8a3c46e27d03cff54e08f23e9bc50476d57`, the full
-checkpoint exports all 29 graphs and serves through native `flare run` on one
-GB300 DGX Station at the default capacities above. All 22 numerical CUDA checks
-pass, including an actual checkpoint expert layer, complete decoder replay,
-state restoration, inactive rows, and allocation stability. All 79 native API
-checks pass. The 50-prompt text/tool/long-context workload uses
-`reasoning_effort=none` and a fixed 64-token output budget; the longest input
-contains 262080 tokens. Other checks cover all five reasoning efforts, cached
-prefix branches, prompt logprobs, and media rejection.
-
-Full-checkpoint TP2/RoCE and SM120/SM121 execution remain unqualified. Reproduce
-endpoint acceptance with `tests/server/test_inkling.py` and
-`tests/server/test_inkling_generation.py`, setting `FLARE_RUN_CUDA_TESTS=1`,
-`FLARE_INKLING_TEST_URL`, and `FLARE_INKLING_SNAPSHOT`.
+On GB300 with locked FlashInfer `1f8ed8a3`, full-checkpoint export captures 29 graphs;
+22 numerical CUDA checks and 61 native API checks pass. The 50-prompt generation
+workload uses `reasoning_effort=none`, a fixed 64-token output budget and inputs
+through 262080 tokens. Coverage includes checkpoint experts, decoder/state replay,
+inactive rows, allocation stability, all reasoning efforts, prefix branches and
+prompt scoring. Full-checkpoint TP2/RoCE and SM120/SM121 remain unqualified.
+Run `tests/server/test_inkling.py`
+with `FLARE_RUN_CUDA_TESTS=1`, `FLARE_INKLING_TEST_URL` and `FLARE_INKLING_SNAPSHOT`.
 
 ## Muse Spark Open
 

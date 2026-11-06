@@ -16,12 +16,7 @@ from b12x.preparation import Knob, MemoryRequirements, Plan, TuningContract
 
 
 def compile_triton(kernel, grid, *args, **kwargs):
-    """Make an Ignition Triton factory's executable cache reclaimable by b12x.
-
-    b12x discovers its own JIT functions automatically. Its mapping registration
-    also covers local functions, so deferred planning entries and losing tactics
-    are reclaimed at the same preparation boundaries.
-    """
+    """Register local Triton executable caches for reclamation during b12x preparation."""
     program = launch_triton(kernel, grid, *args, **kwargs)
     for executable_cache, *_ in kernel.device_caches.values():
         register_program_cache(executable_cache)

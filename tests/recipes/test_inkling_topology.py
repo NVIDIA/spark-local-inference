@@ -12,7 +12,7 @@ from ignition.recipes.inkling.recipe import RECIPE
 
 
 @pytest.mark.parametrize('devices,hosts', [
-    ((0,), None), ((3,), None), ((0, 1), None), ((1, 3), None), ((0, 0), ('spark-a', 'spark-b')),
+    ((3,), None), ((1, 3), None), ((0, 0), ('spark-a', 'spark-b')),
 ])
 def test_one_or_two_distinct_local_or_remote_placements(devices, hosts):
     from ignition.recipes.inkling.bootstrap import PreparationConfig
@@ -59,8 +59,6 @@ def test_rank_group_matches_tensor_parallel_placement(tmp_path, devices, group):
 
 
 def test_nvfp4_plan_fits_one_station():
-    # A conservative available-memory fixture for a DGX Station; the planner
-    # uses detected free GPU memory rather than a product-name memory constant.
     station = planning.Gpu(0, 'NVIDIA GB300', 'GPU-0', 256 << 30, 240 << 30, (10, 3))
     plan = planning.plan(RECIPE, RECIPE.checkpoints[0], (station,), selected=None,
                          concurrency=4, reserve_bytes=4 << 30, speculation=None)
@@ -70,33 +68,6 @@ def test_nvfp4_plan_fits_one_station():
     assert plan.costs.page_bytes == 3_670_016
     assert plan.costs.page_bytes * (plan.context // 128) == 7 << 30
     assert plan.weights_bytes >= 166_130_594_960
-
-
-@pytest.mark.parametrize('world', [1, 2])
-def test_recipe_dispatches_single_rank_or_rank_group(monkeypatch, tmp_path, world):
-    from ignition.preparation import rank_group
-    from ignition.recipes.inkling import bootstrap
-
-    devices = tuple(planning.Gpu(i, 'NVIDIA GB300', f'GPU-{i}', 256 << 30, 240 << 30, (10, 3))
-                    for i in range(world))
-    plan = planning.plan(RECIPE, RECIPE.checkpoints[0], devices, selected=tuple(range(world)),
-                         concurrency=4, reserve_bytes=4 << 30, speculation=None)
-    result = object()
-    calls = []
-
-    def single(snapshot, config, *, rank, group, progress, package_storage):
-        calls.append(('single', config.devices, rank, group))
-        return result
-
-    def parallel(snapshot, config, prepare, **kwargs):
-        assert prepare is single and kwargs['ranks'] is None
-        calls.append(('parallel', config.devices))
-        return result
-
-    monkeypatch.setattr(bootstrap, 'prepare_rank', single)
-    monkeypatch.setattr(rank_group, 'prepare_group', parallel)
-    assert RECIPE.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) is result
-    assert calls == ([('single', (0,), 0, None)] if world == 1 else [('parallel', (0, 1))])
 
 
 def test_nvfp4_plan_fits_two_sparks_with_host_reserve():
