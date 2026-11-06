@@ -474,7 +474,7 @@ fn install_blob_after_rename_error(
         .is_some_and(|code| code == libc::EINVAL || code == libc::ENOTSUP)
     {
         std::fs::hard_link(temporary, destination)?;
-        std::fs::remove_file(temporary)?;
+        // BlobStore::commit owns temporary cleanup after publication.
         return Ok(());
     }
     Err(error.into())
@@ -619,7 +619,39 @@ mod tests {
             .unwrap();
 
             assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+            assert_eq!(std::fs::read(&temporary).unwrap(), b"payload");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_noreplace_rename_leaves_temporary_cleanup_to_the_caller() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for code in [libc::EINVAL, libc::ENOTSUP] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path().join("staging");
+            std::fs::create_dir(&staging).unwrap();
+            let temporary = staging.join("blob.tmp");
+            let destination = directory.path().join("blob");
+            std::fs::write(&temporary, b"payload").unwrap();
+            let permissions = std::fs::metadata(&staging).unwrap().permissions();
+            // Linking needs only search permission on the source directory, but
+            // unlinking also needs write permission. Publication must not unlink.
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let result = install_blob_after_rename_error(
+                &temporary,
+                &destination,
+                std::io::Error::from_raw_os_error(code),
+            );
+
+            std::fs::set_permissions(&staging, permissions).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+            result.unwrap();
+            assert_eq!(std::fs::read(&temporary).unwrap(), b"payload");
+            remove_temporary(&temporary).unwrap();
             assert!(!temporary.exists());
+            assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
         }
     }
     #[test]
@@ -666,6 +698,28 @@ mod tests {
         );
         assert!(!destination.exists());
         assert_eq!(std::fs::read(&temporary).unwrap(), b"payload");
+    }
+    #[test]
+    fn unsupported_noreplace_rename_preserves_hard_link_errors() {
+        for code in [libc::EINVAL, libc::ENOTSUP] {
+            let directory = tempfile::tempdir().unwrap();
+            let temporary = directory.path().join("missing.tmp");
+            let destination = directory.path().join("blob");
+
+            let error = install_blob_after_rename_error(
+                &temporary,
+                &destination,
+                std::io::Error::from_raw_os_error(code),
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            assert!(!destination.exists());
+        }
     }
     #[test]
     fn blob_header_preserves_python_content_identity() {
