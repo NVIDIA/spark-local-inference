@@ -29,9 +29,11 @@ fn export_capture(
         .map_err(|e| PyValueError::new_err(format!("invalid export metadata: {e}")))?;
     py.detach(|| validate_metadata(&request))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let mut lease = OwnerLease(Some(owners));
     let recorder_lock = recorder.as_ref().map(|r| &r.recorder);
-    let outcome = py.detach(|| {
+    let capture = || {
+        if !request.sources && !request.path.as_os_str().is_empty() {
+            helios_core::package::cache::preflight_directory_publication(&request.path)?;
+        }
         let result = match recorder_lock {
             Some(recorder) => {
                 let recorder = recorder
@@ -80,29 +82,46 @@ fn export_capture(
             publication?;
             Ok(output)
         });
-        let drain = super::capture::drain_context(request.context);
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((result, drain))
-    });
-    let (result, drain) = outcome.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if drain.is_ok() {
-        drop(lease.take_after_drain());
+        result
+    };
+    let output = py
+        .detach(|| capture_with_owners(owners, capture, || super::capture::drain_context(request.context)))
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    Ok(NativeRankOutput { output })
+}
+
+fn capture_with_owners<O, T>(
+    owners: O,
+    capture: impl FnOnce() -> super::Result<T>,
+    drain: impl FnOnce() -> super::Result<()>,
+) -> super::Result<T> {
+    let mut lease = OwnerLease(Some(owners));
+    let result = capture();
+    match drain() {
+        Ok(()) => drop(lease.take_after_drain()),
+        Err(error) => {
+            let primary = result
+                .as_ref()
+                .err()
+                .map(|error| format!("{error}; "))
+                .unwrap_or_default();
+            return Err(super::invalid(format!(
+                "{primary}export CUDA drain failed; preparation owners retained: {error}"
+            )));
+        }
     }
-    if let Err(error) = drain {
-        let primary = result
-            .as_ref()
-            .err()
-            .map(|e| format!("{e}; "))
-            .unwrap_or_default();
-        return Err(PyRuntimeError::new_err(format!(
-            "{primary}export CUDA drain failed; preparation owners retained: {error}"
-        )));
-    }
-    let result = result.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    Ok(NativeRankOutput { output: result })
+    result
+}
+
+#[pyfunction]
+fn export_preflight_directory(py: Python<'_>, destination: std::path::PathBuf) -> PyResult<()> {
+    py.detach(|| helios_core::package::cache::preflight_directory_publication(&destination))
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_capture, module)?)?;
+    module.add_function(wrap_pyfunction!(export_preflight_directory, module)?)?;
     module.add_function(wrap_pyfunction!(export_synchronize, module)?)?;
     module.add_function(wrap_pyfunction!(export_reset_peer_storage, module)?)?;
     module.add_function(wrap_pyfunction!(export_serving, module)?)?;
@@ -1019,6 +1038,54 @@ mod tests {
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));
         assert_eq!(parsed.graphs[0].verify_tokens, Some(3));
+    }
+
+    #[test]
+    fn preflight_failure_drains_without_capturing_and_retains_owners_on_failed_drain() {
+        use std::cell::Cell;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct Owner(Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for drain_succeeds in [true, false] {
+            let released = Arc::new(AtomicBool::new(false));
+            let captured = Cell::new(false);
+            let drained = Cell::new(false);
+            let preflight: super::super::Result<()> =
+                Err(super::super::invalid("unsupported publication"));
+            let result = capture_with_owners(
+                Owner(released.clone()),
+                || {
+                    preflight?;
+                    captured.set(true);
+                    Ok(())
+                },
+                || {
+                    drained.set(true);
+                    if drain_succeeds {
+                        Ok(())
+                    } else {
+                        Err(super::super::invalid("drain failed"))
+                    }
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported publication")
+            );
+            assert!(!captured.get());
+            assert!(drained.get());
+            assert_eq!(released.load(Ordering::SeqCst), drain_succeeds);
+        }
     }
 }
 

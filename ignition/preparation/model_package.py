@@ -22,10 +22,10 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
     """
     if publisher is None:
         raise ValueError("final model publication requires a signing publisher")
+    import flare_heliopause
     import torch.distributed as dist
 
     cache_only = path is None
-    import flare_heliopause
     from .package_snapshot import _OPTIONS
 
     settings = _OPTIONS.get()
@@ -38,6 +38,8 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
     token = _OPTIONS.set(settings)
     result = None
     try:
+        if not cache_only and form == 'directory':
+            flare_heliopause.export_preflight_directory(str(path))
         roots = [Path(native_stage.rank_path(rank)) for rank in range(storage.world)]
         if storage.world > 1:
             for rank, control in enumerate(prepared.controls, 1):
