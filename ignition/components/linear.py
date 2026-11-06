@@ -48,7 +48,7 @@ class PreparedProjectionGroup:
     """Project one source into ordered output slices with compatible weights fused."""
 
     def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging,
-                 quantized_staging=None):
+                 quantized_staging):
         from .block_fp8 import BlockFP8Weight
         from .tensor_fp8 import TensorFP8Weight
 

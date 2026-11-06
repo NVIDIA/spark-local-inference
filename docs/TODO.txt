@@ -195,11 +195,6 @@
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
 
-[ ] Defer SM103 TRTLLM MoE module loading until materialization.
-    ignition/components/moe_sm103.py::_trtllm_tactics loads during scratch
-    envelope enumeration, before preparation compiler resource limits apply.
-
-[ ] Complete Muse Glimmer's 64-token generation qualification on GB300.
-    Retain the failing API cases, reproduce the timestamped concurrency input,
-    and control decode capacities before attributing Python/native differences.
-    See docs/model-preparation.md#muse-glimmer for the measured limitations.
+[ ] Make tests/server/test_muse_glimmer.py pass against an exported Muse Glimmer
+    package on GB300. Some text, JSON, and tool cases exceed the 64-token output
+    budget or end without a completed tool call. Close when the suite passes.

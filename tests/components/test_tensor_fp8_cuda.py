@@ -3,16 +3,14 @@
 
 """Checkpoint-calibrated FP8 projections and allocation-stable graph replay."""
 
-import json
 import os
 
 import pytest
 import torch
-from safetensors.torch import save_file
 
 from ignition.components.tensor_fp8 import TensorFP8Projection
 from ignition.components.weights import DirectWeightLoader
-from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from tests.components.test_weight_formats_cuda import checkpoint
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
@@ -33,25 +31,17 @@ def test_tensor_fp8_calibration_survives_loading_and_replay(tmp_path, rows, shar
 
     generator = torch.Generator().manual_seed(2741)
     values = torch.randn((256, 512), generator=generator).mul(20).to(torch.float8_e4m3fn)
-    weight_scale, input_scale = .017, .031
-    tensors = {"proj.weight": values, "proj.weight_scale": torch.tensor(weight_scale),
-               "proj.input_scale": torch.tensor(input_scale)}
-    save_file(tensors, str(tmp_path / "weights.safetensors"))
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
-        "metadata": {"total_size": sum(t.nbytes for t in tensors.values())},
-        "weight_map": {name: "weights.safetensors" for name in tensors}}))
-    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {
-        "quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
-        "quantized_layers": {"proj": {"quant_algo": "FP8"}}}}))
-    with DirectWeightLoader(inspect_indexed_checkpoint(tmp_path), "cuda:0") as loader:
+    weight_scale, input_scale = torch.tensor(.017), torch.tensor(.031)
+    tensors = {"proj.weight": values, "proj.weight_scale": weight_scale, "proj.input_scale": input_scale}
+    with DirectWeightLoader(checkpoint(tmp_path, tensors, {"proj": {"quant_algo": "FP8"}}), "cuda:0") as loader:
         weight = loader.load_linear("proj", rows=(128, 256), columns=(32, 320))
         assert loader._session.torch_copy_bytes == 0
     source = torch.randn((rows, 288), generator=generator).mul(10).bfloat16()
     device_source = source.cuda()
     output = torch.empty((rows, 128), dtype=torch.bfloat16, device="cuda")
     staging = torch.empty(rows * 512, dtype=torch.uint8, device="cuda") if shared else None
-    with RecordedPreparationSession(device=device_source.device, checkpoint='tensor-fp8',
-            workload_schema='tensor-fp8', numerical_policy='default', compile_workers=1) as session:
+    with RecordedPreparationSession(device=device_source.device, checkpoint="tensor-fp8",
+            workload_schema="tensor-fp8", numerical_policy="default", compile_workers=1) as session:
         projection = TensorFP8Projection(device_source, weight, output, session=session, name="tensor-fp8", staging=staging)
         if shared:
             assert projection.quantized.data_ptr() == staging.data_ptr()
@@ -69,10 +59,9 @@ def test_tensor_fp8_calibration_survives_loading_and_replay(tmp_path, rows, shar
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
-            quantized = ((source * factor).float() / tensors['proj.input_scale']).clamp(-448, 448).to(torch.float8_e4m3fn)
+            quantized = ((source * factor).float() / input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
             assert torch.equal(projection.quantized.cpu().view(torch.uint8), quantized.view(torch.uint8))
-            expected = ((quantized.float() @ values.float()[128:256, 32:320].T)
-                        * (tensors['proj.weight_scale'] * tensors['proj.input_scale']))
+            expected = (quantized.float() @ values.float()[128:256, 32:320].T) * (weight_scale * input_scale)
             assert_fp8_projection(output, expected)
         graph.reset()
 
@@ -141,34 +130,26 @@ def test_mixed_group_retains_distinct_fp8_calibration(tmp_path, rows):
                         name + '.input_scale': torch.tensor(scale)})
         declarations[name] = {'quant_algo': 'FP8'}
     tensors['v.weight'] = torch.randn((128, 256), dtype=torch.bfloat16) * .03
+    with DirectWeightLoader(checkpoint(tmp_path, tensors, declarations), 'cuda:0') as loader:
+        weight = loader.load_mixed_linear_group(('q', 'k', 'v'))
+    assert isinstance(weight, GroupedLinearWeights)
+    assert weight.widths == (128, 128, 128)
+    output = torch.empty((rows, 384), dtype=torch.bfloat16, device='cuda')
 
-    def reference(value):
+    def check(value):
         parts = []
         for name in ('q', 'k'):
             scale = tensors[name + '.input_scale']
             quantized = (value.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
             parts.append((quantized.float() @ tensors[name + '.weight'].float().T)
                          * (scale * tensors[name + '.weight_scale']))
-        return torch.cat([*parts, value.float() @ tensors['v.weight'].float().T], -1)
-
-    def assert_reference(value):
-        expected = reference(value)
+        expected = torch.cat([*parts, value.float() @ tensors['v.weight'].float().T], -1)
         assert_fp8_projection(output[:, :256], expected[:, :256])
-        # The BF16 GEMM's FP32 reduction differs near cancellation: measured
+        # The BF16 GEMM's FP32 reduction order differs near cancellation; measured
         # excess beyond a BF16 ULP is at most 4.03e-7 on SM103 and SM120.
         torch.testing.assert_close(output[:, 256:].float().cpu(), expected[:, 256:].bfloat16().float(),
                                    rtol=torch.finfo(torch.bfloat16).eps, atol=2 ** -21)
-    save_file(tensors, str(tmp_path / 'weights.safetensors'))
-    (tmp_path / 'model.safetensors.index.json').write_text(json.dumps(dict(
-        metadata={'total_size': sum(t.nbytes for t in tensors.values())},
-        weight_map={name: 'weights.safetensors' for name in tensors})))
-    (tmp_path / 'config.json').write_text(json.dumps({'quantization_config': {
-        'quant_method': 'modelopt', 'quant_algo': 'MIXED_PRECISION', 'quantized_layers': declarations}}))
-    with DirectWeightLoader(inspect_indexed_checkpoint(tmp_path), 'cuda:0') as loader:
-        weight = loader.load_mixed_linear_group(('q', 'k', 'v'))
-    assert isinstance(weight, GroupedLinearWeights)
-    assert weight.widths == (128, 128, 128)
-    output = torch.empty((rows, 384), dtype=torch.bfloat16, device='cuda')
+
     with RecordedPreparationSession(device=source.device, checkpoint='mixed-fp8', workload_schema='mixed-fp8',
             numerical_policy='default', compile_workers=1) as session:
         arena = ScratchArena(source.device)
@@ -181,7 +162,7 @@ def test_mixed_group_retains_distinct_fp8_calibration(tmp_path, rows):
         compiled = compile_forward(lambda: projection(source))
         compiled()
         torch.cuda.synchronize()
-        assert_reference(original)
+        check(original)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             compiled()
@@ -192,5 +173,5 @@ def test_mixed_group_retains_distinct_fp8_calibration(tmp_path, rows):
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocations
-            assert_reference(original * factor)
+            check(original * factor)
         graph.reset()

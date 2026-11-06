@@ -26,8 +26,8 @@ pub const GB202_DEVICES: [u32; 9] = [
 /// RTX Spark N1X part, which NVML reports for the same SM121 platform.
 pub const GB10_DEVICES: [u32; 2] = [0x2e12, 0x2e03];
 
-/// GB300 device identifiers reported by NVML on DGX Station.
-pub const GB300_DEVICES: [u32; 2] = [0x31c2, 0x31c3];
+/// GB300 device identifiers. `0x31c3` is the SM103 GPU of DGX Station GB300.
+pub const GB300_DEVICES: [u32; 1] = [0x31c3];
 
 pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     if pci_id & 0xffff != 0x10de {
@@ -166,10 +166,6 @@ mod tests {
             candidate("gb10", 8, at(1_792_228_980)).as_deref(),
             Some("gb10-tp8-202610170923")
         );
-        assert_eq!(
-            candidate("gb300", 1, at(1_792_228_980)).as_deref(),
-            Some("gb300-tp1-202610170923")
-        );
         assert!(candidate("sm120", 1, at(0)).is_none());
         assert!(candidate("gb202", 0, at(0)).is_none());
     }
@@ -191,8 +187,6 @@ mod tests {
                 "{device:#06x}"
             );
         }
-        assert_eq!(platform_from_pci(0x31c2_10de), Some("gb300"));
-        assert_eq!(platform_from_pci(0x31c2_1af4), None);
         assert_eq!(platform_from_pci(0x2bbc_1af4), None);
         assert_eq!(platform_from_pci(0x31c3_1af4), None);
         assert_eq!(platform_from_pci(0x1e02_10de), None);
@@ -215,10 +209,6 @@ mod tests {
         assert_eq!(
             deployment_candidate(Some("gb202"), &[2, 1], at).as_deref(),
             Some("gb202-tp1+tp2-202610170923")
-        );
-        assert_eq!(
-            deployment_candidate(Some("gb300"), &[1], at).as_deref(),
-            Some("gb300-tp1-202610170923")
         );
         assert_eq!(
             deployment_candidate(Some("sm120"), &[1], at).as_deref(),

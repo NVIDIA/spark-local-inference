@@ -25,10 +25,6 @@ class TensorFP8Weight:
     def out_features(self):
         return self.packed.out_features
 
-    @property
-    def in_features(self):
-        return self.packed.in_features
-
 
 class TensorFP8Projection:
     def __init__(self, source, weight, output, *, session, name, staging=None, workspace=None):

@@ -266,15 +266,15 @@ impl XtmlOutput {
     }
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;")
 }
 
-fn unescape(text: &str) -> String {
+pub(super) fn unescape(text: &str) -> String {
     text.replace("&lt;", "<").replace("&amp;", "&")
 }
 
-fn partial(text: &str, marker: &str) -> usize {
+pub(super) fn partial(text: &str, marker: &str) -> usize {
     (1..marker.len())
         .rev()
         .find(|&length| text.ends_with(&marker[..length]))

@@ -22,8 +22,7 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
     from ignition.preparation.package_storage import PackageStorage
     from ignition.recipes.muse_glimmer.bootstrap import PreparationConfig, prepare
     from ignition.recipes.muse_glimmer.config import ModelConfig
-    from ignition.recipes.muse_glimmer.pool import continuation_layout
-    from ignition.recipes.muse_glimmer.pool import ContinuationPool
+    from ignition.recipes.muse_glimmer.pool import ContinuationPool, continuation_layout
     from ignition.components.sampling import AdmissionBuffers, DeviceRequestState, RequestAdmission
 
     snapshot = Path(os.environ.get('FLARE_MUSE_GLIMMER_SNAPSHOT', ''))
@@ -71,23 +70,23 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
         compile_workers=1, headroom_bytes=1 << 30, prompt_logprobs=True)
     with PackageStorage(device=0) as storage:
         with prepare(tmp_path, config, package_storage=storage) as model:
+            buffers = model.buffers
             assert {s.kind for s in model.signatures.values()} == {
                 'init', 'restore', 'snapshot', 'prefill', 'scored_prefill', 'decode', 'resume'}
             assert model.memory_report['kv_dtype'] == 'bfloat16'
             assert model.server_config['frontend']['eos_token_ids'] == [200001, 200008]
-            model.buffers['live_rows'].zero_()
-            model.buffers['admission_count'].zero_()
-            model.buffers['state_num_ops'].zero_()
-            before = model.buffers['state_pool'].clone()
+            buffers['live_rows'].zero_()
+            buffers['admission_count'].zero_()
+            buffers['state_num_ops'].zero_()
+            before = buffers['state_pool'].clone()
             allocations = torch.cuda.memory_stats()['allocation.all.allocated']
             for graph in model.graphs.values():
                 graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocations
-            assert torch.equal(model.buffers['state_pool'], before)
+            assert torch.equal(buffers['state_pool'], before)
             pool = next(resource for resource in model.resources if isinstance(resource, ContinuationPool))
             requests = next(resource for resource in model.resources if isinstance(resource, DeviceRequestState))
-            buffers = model.buffers
             buffers['request_state_rows'][0, 0] = 1
             buffers['row_slot_ids'][0] = 0
             buffers['live_rows'].fill_(1)
@@ -101,6 +100,13 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
                 assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocations
                 assert requests.error_code[0].item() == 0
 
+            def command(graph, source, destination, operation, expected):
+                for name, value in dict(request_slots=0, source_slots=source, destination_slots=destination,
+                        operation=operation, expected_consumed=expected, num_ops=1).items():
+                    buffers['state_' + name].fill_(value)
+                replay(graph)
+                buffers['state_num_ops'].zero_()
+
             def admit(generation, *, restore=False):
                 admission = AdmissionBuffers.allocate('cpu', vocab_size=c.vocab_size, capacity=1)
                 admission.stage(0, 0, RequestAdmission(generation, 13, max_new_tokens=8, top_k=1), prompt)
@@ -108,12 +114,8 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
                 for name in admission.__dataclass_fields__:
                     buffers[name].copy_(getattr(admission, name))
                 buffers['row_generations'][0] = generation
-                for name, value in dict(request_slots=0, source_slots=2 if restore else -1,
-                        destination_slots=1, operation=0 if restore else 1,
-                        expected_consumed=127 if restore else 0, num_ops=1).items():
-                    buffers['state_' + name].fill_(value)
-                replay('restore1' if restore else 'init1')
-                buffers['state_num_ops'].zero_()
+                command('restore1' if restore else 'init1', 2 if restore else -1, 1, 0 if restore else 1,
+                        127 if restore else 0)
                 buffers['admission_count'].zero_()
 
             def prefill(tokens, *, scored=False):
@@ -138,29 +140,29 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
             hidden = pool.last_hidden[1].clone()
             cache = {(layer, kind): pool.cache(layer, kind).flatten(0, 1)[:127].clone()
                      for layer in range(2) for kind in ('key', 'value')}
-            for name, value in dict(request_slots=0, source_slots=1, destination_slots=2,
-                    operation=0, expected_consumed=127, num_ops=1).items():
-                buffers['state_' + name].fill_(value)
-            replay('snapshot1')
-            buffers['state_num_ops'].zero_()
+
+            def assert_prompt_state():
+                assert requests.consumed_tokens[0].item() == 127
+                torch.testing.assert_close(pool.last_hidden[1], hidden, atol=0, rtol=0)
+                for (layer, kind), reference in cache.items():
+                    torch.testing.assert_close(pool.cache(layer, kind).flatten(0, 1)[:127], reference,
+                                               atol=0, rtol=0)
+
+            command('snapshot1', 1, 2, 0, 127)
             snapshot_row = pool.backing[2].clone()
             expected_tokens, expected_hidden = continuation()
 
             admit(8)
             prefill(prompt[:64])
             prefill(prompt[64:])
-            torch.testing.assert_close(pool.last_hidden[1], hidden, atol=0, rtol=0)
-            for (layer, kind), reference in cache.items():
-                torch.testing.assert_close(pool.cache(layer, kind).flatten(0, 1)[:127], reference,
-                                           atol=0, rtol=0)
+            assert_prompt_state()
             tokens, final_hidden = continuation()
             assert tokens == expected_tokens
             torch.testing.assert_close(final_hidden, expected_hidden, atol=0, rtol=0)
             assert torch.equal(pool.backing[2], snapshot_row)
 
             admit(9, restore=True)
-            assert requests.consumed_tokens[0].item() == 127
-            assert torch.equal(pool.last_hidden[1], hidden)
+            assert_prompt_state()
             tokens, final_hidden = continuation()
             assert tokens == expected_tokens
             torch.testing.assert_close(final_hidden, expected_hidden, atol=0, rtol=0)
@@ -170,11 +172,7 @@ def test_reduced_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
             buffers['prompt_target_tokens'].fill_(-1)
             buffers['prompt_target_tokens'][:126].copy_(torch.tensor(prompt[1:], device='cuda'))
             prefill(prompt, scored=True)
-            assert requests.consumed_tokens[0].item() == 127
-            torch.testing.assert_close(pool.last_hidden[1], hidden, atol=0, rtol=0)
-            for (layer, kind), reference in cache.items():
-                torch.testing.assert_close(pool.cache(layer, kind).flatten(0, 1)[:127], reference,
-                                           atol=0, rtol=0)
+            assert_prompt_state()
             scores = buffers['prompt_logprobs'][int(buffers['frame_index'].item())].cpu()
             assert scores[:126, 0].tolist() == prompt[1:]
             assert torch.isfinite(scores[:126, 1].contiguous().view(torch.float32)).all()

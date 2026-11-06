@@ -1088,16 +1088,15 @@ flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --
 
 ## Muse Glimmer
 
-`muse-glimmer-30b-nvfp4` selects
+The `muse-glimmer-30b-nvfp4` alias selects
 [`nvidia/Muse-Glimmer-30B-NVFP4`](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4)
 at revision `47818374517751c48c55cde2621594926b1888b6`. It prepares one GPU with
 a 131072-token context, concurrency four and 4096-token prefill chunks. Weights
 retain checkpoint NVFP4 W4A16, calibrated FP8 and excluded BF16 precision.
 Image, audio and video requests are rejected; no vision encoder or draft is prepared.
 
-Use the locked FlashInfer revision `1f8ed8a3`. On GB300/SM103, calibrated FP8
-projections use its SM100 CUTLASS GEMM with caller-owned scratch and original
-E4M3 values/FP32 scales. SM120/SM121 use b12x blockscaled GEMM.
+The FlashInfer dependency pinned in `pyproject.toml` provides the required operators;
+unlike Muse Spark, no local FlashInfer checkout is needed.
 All 52 layers retain BF16 KV; sliding layers use the 2048-token window.
 A 128-token KV page occupies 6,815,744 bytes, a continuation row 6,829,312 bytes,
 and a full-context KV history 6.5 GiB. The planner budgets the full 24.67 GB
@@ -1105,29 +1104,18 @@ checkpoint, including unused vision tensors, plus scratch and caches.
 
 Sampling defaults are temperature 1.0, top-p 0.95 and top-k 64. Set
 `chat_template_kwargs.reasoning_strength` to override the template's `high` default.
-The annotated template preserves canonical bytes and exact message boundaries.
-Muse Spark's shared recipient/ATEM parser handles output; `<|eom|>` separates
-messages, while `<|eot|>` and `<|end_of_text|>` end generation.
+Prompt rendering and output parsing follow [Muse Spark](#muse-spark-open), with
+the template patch in `ignition/recipes/muse_glimmer/assets/chat_template.patch.json`.
 
 ```sh
 .venv/bin/ignition export muse-glimmer-30b-nvfp4 --gpus 0 --prompt-logprobs
 flare/target/release/flare run CACHE_ENTRY --gpus 0
 ```
 
-On GB300, full-checkpoint export captures 29 graphs and native loading succeeds;
-12 FP8 CUDA checks and one reduced-model capture check pass. Native acceptance
-in `tests/server/test_muse_glimmer.py` remains **30 passed, 27 failed** at its
-unchanged 64-token budget: four text, ten JSON and one concurrency case reach
-the limit; twelve tool cases end without a completed call. The 26 fixed-case
-continuations preserve their first 64 tokens and complete correctly at 68–121
-tokens. A concurrency rerun passes with a different timestamped input; the
-original failure remains unresolved. A previous package loads unchanged, with
-text/scoring passing and concurrency reaching the limit.
-
-Python/native replay matches five of six sequences. Cold `tool-1` replay differs
-at token 21, including after independent preparation; uncontrolled decode graph
-selection leaves the cause unresolved. Full-checkpoint SM120/SM121 validation
-and performance measurements remain unperformed.
+Against an exported package on GB300, `tests/server/test_muse_glimmer.py` does not
+yet pass: some text, JSON, and tool cases exceed its 64-token output budget or end
+without a completed tool call. Full-checkpoint SM120/SM121 preparation and serving
+performance have not been measured.
 
 ## Storage and graph capacities
 

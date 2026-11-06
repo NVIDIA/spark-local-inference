@@ -8,10 +8,12 @@ import torch
 
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.linear import prepare_projection
+from ignition.components.paged_attention import PagedAttentionMetadata
 from ignition.components.paged_resume import PreparedResume as _PreparedResume
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from .attention import AttentionScratch, PreparedAttention
 from .model import decoder_layer, norm
+from .pool import PAGE_TOKENS
 
 
 @dataclass(frozen=True)
@@ -69,23 +71,21 @@ class PreparedFeedForward(torch.nn.Module):
         s.activated.copy_(torch.nn.functional.silu(gate) * up)
         return self.down(s.activated).view_as(hidden_states)
 
-    def scratch_tensors(self):
-        return tuple(p.quantized for p in getattr(self.gate_up, "projections", (self.gate_up,)) if hasattr(p, "quantized")), getattr(self.down, "quantized", ())
-
 
 class PreparedDecoder:
-    def __init__(self, weights, scratch, metadata, pool, *, mode, session, name, workspace, buffers=None, scoring=None):
+    def __init__(self, weights, scratch, metadata, pool, *, mode, session, name, workspace, buffers, scoring=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         c = weights.config.text
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             session=session, name=name + ".embedding", num_rows=metadata.live_counts[:1])
         self.embedding_norm = norm("rms", eps=c["rms_norm_eps"])
+        self.cache_metadata = PagedAttentionMetadata(metadata, page_tokens=PAGE_TOKENS, buffers=buffers)
         self.layers = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             attention = PreparedAttention(index, w, weights.config, scratch.normalized,
                 scratch.attention, metadata, pool, mode=mode, session=session, name=prefix + ".attention",
-                workspace=workspace, buffers=buffers)
+                workspace=workspace, cache_metadata=self.cache_metadata)
             feedforward = PreparedFeedForward(w, scratch, session=session, name=prefix + ".mlp", workspace=workspace)
             self.layers.append(decoder_layer(weights.config, w, attention, feedforward))
         self.norm = norm("rms", weights.norm, eps=c["rms_norm_eps"])
@@ -96,9 +96,10 @@ class PreparedDecoder:
                 c["final_logit_softcapping"]), reduction) for source, projection, reduction in self.scoring.parts]
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=None, coordinator=None, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
-        self.output_multiplier, self.softcap = c["output_multiplier"], c["final_logit_softcapping"]
+        self.logits = SoftcappedProjection(self.head, c["output_multiplier"], c["final_logit_softcapping"])
 
     def __call__(self):
+        self.cache_metadata()
         hidden = self.embedding_norm(self.embedding())
         for layer in self.layers:
             hidden = layer(hidden)
@@ -108,12 +109,10 @@ class PreparedDecoder:
             self.scratch.hidden.copy_(self.scoring.source[self.metadata.sample_indices])
         else:
             self.scratch.hidden.copy_(self.norm(hidden[self.metadata.sample_indices]))
-        logits = self.head(self.scratch.hidden)
-        logits.copy_(torch.tanh(logits * self.output_multiplier / self.softcap) * self.softcap)
+        self.logits(self.scratch.hidden)
 
     def scratch_tensors(self):
-        return (self.head.gathered, *((layer.self_attn.scratch_tensors(), layer.mlp.scratch_tensors())
-                                     for layer in self.layers))
+        return self.head.gathered, self.cache_metadata.slots, self.cache_metadata.lengths
 
 
 class SoftcappedProjection:

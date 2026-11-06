@@ -24,9 +24,10 @@ def configuration(window):
 @pytest.mark.parametrize('window', [-1, 256])
 @torch.no_grad()
 def test_chunked_prefill_matches_canonical_cache_and_gate(window):
+    from ignition.components.paged_attention import PagedAttentionMetadata
     from ignition.components.paged_batch import Metadata
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.muse_glimmer.attention import AttentionScratch, PreparedAttention
     from ignition.recipes.muse_glimmer.pool import ContinuationPool
@@ -40,6 +41,8 @@ def test_chunked_prefill_matches_canonical_cache_and_gate(window):
                              output=torch.randn((256, 512), device=device).bfloat16() * .025)
     source = torch.randn((capacity, 256), device=device).bfloat16()
     metadata = Metadata.allocate(capacity, 1, blocks, device)
+    cache_metadata = PagedAttentionMetadata(metadata, page_tokens=128,
+        buffers=GraphBufferPool(device, chunk_bytes=2 << 20).cursor())
     pages = torch.arange(blocks, dtype=torch.int32, device=device)[None]
     def set_metadata(start, count):
         metadata.set(torch.tensor([start], device=device), torch.tensor([count], dtype=torch.int32, device=device),
@@ -52,9 +55,9 @@ def test_chunked_prefill_matches_canonical_cache_and_gate(window):
         session.register_scratch(arena)
         scratch = AttentionScratch.allocate(config, capacity, device)
         attention = PreparedAttention(0, weights, config, source, scratch, metadata, pool,
-            mode='prefill', session=session, name='prefill', workspace=arena)
+            mode='prefill', session=session, name='prefill', workspace=arena, cache_metadata=cache_metadata)
         session.tune()
-        compiled = compile_forward(lambda: attention(source))
+        compiled = compile_forward(lambda: (cache_metadata(), attention(source)))
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -94,7 +97,7 @@ def test_chunked_prefill_matches_canonical_cache_and_gate(window):
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocations
             if count:
-                # BF16 attention rounding: measured max abs 0.001953125, relative L2 0.00312.
+                # BF16 attention rounding; measured max abs 0.00195, relative L2 0.0031.
                 torch.testing.assert_close(scratch.output[:count], expected, atol=.002, rtol=.004)
             for kind, produced in [('key', scratch.key), ('value', scratch.value)]:
                 cache = pool.cache(0, kind).flatten(0, 1)
