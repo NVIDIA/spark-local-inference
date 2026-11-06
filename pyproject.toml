@@ -61,6 +61,7 @@ include = ["ignition*"]
 "ignition.recipes.qwen38" = ["assets/*"]
 "ignition.recipes.step5" = ["assets/*"]
 "ignition.recipes.muse_spark" = ["assets/*"]
+"ignition.recipes.inkling" = ["assets/*"]
 "ignition.recipes.minimax_m3" = ["assets/*"]
 
 [tool.pytest.ini_options]

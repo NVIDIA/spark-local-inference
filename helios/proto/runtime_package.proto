@@ -341,6 +341,7 @@ enum ToolParserKind {
   MINIMAX_XML = 5;
   GEMMA_CALL = 6;
   ATEM = 7;
+  TML_JSON = 8;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
@@ -349,6 +350,7 @@ enum ReasoningParserKind {
   MM_THINK = 3;
   CHANNEL_THOUGHT = 4;
   RECIPIENT_HEADERS = 5;
+  CONTENT_HEADERS = 6;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;

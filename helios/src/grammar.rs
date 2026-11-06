@@ -22,6 +22,7 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 
 /// Assistant recipient framing and the registered tool recipient names.
 pub struct RecipientEnvelope {
+    pub syntax: crate::model::contract::ToolParserKind,
     pub start: crate::output::tagged::OutputStart,
     pub tools: Vec<String>,
 }
@@ -233,7 +234,11 @@ impl GrammarCompiler {
             return self.compile(grammar);
         };
         if let Some(recipient) = &envelope.recipient {
-            return self.compile_recipient(grammar, recipient);
+            return if recipient.syntax == crate::model::contract::ToolParserKind::TmlJson {
+                self.compile_content_headers(grammar, recipient)
+            } else {
+                self.compile_recipient(grammar, recipient)
+            };
         }
         if envelope.reasoning_end.is_none()
             && envelope.tool.is_none()
@@ -350,6 +355,42 @@ impl GrammarCompiler {
             }
         }
         grammar.grammars[0].name = Some("answer".into());
+        grammar.grammars.insert(0, GrammarWithLexer::from_lark(rules));
+        self.compile(grammar)
+    }
+
+    fn compile_content_headers(&self, mut grammar: TopLevelGrammar, envelope: &RecipientEnvelope) -> Result<RequestGrammar> {
+        use crate::output::tagged::OutputStart;
+        let restart = self.marker("<|message_model|>");
+        let end = self.marker("<|end_message|>");
+        let mut rules = self.region("thinking_body", "<|end_message|>");
+        rules.push_str(&format!("thinking: {} thinking_body {restart}\nanswer: {} @answer {end}\n",
+            self.marker("<|content_thinking|>"), self.marker("<|content_text|>")));
+        grammar.grammars[0].name = Some("answer".into());
+        let mut tools = vec![];
+        for (index, name) in envelope.tools.iter().enumerate() {
+            let mut payload = TopLevelGrammar::from_json_schema(serde_json::json!({
+                "type":"object", "properties":{"name":{"const":name},"args":{"type":"object"}},
+                "required":["name","args"], "additionalProperties":false,
+            })).grammars.remove(0);
+            payload.name = Some(format!("payload_{index}"));
+            grammar.grammars.push(payload);
+            rules.push_str(&format!("tool_{index}: {} {} @payload_{index} {end}\n",
+                self.marker(name), self.marker("<|content_invoke_tool_json|>")));
+            tools.push(format!("tool_{index}"));
+        }
+        let ending = if tools.is_empty() { "answer" } else {
+            rules.push_str(&format!("tool: {}\ntools: tool ({restart} thinking* tool)* ({restart} thinking* answer)?\n", tools.join(" | ")));
+            "(answer | tools)"
+        };
+        rules.push_str(&format!("tail: thinking* {ending}\n"));
+        match envelope.start {
+            OutputStart::RecipientHeader => rules.push_str("start: tail\n"),
+            OutputStart::RecipientFrame => rules.push_str(&format!("start: {restart} tail\n")),
+            OutputStart::Reasoning => rules.push_str(&format!("start: thinking_body {restart} tail\n")),
+            OutputStart::Content => rules.push_str(&format!("start: @answer {end}\n")),
+            OutputStart::ToolBody => return Err("structured output cannot continue a TML tool body".into()),
+        }
         grammar.grammars.insert(0, GrammarWithLexer::from_lark(rules));
         self.compile(grammar)
     }
@@ -1751,7 +1792,7 @@ mod recipient_tests {
         let controls=["<|start|>","<|message|>","<|eom|>","<|eot|>"].map(|s|(tokenizer.token_to_id(s).unwrap(),s.to_owned()));
         let compiler=GrammarCompiler::new(&tokenizer,tokenizer.get_vocab_size(true),&[200001,200008],&controls).unwrap();
         let envelope=|start,tools:Vec<String>| OutputEnvelope {
-            recipient:Some(RecipientEnvelope{start,tools}),reasoning_end:None,tool:None,function:None,
+            recipient:Some(RecipientEnvelope{syntax:crate::model::contract::ToolParserKind::Atem,start,tools}),reasoning_end:None,tool:None,function:None,
             tool_ends_reasoning:false,tool_body_start:false,response:None,
         };
         let answer=r#"{"ok":true}"#;

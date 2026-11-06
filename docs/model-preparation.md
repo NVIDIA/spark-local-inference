@@ -58,6 +58,7 @@ Flare loads the package files without Python. Helios is a Rust library;
 
 Recipes default to FP8 E4M3 KV storage, including learned draft-model caches. Qwen Flash retains BF16 selector keys;
 GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
+Inkling retains BF16 KV pages and local histories.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
 scales where required, and memory planning includes each cache's declared page
@@ -1011,6 +1012,40 @@ weight budget for this encoding; loading reports its actual allocation.
 .venv/bin/ignition export minimax-m3-1-flash --gpus 0-3
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
+```
+
+## Inkling-Small NVFP4
+
+The `inkling-small-nvfp4` alias selects
+[`thinkingmachines/Inkling-Small-NVFP4`](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4)
+at revision `b6a99534467840620d411e4cd4ad5819b2610d9c`. It targets one
+GB300 DGX Station (SM103). Defaults are a 262144-token context, concurrency four,
+and 4096-token prefill chunks. The prepared context is capped below the
+checkpoint's 1048576-token limit. Image, audio, video and MTP are not prepared;
+only `model.llm` weights are loaded from the indexed checkpoint.
+
+Quantization follows `hf_quant_config.json`: excluded projections retain BF16;
+routed NVFP4 experts retain their packed weights, block/global scales and
+calibrated activations. Router biases/scales, logits and normalization stay FP32,
+as do residual-convolution history and arithmetic.
+
+Continuation rows preserve all 35 local 512-token BF16 KV rings, seven global
+paged histories, four convolution histories per layer, partial pages, consumed
+cursor and resume hidden state. Each continuation row occupies 82,837,504 bytes
+and each 128-token global KV page occupies 3,670,016 bytes.
+
+Sampling follows the publisher
+[guidance](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/skills/inkling/SKILL.md):
+temperature 1.0, top-p 1.0, and top-k disabled.
+
+Ignition applies `ignition/recipes/inkling/assets/chat_template.patch.json`
+to the downloaded checkpoint template. `<|content_thinking|>` messages route to
+reasoning, `<|content_invoke_tool_json|>` messages become JSON tool calls, and
+`<|content_model_end_sampling|>` ends generation.
+
+```sh
+.venv/bin/ignition export inkling-small-nvfp4 --gpus 0 --prompt-logprobs
+flare/target/release/flare run CACHE_ENTRY --gpus 0
 ```
 
 ## Muse Spark Open

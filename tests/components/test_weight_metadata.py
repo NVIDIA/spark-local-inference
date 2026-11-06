@@ -185,7 +185,7 @@ def test_compressed_expert_records_are_numeric_but_program_storage_is_opaque(mon
     assert_numeric(numeric, expected, opaque=(opaque,))
 
 
-@pytest.mark.parametrize("kind", ["trtllm", "cute"])
+@pytest.mark.parametrize("kind", ["trtllm", "cute", "cute_nvfp4"])
 def test_sm103_expert_storage_uses_the_same_numeric_contract(monkeypatch, kind):
     from ignition.components import moe, moe_sm103
 
@@ -195,11 +195,17 @@ def test_sm103_expert_storage_uses_the_same_numeric_contract(monkeypatch, kind):
     one = torch.ones(2)
     if kind == "trtllm":
         experts = moe_sm103.TrtllmNvfp4Experts(w13, s13, w2, s2, one, one, one, one, one, one, one)
-    else:
+    elif kind == "cute":
         experts = moe_sm103.CuteW4A16Experts(w13, s13, one, w2, s2, one, (s13, s2))
+    else:
+        experts = moe_sm103.CuteNvfp4Experts(
+            w13=w13, w13_scale=s13, w13_alpha=one, w2=w2, w2_scale=s2, w2_alpha=one,
+            scale_storage=(s13, s2), input_global_scale=torch.ones(1),
+            intermediate_global_scale=torch.full((1,), 2.))
     source = torch.zeros((1, 16), dtype=torch.bfloat16)
+    output = torch.empty((1, 1, 16), dtype=torch.bfloat16) if kind == "cute_nvfp4" else torch.empty_like(source)
     with NumericStorage() as numeric:
         operation = moe.PreparedRoutedExperts(source, experts, torch.zeros((1, 1), dtype=torch.int32),
-            torch.ones((1, 1)), torch.empty_like(source), session=None, name="experts")
+            torch.ones((1, 1)), output, session=None, name="experts")
     assert isinstance(operation, moe_sm103.Sm103RoutedExperts)
     assert_numeric(numeric, (value for value in vars(experts).values() if isinstance(value, torch.Tensor)))
