@@ -345,3 +345,30 @@ def test_joint_workspace_is_provisioned_only_for_runtime_selection(monkeypatch, 
     assert calls == [dict(exchange_group=group, device=device, single_channel=True,
                          max_size=32 * 2560 * 2, eager_buffer_bytes=32 * 2560 * 2,
                          ipc=ipc, joint=mode == "runtime")]
+
+
+@pytest.mark.parametrize("configured,widened", [(20_000_000, 600_000_000), (900_000_000, 900_000_000)])
+def test_compiled_warmup_widens_the_roce_wait_across_hosts_and_restores_it(monkeypatch, configured, widened):
+    from ignition.preparation.collectives import warmup_wait
+
+    runtime = SimpleNamespace(spin_limit=configured)
+    with warmup_wait(runtime, SimpleNamespace(spans_hosts=True)):
+        assert runtime.spin_limit == widened
+    assert runtime.spin_limit == configured
+    with pytest.raises(RuntimeError, match="warmup"):
+        with warmup_wait(runtime, SimpleNamespace(spans_hosts=True)):
+            raise RuntimeError("warmup failed")
+    assert runtime.spin_limit == configured
+
+
+def test_compiled_warmup_leaves_same_host_and_pcie_waits_alone():
+    from ignition.preparation.collectives import warmup_wait
+
+    runtime = SimpleNamespace(spin_limit=20_000_000)
+    with warmup_wait(runtime, SimpleNamespace(spans_hosts=False)):
+        assert runtime.spin_limit == 20_000_000
+    pcie = SimpleNamespace()
+    with warmup_wait(pcie, SimpleNamespace(spans_hosts=True)):
+        assert not hasattr(pcie, "spin_limit")
+    with warmup_wait(None, SimpleNamespace(spans_hosts=True)), warmup_wait(runtime, None):
+        assert runtime.spin_limit == 20_000_000
