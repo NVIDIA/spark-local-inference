@@ -13,10 +13,10 @@ from ignition.preparation.frontend import annotated_template_asset, prepare_fron
 
 
 FRONTEND = c.frontend(tools=p.TML_JSON, assistant_marker="<|message_model|>",
-    message_end_markers=["<|end_message|>", "<|content_model_end_sampling|>"], prefix_boundary=None)
+    message_end_markers=["<|end_message|>", "<|content_model_end_sampling|>"], prefix_boundary=None,
+    rejected_tokens=[200005, 200020, 200023, 200053, 200054])
 FRONTEND["reasoning"] = dict(kind=p.CONTENT_HEADERS, open="<|content_thinking|>",
     close="<|end_message|>", wrapping_newlines=0, terminal_markers=[])
-FRONTEND["rejected_tokens"] = [200005, 200020, 200023, 200053, 200054]
 
 
 def prepare_frontend(snapshot, *, eos_token_ids):

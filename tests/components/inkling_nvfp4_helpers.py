@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Raw Inkling NVFP4 fixtures and an independent quantized arithmetic oracle."""
+"""NVFP4 reference arithmetic for Inkling's unweighted routed-expert outputs."""
 
 import torch
 import triton
 import triton.language as tl
+
+from ignition.reference.qwen38_quant import decode_nvfp4, round_e2m1
 
 
 @triton.jit
@@ -18,7 +20,6 @@ def _reciprocal_approximate_kernel(source, output, count: tl.constexpr, BLOCK: t
 
 
 def _reciprocal_approximate(value):
-    """The native quantizer's CUDA reciprocal primitive, independent of its kernels."""
     value = value.contiguous()
     output = torch.empty_like(value)
     _reciprocal_approximate_kernel[(triton.cdiv(value.numel(), 256),)](value, output, value.numel(), 256)
@@ -41,14 +42,6 @@ def _exp2_approximate(value):
     return output
 
 
-def unpack_weight(values, scales):
-    """Decode low-nibble-first E2M1 and unswizzled checkpoint E4M3 block scales."""
-    magnitudes = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.], device=values.device)
-    codes = torch.stack((values & 15, values >> 4), -1).flatten(-2).long()
-    signed = magnitudes[codes & 7] * torch.where(codes < 8, 1., -1.)
-    return signed * scales.float().repeat_interleave(16, -1)
-
-
 def quantize_activation(value, amax, *, quant_scale_math="b12x"):
     """Return E2M1 values times E4M3 block scales, and separate FP32 calibration."""
     value = value.float()
@@ -69,33 +62,24 @@ def quantize_activation(value, amax, *, quant_scale_math="b12x"):
     else:
         raise ValueError(f"unknown NVFP4 quantizer arithmetic: {quant_scale_math}")
     inverse = torch.where(scales != 0, inverse, 0.)
-    normalized = blocks * inverse
-    magnitude = normalized.abs()
-    code = ((magnitude > .25).int() + (magnitude >= .75).int() + (magnitude > 1.25).int()
-            + (magnitude >= 1.75).int() + (magnitude > 2.5).int() + (magnitude >= 3.5).int()
-            + (magnitude > 5.).int())
-    levels = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.], device=value.device)
-    return (levels[code] * normalized.sign() * scales).reshape_as(value), encode
+    return (round_e2m1(blocks * inverse) * scales).reshape_as(value), encode
 
 
-def nvfp4_routes(source, ids, tensors, prefix, *, intermediate_range=None,
-                 quant_scale_math="b12x"):
+def nvfp4_routes(source, ids, tensors, prefix, *, quant_scale_math="b12x"):
     """Unweighted routes: FP32 FC1/SwiGLU -> BF16 -> NVFP4 -> FP32 FC2 -> BF16."""
     first = prefix + ".w13_weight"
     second = prefix + ".w2_weight"
     tensors = {name: value.to(source.device) for name, value in tensors.items() if name.startswith(prefix + ".")}
-    intermediate = tensors[first].shape[1] // 2
-    begin, end = (0, intermediate) if intermediate_range is None else intermediate_range
     source_quantized, input_scale = quantize_activation(
         source, tensors[first + ".input_amax"], quant_scale_math=quant_scale_math)
     result = torch.zeros((*ids.shape, source.shape[-1]), dtype=torch.bfloat16, device=source.device)
+    one = torch.ones((), device=source.device)
     for expert in range(tensors[first].shape[0]):
         tokens, routes = torch.where(ids == expert)
         if tokens.numel() == 0:
             continue
-        rows = slice(2 * begin, 2 * end)
         # Scaled FP4 MMA applies the outer multiplier after the dot product.
-        up_gate = unpack_weight(tensors[first][expert, rows], tensors[first + ".scale"][expert, rows])
+        up_gate = decode_nvfp4(tensors[first][expert], tensors[first + ".scale"][expert], one)
         projected = (source_quantized[tokens] @ up_gate.T) * (tensors[first + ".scale2"][expert] / input_scale)
         gate, up = projected[:, ::2], projected[:, 1::2]
         if quant_scale_math == "flashinfer":
@@ -107,8 +91,7 @@ def nvfp4_routes(source, ids, tensors, prefix, *, intermediate_range=None,
             activated = (torch.nn.functional.silu(gate) * up).bfloat16()
         activated, intermediate_scale = quantize_activation(
             activated, tensors[second + ".input_amax"], quant_scale_math=quant_scale_math)
-        down = unpack_weight(tensors[second][expert, :, begin // 2:end // 2],
-                             tensors[second + ".scale"][expert, :, begin // 16:end // 16])
+        down = decode_nvfp4(tensors[second][expert], tensors[second + ".scale"][expert], one)
         result[tokens, routes] = ((activated @ down.T)
             * (tensors[second + ".scale2"][expert] / intermediate_scale)).bfloat16()
     return result

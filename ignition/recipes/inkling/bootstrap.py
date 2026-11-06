@@ -16,21 +16,18 @@ from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIEL
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
+from ignition.components.paged_resume import PreparedResume
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.prompt_logprobs import PreparedScoredPrefill, PromptScoring, prefill_modes
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
+from ignition.components.sm103 import is_sm103
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.collectives import (
-    CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime,
-    create_dma_all_reduce_runtime, create_roce_runtime,
-)
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
-from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
@@ -38,7 +35,7 @@ from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
 from .contract import prepare as prepare_contract
-from .decoder import PreparedDecoder, PreparedResume, Scratch
+from .decoder import PreparedDecoder, Scratch
 from .frontend import prepare_frontend, runtime_assets
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
@@ -54,9 +51,7 @@ class PreparationConfig:
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
-    devices: tuple[int, ...] = (0,)
-    hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
+    device: int = 0
     context: int = 262144
     prefill_chunk_size: int = 4096
     max_active: int = 4
@@ -68,13 +63,6 @@ class PreparationConfig:
     stream_overlap: bool = True
 
     def __post_init__(self):
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2)
-                or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
-                or len(set(zip(self.hosts or ("",) * len(self.devices), self.devices))) != len(self.devices)
-                or any(type(device) is not int or device < 0 for device in self.devices)):
-            raise ValueError("Inkling-Small NVFP4 preparation requires one or two distinct host/device placements")
-        if self.roce_ring and (self.hosts is None or len(set(self.hosts)) < 2):
-            raise ValueError("RoCE ring requires ranks on separate hosts")
         request_capacity(self.max_active)
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
             raise ValueError("Inkling context must be 128-aligned in [128,262144]")
@@ -86,18 +74,15 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage):
+def prepare(snapshot, config, *, progress=None, package_storage):
     from .recipe import RECIPE
 
     snapshot = Path(snapshot).resolve()
-    shard = TensorParallelShard(rank, len(config.devices))
-    if (shard.world_size > 1) != (group is not None):
-        raise ValueError("an Inkling rank group exists exactly when more than one rank prepares")
-    device = torch.device("cuda", config.devices[rank])
+    shard = TensorParallelShard(0, 1)
+    device = torch.device("cuda", config.device)
     torch.cuda.set_device(device)
-    if torch.cuda.get_device_capability(device) not in ((10, 3), (12, 0), (12, 1)):
-        raise ValueError("Inkling NVFP4 preparation requires SM103, SM120, or SM121: "
-                         "the A4 expert kernels must expose unweighted per-route outputs")
+    if not is_sm103(device):
+        raise ValueError("Inkling preparation requires an SM103 GPU")
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
         headers = [s.header_sha256 for s in manifest.shards]
@@ -113,7 +98,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     slots, blocks = request_capacity(config.max_active), config.context // PAGE_TOKENS
     tokens = max(config.prefill_chunk_size, slots)
     state_rows, pages = slots + snapshots, (config.prefill_chunk_size + PAGE_TOKENS - 1) // PAGE_TOKENS + 2 * slots
-    total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
+    total_memory = torch.cuda.mem_get_info(device)[1]
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.allocate(weights.config, shard, state_rows + 1, pages, device,
             storage=package_storage, maximum_pages=total_memory // page_bytes(weights.config, shard),
@@ -126,24 +111,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + 1), device=device)
-        coordinator = CollectivePreparation(group) if group is not None else None
-        collective = prefill_collective = vocabulary_collective = embedding_collective = None
-        routed_width = weights.config.text["num_experts_per_tok"] * weights.config.hidden
-        if coordinator is not None and coordinator.spans_hosts:
-            gather_bytes = max(slots * weights.config.vocabulary_partition(shard)[2] * 2,
-                               tokens * (weights.config.hidden // shard.world_size) * 2)
-            collective = prefill_collective = vocabulary_collective = embedding_collective = create_roce_runtime(
-                group, device, max_tokens=slots, pipe_tokens=tokens, hidden_size=routed_width,
-                gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage)
-        elif group is not None:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
-                max_tokens=slots, hidden_size=routed_width, ipc=package_storage.peer_storage)
-            prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
-                hidden_size=routed_width, ipc=package_storage.peer_storage)
-            vocabulary_collective = create_all_gather_runtime(group, device, max_rows=slots,
-                columns=weights.config.vocabulary_partition(shard)[2] * shard.world_size, ipc=package_storage.peer_storage)
-            embedding_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
-                columns=weights.config.hidden, ipc=package_storage.peer_storage)
+        coordinator = None
         identity = hashlib.sha256(json.dumps(dict(config=weights.config.text, quantization=weights.config.quantization,
             headers=headers,
             kv_dtype="bfloat16", world_size=shard.world_size, contract="inkling.text.v1"), sort_keys=True).encode()).hexdigest()
@@ -166,8 +134,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             state_pool=pool.backing, memory_capacity=pool.memory_capacity, request_pending_token=requests.pending_token,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame, submission_sequence=sequence,
             **completion.buffers())
-    scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+    scoring = PromptScoring.allocate(config, device, buffers, frame=frame)
     forwards, signatures, metadata = {}, {}, {}
     prefills, batches = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     with phase(progress, "Construct graph catalog"):
@@ -186,32 +153,31 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 private = private_buffers.cursor()
                 m = metadata[name] = Metadata.allocate(capacity, rows, blocks, device, buffers=private)
                 scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
-                decoder = PreparedDecoder(weights, scratch, m, pool, mode=mode,
-                    runtime=prefill_collective if mode == "prefill" else collective,
-                    embedding_runtime=embedding_collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name, workspace=arena,
+                decoder = PreparedDecoder(weights, scratch, m, pool, mode=mode, runtime=None,
+                    embedding_runtime=None, vocabulary_runtime=None, coordinator=coordinator,
+                    session=session, name=name, workspace=arena,
                     buffers=private, scoring=scoring if kind == "scored_prefill" else None)
                 batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool, buffers=private)
                 forward = PreparedGeneration(decoder, batch, completion, frame, sequence,
-                    runtime=collective, coordinator=coordinator, session=session,
+                    runtime=None, coordinator=coordinator, session=session,
                     name=name + ".generation", workspace=arena, buffers=private)
                 add(name, forward, kind, rows, capacity if mode == "prefill" else 1, forward_inputs)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for capacity in reversed(batches):
             name = f"resume{capacity}"
             forward = PreparedResume(weights, requests, pool, inputs, completion, frame, sequence, rows=capacity,
-                runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
+                runtime=None, vocabulary_runtime=None, coordinator=coordinator,
                 session=session, name=name, buffers=private_buffers.cursor())
             add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"))
             for mode in ("init", "restore", "snapshot"):
                 name = f"{mode}{capacity}"
                 forward = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
-                    runtime=collective, coordinator=coordinator, session=session, name=name, capacity=capacity,
+                    runtime=None, coordinator=coordinator, session=session, name=name, capacity=capacity,
                     admission_buffers=admission, draft_state=False, buffers=private_buffers.cursor())
                 fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                 add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()))
     with phase(progress, "Prepare and tune kernels") as stage, transient:
-        tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+        tuning = session.tune(show_progress=progress is not None, console=stage.console)
     stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
@@ -222,7 +188,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
     try:
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
-            pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
+            pool=graph_pool, collective=None, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=package_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume"))
@@ -239,7 +205,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         page_tokens=PAGE_TOKENS, frontend=frontend, sampling_defaults=RECIPE.sampling_defaults.as_dict(), assets=assets,
         model_contract=prepare_contract(signatures, buffers, pool, vocabulary=vocabulary))
     free, total = torch.cuda.mem_get_info(device)
-    memory = dict(rank=rank, world_size=shard.world_size, device=config.devices[rank], weights_bytes=weights.allocated_bytes,
+    memory = dict(rank=0, world_size=1, device=config.device, weights_bytes=weights.allocated_bytes,
         mapped_host_bytes=0, offloaded_bytes=0, continuation_bytes=pool.backing.nbytes, state_rows=state_rows,
         preparation_state_rows=int(pool.memory_capacity[0].item()),
         preparation_state_bytes=int(pool.memory_capacity[0].item()) * layout.row_bytes,
@@ -250,8 +216,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         total_device_bytes=total, headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    channels = tuple(dict.fromkeys(channel for channel in
-        (collective, prefill_collective, vocabulary_collective, embedding_collective) if channel is not None))
     disposable = [prefill_storage, decode_storage, arena.tensor, metadata, graph_buffers.chunks, private_buffers.chunks]
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):
@@ -263,10 +227,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         if hasattr(forward, "decoder"):
             disposable.append(forward.decoder.scratch_tensors())
     return PreparedModel(rebuild_weights=declare_weights(weights, components=("embedding", "embedding_norm", "norm", "head")),
-        device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures, max_active=config.max_active,
+        device=config.device, graphs=graphs, buffers=buffers, signatures=signatures, max_active=config.max_active,
         session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *storage_ranges(disposable), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage,
-            decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, *channels,
+            decode_storage, metadata, compiled, stream, graph_pool, session, coordinator,
             scratch_pool, graph_buffers, private_buffers),
-        close_resources=tuple(c for c in (*channels, scoring) if c is not None))
+        close_resources=(() if scoring is None else (scoring,)))

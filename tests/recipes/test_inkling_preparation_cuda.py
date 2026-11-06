@@ -3,7 +3,6 @@
 
 """Single-rank preparation and replay of the complete Inkling graph catalog."""
 
-import json
 import os
 from pathlib import Path
 
@@ -16,45 +15,32 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @torch.no_grad()
 def test_single_rank_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
-    from safetensors.torch import save_file
     from ignition.components.parallel import TensorParallelShard
     from ignition.components.sampling import AdmissionBuffers, DeviceRequestState, RequestAdmission
     from ignition.preparation.package_storage import PackageStorage
-    from ignition.recipes.inkling.bootstrap import PreparationConfig, prepare_rank
+    from ignition.recipes.inkling.bootstrap import PreparationConfig, prepare
     from ignition.recipes.inkling.config import ModelConfig
     from ignition.recipes.inkling.pool import ContinuationPool, continuation_layout
     from .inkling_helpers import checkpoint
 
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("Inkling preparation requires an SM103 GPU")
     snapshot = Path(os.environ.get("FLARE_INKLING_SNAPSHOT", ""))
     if not (snapshot / "tokenizer.json").is_file():
         pytest.skip("requires pinned Inkling frontend assets")
-    _, tensors = checkpoint(tmp_path)
-    raw = json.loads((tmp_path / "config.json").read_text())
-    # Keep the publisher's complete frontend and special-token IDs while reducing
-    # layer geometry; this exercises frontend/contract preparation without mocks.
+    # Keep the publisher's frontend and special-token IDs while reducing layer geometry.
     publisher = ModelConfig.load(snapshot)
-    raw["text_config"].update(vocab_size=publisher.text["vocab_size"],
-                              unpadded_vocab_size=publisher.vocabulary)
-    for name in ("embed", "unembed"):
-        tensors[f"model.llm.{name}.weight"] = (
-            torch.randn(publisher.text["vocab_size"], 256) * .1).bfloat16()
-    (tmp_path / "config.json").write_text(json.dumps(raw))
-    save_file(tensors, tmp_path / "model.safetensors")
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(dict(
-        metadata={"total_size": sum(t.nbytes for t in tensors.values())},
-        weight_map={name: "model.safetensors" for name in tensors})))
+    checkpoint(tmp_path, vocabulary=(publisher.text["vocab_size"], publisher.vocabulary))
     for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
         (tmp_path / name).symlink_to(snapshot / name)
-    del tensors
     config = ModelConfig.load(tmp_path)
-    preparation = PreparationConfig(devices=(0,), context=256, prefill_chunk_size=128, max_active=1,
+    preparation = PreparationConfig(device=0, context=256, prefill_chunk_size=128, max_active=1,
         snapshot_budget_bytes=continuation_layout(config, TensorParallelShard(0, 1)).row_bytes,
         compile_workers=1, autotune_effort="off", headroom_bytes=1 << 30, prompt_logprobs=True)
     with PackageStorage(device=0) as storage:
-        with prepare_rank(tmp_path, preparation, rank=0, group=None, package_storage=storage) as model:
+        with prepare(tmp_path, preparation, package_storage=storage) as model:
             assert {signature.kind for signature in model.signatures.values()} == {
                 "init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume"}
-            assert model.memory_report["world_size"] == 1
             assert model.memory_report["compiled_decoder"]
             assert model.server_config["frontend"]["eos_token_ids"] == [200006]
             pool = next(resource for resource in model.resources if isinstance(resource, ContinuationPool))
@@ -129,11 +115,6 @@ def test_single_rank_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
                               for kind in ("key", "value")})
                 return tokens, state
 
-            def assert_state(actual, expected):
-                assert actual.keys() == expected.keys()
-                for name in expected:
-                    torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0, msg=name)
-
             admit(7)
             prefill()
             hidden = pool.last_hidden[1].clone()
@@ -148,7 +129,7 @@ def test_single_rank_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
             assert torch.equal(pool.last_hidden[1], hidden)
             tokens, state = continuation()
             assert tokens == expected_tokens
-            assert_state(state, expected_state)
+            torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
             assert torch.equal(pool.backing[2], snapshot_row)
 
             admit(9)
@@ -157,13 +138,14 @@ def test_single_rank_mixed_checkpoint_prepares_and_replays_catalog(tmp_path):
             prefill(scored=True)
             assert torch.equal(pool.last_hidden[1], hidden)
             scores = buffers["prompt_logprobs"][int(buffers["frame_index"].item())].cpu()
+            logprobs = scores[:, 1].contiguous().view(torch.float32)
             assert scores[:126, 0].tolist() == prompt[1:]
-            assert torch.isfinite(scores[:126, 1].contiguous().view(torch.float32)).all()
-            assert (scores[:126, 1].contiguous().view(torch.float32) <= 0).all()
+            assert torch.isfinite(logprobs[:126]).all()
+            assert (logprobs[:126] <= 0).all()
             assert ((scores[:126, 2] >= 1) & (scores[:126, 2] <= config.vocabulary)).all()
             assert (scores[126:, 0] == -1).all()
-            assert torch.isnan(scores[126:, 1].contiguous().view(torch.float32)).all()
+            assert torch.isnan(logprobs[126:]).all()
             tokens, state = continuation()
             assert tokens == expected_tokens
-            assert_state(state, expected_state)
+            torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
             assert torch.equal(pool.backing[2], snapshot_row)

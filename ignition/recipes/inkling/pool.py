@@ -44,10 +44,10 @@ def continuation_layout(config, shard):
                                ("value_conv", heads * geometry.value_dim),
                                ("attention_conv", config.hidden), ("mlp_conv", config.hidden)):
             regions.append((f"layer{layer}.{kind}", (channels, config.text["conv_kernel_size"] - 1), torch.float32))
-    regions.extend((("last_hidden", (config.text["hidden_size"],), torch.bfloat16),
+    regions.extend((("last_hidden", (config.hidden,), torch.bfloat16),
                     ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
-    # TMA stages divide the stride between circular histories in adjacent rows.
+    # Rows align to whole KV pages so window_pages can view rings across adjacent rows.
     alignment = math.lcm(256, *(math.prod(shape) * dtype.itemsize
         for name, shape, dtype in regions if name.startswith("layer") and dtype == KV_DTYPE))
     return StateLayout(layout.regions, (layout.row_bytes + alignment - 1) // alignment * alignment)

@@ -194,3 +194,12 @@
     MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
+
+[ ] Remove the SM120/SM121 b12x expert branch from InklingWeightLoader._nvfp4_experts.
+    Inkling preparation accepts only one SM103 GPU, so only the decoder tests in
+    tests/recipes/test_inkling_cuda.py reach that branch; restrict them to SM103
+    when the branch is removed.
+
+[ ] Support Inkling-Small NVFP4 on two GPUs (two local GPUs or two DGX Sparks over
+    RoCE) and on SM120/SM121. Close when a full-checkpoint export on those
+    platforms serves tests/server/test_inkling.py through flare run.

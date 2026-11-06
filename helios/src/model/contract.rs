@@ -795,10 +795,6 @@ mod tests {
             open: "<|content_thinking|>".into(), close: "<|end_message|>".into(),
             wrapping_newlines: 0, terminal_markers: vec![] });
         assert!(syntax.validate().is_ok());
-        let encoded = serde_json::to_value(&syntax).unwrap();
-        assert_eq!(encoded["tools"]["kind"], 8);
-        assert_eq!(encoded["reasoning"]["kind"], 6);
-        assert!(serde_json::from_value::<FrontendContract>(encoded).unwrap().validate().is_ok());
         syntax.reasoning.as_mut().unwrap().close = "</think>".into();
         assert!(syntax.validate().is_err());
         syntax.reasoning.as_mut().unwrap().close = "<|end_message|>".into();

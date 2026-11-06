@@ -12,7 +12,7 @@ import torch
 from ignition.components.paged_batch import Metadata
 from ignition.components.relative_paged_attention import PreparedRelativePagedAttention
 from ignition.components.residual_short_conv import PreparedResidualShortConvolution
-from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.compilation import compile_forward
 from ignition.preparation.tuning import RecordedPreparationSession
 
 
@@ -47,17 +47,14 @@ def test_relative_attention_canonical_paged_capture(window, counts, starts, capa
     cu = torch.tensor([0, *torch.tensor(counts).cumsum(0).tolist()], dtype=torch.int32, device=device)
     with RecordedPreparationSession(device=device, checkpoint="relative-paged-test", workload_schema="relative-paged",
                                     numerical_policy="default", compile_workers=1) as session:
-        arena = ScratchArena(device)
-        session.register_scratch(arena)
         operation = PreparedRelativePagedAttention(query, key, value, pages, lengths, cu, relative, output,
-            window=window, softmax_scale=1 / dim, session=session, workspace=arena, name="attention")
+            window=window, softmax_scale=1 / dim, session=session, name="attention")
         saved = tuple(t.clone() for t in (pages, lengths, cu))
         for tensor in (pages, lengths, cu):
             tensor.fill_(1 << 29)
         session.tune()
         for tensor, original in zip((pages, lengths, cu), saved):
             tensor.copy_(original)
-        from ignition.preparation.compilation import compile_forward
         run = compile_forward(operation)
         run()
         graph = torch.cuda.CUDAGraph()
@@ -123,17 +120,14 @@ def test_residual_convolution_canonical_chunking_and_state(capacity, channels):
     m = Metadata.allocate(capacity, rows, 1, device)
     with RecordedPreparationSession(device=device, checkpoint="residual-short-conv-test", workload_schema="residual-conv",
                                     numerical_policy="default", compile_workers=1) as session:
-        arena = ScratchArena(device)
-        session.register_scratch(arena)
         operation = PreparedResidualShortConvolution(source, weights, history, m, output,
-            session=session, workspace=arena, name="convolution")
+            session=session, name="convolution")
         for tensor in (m.state_rows, m.starts, m.lengths, m.query_start_loc):
             tensor.fill_(1 << 29)
         session.tune()
         m.state_rows.zero_()
         m.lengths.zero_()
         m.query_start_loc.zero_()
-        from ignition.preparation.compilation import compile_forward
         run = compile_forward(operation)
         run()
         graph = torch.cuda.CUDAGraph()
@@ -188,53 +182,3 @@ def test_residual_convolution_canonical_chunking_and_state(capacity, channels):
         torch.testing.assert_close(history[1, :, 2], source[0].float(), atol=0, rtol=0)
         torch.testing.assert_close(history[2:], stale[2:], atol=0, rtol=0)
         graph.reset()
-
-
-@pytest.mark.parametrize("round_silu", [True, False])
-@torch.no_grad()
-def test_bf16_experts_silu_rounding_and_capture(round_silu):
-    from ignition.components.bf16_experts import PreparedBF16Experts
-    from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool
-
-    torch.manual_seed(837)
-    source = torch.randn((17, 128), device="cuda", dtype=torch.bfloat16)
-    gate_up = (torch.randn((4, 128, 128), device="cuda") * .05).bfloat16()
-    down = (torch.randn((4, 128, 64), device="cuda") * .05).bfloat16()
-    ids = torch.rand((17, 4), device="cuda").topk(2, dim=-1).indices.int()
-    weights = torch.rand((17, 2), device="cuda")
-    valid = torch.tensor([13], device="cuda", dtype=torch.int32)
-    output = torch.empty((17, 2, 128), device="cuda", dtype=torch.bfloat16)
-    operation = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid,
-        buffers=GraphBufferPool("cuda").cursor(), round_silu=round_silu)
-    expected = torch.zeros_like(output)
-    intermediate = torch.empty((13, 2, 64), dtype=torch.bfloat16, device="cuda")
-    for token in range(13):
-        for route in range(2):
-            expert = ids[token, route].item()
-            gate, up = torch.nn.functional.linear(source[token], gate_up[expert]).chunk(2)
-            # BF16 intermediate activation for existing users; Inkling's supported
-            # implementation computes SiLU and multiplication in FP32, rounding once.
-            activated = (torch.nn.functional.silu(gate) * up if round_silu else
-                         (torch.nn.functional.silu(gate.float()) * up.float()).bfloat16())
-            intermediate[token, route] = activated
-            expected[token, route] = torch.nn.functional.linear(activated, down[expert])
-    operation()
-    torch.testing.assert_close(operation.intermediate[:26], intermediate.flatten(0, 1), rtol=.008, atol=2e-5)
-    torch.testing.assert_close(output, expected, rtol=.008, atol=2e-4)
-    run = compile_forward(operation)
-    run()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    before = torch.cuda.memory_stats()["allocation.all.allocated"]
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-    torch.testing.assert_close(output, expected, rtol=.008, atol=2e-4)
-    assert torch.count_nonzero(output[13:]) == 0
-    valid.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(output) == 0
-    graph.reset()

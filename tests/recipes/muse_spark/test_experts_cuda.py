@@ -56,7 +56,8 @@ def test_route_finalizer_canonical_rounding(tokens, valid):
     torch.testing.assert_close(output, expected, rtol=.016, atol=.015625)
 
 
-def test_bf16_experts_raw_silu():
+@pytest.mark.parametrize("round_silu", [True, False])
+def test_bf16_experts_raw_silu(round_silu):
     from ignition.components.bf16_experts import PreparedBF16Experts
     from ignition.preparation.scratch import GraphBufferPool
 
@@ -70,15 +71,21 @@ def test_bf16_experts_raw_silu():
     valid = torch.tensor([13], device="cuda", dtype=torch.int32)
     output = torch.empty((17, 2, 128), device="cuda", dtype=torch.bfloat16)
     prepared = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid,
-                                  buffers=GraphBufferPool("cuda").cursor())
+                                  buffers=GraphBufferPool("cuda").cursor(), round_silu=round_silu)
     expected = torch.zeros_like(output)
+    intermediate = torch.empty((13, 2, 64), dtype=torch.bfloat16, device="cuda")
     for token in range(13):
         for route in range(2):
             expert = ids[token, route].item()
             gate, up = torch.nn.functional.linear(source[token], gate_up[expert]).chunk(2)
-            expected[token, route] = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, down[expert])
+            activated = (torch.nn.functional.silu(gate) * up if round_silu else
+                         (torch.nn.functional.silu(gate.float()) * up.float()).bfloat16())
+            intermediate[token, route] = activated
+            expected[token, route] = torch.nn.functional.linear(activated, down[expert])
     prepared()
-    torch.testing.assert_close(output, expected, rtol=.025, atol=.002)
+    tolerance = dict(rtol=.025, atol=.002) if round_silu else dict(rtol=.008, atol=2e-4)
+    torch.testing.assert_close(prepared.intermediate[:26], intermediate.flatten(0, 1), rtol=.008, atol=2e-5)
+    torch.testing.assert_close(output, expected, **tolerance)
     assert torch.count_nonzero(output[13:]) == 0
     from ignition.preparation.compilation import compile_forward
     run = compile_forward(prepared)
@@ -86,5 +93,14 @@ def test_bf16_experts_raw_silu():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
     graph.replay()
-    torch.testing.assert_close(output, expected, rtol=.025, atol=.002)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    torch.testing.assert_close(output, expected, **tolerance)
+    assert torch.count_nonzero(output[13:]) == 0
+    valid.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output) == 0
+    graph.reset()

@@ -46,8 +46,7 @@ def _relative_attention(Q, K, V, Pages, Lengths, Cu, Bias, Out,
         stop = tl.minimum(length, length - (end - begin) + (tile + 1) * BM)
         maximum = tl.full((BM,), -1.0e30, tl.float32)
         denominator = tl.full((BM,), 0, tl.float32)
-        # Two bounded scans preserve canonical BF16 softmax-probability rounding.
-        # A materialized [queries, context] score or probability tensor is unnecessary.
+        # Pass one finds each row's max and denominator; pass two rounds normalized probabilities to BF16 before the V product.
         for start in range(first, stop, BN):
             keys = start + columns
             page = tl.load(Pages + batch * PT + keys // PAGE, keys < length, 0)
@@ -148,7 +147,7 @@ class PreparedRelativePagedAttention:
     """Read BF16 pages and caller-projected relative logits without expanding KV."""
 
     def __init__(self, query, key_cache, value_cache, page_table, lengths, cu, relative_logits, output,
-                 *, window=-1, softmax_scale, session, workspace, name):
+                 *, window=-1, softmax_scale, session, name):
         self.arguments = query, key_cache, value_cache, page_table, lengths, cu, relative_logits, output
         q, k, v, pages, lengths, cu, bias, out = self.arguments
         if (q.ndim != 3 or min(q.shape) < 1 or q.shape[2] not in (32, 64, 128, 256)

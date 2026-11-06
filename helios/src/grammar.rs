@@ -234,7 +234,11 @@ impl GrammarCompiler {
             return self.compile(grammar);
         };
         if let Some(recipient) = &envelope.recipient {
-            return self.compile_recipient(grammar, recipient);
+            return if recipient.syntax == crate::model::contract::ToolParserKind::TmlJson {
+                self.compile_content_headers(grammar, recipient)
+            } else {
+                self.compile_recipient(grammar, recipient)
+            };
         }
         if envelope.reasoning_end.is_none()
             && envelope.tool.is_none()
@@ -308,9 +312,6 @@ impl GrammarCompiler {
     }
 
     fn compile_recipient(&self, mut grammar: TopLevelGrammar, envelope: &RecipientEnvelope) -> Result<RequestGrammar> {
-        if envelope.syntax == crate::model::contract::ToolParserKind::TmlJson {
-            return self.compile_content_headers(grammar, envelope);
-        }
         use crate::output::tagged::OutputStart;
         let mut rules = String::new();
         let marker = |text: &str| self.marker(text);

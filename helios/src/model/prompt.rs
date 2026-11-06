@@ -276,29 +276,23 @@ pub fn prepare_output(
     if !tools.is_empty() && syntax.tools.is_none() {
         return Err("tool parsing is not prepared".into());
     }
-    let mut control_tokens = if syntax
-        .tools
-        .as_ref()
-        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem | super::contract::ToolParserKind::TmlJson))
-    {
-        let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
-            vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
-        } else if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::TmlJson {
-            vec!["<|message_model|>", "<|content_text|>", "<|content_thinking|>",
-                "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>"]
-        } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
-        markers.into_iter()
-            .map(|marker| {
-                let ids = frontend.encode(marker, false)?;
-                if ids.len() != 1 {
-                    return Err("output envelope delimiters must each occupy one tokenizer token".into());
-                }
-                Ok((ids[0], marker.to_owned()))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        vec![]
+    let markers: &[&str] = match syntax.tools.as_ref().map(|tool| tool.kind) {
+        Some(super::contract::ToolParserKind::Xtml) => &["<|open|>", "<|close|>", "<|sep|>"],
+        Some(super::contract::ToolParserKind::Atem) => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
+        Some(super::contract::ToolParserKind::TmlJson) => &["<|message_model|>", "<|content_text|>", "<|content_thinking|>",
+            "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>"],
+        _ => &[],
     };
+    let mut control_tokens = markers
+        .iter()
+        .map(|&marker| {
+            let ids = frontend.encode(marker, false)?;
+            if ids.len() != 1 {
+                return Err("output envelope delimiters must each occupy one tokenizer token".into());
+            }
+            Ok((ids[0], marker.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
         let tokenizer = frontend.tokenizer();
         for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,

@@ -13,8 +13,8 @@ the same checkpoint storage runs through FlashInfer:
   checkpoint scale, quantizing separate routed rows when scales differ. FC2 inputs are quantized per
   expert in trtllm-gen's FC1 epilogue with each expert's FC2 input scale.
 * W4A16 NVFP4 experts use FlashInfer's CuTe-DSL NVFP4xBF16 grouped GEMMs.
-* Calibrated W4A4 experts requiring a BF16 SwiGLU boundary use CuTe-DSL
-  grouped GEMMs around that explicit intermediate and return raw BF16 routes.
+* NVFP4 experts with NVFP4 activations and a BF16 SwiGLU intermediate use
+  CuTe-DSL block-scaled grouped GEMMs and write unweighted per-route rows.
 
 Weights are re-laid out once, in place. Routing remains b12x's portable
 ``route_topk``. Native kernels allocate their graph-local intermediates from
@@ -139,7 +139,7 @@ class CuteW4A16Experts(Sm103Experts):
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class CuteNvfp4Experts(CuteW4A16Experts):
-    """Calibrated W4A4 experts with BF16 SwiGLU intermediates and raw route output."""
+    """NVFP4 x NVFP4 experts with a BF16 SwiGLU intermediate; ``*_alpha`` include the activation global scales."""
 
     input_global_scale: torch.Tensor
     intermediate_global_scale: torch.Tensor
@@ -262,7 +262,7 @@ def prepare_cute_w4a16_experts(w13, s13, w2, s2, w13_global, w2_global, *, swigl
 
 
 def prepare_cute_nvfp4_experts(w13, s13, w2, s2, scale_vectors) -> CuteNvfp4Experts:
-    """Preserve packed values and calibration while preparing BF16-intermediate W4A4."""
+    """Re-lay out packed NVFP4 experts for NVFP4-activation CuTe-DSL GEMMs, in place."""
     count, hidden, intermediate = _check_packed(w13, s13, w2, s2)
     if len(scale_vectors) != 4:
         raise ValueError("NVFP4 A4 experts require weight and activation global scales")
@@ -612,7 +612,7 @@ class _CuteW4A16State:
 
 
 class _CuteNvfp4State:
-    """Calibrated A4 GEMMs with BF16 activation and independently rounded route outputs."""
+    """CuTe-DSL NVFP4 GEMMs: FC1 to BF16 SwiGLU rows, requantized for FC2, written as unweighted per-route rows."""
 
     implementation = "cute_nvfp4_routes"
 
@@ -652,7 +652,6 @@ class _CuteNvfp4State:
             expert_tiles, limits, mapping, active_tiles, out=s["activated"],
             topk=q.top_k, c_dtype="bfloat16", quantize_output=False,
             mma_tiler_mn=fc1[0], cluster_shape_mn=fc1[1], raster_along_m=fc1[2], enable_pdl=True)
-        # This explicit BF16 tensor is the arithmetic boundary before the calibrated FC2 input.
         self.quantize(s["activated"], e.intermediate_global_scale,
                       s["intermediate"], s["intermediate_scales"],
                       16, False, True, False, False, True, 0)

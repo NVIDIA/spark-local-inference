@@ -98,12 +98,11 @@ def compile_convolution(payload, tactic, ordinal):
 
 @dataclass(frozen=True)
 class State:
-    query: Query
     tactic: tuple
     programs: dict
 
     def run(self, tensors):
-        x, _, _, states, _, _, cu, y = tensors
+        x, _, _, states, *_, y = tensors
         block, _ = self.tactic
         y.zero_()
         args = _arguments(tensors, block)
@@ -128,7 +127,7 @@ def _fake(source, weight, history, states, starts, lengths, cu, output, handle):
 class PreparedResidualShortConvolution:
     """Commit chronological raw FP32 history after all packed outputs are computed."""
 
-    def __init__(self, source, weight, history, metadata, output, *, session, workspace, name):
+    def __init__(self, source, weight, history, metadata, output, *, session, name):
         m = metadata
         self.arguments = source, weight, history, m.state_rows, m.starts, m.lengths, m.query_start_loc, output
         if (source.ndim != 2 or source.dtype != torch.bfloat16 or source.stride(-1) != 1
@@ -158,7 +157,7 @@ class PreparedResidualShortConvolution:
         def materialize(tactic):
             programs = compile_convolution(payload, tactic, source.device.index)
             load_programs(programs)
-            return attach_programs(State(q, tactic, programs), *programs.values())
+            return attach_programs(State(tactic, programs), *programs.values())
 
         self.plan = native_plan(contract=CONTRACT, query=q, device=source.device,
             scratch_bytes=lambda t: 0, materialize=materialize,

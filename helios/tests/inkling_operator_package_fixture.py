@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export relative attention and residual convolution for independent native replay."""
+"""Export relative attention and residual convolution for native replay."""
 
 import json
 from pathlib import Path
@@ -11,17 +11,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class OperatorForward:
-    def __init__(self, attention, convolution, result):
-        self.attention, self.convolution, self.result = attention, convolution, result
+    def __init__(self, attention, convolution, history, result):
+        self.attention, self.convolution, self.history, self.result = attention, convolution, history, result
 
     def __call__(self):
         attention = self.attention()
         convolution = self.convolution()
-        history = self.convolution.arguments[2]
         end = attention.numel() + convolution.numel()
         self.result[:attention.numel()].copy_(attention.flatten())
         self.result[attention.numel():end].copy_(convolution.flatten())
-        self.result[end:].copy_(history.flatten())
+        self.result[end:].copy_(self.history.flatten())
 
 
 def prepare(directory):
@@ -35,7 +34,6 @@ def prepare(directory):
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.package_file import combine
     from ignition.preparation.runtime_package import export_model
-    from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from fixed_package_fixture import allocation_reference
     from fixture_frontend import server_config
@@ -48,8 +46,6 @@ def prepare(directory):
         with RecordedPreparationSession(device=device, checkpoint="inkling-operator-export",
                 workload_schema="relative-attention-residual-convolution", numerical_policy="bf16-fp32-history",
                 compile_workers=1, benchmark_storage=storage) as session:
-            arena = ScratchArena(device)
-            session.register_scratch(arena)
             query = torch.randn((17, 2, 128), device=device, dtype=torch.bfloat16)
             key = torch.randn((2, 128, 1, 128), device=device, dtype=torch.bfloat16)
             value = torch.randn_like(key)
@@ -59,7 +55,7 @@ def prepare(directory):
             bias = (torch.randn((17, 2, 1024), device=device) * .2).bfloat16()
             attention_output = torch.empty_like(query)
             attention = PreparedRelativePagedAttention(query, key, value, pages, lengths, cu, bias, attention_output,
-                softmax_scale=1 / 128, session=session, workspace=arena, name="relative-attention")
+                softmax_scale=1 / 128, session=session, name="relative-attention")
             source = torch.randn((17, 67), device=device, dtype=torch.bfloat16)
             weight = torch.randn((67, 4), device=device) * .1
             history = torch.zeros((3, 67, 3), device=device)
@@ -70,9 +66,9 @@ def prepare(directory):
             metadata.query_start_loc.copy_(cu)
             convolution_output = torch.empty_like(source)
             convolution = PreparedResidualShortConvolution(source, weight, history, metadata, convolution_output,
-                session=session, workspace=arena, name="residual-convolution")
+                session=session, name="residual-convolution")
             result = torch.empty(query.numel() + source.numel() + history.numel(), device=device)
-            run = OperatorForward(attention, convolution, result)
+            run = OperatorForward(attention, convolution, history, result)
             session.tune(show_progress=False)
             signatures = {"decode": GraphSignature("decode", 1, 1)}
             stream = torch.cuda.Stream(device=device)

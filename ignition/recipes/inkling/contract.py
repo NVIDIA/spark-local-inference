@@ -12,9 +12,6 @@ from .pool import PAGE_TOKENS
 
 def prepare(signatures, buffers, pool, *, vocabulary):
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
-    for kind in ("decode", "speculative"):
-        if kind in inputs:
-            inputs[kind].pop("token_ids", None)
     continuation = c.state_view("state_pool", pool.layout.row_bytes)
     regions = [c.history_region(buffers, f"cache.{name}", tensor, p.PAGED_KEY_VALUE)
                for name, tensor in pool.pages.items()]

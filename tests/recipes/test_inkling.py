@@ -3,6 +3,8 @@
 
 """Inkling architecture, checkpoint-precision arithmetic, and complete cache contract."""
 
+import json
+
 import pytest
 import torch
 from google.protobuf.json_format import ParseDict
@@ -14,16 +16,12 @@ from ignition.preparation.execution import GraphSignature
 from ignition.recipes.inkling.config import ModelConfig
 from ignition.recipes.inkling.contract import prepare
 from ignition.recipes.inkling.model import route, mix_routes
-from ignition.recipes.inkling.pool import ContinuationPool, continuation_layout, page_bytes
+from ignition.recipes.inkling.pool import ContinuationPool, page_bytes
 from ignition.recipes.inkling.recipe import RECIPE
 from .inkling_helpers import configuration, quantization
 
 
-def test_checkpoint_alias_and_canonical_geometry():
-    from ignition.recipes import resolve
-    from ignition.recipes.inkling.bootstrap import PreparationConfig
-
-    assert resolve("inkling-small-nvfp4").recipe is RECIPE
+def test_canonical_geometry():
     model = ModelConfig.from_dict(configuration(), quantization())
     assert model.text["mlp_layer_types"] == ["dense", "sparse", "sparse"]
     assert model.text["intermediate_size"] == 256
@@ -32,9 +30,6 @@ def test_checkpoint_alias_and_canonical_geometry():
     assert model.quantized_routed_layers == (2,)
     assert model.vocabulary == 250
     assert RECIPE.speculation is None and RECIPE.max_draft_tokens == 0
-    assert PreparationConfig(prefill_chunk_size=64).prefill_chunk_size == 64
-    with pytest.raises(ValueError):
-        PreparationConfig(devices=(0, 1, 2))
 
 
 @pytest.mark.parametrize("change", [
@@ -49,8 +44,6 @@ def test_rejects_changed_arithmetic(change):
 
 
 def test_checkpoint_quantization_requires_both_calibration_and_exclusions(tmp_path):
-    import json
-
     raw, quant = configuration(), quantization()
     (tmp_path / "config.json").write_text(json.dumps(raw))
     with pytest.raises(FileNotFoundError, match="hf_quant_config"):

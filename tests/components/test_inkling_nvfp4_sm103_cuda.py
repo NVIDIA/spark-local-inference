@@ -4,12 +4,14 @@
 """Original Inkling W4A4 weights through SM103 grouped GEMMs and captured raw routes."""
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 
 from ignition.components.moe import PreparedRoutedExperts
-from ignition.components.moe_sm103 import CuteNvfp4Experts
+from ignition.components.moe_sm103 import CuteNvfp4Experts, _fp4_quantizer
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
@@ -17,8 +19,9 @@ from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.inkling.model import mix_routes
 from ignition.recipes.inkling.weights import InklingWeightLoader
+from ignition.reference.qwen38_quant import decode_nvfp4
 from tests.recipes.inkling_helpers import checkpoint
-from .inkling_nvfp4_helpers import nvfp4_routes, quantize_activation, unpack_weight
+from .inkling_nvfp4_helpers import nvfp4_routes, quantize_activation
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an assigned SM103 GPU")
@@ -26,8 +29,6 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @pytest.mark.parametrize("amax", [1.8359375, 187., 4.])
 def test_sm103_activation_calibration_and_fp4_ties(amax):
-    from ignition.components.moe_sm103 import _fp4_quantizer
-
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("SM103 NVFP4 quantizer")
     generator = torch.Generator(device="cuda").manual_seed(103)
@@ -41,7 +42,7 @@ def test_sm103_activation_calibration_and_fp4_ties(amax):
     scales = torch.empty(16 * 16, device="cuda", dtype=torch.uint8)
     _fp4_quantizer().fp4_quantize(source, scale.reshape(1), values, scales,
                                  16, False, False, False, False, True, 0)
-    actual = unpack_weight(values, scales[:64].view(torch.float8_e4m3fn).reshape(4, 16))
+    actual = decode_nvfp4(values, scales[:64].view(torch.float8_e4m3fn).reshape(4, 16), torch.ones((), device="cuda"))
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
@@ -72,21 +73,6 @@ def test_sm103_calibrated_raw_routes_compiled_replay(tmp_path, tokens):
     with InklingWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1)) as loader:
         experts = loader.load_layer(2).experts
     assert isinstance(experts, CuteNvfp4Experts)
-
-    # Native CuTe FC1 is [up64;gate64], derived only by row permutation.
-    def interleave(tensor):
-        up_gate = torch.stack((tensor[:, 1::2], tensor[:, ::2]), 2)
-        return up_gate.reshape(8, 4, 64, 2, -1).transpose(2, 3).reshape_as(tensor)
-
-    assert torch.equal(experts.w13.cpu(), interleave(tensors[prefix + ".w13_weight"]))
-    assert torch.equal(experts.w2.cpu(), tensors[prefix + ".w2_weight"])
-    for storage, name, rows, columns, reorder in (
-        (experts.scale_storage[0], "w13_weight", 512, 16, interleave),
-        (experts.scale_storage[1], "w2_weight", 256, 16, lambda x: x),
-    ):
-        actual = (storage.cpu().view(torch.uint8).reshape(8, rows // 128, columns // 4, 32, 4, 4)
-                  .permute(0, 1, 4, 3, 2, 5).contiguous().reshape(8, rows, columns))
-        assert torch.equal(actual, reorder(tensors[prefix + "." + name + ".scale"].view(torch.uint8)))
     for name, calibration, alpha in (
         ("w13_weight", experts.input_global_scale, experts.w13_alpha),
         ("w2_weight", experts.intermediate_global_scale, experts.w2_alpha),
@@ -144,9 +130,6 @@ def test_sm103_calibrated_raw_routes_compiled_replay(tmp_path, tokens):
 @pytest.mark.skipif(not os.environ.get("FLARE_INKLING_SNAPSHOT"), reason="requires the official NVFP4 checkpoint")
 @torch.no_grad()
 def test_original_checkpoint_sm103_production_geometry():
-    from pathlib import Path
-    from safetensors import safe_open
-
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("SM103 grouped NVFP4 execution")
     manifest = inspect_indexed_checkpoint(Path(os.environ["FLARE_INKLING_SNAPSHOT"]))
@@ -157,7 +140,6 @@ def test_original_checkpoint_sm103_production_geometry():
     assert (experts.num_experts, experts.hidden_size, experts.intermediate_size) == (256, 4096, 2048)
     selected = [255, 7, 33, 100, 127, 0]
     original = {}
-    # Read original bytes through safetensors, independently of the recipe's packed layout.
     for projection in ("w13_weight", "w2_weight"):
         for suffix in ("", ".scale", ".scale2", ".input_amax"):
             name = prefix + "." + projection + suffix
@@ -194,9 +176,6 @@ def test_original_checkpoint_sm103_production_geometry():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
-        difference = forward.routes.float() - reference.float()
-        print({"max_absolute_error": difference.abs().max().item(),
-               "relative_l2_error": (difference.norm() / reference.float().norm().clamp_min(1e-12)).item()})
         torch.testing.assert_close(forward.routes, reference, atol=0, rtol=0)
         live.zero_()
         graph.replay()

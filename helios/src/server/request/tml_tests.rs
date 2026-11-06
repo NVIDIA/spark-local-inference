@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+//! CPU request preparation with the canonical content-header checkpoint frontend.
+
 use super::*;
 use crate::frontend::{Asset, FrontendAssets};
 use crate::output::tagged::OutputStart;
@@ -55,7 +57,7 @@ fn content_headers_preserve_requests_tools_and_constrained_answers() {
         frontend.tokenizer(),
         config.contract.vocabulary,
         &config.eos_token_ids,
-        &[],
+        &crate::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend).unwrap(),
     )
     .unwrap();
     let prepare = |protocol, mut body: Value| {

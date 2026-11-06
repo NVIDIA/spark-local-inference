@@ -109,7 +109,7 @@ impl OutputPipeline {
     }
 
     /// Whether the parser `new` selects gates reasoning delimiters by token identity.
-    /// XTML and recipient-header framing carry their own control tokens.
+    /// XTML, recipient-header, and content-header framing carry their own control tokens.
     pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
         match syntax.tools.as_ref().map(|t| t.kind) {
             Some(ToolParserKind::Xtml | ToolParserKind::Atem | ToolParserKind::TmlJson) => false,

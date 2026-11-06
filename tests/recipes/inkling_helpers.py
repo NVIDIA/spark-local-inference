@@ -42,12 +42,14 @@ def quantization():
             "*input_quantizer": quantizer.copy(), "default": {"enable": False}}))
 
 
-def checkpoint(path, *, moe_intermediate=128, routed_experts=4, top_k=2):
+def checkpoint(path, *, moe_intermediate=128, routed_experts=4, top_k=2, vocabulary=None):
     torch.manual_seed(7821)
     raw = configuration()
     raw["text_config"]["intermediate_size"] = moe_intermediate
     raw["text_config"]["n_routed_experts"] = routed_experts
     raw["text_config"]["num_experts_per_tok"] = top_k
+    if vocabulary is not None:
+        raw["text_config"].update(vocab_size=vocabulary[0], unpadded_vocab_size=vocabulary[1])
     quant = quantization()
     config = ModelConfig.from_dict(raw, quant)
     c, h = config.text, config.hidden
@@ -95,8 +97,7 @@ def checkpoint(path, *, moe_intermediate=128, routed_experts=4, top_k=2):
                     name = p + ".mlp.experts." + projection
                     original = tensors[name]
                     count, rows, columns = original.shape
-                    # Independent exact checkpoint bytes: signed E2M1 codes, distinct
-                    # block scales and per-expert gains expose row/column packing errors.
+                    # Random E2M1 codes, distinct block scales and per-expert gains expose row/column packing errors.
                     codes = torch.randint(0, 16, original.shape, dtype=torch.uint8)
                     tensors[name] = codes[..., ::2] | (codes[..., 1::2] << 4)
                     tensors[name + ".scale"] = (torch.rand(count, rows, columns // 16) * 2 + 1).to(torch.float8_e4m3fn)

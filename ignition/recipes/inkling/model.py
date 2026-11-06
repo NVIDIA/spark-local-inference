@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inkling normalization and FP32 sink routing without narrowing checkpoint parameters."""
+"""Inkling normalization, FP32 sink routing, route mixing and decoder composition."""
 
 import torch
 
@@ -16,7 +16,7 @@ def norm(weight, eps):
 
 
 def route(logits, correction, scale, *, top_k, shared_experts, route_scale):
-    """Keep FP32 router logits, correction, and global scale, including shared sinks."""
+    """Select top-k routed experts and normalize their FP32 weights jointly with the shared-expert sinks."""
     routed = logits[..., :-shared_experts]
     ids = torch.topk(routed.sigmoid() + correction, top_k, dim=-1, sorted=False).indices
     selected = torch.cat((routed.gather(-1, ids), logits[..., -shared_experts:]), dim=-1)

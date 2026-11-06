@@ -3,6 +3,8 @@
 
 """Real prepared Inkling decoder replay across prefill, decode, and restored state."""
 
+import contextlib
+import json
 import os
 
 import pytest
@@ -18,7 +20,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.inkling.decoder import PreparedDecoder, Scratch
 from ignition.recipes.inkling.model import norm
 from ignition.recipes.inkling.pool import ContinuationPool
-from ignition.recipes.inkling.weights import ModelWeights
+from ignition.recipes.inkling.weights import InklingWeightLoader, ModelWeights
 from tests.components.inkling_nvfp4_helpers import nvfp4_routes
 from .inkling_helpers import checkpoint
 
@@ -111,16 +113,57 @@ def reference(weights, tokens, original):
     return F.linear(hidden, weights.head)[:, :weights.config.vocabulary], hidden
 
 
+@contextlib.contextmanager
+def captured_decoders(tmp_path, rows, pages, shapes):
+    _, original = checkpoint(tmp_path)
+    device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
+    weights = ModelWeights.load(inspect_indexed_checkpoint(tmp_path), device, shard=shard)
+    pool = ContinuationPool.allocate(weights.config, shard, rows, pages, device)
+    buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+    prepared, catalog, keep = {}, {}, []
+    with RecordedPreparationSession(device=device, checkpoint="inkling-decoder-test", workload_schema="inkling",
+                                    numerical_policy="default", compile_workers=1) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        for mode, capacity, batch in shapes:
+            cursor = buffers.cursor()
+            metadata = Metadata.allocate(capacity, batch, 5, device, buffers=cursor)
+            scratch = Scratch.allocate(weights.config, shard, capacity, batch, device, buffers=cursor)
+            decoder = PreparedDecoder(weights, scratch, metadata, pool, mode=mode, runtime=None,
+                embedding_runtime=None, vocabulary_runtime=None, coordinator=None, session=session,
+                name=mode, workspace=arena, buffers=cursor)
+            prepared[mode] = metadata, scratch, decoder
+        session.tune()
+        for mode, (metadata, scratch, decoder) in prepared.items():
+            # Bare decoder tests must initialize metadata that PreparedBatch owns in serving.
+            for field in metadata.__dataclass_fields__:
+                value = getattr(metadata, field)
+                if isinstance(value, torch.Tensor):
+                    value.fill_(-1 if field in ("positions", "page_table", "token_page_table") else 0)
+            compiled = compile_forward(decoder)
+            compiled()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                compiled()
+            catalog[mode] = metadata, scratch, graph
+            keep.append((decoder, compiled))
+        session.freeze()
+        pool.clear_for_preparation()
+        try:
+            yield original, weights, pool, catalog
+        finally:
+            for _, _, graph in catalog.values():
+                graph.reset()
+
+
 @torch.no_grad()
-def test_original_checkpoint_loader_shards_interleaved_rows_without_losing_precision(tmp_path):
+def test_original_checkpoint_loader_deinterleaves_rows_without_losing_precision(tmp_path):
     config, original = checkpoint(tmp_path)
     manifest = inspect_indexed_checkpoint(tmp_path)
-    from ignition.recipes.inkling.weights import InklingWeightLoader
-
-    with InklingWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(1, 2)) as loader:
+    with InklingWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1)) as loader:
         layer = loader.load_layer(1)
     raw = original["model.llm.layers.1.mlp.experts.w13_weight"]
-    assert torch.equal(layer.experts.gate_up.cpu(), torch.cat((raw[:, 128::2], raw[:, 129::2]), dim=1))
+    assert torch.equal(layer.experts.gate_up.cpu(), torch.cat((raw[:, 0::2], raw[:, 1::2]), dim=1))
     assert torch.equal(layer.correction.cpu(), original["model.llm.layers.1.mlp.gate.bias"])
     assert torch.equal(layer.scale.cpu(), original["model.llm.layers.1.mlp.gate.global_scale"])
     assert layer.correction.dtype == layer.scale.dtype == layer.key_conv.dtype == torch.float32
@@ -130,9 +173,6 @@ def test_original_checkpoint_loader_shards_interleaved_rows_without_losing_preci
 @pytest.mark.parametrize("layer,excluded,error", [(1, False, "incomplete NVFP4"), (2, True, "interleaved BF16")])
 @torch.no_grad()
 def test_loader_rejects_checkpoint_precision_disagreeing_with_exclusions(tmp_path, layer, excluded, error):
-    import json
-    from ignition.recipes.inkling.weights import InklingWeightLoader
-
     checkpoint(tmp_path)
     path = tmp_path / "hf_quant_config.json"
     metadata = json.loads(path.read_text())
@@ -151,46 +191,14 @@ def test_loader_rejects_checkpoint_precision_disagreeing_with_exclusions(tmp_pat
 
 @torch.no_grad()
 def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
-    _, original = checkpoint(tmp_path)
-    device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
-    weights = ModelWeights.load(inspect_indexed_checkpoint(tmp_path), device, shard=shard)
-    pool = ContinuationPool.allocate(weights.config, shard, 4, 5, device)
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-    catalog = {}
-    with RecordedPreparationSession(device=device, checkpoint="inkling-decoder-test", workload_schema="inkling",
-                                    numerical_policy="default", compile_workers=1) as session:
-        arena = ScratchArena(device)
-        session.register_scratch(arena)
-        for mode, capacity in (("prefill", 64), ("decode", 1)):
-            cursor = buffers.cursor()
-            metadata = Metadata.allocate(capacity, 1, 5, device, buffers=cursor)
-            scratch = Scratch.allocate(weights.config, shard, capacity, 1, device, buffers=cursor)
-            decoder = PreparedDecoder(weights, scratch, metadata, pool, mode=mode, runtime=None,
-                embedding_runtime=None, vocabulary_runtime=None, coordinator=None, session=session,
-                name=mode, workspace=arena, buffers=cursor)
-            catalog[mode] = metadata, scratch, decoder
-        session.tune()
-        graphs = {}
-        for mode, (metadata, scratch, decoder) in catalog.items():
-            # Bare decoder tests must initialize metadata that PreparedBatch owns in serving.
-            for field in metadata.__dataclass_fields__:
-                value = getattr(metadata, field)
-                if isinstance(value, torch.Tensor):
-                    value.fill_(-1 if field in ("positions", "page_table", "token_page_table") else 0)
-            compiled = compile_forward(decoder)
-            compiled()
-            graph = torch.cuda.CUDAGraph()
-            with session.capture(), torch.cuda.graph(graph):
-                compiled()
-            graphs[mode] = graph, compiled
-        session.freeze()
-        pool.clear_for_preparation()
+    device = torch.device("cuda", 0)
+    with captured_decoders(tmp_path, 4, 5, (("prefill", 64, 1), ("decode", 1, 1))) as (original, weights, pool, catalog):
         tokens = (torch.arange(259, device=device) * 17 % weights.config.vocabulary).long()
         expected, expected_hidden = reference(weights, tokens, original)
         start = 0
         for mode, count in (("prefill", 63), ("decode", 1), ("decode", 1), ("prefill", 62),
                             ("decode", 1), ("decode", 1), ("prefill", 64), ("prefill", 64), ("decode", 1), ("decode", 1)):
-            metadata, scratch, decoder = catalog[mode]
+            metadata, scratch, graph = catalog[mode]
             values = torch.zeros((1, metadata.token_ids.numel()), dtype=torch.int64, device=device)
             values[0, :count] = tokens[start:start+count]
             metadata.set(torch.tensor([start], device=device), torch.tensor([count], device=device, dtype=torch.int32),
@@ -198,7 +206,7 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
                 values, torch.ones(1, device=device, dtype=torch.int32))
             metadata.sample_indices.fill_(count - 1)
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
-            graphs[mode][0].replay()
+            graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             start += count
@@ -207,17 +215,17 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
         assert start == tokens.numel()
         saved = pool.backing.clone()
         pages = {name: value.clone() for name, value in pool.pages.items()}
-        metadata, scratch, decoder = catalog["decode"]
+        metadata, scratch, graph = catalog["decode"]
         metadata.starts.fill_(start)
         metadata.positions.fill_(start)
         metadata.token_ids.fill_(13)
-        graphs["decode"][0].replay()
+        graph.replay()
         torch.cuda.synchronize()
         branch = scratch.logits.clone()
         pool.backing.copy_(saved)
         for name, value in pages.items():
             pool.pages[name].copy_(value)
-        graphs["decode"][0].replay()
+        graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(branch, scratch.logits)
         saved = pool.backing.clone()
@@ -226,51 +234,19 @@ def test_decoder_compiled_replay_cache_boundaries_and_restored_branch(tmp_path):
         metadata.live_counts.zero_()
         metadata.positions.fill_(-1)
         metadata.state_rows.zero_()
-        graphs["decode"][0].replay()
+        graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(saved, pool.backing)
 
 
 @torch.no_grad()
 def test_decoder_batched_decode_with_inactive_rows_after_window_wrap(tmp_path):
-    _, original = checkpoint(tmp_path)
-    device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
-    weights = ModelWeights.load(inspect_indexed_checkpoint(tmp_path), device, shard=shard)
-    pool = ContinuationPool.allocate(weights.config, shard, 5, 10, device)
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-    catalog = {}
-    with RecordedPreparationSession(device=device, checkpoint="inkling-batched-test", workload_schema="inkling",
-                                    numerical_policy="default", compile_workers=1) as session:
-        arena = ScratchArena(device)
-        session.register_scratch(arena)
-        for mode, capacity, rows in (("prefill", 192, 1), ("decode", 4, 4)):
-            cursor = buffers.cursor()
-            metadata = Metadata.allocate(capacity, rows, 5, device, buffers=cursor)
-            scratch = Scratch.allocate(weights.config, shard, capacity, rows, device, buffers=cursor)
-            decoder = PreparedDecoder(weights, scratch, metadata, pool, mode=mode, runtime=None,
-                embedding_runtime=None, vocabulary_runtime=None, coordinator=None, session=session,
-                name=mode, workspace=arena, buffers=cursor)
-            catalog[mode] = metadata, scratch, decoder
-        session.tune()
-        graphs = {}
-        for mode, (metadata, _, decoder) in catalog.items():
-            # Bare decoder tests must initialize metadata that PreparedBatch owns in serving.
-            for field in metadata.__dataclass_fields__:
-                value = getattr(metadata, field)
-                if isinstance(value, torch.Tensor):
-                    value.fill_(-1 if field in ("positions", "page_table", "token_page_table") else 0)
-            compiled = compile_forward(decoder)
-            compiled()
-            graph = torch.cuda.CUDAGraph()
-            with session.capture(), torch.cuda.graph(graph):
-                compiled()
-            graphs[mode] = graph, compiled
-        session.freeze()
-        pool.clear_for_preparation()
+    device = torch.device("cuda", 0)
+    with captured_decoders(tmp_path, 5, 10, (("prefill", 192, 1), ("decode", 4, 4))) as (original, weights, pool, catalog):
         sequences = [(torch.arange(length + 1, device=device) * (17 + row) % weights.config.vocabulary).long()
                      for row, length in enumerate((129, 131))]
         for row, sequence in enumerate(sequences):
-            m, s, _ = catalog["prefill"]
+            m, s, graph = catalog["prefill"]
             values = torch.zeros((1, 192), dtype=torch.int64, device=device)
             values[0, :sequence.numel()-1] = sequence[:-1]
             m.set(torch.zeros(1, device=device, dtype=torch.int64),
@@ -278,9 +254,9 @@ def test_decoder_batched_decode_with_inactive_rows_after_window_wrap(tmp_path):
                 torch.tensor([row+1], device=device), (torch.arange(5, device=device, dtype=torch.int32) + row*5)[None],
                 values, torch.ones(1, device=device, dtype=torch.int32))
             m.sample_indices.fill_(sequence.numel()-2)
-            graphs["prefill"][0].replay()
+            graph.replay()
         untouched = pool.backing[[0, 3, 4]].clone()
-        m, s, _ = catalog["decode"]
+        m, s, graph = catalog["decode"]
         m.set(torch.tensor([129, 0, 131, 0], device=device), torch.tensor([1, 0, 1, 0], device=device, dtype=torch.int32),
             torch.tensor([1, 3, 2, 4], device=device),
             torch.tensor([[0, 1, 2, 3, 4], [-1]*5, [5, 6, 7, 8, 9], [-1]*5], dtype=torch.int32, device=device),
@@ -288,7 +264,7 @@ def test_decoder_batched_decode_with_inactive_rows_after_window_wrap(tmp_path):
                          sequences[1][-1:], torch.zeros(1, dtype=torch.int64, device=device))),
             torch.tensor([4], device=device, dtype=torch.int32))
         before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        graphs["decode"][0].replay()
+        graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
         assert torch.equal(untouched, pool.backing[[0, 3, 4]])

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Paged learned-relative-bias attention with complete FP32 convolution state."""
+"""Paged attention with learned relative bias and residual K/V convolutions."""
 
 from dataclasses import dataclass
 
@@ -14,7 +14,7 @@ from ignition.components.relative_paged_attention import PreparedRelativePagedAt
 from ignition.components.residual_short_conv import PreparedResidualShortConvolution
 from ignition.components.window_attention import stage_windows, commit_window
 from .model import norm
-from .pool import KV_DTYPE, PAGE_TOKENS
+from .pool import PAGE_TOKENS
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class AttentionScratch:
     window_value: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device, *, requests, buffers):
+    def allocate(cls, config, shard, tokens, *, requests, buffers):
         geometries = [config.attention(i) for i in range(config.layers)]
         if len({(a.heads, a.kv_heads, a.key_dim) for a in geometries}) != 1:
             raise ValueError("Inkling scratch requires matching global and sliding head geometry")
@@ -58,8 +58,8 @@ class AttentionScratch:
 
 
 class PreparedAttention(torch.nn.Module):
-    def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
-                 runtime, coordinator, session, name, workspace, buffers):
+    def __init__(self, layer, weights, config, source, scratch, metadata, pool, *, mode,
+                 runtime, coordinator, session, name, buffers, cache_metadata):
         super().__init__()
         self.source = source
         if mode not in ("prefill", "decode"):
@@ -70,9 +70,9 @@ class PreparedAttention(torch.nn.Module):
             session=session, name=name + ".qkv_relative")
         self.query_norm, self.key_norm = norm(weights.query_norm, c["rms_norm_eps"]), norm(weights.key_norm, c["rms_norm_eps"])
         self.key_conv = PreparedResidualShortConvolution(s.key_source, weights.key_conv,
-            pool.convolution(layer, "key"), metadata, s.key.flatten(1), session=session, workspace=workspace, name=name + ".key_conv")
+            pool.convolution(layer, "key"), metadata, s.key.flatten(1), session=session, name=name + ".key_conv")
         self.value_conv = PreparedResidualShortConvolution(s.value_source, weights.value_conv,
-            pool.convolution(layer, "value"), metadata, s.value.flatten(1), session=session, workspace=workspace, name=name + ".value_conv")
+            pool.convolution(layer, "value"), metadata, s.value.flatten(1), session=session, name=name + ".value_conv")
         self.relative = s.relative.flatten()[:s.query.shape[0] * s.query.shape[1] * a.relative_extent].view(
             s.query.shape[0], s.query.shape[1], a.relative_extent)
         self.relative_projection = UnquantizedProjection(s.relative_source.flatten(0, 1), weights.relative,
@@ -82,10 +82,10 @@ class PreparedAttention(torch.nn.Module):
             session=session, name=name + ".output")
         self.reduction = PreparedChunkedAllReduce(s.partial, s.output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".reduce")
-        self.lengths = buffers.zeros(metadata.lengths.shape, torch.int32)
-        self.slots = buffers.zeros(metadata.positions.shape, torch.int64).fill_(-1)
         self.key_cache, self.value_cache = pool.cache(layer, "key"), pool.cache(layer, "value")
         if a.window > 0:
+            self.lengths = buffers.zeros(metadata.lengths.shape, torch.int32)
+            self.slots = buffers.zeros(metadata.positions.shape, torch.int64).fill_(-1)
             count = metadata.lengths.numel() * -(-(a.window + metadata.max_query_tokens) // PAGE_TOKENS)
             self.staged_key, self.staged_value = s.window_key[:count], s.window_value[:count]
             self.pages = torch.arange(count, dtype=torch.int32, device=source.device).view(metadata.lengths.numel(), -1)
@@ -94,12 +94,13 @@ class PreparedAttention(torch.nn.Module):
             self.writer = PreparedPagedKVWriter(s.key, s.value, pool.window_pages(layer, "key"),
                 pool.window_pages(layer, "value"), self.slots, session=session, name=name + ".ring_write") if mode == "decode" else None
         else:
+            self.slots, self.lengths = cache_metadata.slots, cache_metadata.lengths
             key, value, self.pages = self.key_cache, self.value_cache, metadata.page_table
             self.writer = PreparedPagedKVWriter(s.key, s.value, key, value, self.slots,
                 session=session, name=name + ".cache_write")
         self.attention = PreparedRelativePagedAttention(s.query, key, value, self.pages, self.lengths,
             metadata.query_start_loc, self.relative, s.attended, window=a.window - 1 if a.window > 0 else -1,
-            softmax_scale=1. / a.key_dim, session=session, workspace=workspace, name=name + ".attention")
+            softmax_scale=1. / a.key_dim, session=session, name=name + ".attention")
 
     def forward(self, hidden_states, **kwargs):
         hidden = self.source.copy_(hidden_states.reshape_as(self.source))
@@ -115,15 +116,11 @@ class PreparedAttention(torch.nn.Module):
         s.key.copy_(self.key_norm(s.key))
         s.relative_source.copy_(r.view_as(s.relative_source))
         self.relative_projection(s.relative_source.flatten(0, 1))
-        if a.window < 0 and self.log_floor is not None:
-            tau = 1. + self.log_alpha * torch.log(((m.positions.clamp_min(0) + 1).float() / self.log_floor).clamp_min(1.))
-            s.query.copy_(s.query.float() * tau[:, None, None])
-            self.relative.copy_(self.relative.float() * tau[:, None, None])
         if a.window < 0:
-            columns = (m.positions.clamp_min(0) // PAGE_TOKENS).clamp(max=m.token_page_table.shape[1] - 1)
-            pages = m.token_page_table[torch.arange(m.positions.numel(), device=m.positions.device), columns]
-            self.slots.copy_(torch.where(m.positions >= 0, pages.long() * PAGE_TOKENS + m.positions.remainder(PAGE_TOKENS), -1))
-            self.lengths.copy_((m.starts + m.lengths).int())
+            if self.log_floor is not None:
+                tau = 1. + self.log_alpha * torch.log(((m.positions.clamp_min(0) + 1).float() / self.log_floor).clamp_min(1.))
+                s.query.copy_(s.query.float() * tau[:, None, None])
+                self.relative.copy_(self.relative.float() * tau[:, None, None])
             self.writer()
         else:
             stage_windows(self.key_cache, s.key, self.staged_key, m)
@@ -141,4 +138,4 @@ class PreparedAttention(torch.nn.Module):
         return self.reduction(self.output_projection(s.attended.flatten(1))).view_as(hidden_states), None
 
     def scratch_tensors(self):
-        return self.lengths, self.slots
+        return (self.lengths, self.slots) if self.geometry.window > 0 else ()

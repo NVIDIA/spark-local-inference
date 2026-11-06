@@ -13,12 +13,12 @@ use crate::Result;
 use serde_json::Value;
 use std::collections::VecDeque;
 
-pub const START: &str = "<|message_model|>";
-pub const TEXT: &str = "<|content_text|>";
-pub const THINK: &str = "<|content_thinking|>";
-pub const TOOL: &str = "<|content_invoke_tool_json|>";
-pub const END: &str = "<|end_message|>";
-pub const TURN_END: &str = "<|content_model_end_sampling|>";
+const START: &str = "<|message_model|>";
+const TEXT: &str = "<|content_text|>";
+const THINK: &str = "<|content_thinking|>";
+const TOOL: &str = "<|content_invoke_tool_json|>";
+const END: &str = "<|end_message|>";
+const TURN_END: &str = "<|content_model_end_sampling|>";
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -38,7 +38,7 @@ pub struct TmlOutput {
     calls: usize,
     received: usize,
     spans: Vec<Option<std::ops::Range<usize>>>,
-    controls: Vec<(u32, String)>,
+    control_tokens: Vec<(u32, String)>,
     pending_controls: VecDeque<String>,
     pending_text: String,
 }
@@ -57,7 +57,7 @@ fn partial(text: &str, marker: &str) -> usize {
 }
 
 impl TmlOutput {
-    pub fn new(config: OutputConfig, controls: Vec<(u32, String)>) -> Self {
+    pub fn new(config: OutputConfig, control_tokens: Vec<(u32, String)>) -> Self {
         Self {
             state: match config.start {
                 OutputStart::RecipientHeader => State::Header,
@@ -72,7 +72,7 @@ impl TmlOutput {
             calls: 0,
             received: 0,
             spans: vec![],
-            controls,
+            control_tokens,
             pending_controls: VecDeque::new(),
             pending_text: String::new(),
         }
@@ -93,7 +93,9 @@ impl TmlOutput {
         self.spans.clear();
         let text = match input {
             Input::Token(id) => {
-                if let Some((_, marker)) = self.controls.iter().find(|(token, _)| *token == id) {
+                if let Some((_, marker)) =
+                    self.control_tokens.iter().find(|(token, _)| *token == id)
+                {
                     self.pending_controls.push_back(marker.clone());
                 }
                 return Ok(vec![]);
@@ -327,7 +329,12 @@ mod tests {
     }
 
     fn feed(p: &mut TmlOutput, marker: &str, fragmented: bool) -> Result<Vec<Event>> {
-        let id = p.controls.iter().find(|(_, m)| m == marker).unwrap().0;
+        let id = p
+            .control_tokens
+            .iter()
+            .find(|(_, m)| m == marker)
+            .unwrap()
+            .0;
         let mut events = p.push(Input::Token(id))?;
         if fragmented {
             for c in marker.chars() {

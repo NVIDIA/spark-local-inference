@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared Inkling text layers, shared sinks, and sharded vocabulary projection."""
+"""Prepared Inkling text layers, shared-expert sinks, and vocabulary projection."""
 
 from dataclasses import dataclass
 
@@ -13,11 +13,12 @@ from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import PreparedRoutedExperts
-from ignition.components.paged_resume import PreparedResume
+from ignition.components.paged_attention import PagedAttentionMetadata
 from ignition.components.residual_short_conv import PreparedResidualShortConvolution
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from .attention import AttentionScratch, PreparedAttention
 from .model import decoder_layer, mix_routes, norm, route
+from .pool import PAGE_TOKENS
 from .weights import Experts
 
 
@@ -52,7 +53,7 @@ class Scratch:
         embedding = zeros((tokens, config.hidden))
         local_embedding = zeros((tokens, config.hidden // shard.world_size))
         normalized = zeros((tokens, config.hidden))
-        attention = AttentionScratch.allocate(config, shard, tokens, device, requests=samples, buffers=buffers)
+        attention = AttentionScratch.allocate(config, shard, tokens, requests=samples, buffers=buffers)
         convolved = zeros((tokens, config.hidden))
         logits = zeros((tokens, c["n_routed_experts"] + c["n_shared_experts"]), torch.float32)
         ids = zeros((tokens, c["num_experts_per_tok"]), torch.int32)
@@ -70,17 +71,10 @@ class Scratch:
             zeros((samples, config.vocabulary_partition(shard)[2])), zeros((samples, config.vocabulary)))
 
     def rows(self, tokens, samples):
-        values = []
-        for field in self.__dataclass_fields__:
-            value = getattr(self, field)
-            if field == "bf16":
-                value = value.rows(tokens, self.route_ids.shape[1])
-            elif field in ("attention", "dense", "shared"):
-                value = value.rows(tokens)
-            else:
-                value = value[:samples if field in ("hidden", "local_logits", "logits") else tokens]
-            values.append(value)
-        return type(self)(*values)
+        return type(self)(*(getattr(self, field).rows(tokens, self.route_ids.shape[1]) if field == "bf16"
+            else getattr(self, field).rows(tokens) if field in ("attention", "dense", "shared")
+            else getattr(self, field)[:samples if field in ("hidden", "local_logits", "logits") else tokens]
+            for field in self.__dataclass_fields__))
 
 
 class PreparedFeedForward(torch.nn.Module):
@@ -88,10 +82,8 @@ class PreparedFeedForward(torch.nn.Module):
         super().__init__()
         self.scratch, self.metadata, self.config, self.weights = scratch, metadata, config, weights
         s = scratch
-        def mlp(w, storage, suffix):
-            return PreparedMLP(s.normalized, w, storage.gate_up, storage.intermediate, storage.output,
-                session=session, name=name + suffix, workspace=workspace, round_silu=False)
-        self.dense = None if weights.dense is None else mlp(weights.dense, s.dense, ".dense")
+        self.dense = None if weights.dense is None else PreparedMLP(s.normalized, weights.dense, s.dense.gate_up,
+            s.dense.intermediate, s.dense.output, session=session, name=name + ".dense", workspace=workspace, round_silu=False)
         self.reduce = PreparedChunkedAllReduce(s.partial, s.reduced, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".reduce")
         if self.dense is None:
@@ -105,7 +97,10 @@ class PreparedFeedForward(torch.nn.Module):
                     s.route_weights, s.routes, session=session, name=name + ".experts", workspace=workspace)
             self.reduce_routes = PreparedChunkedAllReduce(s.routes.flatten(1), s.reduced_routes.flatten(1),
                 runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduce_routes")
-            self.shared = tuple(mlp(w, s.shared, f".shared{index}") for index, w in enumerate(weights.shared))
+            self.shared = tuple((
+                UnquantizedProjection(s.normalized, w.gate_up, s.shared.gate_up, session=session, name=f"{name}.shared{index}.gate_up"),
+                UnquantizedProjection(s.shared.intermediate, w.down, s.shared.output, session=session, name=f"{name}.shared{index}.down"))
+                for index, w in enumerate(weights.shared))
 
     def forward(self, hidden_states):
         s, c = self.scratch, self.config.text
@@ -125,11 +120,11 @@ class PreparedFeedForward(torch.nn.Module):
         self.reduce_routes(s.routes.flatten(1))
         routed = mix_routes(s.reduced_routes, weights, ids)
         shared = torch.zeros_like(s.output, dtype=torch.float32)
-        for index, expert in enumerate(self.shared):
-            expert.up_projection(s.normalized)
+        for index, (gate_up, down) in enumerate(self.shared):
+            gate_up(s.normalized)
             gate, up = s.shared.gate_up.float().chunk(2, dim=-1)
             s.shared.intermediate.copy_(torch.nn.functional.silu(gate) * up * s.gammas[:, index, None])
-            s.partial.copy_(expert.down_projection(s.shared.intermediate))
+            s.partial.copy_(down(s.shared.intermediate))
             shared = shared + self.reduce(s.partial).float()
         s.output.copy_(routed + shared.to(s.output.dtype))
         return s.output.view_as(hidden_states)
@@ -156,17 +151,18 @@ class PreparedDecoder:
             s.embedding, runtime=embedding_runtime, coordinator=coordinator, session=session,
             name=name + ".embedding", num_rows=metadata.live_counts[:1])
         self.embedding_norm = norm(weights.embedding_norm, c["rms_norm_eps"])
+        self.cache_metadata = PagedAttentionMetadata(metadata, page_tokens=PAGE_TOKENS, buffers=buffers)
         self.layers = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
-            attention = PreparedAttention(index, w, weights.config, weights.shard, s.normalized,
+            attention = PreparedAttention(index, w, weights.config, s.normalized,
                 s.attention, metadata, pool, mode=mode, runtime=runtime, coordinator=coordinator,
-                session=session, name=prefix + ".attention", workspace=workspace, buffers=buffers)
+                session=session, name=prefix + ".attention", buffers=buffers, cache_metadata=self.cache_metadata)
             feedforward = PreparedFeedForward(w, weights.config, s, metadata, runtime=runtime,
                 coordinator=coordinator, session=session, name=prefix + ".mlp", workspace=workspace)
             def convolution(kind, source, weight):
                 return PreparedConvolution(source, weight, pool.convolution(index, kind), metadata,
-                    s.convolved, session=session, workspace=workspace, name=prefix + "." + kind + "_conv")
+                    s.convolved, session=session, name=prefix + "." + kind + "_conv")
             self.layers.append(decoder_layer(weights.config, w, attention, feedforward,
                 convolution("attention", s.attention.output, w.attention_conv),
                 convolution("mlp", s.output, w.mlp_conv)))
@@ -179,6 +175,7 @@ class PreparedDecoder:
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers)
 
     def __call__(self):
+        self.cache_metadata()
         s = self.scratch
         hidden = self.embedding_norm(self.embedding())
         for layer in self.layers:
@@ -192,4 +189,5 @@ class PreparedDecoder:
         self.head(s.hidden)
 
     def scratch_tensors(self):
-        return (self.head.gathered, *(layer.self_attn.scratch_tensors() for layer in self.layers))
+        return (self.head.gathered, self.cache_metadata.slots, self.cache_metadata.lengths,
+                *(layer.self_attn.scratch_tensors() for layer in self.layers))
