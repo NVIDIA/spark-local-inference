@@ -20,19 +20,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("endpoint", [127, 128, 129, 2047, 2048, 2049])
-@pytest.mark.parametrize("dflash", [False, True])
-@torch.no_grad()
-def test_captured_snapshot_forks_preserve_fp8_histories(endpoint, dflash):
-    config = SimpleNamespace(layers=2, attention=lambda i: Geometry(2048 if i == 0 else -1),
-                             text={"hidden_size": 128},
-                             draft=SimpleNamespace(layers=5, attention=Geometry(2048)) if dflash else None)
-    pool = ContinuationPool.allocate(config, TensorParallelShard(0, 1), 8, 5, "cuda:0")
-    if dflash:
-        for layer in range(5):
-            for kind in ('key', 'value'):
-                region = pool.layout.region(f'draft{layer}.{kind}')
-                assert region.dtype == torch.float8_e4m3fn and region.shape == (2048, 2, 64)
+def assert_snapshot_forks(pool, endpoint):
     commands = StateCommands.allocate("cuda:0", capacity=4)
     tables = torch.full((4, 17), -1, dtype=torch.int32, device="cuda:0")
     consumed = pool.region("consumed_tokens")
@@ -92,10 +80,26 @@ def test_captured_snapshot_forks_preserve_fp8_histories(endpoint, dflash):
         assert not plane[3:].count_nonzero()
     pool.region("last_hidden")[2].zero_()
     assert torch.equal(pool.backing[5], expected)
+    graph.reset()
+
+
+@pytest.mark.parametrize("endpoint", [127, 128, 129, 2047, 2048, 2049])
+@pytest.mark.parametrize("dflash", [False, True])
+@torch.no_grad()
+def test_captured_snapshot_forks_preserve_fp8_histories(endpoint, dflash):
+    config = SimpleNamespace(layers=2, attention=lambda i: Geometry(2048 if i == 0 else -1),
+                             text={"hidden_size": 128},
+                             draft=SimpleNamespace(layers=5, attention=Geometry(2048)) if dflash else None)
+    pool = ContinuationPool.allocate(config, TensorParallelShard(0, 1), 8, 5, "cuda:0")
+    if dflash:
+        for layer in range(5):
+            for kind in ('key', 'value'):
+                region = pool.layout.region(f'draft{layer}.{kind}')
+                assert region.dtype == torch.float8_e4m3fn and region.shape == (2048, 2, 64)
+    assert_snapshot_forks(pool, endpoint)
     stride = pool.window_page_stride(0)
     for kind in ("key", "value"):
         paged = pool.window_pages(0, kind)
         for row in (0, 2, 3, 5, 7):
             torch.testing.assert_close(paged[row * stride:row * stride + 16].flatten(0, 1),
                                        pool.cache(0, kind)[row], atol=0, rtol=0, equal_nan=True)
-    graph.reset()

@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "nvidia/Muse-Glimmer-30B-NVFP4",
+    "revision": "47818374517751c48c55cde2621594926b1888b6",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "114f55ebdc1804c1af371197b9fdf2d6bb925966c9dfe46b73782a71bc07965e",
+  "result_sha256": "b916c7e78dc1dbf41f57fe12b8ee0cc59d3d75c19ff316dd424e8e550fd8a7f3",
+  "insertions": [
+    4977,
+    7080
+  ]
+}

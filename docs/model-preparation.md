@@ -1086,9 +1086,40 @@ the canonical control-sequence escaping.
 flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
 ```
 
+## Muse Glimmer
+
+The `muse-glimmer-30b-nvfp4` alias selects
+[`nvidia/Muse-Glimmer-30B-NVFP4`](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4)
+at revision `47818374517751c48c55cde2621594926b1888b6`. It prepares one GPU with
+a 131072-token context, concurrency four and 4096-token prefill chunks. Weights
+retain checkpoint NVFP4 W4A16, calibrated FP8 and excluded BF16 precision.
+Image, audio and video requests are rejected; no vision encoder or draft is prepared.
+
+The FlashInfer dependency pinned in `pyproject.toml` provides the required operators;
+unlike Muse Spark, no local FlashInfer checkout is needed.
+All 52 layers retain BF16 KV; sliding layers use the 2048-token window.
+A 128-token KV page occupies 6,815,744 bytes, a continuation row 6,829,312 bytes,
+and a full-context KV history 6.5 GiB. The planner budgets the full 24.67 GB
+checkpoint, including unused vision tensors, plus scratch and caches.
+
+Sampling defaults are temperature 1.0, top-p 0.95 and top-k 64. Set
+`chat_template_kwargs.reasoning_strength` to override the template's `high` default.
+Prompt rendering and output parsing follow [Muse Spark](#muse-spark-open), with
+the template patch in `ignition/recipes/muse_glimmer/assets/chat_template.patch.json`.
+
+```sh
+.venv/bin/ignition export muse-glimmer-30b-nvfp4 --gpus 0 --prompt-logprobs
+flare/target/release/flare run CACHE_ENTRY --gpus 0
+```
+
+Against an exported package on GB300, `tests/server/test_muse_glimmer.py` does not
+yet pass: some text, JSON, and tool cases exceed its 64-token output budget or end
+without a completed tool call. Full-checkpoint SM120/SM121 preparation and serving
+performance have not been measured.
+
 ## Storage and graph capacities
 
-Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
+Gemma 4, Muse Spark, and Muse Glimmer default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
 one, giving six rows at its default settings. Muse Spark declares 32 packed
 target-token rows for seven DFlash2 drafts at concurrency four. Other recipes

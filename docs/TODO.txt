@@ -194,3 +194,7 @@
     MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
+
+[ ] Make tests/server/test_muse_glimmer.py pass against an exported Muse Glimmer
+    package on GB300. Some text, JSON, and tool cases exceed the 64-token output
+    budget or end without a completed tool call. Close when the suite passes.

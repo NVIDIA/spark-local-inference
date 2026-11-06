@@ -194,7 +194,7 @@ class FullAttention(torch.nn.Module):
             weight = weights.projections[prefix + field]
             if isinstance(weight, TensorFP8Weight):
                 return TensorFP8Projection(inputs, weight, output, session=session, name=name + "." + field,
-                                           staging=projection_staging)
+                                           staging=projection_staging, workspace=workspace)
             return prepare_projection(inputs, weight, output, session=session, name=name + "." + field,
                                       workspace=workspace)
         operands = (*inputs, ("o_proj", self.attended, self.output))
