@@ -129,6 +129,15 @@ snapshots therefore preserve the draft partial page at that endpoint as well
 as target pages and recurrent state. Absorption, proposals, verification,
 sampling, and commit execute inside prepared CUDA graphs.
 
+The GLM checkpoints declare `index_share_for_mtp_iteration`. A round's first
+draft pass runs the MTP layer's C4 indexer. Later passes reuse each request's
+first-pass sparse selection and skip the indexer's projections, C4 writes,
+selection, and, with context parallelism, candidate exchange. They attend to
+records at or before the first pass's position, not to the records of the
+round's earlier drafts. Transformers has no GLM MTP layer and ignores the
+field; vLLM's GLM MTP proposer applies the same reuse without prefill
+context parallelism.
+
 ## DeepSeek DSpark proposals and continuation state
 
 The [DSpark preparation code](../ignition/recipes/deepseek41/dspark.py) composes
