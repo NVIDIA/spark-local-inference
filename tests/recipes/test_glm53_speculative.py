@@ -44,8 +44,8 @@ def test_shared_commit_without_previous_token_embeddings():
 
 
 @pytest.mark.parametrize("width,limits,positions,token_slots,state_indices", [
-    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254],
-     [[1, 0, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]]),
+    # Width one decodes each live row in place through a single state column.
+    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254], [[1], [2]]),
     (6, [6, 2], [255, 256, 257, 258, 259, 260, 510, 511, -1, -1, -1, -1],
      [10 * 256 + 255, *range(11 * 256, 11 * 256 + 5), 21 * 256 + 254, 21 * 256 + 255],
      # Verification records tokens against each request's live row only.
@@ -61,11 +61,12 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     inputs.request_state_rows.copy_(torch.tensor([[1, 8, 9, 10, 11, 12, 13, 14], [2, 15, 16, 17, 18, 19, 20, 21]]))
     op.owner = SimpleNamespace(inputs=inputs, requests=SimpleNamespace(capacity=2), shards=ContextShards())
     m = DecoderMetadata.allocate(2 * width, 2, 2, "cpu")
+    columns = len(state_indices[0])
     op.metadata = DecoderMetadata(m.token_ids, torch.zeros(2 * width, dtype=torch.int64),
-        DeltaMetadata.allocate(2, "cpu", verification_columns=8), m.indexed)
+        DeltaMetadata.allocate(2, "cpu", verification_columns=columns), m.indexed)
     op.active = torch.tensor([True, True])
     op.before = torch.tensor([255, 510])
-    op.offsets, op.columns, op.state_columns = torch.arange(2 * width), torch.arange(width), torch.arange(8)
+    op.offsets, op.columns, op.state_columns = torch.arange(2 * width), torch.arange(width), torch.arange(columns)
     op.candidates = torch.arange(2 * width).view(2, width)
     op.target_metadata(torch.tensor([0, 1]), torch.tensor(limits, dtype=torch.int32))
     assert op.metadata.recurrent.query_start_loc.tolist() == [0, limits[0], sum(limits)]
