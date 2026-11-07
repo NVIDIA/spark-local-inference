@@ -171,13 +171,12 @@ pub trait HostStore {
 ```
 
 The worker calls `store` for each offered checkpoint, without waiting for GPU
-pressure. The scheduler defers a message checkpoint whose own planned prompt
-checkpoint is its direct child less than one physical page later, and terminal
-checkpoints, until a request resumes at that exact checkpoint. A preempted
-terminal counts as resumed. If its prompt capture cannot obtain a snapshot, the
-message is offered while the request still pins it; cancellation or error before
-that capture offers it at retirement. GPU captures, prefill cuts, and retention
-are unchanged; deferred points can be lost to GPU
+pressure. The scheduler offers message checkpoints immediately, including those
+followed by a prompt checkpoint less than one physical page later. A continuation
+can branch at the message endpoint and cannot use the prompt checkpoint's row.
+Terminal checkpoints are deferred until a request resumes at that exact
+checkpoint. A preempted terminal counts as resumed. GPU captures, prefill cuts,
+and GPU eviction policy are unchanged; deferred terminal points can be lost to GPU
 eviction before reuse, and are not announced to the pool until offered.
 Compaction also offers a deferred branch point as its heir and refreshes
 descendant offers with their new parent.
@@ -248,7 +247,12 @@ disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
 Each tier drops a non-root record's row once its only child commits, keeping
-the pages; readers and spills delay removal until they release the row. DRAM
+the pages, unless a child less than one physical page later has been indexed.
+Those close ancestors retain their rows for divergent continuations, even if
+that child is later removed. The close-child marker is in-memory; recovery
+reconstructs it from surviving parent-child links. Ordinary capacity-driven
+eviction and compaction still apply.
+Readers and spills delay row removal until they release the row. DRAM
 releases row slots, disk truncates at the row segment, and later spills omit it.
 A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
 the remaining tokens.
@@ -578,7 +582,8 @@ API on this class of host and is the reference for call patterns.
 - `take_publications()` returns GPU-ready checkpoints offered since the previous
   call, each once, with their id, key, nearest offered ancestor's key, bucket
   digest, whole page chain, tail count since that ancestor, and row state slot.
-  Deferred checkpoints enter the list on reuse or the fallback above.
+  Message checkpoints enter the list at capture; deferred terminal checkpoints
+  enter on reuse or compaction.
 - `SchedulerStats` gains `host_lookups`, `host_hits`, `host_reused_tokens`,
   and `inbound_waiting`.
 - `release_after_shutdown` drops tickets.

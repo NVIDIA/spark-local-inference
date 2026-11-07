@@ -2717,20 +2717,14 @@ impl RequestScheduler {
             ready_after: request.last_use,
         };
         let history = request.history.clone();
-        // Only the last selected message can be the prompt's direct parent.
-        let defer = matches!(capture.kind, BoundaryKind::Message)
-            && request.message_boundaries.last() == Some(&(capture.consumed_tokens as usize))
-            && request.prompt_tokens - (capture.consumed_tokens as usize)
-                < self.capabilities.page_tokens
-            && request.plans_prompt_capture();
+        // A close prompt checkpoint does not substitute for this message endpoint:
+        // a future request may reuse the message and then take another branch.
         let result = self.cache.publish(&history, &proposal)?;
         if let PublishResult::Created { id, ready } = result {
             if !ready {
                 return Err("completed boundary copy was not GPU-ready".into());
             }
-            if !defer {
-                self.record_publication(id);
-            }
+            self.record_publication(id);
             self.cache.pin(id)?;
             if let Some(parent) = self.request(handle)?.prefix {
                 self.cache.unpin(parent)?;
