@@ -36,7 +36,7 @@ The design rests on a few principles:
 [vLLM](https://docs.vllm.ai/en/latest/) covers a much broader range of models,
 hardware, and deployment patterns. Flare trades that breadth for a focused
 serving contract around selected models and local workloads. Flare is not, and
-will never, be a replacement for production inference englines like vLLM.
+will never be, a replacement for production inference engines like vLLM.
 
 Think of Flare as a specialized option when its hardware and model coverage
 fit your machine.
