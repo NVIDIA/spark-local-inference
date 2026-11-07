@@ -12,7 +12,7 @@ from ignition.recipes.muse_glimmer_nvfp4.recipe import RECIPE
 
 def test_defaults_are_the_single_gpu_text_only_declaration():
     config = PreparationConfig()
-    assert (config.device, config.context, config.max_active, config.prefill_chunk_size) == (0, 131072, 4, 4096)
+    assert (config.device, config.context, config.max_active, config.prefill_chunk_size) == (0, 1048576, 4, 4096)
     assert config.language_model_only and config.image_concurrency is None
     assert not config.dflash and not config.speculative_round_shapes
     assert config.speculative_widths == RECIPE.speculation.widths == tuple(range(1, 17))
@@ -31,7 +31,7 @@ def test_image_concurrency_is_bounded_by_concurrency_when_vision_is_prepared():
 
 
 @pytest.mark.parametrize("fault", [
-    dict(device=-1), dict(context=131072 + 128), dict(context=131000), dict(context=64),
+    dict(device=-1), dict(context=1048576 + 128), dict(context=131000), dict(context=64),
     dict(prefill_chunk_size=96), dict(prefill_chunk_size=8192, context=4096),
     dict(snapshot_budget_bytes=0), dict(headroom_bytes=-1), dict(max_active=0),
     dict(dflash=True), dict(speculative_widths=()), dict(speculative_widths=tuple(range(1, 18))),

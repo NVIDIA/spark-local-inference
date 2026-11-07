@@ -60,7 +60,9 @@ RECIPE = Recipe(name="muse_glimmer_nvfp4", served_model_name="Muse-Glimmer-30B",
         # the export inventory's 28,885.60 MiB of resident weights exceeds that by the expanded block scales.
         stored_bytes=23_380_728_424, device_bytes=28_492_369_664, expansion_bytes=1_796_377_242,
         draft_bytes=5_544_328_424),),
-    context=131072, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=15, prefill_chunk=4096,
+    # Declared context 1,048,576 over the native 131,072; no rope scaling — the sliding layers are bounded at 2048
+    # and the full layers carry no positional encoding, so the window is page-bound (ignition/planning.py).
+    context=1048576, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=15, prefill_chunk=4096,
     # The packed round catalog is bounded by `graph_budget` (64 rounds: 29 + 21 + 14 across batches 4, 2, 1); the
     # rebuild manifest requires it declared.
     speculation=Speculation(draft_tokens=15, token_capacity=64, packed_verification=True, graph_budget=64),

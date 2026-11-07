@@ -1201,7 +1201,9 @@ checkpoint. Preparation uses one
 SM120 GPU, the checkpoint's NVFP4 text projections (q/k/v fused, the attention
 gate as its own projection, mlp gate/up fused; the ModelOpt `config_groups`
 metadata selects them and the `model-inputscales.safetensors` shard is read
-through the checkpoint index), FP8 E4M3 KV storage, a 131072-token context,
+through the checkpoint index), FP8 E4M3 KV storage, a 1,048,576-token declared context (native 131,072; no
+rope scaling — the sliding layers are bounded at 2048 and the full layers carry
+no positional encoding),
 four concurrent requests, and 4096-token prefill chunks. The 52 layers alternate
 39 sliding-window layers (2048 tokens, rope 500000) with 13 full-context layers
 without positional encoding; the sigmoid attention gate multiplies the raw

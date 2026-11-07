@@ -16,9 +16,11 @@ bidirectional attention under the inclusive 2048-token sliding mask, the final n
 times the target's ``output_multiplier`` under its softcap, and the rank-256 top-16 candidate
 selector walked greedily over the block.
 
-Tolerance (BF16 accumulation order through five layers): relative L2 at most 2e-2 on the
-block's normalized hidden states and on its softcapped FP32 logits, over the fifteen proposal
-rows and over the anchor row.
+Tolerance (BF16 accumulation order through five layers): relative L2 at most 4e-2 on the
+block's normalized hidden states and at most 2e-2 on its softcapped FP32 logits, over the
+fifteen proposal rows and over the anchor row. The hidden bound is set by the oracle's own
+noise floor: recomputed under a different attention kernel it moves its block rows by up to
+3.6e-2 (rounding compounds along the two-tap chain), while its logits move by under 2e-2.
 
 Acceptance diagnostics: the prepared selector walk, the oracle's walk, the sampled drafts and
 the target's own greedy continuation (fifteen prepared decode steps after the round) are printed
@@ -42,6 +44,7 @@ from tests.recipes.muse_glimmer_nvfp4.test_reference_cuda import (
 DFLASH2_SNAPSHOT = os.environ.get("FLARE_MUSE_GLIMMER_DFLASH2")
 DFLASH2 = pytest.mark.skipif(not DFLASH2_SNAPSHOT, reason="FLARE_MUSE_GLIMMER_DFLASH2 names no DFlash2 checkpoint")
 RELATIVE_L2 = .02
+HIDDEN_RELATIVE_L2 = .04  # the oracle's measured self-noise on the block rows is 3.6e-2
 BLOCK = 16
 GROUP = 16
 
@@ -289,7 +292,7 @@ def test_width_16_round_proposes_the_dflash2_block():
               for name, span in (("anchor", slice(0, 1)), ("proposals", slice(1, BLOCK)))}
     print(dict(tokens=tokens, pending=pending, emitted=emitted, width=BLOCK, relative_l2_bound=RELATIVE_L2, **report), flush=True)
     for name, errors in report.items():
-        assert errors["hidden"] <= RELATIVE_L2 and errors["logits"] <= RELATIVE_L2, (name, errors)
+        assert errors["hidden"] <= HIDDEN_RELATIVE_L2 and errors["logits"] <= RELATIVE_L2, (name, errors)
 
     from transformers import PreTrainedTokenizerFast
 

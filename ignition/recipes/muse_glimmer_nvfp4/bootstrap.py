@@ -46,7 +46,8 @@ from .decoder import PreparedDecoder, PreparedResume, Scratch
 from .frontend import prepare_frontend, runtime_assets
 from .weights import ModelWeights, vision_model
 
-CONTEXT = 131072
+# Native 131,072; no rope scaling — sliding layers are bounded at 2048 and full layers carry no positional encoding.
+CONTEXT = 1048576
 MAX_WIDTH = 16  # the DFlash2 drafter's block: 15 drafts and the pending token
 
 

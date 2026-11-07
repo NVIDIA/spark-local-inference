@@ -96,7 +96,7 @@ def test_quantization_covers_the_eight_text_projections_per_layer_only(config):
 
 def test_declaration_matches_the_layout(config):
     shard = TensorParallelShard(0, 1)
-    assert (RECIPE.context, RECIPE.concurrency, RECIPE.page_tokens, RECIPE.max_draft_tokens) == (131072, 4, 128, 15)
+    assert (RECIPE.context, RECIPE.concurrency, RECIPE.page_tokens, RECIPE.max_draft_tokens) == (1048576, 4, 128, 15)
     assert RECIPE.max_images == 4 and RECIPE.language_model_only
     assert RECIPE.checkpoints[0].alias == "muse-glimmer-30b-nvfp4"
     assert continuation_layout(config, shard).row_bytes == RECIPE.costs(1, None).state_row_bytes
