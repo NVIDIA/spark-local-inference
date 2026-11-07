@@ -32,7 +32,7 @@ RECIPE = Recipe(
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=7, verification_rows=0, max_images=4, image_bytes=32 << 20,
-    online_mxfp8=True, stream_overlap=True, language_model_only=True,
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"), stream_overlap=True, language_model_only=True,
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     # Graph storage is a planning allowance; actual graph memory is reported after preparation.
     ranks=MappingProxyType({16: RankCosts(state_row_bytes=33_238_272, page_bytes=2_912_256,

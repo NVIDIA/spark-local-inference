@@ -2725,6 +2725,8 @@ fn rebuild_compatible(
         && a.local_checkpoint == b.local_checkpoint
         && a.expert_scale_compression == b.expert_scale_compression
         && a.online_mxfp8 == b.online_mxfp8
+        && (if a.online_mxfp8_scope.is_empty() { "all" } else { &a.online_mxfp8_scope })
+            == (if b.online_mxfp8_scope.is_empty() { "all" } else { &b.online_mxfp8_scope })
         && a.language_model_only == b.language_model_only
         && a.mla_compute_mode == b.mla_compute_mode
         && speculation(&a.speculation) == speculation(&b.speculation)
@@ -7099,7 +7101,12 @@ mod tests {
             second_identity
         );
 
-        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 8] = [
+        let omitted_scope = rebuild("same-code");
+        let mut explicit_scope = omitted_scope.clone();
+        explicit_scope.online_mxfp8_scope = "all".into();
+        assert!(rebuild_compatible(&Some(omitted_scope), &Some(explicit_scope)));
+
+        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 9] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),
             ("checkpoint-revision", |value| value.checkpoint_revision = "other".into()),
             ("local-checkpoint", |value| value.local_checkpoint = true),
@@ -7108,6 +7115,7 @@ mod tests {
                 value.expert_scale_compression = Some("native".into())
             }),
             ("online-mxfp8", |value| value.online_mxfp8 = false),
+            ("online-mxfp8-scope", |value| value.online_mxfp8_scope = "kda-input".into()),
             ("language-model-only", |value| value.language_model_only = true),
             ("mla-compute-mode", |value| value.mla_compute_mode = "sparse".into()),
         ];

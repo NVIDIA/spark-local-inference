@@ -48,14 +48,15 @@ def test_kimi_selection_rejects_unavailable_geometry(changes, match):
         PreparationConfig(**options)
 
 
-def test_kimi31_adapter_passes_benchmark_selection_and_precision(monkeypatch, tmp_path):
+@pytest.mark.parametrize("scope", ["all", "kda-input"])
+def test_kimi31_adapter_passes_benchmark_selection_and_precision(monkeypatch, tmp_path, scope):
     from ignition.recipes import resolve
     from .test_declarations import fitted
 
     model = resolve("kimi-k3.1-pro")
     selection = BenchmarkSelection(batches=(8,), contexts=(2048,), width=8)
     plan = replace(fitted(model, 16, concurrency=8), benchmark_selection=selection,
-        speculation=replace(model.recipe.speculation, token_capacity=64), online_mxfp8=True,
+        speculation=replace(model.recipe.speculation, token_capacity=64), online_mxfp8=True, online_mxfp8_scope=scope,
         language_model_only=False, autotune_effort="default")
     (tmp_path / "dspark").mkdir()
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
@@ -67,6 +68,7 @@ def test_kimi31_adapter_passes_benchmark_selection_and_precision(monkeypatch, tm
     assert config.max_active == 8 and config.speculative_token_capacity == 64
     assert config.autotune_effort == "default" and config.compile_decoder
     assert config.vision and config.online_mxfp8 and config.context_parallel
+    assert config.online_mxfp8_scope == scope
     assert config.sampling_defaults == model.recipe.sampling_defaults.as_dict()
     assert Path(config.frontend_template).parts[-3:] == ("kimi31", "assets", "chat_template.jinja")
 
