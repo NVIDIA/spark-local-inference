@@ -96,8 +96,10 @@ impl PatchProcessor {
             interpolation_indices: Vec::new(),
             interpolation_weights: Vec::new(),
             cu_seqlens: vec![0],
+            cu_window_seqlens: vec![],
+            reverse_index: vec![],
         };
-        result.reserve_outputs(total, FEATURES, false, images.len(), images.len() + 1)?;
+        result.reserve_outputs(total, 3 * 2 * self.patch_size * self.patch_size, false, images.len(), images.len() + 1)?;
         let normalized: [Vec<f32>; 3] = std::array::from_fn(|channel| {
             (0..256)
                 .map(|value| match self.normalization {

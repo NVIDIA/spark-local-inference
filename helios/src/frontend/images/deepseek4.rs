@@ -128,6 +128,8 @@ pub(super) fn pack(
         interpolation_indices: Vec::new(),
         interpolation_weights: Vec::new(),
         cu_seqlens: vec![0],
+        cu_window_seqlens: vec![],
+        reverse_index: vec![],
     };
     output.reserve_outputs(total, FEATURES, false, images.len(), images.len() + 1)?;
     for image in images {

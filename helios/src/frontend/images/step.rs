@@ -179,6 +179,8 @@ pub(super) fn process(limits: ImageLimits, images: &[RgbImage]) -> Result<Proces
         interpolation_indices: vec![],
         interpolation_weights: vec![],
         cu_seqlens: vec![0],
+        cu_window_seqlens: vec![],
+        reverse_index: vec![],
     };
     let patches = result.geometry.iter().map(|g| g.patches).sum();
     let sequences = 1 + result.geometry.iter().map(|g| (g.grid_thw[1] * g.grid_thw[2]) as usize + 1).sum::<usize>();

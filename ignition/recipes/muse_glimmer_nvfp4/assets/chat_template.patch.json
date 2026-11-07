@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "original-el8/Muse-Glimmer-30B-NVFP4",
+    "revision": "b47e1e9f77d9a86e18cda5e318c68c632a7fbe59",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678",
+  "result_sha256": "16eef5dd60244db14458243ae874e018957d427b9e3b6b75b74e68a7fd25d106",
+  "insertions": [
+    6247,
+    9896
+  ]
+}

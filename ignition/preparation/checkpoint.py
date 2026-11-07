@@ -389,12 +389,15 @@ def _inspect_indexed_checkpoint(snapshot: Path, index: dict) -> IndexedCheckpoin
     missing = weight_map.keys() - tensors.keys()
     if missing:
         raise CheckpointError(f"indexed tensor missing from shards: {min(missing)}")
-    total = sum(tensor.nbytes for tensor in tensors.values())
+    # Transformers writes the tensor payload sum; the ModelOpt exporter writes the shard file-size sum.
+    payload = sum(tensor.nbytes for tensor in tensors.values())
+    files = sum(shard.file_size for shard in shards)
     if (
         not isinstance(index.get("metadata"), dict)
-        or index["metadata"].get("total_size") != total
+        or index["metadata"].get("total_size") not in (payload, files)
     ):
-        raise CheckpointError(f"index total_size does not match tensor payload bytes: {total}")
+        raise CheckpointError("index total_size matches neither the tensor payload bytes "
+                              f"({payload}) nor the indexed shard file bytes ({files})")
     return IndexedCheckpoint(snapshot, MappingProxyType(tensors), tuple(shards))
 
 

@@ -42,11 +42,10 @@ def prepare_frontend(snapshot, *, eos_token_ids):
     return _prepare_frontend(snapshot, eos_token_ids=list(dict.fromkeys([*eos_token_ids, 200001, 200008])))
 
 
-def runtime_assets(snapshot):
+def runtime_assets(snapshot, patch=Path(__file__).with_name("assets") / "chat_template.patch.json"):
     snapshot = Path(snapshot)
     tokenizer = snapshot / "tokenizer.json"
     with tokenizer.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     return {"tokenizer": {"path": str(tokenizer), "sha256": digest},
-            "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
-                Path(__file__).with_name("assets") / "chat_template.patch.json")}
+            "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(), patch)}

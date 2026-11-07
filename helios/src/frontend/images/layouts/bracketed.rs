@@ -30,6 +30,8 @@ pub(crate) fn prepare_input(
                 interpolation_indices: vec![],
                 interpolation_weights: vec![],
                 cu_seqlens: vec![0],
+                cu_window_seqlens: vec![],
+                reverse_index: vec![],
             };
             processor.expand_prompt(frontend, &rendered.text, &empty)?;
         }

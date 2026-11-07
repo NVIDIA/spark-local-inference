@@ -183,17 +183,27 @@ impl PreparedImageInput {
 
     fn valid_processed(&self, images: &ProcessedImages) -> bool {
         use super::Profile;
+        // Every profile declares its packed patch width and whether it emits position taps;
+        // no default arm, so a new profile cannot inherit another's extents.
         let pixel_width = match self.processor.profile {
             Profile::Qwen(_) | Profile::MiMo(_) => 1536,
             Profile::Radio => 768,
-            Profile::Glm => 1176,
-            _ => 588,
+            Profile::Glm | Profile::PatchMerge(_) | Profile::MuseGlimmer(_) => 1176,
+            Profile::DeepSeek4 | Profile::DeepseekRowMajor(_) | Profile::Moonvit | Profile::Step => 588,
         };
         let patches = self.geometry.patches;
-        let interpolation = matches!(
-            self.processor.profile,
-            Profile::Qwen(_) | Profile::Moonvit | Profile::Step | Profile::Radio
-        );
+        let interpolation = match self.processor.profile {
+            Profile::Qwen(_) | Profile::Moonvit | Profile::Step | Profile::Radio | Profile::MuseGlimmer(_) => true,
+            Profile::MiMo(_)
+            | Profile::PatchMerge(_)
+            | Profile::DeepSeek4
+            | Profile::DeepseekRowMajor(_)
+            | Profile::Glm => false,
+        };
+        let (windows, reverse) = match self.processor.profile {
+            Profile::MuseGlimmer(_) => (super::muse_glimmer::windows(&self.geometry) + 1, patches),
+            _ => (0, 0),
+        };
         let sequences = if matches!(self.processor.profile, Profile::Step) {
             let local = self.geometry.grid_thw[1] * self.geometry.grid_thw[2];
             (0..=local)
@@ -217,6 +227,8 @@ impl PreparedImageInput {
             && images.interpolation_indices.len() == if interpolation { patches } else { 0 }
             && images.interpolation_weights.len() == if interpolation { patches } else { 0 }
             && images.cu_seqlens == sequences
+            && images.cu_window_seqlens.len() == windows
+            && images.reverse_index.len() == reverse
     }
 
     pub fn release_decoded(&self) {
@@ -324,11 +336,13 @@ mod tests {
     use super::*;
     use crate::frontend::images::{
         DeepseekRowMajorImageSettings, ImageLimits, ImageSettings, MimoImageSettings,
-        QwenImageSettings,
+        MuseGlimmerImageSettings, PatchMergeImageSettings, QwenImageSettings,
     };
 
+    /// One of every `ImageSettings` variant; the match below fails to compile when a variant
+    /// is added without a row here.
     fn settings() -> Vec<ImageSettings> {
-        vec![
+        let settings = vec![
             ImageSettings::Qwen(QwenImageSettings {
                 min_pixels: 65536,
                 max_pixels: 16777216,
@@ -351,7 +365,45 @@ mod tests {
             ImageSettings::Moonvit {},
             ImageSettings::Step {},
             ImageSettings::Radio {},
-        ]
+            ImageSettings::Glm {},
+            ImageSettings::PatchMerge(PatchMergeImageSettings {
+                patch_size: 14,
+                min_pixels: 3136,
+                max_pixels: 451584,
+                image_mean: [0.48145466, 0.4578275, 0.40821073],
+                image_std: [0.26862954, 0.26130258, 0.27577711],
+                image_token: "image".into(),
+                start_token: "start".into(),
+                end_token: "end".into(),
+            }),
+            ImageSettings::MuseGlimmer(MuseGlimmerImageSettings {
+                patch_size: 14,
+                merge_size: 2,
+                max_image_tokens: 4096,
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+                image_token: "<|patch|>".into(),
+                start_token: "<|image_start|>".into(),
+                end_token: "<|image_end|>".into(),
+            }),
+        ];
+        let mut covered = [false; 10];
+        for variant in &settings {
+            covered[match variant {
+                ImageSettings::Qwen(_) => 0,
+                ImageSettings::Mimo(_) => 1,
+                ImageSettings::PatchMerge(_) => 2,
+                ImageSettings::Deepseek4 {} => 3,
+                ImageSettings::DeepseekRowMajor(_) => 4,
+                ImageSettings::Moonvit {} => 5,
+                ImageSettings::Step {} => 6,
+                ImageSettings::Radio {} => 7,
+                ImageSettings::Glm {} => 8,
+                ImageSettings::MuseGlimmer(_) => 9,
+            }] = true;
+        }
+        assert!(covered.iter().all(|c| *c));
+        settings
     }
 
     fn processor(settings: ImageSettings) -> Arc<ImageProcessor> {
@@ -486,7 +538,45 @@ mod tests {
                 "{settings:?}"
             );
             assert_eq!(actual.cu_seqlens, expected.cu_seqlens, "{settings:?}");
+            assert_eq!(actual.cu_window_seqlens, expected.cu_window_seqlens, "{settings:?}");
+            assert_eq!(actual.reverse_index, expected.reverse_index, "{settings:?}");
             assert_eq!(processor.preparation_counts().prepared_images, 2);
+        }
+    }
+
+    /// Every profile's declared width and taps accept its own output: a wildcard arm in
+    /// `valid_processed` once sized PatchMerge at 588 and rejected every materialization.
+    #[cfg(feature = "server")]
+    #[test]
+    fn every_image_settings_variant_materializes_through_the_cache_path() {
+        let store = flare_selene::input::InputStore::start(
+            64 << 20,
+            None,
+            flare_selene::input::DiskBudget::new(0, 0),
+        )
+        .unwrap();
+        for settings in settings() {
+            let processor = processor(settings.clone());
+            let source = image(91, 37, 7);
+            let description = processor.describe_image(&source).unwrap();
+            let prepared = input(
+                processor.clone(),
+                processor.encoded_source(ImageEncoding::Png, png(&source), None),
+                description,
+            );
+            let expected = processor.process(&[source]).unwrap();
+            let first = prepared.materialize_cached(Some(&store)).unwrap();
+            assert_eq!(first.encode().unwrap(), expected.encode().unwrap(), "{settings:?}");
+            assert_eq!(first.pixel_values.len(), prepared.geometry.patches * match settings {
+                ImageSettings::Qwen(_) | ImageSettings::Mimo(_) => 1536,
+                ImageSettings::Radio {} => 768,
+                ImageSettings::Glm {} | ImageSettings::PatchMerge(_) | ImageSettings::MuseGlimmer(_) => 1176,
+                ImageSettings::Deepseek4 {} | ImageSettings::DeepseekRowMajor(_)
+                | ImageSettings::Moonvit {} | ImageSettings::Step {} => 588,
+            }, "{settings:?}");
+            let cached = prepared.materialize_cached(Some(&store)).unwrap();
+            assert_eq!(cached.encode().unwrap(), first.encode().unwrap(), "{settings:?}");
+            assert_eq!(processor.preparation_counts().prepared_images, 1, "{settings:?}");
         }
     }
 
@@ -741,7 +831,7 @@ mod tests {
 
     #[test]
     fn malformed_binary_records_cannot_allocate_from_unbounded_counts() {
-        let mut bytes = b"FLAREIMG\x01".to_vec();
+        let mut bytes = b"FLAREIMG\x02".to_vec();
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(ProcessedImages::decode(&bytes).is_err());
         let valid = ProcessedImages::default().encode().unwrap();

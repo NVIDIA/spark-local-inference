@@ -76,6 +76,43 @@ struct Axis {
     precision: u32,
 }
 
+#[derive(Clone, Copy)]
+enum Filter {
+    Cubic,
+    Linear,
+    /// Lanczos with `a = 3`, PyTorch's `lanczos_filter` (also Pillow's `LANCZOS`).
+    Lanczos,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Self::Cubic => 2.0,
+            Self::Linear => 1.0,
+            Self::Lanczos => 3.0,
+        }
+    }
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            Self::Cubic => cubic(x),
+            Self::Linear => (1.0 - x.abs()).max(0.0),
+            Self::Lanczos => lanczos3(x),
+        }
+    }
+}
+
+fn lanczos3(x: f64) -> f64 {
+    const A: f64 = 3.0;
+    if x == 0.0 {
+        return 1.0;
+    }
+    if x.abs() >= A {
+        return 0.0;
+    }
+    let x = x * std::f64::consts::PI;
+    A * x.sin() * (x / A).sin() / (x * x)
+}
+
 fn cubic(x: f64) -> f64 {
     let x = x.abs();
     if x < 1.0 {
@@ -87,9 +124,9 @@ fn cubic(x: f64) -> f64 {
     }
 }
 
-fn axis(input: usize, output: usize, pillow: bool, linear: bool) -> Axis {
+fn axis(input: usize, output: usize, pillow: bool, filter: Filter) -> Axis {
     let scale = input as f64 / output as f64;
-    let support = (if linear { 1.0 } else { 2.0 }) * scale.max(1.0);
+    let support = filter.support() * scale.max(1.0);
     let inverse_scale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
     let max_taps = support.ceil() as usize * 2 + 1;
     let mut maximum = 0.0f64;
@@ -101,12 +138,7 @@ fn axis(input: usize, output: usize, pillow: bool, linear: bool) -> Axis {
             let count = (end - start).min(max_taps);
             let mut weights: Vec<_> = (0..count)
                 .map(|j| {
-                    let x = (j as f64 + start as f64 - center + 0.5) * inverse_scale;
-                    if linear {
-                        (1.0 - x.abs()).max(0.0)
-                    } else {
-                        cubic(x)
-                    }
+                    filter.weight((j as f64 + start as f64 - center + 0.5) * inverse_scale)
                 })
                 .collect();
             let sum: f64 = weights.iter().sum();
@@ -154,30 +186,37 @@ fn axis(input: usize, output: usize, pillow: bool, linear: bool) -> Axis {
 }
 
 pub(super) fn resize(input: &RgbImage, width: usize, height: usize) -> Vec<u8> {
-    resample(input, width, height, false, false)
+    resample(input, width, height, false, Filter::Cubic)
+}
+
+/// Antialiased Lanczos (`a = 3`) resampling as torchvision's `InterpolationMode.LANCZOS`
+/// runs it on CPU uint8 tensors: PyTorch's separable antialiased kernel, horizontal pass
+/// then vertical, each rounded to uint8.
+pub(super) fn lanczos(input: &RgbImage, width: usize, height: usize) -> Vec<u8> {
+    resample(input, width, height, false, Filter::Lanczos)
 }
 
 pub(super) fn pillow(input: &RgbImage, width: usize, height: usize) -> Vec<u8> {
     // Pillow resizes vertically first only when shrinking an image taller than
     // 100 times its width. Each pass rounds to uint8, so the order affects RGB.
     if input.height > height && input.height > input.width * 100 {
-        let pixels = resample(input, input.width, height, true, false);
+        let pixels = resample(input, input.width, height, true, Filter::Cubic);
         let intermediate = RgbImage::new(input.width, height, pixels).unwrap();
-        return resample(&intermediate, width, height, true, false);
+        return resample(&intermediate, width, height, true, Filter::Cubic);
     }
-    resample(input, width, height, true, false)
+    resample(input, width, height, true, Filter::Cubic)
 }
 
 pub(super) fn bilinear(input: &RgbImage, width: usize, height: usize) -> Vec<u8> {
-    resample(input, width, height, false, true)
+    resample(input, width, height, false, Filter::Linear)
 }
 
-fn resample(input: &RgbImage, width: usize, height: usize, pillow: bool, linear: bool) -> Vec<u8> {
+fn resample(input: &RgbImage, width: usize, height: usize, pillow: bool, filter: Filter) -> Vec<u8> {
     let source = &input.pixels;
     let horizontal = if width == input.width {
         None
     } else {
-        let axis = axis(input.width, width, pillow, linear);
+        let axis = axis(input.width, width, pillow, filter);
         let mut pixels = vec![0; input.height * width * 3];
         for y in 0..input.height {
             for (x, (start, weights)) in axis.taps.iter().enumerate() {
@@ -198,7 +237,7 @@ fn resample(input: &RgbImage, width: usize, height: usize, pillow: bool, linear:
     if height == input.height {
         return source.clone();
     }
-    let axis = axis(input.height, height, pillow, linear);
+    let axis = axis(input.height, height, pillow, filter);
     let mut pixels = vec![0; height * width * 3];
     for (y, (start, weights)) in axis.taps.iter().enumerate() {
         for x in 0..width * 3 {

@@ -158,6 +158,12 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
                 Profile::Glm(_) => serde_json::json!({"glm": {}}),
+                Profile::MuseGlimmer(config) => serde_json::json!({"muse_glimmer": {
+                    "patch_size": config.patch_size, "merge_size": config.merge_size,
+                    "max_image_tokens": config.max_image_tokens,
+                    "image_mean": config.image_mean, "image_std": config.image_std,
+                    "image_token": config.image_token, "start_token": config.start_token, "end_token": config.end_token,
+                }}),
             })
         })
         .transpose()?;

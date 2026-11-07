@@ -10,7 +10,7 @@ from .frontend import FRONTEND
 from .pool import PAGE_TOKENS
 
 
-def prepare(signatures, buffers, pool, *, vocabulary, draft_lag=None):
+def prepare(signatures, buffers, pool, *, vocabulary, draft_lag=None, vision=None, frontend=FRONTEND):
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
     for kind in ("decode", "speculative"):
         if kind in inputs:
@@ -26,4 +26,5 @@ def prepare(signatures, buffers, pool, *, vocabulary, draft_lag=None):
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation,
                       tokens_per_record=1, window_tokens=0), *regions],
         graphs=c.graph_contracts(signatures, inputs, continuation=continuation,
-                                 pending=c.state_view("request_pending_token", 8), cursor=cursor), frontend=FRONTEND)
+                                 pending=c.state_view("request_pending_token", 8), cursor=cursor),
+        vision=vision, frontend=frontend)

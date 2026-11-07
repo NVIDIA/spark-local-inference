@@ -363,6 +363,7 @@ enum ImagePreparationKind {
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
   GLM_IMAGE_PREPARATION = 8;
   PATCH_MERGE_IMAGE_PREPARATION = 9;
+  MUSE_GLIMMER_IMAGE_PREPARATION = 10;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -494,7 +495,18 @@ message ImageSettings {
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
     Empty glm = 8;
     PatchMergeImageSettings patch_merge = 9;
+    MuseGlimmerImageSettings muse_glimmer = 10;
   }
+}
+message MuseGlimmerImageSettings {
+  uint32 patch_size = 1;
+  uint32 merge_size = 2;
+  uint64 max_image_tokens = 3;
+  repeated float image_mean = 4;
+  repeated float image_std = 5;
+  string image_token = 6;
+  string start_token = 7;
+  string end_token = 8;
 }
 message PatchMergeImageSettings {
   uint32 patch_size = 1;

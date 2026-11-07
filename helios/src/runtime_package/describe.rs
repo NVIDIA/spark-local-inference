@@ -284,6 +284,8 @@ pub(super) fn vision_json(
             Profile::PatchMerge(c) => json!({"profile": "patch_merge", "patch_size": c.patch_size,
                 "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::Glm(_) => json!({"profile": "glm"}),
+            Profile::MuseGlimmer(c) => json!({"profile": "muse_glimmer", "patch_size": c.patch_size,
+                "merge_size": c.merge_size, "max_image_tokens": c.max_image_tokens}),
         }
     });
     json!({

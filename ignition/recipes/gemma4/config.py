@@ -4,12 +4,10 @@
 """Structural checkpoint configuration for the Gemma 4 model family."""
 
 from dataclasses import dataclass
-import fnmatch
 import json
 from pathlib import Path
-import re
 
-from ignition.preparation.quantization import quantized_layers
+from ignition.preparation.quantization import matches_pattern, modelopt_nvfp4_layers, quantized_layers
 
 ARCHITECTURES = (
     "Gemma4ForConditionalGeneration",
@@ -513,12 +511,6 @@ def _candidate_linear_names(config: ModelConfig) -> list[str]:
     return names
 
 
-def _matches_pattern(name: str, pattern: str) -> bool:
-    if pattern.startswith("re:"):
-        return bool(re.search(pattern[3:], name))
-    return fnmatch.fnmatchcase(name, pattern)
-
-
 def _parse_quantization(raw: dict, config: ModelConfig) -> dict:
     quant = raw.get("quantization_config")
     if quant is None:
@@ -529,20 +521,7 @@ def _parse_quantization(raw: dict, config: ModelConfig) -> dict:
         raise ValueError(f"unsupported Gemma 4 quantization_config: {quant!r}")
     method = quant.get("quant_method")
     if method == "modelopt" and quant.get("quant_algo") == "NVFP4":
-        groups = quant.get("config_groups")
-        group_0 = groups.get("group_0") if isinstance(groups, dict) else None
-        weights = group_0.get("weights") if isinstance(group_0, dict) else None
-        if not isinstance(weights, dict) or weights.get("num_bits") != 4 or weights.get("group_size") != 16:
-            raise ValueError("Gemma 4 NVFP4 quantization requires 4-bit group_size=16 weights")
-        ignore = quant.get("ignore", ())
-        if not isinstance(ignore, list) or any(not isinstance(pattern, str) for pattern in ignore):
-            raise ValueError("Gemma 4 NVFP4 ignore list must contain glob strings")
-        entry = {"quant_algo": "NVFP4", "group_size": 16}
-        return {
-            name: entry
-            for name in _candidate_linear_names(config)
-            if not any(_matches_pattern(name, pattern) for pattern in ignore)
-        }
+        return modelopt_nvfp4_layers(raw, _candidate_linear_names(config))
     if method == "compressed-tensors":
         groups = quant.get("config_groups")
         ignore = quant.get("ignore", ())
@@ -573,10 +552,10 @@ def _parse_quantization(raw: dict, config: ModelConfig) -> dict:
             group_specs.append((tuple(targets), spec))
         result = {}
         for name in _candidate_linear_names(config):
-            if any(_matches_pattern(name, pattern) for pattern in ignore):
+            if any(matches_pattern(name, pattern) for pattern in ignore):
                 continue
             for targets, spec in group_specs:
-                if any(_matches_pattern(name, pattern) for pattern in targets):
+                if any(matches_pattern(name, pattern) for pattern in targets):
                     result[name] = spec
                     break
         return result

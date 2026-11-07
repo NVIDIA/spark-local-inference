@@ -19,11 +19,12 @@ from unittest import mock
 import pytest
 
 from ignition.preparation import checkpoint_source as transport
-from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.checkpoint import CheckpointError, inspect_indexed_checkpoint
 from ignition.preparation.runtime_package import FileSource
 
 
-def checkpoint(directory):
+def checkpoint(directory, *, total_size=None):
+    """Write one shard; ``total_size`` defaults to the tensor payload sum Transformers records."""
     directory.mkdir()
     selected, unused = bytes(range(32)), b"unrequested-engram" * 8192
     header = json.dumps({"selected": {"dtype": "U8", "shape": [4, 8], "data_offsets": [0, 32]},
@@ -32,9 +33,21 @@ def checkpoint(directory):
     (directory / "weights.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + selected + unused)
     (directory / "config.json").write_text('{}')
     (directory / "model.safetensors.index.json").write_text(json.dumps({
-        "metadata": {"total_size": 32 + len(unused)},
+        "metadata": {"total_size": 32 + len(unused) if total_size is None else total_size},
         "weight_map": {"selected": "weights.safetensors", "engram": "weights.safetensors"}}))
     return len(header) + 8
+
+
+def test_index_total_size_accepts_payload_or_shard_file_bytes(tmp_path):
+    """The ModelOpt exporter records the shard file-size sum where Transformers records the payload sum."""
+    payload = 32 + len(b"unrequested-engram" * 8192)
+    header_bytes = checkpoint(tmp_path / "payload")
+    assert inspect_indexed_checkpoint(tmp_path / "payload").shards[0].file_size == header_bytes + payload
+    checkpoint(tmp_path / "files", total_size=header_bytes + payload)
+    assert inspect_indexed_checkpoint(tmp_path / "files").tensors["selected"].nbytes == 32
+    checkpoint(tmp_path / "other", total_size=payload + 1)
+    with pytest.raises(CheckpointError, match=rf"payload bytes \({payload}\).*file bytes \({header_bytes + payload}\)"):
+        inspect_indexed_checkpoint(tmp_path / "other")
 
 
 @contextmanager
