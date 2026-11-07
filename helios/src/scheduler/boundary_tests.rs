@@ -683,7 +683,7 @@ fn message_boundaries_must_be_ordered_unique_and_within_the_prompt() {
 }
 
 #[test]
-fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
+fn host_offers_message_endpoints_even_when_a_prompt_is_nearby() {
     let page_tokens = 64;
     for gap in [page_tokens - 1, page_tokens] {
         for output in [1, 3] {
@@ -697,10 +697,9 @@ fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
             stop_at_capture(&mut s, h, message as u64);
             run_step(&mut s);
             let message_id = s.request(h).unwrap().prefix.unwrap();
-            let deferred = gap < page_tokens && output > 1;
             let offered = s.take_publications();
-            assert_eq!(offered.len(), if deferred { 1 } else { 2 });
-            let root = offered[0].key;
+            assert_eq!(offered.len(), 2);
+            assert_eq!(offered[1].id, message_id);
             let terminal = finish(&mut s, h);
             let offered = s.take_publications();
             if output > 1 {
@@ -709,11 +708,7 @@ fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
                 assert_eq!(p.key.consumed_tokens, prompt as u64);
                 assert_eq!(
                     p.parent,
-                    Some(if deferred {
-                        root
-                    } else {
-                        s.cache.checkpoint(message_id).unwrap().prefix()
-                    })
+                    Some(s.cache.checkpoint(message_id).unwrap().prefix())
                 );
                 let start = p.parent.unwrap().consumed_tokens as usize / page_tokens;
                 assert_eq!(p.tail(), &s.cache.page_chain(p.id).unwrap()[start..]);
@@ -732,17 +727,20 @@ fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
 }
 
 #[test]
-fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
+fn message_endpoint_is_offered_eagerly_and_terminal_on_exact_resume() {
     let mut s = scheduler_with_concurrency(16, false, 64, 1);
     s.enable_publications();
     let h = s.admit(spec(Some(127), 129, 3)).unwrap();
     stop_at_capture(&mut s, h, 127);
     run_step(&mut s);
     let message = s.request(h).unwrap().prefix.unwrap();
-    assert!(s.take_publications().is_empty());
+    let offered = s.take_publications();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].id, message);
     let terminal = finish(&mut s, h);
     let prompt = s.take_publications().pop().unwrap();
-    assert_eq!((prompt.parent, prompt.tail_pages), (None, 2));
+    let message_key = s.cache.checkpoint(message).unwrap().prefix();
+    assert_eq!((prompt.parent, prompt.tail_pages), (Some(message_key), 1));
     for id in [message, terminal] {
         let key = s.cache.checkpoint(id).unwrap().prefix();
         let mut request = spec(None, 1, 1);
@@ -759,8 +757,12 @@ fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
         let h = s.admit_planned(request.clone(), plan, None).unwrap().handle;
         assert_eq!(s.request(h).unwrap().prefix, Some(id));
         let offered = s.take_publications();
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0].id, id);
+        if id == message {
+            assert!(offered.is_empty()); // Already offered at capture.
+        } else {
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].id, id);
+        }
         assert!(s.cache.checkpoint(id).unwrap().pin_count() > 0);
         assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
         assert_eq!(s.plan().unwrap().kind, GraphKind::Resume);
@@ -772,7 +774,7 @@ fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
 }
 
 #[test]
-fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
+fn eager_message_offer_survives_missing_prompt_capture() {
     for cancel in [false, true] {
         let mut s = scheduler_with_concurrency(3, false, 64, 1);
         s.enable_publications();
@@ -780,7 +782,9 @@ fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
         stop_at_capture(&mut s, h, 127);
         run_step(&mut s);
         let message = s.request(h).unwrap().prefix.unwrap();
-        assert!(s.take_publications().is_empty());
+        let offered = s.take_publications();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, message);
         // Other requests reserve all remaining rows, so the planned prompt copy skips.
         let held: Vec<_> = (0..2).map(|_| s.reserve_snapshot(0).unwrap()).collect();
         if cancel {
@@ -791,10 +795,7 @@ fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
             assert!(s.cache.checkpoint(message).unwrap().pin_count() > 0);
             assert_eq!(s.stats().prompt_checkpoints, 0);
         }
-        let offered = s.take_publications();
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0].id, message);
-        assert_eq!(offered[0].tail_pages, 1);
+        assert!(s.take_publications().is_empty());
         if !cancel {
             assert_eq!(finish(&mut s, h), message);
             assert!(s.take_publications().is_empty());
@@ -806,7 +807,7 @@ fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
 }
 
 #[test]
-fn only_the_last_selected_message_can_be_shadowed_by_the_prompt() {
+fn all_selected_message_boundaries_are_offered() {
     let mut s = scheduler_with_concurrency(16, false, 64, 1);
     s.enable_publications();
     let mut request = spec(None, 130, 3);
@@ -818,6 +819,6 @@ fn only_the_last_selected_message_can_be_shadowed_by_the_prompt() {
             .iter()
             .map(|p| p.key.consumed_tokens)
             .collect::<Vec<_>>(),
-        [127, 130]
+        [127, 129, 130]
     );
 }
