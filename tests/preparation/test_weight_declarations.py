@@ -668,3 +668,29 @@ def test_misc_preserves_stable_and_tuned_storage_classes():
     misc = {view['name']: view['storage'] for view in declaration['views'] if view['group'] == 'misc'}
     assert misc == {'weights.embedding': STABLE, 'weights.head': STABLE,
                     "weights.vision['patch']": STABLE, 'weights.draft': TUNED}
+
+
+def test_declared_container_fields_exist_on_their_dataclasses():
+    """Every declared field of a recipe dataclass container must be a field of that class.
+
+    `declared_views` reads declared fields with `getattr`, so a field the class
+    does not define fails every export of that recipe at manifest time.
+    """
+    from dataclasses import fields, is_dataclass
+    import importlib
+
+    import ignition.components.weights  # noqa: F401  (registers the shared declarations)
+    from ignition.preparation.rebuild_manifest import CONTAINER_FIELDS
+
+    missing = {}
+    for key, declared in CONTAINER_FIELDS.items():
+        module, _, name = key.rpartition('.')
+        if not module.startswith('ignition.'):
+            continue
+        cls = getattr(importlib.import_module(module), name)
+        if not is_dataclass(cls):
+            continue
+        absent = [field for field in declared if field not in {f.name for f in fields(cls)}]
+        if absent:
+            missing[key] = absent
+    assert not missing, missing
