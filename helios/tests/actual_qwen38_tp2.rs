@@ -18,7 +18,7 @@ use std::{
 };
 
 use flare_helios::package::{
-    cache, derivation, naming, progress, protection, reader, schema::wire,
+    cache, derivation, naming, prepared_weights, progress, protection, reader, schema::wire,
 };
 use flare_helios::runtime_package::Publisher;
 use prost::Message as _;
@@ -621,7 +621,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let mut empty_source_view_bytes = 0u64;
     let mut unavailable_views = Vec::new();
     for rank in tp2_verified.ranks() {
-        if let Some(catalog) = &rank.prepared_weights {
+        if let Some(catalog) = prepared_weights::catalog(rank).unwrap() {
             unavailable_views.extend(catalog.unavailable.iter().cloned());
             for view in &catalog.views {
                 weight_views += 1;
@@ -903,7 +903,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let mut view_independent_bytes = 0u64;
     let mut view_uninitialized_padding_bytes = 0u64;
     for rank in installed_verified.ranks() {
-        let Some(catalog) = &rank.prepared_weights else {
+        let Some(catalog) = prepared_weights::catalog(rank).unwrap() else {
             continue;
         };
         for view in &catalog.views {

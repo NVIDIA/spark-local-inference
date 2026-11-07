@@ -50,7 +50,38 @@ before the session's capture guard forbids further kernel resolution.
   the owning rank. Preserve native mutations, storage aliases, and stream dependencies;
   bind process-local kernel handles and caller-owned tensors at startup. Complete
   b12x preparation, tuning, binding refresh, and compiled warmup before capturing
-  each serving graph. Retain compiled kernel owners until native replay has drained.
+  each serving graph. Warm the complete selected catalog before retaining a serving graph.
+  Package-backed eager warmups release their transient pools before capture, so
+  their workspaces do not coexist with retained graph intermediates. Ranks
+  synchronize before each warmup and each capture. Retain compiled kernel owners
+  until native replay has drained.
+
+`ignition.runtime_patches.apply()` installs process-local Dynamo, Inductor, and
+Triton fixes after dependency environment setup and before compilation or artifact
+loading. It requires Torch 2.14.1+cu132 and Triton 3.8.0, checks replacement source
+contexts, and leaves dependency files unchanged. Spawned preparation ranks and
+tuning replicas install the fixes before GPU setup. Dependency worker hooks cover
+b12x's offline compiler initializer, Inductor's subprocess sidecar and job workers,
+and direct spawned Inductor workers. The lightweight Triton bootstrap does not
+import Torch or initialize CUDA.
+
+The runtime patches defer mutation-region recomputation during single-node
+auto-functionalization decomposition, directly construct eligible no-clone
+custom-op decompositions, avoid scheduler membership-set copies, and defer
+input-mutation stream checks until a trace records an event. Event recording
+restarts tracing with complete mutation checks. Required clones and stream
+ordering checks remain active.
+
+Static Triton launchers preserve cooperative CUDA attributes and discard
+process-local launcher bindings when serialized. Their cache filenames follow
+Triton's 150-character limit without truncating CUDA symbol names. Scheduler
+template replacement rebuilds dependencies after mutation renaming, and Triton
+helper compilation derives host identity without launching a subprocess.
+
+The runtime patch implementation contributes to both Ignition forward cache
+keys and Torch's compiler cache tag. Changing it invalidates compiled forwards
+and Torch graph caches. Captured packages execute independently of these Python
+patches.
 
 ## Runtime package export
 
@@ -134,6 +165,10 @@ incompatible metadata is an error, with no live-weight fallback.
   available system RAM. Recipes pass byte headroom, not hardware flags. Forward
   compilation uses memory-bounded parallel workers on both integrated and discrete
   GPUs; artifact binding starts no additional compiler pool.
+  Kernel tuning admits candidates under one scratch limit shared by participating
+  ranks, after reserving headroom, tuning growth, and pending persistent storage.
+  Envelope sizing and candidate races use the same admissible configurations;
+  concurrent branches retain their combined scratch requirement.
 
 ## Tensor-parallel compilation
 
@@ -161,7 +196,8 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   once, on a rank that selects it, from that rank's own forward; on one host, a
   rank without variants left, or without room for a compiler, compiles another
   rank's variant from that rank's traced forward metadata. Compiler pools are
-  budgeted for their host's ranks. Ranks on one host share its cache directory;
+  budgeted for their host's ranks and close when their local and borrowed work
+  finishes, before ranks exchange completion results. Ranks on one host share its cache directory;
   ranks on other hosts receive the artifacts they lack. Every rank loads the same
   artifacts, binds its tensors and native handles, and participates in ordered
   warmup and local capture. Inductor's first owner-process warmup may tune the
@@ -176,6 +212,13 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   select a variant key through `compilation_variant` on each rank. Every
   selected variant must compile before collective warmup; ranks must not retrace
   or compile on a binding mismatch.
+  Load, warm, freeze, and save one forward at a time in catalog order. Release
+  its portable compiler state and tuning registration after the cache write;
+  retain canonical kernel selections, execution guards, live kernel owners, and
+  bound storage. Standalone guards retain their full check tree and callbacks;
+  discard the unused Dynamo diff tree and duplicate debug lists, since type
+  invalidation finalizers can keep the wrapper alive for the process lifetime.
+  Complete warmup for the entire catalog before capturing any graph.
 
 ## Shape and graph-transition validation
 

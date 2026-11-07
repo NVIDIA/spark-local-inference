@@ -10,6 +10,8 @@ import math
 import random
 import statistics
 
+from .executor import BenchmarkExecutor
+
 
 @dataclass(frozen=True)
 class BenchmarkCase:
@@ -19,9 +21,9 @@ class BenchmarkCase:
     context_tokens: int
 
     def __post_init__(self):
-        if (self.batch not in (1, 2, 4) or self.width not in (8, 16)
+        if (self.batch not in (1, 2, 4, 8) or self.width not in (8, 16)
                 or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4, W=8,16, P=B*W and positive context")
+            raise ValueError("round benchmark requires B=1,2,4,8, W=8,16, P=B*W and positive context")
 
 
 @dataclass(frozen=True)
@@ -86,35 +88,6 @@ def prompt_tokens(tokenizer, length, *, seed, lane):
         if not tokens:
             raise ValueError("checkpoint tokenizer produced an empty benchmark prompt")
     return tokens[:length]
-
-
-class StateSnapshot:
-    """Same-device copies of explicitly declared persistent tensors, outside replay timing."""
-
-    def __init__(self, tensors, stream):
-        import torch
-
-        self.entries = {}
-        seen = set()
-        with torch.cuda.stream(stream), torch.no_grad():
-            for name, tensor in tensors.items():
-                if tensor.device.type != "cuda":
-                    raise ValueError(f"benchmark state {name} must be a CUDA tensor")
-                key = (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-                if key in seen:
-                    continue
-                seen.add(key)
-                saved = torch.empty_like(tensor)
-                saved.copy_(tensor, non_blocking=True)
-                self.entries[name] = (tensor, saved)
-        stream.synchronize()
-
-    def restore(self, stream):
-        import torch
-
-        with torch.cuda.stream(stream), torch.no_grad():
-            for tensor, saved in self.entries.values():
-                tensor.copy_(saved, non_blocking=True)
 
 
 def _message(scheduler, step):
@@ -310,13 +283,11 @@ def measurement_result(cases, measurements, *, warmup, repetitions, seeds, statu
     return result
 
 
-def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
+def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
     """Measure captured graphs at a real prefix, restoring state before every replay."""
-    import torch
-
-    from ignition.direct.executor import StepRunner
     from ignition.direct.scheduler import Layout
 
+    model = getattr(prepared, "model", prepared)
     cases, seeds = tuple(scenarios), tuple(seeds)
     if not cases or not seeds or warmup < 1 or repetitions < 1:
         raise ValueError("benchmark needs cases, seeds, positive warmup and positive repetitions")
@@ -336,7 +307,7 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
         _round_shape = ("speculative", case.batch, case.width, case.packed_tokens)
         if sum(shape[:4] == _round_shape for shape in layout.packed_shapes) != 1:
             raise ValueError(f"benchmark case has no unique prepared round: {case}")
-    runner = StepRunner(model, eager=False)
+    runner = BenchmarkExecutor(prepared)
     measurements = [[] for _ in cases]
 
     def result(status, failure=None):
@@ -351,17 +322,14 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                 samples.append(dict(seed=seed, times_ms=times))
                 generation += 1
                 baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
-                snapshot = StateSnapshot(model.benchmark_state, runner.stream)
+                runner.snapshot()
                 for iteration in range(-1, warmup + repetitions):
                     scheduler = deepcopy(baseline, {id(layout): layout})
-                    snapshot.restore(runner.stream)
+                    runner.restore()
                     step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
-                    allocated = torch.cuda.memory_allocated(runner.device)
                     elapsed = runner.run(_message(scheduler, step))
                     if iteration >= warmup:
                         times.append(elapsed / 1e6)
-                    if torch.cuda.memory_allocated(runner.device) != allocated:
-                        raise RuntimeError("captured benchmark replay changed allocated CUDA memory")
                     records = _complete(model, runner, scheduler, step, elapsed)
                     _check_request_state(model, step, records)
                     if isinstance(case, PrefillCase) and any(
@@ -374,9 +342,8 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                             samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
                 if progress is not None:
                     progress(result("running"))
-                snapshot.restore(runner.stream)
-                runner.stream.synchronize()
-                del snapshot
+                runner.restore()
+                runner.release_snapshot()
     except BaseException as error:
         if progress is not None:
             try:

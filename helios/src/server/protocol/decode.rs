@@ -152,6 +152,7 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
                             id: optional_id(call, "id")?,
                             name: field(&call["function"], "name")?.into(),
                             arguments: arguments(&call["function"]["arguments"])?,
+                            arguments_source: call["function"]["arguments"].as_str().map(str::to_owned),
                         });
                     }
                 }
@@ -192,6 +193,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                         id: Some(field(block, "id")?.into()),
                         name: field(block, "name")?.into(),
                         arguments: arguments(&block["input"])?,
+                        arguments_source: block["input"].as_str().map(str::to_owned),
                     }],
                     "tool_result" => vec![Part::ToolResult {
                         id: Some(field(block, "tool_use_id")?.into()),
@@ -264,6 +266,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                         item.get("namespace").and_then(Value::as_str),
                     ),
                     arguments: arguments(&item["arguments"])?,
+                    arguments_source: item["arguments"].as_str().map(str::to_owned),
                 }],
             ),
             "custom_tool_call" => (
@@ -275,6 +278,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                         item.get("namespace").and_then(Value::as_str),
                     ),
                     arguments: json!({"input":field(&item,"input")?}),
+                    arguments_source: None,
                 }],
             ),
             "function_call_output" | "custom_tool_call_output" => (
@@ -1040,6 +1044,47 @@ mod native_prompt_tests {
         )
         .unwrap();
         (frontend, compiler, config)
+    }
+
+    #[test]
+    fn tool_argument_sources_survive_protocol_decoding_and_native_preparation() {
+        let source = r#"{"z":1e2,"a":[1,  2],"z":-0,"s":"café\n"}"#;
+        let (frontend, compiler, mut config) = renderer(
+            PromptEncoder::Jinja,
+            Some(include_str!("../../../../ignition/recipes/kimi31/assets/chat_template.jinja")),
+            TemplateEncoding::TokenSegments,
+        );
+        config.contract.frontend.rejected_tokens.clear();
+        let expected_argument = "<|open|>argument key=\"z\" type=\"number\"<|sep|>";
+        for (protocol, body) in [
+            (Protocol::Chat, json!({"messages":[{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"lookup","arguments":source}}]}, {"role":"user","content":"Continue"}]})),
+            (Protocol::Responses, json!({"input":[{"type":"function_call","call_id":"a","name":"lookup","arguments":source},{"role":"user","content":"Continue"}]})),
+            (Protocol::Messages, json!({"max_tokens":4,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"lookup","input":source}]},{"role":"user","content":"Continue"}]})),
+        ] {
+            for invalid in ["{", "null", "[]", "1", r#"{"x":1} trailing"#] {
+                let mut malformed = body.clone();
+                let pointer = match protocol {
+                    Protocol::Chat => "/messages/0/tool_calls/0/function/arguments",
+                    Protocol::Responses => "/input/0/arguments",
+                    Protocol::Messages => "/messages/0/content/0/input",
+                    _ => unreachable!(),
+                };
+                *malformed.pointer_mut(pointer).unwrap() = json!(invalid);
+                let error = decode(protocol, malformed, false).err().unwrap().to_string();
+                assert!(error.contains("invalid tool arguments JSON") || error.contains("tool arguments must be a JSON object"), "{error}");
+            }
+            let decoded = decode(protocol, body, false).unwrap();
+            let Input::Conversation(messages) = &decoded.request.input else { panic!() };
+            assert!(matches!(&messages[0].parts[0], Part::ToolCall { arguments_source: Some(original), arguments, .. }
+                if original == source && arguments["a"] == json!([1,2])));
+            let prepared = crate::server::request::prepare_inference(
+                &frontend, None, &compiler, &config, &decoded.request, 0, false,
+            ).unwrap();
+            assert!(prepared.rendered_prompt.contains(&format!("{expected_argument}1e2<|close|>argument")), "{}", prepared.rendered_prompt);
+            assert!(prepared.rendered_prompt.contains(&format!("{expected_argument}-0<|close|>argument")));
+            assert!(prepared.rendered_prompt.contains("<|sep|>[1,  2]<|close|>argument"));
+            assert!(prepared.rendered_prompt.contains("<|sep|>café\n<|close|>argument"));
+        }
     }
 
     #[test]

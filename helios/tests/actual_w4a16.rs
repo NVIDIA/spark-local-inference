@@ -21,7 +21,7 @@ use std::{
 };
 
 use flare_helios::package::{
-    cache, container, conversion, derivation, protection, reader,
+    cache, container, conversion, derivation, prepared_weights, protection, reader,
     schema::wire, PayloadId,
 };
 use flare_helios::runtime_package::Publisher;
@@ -219,18 +219,22 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
     let tp2_selection = tp_selection(&tp2_metadata, &profiles, 2);
     let tp2_verified =
         protection::verify(&tp2_metadata.envelope, &profiles, tp2_selection).unwrap();
-    let (expected_reusable_weight_bytes, expected_exception_bytes) = tp2_verified
-        .ranks()
-        .iter()
-        .filter_map(|rank| rank.prepared_weights.as_ref())
-        .flat_map(|catalog| &catalog.views)
-        .fold((0u64, 0u64), |(weights, exceptions), view| {
-            if view.sources.iter().any(|source| !source.pieces.is_empty()) {
-                (weights.saturating_add(view.nbytes), exceptions)
-            } else {
-                (weights, exceptions.saturating_add(view.nbytes))
+    let mut expected_reusable_weight_bytes = 0u64;
+    let mut expected_exception_bytes = 0u64;
+    let mut has_piece_metadata = false;
+    for rank in tp2_verified.ranks() {
+        if let Some(catalog) = prepared_weights::catalog(rank).unwrap() {
+            for view in &catalog.views {
+                if view.sources.iter().any(|source| !source.pieces.is_empty()) {
+                    expected_reusable_weight_bytes = expected_reusable_weight_bytes.saturating_add(view.nbytes);
+                } else {
+                    expected_exception_bytes = expected_exception_bytes.saturating_add(view.nbytes);
+                }
+                has_piece_metadata |= view.sources.iter().any(|source|
+                    !source.pieces.is_empty() || !source.piece_encoding.is_empty());
             }
-        });
+        }
+    }
     let (expected_initializers, expected_globals) =
         initializer_snapshot(&tp2_metadata, &tp2_verified);
     assert!(
@@ -238,13 +242,7 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
         "fixture contains no rank bytes to compare"
     );
     assert!(
-        tp2_verified
-            .ranks()
-            .iter()
-            .filter_map(|rank| rank.prepared_weights.as_ref())
-            .flat_map(|catalog| &catalog.views)
-            .flat_map(|view| &view.sources)
-            .any(|source| !source.pieces.is_empty() || !source.piece_encoding.is_empty()),
+        has_piece_metadata,
         "fixture does not contain actual piece metadata"
     );
 
@@ -283,14 +281,8 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
             .find(|rank| rank.rank == expected.rank)
             .expect("combined TP2 rank missing");
         assert_eq!(
-            expected
-                .prepared_weights
-                .as_ref()
-                .map(|catalog| catalog.encode_to_vec()),
-            actual
-                .prepared_weights
-                .as_ref()
-                .map(|catalog| catalog.encode_to_vec()),
+            prepared_weights::catalog(expected).unwrap(),
+            prepared_weights::catalog(actual).unwrap(),
             "rank {} prepared weight catalog changed",
             expected.rank
         );

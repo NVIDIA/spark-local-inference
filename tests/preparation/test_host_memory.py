@@ -113,6 +113,34 @@ def test_discrete_device_budget_is_independent_of_host_ram(monkeypatch):
     assert host_memory.device_memory_info("cuda:0") == (24 << 30, 32 << 30)
 
 
+@pytest.mark.parametrize("pools", [1, 16])
+def test_candidate_scratch_leaves_device_headroom_growth_and_pending_storage(monkeypatch, pools):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    assert host_memory.candidate_scratch_limit(0, pools=pools, headroom_bytes=1 << 30,
+        pending_persistent_bytes=512 << 20) == 2560 << 20
+
+
+def test_candidate_scratch_shares_integrated_memory_between_local_ranks(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(host_memory, "device_memory_info", lambda device: (40 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
+    assert host_memory.candidate_scratch_limit(0, pools=4, headroom_bytes=1 << 30,
+        pending_persistent_bytes=512 << 20) == 6656 << 20
+
+
+def test_candidate_scratch_never_spends_reserved_memory(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    assert host_memory.candidate_scratch_limit(0, headroom_bytes=1 << 30) == 0
+
+
 @pytest.mark.parametrize("pools", [1, 2, 4])
 @pytest.mark.parametrize("race_budget", [None, 1 << 20, 64 << 30])
 def test_discrete_tuning_keeps_device_headroom_without_dividing_vram_across_ranks(

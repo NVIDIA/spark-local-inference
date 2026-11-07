@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from ignition.bench.runner import (BenchmarkCase, StateSnapshot, _check_metadata, _prefill, _round,
+from ignition.bench.executor import StateSnapshot
+from ignition.bench.runner import (BenchmarkCase, _check_metadata, _prefill, _round,
                                    acceptance_observation, measurement_result)
 
 

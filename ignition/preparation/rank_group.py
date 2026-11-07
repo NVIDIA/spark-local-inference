@@ -48,6 +48,9 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
     # Rank zero coordinates shutdown; a terminal interrupt must not end a peer mid-drain.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
+        from ignition import runtime_patches
+
+        runtime_patches.apply()
         _use_loopback()
         dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=len(config.devices),
                                 timeout=_PREPARATION_TIMEOUT)
@@ -111,6 +114,10 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             from ignition.direct.executor import serve_peer
 
             serve_peer(model, connection, **command[1])
+        elif command == "benchmark":
+            from ignition.bench.executor import serve_peer
+
+            serve_peer(model, connection)
         elif command != "close":
             raise RuntimeError("invalid prepared rank handoff")
         connection.close()
@@ -198,6 +205,16 @@ class PreparedRankGroup:
             raise RuntimeError("prepared rank group has already been consumed or closed")
         for control in self.controls:
             control.send(("direct", {"eager": eager}))
+            control.close()
+        self._started = True
+        return list(self.connections)
+
+    def start_benchmark(self):
+        """Hand every peer to restored CUDA graph measurements without native serving."""
+        if self._started or self._closed:
+            raise RuntimeError("prepared rank group has already been consumed or closed")
+        for control in self.controls:
+            control.send("benchmark")
             control.close()
         self._started = True
         return list(self.connections)

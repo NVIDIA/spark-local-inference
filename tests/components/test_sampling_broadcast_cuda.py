@@ -40,7 +40,7 @@ class SamplingRound:
                 self.verify.state.seed.view(torch.int64), self.verify.state.rng_counter.view(torch.int64))
 
 
-def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False):
+def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False, compiled=True):
     from ignition.components.draft_sampling import PreparedDraftDistribution
     from ignition.components.parallel_draft import prepare_sampling_broadcasts, prepare_sampling_scratch
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
@@ -141,7 +141,7 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                 owners.append(operation)
             session.tune(show_progress=False)
             for index, operation in enumerate(owners):
-                call = compile_forward(operation)
+                call = compile_forward(operation) if compiled else operation
                 call()
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
@@ -208,11 +208,13 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
 
 
 @pytest.mark.parametrize("world", [2, 4, 16])
-def test_native_sampling_broadcast(world, tmp_path):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_native_sampling_broadcast(world, compiled, tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     if torch.cuda.device_count() < world:
         pytest.skip(f"requires {world} assigned GPUs")
-    mp.spawn(_rank, args=(world, (tmp_path / "rendezvous").as_uri()), nprocs=world, join=True)
+    mp.spawn(_rank, args=(world, (tmp_path / "rendezvous").as_uri(), False, False, compiled),
+             nprocs=world, join=True)
 
 
 @pytest.mark.parametrize("world", [2, 4])

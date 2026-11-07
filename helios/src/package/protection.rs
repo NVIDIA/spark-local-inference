@@ -454,6 +454,7 @@ pub fn verify(
         // catalog can never authorize a later rank's slices.
         let frozen = catalog.clone();
         let mut resource_ids = BTreeSet::new();
+        let mut decoded_metadata_nbytes = 0u64;
         for rank_id in selected {
             let rank_commitment = decoded
                 .ranks
@@ -478,10 +479,23 @@ pub fn verify(
             if decoded_rank.rank != rank_id || decoded_rank.deployment_id != decoded.deployment_id {
                 return Err(invalid("rank body disagrees with its deployment"));
             }
-            let mut local = frozen.clone();
-            schema::validate_rank(&decoded_rank, count, &mut local, &mut resource_ids)?;
-            catalog.insert_all(&decoded_rank.payloads)?;
+            decoded_metadata_nbytes = decoded_metadata_nbytes.checked_add(
+                super::prepared_weights::reconstructed_rank_nbytes(&decoded_rank, body.len())?
+            ).ok_or_else(|| invalid("selected rank metadata length overflow"))?;
+            if decoded_metadata_nbytes > schema::MAX_SELECTED_RANK_METADATA {
+                return Err(invalid("selected reconstructed rank metadata exceeds its limit"));
+            }
             ranks.push(decoded_rank);
+        }
+        for decoded_rank in &ranks {
+            let mut local = frozen.clone();
+            schema::validate_rank(decoded_rank, count, &mut local, &mut resource_ids)?;
+            if decoded_rank.compressed_prepared_weights.is_some()
+                && let Some(weights) = super::prepared_weights::catalog(decoded_rank)?
+            {
+                schema::validate_rank_prepared_weights(decoded_rank, &weights)?;
+            }
+            catalog.insert_all(&decoded_rank.payloads)?;
         }
         deployment = Some(decoded);
     }
@@ -1230,6 +1244,7 @@ mod tests {
             execution: Some(runtime::Execution::default()),
             roce: None,
             prepared_weights: None,
+            compressed_prepared_weights: None,
         }
     }
 

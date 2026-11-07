@@ -53,7 +53,8 @@ class PreparedVarlenAttention:
                     name=name,
                     prepare_call=prepare,
                     benchmark_call=partial(fixtures.benchmark_call, arguments=arguments, workspace=workspace,
-                        inputs=fixtures.input_factory(arguments, storage=getattr(session, "benchmark_storage", None))),
+                        inputs=fixtures.input_factory(arguments, storage=getattr(session, "benchmark_storage", None),
+                                                      session=session)),
                 ),
             ),
         )

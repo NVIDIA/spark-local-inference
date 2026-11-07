@@ -128,6 +128,20 @@ def compile_threads(limit, *, workers, available, device_bytes=0, headroom_bytes
     return max(1, min(limit, spare // (workers * _COMPILE_THREAD_BYTES)))
 
 
+def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persistent_bytes=0):
+    """Leave physical memory for tuning fixtures, modules, and pending plan storage."""
+    import torch
+
+    available = device_memory_info(device)[0]
+    if torch.cuda.get_device_properties(device).is_integrated:
+        if os.name == "nt":
+            available = min(available, available_bytes())
+        available = (available - max(_HEADROOM_BYTES, headroom_bytes)) // pools
+    else:
+        available -= headroom_bytes
+    return max(0, available - _TUNING_GROWTH_BYTES - pending_persistent_bytes)
+
+
 def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None):
     """Size compiler pools and candidate races against their physical memory supply."""
     import torch

@@ -234,7 +234,10 @@ class PreparedStateTransfer:
         if consumed.shape != (pool.backing.shape[0], 1) or consumed.dtype != torch.int64:
             raise ValueError("state rows require one int64 consumed endpoint")
         self.state_rows = state_rows
-        self.pool, self.commands, self.tables, self.pages = pool, commands, tables, tuple(pages)
+        excluded_regions = tuple(excluded_regions)
+        excluded = set(excluded_regions)
+        self.pool, self.commands, self.tables = pool, commands, tables
+        self.pages = tuple((name, cache) for name, cache in pages if name not in excluded)
         groups, page_count = defaultdict(list), None
         names = set()
         for name, cache in self.pages:
@@ -249,7 +252,7 @@ class PreparedStateTransfer:
             groups[region.nbytes].append((cache.data_ptr(), region.offset))
         if page_count is None:
             raise ValueError("state transfer requires physical KV page bindings")
-        trailing_pages = tuple(trailing_pages)
+        trailing_pages = tuple((name, cache) for name, cache in trailing_pages if name not in excluded)
         self.trailing_tables = trailing_tables
         trailing_groups = defaultdict(list)
         if trailing_pages:

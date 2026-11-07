@@ -13,6 +13,7 @@ pub mod export;
 pub mod inverse;
 pub mod naming;
 pub mod progress;
+pub mod prepared_weights;
 pub mod protection;
 pub mod reader;
 pub mod schema;

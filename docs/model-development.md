@@ -149,6 +149,10 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   expression is the number of completed segments. For example,
   `{% mark ns.segments | length %}` refers to segment entries, not bytes in the
   serialized JSON representation. Preserve each segment's `allow_special` value.
+- Normalized image blocks carry `image_index`. A token-segment template that
+  reorders images must emit that index on each image segment, covering every
+  source exactly once. Helios applies the same order to image sources and their
+  checkpoint hints. Templates without image indices retain input image order.
 - Place marks at root output sites after a completed preamble or message.
   Marks inside macros, captured assignments, or filter blocks are forbidden;
   mark the root call site after the helper returns. Handle each output branch,

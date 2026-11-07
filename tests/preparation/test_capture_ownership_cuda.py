@@ -106,6 +106,7 @@ def test_capture_releases_serialized_artifact_and_preserves_guards_and_replay(tm
         reference = weakref.ref(artifact)
         del artifact
         assert bound.prepare_capture() > 0
+        assert bound.prepare_capture() == 0
         gc.collect()
         assert reference() is None
         assert bound.artifact.backend._serialized_artifact is None

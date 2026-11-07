@@ -18,4 +18,5 @@ include = [
     { path = "ignition/recipes/qwen38/assets/chat_template.patch.json", format = "sdist" },
     { path = "ignition/recipes/step5/assets/chat_template.patch.json", format = "sdist" },
     { path = "ignition/recipes/kimi3/assets/chat_template.jinja", format = "sdist" },
+    { path = "ignition/recipes/kimi31/assets/chat_template.jinja", format = "sdist" },
 ]

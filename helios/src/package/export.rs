@@ -24,6 +24,10 @@ use crate::package::schema::{self, wire};
 use crate::package::{PayloadId, invalid};
 use prost::Message;
 
+#[cfg(test)]
+#[path = "export_cache_tests.rs"]
+mod cache_tests;
+
 fn io(context: &str, error: std::io::Error) -> crate::Error {
     format!("{context}: {error}").into()
 }
@@ -610,7 +614,13 @@ fn publish_inner(
             let ranks_count =
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
+            if rank_body.compressed_prepared_weights.is_some()
+                && let Some(weights) = super::prepared_weights::catalog(&rank_body)?
+            {
+                schema::validate_rank_prepared_weights(&rank_body, &weights)?;
+            }
             coalesce_initializers(&mut rank_body.initializers)?;
+            super::prepared_weights::compact(&mut rank_body)?;
             let encoded = wire::RankBody::encode_to_vec(&rank_body);
             body.ranks.push(wire::RankCommitment {
                 rank: rank_body.rank,
@@ -775,11 +785,10 @@ fn hash_file(path: &Path, nbytes: u64) -> Result<PayloadId, crate::Error> {
 
 /// Merge adjacent initializer runs without changing their covered bytes or order.
 ///
-/// The rank body has already passed schema validation, so an initializer has a
-/// source slice and its destination and payload ranges are in bounds. Only
+/// Merge initializer runs without changing the acceptance of invalid records. Only
 /// exact source and destination continuity for one allocation, payload, and
 /// role is merged; holes, overlaps, and non-adjacent runs stay distinct.
-fn coalesce_initializers(
+pub fn coalesce_initializers(
     initializers: &mut Vec<wire::Initializer>,
 ) -> Result<(), crate::Error> {
     let mut merged = Vec::with_capacity(initializers.len());
@@ -802,6 +811,7 @@ fn coalesce_initializers(
             merged.push(initializer);
         }
     }
+    merged.shrink_to_fit();
     *initializers = merged;
     Ok(())
 }
@@ -820,7 +830,8 @@ fn initializer_merge_length(
     let Some(next_source) = next.source.as_ref().and_then(|source| source.slice.as_ref()) else {
         return Ok(None);
     };
-    if previous.allocation != next.allocation
+    if previous_source.nbytes == 0 || next_source.nbytes == 0
+        || previous.allocation != next.allocation
         || previous.source.as_ref().map(|source| source.role) != next.source.as_ref().map(|source| source.role)
         || previous_source.payload_id != next_source.payload_id
     {
@@ -1024,15 +1035,14 @@ fn data_result(total: u64, reused: u64) -> String {
     }
 }
 
-/// Concurrent payload installations into one directory package.
-const MAX_DIRECTORY_INSTALL_WORKERS: usize = 8;
+/// Concurrent payload checks or directory installations in one publication phase.
+const MAX_PAYLOAD_INSTALL_WORKERS: usize = 8;
 
 /// Install or re-verify one data phase's payloads and record their locations
 /// in listed order. Returns the cached weight bytes linked without hashing.
 ///
-/// Directory publication hashes and installs independent payloads
-/// concurrently. Cache publication and no-weights exports run sequentially
-/// through their staging transaction.
+/// Cache payload checks and directory installations run concurrently. Cache
+/// object installation, staging links, and location publication remain serialized.
 fn install_phase_payloads(
     payloads: &[PublishPayload],
     weights: Option<&[crate::package::cache::PayloadObject]>,
@@ -1042,6 +1052,11 @@ fn install_phase_payloads(
     no_weights: bool,
     phase: &crate::startup::Phase,
 ) -> Result<u64, crate::Error> {
+    if let Destination::Cache(root, staging) = destination {
+        return install_cache_phase_payloads(
+            payloads, weights, root, staging, locations, located, no_weights, phase,
+        );
+    }
     let directory = match destination {
         Destination::Directory(root) if weights.is_none() && !no_weights => Some(*root),
         _ => None,
@@ -1072,7 +1087,7 @@ fn install_phase_payloads(
         .collect();
     let workers = std::thread::available_parallelism()
         .map_or(1, |workers| workers.get())
-        .min(MAX_DIRECTORY_INSTALL_WORKERS)
+        .min(MAX_PAYLOAD_INSTALL_WORKERS)
         .min(payloads.len())
         .max(1);
     let cursor = std::sync::atomic::AtomicUsize::new(0);
@@ -1124,23 +1139,155 @@ fn install_phase_payloads(
     Ok(0)
 }
 
-fn reuse_weight(
+enum PreparedCachePayload {
+    Reused(crate::package::cache::PayloadObject),
+    Verified(Option<crate::package::cache::PayloadObject>),
+}
+
+fn prepare_cache_payload(
     payload: &PublishPayload,
     weights: Option<&[crate::package::cache::PayloadObject]>,
-    destination: &mut Destination<'_>,
+    root: &crate::package::cache::Root,
+    install: bool,
+    no_weights: bool,
+) -> Result<PreparedCachePayload, crate::Error> {
+    if let Some(object) = reused_weight(payload, weights)? {
+        return Ok(PreparedCachePayload::Reused(object.clone()));
+    }
+    verify_payload_source(payload)?;
+    if !install {
+        return Ok(PreparedCachePayload::Verified(None));
+    }
+    let object = root.payload(payload.id)?;
+    if let Some(object) = &object {
+        if object.length() != payload.nbytes() {
+            return Err(invalid(format!(
+                "cached payload {} length differs from its declaration",
+                payload.id,
+            )));
+        }
+        if object.slice().digest()? != payload.id {
+            return Err(invalid(format!(
+                "cached payload {} bytes do not match their identity",
+                payload.id,
+            )));
+        }
+    } else if no_weights
+        && matches!(
+            payload.role,
+            wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
+        )
+    {
+        return Err(invalid(format!(
+            "no-weights export is missing cached payload {} (group {})",
+            payload.id, payload.relative,
+        )));
+    }
+    Ok(PreparedCachePayload::Verified(object))
+}
+
+fn install_cache_phase_payloads(
+    payloads: &[PublishPayload],
+    weights: Option<&[crate::package::cache::PayloadObject]>,
+    root: &crate::package::cache::Root,
+    staging: &mut crate::package::cache::Staging,
     locations: &mut Vec<wire::PayloadLocation>,
-    located: bool,
-) -> Result<bool, crate::Error> {
+    located: &mut BTreeMap<PayloadId, ()>,
+    no_weights: bool,
+    phase: &crate::startup::Phase,
+) -> Result<u64, crate::Error> {
+    let mut seen: std::collections::BTreeSet<_> = located.keys().copied().collect();
+    let installs: Vec<_> = payloads
+        .iter()
+        .map(|payload| seen.insert(payload.id))
+        .collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |workers| workers.get())
+        .min(MAX_PAYLOAD_INSTALL_WORKERS)
+        .min(payloads.len())
+        .max(1);
+    let mut reused_bytes = 0;
+    // Batching bounds the file handles retained by verified cache objects.
+    for (payloads, installs) in payloads.chunks(workers).zip(installs.chunks(workers)) {
+        let prepared = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(payloads.len());
+            for (payload, install) in payloads.iter().zip(installs.iter().copied()) {
+                handles.push(
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, move || {
+                            phase.detail(format!(
+                                "{} ({} bytes)",
+                                payload.relative,
+                                payload.nbytes()
+                            ));
+                            let result =
+                                prepare_cache_payload(payload, weights, root, install, no_weights);
+                            if result.is_ok() {
+                                phase.advance_bytes(payload.nbytes());
+                            }
+                            result
+                        })
+                        .map_err(|error| {
+                            invalid(format!("spawn cache payload verifier: {error}"))
+                        })?,
+                );
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| invalid("cache payload verifier panicked"))?
+                })
+                .collect::<Result<Vec<_>, crate::Error>>()
+        })?;
+        for ((payload, install), prepared) in
+            payloads.iter().zip(installs.iter().copied()).zip(prepared)
+        {
+            let object = match prepared {
+                PreparedCachePayload::Reused(object) => {
+                    reused_bytes += payload.nbytes();
+                    Some(object)
+                }
+                PreparedCachePayload::Verified(object) => object,
+            };
+            if install {
+                let object = match object {
+                    Some(object) => object,
+                    None => root.insert_payload(payload.id, payload.nbytes(), payload.reader())?,
+                };
+                if object.id() != payload.id {
+                    return Err(invalid(
+                        "cache payload identity differs from the signed identity",
+                    ));
+                }
+                staging.link(&object, &payload.relative)?;
+                locations.push(wire::PayloadLocation {
+                    payload_id: payload.id.as_bytes().to_vec(),
+                    file: payload.relative.clone(),
+                    tensor: container::COMPANION_TENSOR.to_string(),
+                });
+                located.insert(payload.id, ());
+            }
+        }
+    }
+    Ok(reused_bytes)
+}
+
+fn reused_weight<'a>(
+    payload: &PublishPayload,
+    weights: Option<&'a [crate::package::cache::PayloadObject]>,
+) -> Result<Option<&'a crate::package::cache::PayloadObject>, crate::Error> {
     let Some(weights) = weights.filter(|_| {
         matches!(
             payload.role,
             wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
         )
     }) else {
-        return Ok(false);
+        return Ok(None);
     };
     if !weights.iter().any(|object| object.id() == payload.id) {
-        return Ok(false);
+        return Ok(None);
     }
     let object = weights
         .iter()
@@ -1153,9 +1300,20 @@ fn reuse_weight(
         .ok_or_else(|| {
             invalid(format!(
                 "reused weight {} does not reference its leased cache object",
-                payload.relative
+                payload.relative,
             ))
         })?;
+    Ok(Some(object))
+}
+
+fn reuse_weight(
+    payload: &PublishPayload,
+    weights: Option<&[crate::package::cache::PayloadObject]>,
+    destination: &mut Destination<'_>,
+    locations: &mut Vec<wire::PayloadLocation>,
+    located: bool,
+) -> Result<bool, crate::Error> {
+    let Some(object) = reused_weight(payload, weights)? else { return Ok(false) };
     if !located {
         let Destination::Cache(_, staging) = destination else {
             return Err(invalid("weight reuse requires the package cache"));
@@ -2676,6 +2834,7 @@ mod tests {
             execution: None,
             roce: None,
             prepared_weights: None,
+            compressed_prepared_weights: None,
         };
         let request = PublishRequest {
             package,
