@@ -45,7 +45,7 @@ def _local_tuning_catalog(requests):
 
 
 def _prepare_compiler_toolchain():
-    """Resolve forward math libraries before native program identities are recorded."""
+    """Resolve forward math libraries before any Triton program identity is recorded."""
     from ignition import runtime_patches
 
     runtime_patches.apply()
@@ -54,10 +54,16 @@ def _prepare_compiler_toolchain():
 
     from .compilation import _OPTIONS
 
-    # Inductor selects the CUDA toolkit's libdevice for eager precision. Native
-    # discovery and later materialization must see that same library identity.
+    # Inductor selects the CUDA toolkit's libdevice for eager precision. Every
+    # Triton compile in the process must see that same library identity: Triton
+    # memoizes compiled kernels per specialization without the library path, so
+    # a kernel compiled against the bundled library before the switch would be
+    # reused with a program identity that native discovery never declared.
     with config.patch(emulate_precision_casts=_OPTIONS["emulate_precision_casts"]):
         _set_triton_libdevice_path()
+
+
+_prepare_compiler_toolchain()
 
 
 def with_autotune_effort(prepare):
@@ -109,7 +115,6 @@ class RecordedPreparationSession(PreparationSession):
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
         self.lock_gpu_clocks = lock_gpu_clocks
-        _prepare_compiler_toolchain()
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
                              namespace=identity, race_budget=race_budget, prime=False,
@@ -727,7 +732,6 @@ def declare(session, requests, *, coordinator=None):
     if isinstance(session, RecordedPreparationSession):
         session.declare(requests, coordinator=coordinator)
     else:
-        _prepare_compiler_toolchain()
         options = {} if coordinator is None else {"coordinator": coordinator}
         session.prepare(requests, **options)
 

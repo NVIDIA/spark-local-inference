@@ -13,7 +13,7 @@ import pytest
 import ignition
 
 
-@pytest.mark.parametrize("session_kind", ["recorded", "standalone"])
+@pytest.mark.parametrize("session_kind", ["import", "recorded", "standalone"])
 def test_discovery_options_survive_inductor_precision_initialization(session_kind):
     # A subprocess preserves the unset-library startup condition independently
     # of other tests that have already initialized Inductor.
@@ -43,7 +43,11 @@ from ignition.preparation.compilation import _OPTIONS
 from ignition.preparation.tuning import RecordedPreparationSession, declare
 
 observed = []
-if sys.argv[1] == "recorded":
+if sys.argv[1] == "import":
+    # Kernels compiled before any session exists, such as a component's own
+    # tests, must already carry the identity that later discovery declares.
+    observed.append(CUDAOptions())
+elif sys.argv[1] == "recorded":
     # Only the GPU-owning base constructor is replaced. Flare's constructor
     # and the real Inductor/Triton library selection remain under test.
     def base_initialize(self, **kwargs):
