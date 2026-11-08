@@ -423,6 +423,65 @@ def _fake_all_gather(source, output, dependencies, handle):
     pass
 
 
+@torch.library.custom_op("flare::start_all_gather", mutates_args=("output",))
+def _start_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                      handle: int, stream: int) -> None:
+    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
+    with torch.cuda.stream(auxiliary):
+        _gather_columns(source, output, handle)
+
+
+@_start_all_gather.register_fake
+def _fake_start_all_gather(source, output, dependencies, handle, stream):
+    pass
+
+
+@torch.library.custom_op("flare::join_all_gather", mutates_args=("output",))
+def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependency: torch.Tensor, stream: int) -> None:
+    torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
+
+
+@_join_all_gather.register_fake
+def _fake_join_all_gather(source, output, dependency, stream):
+    pass
+
+
+class ConcurrentAllGather:
+    """Overlap a prepared PCIe gather with local work, joining before channel reuse.
+
+    The join retains the source through its asynchronous read and follows a local
+    output dependency. A subsequent collective must read the joined output as a
+    dependency, keeping communication serialized through compilation.
+    """
+
+    def __init__(self, gather, *, workspace, session, parallel_plans):
+        from ignition.preparation.scratch import ScratchArena
+
+        plans = tuple(parallel_plans)
+        if gather.single or gather.roce:
+            raise ValueError("concurrent column gather requires a prepared PCIe channel")
+        if not isinstance(workspace, ScratchArena) or not workspace.overlap or not plans:
+            raise ValueError("concurrent column gather requires an overlap arena and local plans")
+        self.gather = gather
+        self.stream = workspace.auxiliary_stream
+        self.stream_handle = self.stream.cuda_stream
+        for plan in plans:
+            workspace.register_parallel(gather.plan, plan)
+        register_finalizer(session, self.validate_scratch)
+
+    def validate_scratch(self):
+        # PCIe gather scratch belongs to its persistent channel, outside the shared arena.
+        if self.gather.plan.memory_requirements().scratch_nbytes:
+            raise ValueError("concurrent column gather requires a plan without caller scratch")
+
+    def start(self, source):
+        _start_all_gather(source, self.gather.output, self.gather.dependencies,
+                          self.gather.handle, self.stream_handle)
+
+    def finish(self, source, dependency):
+        _join_all_gather(source, self.gather.output, dependency, self.stream_handle)
+        return self.gather.output
 
 
 @triton.jit

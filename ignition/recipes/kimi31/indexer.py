@@ -83,11 +83,16 @@ class PreparedIndexSelection:
             coordinator=None if context is None else context.coordinator, name=name + ".selected",
             buffers=SharedBuffers(buffers, query.device, allocator, prefix="consensus."))
 
-    def __call__(self):
+    def prepare_local(self):
+        """Produce rank-local candidates without using a peer communication channel."""
         index_pages(self.tables[:1] if self.mode == "prefill" else self.tables, self.pages)
         self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
         self.indexer()
         pack_candidates(self.local, self.scores, self.packed, self.shards)
+        return self.packed
+
+    def exchange(self):
+        """Exchange local candidates, select global records, and agree on their order."""
         self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
         self.global_scores.copy_(self.gathered[:, :, 0])
         self.global_ids.copy_(self.gathered.view(torch.int32)[:, :, 1])
@@ -95,6 +100,10 @@ class PreparedIndexSelection:
         self.fold()
         self.broadcast()
         return self.selected
+
+    def __call__(self):
+        self.prepare_local()
+        return self.exchange()
 
 
 class PreparedDSAIndexer:
@@ -135,6 +144,13 @@ class PreparedDSAIndexer:
             session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
             latent_cache=latent_cache)
             for start, end in self.bounds)
+
+    @property
+    def local_plans(self):
+        """Projection, query-quantization, and index-scoring plans with no peer exchange."""
+        return (*[projection.plan for projection in self.projections],
+                *[plan for part in self.parts
+                  for plan in (part.indexer.query_plan, part.indexer.selection.plan)])
 
     def project(self, source):
         self.projections[0](self.query_latent)
