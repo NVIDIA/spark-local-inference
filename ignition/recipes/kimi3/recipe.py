@@ -43,7 +43,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
+        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         vision=not plan.language_model_only, sampling_defaults=recipe.sampling_defaults.as_dict(),
         frontend_template=str(Path(__file__).parent.parent / recipe.name / "assets" / "chat_template.jinja"),
@@ -80,7 +80,7 @@ RECIPE = Recipe(
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
-    online_mxfp8=True,
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"),
     # Decode and verification run each MoE layer's shared experts beside its routing and routed experts.
     stream_overlap=True,
     # Text-only plans, as vLLM serves Kimi K3 with --language-model-only, leave the MoonViT encoder unloaded.

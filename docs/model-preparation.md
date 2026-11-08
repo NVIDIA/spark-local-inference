@@ -994,12 +994,32 @@ layers, attention residuals, latent SiTU experts, and the MoonViT image encoder.
 The checkpoint's native MXFP4 expert weights use losslessly compressed block
 scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
-The optional conversion otherwise covers the same target projections as Kimi K3.
+`--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
+`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
+DSpark draft weights retain checkpoint precision. Omit the flag to retain
+checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
 of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
+
+With the default `--prefill-chunk-size 4096`, the 4096-token prefill graph
+stages owner-encoded latent and index history locally, distributes index-query
+rows across context ranks, and gathers final selected IDs once per layer.
+Stored FP8 records and FP32 index scales are copied byte-for-byte, including
+records written by the current chunk. Projection shapes, normalization and
+weight formats are unchanged. Smaller captured prefill capacities retain direct
+peer reads; they still require peer KV mappings at startup.
+
+At a 1,048,576-token context limit and 4096-token prefill capacity, latent history
+and its peer staging reserve 612 MiB per rank. Index history, staging, selected
+IDs and their transport channel reserve another 238.535 MiB per rank, before
+query buffers and score scratch. Serial layers reuse these allocations, which
+reduce the remaining KV-page budget. Keep the default 4096-token capacity for
+this prefill path; `--prefill-chunk-size 2048` omits it and its fixed history
+storage. The component checks in `qualify/kimi_staged_prefill.py` and
+`qualify/kimi_query_prefill.py` cover the history transfers and query partitioning.
 
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)

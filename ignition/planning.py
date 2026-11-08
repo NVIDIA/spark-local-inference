@@ -199,11 +199,19 @@ class Plan:
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
+    online_mxfp8_scope: str | None = None
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.online_mxfp8_scope is None:
+            object.__setattr__(self, "online_mxfp8_scope",
+                               self.recipe.online_mxfp8_scope if self.online_mxfp8 else "all")
+        if self.online_mxfp8_scope not in self.recipe.online_mxfp8_scopes:
+            raise UsageError("online MXFP8 scope is not supported by the recipe")
+        if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
+            raise UsageError("online MXFP8 scope requires --online-mxfp8")
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -371,7 +379,7 @@ class Plan:
             "force_moe_decode_a16": self.force_moe_decode_a16,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
-            "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
+            "online_mxfp8": self.online_mxfp8, "online_mxfp8_scope": self.online_mxfp8_scope, "language_model_only": self.language_model_only,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -404,7 +412,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
-        image_concurrency: int | None = None, online_mxfp8: bool = False,
+        image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -466,7 +474,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
-                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
+                    if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -520,7 +528,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
-         image_concurrency: int | None = None, online_mxfp8: bool = False,
+         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
          language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -535,6 +543,10 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         raise UsageError("--speculative-method dflash2 requires separate prefill and verification graphs")
     if mixed_prefill and not recipe.mixed_prefill:
         raise UsageError(f"--mixed-prefill: {checkpoint.alias} does not capture mixed prefill/decode graphs")
+    if online_mxfp8_scope not in (None, "all") and not online_mxfp8:
+        raise UsageError("online MXFP8 scope requires --online-mxfp8")
+    if online_mxfp8_scope is not None and online_mxfp8_scope not in recipe.online_mxfp8_scopes:
+        raise UsageError(f"online MXFP8 scope: {checkpoint.alias} supports " + ", ".join(recipe.online_mxfp8_scopes))
     if online_mxfp8 and not recipe.online_mxfp8:
         raise UsageError(f"--online-mxfp8: {checkpoint.alias} names no projections to store as MXFP8")
     if language_model_only and not recipe.language_model_only:
@@ -583,7 +595,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
-                   online_mxfp8=online_mxfp8, language_model_only=language_model_only,
+                   online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
     def automatic(world_size, **settings):

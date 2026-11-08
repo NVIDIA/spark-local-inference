@@ -48,14 +48,16 @@ def test_kimi_selection_rejects_unavailable_geometry(changes, match):
         PreparationConfig(**options)
 
 
-def test_kimi31_adapter_passes_benchmark_selection_and_precision(monkeypatch, tmp_path):
+@pytest.mark.parametrize("alias,default", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])
+@pytest.mark.parametrize("scope", [None, "all", "kda-input"])
+def test_kimi_adapter_passes_benchmark_selection_and_precision(monkeypatch, tmp_path, alias, default, scope):
     from ignition.recipes import resolve
     from .test_declarations import fitted
 
-    model = resolve("kimi-k3.1-pro")
-    selection = BenchmarkSelection(batches=(8,), contexts=(2048,), width=8)
+    model = resolve(alias)
+    selection = BenchmarkSelection(batches=(8,), contexts=(2048,), width=8) if model.recipe.name == "kimi31" else None
     plan = replace(fitted(model, 16, concurrency=8), benchmark_selection=selection,
-        speculation=replace(model.recipe.speculation, token_capacity=64), online_mxfp8=True,
+        speculation=replace(model.recipe.speculation, token_capacity=64), online_mxfp8=True, online_mxfp8_scope=scope,
         language_model_only=False, autotune_effort="default")
     (tmp_path / "dspark").mkdir()
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
@@ -63,12 +65,14 @@ def test_kimi31_adapter_passes_benchmark_selection_and_precision(monkeypatch, tm
     config = model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
     assert config.benchmark_selection is selection
     assert config.draft_checkpoint == str(tmp_path / "dspark")
-    assert config.speculative_round_shapes == ((8, 8, 64),)
+    if selection is not None:
+        assert config.speculative_round_shapes == ((8, 8, 64),)
     assert config.max_active == 8 and config.speculative_token_capacity == 64
     assert config.autotune_effort == "default" and config.compile_decoder
     assert config.vision and config.online_mxfp8 and config.context_parallel
+    assert config.online_mxfp8_scope == (default if scope is None else scope)
     assert config.sampling_defaults == model.recipe.sampling_defaults.as_dict()
-    assert Path(config.frontend_template).parts[-3:] == ("kimi31", "assets", "chat_template.jinja")
+    assert Path(config.frontend_template).parts[-3:] == (model.recipe.name, "assets", "chat_template.jinja")
 
 
 def test_kimi_benchmark_state_covers_backed_histories_requests_and_rng():
