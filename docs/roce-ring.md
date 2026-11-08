@@ -4,7 +4,7 @@ Flare's experimental `--roce-ring` option connects each tensor-parallel rank to
 its neighbors in rank order. A native CPU proxy forwards transfers addressed to
 other ranks through those neighbors. The transport supports 2 through 16 ranks;
 each model recipe still determines which tensor-parallel sizes it can prepare.
-GLM-5.3 Flash and Qwen3.8 Flash prepare multi-host TP2 and TP4 cores.
+GLM-5.3 Flash, Qwen3.8 Flash, and DeepSeek V4 Flash prepare multi-host TP2 and TP4 cores.
 
 Ring routing applies to RoCEnante's one-shot reductions, two-shot reductions,
 and variable-length gathers. The collective algorithms and arithmetic remain
