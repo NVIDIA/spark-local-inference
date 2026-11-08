@@ -3766,7 +3766,7 @@ fn make_immutable(path: &Path) -> Result<()> {
 
 /// Copy one file to a new destination with the source's permissions, and flush the copy.
 #[cfg(not(windows))]
-fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::copy(source, destination)?;
     super::container::sync_file(destination)
 }
@@ -3777,7 +3777,7 @@ fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
 /// source's read-only attribute, so the copy is written and flushed through a
 /// writable handle before the source's permissions are applied.
 #[cfg(windows)]
-fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .write(true)

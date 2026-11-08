@@ -59,6 +59,30 @@ def convert(args):
         print(f'Payload form: {store.form}; bytes written: {store.bytes}')
 
 
+def edit(args):
+    from ignition.cli.config import Configuration
+    from ignition import development
+    from ignition.preparation.package_snapshot import payload_edit, payload_form
+
+    configuration = Configuration.load(args.config)
+    try:
+        if args.served_model_name is None and args.chat_template is None:
+            raise ValueError('edit requires --served-model-name or --chat-template')
+        if args.output.exists():
+            raise FileExistsError(args.output)
+        if payload_form(args.package) == 'legacy':
+            raise ValueError('edit supports payload-format packages only')
+        template = args.chat_template.read_bytes() if args.chat_template is not None else None
+        profiles = _public_profiles(args, configuration)
+        publisher = development.publisher(configuration)
+        payload_edit(args.package, args.output, publisher=publisher, profiles=profiles,
+                     served_model_name=args.served_model_name, chat_template=template)
+    except (ValueError, OSError) as error:
+        raise UsageError(str(error)) from error
+    print(f'Edited development package: {args.output}')
+    print(f'Development publisher: {development.profile(configuration, publisher)}')
+
+
 def keygen(args):
     from ignition.signing import generate, passphrase
 

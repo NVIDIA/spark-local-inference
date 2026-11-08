@@ -23,6 +23,11 @@ use std::{
 
 use prost::Message;
 
+#[cfg(feature = "frontend")]
+mod edit;
+#[cfg(feature = "frontend")]
+pub use edit::{EditRequest, edit};
+
 use super::{
     PayloadId,
     container::{self, COMPANION_TENSOR, Source, Writer},
@@ -3618,6 +3623,8 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "frontend")]
+    mod edit_tests;
     use super::super::PayloadId;
     use super::*;
     use crate::package::container::{Container, Slice, write_companion};
