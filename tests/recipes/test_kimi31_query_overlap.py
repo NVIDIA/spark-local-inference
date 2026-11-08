@@ -146,6 +146,7 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
     op.metadata = SimpleNamespace(positions=torch.zeros(1, dtype=torch.int64), token_page_table=torch.zeros((1, 1)))
     op.shards = SimpleNamespace(token_slots=lambda *args: op.slots)
     op.mode = 'decode'
+    op.history = None
     op.project = lambda source: events.append('projection')
     monkeypatch.setattr(attention, 'write_records', lambda *args: events.append('cache_write'))
     op.indexer = SimpleNamespace(project=lambda source: events.append('index_projection'))
