@@ -413,9 +413,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 context = replace(context, window=window, slab=torch.zeros(
                     (window + config.prefill_chunk_size, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device))
             if context is not None and getattr(context, "staging", None) is not None:
-                records = torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device)
-                context = replace(context, staged_records=records,
-                    index_records=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
+                # Full-history staging is produced by complete prefill graphs.
+                # Kernel trials use private index inputs and selected MLA records.
+                with deferred_pool:
+                    records = torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device)
+                    context = replace(context, staged_records=records,
+                        index_records=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
         if context is not None and getattr(context, "staging", None) is not None:
             # The slab's address survives scratch unmapping, but its pointer table
             # must retain its contents when scratch is rematerialized as zeros.
