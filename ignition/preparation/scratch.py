@@ -132,9 +132,14 @@ class ScratchArena:
         if capacity < self.nbytes:
             if self.frozen:
                 raise RuntimeError("cannot trim a frozen scratch arena")
+            device = self.device
             with (nullcontext() if self.allocation_pool is None else
-                  torch.cuda.use_mem_pool(self.allocation_pool, device=self.device.index)):
-                self.tensor = torch.empty(capacity, dtype=torch.uint8, device=self.device)
+                  torch.cuda.use_mem_pool(self.allocation_pool, device=device.index)):
+                # Tuning has drained and scratch contents are disposable. Release
+                # our candidate owner before allocating the selected capacity;
+                # external views, if any, still retain their own valid storage.
+                self.tensor = torch.empty(0, dtype=torch.uint8, device=device)
+                self.tensor = torch.empty(capacity, dtype=torch.uint8, device=device)
 
     def views(self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]) -> tuple[torch.Tensor, ...]:
         """Return disjoint views for simultaneous use within one serialized call.
