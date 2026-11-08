@@ -1,6 +1,8 @@
 """Qualify query-sharded sparse indexing with checkpoint projections on TP16.
 
-The fixture compares the distributed candidate fold with query-row ownership.
+The fixture compares an unordered distributed candidate fold followed by a
+rank-zero byte broadcast with production query-row ownership. The reference
+composition is explicit so production merge changes do not redefine it.
 It uses checkpoint index weights and deterministic synthetic hidden states,
 preserves stored key/scale bytes, and reports selection and attention errors.
 Timings cover index projections, cache writes, selection and communication;
@@ -49,10 +51,82 @@ def load_weights(checkpoint, layer, device):
     return result
 
 
+class BroadcastIndexSelection:
+    """Reference prefill selection with unordered top-k and rank-zero agreement.
+
+    Rank-local FP8 scoring, underfull compaction, row top-k and byte broadcast
+    are independently prepared components. This fixture deliberately does not
+    instantiate the recipe's distributed-selection composition.
+    """
+
+    def __init__(self, query, weights, cache, metadata, shards, context, buffers, *,
+                 start, end, session, name, workspace):
+        import torch
+        from ignition.components.candidate_rows import PreparedCandidateRows
+        from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
+        from ignition.components.fp8_indexer import PreparedFP8Indexer
+        from ignition.components.row_topk import PreparedRowTopK
+        from ignition.recipes.kimi31.indexer import SharedBuffers
+
+        rows, width = end - start, metadata.token_page_table.shape[1]
+        self.positions, self.tables = metadata.positions[start:end], metadata.token_page_table[start:end]
+        self.shards = shards
+        storage = SharedBuffers(buffers, query.device)
+        self.pages = storage.buffer("pages", (1, width * 2), torch.int32)
+        self.lengths = storage.buffer("local_lengths", (rows,), torch.int32)
+        self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
+        self.scores = storage.buffer("local_scores", (rows, TOPK), torch.float32)
+        self.packed = storage.buffer("candidates", (rows, TOPK, 2), torch.float32)
+        self.gathered = storage.buffer("gathered", (rows, TOPK * shards.world, 2), torch.float32)
+        self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
+        self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
+        self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
+        self.active = storage.buffer("active", (rows,), torch.bool)
+        self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
+        self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
+        self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
+            cache, self.pages.expand(rows, -1), self.lengths, None, self.local,
+            mode="prefill", session=session, name=name + ".local", workspace=workspace,
+            buffers=SharedBuffers(buffers, query.device, prefix="fp8."), topk=TOPK, scores=self.scores,
+            prefill_records_per_call=131072, head_weight_scale=1., hadamard=False, key_power_of_two=False)
+        self.gather = PreparedAllGather(self.packed.view(torch.bfloat16).view(rows, TOPK * 4),
+            self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=context.candidates,
+            session=session, coordinator=context.coordinator, name=name + ".candidates", dependencies=(cache,))
+        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
+            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
+            buffers=SharedBuffers(buffers, query.device, prefix="candidate_rows."))
+        self.fold = PreparedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
+            self.selected_scores, self.selected, session=session, name=name + ".fold")
+        self.broadcast = PreparedBroadcast((self.selected,), runtime=context.candidates, session=session,
+            coordinator=context.coordinator, name=name + ".selected",
+            buffers=SharedBuffers(buffers, query.device, prefix="consensus."))
+
+    def prepare_local(self):
+        import torch
+        from ignition.recipes.kimi31.dcp import index_pages, pack_candidates
+
+        index_pages(self.tables[:1], self.pages)
+        self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
+        self.indexer()
+        pack_candidates(self.local, self.scores, self.packed, self.shards)
+        return self.packed
+
+    def __call__(self):
+        import torch
+
+        self.prepare_local()
+        self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
+        self.active.copy_(self.positions >= 0)
+        self.candidate_rows()
+        self.fold()
+        self.broadcast()
+        return self.selected
+
+
 class SelectionFixture:
     def __init__(self, weights, source, latent, cache, metadata, context, session, arena, *, eps):
         import torch
-        from ignition.recipes.kimi31.indexer import PreparedDSAIndexer, PreparedIndexSelection
+        from ignition.recipes.kimi31.indexer import PreparedDSAIndexer
 
         self.source, self.metadata, self.cache = source, metadata, cache
         self.index = PreparedDSAIndexer(weights, source, latent, metadata, cache, context.shards,
@@ -62,10 +136,9 @@ class SelectionFixture:
         self.packed_weights = torch.empty((ROWS, 160), dtype=torch.bfloat16, device=source.device)
         self.index.sharded.weights = self.packed_weights[:, 128:]
         control_buffers = {}
-        self.control = tuple(PreparedIndexSelection(self.index.query, self.index.head_weights, cache,
+        self.control = tuple(BroadcastIndexSelection(self.index.query, self.index.head_weights, cache,
             metadata, context.shards, context, control_buffers, start=begin, end=begin + 128,
-            mode="prefill", session=session, name=f"control.rows{begin}", workspace=arena,
-            allocator=None, latent_cache=cache) for begin in range(0, ROWS, 128))
+            session=session, name=f"control.rows{begin}", workspace=arena) for begin in range(0, ROWS, 128))
         self.baseline = torch.empty((ROWS, TOPK), dtype=torch.int32, device=source.device)
         self.candidate = self.index.sharded.selected
 
@@ -520,6 +593,8 @@ def _worker(rank, rendezvous, checkpoint, destination, policy, compiled, maximum
                 dist.all_gather_object(gathered, reports)
                 if rank == 0:
                     Path(destination).write_text(json.dumps(dict(policy=policy, compiled=compiled,
+                        distributed_reference=dict(scoring="PreparedFP8Indexer", compaction="PreparedCandidateRows",
+                            merge="PreparedRowTopK", agreement="PreparedBroadcast"),
                         checkpoint_layer=3, rows=ROWS, context_capacity=maximum, ranks=gathered), indent=2) + "\n")
     finally:
         for graph in graphs:
