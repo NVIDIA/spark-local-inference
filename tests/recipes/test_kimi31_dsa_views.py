@@ -80,7 +80,7 @@ def test_equal_selection_stages_share_scratch_and_preserve_input_offsets(monkeyp
         buffers, start=start, end=end, mode="prefill", session=None, name=f"selection{start}",
         workspace=None, allocator=None, latent_cache=None) for start, end in bounds)
     names = ("pages", "lengths", "local", "scores", "packed", "gathered", "global_scores",
-             "global_ids", "fold_lengths", "selected_scores", "selected")
+             "global_ids", "fold_lengths", "active", "selected_scores", "selected")
     for name in names:
         assert getattr(parts[0], name) is getattr(parts[1], name)
     assert parts[2].lengths is not parts[0].lengths
@@ -98,6 +98,10 @@ def test_equal_selection_stages_share_scratch_and_preserve_input_offsets(monkeyp
     assert parts[0].indexer.args[0].storage_offset() != parts[1].indexer.args[0].storage_offset()
     assert len({id(part.indexer.plan) for part in parts}) == len(parts)
     assert len({id(part.fold.plan) for part in parts}) == len(parts)
+    for name in ("counts", "exceptional"):
+        full = getattr(parts[0].candidate_rows, name)
+        assert getattr(parts[1].candidate_rows, name) is full
+        _assert_geometry(getattr(parts[2].candidate_rows, name), full[:1])
 
 
 def test_worker_serialization_preserves_shared_prefix_identity():

@@ -5,6 +5,7 @@
 
 import torch
 
+from ignition.components.candidate_rows import PreparedCandidateRows
 from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.components.linear import UnquantizedProjection
@@ -62,6 +63,7 @@ class PreparedIndexSelection:
         self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
         self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
         self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
+        self.active = storage.buffer("active", (rows,), torch.bool)
         self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
@@ -79,6 +81,9 @@ class PreparedIndexSelection:
             name=name + ".candidates", dependencies=(latent_cache,))
         self.fold = PreparedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
             self.selected_scores, self.selected, session=session, name=name + ".fold")
+        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
+            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
         self.broadcast = PreparedBroadcast((self.selected,), runtime=runtime, session=session,
             coordinator=None if context is None else context.coordinator, name=name + ".selected",
             buffers=SharedBuffers(buffers, query.device, allocator, prefix="consensus."))
@@ -89,9 +94,8 @@ class PreparedIndexSelection:
         self.indexer()
         pack_candidates(self.local, self.scores, self.packed, self.shards)
         self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
-        self.global_scores.copy_(self.gathered[:, :, 0])
-        self.global_ids.copy_(self.gathered.view(torch.int32)[:, :, 1])
-        self.fold_lengths.copy_(torch.where(self.positions >= 0, self.global_ids.shape[1], 0))
+        self.active.copy_(self.positions >= 0)
+        self.candidate_rows()
         self.fold()
         self.broadcast()
         return self.selected
