@@ -6,10 +6,10 @@
 import torch
 
 from ignition.components.candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
+from ignition.components.collectives import PreparedAllGather
 from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.row_topk import PreparedRowTopK
+from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
 
 from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
 
@@ -79,14 +79,12 @@ class PreparedIndexSelection:
             self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=runtime,
             session=session, coordinator=None if context is None else context.coordinator,
             name=name + ".candidates", dependencies=(latent_cache,))
-        self.fold = PreparedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
-            self.selected_scores, self.selected, session=session, name=name + ".fold")
+        self.fold = PreparedOrderedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
+            self.selected_scores, self.selected, session=session, name=name + ".fold",
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="agreement."))
         self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
             self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
             buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
-        self.broadcast = PreparedBroadcast((self.selected,), runtime=runtime, session=session,
-            coordinator=None if context is None else context.coordinator, name=name + ".selected",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="consensus."))
 
     def prepare_local(self):
         """Produce rank-local candidates without using a peer communication channel."""
@@ -102,7 +100,6 @@ class PreparedIndexSelection:
         self.active.copy_(self.positions >= 0)
         self.candidate_rows()
         self.fold()
-        self.broadcast()
         return self.selected
 
     def __call__(self):
