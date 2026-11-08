@@ -45,9 +45,9 @@ def usage(prepared):
     return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in report.get("ranks", (report,)))
 
 
-# Export VRAM inventory (gb202-tp1-202611061529): graph scratch pools 1,901.14 MiB + capture pool 1,126.00 MiB +
-# disposable vision arena 837.56 MiB + other owned tensors 459.43 MiB + graph I/O 79.45 MiB.
-_GRAPH_BYTES = 4_617_488_302
+# Export VRAM inventory (gb202-tp1-202611080045 at --max-concurrency 16): graph scratch pools 2,870.81 MiB + capture
+# pool 1,126.00 MiB + disposable vision arena 843.03 MiB + other owned tensors 1,008.16 MiB + graph I/O 90.16 MiB.
+_GRAPH_BYTES = 6_226_612_060
 
 RECIPE = Recipe(name="muse_glimmer_nvfp4", served_model_name="Muse-Glimmer-30B",
     # Sampling defaults carried from Muse Spark; the model card gives none.
@@ -62,10 +62,13 @@ RECIPE = Recipe(name="muse_glimmer_nvfp4", served_model_name="Muse-Glimmer-30B",
         draft_bytes=5_544_328_424),),
     # Declared context 1,048,576 over the native 131,072; no rope scaling — the sliding layers are bounded at 2048
     # and the full layers carry no positional encoding, so the window is page-bound (ignition/planning.py).
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=15, prefill_chunk=4096,
-    # The packed round catalog is bounded by `graph_budget` (64 rounds: 29 + 21 + 14 across batches 4, 2, 1); the
-    # rebuild manifest requires it declared.
-    speculation=Speculation(draft_tokens=15, token_capacity=64, packed_verification=True, graph_budget=64),
+    # Eight admitted requests by default and sixteen at `--max-concurrency 16` on one 96 GB RTX PRO 6000; 128 packed
+    # target rows keep the full fifteen-draft depth through eight active requests (served acceptance puts 18% of
+    # accepted drafts at depths 8-15) and seven at sixteen.
+    context=1048576, page_tokens=128, concurrency=8, max_concurrency=16, max_draft_tokens=15, prefill_chunk=4096,
+    # The packed round catalog is bounded by `graph_budget` (64 rounds: 17 + 18 + 16 + 13 across batches 8, 4, 2, 1 by
+    # default; 9 + 16 + 16 + 13 + 10 across 16, 8, 4, 2, 1 at the ceiling); the rebuild manifest requires it declared.
+    speculation=Speculation(draft_tokens=15, token_capacity=128, packed_verification=True, graph_budget=64),
     max_images=4, image_bytes=32 << 20, language_model_only=True,
     verification_rows=0,
     # 39 FP8 sliding rings of 2048 × 2 × 128 per key/value, 13 paged full layers at 128-token pages, and with

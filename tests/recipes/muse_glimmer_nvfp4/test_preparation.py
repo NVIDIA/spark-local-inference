@@ -61,6 +61,22 @@ def test_dflash_catalog_covers_width_one_and_the_full_sixteen_token_block(tmp_pa
         PreparationConfig(dflash=True, draft_snapshot=tmp_path, speculative_token_capacity=8)
 
 
+@pytest.mark.parametrize("max_active, batches, samples", [
+    (RECIPE.concurrency, (1, 2, 4, 8), 128), (RECIPE.max_concurrency, (1, 2, 4, 8, 16), 256)])
+def test_dflash_catalog_keeps_full_depth_through_eight_requests_and_shares_rows_at_sixteen(tmp_path, max_active,
+                                                                                            batches, samples):
+    rows = RECIPE.speculation.token_capacity
+    config = PreparationConfig(dflash=True, draft_snapshot=tmp_path, max_active=max_active, speculative_token_capacity=rows)
+    shapes = config.speculative_round_shapes
+    assert (RECIPE.concurrency, RECIPE.max_concurrency, rows) == (8, 16, 128)
+    assert {batch for batch, _, _ in shapes} == set(batches) and all((batch, 1, batch) in shapes for batch in batches)
+    assert (8, 16, 128) in shapes and (max_active, 16, max_active + 1) in shapes and (max_active, 16, 128) in shapes
+    assert all(packed <= 128 for _, _, packed in shapes)
+    assert len([shape for shape in shapes if shape[1] == 16]) <= config.speculative_graph_budget == 64
+    # Target rows share the 128-row capacity; sampled rows are one per request and width.
+    assert (config.decode_tokens, config.decode_samples) == (128, samples)
+
+
 def test_recipe_prepare_runs_in_process_on_one_gpu(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
