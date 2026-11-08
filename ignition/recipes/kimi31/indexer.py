@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.candidate_rows import PreparedCandidateRows
 from ignition.components.collectives import PreparedAllGather
-from ignition.components.fp8_indexer import PreparedFP8Indexer
+from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
 
@@ -140,18 +140,27 @@ class PreparedDSAIndexer:
         self.bounds = tuple((start, min(start + step, rows)) for start in range(0, rows, step))
         selection_buffers = buffers.setdefault("selection", {})
         cache_pages = cache.view(-1, 64 * 132)
-        self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
-            metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
-            session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
-            latent_cache=latent_cache)
-            for start, end in self.bounds)
+        self.cache, self.sharded = cache_pages, None
+        if mode == "prefill" and rows >= 4096:
+            from .query_selection import PreparedQuerySelection
+
+            self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
+                metadata, shards, context, buffers.setdefault("query_selection", {}),
+                session=session, name=name + ".queries", workspace=workspace, allocator=allocator)
+            self.parts = self.sharded.parts
+        else:
+            self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
+                metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
+                session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
+                latent_cache=latent_cache)
+                for start, end in self.bounds)
 
     @property
     def local_plans(self):
         """Projection, query-quantization, and index-scoring plans with no peer exchange."""
+        indexers = ([part.indexer for part in self.parts] if self.sharded is None else self.sharded.indexers)
         return (*[projection.plan for projection in self.projections],
-                *[plan for part in self.parts
-                  for plan in (part.indexer.query_plan, part.indexer.selection.plan)])
+                *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
     def project(self, source):
         self.projections[0](self.query_latent)
@@ -164,4 +173,4 @@ class PreparedDSAIndexer:
         self.normalized_key.copy_(centered * torch.rsqrt(variance + self.eps)
             * self.weights["indexer.k_norm.weight"].float() + self.weights["indexer.k_norm.bias"].float())
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        self.parts[0].indexer.write_keys(self.normalized_key, self.slots)
+        write_fp8_index_keys(self.normalized_key, self.slots, self.cache, hadamard=False, power_of_two=False)
