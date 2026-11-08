@@ -16,6 +16,7 @@ from ignition.recipes.kimi3 import weights
 @dataclass
 class Converted:
     shape: tuple
+    retain_scale_rows: bool = True
 
 
 @dataclass
@@ -110,7 +111,8 @@ def metadata_config(monkeypatch):
     )
     monkeypatch.setattr(weights.ModelConfig, "load", lambda snapshot: config)
     monkeypatch.setattr(weights, "quantize_bf16_linear_as_mxfp8",
-                        lambda tensor: Converted(tuple(tensor.shape)))
+                        lambda tensor, *, retain_scale_rows=True:
+                        Converted(tuple(tensor.shape), retain_scale_rows))
     return config
 
 
@@ -130,6 +132,7 @@ def test_scope_selects_actual_loader_projection_groups(metadata_config, scope, o
                     else {"latent_gate", "q_b", "output"}) if broad else (
                         {"input"} if online and kind == "kda" else set())
         assert converted == expected
+        assert all(not layer["attention"][name].retain_scale_rows for name in converted)
         assert all(isinstance(value, Converted) == broad for value in layer["shared"].values())
         assert all(isinstance(layer[name], Converted) == broad
                    for name in ("latent_down", "latent_down_rows", "latent_up"))
@@ -155,7 +158,7 @@ def test_loader_rejects_unknown_scope_before_checkpoint_access(scope):
     (None, True), ("all", True), ("kda-input", True), ("all", False),
 ])
 def test_model_loader_forwards_scope_without_changing_dspark_family(
-        monkeypatch, metadata_config, sparse, scope, online):
+        monkeypatch, metadata_config, sparse, scope, online, tmp_path):
     from ignition.recipes.kimi3 import dspark_weights
     from ignition.recipes.kimi31 import dspark_config, dspark_weights as sparse_draft_weights
 
@@ -183,9 +186,11 @@ def test_model_loader_forwards_scope_without_changing_dspark_family(
         return draft
 
     monkeypatch.setattr(draft_owner, "load", load_draft)
+    (tmp_path / "config.json").write_text('{"architectures": ["K3DSparkModel"]}' if sparse
+                                         else '{"architectures": ["DSparkDraftModel"]}')
     options = {} if scope is None else {"online_mxfp8_scope": scope}
     result = weights.ModelWeights.load(SimpleNamespace(snapshot="metadata"), torch.device("meta"),
-        shard=TensorParallelShard(0, 1), online_mxfp8=online, draft_checkpoint="draft",
+        shard=TensorParallelShard(0, 1), online_mxfp8=online, draft_checkpoint=tmp_path,
         vision=False, **options)
     assert loaders[0].online_mxfp8_scope == (scope or "all")
     assert loaders[0].online_mxfp8 == online

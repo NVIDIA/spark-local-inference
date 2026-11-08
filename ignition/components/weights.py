@@ -44,6 +44,10 @@ for _container, _fields in (
       'mlp', 'attention_conv', 'mlp_conv')),
     ('ignition.components.dflash2_weights.DraftWeights',
      ('projection', 'hidden_norm', 'context_kv', 'norm', 'layers', 'selector')),
+    ('ignition.recipes.kimi31.dflash_weights.LayerWeights',
+     ('attention', 'input_norm', 'post_attention_norm', 'mlp', 'attention_conv', 'mlp_conv')),
+    ('ignition.recipes.kimi31.dflash_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'layers', 'selector', 'head')),
     # Recipe weight containers reached inside a declared layer/component.
     ('ignition.recipes.deepseek41.weights.ExpertWeights',
      ('router', 'correction', 'experts', 'shared', 'vision_correction')),
@@ -643,7 +647,7 @@ def record_final_fp4_expert_provenance_all():
             recorder(prepared)
 
 
-def quantize_bf16_linear_as_mxfp8(weight):
+def quantize_bf16_linear_as_mxfp8(weight, *, retain_scale_rows=True):
     """Convert a BF16 projection to b12x MXFP8 storage during loading."""
     import torch
     from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
@@ -657,7 +661,8 @@ def quantize_bf16_linear_as_mxfp8(weight):
     rows, columns = weight.shape
     padded = (columns + 127) // 128 * 128
     source = weight if columns == padded else torch.nn.functional.pad(weight, (0, padded - columns))
-    return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source), columns, padded, rows)
+    return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source, retain_scale_rows=retain_scale_rows),
+                             columns, padded, rows)
 
 
 class DirectWeightLoader:
