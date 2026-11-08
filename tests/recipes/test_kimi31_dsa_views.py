@@ -65,7 +65,7 @@ def test_equal_selection_stages_share_scratch_and_preserve_input_offsets(monkeyp
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
 
-    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedRowTopK", "PreparedBroadcast"):
+    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedOrderedRowTopK"):
         monkeypatch.setattr(indexer, name, operation)
     rows = 257
     query = torch.zeros((rows, 4096), dtype=torch.bfloat16)
