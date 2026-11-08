@@ -20,6 +20,29 @@ import traceback
 import torch
 
 
+def configure_environment(checkpoint, configuration_path, gpus):
+    """Apply the checkpoint recipe before any b12x module is imported."""
+    if any(name == 'b12x' or name.startswith(('b12x.', 'flashinfer.experimental.b12x')) for name in sys.modules):
+        raise RuntimeError('configure the qualifier before importing b12x')
+    from ignition.cli.config import Configuration
+    from ignition.cli.environment import apply
+    from ignition.cli.preparation import collective_tuning_mode, resolve_model, tuning_effort
+
+    configuration = Configuration.load(configuration_path)
+    model = resolve_model(configuration, str(checkpoint))
+    if model.recipe.name != 'kimi31':
+        raise ValueError('latent projection qualification requires a Kimi K3.1 checkpoint')
+    collective_tuning = collective_tuning_mode(configuration, model)
+    if collective_tuning != 'static':
+        raise ValueError('latent projection qualification requires static collective tuning')
+    apply(configuration, gpus, model.recipe.b12x_environment)
+    return dict(recipe=model.recipe.name, configuration=str(configuration.path),
+        recipe_b12x=dict(model.recipe.b12x_environment),
+        effective_b12x={name: value for name, value in sorted(os.environ.items()) if name.startswith('B12X_')},
+        gpu_uuids=[gpu.uuid for gpu in gpus], collective_tuning=collective_tuning,
+        autotune_effort=tuning_effort(configuration))
+
+
 def projection_errors(actual, reference):
     if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
         raise AssertionError('latent projection contains nonfinite values')
@@ -97,7 +120,10 @@ class ProjectionRouting:
         return self.latent
 
 
-def worker(rank, rendezvous, checkpoint, destination):
+def worker(rank, rendezvous, checkpoint, destination, policy):
+    for name, value in policy['effective_b12x'].items():
+        if os.environ.get(name) != value:
+            raise RuntimeError(f'worker dependency setting changed before preparation: {name}')
     from ignition import runtime_patches
     runtime_patches.apply()
     import torch.distributed as dist
@@ -115,13 +141,14 @@ def worker(rank, rendezvous, checkpoint, destination):
     device = torch.device('cuda', rank)
     dist.init_process_group('gloo', rank=rank, world_size=16, init_method=rendezvous,
                             timeout=timedelta(minutes=30))
-    graphs, runtimes, results, timings = [], [], [], []
+    graphs, runtimes, results, timings, selected_plans = [], [], [], [], []
 
     def save():
         if rank == 0:
             Path(destination).write_text(json.dumps(dict(checkpoint=str(checkpoint), layer=1,
                 reference='Full-K FP32 projection of BF16 inputs and weights, rounded to BF16; TF32 disabled.',
                 gate='Each case: relative L2 below 0.01; candidate overall and worst-row relative L2 no worse than control; exact router transport and routing.',
+                environment=policy, selected_plans_by_rank=selected_plans,
                 cases=results, component_timings=timings), indent=2) + '\n')
 
     try:
@@ -142,13 +169,16 @@ def worker(rank, rendezvous, checkpoint, destination):
         router_weight = full_router[r0:r1].contiguous()
         columns = torch.arange(h0, h1, device=device)
         coordinator = CollectivePreparation(dist.group.WORLD)
-        reduction = create_all_reduce_runtime(dist.group.WORLD, device, collective_tuning='static', max_tokens=1024, hidden_size=7168)
+        reduction = create_all_reduce_runtime(dist.group.WORLD, device,
+            collective_tuning=policy['collective_tuning'], max_tokens=1024, hidden_size=7168)
         router_runtime = create_all_gather_runtime(dist.group.WORLD, device, max_rows=1024, columns=2048)
         pair_runtime = create_head_exchange(dist.group.WORLD, device, max_rows=1024, heads=16, head_dim=336)
         runtimes = [pair_runtime, router_runtime, reduction]
         with RecordedPreparationSession(device=device, checkpoint=str(Path(checkpoint).resolve()),
                 workload_schema='kimi-full-k-latent-routing', numerical_policy='fp32-reference-bf16-output',
-                coordinator=coordinator, compile_workers=16) as session:
+                namespace={'recipe_b12x': policy['recipe_b12x']},
+                coordinator=coordinator, compile_workers=16,
+                collective_tuning=policy['collective_tuning'], autotune_effort=policy['autotune_effort']) as session:
             cases, buffers, compiled, timing_cases = [], {}, [], []
             for rows, strided in ((4096, False), (128, False), (16, False), (128, True)):
                 backing = torch.zeros((rows, 7200 if strided else 7168), dtype=torch.bfloat16, device=device)
@@ -160,7 +190,15 @@ def worker(rank, rendezvous, checkpoint, destination):
                 cases.append((rows, strided, source, variants))
             if rank == 0:
                 print('Tuning latent projection and router fixtures with ordinary b12x selection', flush=True)
-            session.tune(show_progress=False)
+            tuning = session.tune(show_progress=False)
+            from b12x.preparation import FrozenMapping
+
+            collective_queries = {request.name: FrozenMapping(
+                request.plan.contract.encode_query(request.plan.query)).to_dict()
+                for request in session._recorded_requests.values() if request.plan.component_id == 'comm.pcie'}
+            selected_plans = [None] * 16
+            dist.all_gather_object(selected_plans, dict(rank=rank, tuning=tuning, collective_queries=collective_queries))
+            save()
             for rows, strided, source, variants in cases:
                 for mode in ('eager', 'compiled'):
                     if rank == 0:
@@ -278,16 +316,25 @@ def worker(rank, rendezvous, checkpoint, destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--config', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
         parser.error('output must not already exist')
-    if torch.cuda.device_count() != 16:
+    from ignition.cli.preparation import Host
+
+    gpus = Host.discover().gpus
+    if len(gpus) != 16:
         parser.error('assign exactly sixteen idle CUDA devices')
+    policy = configure_environment(args.checkpoint, args.config, gpus)
+    print(json.dumps(dict(environment=policy)), flush=True)
+    if torch.cuda.device_count() != 16:
+        parser.error('configured CUDA visibility must contain sixteen devices')
     import torch.multiprocessing as mp
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='kimi-latent-prefill-') as directory:
-        mp.spawn(worker, args=((Path(directory) / 'gloo').as_uri(), str(args.checkpoint), str(args.output)), nprocs=16, join=True)
+        mp.spawn(worker, args=((Path(directory) / 'gloo').as_uri(), str(args.checkpoint), str(args.output), policy),
+                 nprocs=16, join=True)
 
 
 if __name__ == '__main__':
