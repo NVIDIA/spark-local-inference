@@ -994,7 +994,10 @@ layers, attention residuals, latent SiTU experts, and the MoonViT image encoder.
 The checkpoint's native MXFP4 expert weights use losslessly compressed block
 scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
-The optional conversion otherwise covers the same target projections as Kimi K3.
+`--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
+`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
+DSpark draft weights retain checkpoint precision. Omit the flag to retain
+checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
 of two; key scales use `max(absmax, 1e-4) / 448` in FP32.

@@ -199,7 +199,9 @@ class Recipe:
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as
     MXFP8 while loading, trading checkpoint precision for decode bandwidth.
-    `online_mxfp8_scopes` names eligible projection groups; `all` selects the complete set.
+    `online_mxfp8_scope` selects the conversion group for preparation; `all` selects
+    the complete eligible set. `online_mxfp8_scopes` also accepts groups recorded in
+    prepared metadata so an explicit precision choice retains its meaning.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
@@ -235,6 +237,7 @@ class Recipe:
     stream_overlap: bool = False
     mixed_prefill: bool = False
     online_mxfp8: bool = False
+    online_mxfp8_scope: str = "all"
     online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
@@ -257,6 +260,8 @@ class Recipe:
                                         speculation.token_capacity if enabled else None))
 
     def __post_init__(self):
+        if self.online_mxfp8_scope not in self.online_mxfp8_scopes:
+            raise ValueError("recipe online MXFP8 scope must belong to its supported conversion groups")
         if self.export_repository:
             import re
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*', self.export_repository) or '..' in self.export_repository:

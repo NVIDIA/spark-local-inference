@@ -246,13 +246,10 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="development: capture graphs without compiling forwards")
     advanced.add_argument("--online-mxfp8", action="store_true",
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading"
-                               " (Kimi K3 KDA, MLA except batched key/value, shared"
+                               " (Kimi K3.1 target KDA inputs only; Kimi K3 KDA, MLA except batched key/value, shared"
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
                                " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
-    advanced.add_argument("--online-mxfp8-scope", choices=("all", "kda-input"),
-                          help="projection group converted by --online-mxfp8; all converts every eligible"
-                               " projection (default), kda-input converts only fused Kimi KDA inputs")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

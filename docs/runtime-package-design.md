@@ -329,6 +329,13 @@ collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
 original ladder file path. Helios does not interpret that preparation input.
 
+Online MXFP8 conversion records its resolved projection group in
+`RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
+independently of the recipe's preparation default. Explicit `all` and `kda-input`
+values retain their meanings. Weight reuse and package combination reject
+different conversion groups; changing a recipe default never changes stored
+weights or the serving behavior of an exported package.
+
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
 owner paths, packing-owner types, dtypes, shapes, element strides, and

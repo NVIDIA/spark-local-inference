@@ -156,7 +156,7 @@ def run(args):
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
-        online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope, language_model_only=args.language_model_only,
+        online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
