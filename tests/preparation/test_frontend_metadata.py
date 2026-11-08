@@ -86,6 +86,32 @@ def test_image_metadata_is_a_tight_consumed_contract():
             image_settings(changed, model, "qwen")
 
 
+def mimo_source(min_pixels, max_pixels, mean, std):
+    processor = dict(processor_class="Qwen2_5_VLProcessor", image_processor_type="Qwen2VLImageProcessor",
+        patch_size=16, temporal_patch_size=2, merge_size=2, min_pixels=min_pixels, max_pixels=max_pixels,
+        image_mean=mean, image_std=std)
+    model = dict(model_type="mimo_v2", image_token_id=151655,
+        vision_config=dict(patch_size=16, temporal_patch_size=2, spatial_merge_size=2))
+    return processor, model
+
+
+@pytest.mark.parametrize("area,mean,std", [
+    ((3136, 12845056), [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+    ((8192, 8388608), [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+def test_mimo_image_profile_packages_the_checkpoint_resize_area_and_normalization(area, mean, std):
+    processor, model = mimo_source(*area, mean, std)
+    assert image_settings(processor, model, "mimo") == {"mimo": dict(
+        min_pixels=area[0], max_pixels=area[1], image_mean=mean, image_std=std)}
+    for key, value in (("min_pixels", 0), ("min_pixels", area[1] + 1), ("max_pixels", 1.5),
+                       ("image_mean", mean[:2]), ("image_mean", [float("nan"), 0.5, 0.5]),
+                       ("image_std", [0.2, 0., 0.2]), ("merge_size", 3)):
+        with pytest.raises(ValueError, match="unsupported image processor"):
+            image_settings({**processor, key: value}, model, "mimo")
+    with pytest.raises(ValueError, match="unsupported model configuration"):
+        image_settings(processor, {**model, "model_type": "qwen4_exp"}, "mimo")
+
+
 def test_glm_image_profile_validates_checkpoint_structure():
     fixture = json.loads((Path(__file__).parents[1] / "frontend/glm53_images.json").read_text())
     processor, model = fixture["processor"], fixture["model"]

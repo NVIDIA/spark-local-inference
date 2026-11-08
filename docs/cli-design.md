@@ -460,7 +460,7 @@ Gemma 4 defaults to four concurrent requests and six speculative target-token
 rows. Other recipes default to 32 concurrent requests and 128 target-token rows.
 Qwen3.8 Flash, Qwen3.8 27B, and GLM 5.3 use rectangular catalogs covering five
 drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
-covers its full three-draft depth at batch 32. DeepSeek V4/V4.1, MiMo V2.6 Pro,
+covers its full three-draft depth at batch 32. DeepSeek V4/V4.1, MiMo V2.6,
 Kimi K3, Nemotron Bolt, and MiniMax M3.1 use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects
 its proposal and prefix-allocation mode.

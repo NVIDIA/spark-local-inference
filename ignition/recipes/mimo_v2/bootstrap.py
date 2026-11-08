@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare MiMo text, DFlash proposals and image encoder graphs for local TP."""
+"""Prepare MiMo text, DFlash proposals and image encoder graphs for same-host or multi-host TP."""
 
 import contextlib
 import hashlib
@@ -42,11 +42,12 @@ from ignition.preparation.collectives import (
     create_all_gather_runtime,
     create_all_reduce_runtime,
     create_dma_all_reduce_runtime,
+    create_roce_runtime,
 )
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import release_unused
-from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
+from ignition.preparation.frontend import prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
@@ -59,7 +60,8 @@ from .decoder import PreparedDecoder, Scratch
 from .dflash import SpeculativePreparation
 from .model import DecoderEnvironment
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
-from .vision import FEATURES, HIDDEN, PATCH_CAPACITIES, PreparedVision, VisionInputs, VisionScratch
+from .frontend import chat_template_asset
+from .vision import FEATURES, PATCH_CAPACITIES, VISION_WIDTH, PreparedVision, VisionInputs, VisionScratch
 from .vision_state import PreparedVisionGeneration
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from .weights import ModelWeights
@@ -77,6 +79,10 @@ class PreparationConfig:
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(8))
+    # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
+    hosts: tuple[str, ...] | None = None
+    roce_ring: bool = False
+    roce_chain: bool = False
     context: int = 1048576
     prefill_chunk_size: int = 4096
     max_active: int = 4
@@ -101,12 +107,20 @@ class PreparationConfig:
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
+        placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (
-            len(self.devices) not in (2, 4, 8)
-            or len(set(self.devices)) != len(self.devices)
-            or any(d < 0 for d in self.devices)
+            not isinstance(self.devices, tuple)
+            or len(self.devices) not in (2, 4, 8)
+            or len(set(placements)) != len(self.devices)
+            or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
+            or any(type(d) is not int or d < 0 for d in self.devices)
         ):
-            raise ValueError("MiMo preparation requires distinct GPUs dividing its eight QKV checkpoint shards")
+            raise ValueError("MiMo preparation requires two, four or eight distinct GPUs")
         if not PAGE_TOKENS <= self.context <= 1048576 or self.context % PAGE_TOKENS:
             raise ValueError("MiMo context must be 128-aligned in [128,1048576]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
@@ -206,19 +220,43 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         ipc = core_storage.peer_storage
+        hidden = weights.config.text["hidden_size"]
         draft_rows = slots * weights.config.draft.block_size if config.dflash else 0
         tokens = max(config.prefill_chunk_size, config.decode_tokens, draft_rows)
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=6144, ipc=ipc)
-        prefill_collective = create_dma_all_reduce_runtime(
-            group, device, max_tokens=config.prefill_chunk_size, hidden_size=6144, ipc=ipc
-        )
-        vocabulary_collective = create_all_gather_runtime(
-            group, device, max_rows=max(config.decode_samples, draft_rows), columns=152576, ipc=ipc
-        )
-        context_collective = (create_all_gather_runtime(group, device,
-            max_rows=tokens, columns=6144, ipc=ipc) if config.dflash else None)
-        vision_collective = create_dma_all_reduce_runtime(group, device,
-            max_tokens=PATCH_CAPACITIES[-1] // 4, hidden_size=6144, ipc=ipc)
+        gather_rows = max(config.decode_samples, draft_rows)
+        # The image encoder reduces (patches, 1280) block outputs and (patches / 4, hidden) merged
+        # features; size its reductions in hidden-width rows covering the larger of the two.
+        vision_tokens = -(-max(PATCH_CAPACITIES[-1] * VISION_WIDTH, PATCH_CAPACITIES[-1] // 4 * hidden) // hidden)
+        if coordinator.spans_hosts:
+            # Ranks on separate Sparks reduce, gather and broadcast through one RoCEnante runtime in
+            # rank-serial order: decode rows reduce one-shot, prefill chunks and image features through
+            # the pipelined two-shot path. Gathers carry vocabulary partitions, DFlash context
+            # projections, and packed speculative acceptance results over the same channel.
+            gather_bytes = max(gather_rows * (152576 // shard.world_size) * 2,
+                               tokens * (hidden // shard.world_size) * 2)
+            if config.dflash:
+                from ignition.components.collectives import packed_broadcast_layout
+                from ignition.components.speculation import SpeculativeAcceptance
+
+                acceptance = SpeculativeAcceptance.broadcast_layout(max(config.batch_capacities), max(config.speculative_widths))
+                gather_bytes = max(gather_bytes, (packed_broadcast_layout(acceptance.values())[1] + 15) // 16 * 16)
+            collective = create_roce_runtime(group, device, max_tokens=tokens, pipe_tokens=max(tokens, vision_tokens),
+                hidden_size=hidden, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain,
+                core_storage=core_storage)
+            prefill_collective = vocabulary_collective = vision_collective = collective
+            context_collective = collective if config.dflash else None
+        else:
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=hidden, ipc=ipc)
+            prefill_collective = create_dma_all_reduce_runtime(
+                group, device, max_tokens=config.prefill_chunk_size, hidden_size=hidden, ipc=ipc
+            )
+            vocabulary_collective = create_all_gather_runtime(
+                group, device, max_rows=gather_rows, columns=152576, ipc=ipc
+            )
+            context_collective = (create_all_gather_runtime(group, device,
+                max_rows=tokens, columns=hidden, ipc=ipc) if config.dflash else None)
+            vision_collective = create_dma_all_reduce_runtime(group, device,
+                max_tokens=vision_tokens, hidden_size=hidden, ipc=ipc)
         identity = hashlib.sha256(
             json.dumps(
                 {
@@ -256,7 +294,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         vision_inputs = VisionInputs.allocate(device)
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
         vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency, image_token=weights.config.text["image_token_id"],
-                                   features=FEATURES, hidden=HIDDEN)
+                                   features=FEATURES, hidden=hidden)
         vision_storage = {}
         environment = DecoderEnvironment.load(snapshot, vision_state)
         buffers = dict(
@@ -388,7 +426,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
             cursor = graph_buffers.cursor()
-            vision_storage[capacity] = VisionScratch.allocate(capacity, shard, device, buffers=cursor)
+            vision_storage[capacity] = VisionScratch.allocate(capacity, shard, device, hidden=hidden, buffers=cursor)
             encoder = PreparedVision(
                 weights.vision,
                 vision_storage[capacity],
@@ -509,9 +547,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             ("tokenizer", snapshot / "tokenizer.json"),
         )
     }
-    assets["chat_template"] = annotated_template_asset(
-        (snapshot / "chat_template.jinja").read_bytes(),
-        Path(__file__).with_name("assets") / "chat_template.patch.json")
+    assets["chat_template"] = chat_template_asset(snapshot)
     cache_regions = [history_region(buffers, "cache." + name, tensor, contract_proto.PAGED_KEY_VALUE)
         for name, tensor in pool.pages.items()]
     buffers["request_pending_token"] = requests.pending_token
@@ -629,9 +665,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             coordinator,
             speculation,
         ),
+        # Across hosts every collective is the one RoCE runtime; close each owner once.
         close_resources=tuple(
-            c
-            for c in (scoring, context_collective, vision_collective, prefill_collective, vocabulary_collective, collective)
+            c for c in dict.fromkeys(
+                (scoring, context_collective, vision_collective, prefill_collective, vocabulary_collective, collective))
             if c is not None
         ),
     )

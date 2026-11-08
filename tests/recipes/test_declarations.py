@@ -71,7 +71,8 @@ def test_qwen_state_rows_and_pages_match_the_prepared_layouts(world_size):
 
 
 @pytest.mark.parametrize("alias,world_size", [("qwen3.8-27b", 1), ("kimi-k3-mxfp4-csf", 16),
-    ("mimo-v2.6-pro-mopd", 2), ("mimo-v2.6-pro-mopd", 4), ("mimo-v2.6-pro-mopd", 8), ("nemotron-bolt-24gb", 1)])
+    ("mimo-v2.6-pro-mopd", 2), ("mimo-v2.6-pro-mopd", 4), ("mimo-v2.6-pro-mopd", 8),
+    ("mimo-v2.6-flash-rl", 2), ("mimo-v2.6-flash-rl", 4), ("nemotron-bolt-24gb", 1)])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
     from dataclasses import replace
@@ -128,7 +129,7 @@ def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
     else:
         caches.extend(draft_caches)
     assert caches and all(cache.dtype == torch.float8_e4m3fn for cache in caches)
-    costs = model.recipe.costs(world_size, model.recipe.speculation if drafting else None)
+    costs = model.recipe.costs(world_size, model.recipe.speculation if drafting else None, model.checkpoint)
     assert pool.layout.row_bytes == costs.state_row_bytes
     assert sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
 
@@ -289,13 +290,68 @@ def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path):
     config, *_ = seen.pop()
     assert config.mtp is False and config.page_capacity == plan.minimum_pages
 
+    # MiMo ranks on separate hosts also prepare on GPU 0 and receive the planned checkpoint.
+    from ignition.recipes.mimo_v2 import bootstrap as mimo
+
+    flash = resolve("mimo-v2.6-flash-rl")
+    plan = fitted(flash, 2, concurrency=8)
+    assert flash.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) == "group"
+    config, prepare, ranks, checkpoint = seen.pop()
+    assert prepare is mimo.prepare_rank and config.devices == (0, 1) and config.hosts is None
+    assert ranks is None and checkpoint == plan.checkpoint and config.dflash
+    flash.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None, ranks=rendezvous)
+    config, prepare, ranks, checkpoint = seen.pop()
+    assert config.devices == (0, 0) and config.hosts == ("boot-a", "boot-b")
+    assert ranks is rendezvous and checkpoint == plan.checkpoint
+    assert not config.roce_ring and not config.roce_chain
+
+
+def test_flash_checkpoint_declares_the_sizes_its_shards_divide():
+    from ignition.errors import CapacityError
+
+    flash, pro = resolve("mimo-v2.6-flash-rl"), resolve("mimo-v2.6-pro-mopd")
+    recipe = flash.recipe
+    assert recipe.checkpoint_tensor_parallel(pro.checkpoint) == recipe.tensor_parallel == (2, 4, 8)
+    assert recipe.checkpoint_tensor_parallel(flash.checkpoint) == (2, 4)
+    assert recipe.served_name(pro.checkpoint) == "MiMo-V2.6-Pro-MOPD"
+    assert recipe.served_name(flash.checkpoint) == "MiMo-V2.6-Flash-RL"
+    for world in (2, 4):
+        with_drafts, plain = recipe.costs(world, recipe.speculation, flash.checkpoint), recipe.costs(world, None, flash.checkpoint)
+        assert with_drafts.page_bytes == plain.page_bytes and with_drafts.state_row_bytes > plain.state_row_bytes
+        assert with_drafts.graph_bytes == recipe.costs(world, recipe.speculation).graph_bytes
+    # Eight GPUs select a size the Flash checkpoint's four fused-QKV shards do not divide.
+    gpus = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
+                 for index in range(8))
+    with pytest.raises(CapacityError, match="needs 2 or 4 GPUs; 8 selected"):
+        planning.plan(recipe, flash.checkpoint, gpus, selected=tuple(range(8)), concurrency=4,
+                      reserve_bytes=0, prefill_chunk=None, speculation=recipe.speculation)
+    planning.plan(recipe, pro.checkpoint, gpus, selected=tuple(range(8)), concurrency=4,
+                  reserve_bytes=0, prefill_chunk=None, speculation=recipe.speculation)
+
+
+def test_checkpoint_costs_stay_within_the_recipe_sizes():
+    from dataclasses import replace
+
+    from ignition.recipes.declaration import RankCosts
+
+    flash = resolve("mimo-v2.6-flash-rl")
+    recipe, checkpoint = flash.recipe, flash.checkpoint
+    costs = {world: RankCosts(1, 1, 1) for world in (2, 3)}
+    with pytest.raises(ValueError, match="sizes its recipe does not serve"):
+        replace(recipe, checkpoints=(replace(checkpoint, ranks=costs, plain_ranks=costs),))
+    with pytest.raises(ValueError, match="with and without speculation for different sizes"):
+        replace(recipe, checkpoints=(replace(checkpoint, plain_ranks={2: RankCosts(1, 1, 1)}),))
+    with pytest.raises(ValueError, match="with and without speculation for different sizes"):
+        replace(recipe, checkpoints=(replace(checkpoint, ranks=None),))
+
 
 def test_recipes_declare_whether_they_overlap_branches():
     overlapping = {alias: resolve(alias).recipe.stream_overlap for alias in (
-        "qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash", "mimo-v2.6-pro-mopd")}
+        "qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash", "mimo-v2.6-pro-mopd",
+        "mimo-v2.6-flash-rl")}
     # MiMo composes every branch on the main stream; the others overlap shared experts or projection chains.
     assert overlapping == {"qwen3.8-flash": True, "glm-5.3-flash": True, "deepseek-v4-flash": True,
-                           "deepseek-v4.1-flash": True, "mimo-v2.6-pro-mopd": False}
+                           "deepseek-v4.1-flash": True, "mimo-v2.6-pro-mopd": False, "mimo-v2.6-flash-rl": False}
 
 
 @pytest.mark.parametrize("alias", ["qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash"])
@@ -382,6 +438,7 @@ def test_deepseek41_recipe_defaults_and_adapter_preserve_packed_gpu_planning(mon
 @pytest.mark.parametrize("alias,options", [
     ("deepseek-v4-flash", {}),
     ("mimo-v2.6-pro-mopd", {}),
+    ("mimo-v2.6-flash-rl", {}),
     ("kimi-k3-mxfp4-csf", {"draft_checkpoint": Path("dspark")}),
     ("nemotron-bolt-24gb", {"draft_checkpoint": Path("lilicorr")}),
 ])

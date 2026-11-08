@@ -135,7 +135,7 @@ def test_graph_budget_preserves_cpu_fixed_width_mode():
         Speculation(5, adaptive=False, packed_verification=True, draft_prefix_selection="gpu", graph_budget=64)
 
 
-@pytest.mark.parametrize("alias", ["deepseek-v4-flash", "mimo-v2.6-pro-mopd", "kimi-k3-mxfp4-csf", "qwen3.8-27b", "qwen3.8-27b-qad"])
+@pytest.mark.parametrize("alias", ["deepseek-v4-flash", "mimo-v2.6-pro-mopd", "mimo-v2.6-flash-rl", "kimi-k3-mxfp4-csf", "qwen3.8-27b", "qwen3.8-27b-qad"])
 def test_cpu_packed_recipe_accepts_fixed_width_and_explicit_graph_budget(alias):
     value = selected("--no-mtp-adaptive-verification", "--speculative-graph-budget", "32", alias=alias)
     assert value.packed_verification and value.draft_prefix_selection == "cpu"

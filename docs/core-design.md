@@ -355,7 +355,7 @@ Recipes declare the data consumed by the shared native contract:
 | [GLM 5.3 Flash](../ignition/recipes/glm53/recipe.py) | [Prepared data](../ignition/recipes/glm53/contract.py) | KDA recurrence, indexed MLA, mHC, vision, and learned MTP |
 | [DeepSeek V4.1 Flash](../ignition/recipes/deepseek41/recipe.py) | [Prepared data](../ignition/recipes/deepseek41/contract.py) | Compressed latent attention, sliding windows, Engram tables, and DSpark proposal composition |
 | [DeepSeek V4 Flash](../ignition/recipes/deepseek4/recipe.py) | [Prepared data](../ignition/recipes/deepseek4/contract.py) | Compressed latent attention, sliding windows, vision, and DSpark proposals |
-| [MiMo V2.6 Pro](../ignition/recipes/mimo_v2/recipe.py) | [Prepared data](../ignition/recipes/mimo_v2/contract.py) | Paged KV, sliding windows, vision, and DFlash proposals |
+| [MiMo V2.6 Pro and Flash](../ignition/recipes/mimo_v2/recipe.py) | [Prepared data](../ignition/recipes/mimo_v2/contract.py) | Paged KV, sliding windows, vision, and DFlash proposals |
 
 Recipes declare supported GPU counts, checkpoint revisions, and feature
 capacities. Each architecture and tensor-parallel size requires independent
