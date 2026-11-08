@@ -6,7 +6,7 @@
 import torch
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
+from ignition.components.collectives import ConcurrentAllGather, PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.peer_record_gather import PreparedPeerRecordGather
 from ignition.components.interleaved_history import PreparedInterleavedHistory
@@ -110,11 +110,24 @@ class PreparedDSA(PreparedMLAProjection):
                     runtime=context.heads, session=session, coordinator=context.coordinator, name=name + ".combine",
                     threads=512, block_limit=8)
             self.parts.append(part)
+        self.query_overlap = None
+        if mode == "decode" and self.absorbed.shape[0] == 1 and workspace is not None and workspace.overlap:
+            part, = self.parts
+            # The fork follows cache production. Candidate transport follows the joined
+            # query output, so the two channels never execute concurrently on any rank.
+            part["gather"].dependencies.append(cache)
+            part["selector"].gather.dependencies.append(part["gather"].output)
+            self.query_overlap = ConcurrentAllGather(part["gather"], workspace=workspace, session=session,
+                                                     parallel_plans=self.indexer.local_plans)
 
     def __call__(self, source):
         self.project(source)
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
+        if self.query_overlap is not None:
+            part, = self.parts
+            part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
+            self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
         self.indexer.project(source)
         if self.history is not None:
             # Read the owning rank's cache after this layer writes the chunk;
@@ -123,7 +136,12 @@ class PreparedDSA(PreparedMLAProjection):
             self.history()
         for part in self.parts:
             selector = part["selector"]
-            selected = selector()
+            if self.query_overlap is None:
+                selected = selector()
+            else:
+                dependency = selector.prepare_local()
+                self.query_overlap.finish(part["quantized"].view(self.absorbed.shape[0], -1), dependency)
+                selected = selector.exchange()
             selection_slots(selected, selector.positions, selector.tables, part["owners"], part["slots"],
                 part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill",
                 global_records=self.history is not None)
@@ -131,8 +149,9 @@ class PreparedDSA(PreparedMLAProjection):
                 part["gather"]()
                 part["attention"]()
             else:
-                part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
-                part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
+                if self.query_overlap is None:
+                    part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
+                    part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
                 part["attention"]()
                 part["combine"](part["partial"], part["lse"])
         return self.finish()
