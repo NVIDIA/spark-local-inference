@@ -1001,6 +1001,20 @@ of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
 
+Prefill capacities of at least 4096 tokens stage each layer's visible latent
+history through fixed peer buffers before reading selected records locally.
+The transfer preserves owner-cache bytes, selection order and BF16 attention
+queries. At a 1,048,576-token context limit, it adds 36 MiB of shared staging
+and 576 MiB of local history storage per rank. Smaller prefill capacities still
+read peer KV pools directly, so this does not remove their startup mappings.
+TP16 component checks cover exact record bytes and selected order, unchanged
+BF16 attention outputs, empty and partial rows, changing histories through
+1,048,576 tokens, and queued compiled replay. Native package performance remains
+unqualified. Reproduce the component checks with
+`tests/recipes/test_kimi31_staged_prefill_cuda.py`; `python -m
+qualify.kimi_staged_prefill --output PATH` measures the paired complete transfer,
+selected-gather and attention paths on sixteen explicitly assigned idle GPUs.
+
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)
 draft at revision `6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94`, downloaded into the
