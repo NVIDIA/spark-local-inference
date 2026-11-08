@@ -5,6 +5,7 @@
 """Explicit compilation policies retain their cache, backend and restore identity."""
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
+from inspect import signature
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
@@ -26,11 +27,19 @@ class _Selections(inductor_tuning.InductorSelections):
 
 
 def _loaded_backend():
-    return SimpleNamespace(compiled_fn=SimpleNamespace(artifact=SimpleNamespace(_flare_graph=object())))
+    from torch._dynamo.guards import GuardManagerWrapper
+
+    backend = aot.StorageBackend.__new__(aot.StorageBackend)
+    backend.artifact = SimpleNamespace(_flare_graph=object())
+    backend._serialized_artifact = b"portable backend"
+    return SimpleNamespace(compiled_fn=backend, signature=signature(lambda forward: None),
+        runtime_env=SimpleNamespace(closure=()), guards_state=b"portable guards",
+        guard_manager=GuardManagerWrapper(root=SimpleNamespace(check=lambda arguments: True)))
 
 
 @pytest.fixture
 def caches(monkeypatch, tmp_path):
+    aot.runtime_patches.apply()
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', _Selections)
     monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: SimpleNamespace(synchronize=lambda: None))
     package = tmp_path / 'ignition' / 'preparation'
@@ -64,6 +73,13 @@ def test_explicit_options_are_an_immutable_snapshot_and_part_of_cache_identity(c
         prepared.options['compile_threads'] = 1
     assert caches(options=dict(prepared.options, compile_threads=1)).root == prepared.root
     assert caches(options=dict(baseline)).root == ordinary.root
+
+
+def test_runtime_patch_identity_invalidates_forward_artifacts(caches, monkeypatch):
+    with torch.compiler.config.patch(cache_key_tag=torch.compiler.config.cache_key_tag):
+        ordinary = caches()
+        monkeypatch.setattr(aot.runtime_patches, 'identity', lambda: 'different-runtime-patches')
+        assert caches().root != ordinary.root
 
 
 def test_aot_forward_snapshots_explicit_options_for_its_backend(monkeypatch):
@@ -143,6 +159,7 @@ def test_prepare_and_binding_rebuild_retain_instance_options(caches, monkeypatch
         _artifacts = _loaded_backend()
         def __call__(self, owner):
             return owner
+        fn = __call__
         def save_compiled_function(self, path):
             Path(path).write_bytes(b'compiled')
     def compile(owner, *, options):
@@ -178,6 +195,7 @@ def test_prepare_many_passes_snapshot_and_preserves_warmup_scope(caches, monkeyp
         _artifacts = _loaded_backend()
         def __call__(self, owner):
             executed.append('execute')
+        fn = __call__
         def save_compiled_function(self, path):
             Path(path).write_bytes(b'compiled')
     @contextmanager
@@ -216,6 +234,7 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
         _artifacts = _loaded_backend()
         def __call__(self, owner):
             executed.append('execute')
+        fn = __call__
         def save_compiled_function(self, path):
             Path(path).write_bytes(b'recompiled')
     def compile(owner, *, options):

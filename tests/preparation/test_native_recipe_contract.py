@@ -89,7 +89,8 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         draft_page_tables=torch.zeros_like(inputs.page_tables))
     completion_capacity = config.completion_token_capacity if completion_capacity is None else completion_capacity
     buffers.update(CompletionOutputs.allocate((2, capacity, 16 + completion_capacity), device="cpu").buffers())
-    vision_buffers = _vision_buffers(recipe)
+    vision = getattr(config, "vision", not getattr(config, "language_model_only", False))
+    vision_buffers = _vision_buffers(recipe) if vision else {}
     buffers.update(vision_buffers)
     if vision_buffers:
         from ignition.components.vision_state import PrefillVisionInputs
@@ -158,14 +159,15 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     for key, value in dict(page_tokens=256 if recipe == "glm53" else 64 if recipe == "qwen38" else 128,
             draft_lag=0 if recipe in ("deepseek41", "deepseek4", "mimo_v2") else 1,
             rows=None if recipe in ("deepseek41", "deepseek4") else 1,
-            vocabulary=vocabulary, mtp=getattr(config, "mtp", True), dspark=True, image_slots=4).items():
+            vocabulary=vocabulary, mtp=getattr(config, "mtp", True), dspark=True,
+            image_slots=getattr(config, "image_concurrency", 4), vision=vision).items():
         if key in arguments:
             kwargs[key] = value
     if recipe == "glm53" and not config.mtp:
         kwargs["draft_lag"] = None
     if "frontend" in arguments:
         kwargs["frontend"] = importlib.import_module(f"ignition.recipes.{recipe}.frontend").FRONTEND
-    if recipe not in ("gemma4", "qwen38_dense"):
+    if vision_buffers:
         add("vision", 1, 1)
     contract = module.prepare(signatures, buffers, pool, **kwargs)
     if contract["vision"]["max_images"]:
@@ -199,6 +201,20 @@ def test_generated_recipe_catalog_passes_native_contract_validation(recipe):
             (graph["batch_capacity"], graph["draft_tokens"], graph["token_capacity"], graph.get("packed_token_capacity", 0))
             for graph in manifest["graphs"] if graph["kind"] == "speculative"
         }
+
+
+@pytest.mark.parametrize("image_concurrency", [None, 0])
+def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(image_concurrency):
+    import flare_heliopause
+
+    config, contract, manifest = _recipe_metadata("kimi3", config_options=dict(
+        vision=False, image_concurrency=image_concurrency))
+    assert config.image_concurrency == 0
+    assert contract["vision"] == dict(feature_slots=0, features_per_request=0,
+        max_images=0, patches_per_feature=0, patch_capacities=[])
+    assert not contract["frontend"].get("image_preparation")
+    assert all(graph["kind"] != "vision" for graph in manifest["graphs"])
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
 
 
 def test_deepseek41_export_geometry_passes_native_bootstrap():

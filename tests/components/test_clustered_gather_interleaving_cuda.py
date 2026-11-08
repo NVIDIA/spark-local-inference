@@ -55,7 +55,7 @@ def _rank(rank, directory):
         def forward(reduce_handle, gather_handle):
             def run(source, reduced, gathered):
                 _all_reduce(source, reduced, reduce_handle)
-                _all_gather(reduced, gathered, gather_handle)
+                _all_gather(reduced, gathered, [], gather_handle)
             return run
 
         for rows, (source, reduced, gathered, r, g) in cases.items():

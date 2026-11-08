@@ -91,12 +91,12 @@ class QSABenchmarkInputs:
             self.binding[name].copy_(value)
 
 
-def input_factory(caps, binding, dynamic, *, storage=None):
+def input_factory(caps, binding, dynamic, *, storage=None, session=None):
     def allocate():
         with (nullcontext() if storage is None else storage.transient()):
             return QSABenchmarkInputs(caps, binding, dynamic)
 
-    return candidate_inputs(allocate)
+    return candidate_inputs(allocate, session=session)
 
 
 def benchmark_call(state, *, inputs, workspace):

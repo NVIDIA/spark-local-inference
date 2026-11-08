@@ -57,22 +57,24 @@ def test_trial_inputs_are_restored_before_warmup_and_outside_graph_capture(monke
             state["capturing"] = False
 
     def restore(name):
-        assert name == "trial" and not state["capturing"]
+        assert name in ("trial", "other") and not state["capturing"]
         state["value"] += 1
         calls.append(("restore", state["value"]))
 
     def forward():
-        calls.append(("run", state["value"]))
+        calls.append(("run", state["value"], state["capturing"]))
 
     monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
     monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
     monkeypatch.setattr(capture.torch.cuda, "graph", graph_scope)
-    capture.capture_forwards({"trial": forward}, {"trial": SimpleNamespace(kind="speculative")},
+    capture.capture_forwards(dict.fromkeys(("trial", "other"), forward),
+        {name: SimpleNamespace(kind="speculative") for name in ("trial", "other")},
         session=SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {}), capture=nullcontext),
         device="cuda:0", stream=stream, pool=None, compile_decoder=False, before_run=restore)
-    assert calls == [("restore", 1), ("run", 1), ("restore", 2), ("run", 2)]
+    assert calls == [("restore", 1), ("run", 1, False), ("restore", 2), ("run", 2, False),
+                     ("restore", 3), ("run", 3, True), ("restore", 4), ("run", 4, True)]
 
 
 def test_grouped_capture_compiles_one_representative_and_captures_each_owner(monkeypatch):

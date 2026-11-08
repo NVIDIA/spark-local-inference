@@ -8,6 +8,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 
 
@@ -184,9 +185,11 @@ class CollectivePreparation:
         return len(set(self.hosts)) > 1
 
     def same_on_every_rank(self, value):
-        values = [None] * len(self.ranks)
-        dist.all_gather_object(values, value, group=self.group)
-        return all(item == values[0] for item in values)
+        reference = [value if dist.get_rank() == self.ranks[0] else None]
+        dist.broadcast_object_list(reference, src=self.ranks[0], group=self.group)
+        matching = torch.tensor(int(value == reference[0]), dtype=torch.int32, device="cpu")
+        dist.all_reduce(matching, op=dist.ReduceOp.MIN, group=self.group)
+        return bool(matching.item())
 
     def share_selections(self, cache):
         """Adopt rank zero's cached kernel selections on every rank.

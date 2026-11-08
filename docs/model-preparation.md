@@ -56,7 +56,8 @@ Unsigned rank staging is private to preparation and cannot load in Helios.
 Flare loads the package files without Python. Helios is a Rust library;
 `flare_heliopause` is a CPython extension imported by Ignition.
 
-Recipes default to FP8 E4M3 KV storage, including learned draft-model caches. Qwen Flash retains BF16 selector keys;
+Recipes generally use FP8 E4M3 KV storage. Kimi DSpark drafts retain BF16 keys and values,
+and Qwen Flash retains BF16 selector keys;
 GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
@@ -74,39 +75,33 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-Ignition applies three bundled preparation patches to the pinned PyTorch 2.14.1 and
-Triton 3.8 preparation environment before importing preparation libraries in
-`export`, `debug-serve`, `bench`, and `join`, including commands launched through `uv run`.
-`ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
-Triton's 150-character physical cache filenames while retaining full CUDA symbol
-names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
-cooperative vision reductions in portable static kernels through Triton's CUDA
-launcher, including their cooperative launch attributes and frozen selections.
-`ignition/patches/triton-platform-key-pointer-width.patch` derives Triton's helper
-cache key from the interpreter's pointer width without launching `file`.
-Nsight Systems injection can conflict with `file`'s seccomp sandbox and hang
-startup ([NVIDIA known issues](https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html#general-issues)).
-The pointer-width key retains machine and operating-system identity and
-invalidates compiled helper caches that used executable linkage metadata.
-Patch application checks dependency versions and exact source context, accepts
-already applied hunks, and replaces installation files atomically without
-modifying uv's shared wheel cache. Each preparation host needs a writable,
-dedicated Flare environment. Reinstalling Torch or Triton restores its distribution files;
-the preparation command reapplies the patches.
+`ignition.runtime_patches` installs process-local fixes for PyTorch 2.14.1+cu132
+and Triton 3.8.0. Preparation commands set dependency paths and GPU visibility
+before installation. Spawned ranks, tuning replicas, b12x compiler workers, and
+Inductor workers install the fixes they require before using the affected code.
+Dependency files and shared wheel-cache files remain unchanged. Version and
+source-context checks reject incompatible implementations; existing source-patched
+installations are also accepted.
 
-`uv sync` installs dependencies without running the patches, and `uv build`
-includes the patch files in Ignition's wheel and source distribution without
-modifying its isolated build environment. For standalone Python tools and tests
-that import Inductor or Triton before invoking Ignition preparation, apply the bundled
-patches before starting their process:
+The fixes preserve cooperative CUDA launch attributes in serialized kernels,
+match Triton's 150-character cache filenames, retain dependencies on mutated
+inputs when replacing kernel templates, and reduce compiler bookkeeping costs.
+Triton's helper cache key uses machine, operating system, and interpreter pointer
+width without invoking `file`, avoiding subprocess probing under profiler injection.
+Compiled-forward and Torch graph cache identities include the runtime patches.
 
-```sh
-uv run --locked --extra prepare python -m ignition.patches
+Standalone Python tools that use Torch or Triton directly must install the fixes
+in the same process before compilation or CUDA driver initialization:
+
+```python
+from ignition import runtime_patches
+
+runtime_patches.apply()
 ```
 
 `python scripts/setup_preparation.py` resolves the FlashInfer revision declared
 in `pyproject.toml`, syncs preparation/test dependencies, rebuilds FlashInfer and
-Heliopause, and applies the bundled patches before exiting. It updates `uv.lock`
+Heliopause. It updates `uv.lock`
 when the declared dependency resolves differently.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
@@ -165,6 +160,13 @@ separately prepared package; a TP2 package cannot be loaded as TP1. Qwen TP1 and
 GLM TP4 have been exercised end to end; Qwen TP4 still requires model validation.
 
 ## Preparation resources
+
+Package assembly retains file handles and cache leases for every rank's weight
+payloads until publication finishes. For sixteen-rank Kimi exports on Linux, set
+`ulimit -Sn 65536` in the export shell; its hard limit must allow that value.
+
+Checkpoint reads use b12x's pinned-host reader. Each rank initializes only its
+destination GPU for file transfers, avoiding CUDA contexts on its peers' GPUs.
 
 `--autotune-effort off|default|audit` controls b12x candidate filtering.
 `off` prepares heuristic choices without tuning races or tuned-selection cache
@@ -980,6 +982,88 @@ temperature 1, top-p 1, no top-k filter, and neutral penalties. Reasoning is
 always enabled; requests to disable thinking are ignored without an error.
 Effort defaults to `max`; requests can select `low`, `high`, or `max` and
 override sampling defaults. Preserve assistant reasoning in conversation history.
+
+## Kimi K3.1 Pro
+
+The `kimi-k3.1-pro` alias selects
+[`moonshotai/Kimi-K3.1-Pro`](https://huggingface.co/moonshotai/Kimi-K3.1-Pro)
+revision `d9e99b0792a5e93b78ea9bea62a68167e36ddd9e` on sixteen GPUs on one host.
+The recipe supports token-interleaved context parallelism across those sixteen ranks.
+Its 93-layer decoder combines 69 KDA layers with 24 sparse latent-attention
+layers, attention residuals, latent SiTU experts, and the MoonViT image encoder.
+The checkpoint's native MXFP4 expert weights use losslessly compressed block
+scales during preparation. The sparse indexer retains its BF16 checkpoint
+projections and LayerNorm weights, including with `--online-mxfp8`.
+The optional conversion otherwise covers the same target projections as Kimi K3.
+Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
+projection and normalization round in BF16. Query scales round upward to powers
+of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
+MLA query/KV normalization and indexer LayerNorm use the checkpoint's
+`rms_norm_eps` value of `1e-5`.
+
+Kimi K3.1 Pro uses the
+[`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)
+draft at revision `6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94`, downloaded into the
+Hugging Face cache. A target checkpoint may carry the same draft format in its
+`dspark/` directory. Kimi K3's Red Hat draft is incompatible. Export with
+`--no-mtp` to omit draft weights and state. Images are enabled unless
+`--language-model-only` is selected. The export command uses online MXFP8
+projection conversion to leave more memory for preparation and serving caches.
+
+```sh
+ulimit -Sn 65536
+.venv/bin/ignition export kimi-k3.1-pro --gpus 0-15 \
+  --max-concurrency 8 --speculative-token-capacity 64 \
+  --online-mxfp8 --autotune-effort default --compile-workers 16
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/kimi-k3.1-pro-tp16-c8-images-dspark.safetensors
+
+./flare/target/release/flare run \
+  /data/flare-runtime/kimi-k3.1-pro-tp16-c8-images-dspark.safetensors \
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+```
+
+Forward compilation is enabled. The 64-token speculative capacity accommodates
+eight requests at verification width eight, including each pending token.
+The separate packed speculative graph budget defaults to 64.
+
+Each sparse-attention layer stores 128 E4M3 latent records and 128 index records
+per local page. Each index record contains 128 E4M3 values and one FP32 scale;
+two 64-record index subpages share the latent page's logical allocation.
+With sixteen-way context parallelism, a logical page covers 2,048 global tokens
+and uses 2,174,976 bytes per rank across all attention layers. A continuation row
+uses 30,275,328 bytes per rank, preserving KDA state, partial latent and index
+pages, and the final normalized hidden vector. The declaration's weight estimate
+uses Kimi K3's matching target layouts plus replicated indexer weights. Graph
+memory remains a preparation planning allowance until graphs are captured.
+
+Inferact's five-layer draft uses causal full-context MLA, even though the target
+uses sparse attention. It consumes the residual block sums after zero-based
+target layers 75, 79, 83, 87, and 91. These differ from the learned AttnRes
+mixtures used by Kimi K3's draft. The target supplies the embedding and vocabulary
+head. Seven proposal positions contain the pending token followed by masks;
+the rank-512 Markov head conditions each sampled proposal on the preceding token.
+The confidence head is not executed; serving chooses among the prepared target
+verification widths using observed costs and acceptance.
+
+Draft RoPE uses interleaved YaRN with factor 32, theta 1,000,000, and the original
+32,768-position range. The checkpoint's explicit `attn_factor` cancels its YaRN
+cosine/sine magnitude gain. The rotary gain is therefore one. Implementations
+that omit `attn_factor` do not have the same rotary arithmetic.
+
+Each draft layer stores accepted target context as 1,152-byte BF16 latent records,
+interleaved across the sixteen context ranks. Proposal records use separate
+scratch pages and causal attention; they never require speculative suffix pages
+in the persistent draft cache. Only accepted target features populate that cache.
+With seven drafts, logical pages use 2,912,256 bytes per rank and continuation
+rows use 33,238,272 bytes, including KDA verification history and partial draft
+pages. Prefix snapshots preserve the complete draft history. Loading a draft
+package with `--mtp-draft-tokens 0` selects its ordinary generation graphs.
+
+Serving defaults follow the
+[model card](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results):
+temperature 1, top-p 0.95, no top-k filter, and neutral penalties. Reasoning effort
+defaults to `max`, with `low`, `high`, and `max` request values. Preserve assistant
+reasoning in conversation history.
 
 ## MiniMax M3.1 Flash
 

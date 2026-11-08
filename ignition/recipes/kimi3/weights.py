@@ -39,7 +39,7 @@ class ModelWeights:
              peers=None, vision=True):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
-        ``draft_checkpoint`` loads Red Hat DSpark from its checkpoint directory.
+        ``draft_checkpoint`` loads the target model's DSpark checkpoint.
         Without ``vision``, the vision encoder stays on disk.
         """
         before = torch.cuda.memory_allocated(device)
@@ -59,11 +59,18 @@ class ModelWeights:
             vision = None
         draft = None
         if draft_checkpoint is not None:
-            from .dspark_weights import DraftWeights
+            if config.dsa is None:
+                from .dspark_weights import DraftWeights
 
-            config = replace(config, draft=DSparkConfig.load(draft_checkpoint, config))
+                draft_config, draft_args = DSparkConfig, {}
+            else:
+                from ignition.recipes.kimi31.dspark_config import DSparkConfig as draft_config
+                from ignition.recipes.kimi31.dspark_weights import DraftWeights
+
+                draft_args = dict(target_embedding=embedding)
+            config = replace(config, draft=draft_config.load(draft_checkpoint, config))
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8)
+                                      online_mxfp8=online_mxfp8, **draft_args)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
@@ -167,6 +174,23 @@ class KimiWeightLoader(DirectWeightLoader):
             gate = self.linear(a + ".g_proj", rows=head_rows)
             width = sum(x.shape[0] for x in latent)
             attention["latent_gate"] = torch.cat((*latent, gate.new_zeros((-width % 8, gate.shape[1])), gate))
+        if self.config.layers[index] == "dsa":
+            d = self.config.dsa
+            shapes = {"wq_b": (d.heads * d.head_dim, c["q_lora_rank"]),
+                      "wk": (d.head_dim, c["hidden_size"]),
+                      "weights_proj": (d.heads, c["hidden_size"])}
+            for key, shape in shapes.items():
+                name = a + ".indexer." + key
+                source = self._sources[name + ".weight"]
+                if tuple(source.shape) != shape or source.dtype != torch.bfloat16:
+                    raise ValueError(f"{name}: expected BF16 indexer projection {shape}")
+                attention["indexer." + key] = self.linear(name)
+            for key in ("weight", "bias"):
+                name = a + ".indexer.k_norm." + key
+                source = self._sources[name]
+                if tuple(source.shape) != (d.head_dim,) or source.dtype != torch.bfloat16:
+                    raise ValueError(f"{name}: expected BF16 LayerNorm vector")
+                attention["indexer.k_norm." + key] = self.load_tensor(name)
         attention["output"] = self.linear(a + ".o_proj", columns=head_rows)
         if self.online_mxfp8:
             for key in ("input", "forget", "latent_gate", "q_b", "output"):

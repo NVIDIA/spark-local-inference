@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import weakref
 
 from ignition.preparation.fixtures.recurrent import BenchmarkStateArena, RecurrentBenchmarkInputs
 
@@ -44,3 +45,9 @@ def test_decode_fixture_allocates_only_live_token_checkpoints(sequences, tokens,
     torch.testing.assert_close(fixture.state[:rows], fixture.initial_state)
     assert not fixture.state[0].count_nonzero()
     assert not arguments["state_indices"].count_nonzero()
+    owner = weakref.ref(fixture)
+    producers = fixture.producers
+    del fixture
+    assert owner() is not None
+    del producers
+    assert owner() is None

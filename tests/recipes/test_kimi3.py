@@ -39,6 +39,15 @@ def test_checkpoint_geometry(config):
     assert page_bytes(config) == 24 * 128 * 576
 
 
+def test_mla_norm_epsilon_uses_the_k3_attention_default(config):
+    from dataclasses import replace
+
+    assert config.text["rms_norm_eps"] == 1e-5
+    assert config.mla_norm_eps == 1e-6
+    changed = replace(config, text={**config.text, "rms_norm_eps": 1e-4})
+    assert changed.mla_norm_eps == 1e-6
+
+
 def test_quantization_and_layer_partition_rejected(config):
     from ignition.recipes.kimi3.config import ModelConfig
 
@@ -189,7 +198,7 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
         torch.manual_seed(41)
         source = torch.randn((tokens, 7168), device=device, dtype=torch.bfloat16)
         graph_buffers = GraphBufferPool(device)
-        op = PreparedMLA(weights, source, metadata, cache, mode=mode, session=session,
+        op = PreparedMLA(weights, source, metadata, cache, eps=config.mla_norm_eps, mode=mode, session=session,
                          name="mla", workspace=arena, buffers={}, allocator=graph_buffers.cursor())
         session.tune(show_progress=False)
         metadata.query_start_loc[1] = tokens

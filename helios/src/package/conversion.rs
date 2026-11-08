@@ -788,20 +788,28 @@ pub struct RankPlan {
     pub targets: BTreeMap<PayloadId, PlannedTarget>,
 }
 
-/// Reads the prepared weight owners of one deployment with their payload bytes.
-pub fn prepared_ranks(source: &Path, deployment: usize) -> Result<Vec<PreparedRank>> {
-    let verified = Verified::open(source, Some(&[deployment]))?;
-    prepared_rank_owners(&verified, verified.payloads()?)
+/// Reads the authenticated prepared weight owners of one deployment with their payload bytes.
+pub fn prepared_ranks(
+    source: &Path,
+    authenticated: &protection::VerifiedPackage,
+) -> Result<Vec<PreparedRank>> {
+    combine_prepared_ranks(source, authenticated, SourceVerification::Hash)
 }
 
 /// Reads one combine source deployment, hashing its payloads only when planning
 /// will read their bytes.
 fn combine_prepared_ranks(
     source: &Path,
-    deployment: usize,
+    authenticated: &protection::VerifiedPackage,
     verification: SourceVerification,
 ) -> Result<Vec<PreparedRank>> {
+    let protection::Selection::Deployment { deployment, rank: None } = authenticated.selection() else {
+        return Err(invalid("prepared weight owners require an authenticated complete deployment"));
+    };
     let verified = Verified::open(source, Some(&[deployment]))?;
+    if !authenticated.matches_envelope(&verified.metadata.envelope) {
+        return Err(invalid("prepared weight source differs from its authenticated metadata"));
+    }
     let files = verified.payload_files()?;
     if let SourceVerification::Hash = verification {
         let total: u64 = files.iter().map(|(_, slice)| slice.len()).sum();
@@ -810,10 +818,10 @@ fn combine_prepared_ranks(
         files.verify_with_progress(&|bytes| phase.advance_bytes(bytes))?;
         phase.finish(format!("{total} source bytes verified"));
     }
-    prepared_rank_owners(&verified, files)
+    prepared_rank_owners(authenticated.ranks(), files)
 }
 
-fn prepared_rank_owners(verified: &Verified, files: reader::PayloadFiles) -> Result<Vec<PreparedRank>> {
+fn prepared_rank_owners(bodies: &[wire::RankBody], files: reader::PayloadFiles) -> Result<Vec<PreparedRank>> {
     let mut payloads = BTreeMap::new();
     for (id, slice) in files.iter() {
         payloads.insert(
@@ -824,8 +832,8 @@ fn prepared_rank_owners(verified: &Verified, files: reader::PayloadFiles) -> Res
             slice.clone(),
         );
     }
-    let mut ranks = Vec::with_capacity(verified.ranks.len());
-    for body in &verified.ranks {
+    let mut ranks = Vec::with_capacity(bodies.len());
+    for body in bodies {
         let mut mappings: BTreeMap<String, Vec<(u64, u64, PayloadId, u64)>> = BTreeMap::new();
         for initializer in &body.initializers {
             let Some(slice) = initializer.source.as_ref().and_then(|use_| use_.slice.as_ref()) else {
@@ -851,7 +859,7 @@ fn prepared_rank_owners(verified: &Verified, files: reader::PayloadFiles) -> Res
             entries.sort_by_key(|entry| entry.0);
         }
         let mut owners = Vec::new();
-        if let Some(catalog) = &body.prepared_weights {
+        if let Some(catalog) = super::prepared_weights::catalog(body)? {
             for view in &catalog.views {
                 let allocation = body
                     .allocations
@@ -2910,7 +2918,7 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
         // once, when publication installs them.
         let canonical_prepared = combine_prepared_ranks(
             &request.sources[canonical_source_index],
-            canonical_deployment_index,
+            sources[canonical_source_index].authorized[canonical_deployment_index].verified(),
             if entries.len() > 1 { SourceVerification::Hash } else { SourceVerification::Defer },
         )?;
         let canonical_entry = (canonical_source_index, canonical_deployment_index);
@@ -2952,7 +2960,7 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
             } else {
                 Some(combine_prepared_ranks(
                     &request.sources[source_index],
-                    deployment_index,
+                    source.authorized[deployment_index].verified(),
                     SourceVerification::Hash,
                 )?)
             };
@@ -3655,6 +3663,20 @@ mod tests {
         derived: Vec<u8>,
     }
 
+    fn authenticated_prepared_ranks(
+        source: &Path,
+        deployment: usize,
+        publishers: &[Publisher],
+    ) -> Result<Vec<PreparedRank>> {
+        let metadata = Metadata::open(source)?;
+        let verified = protection::verify(
+            &metadata.envelope,
+            publishers,
+            protection::Selection::Deployment { deployment, rank: None },
+        )?;
+        prepared_ranks(source, &verified)
+    }
+
     fn descriptor(id: PayloadId, bytes: &[u8]) -> wire::PayloadDescriptor {
         wire::PayloadDescriptor {
             id: id.as_bytes().to_vec(),
@@ -3696,6 +3718,16 @@ mod tests {
     }
 
     fn fixture_with(scratch: &Scratch, payload: &[u8], owner_len: u64, locality: u64) -> Fixture {
+        fixture_with_encoding(scratch, payload, owner_len, locality, true)
+    }
+
+    fn fixture_with_encoding(
+        scratch: &Scratch,
+        payload: &[u8],
+        owner_len: u64,
+        locality: u64,
+        compressed_catalog: bool,
+    ) -> Fixture {
         let rng = SystemRandom::new();
         let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -3720,7 +3752,7 @@ mod tests {
         let (stored, compressed) = protect::compress(&graph_plaintext).unwrap();
         let graph_id = PayloadId::of(&stored);
 
-        let rank = wire::RankBody {
+        let mut rank = wire::RankBody {
             rank: 0,
             deployment_id: "sm120-tp1".into(),
             context: Some(runtime::Context::default()),
@@ -3790,6 +3822,13 @@ mod tests {
             }],
             ..Default::default()
         };
+        if compressed_catalog {
+            let catalog_bytes = rank.prepared_weights.take().unwrap().encode_to_vec();
+            rank.compressed_prepared_weights = Some(wire::CompressedPreparedWeightCatalog {
+                zstd: protect::compress(&catalog_bytes).unwrap().0,
+                decoded_nbytes: catalog_bytes.len() as u64,
+            });
+        }
         let rank_bytes = rank.encode_to_vec();
         let deployment = wire::DeploymentBody {
             deployment_id: "sm120-tp1".into(),
@@ -4289,6 +4328,26 @@ mod tests {
             payloads
         };
         assert_eq!(summary(&first), summary(&second));
+    }
+
+    #[test]
+    fn inline_catalog_round_trip_preserves_prepared_owners() {
+        let scratch = Scratch::new("inline-catalog-roundtrip");
+        let fixture = fixture_with_encoding(&scratch, b"stable-weight-bytes", 19, 64, false);
+        let before = authenticated_prepared_ranks(&fixture.directory, 0, &fixture.publishers).unwrap();
+        assert_eq!(before[0].owners.len(), 1);
+        let packed = scratch.join("packed.safetensors");
+        pack(&fixture.directory, &packed).unwrap();
+        let unpacked = scratch.join("unpacked");
+        unpack(&packed, &unpacked).unwrap();
+        assert_eq!(Metadata::open(&unpacked).unwrap().envelope, fixture.envelope);
+        let after = authenticated_prepared_ranks(&unpacked, 0, &fixture.publishers).unwrap();
+        assert_eq!(before[0].owners, after[0].owners);
+        let metadata = Metadata::open(&unpacked).unwrap();
+        let envelope = protection::envelope(&metadata.envelope).unwrap();
+        let rank = wire::RankBody::decode(envelope.ranks[0].body.as_slice()).unwrap();
+        assert!(rank.prepared_weights.is_some());
+        assert!(rank.compressed_prepared_weights.is_none());
     }
 
     #[test]
@@ -6514,8 +6573,8 @@ mod tests {
             development: false,
         };
         let (source, _, _, _) = publish_split_owner_source(&scratch, &key, &publisher, true, false, false, false);
-        let base = prepared_ranks(&source, 0).unwrap();
-        let target = prepared_ranks(&source, 1).unwrap();
+        let base = authenticated_prepared_ranks(&source, 0, std::slice::from_ref(&publisher)).unwrap();
+        let target = authenticated_prepared_ranks(&source, 1, std::slice::from_ref(&publisher)).unwrap();
         let reject = |target: PreparedRank| {
             let plan = plan_rank(&base[0], &target, &derivation::Limits::default()).unwrap();
             assert!(
@@ -6566,8 +6625,8 @@ mod tests {
         };
         let (source, _source_id, target_id, target) =
             publish_split_owner_source(&scratch, &key, &publisher, true, false, false, false);
-        let canonical = prepared_ranks(&source, 0).unwrap();
-        let target_rank = prepared_ranks(&source, 1).unwrap();
+        let canonical = authenticated_prepared_ranks(&source, 0, std::slice::from_ref(&publisher)).unwrap();
+        let target_rank = authenticated_prepared_ranks(&source, 1, std::slice::from_ref(&publisher)).unwrap();
         let wrong_path = scratch.0.join("wrong-source.bin");
         fs::write(&wrong_path, vec![0xaa; 17]).unwrap();
         let wrong_slice = container::Slice::new(
@@ -8673,13 +8732,13 @@ mod tests {
     fn combiner_plans_prepared_owners_across_deployments() {
         let base_scratch = Scratch::new("plan-base");
         let base = fixture(&base_scratch);
-        let canonical = prepared_ranks(&base.directory, 0).unwrap();
+        let canonical = authenticated_prepared_ranks(&base.directory, 0, &base.publishers).unwrap();
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].owners.len(), 1);
 
         let prefix_scratch = Scratch::new("plan-prefix");
         let prefix = fixture_with(&prefix_scratch, b"stable-weight-bytes-tail", 19, 64);
-        let prefix = prepared_ranks(&prefix.directory, 0).unwrap();
+        let prefix = authenticated_prepared_ranks(&prefix.directory, 0, &prefix.publishers).unwrap();
         let plan = plan_rank(&canonical[0], &prefix[0], &derivation::Limits::default()).unwrap();
         assert_eq!(
             plan.owners["layer-000"],
@@ -8690,7 +8749,7 @@ mod tests {
 
         let identical_scratch = Scratch::new("plan-identical");
         let identical = fixture(&identical_scratch);
-        let identical = prepared_ranks(&identical.directory, 0).unwrap();
+        let identical = authenticated_prepared_ranks(&identical.directory, 0, &identical.publishers).unwrap();
         let plan = plan_rank(&canonical[0], &identical[0], &derivation::Limits::default()).unwrap();
         assert!(matches!(
             plan.owners["layer-000"],
@@ -8699,13 +8758,13 @@ mod tests {
 
         let other_scratch = Scratch::new("plan-other");
         let other = fixture_with(&other_scratch, b"different-weight-xxx", 19, 64);
-        let other = prepared_ranks(&other.directory, 0).unwrap();
+        let other = authenticated_prepared_ranks(&other.directory, 0, &other.publishers).unwrap();
         let plan = plan_rank(&canonical[0], &other[0], &derivation::Limits::default()).unwrap();
         assert_eq!(plan.owners["layer-000"], OwnerShare::Independent);
 
         let packing_scratch = Scratch::new("plan-packing");
         let packing = fixture_with(&packing_scratch, b"stable-weight-bytes-tail", 19, 128);
-        let packing = prepared_ranks(&packing.directory, 0).unwrap();
+        let packing = authenticated_prepared_ranks(&packing.directory, 0, &packing.publishers).unwrap();
         let plan = plan_rank(&canonical[0], &packing[0], &derivation::Limits::default()).unwrap();
         assert_eq!(plan.owners["layer-000"], OwnerShare::Independent);
     }

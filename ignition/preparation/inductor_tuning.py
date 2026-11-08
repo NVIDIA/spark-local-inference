@@ -125,7 +125,7 @@ class InductorSelections:
         from torch._inductor.async_compile import CompiledTritonKernels
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
-        backend = bound.artifact._artifacts.compiled_fn
+        backend = bound.backend
         graph = backend.artifact._flare_graph
         original, = graph.device_idxs
         entries = ({} if graph._triton_bundle is None else
@@ -314,3 +314,8 @@ class InductorSelections:
         entry.compiled_fw.result._triton_bundle = bundle
         backend._serialized_artifact = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
         backend._tuning_frozen = True
+
+    def release(self, bound):
+        self.forwards.pop(id(bound))
+        if not self.forwards:
+            self.instances.clear()

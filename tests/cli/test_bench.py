@@ -48,6 +48,23 @@ def test_explicit_draft_count_and_unordered_selections():
     assert value.contexts == (512, 2048)
 
 
+def test_kimi_eight_request_round_with_autotuning():
+    args = _parser().parse_args(["bench", "kimi-k3.1-pro", "--gpus", "0-15",
+        "--batches", "8", "--max-concurrency", "8", "--verify-width", "8",
+        "--speculative-token-capacity", "64", "--online-mxfp8", "--autotune-effort", "default"])
+    value = Settings.from_args(args)
+    assert (value.batches, value.width) == ((8,), 8)
+    assert args.autotune_effort == "default" and not args.no_compile
+    assert args.max_concurrency == 8 and args.speculative_token_capacity == 64
+
+
+def test_kimi_rejects_private_dflash_studies_before_preparation(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    assert main(["bench", "kimi-k3.1-pro", "--speculation-study", "--config", str(config)]) == 2
+    assert "--speculation-study requires Qwen3.8-27B DFlash2" in capsys.readouterr().err
+
+
 def test_prefill_defaults_and_target_only_selection():
     value = settings("--prefill")
     assert value.prefill and value.batches == (1,) and value.contexts == (0,)
@@ -86,14 +103,14 @@ def test_prefill_report_names_chunk_and_prefix():
     (("--verify-width", "4"), "requires --verify-width 8"),
     (("--mtp-draft-tokens", "3"), "requires --verify-width 8"),
     (("--batches", "0"), "from 1,2,4"),
-    (("--batches", "8"), "from 1,2,4"),
+    (("--batches", "16"), "from 1,2,4,8"),
     (("--contexts", "0"), "positive multiples"),
     (("--contexts", "513"), "positive multiples"),
     (("--warmup", "-1"), "positive"),
     (("--warmup", "0"), "positive"),
     (("--repetitions", "0"), "positive"),
     (("--seeds", "-1"), "0 through"),
-    (("--no-mtp",), "requires DFlash2 state"),
+    (("--no-mtp",), "requires draft state"),
     (("--mixed-prefill",), "speculative rounds"),
     (("--prompt-logprobs",), "speculative rounds"),
     (("--official-source", "https://example.com/model"), "package publishing"),
@@ -115,7 +132,7 @@ def test_bench_help_describes_measured_boundary(capsys):
         main(["bench", "--help"])
     assert error.value.code == 0
     output = capsys.readouterr().out
-    assert "Qwen3.8-27B DFlash2 only" in output
+    assert "Kimi K3.1 Pro DSpark" in output
     assert "excludes preparation" in output
     assert "not serving throughput" in output
     assert "--repetitions" in output
@@ -125,7 +142,7 @@ def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text("")
     assert main(["bench", "qwen3.8-flash", "--config", str(config)]) == 2
-    assert "supports only the Qwen3.8-27B DFlash2 recipe" in capsys.readouterr().err
+    assert "supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark" in capsys.readouterr().err
 
 
 def test_report_keeps_case_latency_and_equal_weight_score_separate(tmp_path, capsys):

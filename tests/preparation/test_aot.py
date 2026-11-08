@@ -112,7 +112,7 @@ def test_compile_time_reduction_winner_restores_without_search(tmp_path, monkeyp
     monkeypatch.setattr(CachingAutotuner, "benchmark_all_configs", unexpected)
     restored = cache.prepare_many({"reduce": fresh}, signature)["reduce"]
     assert restored.cache_hit
-    backend = restored.artifact._artifacts.compiled_fn
+    backend = restored.backend
     entry = backend.artifact.inner_fn.compiled_fn.serialize()
     tuners = entry.compiled_fw.result._triton_bundle.static_autotuners
     assert tuners

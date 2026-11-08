@@ -13,6 +13,7 @@ from ignition.components.collectives import PreparedChunkedAllGather, PreparedCh
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
+from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.kda_speculation import PreparedKDAReplay
@@ -227,13 +228,22 @@ class PreparedLatentMoE:
                                   buffers=buffers.setdefault("shared", {}), allocator=allocator,
                                   workspace=workspace, parallel_plans=(self.router_projection.plan, self.down.plan,
                                       self.experts.plan, self.up.plan) if self.route_gather is not None else ())
+        self.concurrent_down = (ConcurrentProjectionChain((self.down,),
+            parallel_plans=(self.router_projection.plan,), session=session, workspace=workspace)
+            if self.route_gather is not None and workspace is not None and workspace.overlap else None)
 
     def __call__(self, source):
-        if self.shared.concurrent:
-            self.shared.start(source)
+        if self.concurrent_down is not None:
+            self.concurrent_down.start(source)
         logits = self.router_projection(source)
         if self.route_gather is not None:
-            self.down(source)
+            if self.concurrent_down is not None:
+                self.concurrent_down.finish(source, logits)
+            else:
+                self.down(source)
+        if self.shared.concurrent:
+            self.shared.start(source)
+        if self.route_gather is not None:
             self.route_gather()
         else:
             self.router_input[:, :logits.shape[1]].copy_(logits)
@@ -255,7 +265,7 @@ class PreparedDecoder:
 
     ``verify`` rows are speculative candidates: KDA layers record them without advancing committed states
     until ``commit`` replays each request's accepted prefix. With a draft model, every forward also keeps
-    DSpark's AttnRes mixtures entering its auxiliary layers in ``auxiliary``.
+    the draft's configured residual stream entering its auxiliary layers in ``auxiliary``.
     """
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
@@ -290,15 +300,21 @@ class PreparedDecoder:
             kind = config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
                           buffers=self.buffers.setdefault(kind, {}), allocator=allocator)
-            attention = (PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
-                eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
-                **kwargs) if kind == "kda" else
-                PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
-                            peers=None if context is None else context.peers[index], coordinator=coordinator,
-                            # The smallest latent exchange that carries the step, else the largest in chunks.
-                            latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
-                                         latent_runtimes[-1] if latent_runtimes else None),
-                            **kwargs))
+            if kind == "kda":
+                attention = PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
+                    eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
+                    **kwargs)
+            else:
+                attention_type, extra = PreparedMLA, {}
+                if kind == "dsa":
+                    from ignition.recipes.kimi31.attention import PreparedDSA
+
+                    attention_type, extra = PreparedDSA, dict(index_cache=pool.indexer_pages(index))
+                attention = attention_type(w["attention"], source, metadata, pool.attention(index),
+                    eps=config.mla_norm_eps, context=context,
+                    peers=None if context is None else context.peers[index], coordinator=coordinator,
+                    latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
+                                 latent_runtimes[-1] if latent_runtimes else None), **extra, **kwargs)
             if "mlp" in w:
                 # The dense MLP writes the MoE layers' output, which its reduction consumes before the next mixture.
                 dense = self.buffers.setdefault("dense", {})
@@ -333,10 +349,10 @@ class PreparedDecoder:
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
-        # DSpark's context: the AttnRes mixture each auxiliary layer receives, before its input norm. Plans
-        # without the draft keep none.
+        # Auxiliary outputs precede each selected layer's input normalization.
         self.auxiliary_layers = (config.draft.auxiliary_layers
                                  if weights.draft is not None else ())
+        self.auxiliary_stream = config.draft.auxiliary_stream if self.auxiliary_layers else None
         if self.auxiliary_layers:
             if "auxiliary" not in self.buffers:
                 self.buffers["auxiliary"] = zeros((tokens, len(self.auxiliary_layers) * hidden))
@@ -379,12 +395,15 @@ class PreparedDecoder:
         delta, mode = self.embedding.gather(local), REPLACE
         for index, (w, attention, mlp, reduce) in enumerate(self.layers):
             committed, boundary = -(-index // size), index % size == 0
-            mixture = None
+            auxiliary = None
             if index in self.auxiliary_layers:
                 column = self.auxiliary_layers.index(index) * self.residual.prefix.shape[1]
-                mixture = self.auxiliary[:, column:column + self.residual.prefix.shape[1]]
+                auxiliary = self.auxiliary[:, column:column + self.residual.prefix.shape[1]]
             hidden = self.residual.mix(delta, mode, sources=committed, write=index // size if boundary else -1,
-                score=w["attention_res_score"], norm=w["input_layernorm"], eps=eps, output_eps=eps, mixture=mixture)
+                score=w["attention_res_score"], norm=w["input_layernorm"], eps=eps, output_eps=eps,
+                mixture=auxiliary if self.auxiliary_stream == "attn_res" else None)
+            if auxiliary is not None and self.auxiliary_stream == "prefix":
+                auxiliary.copy_(self.residual.prefix)
             attended = reduce(attention(hidden))
             hidden = self.residual.mix(attended, REPLACE if boundary else ADD, sources=committed + boundary, write=-1,
                 score=w["mlp_res_score"], norm=w["post_attention_layernorm"], eps=eps, output_eps=eps,

@@ -1,0 +1,142 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 #}
+{%- set ns = namespace(segments=[], calls=[], tool_index=0, next_message=0) -%}
+{%- macro emit(text, special=false) -%}
+    {%- if text | string -%}
+        {%- set ns.segments = ns.segments + [{'text': text | string, 'allow_special': special}] -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro open(tag, attrs=[]) -%}
+    {{- emit('<|open|>', true) -}}{{- emit(tag) -}}
+    {%- for key, value in attrs -%}
+        {{- emit(' ' + key) -}}{{- emit('="') -}}
+        {{- emit(value | string | replace('&', '&amp;') | replace('"', '&quot;')) -}}{{- emit('"') -}}
+    {%- endfor -%}
+    {{- emit('<|sep|>', true) -}}
+{%- endmacro -%}
+{%- macro close(tag) -%}
+    {{- emit('<|close|>', true) -}}{{- emit(tag) -}}{{- emit('<|sep|>', true) -}}
+{%- endmacro -%}
+{%- macro end_message() -%}{{- close('message') -}}{{- emit('<|end_of_msg|>', true) -}}{%- endmacro -%}
+{%- macro content(value) -%}
+    {%- if value is string -%}{{- emit(value) -}}
+    {%- elif value is not none -%}
+        {%- for part in value -%}
+            {%- if part.type in ['image', 'image_url'] -%}
+                {%- if part.image_index is defined -%}
+                    {%- set ns.segments = ns.segments + [{'text': '<|media_pad|>', 'allow_special': true, 'image_index': part.image_index}] -%}
+                {%- else -%}{{- emit('<|media_pad|>', true) -}}{%- endif -%}
+            {%- else -%}{{- emit(part.text) -}}{%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro internal(kind, body) -%}
+    {{- open('message', [('role', 'system'), ('type', kind)]) -}}{{- emit(body | trim) -}}{{- end_message() -}}
+{%- endmacro -%}
+{%- macro declare_tools(value, dynamic=false) -%}
+    {%- set body = '## New Tools Available\nThe system dynamically extends the toolset via lazy-loading.\nYou have access to all existing and extended tools.\nHere are the specs for the extended tools.\n\n' if dynamic else '# Tools\nHere are the available tools, described in JSONSchema.\n\n' -%}
+    {{- internal('tool-declare', body + '```json\n' + (value | tojson(ensure_ascii=false, sort_keys=true, separators=(',', ':'))) + '\n```') -}}
+{%- endmacro -%}
+{%- macro message(m, tool_name=none) -%}
+    {%- set attrs = [('role', m.role)] -%}
+    {%- if m.role == 'system' and m.tools -%}
+        {{- declare_tools(m.tools, true) -}}
+    {%- elif m.role in ['user', 'system', 'assistant', 'tool'] -%}
+        {%- if m.role == 'tool' -%}
+            {%- set ns.tool_index = ns.tool_index + 1 -%}
+            {%- set name = tool_name or m.tool or m.name -%}
+            {%- if not name and ns.tool_index <= ns.calls | length -%}
+                {%- set call = ns.calls[ns.tool_index - 1] -%}
+                {%- set name = (call.function | default(call)).name -%}
+            {%- endif -%}
+            {%- if not name -%}{{- raise_exception('Kimi K3.1 tool messages require a resolvable tool name') -}}{%- endif -%}
+            {%- set attrs = attrs + [('tool', name), ('index', ns.tool_index)] -%}
+        {%- elif m.name -%}{%- set attrs = attrs + [('name', m.name)] -%}{%- endif -%}
+        {{- open('message', attrs) -}}
+        {%- if m.role == 'assistant' -%}
+            {%- set ns.calls = m.tool_calls | default([], true) -%}
+            {%- set ns.tool_index = 0 -%}
+            {{- open('think') -}}
+            {%- set reasoning = m.reasoning_content or m.reasoning -%}
+            {%- if reasoning -%}{{- emit(reasoning) -}}{%- endif -%}
+            {{- close('think') -}}
+            {{- open('response') -}}{{- content(m.content) -}}{{- close('response') -}}
+            {%- if ns.calls -%}
+                {{- open('tools') -}}
+                {%- for call in ns.calls -%}
+                    {%- set fn = call.function | default(call) -%}
+                    {{- open('call', [('tool', fn.name), ('index', loop.index)]) -}}
+                    {%- set args = fn.arguments | default({}, true) -%}
+                    {%- set source = fn.arguments_source | default(args if args is string else none) -%}
+                    {%- if source is not none -%}
+                        {%- for key, value, literal in json_object_members(source) -%}
+                            {%- set kind = 'null' if value is none else 'boolean' if value is boolean else 'number' if value is number else 'object' if value is mapping else 'array' if value is sequence and value is not string else 'string' -%}
+                            {{- open('argument', [('key', key), ('type', kind)]) -}}
+                            {{- emit(value if value is string else literal) -}}
+                            {{- close('argument') -}}
+                        {%- endfor -%}
+                    {%- else -%}
+                        {%- if args is not mapping -%}{{- raise_exception('Kimi K3.1 tool arguments must be a JSON object') -}}{%- endif -%}
+                        {%- for key, value in args.items() -%}
+                            {%- set kind = 'null' if value is none else 'boolean' if value is boolean else 'number' if value is number else 'object' if value is mapping else 'array' if value is sequence and value is not string else 'string' -%}
+                            {{- open('argument', [('key', key), ('type', kind)]) -}}
+                            {{- emit(value if value is string else value | tojson(ensure_ascii=false)) -}}
+                            {{- close('argument') -}}
+                        {%- endfor -%}
+                    {%- endif -%}
+                    {{- close('call') -}}
+                {%- endfor -%}
+                {{- close('tools') -}}
+            {%- endif -%}
+        {%- else -%}{{- content(m.content) -}}{%- endif -%}
+        {{- end_message() -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if tools -%}{{- declare_tools(tools) -}}{%- endif -%}
+{%- set effort = reasoning_effort | default(thinking_effort | default('max')) -%}
+{%- if effort not in ['low', 'high', 'max'] -%}
+    {{- raise_exception('Kimi K3.1 reasoning effort must be low, high, or max') -}}
+{%- endif -%}
+{{- internal('thinking-effort', '`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=' + effort + '`.') -}}
+{%- mark ns.segments | length -%}{%- for m in messages -%}
+    {%- if loop.index0 >= ns.next_message -%}
+        {%- if m.role == 'tool' -%}
+            {%- set run = namespace(items=[], matched=true, done=false) -%}
+            {%- for result in messages[loop.index0:] -%}
+                {%- if not run.done and result.role == 'tool' -%}
+                    {%- set found = namespace(position=none, name=none) -%}
+                    {%- set result_id = result.tool_call_id | default(result.id) -%}
+                    {%- for call in ns.calls -%}
+                        {%- if found.position is none and result_id is defined and call.id is defined and result_id | string == call.id | string -%}
+                            {%- set found.position = loop.index -%}
+                            {%- set found.name = (call.function | default(call)).name -%}
+                        {%- endif -%}
+                    {%- endfor -%}
+                    {%- if found.position is none -%}{%- set run.matched = false -%}{%- endif -%}
+                    {%- set run.items = run.items + [{'position': found.position, 'message': result, 'name': found.name}] -%}
+                {%- else -%}{%- set run.done = true -%}{%- endif -%}
+            {%- endfor -%}
+            {%- set ns.next_message = loop.index0 + run.items | length -%}
+            {%- set ordered = run.items | sort(attribute='position') if run.matched else run.items -%}
+            {%- for item in ordered -%}{{- message(item.message, item.name if run.matched else none) -}}{%- mark ns.segments | length -%}{%- endfor -%}
+        {%- else -%}{{- message(m) -}}{%- mark ns.segments | length -%}{%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if tool_choice == 'required' -%}
+    {{- internal('tool-choice', 'The system is invoked with `tool_choice=required`.\nYou MUST call tools in the next message.') -}}
+{%- elif tool_choice == 'none' -%}
+    {{- internal('tool-choice', 'The system is invoked with `tool_choice=none`.\nYou MUST NOT call any tools in the next message.') -}}
+{%- endif -%}
+{%- set format = response_format.type if response_format is mapping else response_format -%}
+{%- if format in ['json_object', 'json_schema'] -%}
+    {%- set body = 'The system is invoked with `response_format=' + format + '`.\nYour response must be raw JSON data without markdown code blocks (```json) or any additional formatting.' -%}
+    {%- if format == 'json_schema' -%}
+        {%- set schema = response_schema | default(response_format.json_schema.schema) -%}
+        {%- set body = body + '\nThe JSON data must match the following schema:\n```json\n' + (schema | tojson(ensure_ascii=false, sort_keys=true, separators=(',', ':'))) + '\n```' -%}
+    {%- endif -%}
+    {{- internal('response-format', body) -}}
+{%- endif -%}
+{%- mark ns.segments | length -%}{%- if add_generation_prompt -%}
+    {{- open('message', [('role', 'assistant')]) -}}{{- open('think') -}}
+{%- endif -%}
+{{- ns.segments | tojson(ensure_ascii=false) -}}

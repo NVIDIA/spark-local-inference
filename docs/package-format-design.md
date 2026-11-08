@@ -216,6 +216,20 @@ statistics declare their tensor, expert, or shard domain. These records describe
 how to match byte regions; Helios serving does not interpret them. Exact target
 byte comparison remains required even when these declarations agree.
 
+Rank metadata stores a prepared weight catalog inline in `prepared_weights`
+or as one zstd level-3 frame in `compressed_prepared_weights`. The compressed
+form includes its decoded byte length; both forms together are invalid.
+Exporters use compression when it reduces the encoded size. Readers retain
+support for inline catalogs. Rank signatures authenticate compressed bytes
+before catalog decoding. Decoding requires an exact length, a window no larger
+than 8 MiB, and one complete frame without trailing bytes. Reconstructing a
+rank's inline metadata must fit within 128 MiB; selected ranks together must
+fit within 512 MiB. The signed envelope retains its 128 MiB limit. Keyless
+container conversion preserves compressed catalogs without decoding them.
+Verification checks the size bounds for all selected ranks before decoding
+any catalog. Consumers decode one catalog at a time; verified rank records
+retain the compressed form.
+
 An unchanged checkpoint tensor may contribute several affine byte pieces to a
 retained owner, including expert concatenation and scale swizzles:
 

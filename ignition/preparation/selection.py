@@ -21,8 +21,8 @@ class BenchmarkSelection:
                 raise ValueError(f"benchmark {name} must be a nonempty tuple of integers")
             if tuple(sorted(set(values))) != values:
                 raise ValueError(f"benchmark {name} must be distinct and increasing")
-        if any(batch not in (1, 2, 4) for batch in self.batches):
-            raise ValueError("benchmark batches must be selected from 1, 2, 4")
+        if any(batch not in (1, 2, 4, 8) for batch in self.batches):
+            raise ValueError("benchmark batches must be selected from 1, 2, 4, 8")
         if type(self.prefill_chunk) is not int or self.prefill_chunk < 0 or self.prefill_chunk % 128:
             raise ValueError("benchmark prefill chunk must be zero or a positive multiple of 128")
         if self.prefill_chunk and self.batches != (1,):

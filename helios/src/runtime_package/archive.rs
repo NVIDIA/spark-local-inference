@@ -413,6 +413,8 @@ impl Archive {
     /// Open the file and read its signed envelope: the file, the payload start and size, and the
     /// envelope bytes, none of them verified yet.
     pub(super) fn envelope(path: &Path) -> Result<(File, u64, u64, Vec<u8>)> {
+        let primary_path = path.is_dir().then(|| path.join("model.safetensors"));
+        let path = primary_path.as_deref().unwrap_or(path);
         #[cfg(unix)]
         let file = File::open(path).map_err(|e| e.to_string())?;
         #[cfg(windows)]
@@ -475,6 +477,8 @@ impl Archive {
         publishers: &[Publisher],
         rank: Option<usize>,
     ) -> Result<(Self, wire::ModelIndex)> {
+        let primary_path = path.is_dir().then(|| path.join("model.safetensors"));
+        let path = primary_path.as_deref().unwrap_or(path);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())

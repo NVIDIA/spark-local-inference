@@ -29,6 +29,23 @@ def test_complete_rounds_and_context_backing():
     assert selection.physical_pages(128) * 128 > 4 * (16384 + 8)
 
 
+def test_kimi_tp16_eight_request_benchmark_plan():
+    model = resolve("kimi-k3.1-pro")
+    gpus = tuple(planning.Gpu(rank, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{rank}",
+                             96 << 30, 95 << 30, (12, 0)) for rank in range(16))
+    selection = BenchmarkSelection(batches=(8,), contexts=(2048, 8192), width=8)
+    plan = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(16)),
+                         concurrency=8, reserve_bytes=0, online_mxfp8=True,
+                         speculation=replace(model.recipe.speculation, token_capacity=64))
+    selected = replace(plan, benchmark_selection=selection)
+    assert selected.world_size == 16 and selected.concurrency == 8
+    assert selected.benchmark_selection.speculative_round_shapes == ((8, 8, 64),)
+    assert selected.speculative_token_capacity == 64
+    assert selection.physical_pages(2048) == 41
+    with pytest.raises(UsageError, match="speculation studies require"):
+        replace(plan, benchmark_selection=BenchmarkSelection(batches=(1,), speculation_study=True))
+
+
 def test_fifteen_draft_native_catalog_and_completion_capacity():
     from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
 
@@ -80,7 +97,7 @@ def test_prefill_plan_and_recipe_accept_no_decode_catalog(mtp):
         replace(plan, prefill_chunk=4096)
 
 
-@pytest.mark.parametrize("values", [dict(batches=()), dict(batches=(1, 3)), dict(batches=(1, 8)),
+@pytest.mark.parametrize("values", [dict(batches=()), dict(batches=(1, 3)), dict(batches=(1, 16)),
     dict(batches=(2, 1)), dict(contexts=(512, 512)), dict(contexts=(513,)),
     dict(contexts=(0,)), dict(width=0), dict(width=True), dict(width=4), dict(width=9)])
 def test_invalid_selection(values):

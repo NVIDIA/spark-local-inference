@@ -407,7 +407,7 @@ fn map_groups(
         .as_ref()
         .ok_or_else(|| invalid("--reuse-weights requires declared weight views"))?;
     let current = super::package::convert_prepared(rebuild, bundle, Some(views))?;
-    let prior = previous.prepared_weights.as_ref().ok_or_else(|| {
+    let prior = helios_core::package::prepared_weights::catalog(previous)?.ok_or_else(|| {
         invalid("cached rank has no prepared weight catalog; export with weights first")
     })?;
     let old_views: BTreeMap<_, _> = prior

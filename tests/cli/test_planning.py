@@ -672,7 +672,8 @@ def test_collective_tuning_plan_recipe_default_and_override(mode):
 def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
     from importlib import import_module
 
-    bootstrap = import_module(f"ignition.recipes.{recipe.name}.bootstrap")
+    bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.name
+    bootstrap = import_module(f"ignition.recipes.{bootstrap_name}.bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
     from ignition.preparation.collective_ladder import load

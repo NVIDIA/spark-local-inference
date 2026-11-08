@@ -53,8 +53,8 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 The Python distribution and source package are named `ignition`. Install the
 preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
-Preparation commands apply the bundled, version-checked Inductor and Triton patches before
-importing preparation libraries; `uv run --locked --extra prepare ignition ...`
+Preparation commands install version-checked runtime patches after setting the
+dependency environment; `uv run --locked --extra prepare ignition ...`
 uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
 for patch application in standalone Python tools.
 
@@ -194,11 +194,13 @@ storage according to those selections and available GPU memory.
 
 ### GPU graph latency benchmark
 
-`ignition bench qwen3.8-27b` prepares the real Qwen3.8-27B target and DFlash2
-draft checkpoint, captures the selected graph catalog, and measures complete
-speculative GPU rounds with CUDA events. It opens no HTTP listener and exports
-no package. The benchmark supports the Qwen3.8-27B dense recipe on one local GPU;
-other recipes fail explicitly.
+`ignition bench` prepares the target and draft checkpoints, captures the selected
+graph catalog, and measures complete speculative GPU rounds with CUDA events.
+It opens no HTTP listener and exports no package. Supported recipes are
+Qwen3.8-27B DFlash2 on one local GPU and Kimi K3.1 Pro DSpark on sixteen local
+GPUs. Tensor-parallel samples report the slowest rank's graph duration. Every
+rank finishes restoring request, cache, recurrent, and sampling state before
+the timed graph starts.
 
 ```sh
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
@@ -206,13 +208,17 @@ other recipes fail explicitly.
   --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
   --prefill-chunk-size 4096 --contexts 0,4096 --output /tmp/qwen38-prefill.json
+.venv/bin/ignition bench kimi-k3.1-pro --gpus 0-15 \
+  --batches 8 --max-concurrency 8 --verify-width 8 --contexts 8192 \
+  --speculative-token-capacity 64 --online-mxfp8 \
+  --autotune-effort default --output /tmp/kimi31-rounds.json
 ```
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
 | `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4,8`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
 | `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
 | `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
@@ -234,6 +240,11 @@ that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
 
+Kimi K3.1 Pro supports verification width eight. Its selected catalog contains
+the requested speculative rounds and the initialization and prefill graphs
+needed to establish their contexts. Vision weights retain their configured
+residency, while image graphs are omitted from this text benchmark.
+
 For fifteen drafts plus the pending token, select `--mtp-draft-tokens 15` or
 `--verify-width 16`. Specifying both requires matching values. This measures the
 native width-sixteen graph, including verification, commit, and completion
@@ -247,7 +258,7 @@ publication, with package-defined ABI 6 completion capacity:
   --output /tmp/qwen38-depth15-rounds.json
 ```
 
-With `--speculation-study`, batches and concurrency must be one; the default
+`--speculation-study` requires Qwen3.8-27B DFlash2. Batches and concurrency must be one; the default
 context is 8192. Widths 8, 13, and 16 prepare respectively 7, 12, and 15 drafts.
 The effective DFlash2 proposal block equals the selected width, independently
 of the checkpoint's eight-token block declaration. Weights and checkpoint

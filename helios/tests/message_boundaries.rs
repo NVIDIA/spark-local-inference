@@ -312,3 +312,31 @@ fn segmented_xtml_preserves_block_hints_through_json_escaping() {
     assert!(changed.token_ids.starts_with(&marked.token_ids[..cut]));
     assert!(changed.message_boundaries.contains(&cut));
 }
+
+#[test]
+fn segmented_tool_results_keep_images_and_checkpoints_in_rendered_order() {
+    let frontend = frontend(
+        include_str!("../../ignition/recipes/kimi31/assets/chat_template.jinja"),
+        TemplateEncoding::TokenSegments,
+    );
+    let messages = json!([
+        {"role":"assistant","tool_calls":[
+            {"id":"a","function":{"name":"first","arguments":{}}},
+            {"id":"b","function":{"name":"second","arguments":{}}}]},
+        {"role":"tool","tool_call_id":"b","_checkpoint_hints":[1],"content":[
+            {"type":"image_url","image_url":{"url":"second-image"}},
+            {"type":"text","text":"Second result"}]},
+        {"role":"tool","tool_call_id":"a","content":[
+            {"type":"text","text":"First result"},
+            {"type":"image_url","image_url":{"url":"first-image"}}]}
+    ]);
+    let rendered = frontend.render_chat(messages.as_array().unwrap(), &json!({"add_generation_prompt":true}).as_object().unwrap()).unwrap();
+    assert_eq!(rendered.image_sources, ["first-image", "second-image"]);
+    assert_eq!(rendered.image_checkpoint_hints, [1]);
+    assert!(rendered.text.find("First result").unwrap() < rendered.text.find("Second result").unwrap());
+    assert_eq!(rendered.message_boundaries.len(), 4);
+    let marker = "<|close|>message<|sep|><|end_of_msg|>";
+    for &boundary in &rendered.message_boundaries {
+        assert!(frontend.decode(&rendered.token_ids[..boundary], false).unwrap().ends_with(marker));
+    }
+}

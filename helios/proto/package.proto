@@ -169,6 +169,7 @@ message RankBody {
   flare.runtime.Execution execution = 14;
   flare.runtime.RoceTransport roce = 15;
   PreparedWeightCatalog prepared_weights = 16;
+  CompressedPreparedWeightCatalog compressed_prepared_weights = 17;
 }
 
 message Allocation {
@@ -298,6 +299,13 @@ message PreparedWeightCatalog {
   uint32 version = 1;
   repeated PreparedWeightView views = 2;
   repeated string unavailable = 3;
+}
+
+// A single zstd frame containing a PreparedWeightCatalog. Rank signatures authenticate the
+// compressed bytes and decoded length before the catalog is decompressed.
+message CompressedPreparedWeightCatalog {
+  bytes zstd = 1;
+  uint64 decoded_nbytes = 2;
 }
 
 message PreparedWeightView {

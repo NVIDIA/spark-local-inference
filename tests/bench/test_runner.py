@@ -90,6 +90,33 @@ def test_case_estimate_keeps_raw_samples_and_uses_all_seeds():
     assert (result["batch"], result["packed_tokens"], result["context_tokens"]) == (2, 16, 512)
 
 
+def test_eight_request_round_packs_every_lane_at_width_eight():
+    from ignition.bench.runner import _round
+    from ignition.direct.scheduler import Lane, Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(capacity=8, max_active=8, widths=(1, 8), graphs={
+        ("init", 8, 1): "init8", ("prefill", 1, 512): "prefill512",
+        ("speculative", 8, 8, 64, 7): "round8x8"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    members = [request(index + 1, [10] * 512, limit=64) for index in range(8)]
+    for member in members:
+        scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0) for member in members}))
+    for member in members:
+        step = scheduler._step("prefill", 512, [Lane(member, 0, 512)])
+        scheduler.complete(step, records(scheduler, step, {member: (1, 512, [42], 0)}))
+    step = _round(scheduler, BenchmarkCase(8, 8, 64, 512))
+    packed = uploads(scheduler, step)
+    assert (step.graph, step.batch, step.width, step.packed_tokens, step.draft_tokens) == (
+        "round8x8", 8, 8, 64, 7)
+    assert [(lane.start, lane.tokens) for lane in step.lanes] == [(512, 8)] * 8
+    assert packed["row_slot_ids"] == {0: list(range(8))}
+    assert packed["query_lengths"] == {0: [8] * 8}
+    assert packed["live_rows"] == {0: [8]}
+
+
 @pytest.mark.parametrize("times", [[], [0.], [-1.], [math.inf], [math.nan]])
 def test_missing_or_invalid_measurements_are_not_latency_estimates(times):
     with pytest.raises(ValueError, match="finite and positive"):
@@ -177,7 +204,7 @@ def test_device_snapshot_restores_graph_mutations_and_aliased_views():
         pytest.skip("set FLARE_RUN_CUDA_TESTS=1 on an assigned CUDA device")
     import torch
 
-    from ignition.bench.runner import StateSnapshot
+    from ignition.bench.executor import StateSnapshot
 
     stream = torch.cuda.Stream()
     values = torch.arange(16, dtype=torch.float32, device="cuda")

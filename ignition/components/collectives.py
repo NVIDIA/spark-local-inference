@@ -414,12 +414,12 @@ def _gather_columns(source, output, handle):
 
 
 @torch.library.custom_op("flare::pcie_all_gather", mutates_args=("output",))
-def _all_gather(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+def _all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor], handle: int) -> None:
     _gather_columns(source, output, handle)
 
 
 @_all_gather.register_fake
-def _fake_all_gather(source, output, handle):
+def _fake_all_gather(source, output, dependencies, handle):
     pass
 
 
@@ -560,13 +560,15 @@ class PreparedAllGather:
 
     Each output row contains rank zero's columns, then rank one's, and so on.
     Operations sharing the channel must execute serially on every rank.
+    Dependencies order storage writes before the collective publishes them to peers.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, dependencies=()):
         import torch.distributed as dist
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        self.dependencies = list(dependencies)
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -645,7 +647,7 @@ class PreparedAllGather:
         if self.single:
             self.output.copy_(source)
             return self.output
-        _all_gather(source, self.output, self.handle)
+        _all_gather(source, self.output, self.dependencies, self.handle)
         return self.output
 
     def run_eager(self, source):
@@ -725,7 +727,8 @@ class PreparedLseReduceScatter:
     `rank` is this rank as a one-element device tensor.
     """
 
-    def __init__(self, partial, lse, output, *, runtime, session, coordinator, name, staging=None, rank=None):
+    def __init__(self, partial, lse, output, *, runtime, session, coordinator, name, staging=None, rank=None,
+                 threads=None, block_limit=None):
         import torch.distributed as dist
         from b12x.comm import pcie
 
@@ -757,7 +760,9 @@ class PreparedLseReduceScatter:
             raise ValueError("LSE reduce-scatter requires BF16 partials, FP32 LSE and a head shard of its channel")
         self.runtime, self.output = runtime, output
         call = {"partial_output": partial, "partial_lse": lse, "out": output, "is_lse_base_on_e": True}
-        query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.lse_reduce_scatter", call=call)
+        geometry = {key: value for key, value in (("threads", threads), ("block_limit", block_limit))
+                    if value is not None}
+        query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.lse_reduce_scatter", call={**call, **geometry})
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,

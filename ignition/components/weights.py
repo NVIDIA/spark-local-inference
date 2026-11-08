@@ -12,10 +12,8 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from math import prod
 import json
-import os
 import sys
 import weakref
-from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING
 
@@ -88,6 +86,11 @@ for _container, _fields in (
     ('ignition.recipes.kimi3.dspark_weights.DraftLayerWeights',
      ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm', 'mlp')),
     ('ignition.recipes.kimi3.dspark_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'embedding', 'head',
+      'markov_embedding', 'markov_head', 'layers')),
+    ('ignition.recipes.kimi31.dspark_weights.DraftLayerWeights',
+     ('attention', 'input_norm', 'post_attention_norm', 'mlp')),
+    ('ignition.recipes.kimi31.dspark_weights.DraftWeights',
      ('projection', 'hidden_norm', 'context_kv', 'norm', 'embedding', 'head',
       'markov_embedding', 'markov_head', 'layers')),
     ('ignition.recipes.kimi3.vision.VisionWeights', ('tensors',)),
@@ -640,22 +643,6 @@ def record_final_fp4_expert_provenance_all():
             recorder(prepared)
 
 
-def _checkpoint_read_mode(paths):
-    """Use b12x's pinned-host reader for RAM files that GDS cannot register."""
-    if sys.platform != "linux":
-        return "auto"
-    memory_devices = set()
-    for line in Path('/proc/self/mountinfo').read_text().splitlines():
-        mount, filesystem = line.split(' - ', 1)
-        if filesystem.split()[0] in ('tmpfs', 'ramfs'):
-            memory_devices.add(tuple(map(int, mount.split()[2].split(':'))))
-    for path in paths:
-        device = path.stat().st_dev
-        if (os.major(device), os.minor(device)) in memory_devices:
-            return "bounce"
-    return _read_mode()
-
-
 def quantize_bf16_linear_as_mxfp8(weight):
     """Convert a BF16 projection to b12x MXFP8 storage during loading."""
     import torch
@@ -673,51 +660,13 @@ def quantize_bf16_linear_as_mxfp8(weight):
     return MXFP8LinearWeight(quantize_mxfp8_rows_torch(source), columns, padded, rows)
 
 
-def _read_mode():
-    """Checkpoint transport for a rank process that allocates only on its own GPU.
-
-    Without the nvidia-fs driver, cuFile only emulates direct reads through host
-    memory, yet still retains a context and bounce buffers on every visible GPU,
-    about 0.5 GiB each. With many ranks per host those claims can exhaust a GPU
-    before its weights fit. The bounce reader performs the same reads on its own
-    device only.
-    """
-    import os
-
-    return "auto" if os.path.exists("/proc/driver/nvidia-fs") else "bounce"
-
-
-def _release_unused_contexts(device):
-    """Destroy primary contexts that checkpoint reads opened on other visible GPUs.
-
-    GPUDirect Storage reads retain a CUDA context, about 0.5 GiB, on every visible
-    device. A rank process allocates only on its own device, so those contexts only
-    take memory from its peers' KV pages.
-    """
-    import ctypes
-
-    import torch
-
-    try:
-        driver = ctypes.CDLL("libcuda.so.1")
-    except OSError:
-        return
-    for ordinal in range(torch.cuda.device_count()):
-        if ordinal == device or torch.cuda.memory_reserved(ordinal):
-            continue
-        handle, flags, active = ctypes.c_int(), ctypes.c_uint(), ctypes.c_int()
-        if (driver.cuDeviceGet(ctypes.byref(handle), ordinal) == 0
-                and driver.cuDevicePrimaryCtxGetState(handle, ctypes.byref(flags), ctypes.byref(active)) == 0
-                and active.value):
-            driver.cuDevicePrimaryCtxReset_v2(handle)
-
-
 class DirectWeightLoader:
     """Own b12x tensor views until direct transfers finish.
 
     Recipe subclasses select tensors and validate model-specific quantization.
-    Source views may partition weight rows or columns without CPU weight copies.
+    Source views partition weight rows or columns without materializing CPU weight tensors.
     Compressed scale payloads are gathered and indexed on CUDA one layer at a time.
+    File reads use pinned-host staging and initialize only the destination GPU.
     """
 
     def __init__(
@@ -932,8 +881,7 @@ class DirectWeightLoader:
 
             source = source_for(self.manifest.snapshot)
             if source is None:
-                read_mode = _checkpoint_read_mode(self.manifest.snapshot / shard for shard in shards)
-                self._session = stack.enter_context(DirectWeightSession(device=self.device.index, read_mode=read_mode))
+                self._session = stack.enter_context(DirectWeightSession(device=self.device.index, read_mode="bounce"))
             else:
                 from ignition.preparation.remote_weights import RemoteWeightSession
 
@@ -986,7 +934,6 @@ class DirectWeightLoader:
             self._session = None
             self._display = self._load_stats = None
             self._sources.clear()
-            _release_unused_contexts(self.device.index)
 
     def _require_open(self):
         if self._session is None:

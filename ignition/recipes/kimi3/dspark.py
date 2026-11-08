@@ -350,11 +350,20 @@ class SpeculativePreparation:
         # The anchor predicts the first draft, so a block holds one position per draft.
         self.block_size, self.logit_offset = max(1, draft_tokens), 0
         self.context_buffers = {}
+        context_type, draft_type, scratch_type = PreparedContext, PreparedDraft, DraftScratch
+        if weights.config.dsa is not None:
+            from ignition.recipes.kimi31.dspark import DraftScratch as scratch_type
+            from ignition.recipes.kimi31.dspark import PreparedContext as context_type
+            from ignition.recipes.kimi31.dspark import PreparedDraft as draft_type
+
+            context_type = partial(context_type, context=collectives["context"])
+            draft_type = partial(draft_type, context=collectives["context"],
+                                 latents=collectives["latent_runtimes"][-1])
         self.forwards = DraftForwards(decoder,
-            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers),
-            partial(PreparedDraft, block=self.block_size, embedding_runtime=collectives["embedding_runtime"]),
+            partial(context_type, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers),
+            partial(draft_type, block=self.block_size, embedding_runtime=collectives["embedding_runtime"]),
             PreparedMarkov)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
-        self.draft_scratch = DraftScratch.allocate(weights.config, weights.shard,
+        self.draft_scratch = scratch_type.allocate(weights.config, weights.shard,
             requests.capacity * self.block_size, self.block_size, pool.backing.device)
