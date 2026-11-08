@@ -9,6 +9,7 @@ from b12x.attention import dense_mla
 from ignition.components.collectives import ConcurrentAllGather, PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.peer_record_gather import PreparedPeerRecordGather
+from ignition.components.interleaved_history import PreparedInterleavedHistory
 from ignition.recipes.kimi3.attention import FP8, PreparedMLAProjection
 from ignition.recipes.kimi3.dcp import ContextShards
 
@@ -41,6 +42,17 @@ class PreparedDSA(PreparedMLAProjection):
             buffers=buffers.setdefault("index", {}), latent_cache=cache, allocator=allocator)
         self.slots = self.buffer("cache_slots", dtype=torch.int64)
         self.mode = mode
+        self.history = None
+        if mode == "prefill" and source.shape[0] >= 4096:
+            if context.staging is None or context.staged_records is None or metadata.starts.numel() != 1:
+                raise ValueError("large sparse prefill requires fixed staging for one request's history")
+            history_storage = SharedBuffers(buffers.setdefault("history", {}), source.device, allocator)
+            self.history_end = history_storage.buffer("end", (1,), torch.int64)
+            self.history_records = context.staged_records
+            self.history = PreparedInterleavedHistory(cache, metadata.page_table[0], self.history_end,
+                self.shards.index, context.staging.tensor.view(-1, RECORD_BYTES), context.staging.addresses,
+                self.history_records, context.stage_signals, runtime=context.stage_runtime,
+                session=session, coordinator=coordinator, name=name + ".history")
         self.parts = []
         storage = SharedBuffers(buffers.setdefault("selected_attention", {}), source.device, allocator)
         heads = self.absorbed.shape[1]
@@ -62,8 +74,12 @@ class PreparedDSA(PreparedMLAProjection):
                 if peers is None or peers.shape != (self.shards.world,):
                     raise ValueError("Kimi sparse prefill requires every rank's latent-cache address")
                 selected = storage.buffer("records", (rows, TOPK, RECORD_BYTES), FP8)
-                part["gather"] = PreparedPeerRecordGather(peers, owners, slots, counts, selected,
-                    peer_records=cache.shape[0] * cache.shape[1], session=session, name=f"{name}.records{start}")
+                local_history = self.history is not None
+                part["gather"] = PreparedPeerRecordGather(context.staged_address if local_history else peers,
+                    owners, slots, counts, selected,
+                    peer_records=self.history_records.shape[0] if local_history else cache.shape[0] * cache.shape[1],
+                    session=session, name=f"{name}.records{start}",
+                    dependencies=(self.history_records, self.history.completed) if local_history else ())
                 if rows not in record_views:
                     record_views[rows] = selected.view(-1, 1, RECORD_BYTES)
                 caps = dense_mla.Caps(mode="decode", q_dtype=torch.bfloat16, num_q_heads=heads,
@@ -113,16 +129,26 @@ class PreparedDSA(PreparedMLAProjection):
             part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
             self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
         self.indexer.project(source)
+        if self.history is not None:
+            # Read the owning rank's cache after this layer writes the chunk;
+            # replicated projection outputs need not be byte-identical across ranks.
+            self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
+            self.history()
+        if self.indexer.sharded is not None:
+            self.indexer.sharded()
         for part in self.parts:
             selector = part["selector"]
-            if self.query_overlap is None:
+            if self.indexer.sharded is not None:
+                selected = selector.selected
+            elif self.query_overlap is None:
                 selected = selector()
             else:
                 dependency = selector.prepare_local()
                 self.query_overlap.finish(part["quantized"].view(self.absorbed.shape[0], -1), dependency)
                 selected = selector.exchange()
             selection_slots(selected, selector.positions, selector.tables, part["owners"], part["slots"],
-                part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill")
+                part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill",
+                global_records=self.history is not None)
             if self.mode == "prefill":
                 part["gather"]()
                 part["attention"]()
