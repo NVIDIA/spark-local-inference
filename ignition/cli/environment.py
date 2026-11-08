@@ -5,16 +5,18 @@
 """Process environment that preparation libraries read, set from Flare's configuration.
 
 PyTorch, b12x, Triton, and the CuTe DSL read these variables when they are
-imported or first used, so `apply` runs before any of them is imported. Rank
-and compiler processes inherit the result.
+imported or first used. `apply` sets the environment before installing runtime
+patches. Rank and compiler processes inherit the environment and install their
+own patches.
 """
 
 import hashlib
 import os
+import sys
 from importlib import util
 from pathlib import Path
 
-from ignition import patches
+from ignition import runtime_patches
 
 _DLL_DIRECTORIES = []
 
@@ -34,9 +36,10 @@ def flashinfer_workspace(kernel_cache: Path) -> Path:
 def apply(configuration, gpus, b12x=()) -> None:
     """Select the plan's GPUs as process-local devices 0 through N-1, place every cache and set the recipe's
     b12x settings, which b12x reads only from its environment."""
-    patches.apply()
     kernel_cache = configuration.directory("kernel_cache")
     os.environ.update({
+        # Preserve explicitly selected dependency roots in Inductor subprocesses.
+        "TORCH_CUSTOM_PYTHONPATH": os.pathsep.join(sys.path),
         "CUDA_VISIBLE_DEVICES": ",".join(gpu.uuid for gpu in gpus),
         "HF_HUB_CACHE": str(configuration.directory("hub_cache")),
         "B12X_COMPILE_CACHE_DIR": str(kernel_cache / "b12x"),
@@ -55,3 +58,4 @@ def apply(configuration, gpus, b12x=()) -> None:
             for path in (cuda / "bin", cuda / "bin/x64", cuda / "lib/x64"):
                 if path.is_dir():
                     _DLL_DIRECTORIES.append(os.add_dll_directory(str(path)))
+    runtime_patches.apply()

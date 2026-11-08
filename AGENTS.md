@@ -9,15 +9,106 @@ Heliopause depend on Helios; Helios has no Python or preparation-tool dependency
 
 ## Required setup and commit review
 
-On entering a clone or worktree, and after pulling changes, re-read this file and
-[the design self-review](docs/design-review.md). Before committing, ensure the
-repository's `.githooks/commit-msg` hook is enabled by following that document's
-installation instructions. Preserve any existing active hooks when installing.
+On entering a clone or worktree, and after pulling changes, re-read this file,
+[the design self-review](docs/design-review.md), and
+[the repository prose skill](.agents/skills/repo-prose/SKILL.md). Before committing,
+enable the repository's `.githooks/commit-msg` hook by following the
+[hook installation instructions](docs/design-review.md#hook-installation).
+Preserve any existing active hooks when installing.
 
 Before every commit, follow the staged-diff review and acknowledgment instructions
 in `docs/design-review.md`. A rejected acknowledgment requires reading that
 document and reviewing the staged change before retrying; do not treat the
 rejection as a formatting repair.
+
+## Required prose review
+
+Before writing or reviewing repository prose, read and apply
+[the repository prose skill](.agents/skills/repo-prose/SKILL.md). It applies to
+documentation, code comments, docstrings, names, errors, commit messages, PR titles
+and descriptions, issue and review comments, plans, and technical reports. Code
+tasks are included whenever they produce prose, including progress messages and
+completion reports.
+
+Before committing or publishing, review the final text against the skill. Rewrite
+passages that require conversation history, introduce unexplained identifiers, or
+claim results beyond the stated evidence. Review edited PR descriptions and
+comments before publishing them, even when no repository files change.
+
+Every delegated task must include the skill's resolved absolute path and require
+the delegate to read and follow it. Pass this requirement to further delegates,
+and review returned prose before incorporating or publishing it. A review
+acknowledgment does not substitute for reading the skill and reviewing the text.
+
+## Required PR descriptions
+
+A PR description must explain the argument for the change to a reviewer who knows
+the repository but has none of the author's working context. **Every description
+must answer these four questions, in this order: why, what exactly changed, what
+benefit or result is claimed, and what evidence supports it.** A description that
+makes the reviewer reconstruct these answers from implementation details, test
+inventories, or linked PRs is incomplete. Rewrite it before publishing, even if
+every individual statement is accurate.
+
+1. **Why is this change being proposed?** Identify the affected workflow and the
+   concrete defect, cost, or missing capability. Explain why it matters and why
+   the chosen approach addresses it. Give the relevant dataflow, ownership, or
+   execution constraint that makes the approach valid. Technical vocabulary and
+   a sequence of operations do not substitute for a causal explanation. Assume
+   an experienced engineer who needs local context, not introductory instruction.
+2. **What exactly did this PR change?** Name the affected components and explain
+   the concrete implementation and behavior changes. Make the before/after
+   explicit: what is replaced, removed, or added, and how the resulting path
+   works. Do not describe both behaviors in the same tense and leave the reader
+   to infer the transition. Identify material numerical, compatibility, and
+   resource-lifetime changes. A file list or a label such as "optimized prefill"
+   does not explain what was done.
+3. **What is the claimed benefit or result?** State the expected or observed
+   effect precisely, distinguishing an expectation from a measured result. Give
+   the headline comparison and metric direction for a measured improvement,
+   with its scope and material limitations attached. Distinguish component
+   measurements from whole-model or service results, and isolated changes from
+   combined-stack results. Never attribute a combined result to one PR. The
+   claimed benefit must be clear before presenting the supporting test and
+   benchmark details.
+4. **What evidence supports those claims?** Connect each material claim to the
+   relevant checks or measurements: the behavior tested, baseline or reference,
+   configuration, result, and limits of the conclusion. State what remains
+   untested or inconclusive. Explain differences between runs when passed and
+   skipped cases would otherwise appear contradictory. Keep material failures,
+   skipped checks, and measurement limitations visible. Test counts and labels
+   such as "qualified" cannot stand in for the tested contract and result.
+   Reproduction commands must identify the required inputs and configuration
+   directly or through a precise reference; placeholder arguments alone do not
+   explain a measurement. Never invent evidence to complete the description.
+
+Apply these requirements to the supporting detail:
+
+- **Give details a clear hierarchy.** Establish the central design and principal
+  correctness or compatibility risks before supporting implementation and
+  validation details. Include details because they help assess the change.
+  Avoid exhaustive inventories of changed files, preserved properties, buffers,
+  and tests. Explain the relevance of non-obvious constraints. Keep reproduction
+  instructions and merge logistics after the technical explanation.
+- **Resolve references where they are needed.** Explain a component's role before
+  using its internal shorthand. Replace phrases such as "ordinary tuning" or
+  "canonical policy" with the relevant settings or a precise reference. Links
+  may carry supporting detail, but the description must contain the central
+  argument. For stacked PRs, explain what each necessary dependency supplies,
+  what this diff contributes, and the required merge order; a chain of PR numbers
+  alone is insufficient.
+- **Remove process assurances that add no technical evidence.** Statements that
+  source "matches the tested implementation," work was reviewed, or a branch is
+  ready do not explain behavior or establish correctness. Report the actual
+  checks and their scope. Do not add audit artifacts or development chronology.
+
+Before publishing or updating a PR, read its description independently of the
+diff and development conversation. **Do not publish it if the rationale, exact
+change, claimed benefit, supporting evidence, or material limitations must be
+guessed.** Repair missing explanations rather than adding headings or more raw
+detail. Scale length to the change: a small fix may need only a short paragraph
+and relevant validation. The content and order are mandatory; particular headings
+and a fixed-length template are not.
 
 ## Contribution scope and rejection criteria
 

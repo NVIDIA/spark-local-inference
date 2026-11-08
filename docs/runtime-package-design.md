@@ -278,6 +278,11 @@ leading bytes, and trailing bytes use positioned I/O where needed. Output files
 retain their exact declared lengths. Direct-I/O errors fail the operation.
 
 Payload publication verifies source bytes and existing cache objects before reuse.
+Cache publication checks up to eight payloads concurrently, retaining each
+verified object's file handle and cache lease until its staging link is created.
+Object installation, staging links, and location records remain serialized.
+Every duplicate source occurrence is verified; authorized cached-weight reuse
+retains its existing pinned-object checks.
 A cache miss installs an immutable object without replacing existing entries.
 `--no-weights` requires exact cached weight payloads, including tuned weights;
 missing or corrupt required payloads fail publication. Executable and initial-state
@@ -324,6 +329,13 @@ collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
 original ladder file path. Helios does not interpret that preparation input.
 
+Online MXFP8 conversion records its resolved projection group in
+`RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
+independently of the recipe's preparation default. Explicit `all` and `kda-input`
+values retain their meanings. Weight reuse and package combination reject
+different conversion groups; changing a recipe default never changes stored
+weights or the serving behavior of an exported package.
+
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
 owner paths, packing-owner types, dtypes, shapes, element strides, and
@@ -334,6 +346,11 @@ share storage. Ignition describes live tensor metadata; Heliopause resolves its
 addresses against retained allocations and creates no weight copy.
 Meta tensors, discarded storage, and disposable scratch are listed as
 unavailable rather than treated as recoverable weights.
+
+Payload rank bodies retain these catalogs inline or in a lossless zstd frame.
+Verification authenticates rank metadata and checks decoded size bounds before
+catalog consumers decompress one catalog at a time. The catalog contents and
+weight reuse comparisons are independent of that encoding.
 
 These catalogs describe prepared storage, whose names and packing can differ
 from the original checkpoint. They do not serialize Python objects or execute

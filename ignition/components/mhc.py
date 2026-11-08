@@ -160,7 +160,8 @@ class PreparedMHC:
                 output=tuple(buffers.bind_args().values()),
                 owners=(*prime_owners(workspace, storage, binding), fixture))
 
-        benchmark_inputs = candidate_inputs(lambda: _BenchmarkInputs(residual, self.operation, pre_mix is not None))
+        benchmark_inputs = candidate_inputs(lambda: _BenchmarkInputs(residual, self.operation, pre_mix is not None),
+                                            session=session)
 
         def benchmark(state):
             fixture = benchmark_inputs()

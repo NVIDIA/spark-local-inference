@@ -44,6 +44,7 @@ pub enum Part {
         id: Option<String>,
         name: String,
         arguments: Value,
+        arguments_source: Option<String>,
     },
     ToolResult {
         id: Option<String>,
@@ -313,12 +314,16 @@ pub fn template_messages(
                     id,
                     name,
                     arguments,
+                    arguments_source,
                 } => {
                     if current.get("tool_calls").is_none() {
                         current["tool_calls"] = json!([]);
                     }
                     let mut call =
                         json!({"type":"function","function":{"name":name,"arguments":arguments}});
+                    if let Some(source) = arguments_source {
+                        call["function"]["arguments_source"] = json!(source);
+                    }
                     if let Some(id) = id {
                         call["id"] = json!(id);
                     }
@@ -446,6 +451,7 @@ mod tool_result_order_tests {
                     id: id.map(str::to_owned),
                     name: format!("lookup_{index}"),
                     arguments: json!({}),
+                    arguments_source: None,
                 })
                 .collect(),
             phase: None,

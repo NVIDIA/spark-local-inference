@@ -10,7 +10,7 @@ import torch
 from b12x.preparation import PreparedCall
 
 from ignition.preparation.scratch import planned_scratch
-from .resources import candidate_inputs
+from .resources import candidate_inputs, restore_seed
 
 
 @dataclass(frozen=True)
@@ -28,9 +28,8 @@ class AttentionBenchmarkInputs:
         return sum(value.untyped_storage().nbytes() for value in vars(self).values())
 
     def produce(self):
-        self.q.copy_(self.seed_q)
-        self.k.copy_(self.seed_k)
-        self.v.copy_(self.seed_v)
+        for value, seed in ((self.q, self.seed_q), (self.k, self.seed_k), (self.v, self.seed_v)):
+            restore_seed(value, seed)
 
 
 def attention_benchmark_inputs(arguments):
@@ -40,11 +39,13 @@ def attention_benchmark_inputs(arguments):
     result = {}
     for name in ("q", "k", "v"):
         source = arguments[name]
+        value = torch.empty_strided(source.shape, source.stride(), dtype=source.dtype,
+                                    device=source.device).normal_(generator=generator)
         seed = torch.empty_strided(source.shape, source.stride(), dtype=source.dtype,
-                                   device=source.device).normal_(generator=generator)
+                                   device="cpu", pin_memory=source.is_cuda)
+        seed.copy_(value)
         result[f"seed_{name}"] = seed
-        result[name] = torch.empty_strided(source.shape, source.stride(),
-                                           dtype=source.dtype, device=source.device).copy_(seed)
+        result[name] = value
     count = arguments["cu_seqlens_q"].numel()
     maximum = arguments["max_seqlen_q"]
     if (count - 1) * maximum < query.shape[0]:
@@ -53,20 +54,19 @@ def attention_benchmark_inputs(arguments):
     return AttentionBenchmarkInputs(**result, cu_seqlens_q=lengths)
 
 
-def input_factory(arguments, *, storage=None):
+def input_factory(arguments, *, storage=None, session=None):
     def allocate():
         with (nullcontext() if storage is None else storage.transient()):
             return attention_benchmark_inputs(arguments)
 
-    return candidate_inputs(allocate)
+    return candidate_inputs(allocate, session=session)
 
 
 def benchmark_call(state, *, arguments, inputs, workspace):
+    """Keep candidate inputs private and reuse the caller's disposable output."""
     inputs = inputs()
     arguments = {**arguments, **{key: getattr(inputs, key)
                                   for key in ("q", "k", "v", "cu_seqlens_q")}}
-    if "out" in arguments:
-        arguments = {**arguments, "out": torch.empty_like(arguments["out"])}
     scratch = planned_scratch(state.scratch_plan.scratch_specs(), workspace)
     binding = state.bind(scratch=scratch, **arguments)
     return PreparedCall(run=lambda: state.run(binding), produce=inputs.produce,

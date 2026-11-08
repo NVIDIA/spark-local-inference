@@ -83,6 +83,16 @@ def payload_promote(source, destination, *, publisher, profiles, accepted, targe
     return SimpleNamespace(**json.loads(value))
 
 
+def payload_edit(source, destination, *, publisher, profiles, served_model_name=None, chat_template=None):
+    """Edit frontend metadata while preserving stored weights and executables."""
+    import flare_heliopause
+    if Path(destination).exists():
+        raise FileExistsError(destination)
+    flare_heliopause.export_payload_edit(
+        str(source), str(destination), json.dumps(publisher.native_request), json.dumps(profiles),
+        served_model_name, chat_template)
+
+
 def payload_form(source):
     """Classify a package as payload packed, payload directory, or legacy."""
     import flare_heliopause

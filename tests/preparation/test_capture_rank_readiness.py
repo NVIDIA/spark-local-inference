@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Collective warmup waits for every rank to finish the preceding graph's instantiation."""
+"""Capture waits for peer warmups and the preceding graph's instantiation."""
 
 import multiprocessing
 
 
-def capture_rank(rank, world, store, finished, outcome):
+def capture_rank(rank, world, store, warmed, finished, outcome):
     from contextlib import nullcontext
     from datetime import timedelta
     from types import SimpleNamespace
@@ -25,6 +25,7 @@ def capture_rank(rank, world, store, finished, outcome):
 
         class Graph:
             def __init__(self, **kwargs):
+                assert all(warmed)
                 self.index = len(created)
                 created.append(self)
 
@@ -34,10 +35,16 @@ def capture_rank(rank, world, store, finished, outcome):
                 finished[rank * 2 + self.index] = 1
 
         def first():
-            pass
+            if not created:
+                warmed[rank * 2] = 1
 
         def second():
-            assert all(finished[peer * 2] for peer in range(world))
+            if not created:
+                if rank == world - 1:
+                    time.sleep(.3)
+                warmed[rank * 2 + 1] = 1
+            else:
+                assert all(finished[peer * 2] for peer in range(world))
 
         stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
         capture.torch.cuda.current_stream = lambda device: stream
@@ -58,13 +65,14 @@ def capture_rank(rank, world, store, finished, outcome):
             dist.destroy_process_group()
 
 
-def test_warmup_waits_for_slow_peer_graph_instantiation(tmp_path):
+def test_capture_waits_for_peer_warmup_and_graph_instantiation(tmp_path):
     context = multiprocessing.get_context("fork")
     world = 3
+    warmed = context.Array("i", world * 2, lock=False)
     finished = context.Array("i", world * 2, lock=False)
     outcome = context.Queue()
     processes = [context.Process(target=capture_rank,
-        args=(rank, world, tmp_path / "store", finished, outcome)) for rank in range(world)]
+        args=(rank, world, tmp_path / "store", warmed, finished, outcome)) for rank in range(world)]
     for process in processes:
         process.start()
     results = dict(outcome.get(timeout=30) for _ in processes)

@@ -15,6 +15,7 @@ const EXECUTABLE_OFFSET: usize = 64;
 
 struct Fixture {
     path: PathBuf,
+    directory: Option<PathBuf>,
     envelope: wire::ProtectedIndex,
     payload: Vec<u8>,
     plain: Vec<u8>,
@@ -25,6 +26,9 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        if let Some(directory) = &self.directory {
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 }
 
@@ -173,6 +177,7 @@ impl Fixture {
         };
         let mut fixture = Self {
             path,
+            directory: None,
             envelope,
             payload,
             plain,
@@ -237,6 +242,69 @@ impl Fixture {
             .read_to_end(&mut result)
             .map_err(|error| error.to_string())?;
         Ok(result)
+    }
+}
+
+#[test]
+fn signed_formats_four_and_six_load_from_directories_with_companions() {
+    for version in [4, 6] {
+        let mut fixture = Fixture::new(version, 256);
+        let directory = fixture.path.with_extension("");
+        std::fs::create_dir(&directory).unwrap();
+        let primary = directory.join("model.safetensors");
+        std::fs::rename(&fixture.path, &primary).unwrap();
+        fixture.path = primary;
+        fixture.directory = Some(directory.clone());
+        for companion in [None, Some(format!("{}.safetensors", "a".repeat(64)))] {
+            if let Some(name) = &companion {
+                let envelope = fixture.envelope.encode_to_vec();
+                let layout = serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "files": {"": [[fixture.payload.len(), name]]},
+                })).unwrap();
+                let mut header = serde_json::to_vec(&serde_json::json!({
+                    "__metadata__": {"format": "flare-snapshot"},
+                    "flare.payload": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+                    "flare.metadata": {"dtype": "U8", "shape": [envelope.len()], "data_offsets": [0, envelope.len()]},
+                    "flare.layout": {"dtype": "U8", "shape": [layout.len()], "data_offsets": [envelope.len(), envelope.len() + layout.len()]},
+                })).unwrap();
+                header.resize(4088, b' ');
+                let mut file = File::create(&fixture.path).unwrap();
+                file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+                file.write_all(&header).unwrap();
+                file.write_all(&envelope).unwrap();
+                file.write_all(&layout).unwrap();
+                let length = fixture.payload.len();
+                let mut header = serde_json::to_vec(&serde_json::json!({
+                    "__metadata__": {"format": "flare-data"},
+                    "flare.payload": {"dtype": "U8", "shape": [length], "data_offsets": [0, length]},
+                })).unwrap();
+                header.resize(4088, b' ');
+                let mut file = File::create(directory.join(name)).unwrap();
+                file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+                file.write_all(&header).unwrap();
+                file.write_all(&fixture.payload).unwrap();
+            }
+            for path in [&fixture.path, &directory] {
+                let claim = PackageClaim::read(path).unwrap();
+                assert_eq!(claim.signer, fixture.publisher.fingerprint());
+                assert_eq!(claim.namespace, fixture.publisher.namespace);
+                assert_eq!(
+                    super::super::package_companions(path).unwrap(),
+                    companion.iter().cloned().collect::<Vec<_>>()
+                );
+                let verified = VerifiedPackage::open(
+                    path, std::slice::from_ref(&fixture.publisher), None,
+                ).unwrap();
+                let authorized = verified.authorize(&fixture.publisher.namespace, false).unwrap();
+                let archive = authorized.legacy_archive().unwrap();
+                let span = &authorized.legacy_index().unwrap().ranks[0].resources["kernel"];
+                let (file, start) = archive.source(span).unwrap();
+                let mut reader = archive.protection.reader(file.file.clone(), start, span).unwrap();
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, fixture.plain);
+            }
+        }
     }
 }
 

@@ -416,6 +416,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                  seed, offset, sampled, prefix_offset=0, workspace=None):
         super().__init__(logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                          prefix_offset=prefix_offset, workspace=workspace)
+        del self.vocab_ids
         if logits.shape[1] != 1:
             raise ValueError("draft proposals cover one position")
         # Fused scoring: per-block maxima of each row before the row reduction.

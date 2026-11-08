@@ -1177,6 +1177,7 @@ mod payload_tests {
             execution: None,
             roce: None,
             prepared_weights: None,
+            compressed_prepared_weights: None,
         }
     }
 

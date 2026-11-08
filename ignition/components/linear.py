@@ -128,7 +128,8 @@ class UnquantizedProjection:
             declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
                 run=lambda: state.run(source, weight, out=output)),
                 benchmark_call=partial(bf16_fixtures.benchmark_call,
-                    inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)), weight=weight,
+                    inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None),
+                                         session=session), weight=weight,
                                        bias=None)),))
             return
         query = bf16_gemv.query_from_call(source, weight, out=output, bias=bias)
@@ -140,7 +141,7 @@ class UnquantizedProjection:
             name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(source, weight, out=output, bias=bias)),
             benchmark_call=partial(bf16_fixtures.benchmark_call,
-                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)),
+                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None), session=session),
                                    weight=weight, bias=bias),
         ),))
 
@@ -351,7 +352,7 @@ class QuantizedProjection:
             name=name,
             prepare_call=prepare,
             benchmark_call=partial(gemm_fixtures.benchmark_call,
-                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)),
+                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None), session=session),
                 values=values, scales=scales, gain=gain, bias=bias, weight=weight,
                 activation_scale=self.activation_scale,
                 selected_workspace=selected_workspace),

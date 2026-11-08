@@ -12,6 +12,8 @@ from pathlib import Path
 
 import torch
 
+from ignition import runtime_patches
+
 from . import host_memory
 from .compilation import _OPTIONS, _defer_full_collection
 from .host_memory import compile_threads, cpu_workers, device_memory_info, worker_limit
@@ -24,6 +26,7 @@ _DISCRETE_WORKER_DEVICE_BYTES = 1 << 30
 
 @_defer_full_collection()
 def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
+    runtime_patches.apply()
     from .aot import aot_forward
     from .device_binding import bind_device
     from .forward_metadata import loads

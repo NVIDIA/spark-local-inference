@@ -22,10 +22,6 @@ def main() -> int:
              "--reinstall-package", "flashinfer-python", "--reinstall-package", "flare-heliopause"],
             cwd=ROOT, env=environment, check=True,
         )
-        subprocess.run(
-            ["uv", "run", "--no-sync", "python", "-m", "ignition.patches"],
-            cwd=ROOT, check=True,
-        )
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"preparation environment setup failed: {exc}", file=sys.stderr)
         return 1

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation setup installs locked dependencies with the native build policy."""
+"""Preparation setup updates dependencies with the native build policy."""
 
 from __future__ import annotations
 
@@ -18,30 +18,28 @@ setup = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(setup)
 
 
-def test_setup_runs_locked_sync(monkeypatch):
+def test_setup_updates_preparation_dependencies(monkeypatch):
     calls = []
     monkeypatch.setattr(setup.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert setup.main() == 0
-    assert len(calls) == 2
+    assert len(calls) == 1
     command = calls[0][0][0]
-    assert command[:3] == ["uv", "sync", "--locked"]
+    assert command[:4] == ["uv", "sync", "--upgrade-package", "flashinfer-python"]
     assert calls[0][1]["env"]["BUILD_NVEP"] == "0"
-    assert calls[1][0][0] == ["uv", "run", "--no-sync", "python", "-m", "ignition.patches"]
-    assert calls[1][1] == {"cwd": ROOT, "check": True}
+    assert calls[0][1]["cwd"] == ROOT
+    assert calls[0][1]["check"] is True
 
 
 @pytest.mark.parametrize("error", [OSError("uv unavailable"), subprocess.CalledProcessError(1, "uv")])
-@pytest.mark.parametrize("failure_call", [1, 2])
-def test_failed_sync_or_patch_reports_error(monkeypatch, capsys, error, failure_call):
+def test_failed_sync_reports_error(monkeypatch, capsys, error):
     calls = 0
 
     def fail(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        if calls == failure_call:
-            raise error
+        raise error
 
     monkeypatch.setattr(setup.subprocess, "run", fail)
     assert setup.main() == 1
-    assert calls == failure_call
+    assert calls == 1
     assert str(error) in capsys.readouterr().err

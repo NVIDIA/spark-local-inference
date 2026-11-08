@@ -44,7 +44,7 @@ class PreparedMLANormQuant:
             query_features=1280, kv_features=512, epsilon=eps, min_amax=1e-4,
             affine_prefetch_ready=True, release_dependents=release_dependents))
         representative = input_factory(projected, projected,
-            storage=getattr(session, "benchmark_storage", None))
+            storage=getattr(session, "benchmark_storage", None), session=session)
 
         def prepare(state, fixture=None):
             source = projected if fixture is None else fixture.source

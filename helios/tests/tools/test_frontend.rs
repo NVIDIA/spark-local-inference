@@ -92,6 +92,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if serde_json::to_value(&rendered.token_ids).unwrap() != case["token_ids"] {
                             return Err((format!("{name}: token IDs differ")).into());
                         }
+                        if let Some(expected) = case.get("image_sources") {
+                            if serde_json::to_value(&rendered.image_sources).unwrap() != *expected {
+                                return Err(format!("{name}: image sources differ").into());
+                            }
+                        }
                         if let Some(expected) = case.get("message_boundaries") {
                             if serde_json::to_value(&rendered.message_boundaries).unwrap() != *expected {
                                 return Err(format!("{name}: message boundaries differ: expected {expected}, received {:?}", rendered.message_boundaries).into());

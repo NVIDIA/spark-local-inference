@@ -17,6 +17,7 @@ import pytest
 from ignition import planning
 from ignition.cli import environment, main, serve
 from ignition.cli.config import Configuration
+from ignition.preparation.model import PreparedModel
 from ignition.recipes import ResolvedModel, recipes, resolve
 from ignition.recipes.declaration import RankUsage
 
@@ -259,8 +260,6 @@ def test_diagnostic_serving_retains_storage_until_native_shutdown(host, monkeypa
 
 
 def test_diagnostic_startup_failure_retains_undrained_host_storage(host, monkeypatch):
-    from ignition.preparation.model import PreparedModel
-
     original = RuntimeError("native startup retained resources")
     original.resources_retained = True
     released = []
@@ -473,15 +472,22 @@ def test_uncached_checkpoint_downloads_before_export(host, monkeypatch):
 def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_path):
     from ignition.cli.config import Configuration
 
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    installed = []
+    def install():
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
+        assert os.environ["CUDA_HOME"] == f"{tmp_path}/cuda"
+        installed.append(True)
+    monkeypatch.setattr(environment.runtime_patches, "apply", install)
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
-                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
+                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     path = tmp_path / "config.toml"
     path.write_text(f'[paths]\ncuda = "{tmp_path}/cuda"\nkernel_cache = "{tmp_path}/kernels"\n')
     gpus = (types.SimpleNamespace(uuid="GPU-b"), types.SimpleNamespace(uuid="GPU-a"))
     environment.apply(Configuration.load(path), gpus)
+    assert installed == [True]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
     assert os.environ["B12X_COMPILE_CACHE_DIR"] == f"{tmp_path}/kernels/b12x"
     assert Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).is_relative_to(tmp_path / "kernels" / "flashinfer")
@@ -489,12 +495,15 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
     assert os.environ["HF_HUB_CACHE"] == f"{tmp_path}/.cache/huggingface/hub"
     assert os.environ["CUDA_HOME"] == f"{tmp_path}/cuda"
+    from torch._inductor.utils import python_subprocess_env
+
+    assert python_subprocess_env()["PYTHONPATH"].split(os.pathsep) == sys.path
 
 
 @pytest.mark.parametrize("configured", (False, True))
 @pytest.mark.parametrize("inherited_cuda", (None, "/system/cuda"))
 def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, tmp_path, configured, inherited_cuda):
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    monkeypatch.setattr(environment.runtime_patches, "apply", lambda: ())
     package = tmp_path / "site-packages" / "nvidia"
     compiler = package / "cu13" / "bin" / "nvcc"
     compiler.parent.mkdir(parents=True)
@@ -505,7 +514,7 @@ def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, 
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "TRITON_PTXAS.EXE_PATH",
                  "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
-                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
+                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     if inherited_cuda is None:
         monkeypatch.delenv("CUDA_HOME", raising=False)
@@ -525,7 +534,7 @@ def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeyp
     from ignition.cli.config import Configuration
     from ignition.recipes.kimi3.recipe import RECIPE
 
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    monkeypatch.setattr(environment.runtime_patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", *RECIPE.b12x_environment):

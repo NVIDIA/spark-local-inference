@@ -28,6 +28,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     Persistent state and graph outputs must live in caller-owned storage.
     Only graph-local intermediates may use the shared graph memory pool;
     serving replays variants serially and may choose them in any order.
+    All eager warmups precede capture so their transient workspaces do not
+    coexist with retained graph intermediates.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
     and graph capture; it is unused for the ordinary serving catalog.
     ``compile_group`` compiles one representative for same-signature trial
@@ -92,12 +94,11 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         release_unused()
     elif materialize is not None:
         materialize()
-    with phase(progress, label, total=len(names)) as stage:
+    with phase(progress, "Warm serving graphs", total=len(names)) as stage:
         for name in names:
             function = functions[name]
             if coordinator is not None:
                 coordinator.barrier(f"capture warmup {name}", coordinator.ranks)
-            started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
             with warmup(), torch.cuda.stream(stream):
                 if before_run is not None:
@@ -109,6 +110,14 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 else:
                     function()
             stream.synchronize()
+            stage.update(advance=1)
+    with phase(progress, label, total=len(names)) as stage:
+        for name in names:
+            function = compiled.get(name, functions[name])
+            if coordinator is not None:
+                coordinator.barrier(f"capture {name}", coordinator.ranks)
+            started = monotonic()
+            stream.wait_stream(torch.cuda.current_stream(device))
             graph = torch.cuda.CUDAGraph(keep_graph=True) if retain_graphs else torch.cuda.CUDAGraph()
             communication = nullcontext() if collective is None else collective.capture(stream=stream)
             def memory_detail():

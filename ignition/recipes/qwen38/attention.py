@@ -268,7 +268,7 @@ class PreparedAttention:
                                 owners=prime_owners(workspace, storage, binding))
 
         benchmark_inputs = qsa_fixtures.input_factory(caps, self.binding_kwargs, self.dynamic(),
-            storage=getattr(session, "benchmark_storage", None))
+            storage=getattr(session, "benchmark_storage", None), session=session)
         declare(session, (self.plan.request(name=f"{name}.qsa", prepare_call=prepare,
             benchmark_call=partial(qsa_fixtures.benchmark_call, inputs=benchmark_inputs, workspace=workspace)),))
         def refresh():

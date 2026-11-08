@@ -29,6 +29,8 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, treespec_loads
 
+from ignition import runtime_patches
+
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
                           _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
@@ -41,6 +43,7 @@ _CHECK_BINDINGS = ContextVar("flare_check_bindings", default=False)
 
 
 def _load_inductor(data, original, *, frozen=False):
+    runtime_patches.apply()
     from torch._functorch._aot_autograd.aot_autograd_result import deserialize_bundled_cache_entry
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
@@ -256,6 +259,7 @@ def _deserialized_triton_launch(kernel_info):
 
 class StorageBackend(SerializableCallable):
     def __init__(self, module, examples, *, options=None):
+        runtime_patches.apply()
         from torch._guards import detect_fake_mode
         from torch._inductor import standalone_compile
 
@@ -403,6 +407,7 @@ def _execute(forward):
 
 
 def aot_forward(forward, *, options=None):
+    runtime_patches.apply()
     options = dict(_OPTIONS if options is None else options)
     sources = r'.*\.(?:_?handle|stream_handle|launch_order|plans\[\d+\])$'
     with _guard_serialization(), torch.compiler.config.patch(unbacked_sources=sources):
@@ -434,16 +439,32 @@ class BoundForward:
     def __call__(self):
         return self.artifact(self.owner)
 
+    @property
+    def backend(self):
+        return (self.artifact.backend if isinstance(self.artifact, _GuardedForwardCall)
+                else self.artifact._artifacts.compiled_fn)
+
     def prepare_capture(self):
         """Retain execution guards and kernel owners after portable cache writes finish."""
+        if isinstance(self.artifact, _GuardedForwardCall):
+            return 0
         state = self.artifact._artifacts
         if (tuple(state.signature.parameters) != ("forward",) or state.runtime_env.closure
                 or state.guard_manager is None or not isinstance(state.compiled_fn, StorageBackend)):
             raise RuntimeError("capture requires a storage-bound, closed compiled forward")
+        guards = state.guard_manager
+        if guards.cache_entry is not None or guards.extra_state is not None:
+            raise RuntimeError("capture requires standalone compiled guards")
         backend = state.compiled_fn
         released = len(state.guards_state) + len(backend._serialized_artifact or b"")
         backend._serialized_artifact = None
-        self.artifact = _GuardedForwardCall(self.artifact.fn, state.guard_manager, backend)
+        # Type-invalidation finalizers can retain this wrapper for the process lifetime.
+        # Standalone execution checks the full root, without Dynamo's diff tree or debug lists.
+        guards.diff_guard_root = None
+        guards.diff_guard_sources.clear()
+        guards.code_parts.clear()
+        guards.verbose_code_parts = None
+        self.artifact = _GuardedForwardCall(self.artifact.fn, guards, backend)
         return released
 
 
@@ -546,6 +567,7 @@ class ForwardCache:
 
     def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
                  lock_gpu_clocks=False):
+        runtime_patches.apply()
         import flashinfer
         from torch._inductor.codecache import torch_key
 
@@ -556,7 +578,7 @@ class ForwardCache:
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
-        key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(),
+        key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(), runtime_patches.identity(),
             properties.name, properties.major, properties.minor, properties.multi_processor_count)))
         for source in (Path(__file__).resolve().parents[1], Path(flashinfer.__file__).resolve().parent):
             for path in sorted(source.rglob('*.py')):
@@ -585,17 +607,18 @@ class ForwardCache:
         mismatch fails on all ranks and cannot trigger compilation on peers.
         """
         if (not forwards or not isinstance(template, BoundForward) or template.pending is not None
-                or not isinstance(template.artifact._artifacts.compiled_fn, StorageBackend)):
+                or not isinstance(template.backend, StorageBackend)):
             raise ValueError("group binding requires a completed storage-bound forward")
         artifact = template.artifact
         failures = {}
         for name, owner in forwards.items():
             try:
+                template.prepare_capture()
+                artifact = template.artifact
                 if type(owner) is not type(template.owner):
                     raise BindingMismatch("grouped forward type differs from its compiled representative")
-                if not artifact.guard_check(owner):
-                    reason = artifact._artifacts.guard_manager.check_verbose(
-                        artifact.prepare_f_locals(owner))
+                if not artifact.guards.check({"forward": owner}):
+                    reason = artifact.guards.check_verbose({"forward": owner})
                     raise BindingMismatch(f"compiled forward guard differs: {reason}")
                 token = _CHECK_BINDINGS.set(True)
                 try:
@@ -702,6 +725,9 @@ class ForwardCache:
                             compiled[name] = self._warm(bound, path, name=name, progress=None,
                                                        selections=selections, warmup=warmup,
                                                        before_run=None if before_run is None else lambda name=name: before_run(name))
+                            compiled[name].prepare_capture()
+                            selections.release(compiled[name])
+                            release_unused()
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -732,6 +758,9 @@ class ForwardCache:
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
+                        compiled[name].prepare_capture()
+                        selections.release(compiled[name])
+                        release_unused()
                     stage.update(advance=1)
         release_unused()
         return compiled
@@ -766,8 +795,9 @@ class ForwardCache:
         unavailable, loans = None, []
         with ExitStack() as scope:
             stage = scope.enter_context(phase(progress, "Compile model forwards", total=len(work)))
+            compiler_scope = scope.enter_context(ExitStack())
             try:
-                compiler = scope.enter_context(CompilePool(
+                compiler = compiler_scope.enter_context(CompilePool(
                     self.device, headroom_bytes=self.headroom_bytes, pools=coordinator.local_ranks,
                     options=self.options, compile_workers=self.compile_workers))
             except MemoryError as failure:
@@ -863,6 +893,10 @@ class ForwardCache:
                 outcome = paths, None
             except Exception as failure:
                 outcome = None, f"{type(failure).__name__}: {failure}"
+            try:
+                compiler_scope.close()
+            except Exception as failure:
+                outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
             outcomes = [None] * len(ranks)
             dist.all_gather_object(outcomes, outcome, group=group)
             # Forwards lent to other ranks are complete once every rank reports.
@@ -882,57 +916,56 @@ class ForwardCache:
             release_unused()
             if materialize is not None:
                 materialize()
-            with phase(progress, "Load compiled forwards", total=len(functions) - len(selected)) as stage:
-                for name, forward in functions.items():
-                    if name in selected:
-                        continue
-                    path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
-                    with _guard_code_cache(self.root / 'guards'):
-                        selected[name] = self._load(forward, Path(path), required=True,
-                            before_run=None if before_run is None else lambda name=name: before_run(name))
-                    selected[name].cache_hit = not compiled
-                    stage.update(advance=1)
         except Exception as failure:
-            import traceback
-
-            traceback.print_exc(limit=-40)
             error = f"{type(failure).__name__}: {failure}"
         errors = [None] * len(ranks)
         dist.all_gather_object(errors, error, group=group)
         if any(errors):
-            raise RuntimeError(f"compiled forward binding failed: {errors}")
-        release_unused()
+            raise RuntimeError(f"compiled forward materialization failed: {errors}")
         selections = InductorSelections(self.device, coordinator=coordinator,
                                         lock_gpu_clocks=self.lock_gpu_clocks)
-        failure = None
-        try:
-            for bound in selected.values():
-                selections.register(bound)
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        selections._check(failure)
-        with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
-            for name in functions:
+        published, released = [], 0
+        with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
+            for name, forward in functions.items():
+                failure = None
+                try:
+                    if name not in selected:
+                        path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
+                        with _guard_code_cache(self.root / 'guards'):
+                            selected[name] = self._load(forward, Path(path), required=True,
+                                before_run=None if before_run is None else lambda name=name: before_run(name))
+                        selected[name].cache_hit = not compiled
+                    bound = selected[name]
+                    selections.register(bound)
+                except Exception as error:
+                    import traceback
+
+                    traceback.print_exc(limit=-40)
+                    failure = f"{name}: {type(error).__name__}: {error}"
+                selections._check(failure)
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
-                    selections.warm(selected[name], warmup,
+                    selections.warm(bound, warmup,
                                     before_run=None if before_run is None else lambda name=name: before_run(name))
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
+                failure = None
+                try:
+                    selections.freeze(bound)
+                    variant = getattr(forward, 'compilation_variant', 'shared')
+                    if compilers[name, variant] == share:
+                        path, _ = paths[name, variant]
+                        bound.artifact.save_compiled_function(path)
+                        published.append(path)
+                    released += bound.prepare_capture()
+                    selections.release(bound)
+                    release_unused()
+                except Exception as error:
+                    failure = f"{name}: {type(error).__name__}: {error}"
+                selections._check(failure)
                 stage.update(advance=1)
-        published, failure = [], None
-        try:
-            for name, bound in selected.items():
-                selections.freeze(bound)
-                variant = getattr(functions[name], 'compilation_variant', 'shared')
-                if compilers[name, variant] == share:
-                    path, _ = paths[name, variant]
-                    bound.artifact.save_compiled_function(path)
-                    published.append(path)
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        selections._check(failure)
+            stage.update(f"{released >> 20} MiB portable state released; guards and kernel owners retained")
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
