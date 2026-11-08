@@ -5,10 +5,11 @@
 
 import torch
 
-from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
-from ignition.components.fp8_indexer import PreparedFP8Indexer
+from ignition.components.candidate_rows import PreparedCandidateRows
+from ignition.components.collectives import PreparedAllGather
+from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.row_topk import PreparedRowTopK
+from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
 
 from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
 
@@ -62,6 +63,7 @@ class PreparedIndexSelection:
         self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
         self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
         self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
+        self.active = storage.buffer("active", (rows,), torch.bool)
         self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
@@ -77,24 +79,32 @@ class PreparedIndexSelection:
             self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=runtime,
             session=session, coordinator=None if context is None else context.coordinator,
             name=name + ".candidates", dependencies=(latent_cache,))
-        self.fold = PreparedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
-            self.selected_scores, self.selected, session=session, name=name + ".fold")
-        self.broadcast = PreparedBroadcast((self.selected,), runtime=runtime, session=session,
-            coordinator=None if context is None else context.coordinator, name=name + ".selected",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="consensus."))
+        self.fold = PreparedOrderedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
+            self.selected_scores, self.selected, session=session, name=name + ".fold",
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="agreement."))
+        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
+            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
 
-    def __call__(self):
+    def prepare_local(self):
+        """Produce rank-local candidates without using a peer communication channel."""
         index_pages(self.tables[:1] if self.mode == "prefill" else self.tables, self.pages)
         self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
         self.indexer()
         pack_candidates(self.local, self.scores, self.packed, self.shards)
+        return self.packed
+
+    def exchange(self):
+        """Exchange local candidates, select global records, and agree on their order."""
         self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
-        self.global_scores.copy_(self.gathered[:, :, 0])
-        self.global_ids.copy_(self.gathered.view(torch.int32)[:, :, 1])
-        self.fold_lengths.copy_(torch.where(self.positions >= 0, self.global_ids.shape[1], 0))
+        self.active.copy_(self.positions >= 0)
+        self.candidate_rows()
         self.fold()
-        self.broadcast()
         return self.selected
+
+    def __call__(self):
+        self.prepare_local()
+        return self.exchange()
 
 
 class PreparedDSAIndexer:
@@ -130,11 +140,27 @@ class PreparedDSAIndexer:
         self.bounds = tuple((start, min(start + step, rows)) for start in range(0, rows, step))
         selection_buffers = buffers.setdefault("selection", {})
         cache_pages = cache.view(-1, 64 * 132)
-        self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
-            metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
-            session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
-            latent_cache=latent_cache)
-            for start, end in self.bounds)
+        self.cache, self.sharded = cache_pages, None
+        if mode == "prefill" and rows >= 4096:
+            from .query_selection import PreparedQuerySelection
+
+            self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
+                metadata, shards, context, buffers.setdefault("query_selection", {}),
+                session=session, name=name + ".queries", workspace=workspace, allocator=allocator)
+            self.parts = self.sharded.parts
+        else:
+            self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
+                metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
+                session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
+                latent_cache=latent_cache)
+                for start, end in self.bounds)
+
+    @property
+    def local_plans(self):
+        """Projection, query-quantization, and index-scoring plans with no peer exchange."""
+        indexers = ([part.indexer for part in self.parts] if self.sharded is None else self.sharded.indexers)
+        return (*[projection.plan for projection in self.projections],
+                *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
     def project(self, source):
         self.projections[0](self.query_latent)
@@ -147,4 +173,4 @@ class PreparedDSAIndexer:
         self.normalized_key.copy_(centered * torch.rsqrt(variance + self.eps)
             * self.weights["indexer.k_norm.weight"].float() + self.weights["indexer.k_norm.bias"].float())
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        self.parts[0].indexer.write_keys(self.normalized_key, self.slots)
+        write_fp8_index_keys(self.normalized_key, self.slots, self.cache, hadamard=False, power_of_two=False)

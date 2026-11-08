@@ -27,6 +27,13 @@ def _write_keys(Keys, Cache, ScaleCache, Slots, stride, HADAMARD: tl.constexpr, 
                 stride, 64, 128, 448.0, HADAMARD=HADAMARD, POWER_OF_TWO_SCALE=POWER_OF_TWO_SCALE)
 
 
+def write_fp8_index_keys(keys, slots, cache, *, hadamard, power_of_two):
+    """Write owner-local keys independently of the cache used for query selection."""
+    torch.library.wrap_triton(_write_keys)[(keys.shape[0],)](
+        keys, cache.view(torch.float8_e4m3fn), cache.view(torch.float32),
+        slots, cache.stride(0), HADAMARD=hadamard, POWER_OF_TWO_SCALE=power_of_two, num_warps=4)
+
+
 class PreparedFP8Indexer:
     """Quantize BF16 queries/keys and select from planar 64-record FP8 pages.
 
@@ -83,10 +90,8 @@ class PreparedFP8Indexer:
             name=name + ".select", workspace=workspace, scores=scores)
 
     def write_keys(self, keys, slots):
-        torch.library.wrap_triton(_write_keys)[(keys.shape[0],)](
-            keys, self.cache.view(torch.float8_e4m3fn), self.cache.view(torch.float32),
-            slots, self.cache.stride(0), HADAMARD=self.hadamard,
-            POWER_OF_TWO_SCALE=self.key_power_of_two, num_warps=4)
+        write_fp8_index_keys(keys, slots, self.cache,
+                            hadamard=self.hadamard, power_of_two=self.key_power_of_two)
 
     def __call__(self):
         self.scaled_weights.copy_(self.weights)
