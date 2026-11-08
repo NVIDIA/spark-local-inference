@@ -153,9 +153,11 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-Preparation and serving use proxy ABI 10, whose region holds eight packets in flight per sender and
-rail. A core prepared with RoCE proxy ABI 9, which holds one, requires re-export. The chain topology
-is a mode of the ABI 10 layout, and startup rejects a mismatch before replay.
+Preparation and serving use proxy ABI 11. Its proxy holds eight packets in flight per sender and
+rail in ring mailboxes that the runtime allocates at startup, and it serves the pipelined
+reduce-scatter and shard-gather operations. Cores recording proxy ABI 9 or 10 have the same
+captured region layout, so the runtime loads cores that record ABI 9, 10 or 11. The chain topology
+is a mode of this layout, and startup rejects any other proxy ABI before replay.
 
 ### Prepare across four hosts
 
@@ -237,7 +239,7 @@ Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a core prepared
 with the option. The serving flag chooses routing independently of the
-core's graph catalog. A compatible ABI 10 core can use either transport
+core's graph catalog. A core recording proxy ABI 9, 10 or 11 can use either transport
 without changing its captured addresses or collective algorithms. Preparation
 on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
 are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
