@@ -536,6 +536,11 @@ captured capacities from 64 through 32,768 patches. Each feature slot holds an
 advance. `--image-concurrency` defaults to the smaller of four and text
 concurrency. `--language-model-only` omits image weights and graphs.
 
+On GB10, a TP2 package with sixteen concurrent requests and 8192-token chunks
+maps 91,854 MiB per rank and, at the default 4 GiB reserve, serves with
+93.5 GiB loaded and 10.6 GiB of KV cache per rank. Image requests have not
+been run on GB10.
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek-v4.1-flash` alias selects `deepseek-ai/DeepSeek-V4.1-Flash-1017`

@@ -80,7 +80,9 @@ RECIPE = Recipe(
         # Language model, draft layer, output head, and replicated vision tower.
         device_bytes=177_421_592_008,
         # Decoder layer 45, the MTP module.
-        draft_bytes=4_301_658_112),),
+        draft_bytes=4_301_658_112,
+        # Two-Spark TP2 exports map 91,854 MiB per rank at sixteen requests, 7.08 GiB above half the device bytes.
+        expansion_bytes=15 << 30),),
     context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.
