@@ -134,9 +134,13 @@ class PreparedDSA(PreparedMLAProjection):
             # replicated projection outputs need not be byte-identical across ranks.
             self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
             self.history()
+        if self.indexer.sharded is not None:
+            self.indexer.sharded()
         for part in self.parts:
             selector = part["selector"]
-            if self.query_overlap is None:
+            if self.indexer.sharded is not None:
+                selected = selector.selected
+            elif self.query_overlap is None:
                 selected = selector()
             else:
                 dependency = selector.prepare_local()

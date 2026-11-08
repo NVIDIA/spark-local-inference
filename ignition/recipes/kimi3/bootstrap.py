@@ -318,8 +318,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
                 staging = SharedPages(group, device, config.context // shard.world_size * RECORD_BYTES,
                                       ipc=package_storage.peer_storage)
+                index_staging = SharedPages(group, device, config.context // shard.world_size * 132,
+                                            ipc=package_storage.peer_storage)
                 context = replace(context, staging=staging, stage_runtime=collective,
-                    stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)))
+                    stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
+                    index_staging=index_staging,
+                    index_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
+                    selections=create_head_exchange(group, device,
+                        max_rows=-(-config.prefill_chunk_size // shard.world_size),
+                        heads=shard.world_size, head_dim=4096, ipc=package_storage.peer_storage))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -375,12 +382,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     (window + config.prefill_chunk_size, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device))
             if context is not None and getattr(context, "staging", None) is not None:
                 records = torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device)
-                context = replace(context, staged_records=records)
+                context = replace(context, staged_records=records,
+                    index_records=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
         if context is not None and getattr(context, "staging", None) is not None:
             # The slab's address survives scratch unmapping, but its pointer table
             # must retain its contents when scratch is rematerialized as zeros.
             context = replace(context, staged_address=torch.tensor(
-                [context.staged_records.data_ptr()], dtype=torch.int64, device=device))
+                [context.staged_records.data_ptr()], dtype=torch.int64, device=device),
+                index_columns=torch.arange(config.context // 64, dtype=torch.int32, device=device))
         vision_prefill = vision_state = None
         if patches:
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -578,13 +587,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)) +
-                        (() if context is None or getattr(context, "staging", None) is None else (context.staging,)),
+                        (() if context is None or getattr(context, "staging", None) is None
+                         else (context.staging, context.index_staging)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, graph_buffers.chunks,
             None if speculation is None else speculation.sampling_buffers.chunks, arena.tensor, metadata,
                                            *(() if context is None else (context.slab,)),
                                            *(() if context is None or getattr(context, "staging", None) is None
-                                             else (context.staged_records, context.staging.tensor)),
+                                             else (context.staged_records, context.staging.tensor,
+                                                   context.index_records, context.index_staging.tensor)),
                                            *(() if not patches else (vision_storage, vision_state.arena)),
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,

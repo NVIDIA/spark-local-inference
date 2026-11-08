@@ -48,6 +48,11 @@ class ContextParallel:
     staged_address: torch.Tensor | None = None
     stage_signals: tuple = ()
     stage_runtime: object = None
+    index_staging: object = None
+    index_records: torch.Tensor | None = None
+    index_columns: torch.Tensor | None = None
+    index_signals: tuple = ()
+    selections: object = None
 
 
 def index_pages(model_pages, output):
