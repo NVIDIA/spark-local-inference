@@ -351,6 +351,7 @@ class RecordedPreparationSession(PreparationSession):
             raise RuntimeError("benchmark fixtures can only be retired during tuning")
         self._benchmark_resources = {key: value for key, value in self._benchmark_resources.items()
                                      if key in self._benchmark_restorers}
+        torch.accelerator.memory.empty_host_cache()
 
     def register_benchmark_resource(self, key: Hashable, resource, *, restore):
         """Borrow preparation-only storage until trial cleanup and restoration finish."""
@@ -654,6 +655,7 @@ class RecordedPreparationSession(PreparationSession):
                 try:
                     with torch.cuda.device(self.device.ordinal):
                         torch.cuda.empty_cache()
+                        torch.accelerator.memory.empty_host_cache()
                     self._tune_status = "ready"
                 except BaseException:
                     self._tune_status = "failed"

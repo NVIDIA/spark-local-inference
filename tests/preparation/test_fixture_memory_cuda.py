@@ -19,6 +19,41 @@ pytestmark = pytest.mark.skipif(os.getenv("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @torch.no_grad()
+def test_retiring_fixtures_releases_pinned_cache_and_preserves_live_and_borrowed_inputs():
+    device = torch.device("cuda:0")
+    source = torch.empty((1024, 1024), dtype=torch.bfloat16, device=device)
+    output = torch.empty((1024, 64), dtype=source.dtype, device=device)
+    torch.accelerator.memory.empty_host_cache()
+    with RecordedPreparationSession(device=device, checkpoint="pinned-fixture-memory",
+            workload_schema="projection-fixture-owners", numerical_policy="bf16") as session:
+        borrowed = input_factory(source, output)()
+        session.register_benchmark_resource("borrowed", borrowed, restore=borrowed.produce)
+        session._tune_status = "tuning"
+        live = session.benchmark_resource("live", lambda: input_factory(source, output)())
+        retired = session.benchmark_resource("retired", lambda: input_factory(source, output)())
+        reference = weakref.ref(retired)
+        seed_bytes = retired.seed.nbytes
+        del retired
+        torch.cuda.synchronize(device)
+        before = torch.cuda.host_memory_stats()
+        session.release_benchmark_cache()
+        after = torch.cuda.host_memory_stats()
+        assert reference() is None
+        assert session._benchmark_resources == {"borrowed": borrowed}
+        assert after["allocated_bytes.current"] == before["allocated_bytes.current"] - seed_bytes
+        assert after["active_bytes.current"] == before["active_bytes.current"] - seed_bytes
+        for fixture in (live, borrowed):
+            fixture.source.fill_(float("nan"))
+            fixture.produce()
+        torch.cuda.synchronize(device)
+        for fixture in (live, borrowed):
+            assert torch.equal(fixture.source.cpu(), fixture.seed)
+    del fixture, live, borrowed
+    torch.cuda.synchronize(device)
+    torch.accelerator.memory.empty_host_cache()
+
+
+@torch.no_grad()
 def test_projection_can_follow_expert_tuning_under_memory_pressure():
     device = torch.device("cuda:0")
     source = torch.empty((4096, 7168), dtype=torch.bfloat16, device=device)
