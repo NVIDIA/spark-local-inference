@@ -1004,6 +1004,19 @@ of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
 
+With compiled forwards, speculation enabled, `--collective-tuning static`
+(the default), and `--autotune-effort default` or `audit`, preparation measures
+two complete sparse-candidate exchanges for single-request decode and
+verification. One gathers every rank's candidates on every rank; the other
+sends each query's candidates to one owner, selects there, and broadcasts only
+the selected IDs. Both preserve FP32 score words, cutoff ties and ID order.
+The measurement includes packing, transport, selection and replication, and
+binds one implementation per row capacity before model capture. The choice is
+recorded under `candidate_compositions` in preparation measurements. Prefill,
+multiple-request graphs, runtime collective tuning and disabled autotuning
+retain the replicated exchange. No serving flag or runtime graph change is
+required.
+
 With the default `--prefill-chunk-size 4096`, the 4096-token prefill graph
 stages owner-encoded latent and index history locally, distributes index-query
 rows across context ranks, and gathers final selected IDs once per layer.

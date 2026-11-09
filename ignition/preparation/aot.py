@@ -257,6 +257,34 @@ def _deserialized_triton_launch(kernel_info):
     return kernel
 
 
+def _serialized_invocations(invocations):
+    """Record opaque launches without their process-local Triton table indices."""
+    from torch._library.custom_ops import _maybe_get_opdef
+    from torch._dynamo.aot_compile_types import _serialize_triton_kernel
+
+    calls = []
+    for call in invocations:
+        target = call.target
+        leaves = call.leaves
+        if target is torch.ops.higher_order.triton_kernel_wrapper_mutation:
+            args, kwargs = tree_unflatten(leaves, call.tree)
+            kwargs = dict(kwargs)
+            kernel = kernel_side_table.get_kernel(kwargs['kernel_idx'])
+            constants = kernel_side_table.get_constant_args(kwargs['constant_args_idx'])
+            kernel, constants = _serialized_triton_launch(kernel, constants, kwargs['kwargs'])
+            name = ('triton', _serialize_triton_kernel(kernel), constants)
+            kwargs['kernel_idx'] = kwargs['constant_args_idx'] = None
+            leaves, _ = tree_flatten((args, kwargs))
+        elif isinstance(target, torch._ops.OpOverload):
+            definition = _maybe_get_opdef(target)
+            registration = None if definition is None else definition._init_fn.__module__
+            name = ('op', target.namespace, target._opname, target._overloadname, registration)
+        else:
+            raise TypeError(f'cannot serialize native operator: {target}')
+        calls.append((name, leaves, treespec_dumps(call.tree), call.operands, call.integers))
+    return calls
+
+
 class StorageBackend(SerializableCallable):
     def __init__(self, module, examples, *, options=None):
         runtime_patches.apply()
@@ -340,32 +368,10 @@ class StorageBackend(SerializableCallable):
 
     @classmethod
     def serialize_compile_artifacts(cls, fn):
-        from torch._library.custom_ops import _maybe_get_opdef
-        from torch._dynamo.aot_compile_types import _serialize_triton_kernel
-
         with _artifact_kernel_table():
             artifact = (fn.artifact.serialize() if fn._serialized_artifact is None
                         else zlib.decompress(fn._serialized_artifact))
-        calls = []
-        for call in fn.invocations:
-            target = call.target
-            leaves = call.leaves
-            if target is torch.ops.higher_order.triton_kernel_wrapper_mutation:
-                args, kwargs = tree_unflatten(leaves, call.tree)
-                kwargs = dict(kwargs)
-                kernel = kernel_side_table.get_kernel(kwargs['kernel_idx'])
-                constants = kernel_side_table.get_constant_args(kwargs['constant_args_idx'])
-                kernel, constants = _serialized_triton_launch(kernel, constants, kwargs['kwargs'])
-                name = ('triton', _serialize_triton_kernel(kernel), constants)
-                kwargs['kernel_idx'] = kwargs['constant_args_idx'] = None
-                leaves, _ = tree_flatten((args, kwargs))
-            elif isinstance(target, torch._ops.OpOverload):
-                definition = _maybe_get_opdef(target)
-                registration = None if definition is None else definition._init_fn.__module__
-                name = ('op', target.namespace, target._opname, target._overloadname, registration)
-            else:
-                raise TypeError(f'cannot serialize native operator: {target}')
-            calls.append((name, leaves, treespec_dumps(call.tree), call.operands, call.integers))
+        calls = _serialized_invocations(fn.invocations)
         return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen))
 
     @classmethod
@@ -435,6 +441,7 @@ class BoundForward:
     owner: object
     cache_hit: bool
     pending: object = None
+    execution_identity: str | None = None
 
     def __call__(self):
         return self.artifact(self.owner)
@@ -647,7 +654,8 @@ class ForwardCache:
             detail = [(rank, name, reason) for rank, (_, _, items) in zip(ranks, gathered, strict=True)
                       for name, reason in sorted(items.items())]
             raise BindingMismatch(f"grouped forward bindings differ from compiled guards: {detail[:4]}")
-        return {name: BoundForward(artifact, owner, template.cache_hit)
+        return {name: BoundForward(artifact, owner, template.cache_hit,
+                                   execution_identity=template.execution_identity)
                 for name, owner in forwards.items()}
 
     @contextmanager
@@ -707,7 +715,8 @@ class ForwardCache:
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
                                        materialize=materialize, warmup=warmup, before_run=before_run)
-        selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
+        selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
+                                        source_identity=self.root.name)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
@@ -923,7 +932,7 @@ class ForwardCache:
         if any(errors):
             raise RuntimeError(f"compiled forward materialization failed: {errors}")
         selections = InductorSelections(self.device, coordinator=coordinator,
-                                        lock_gpu_clocks=self.lock_gpu_clocks)
+                                        lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
         published, released = [], 0
         with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
             for name, forward in functions.items():
@@ -1043,7 +1052,8 @@ class ForwardCache:
         from .inductor_tuning import InductorSelections
 
         if selections is None:
-            selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
+            selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
+                                        source_identity=self.root.name)
         path.parent.mkdir(parents=True, exist_ok=True)
         if not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph'):
             bound.artifact.save_compiled_function(str(path))

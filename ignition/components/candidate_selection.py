@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Exact rank-local candidate merging with prepared communication alternatives."""
+
+import torch
+
+from .candidate_rows import PreparedCandidateRows
+from .collectives import PreparedAllGather
+from .ordered_row_topk import PreparedOrderedRowTopK
+from .owner_topk import PreparedOwnerTopK
+
+
+class PreparedCandidateSelection:
+    """Normalize local IDs and select global rows without changing score bits.
+
+    The replicated composition gathers every candidate on every rank. The
+    owner composition selects each query on one rank and broadcasts final IDs.
+    Both use the same candidate preprocessing, cutoff ties and emission order.
+    Preparation binds one composition before model compilation; serving has
+    no runtime choice. Serial calls may share storage and transport channels.
+    """
+
+    def __init__(self, indices, scores, positions, rank, output, *, world, gather_runtime,
+                 owner_runtime, reduction_runtime, session, coordinator, name, buffers,
+                 dependencies=(), alternatives=("replicated", "owner")):
+        rows, topk = indices.shape
+        if (indices.dtype != torch.int32 or scores.shape != indices.shape or scores.dtype != torch.float32
+                or positions.shape != (rows,) or positions.dtype != torch.int64
+                or output.shape != (rows, topk) or output.dtype != torch.int32
+                or (rank is None and world != 1)
+                or (rank is not None and (rank.shape != (1,) or rank.dtype != torch.int64))
+                or any(not value.is_contiguous() or value.device != indices.device
+                       for value in (indices, scores, positions, rank, output) if value is not None)):
+            raise ValueError("candidate merging requires matching contiguous local rows and global output IDs")
+        if not alternatives or not set(alternatives) <= {"replicated", "owner"}:
+            raise ValueError("candidate merging requires supported prepared alternatives")
+        self.indices, self.scores, self.positions, self.output = indices, scores, positions, output
+        self.rank = 0 if rank is None else rank
+        self.rows, self.world, self.topk = rows, world, topk
+        self.dependencies = list(dependencies)
+        self.alternatives = tuple(alternatives)
+        self.implementation = None
+        self.active = buffers.zeros((rows,), torch.bool)
+        self.gather = self.owner = None
+        if "replicated" in alternatives:
+            self.packed = buffers.zeros((rows, topk, 2), torch.float32)
+            self.gathered = buffers.zeros((rows, topk*world, 2), torch.float32)
+            self.values = buffers.zeros((rows, topk*world), torch.float32)
+            self.global_ids = buffers.zeros((rows, topk*world), torch.int32)
+            self.lengths = buffers.zeros((rows,), torch.int32)
+            self.selected_scores = buffers.zeros((rows, topk), torch.float32)
+            self.gather = PreparedAllGather(self.packed.view(torch.bfloat16).view(rows, -1),
+                self.gathered.view(torch.bfloat16).view(rows, -1), runtime=gather_runtime,
+                session=session, coordinator=coordinator, name=name+".replicated.transport")
+            self.gather.dependencies = self.dependencies
+            self.candidates = PreparedCandidateRows(self.gathered, self.active, self.values,
+                self.global_ids, self.lengths, topk=topk, buffers=buffers)
+            self.fold = PreparedOrderedRowTopK(self.values, self.lengths, self.global_ids,
+                self.selected_scores, output, session=session, name=name+".replicated.fold", buffers=buffers)
+        if "owner" in alternatives:
+            if owner_runtime is None or reduction_runtime is None or owner_runtime.world_size != world:
+                raise ValueError("owner selection requires matching prepared transport owners")
+            self.planar = buffers.zeros((2*rows, topk), torch.float32)
+            self.owner_scores, self.owner_ids = self.planar[:rows], self.planar[rows:].view(torch.int32)
+            self.owner = PreparedOwnerTopK(self.owner_ids, self.owner_scores, self.active, rank, output,
+                owner_runtime=owner_runtime, reduction_runtime=reduction_runtime, session=session,
+                coordinator=coordinator, name=name+".owner", buffers=buffers)
+            self.owner.transport.dependencies = self.dependencies
+
+    def bind(self, implementation):
+        if implementation not in self.alternatives:
+            raise ValueError("candidate selection was not prepared for this implementation")
+        self.implementation = implementation
+
+    def plans(self, implementation):
+        if implementation == "replicated" and self.gather is not None:
+            return (("transport", self.gather.plan), ("selection", self.fold.plan))
+        if implementation == "owner" and self.owner is not None:
+            return (("transport", self.owner.transport.plan), ("selection", self.owner.fold.plan),
+                    ("replication", self.owner.broadcast.reduction.plan))
+        raise ValueError("candidate selection implementation has no prepared plans")
+
+    def pack(self, implementation=None):
+        implementation = self.implementation if implementation is None else implementation
+        live = self.indices >= 0
+        if implementation == "owner":
+            self.owner_ids.copy_(torch.where(live, self.indices*self.world+self.rank, -1).to(torch.int32))
+            self.owner_scores.copy_(torch.where(live, self.scores, -torch.inf))
+            return self.planar
+        if implementation == "replicated":
+            self.packed[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
+            self.packed.view(torch.int32)[:, :, 1].copy_(
+                torch.where(live, self.indices*self.world+self.rank, -1).to(torch.int32))
+            return self.packed
+        raise RuntimeError("candidate selection must bind a composition before execution")
+
+    def exchange(self, implementation=None):
+        implementation = self.implementation if implementation is None else implementation
+        self.active.copy_(self.positions >= 0)
+        if implementation == "owner":
+            return self.owner()
+        if implementation == "replicated":
+            self.gather(self.packed.view(torch.bfloat16).view(self.rows, -1))
+            self.candidates()
+            self.fold()
+            return self.output
+        raise RuntimeError("candidate selection must bind a composition before execution")
+
+
+class CandidateSelectionForward:
+    """One immutable composition used by preparation-time compiled trials."""
+
+    def __init__(self, selection, implementation):
+        self.selection, self.implementation = selection, implementation
+
+    def __call__(self):
+        self.selection.pack(self.implementation)
+        return self.selection.exchange(self.implementation)
