@@ -377,6 +377,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 extra["candidates"] = create_head_exchange(group, device,
                     max_rows=max(min(config.prefill_chunk_size, 128), config.decode_tokens),
                     heads=shard.world_size, head_dim=8192, ipc=package_storage.peer_storage)
+                if (drafting and config.compile_decoder and config.autotune_effort != "off"
+                        and config.collective_tuning == "static"):
+                    from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
+
+                    extra["candidate_owners"] = PCIeDCPTopKOwnerExchange.from_exchange_group(
+                        exchange_group=group, device=device, max_rows=config.draft_tokens+1,
+                        topk=2048, stream_affine=False, ipc=package_storage.peer_storage)
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
             heads = weights.config.text["num_attention_heads"]
             context = ContextParallel(ContextShards.on(rank, shard.world_size, device),
@@ -398,6 +405,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     selections=create_head_exchange(group, device,
                         max_rows=-(-config.prefill_chunk_size // shard.world_size),
                         heads=shard.world_size, head_dim=4096, ipc=package_storage.peer_storage))
+            if getattr(context, "candidate_owners", None) is not None:
+                from ignition.recipes.kimi31.selection_tuning import CandidateSelectionTuning
+
+                context = replace(context, selection_tuning=CandidateSelectionTuning(
+                    context, collective, cache_root=config.kernel_cache))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -595,6 +607,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if config.compile_decoder:
         scratch_pool.release_backing()
         deferred_pool.release_backing()
+    if context is not None and getattr(context, "selection_tuning", None) is not None:
+        with phase(progress, "Tune sparse candidate compositions"), package_storage.transient():
+            tuning["candidate_compositions"] = context.selection_tuning.tune(session)
 
     def materialize():
         scratch_pool.materialize()
@@ -677,6 +692,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)) +
+                        (() if context is None or getattr(context, "candidate_owners", None) is None
+                         else (context.candidate_owners,)) +
                         (() if context is None or getattr(context, "staging", None) is None
                          else (context.staging, context.index_staging)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

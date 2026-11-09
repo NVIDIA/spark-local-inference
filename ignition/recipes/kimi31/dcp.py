@@ -53,6 +53,8 @@ class ContextParallel:
     index_columns: torch.Tensor | None = None
     index_signals: tuple = ()
     selections: object = None
+    candidate_owners: object = None
+    selection_tuning: object = None
 
 
 def index_pages(model_pages, output):
