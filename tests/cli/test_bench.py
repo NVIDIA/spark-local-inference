@@ -58,6 +58,26 @@ def test_kimi_eight_request_round_with_autotuning():
     assert args.max_concurrency == 8 and args.speculative_token_capacity == 64
 
 
+def test_verification_matrix_keeps_the_full_draft_block():
+    value = settings("--verify-prefixes", "8,1,6,4", "--mtp-draft-tokens", "7")
+    assert value.verification_prefixes == (1, 4, 6, 8)
+    assert value.width == 8
+    assert value.batches == (1,)
+    assert settings("--verify-prefixes", "4,6").width == 8
+
+
+@pytest.mark.parametrize("flags", [
+    ("--verify-prefixes", "0,8"), ("--verify-prefixes", "4,9"),
+    ("--verify-prefixes", "1,8", "--batches", "2"),
+    ("--verify-prefixes", "1,8", "--prefill"),
+    ("--verify-prefixes", "1,8", "--speculation-study"),
+    ("--verify-prefixes", "1,8", "--mtp-draft-tokens", "3"),
+])
+def test_invalid_verification_matrix(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)
+
+
 def test_kimi_rejects_private_dflash_studies_before_preparation(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text("")
