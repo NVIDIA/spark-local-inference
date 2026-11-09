@@ -536,6 +536,10 @@ captured capacities from 64 through 32,768 patches. Each feature slot holds an
 advance. `--image-concurrency` defaults to the smaller of four and text
 concurrency. `--language-model-only` omits image weights and graphs.
 
+Reasoning is always enabled; requests to disable thinking are ignored without an
+error. See [reasoning controls](api.md#reasoning-sampling-and-usage) for effort
+and history.
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek-v4.1-flash` alias selects `deepseek-ai/DeepSeek-V4.1-Flash-1017`
