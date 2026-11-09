@@ -24,6 +24,23 @@ impl ProcessedImages {
             .append(&mut images.interpolation_indices);
         self.interpolation_weights
             .append(&mut images.interpolation_weights);
+        if self.cu_window_seqlens.is_empty() {
+            self.cu_window_seqlens.push(0);
+        }
+        let window_offset = *self.cu_window_seqlens.last().unwrap();
+        self.cu_window_seqlens.extend(
+            images
+                .cu_window_seqlens
+                .into_iter()
+                .skip(1)
+                .map(|n| n + window_offset),
+        );
+        if self.cu_window_seqlens.len() == 1 {
+            self.cu_window_seqlens.clear();
+        }
+        let patch_offset = self.reverse_index.len() as i64;
+        self.reverse_index
+            .extend(images.reverse_index.into_iter().map(|n| n + patch_offset));
     }
 
     pub fn encoded_len(&self) -> Result<usize> {
@@ -34,9 +51,11 @@ impl ProcessedImages {
             (self.interpolation_indices.len(), 32),
             (self.interpolation_weights.len(), 16),
             (self.cu_seqlens.len(), 4),
+            (self.cu_window_seqlens.len(), 4),
+            (self.reverse_index.len(), 8),
         ]
         .into_iter()
-        .try_fold(9usize + 6 * 8, |total, (count, width)| {
+        .try_fold(9usize + 8 * 8, |total, (count, width)| {
             count
                 .checked_mul(width)
                 .and_then(|bytes| total.checked_add(bytes))
@@ -51,7 +70,7 @@ impl ProcessedImages {
     }
 
     fn write_encoded(&self, mut write: impl FnMut(&[u8])) {
-        write(b"FLAREIMG\x01");
+        write(b"FLAREIMG\x02");
         let count = |write: &mut dyn FnMut(&[u8]), n: usize| write(&(n as u64).to_le_bytes());
         count(&mut write, self.geometry.len());
         for g in &self.geometry {
@@ -82,11 +101,19 @@ impl ProcessedImages {
         for n in &self.cu_seqlens {
             write(&n.to_le_bytes());
         }
+        count(&mut write, self.cu_window_seqlens.len());
+        for n in &self.cu_window_seqlens {
+            write(&n.to_le_bytes());
+        }
+        count(&mut write, self.reverse_index.len());
+        for n in &self.reverse_index {
+            write(&n.to_le_bytes());
+        }
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader(bytes);
-        if reader.take(9)? != b"FLAREIMG\x01" {
+        if reader.take(9)? != b"FLAREIMG\x02" {
             return Err("invalid prepared image record version".into());
         }
         let count = reader.count(56)?;
@@ -142,6 +169,16 @@ impl ProcessedImages {
         for _ in 0..count {
             cu_seqlens.push(i32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
         }
+        let count = reader.count(4)?;
+        let mut cu_window_seqlens = Vec::with_capacity(count);
+        for _ in 0..count {
+            cu_window_seqlens.push(i32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
+        }
+        let count = reader.count(8)?;
+        let mut reverse_index = Vec::with_capacity(count);
+        for _ in 0..count {
+            reverse_index.push(reader.i64()?);
+        }
         if !reader.0.is_empty() {
             return Err("trailing prepared image record bytes".into());
         }
@@ -152,6 +189,8 @@ impl ProcessedImages {
             interpolation_indices,
             interpolation_weights,
             cu_seqlens,
+            cu_window_seqlens,
+            reverse_index,
         })
     }
 }

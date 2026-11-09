@@ -1228,6 +1228,8 @@ fn vision_upload_selects_source_image_independently_of_destination_feature_offse
         interpolation_indices: (0..8).map(|i| [i, i + 1, i + 2, i + 3]).collect(),
         interpolation_weights: vec![[0.25; 4]; 8],
         cu_seqlens: vec![0, 4, 8],
+        cu_window_seqlens: vec![],
+        reverse_index: vec![],
     };
     for (image, destination) in [(0, 0), (1, 1), (1, 0)] {
         let staging = crate::frontend::images::packing::prepare(

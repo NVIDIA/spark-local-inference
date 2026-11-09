@@ -29,6 +29,7 @@ def tensors(value):
     ("recipes.kimi3.vision", 1024, 256, False, {}),
     ("recipes.nemotron_h.vision", 256, 64, False, {}),
     ("recipes.step5.vision", 256, 64, True, {}),
+    ("recipes.muse_glimmer_nvfp4.vision", 1024, 256, False, {}),
 ])
 def test_vision_capacities_reuse_pool_storage(module, large, small, sharded, options):
     scratch_type = import_module(f"ignition.{module}").VisionScratch

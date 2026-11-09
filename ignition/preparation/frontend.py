@@ -114,6 +114,22 @@ def image_settings(config, model, profile):
             "init_pos_emb_width": 64, "pos_emb_interpolation_mode": "bilinear",
             "merge_kernel_size": [2, 2]}, "MoonViT vision configuration")
         return {"moonvit": {}}
+    if profile == "muse_glimmer":
+        _expected(config, {"processor_class": "MuseGlimmerProcessor"}, "Muse Glimmer processor")
+        image = config["image_processor"]
+        _expected(image, {"image_processor_type": "MuseGlimmerImageProcessor", "patch_size": 14,
+            "merge_size": 2, "temporal_patch_size": 2, "max_image_tokens": 4096, "resample": 1,
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3}, "Muse Glimmer image processor")
+        optional = {"rescale_factor": 1 / 255,
+            "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
+        _expected(image, {key: value for key, value in optional.items() if key in image}, "Muse Glimmer image processor")
+        _expected(model, {"model_type": "muse_glimmer", "image_token_id": 200092, "video_token_id": 200091},
+                  "Muse Glimmer model configuration")
+        _expected(model["vision_config"], {"patch_size": 14, "merge_size": 2, "patch_temporal": 2,
+            "pos_emb_height": 32, "pos_emb_width": 32}, "Muse Glimmer vision configuration")
+        return {"muse_glimmer": dict(patch_size=14, merge_size=2, max_image_tokens=4096,
+            image_mean=image["image_mean"], image_std=image["image_std"],
+            image_token="<|patch|>", start_token="<|image_start|>", end_token="<|image_end|>")}
     if profile == "deepseek_row_major":
         vision = model["vision_config"]
         _expected(vision, {"patch_size": 14, "downsample_ratio": 3, "max_image_tokens": 1024,

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from ignition.components.collectives import PreparedAllReduce
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import prepare_projection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.window_attention import stage_windows, commit_window
 
@@ -29,7 +29,7 @@ class AttentionScratch:
     window_value: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device, *, requests=1, buffers=None):
+    def allocate(cls, config, shard, tokens, device, *, requests=1, buffers=None, max_verify_width=8):
         geometries = [config.attention(i) for i in range(config.layers)]
         if len({(a.heads, a.kv_heads, a.key_dim, a.value_dim) for a in geometries}) != 1:
             raise ValueError("Muse Spark attention scratch requires matching global and sliding head geometry")
@@ -40,7 +40,7 @@ class AttentionScratch:
                     else buffers.zeros(shape, dtype))
         window = max(a.window for a in geometries)
         pages = max((tokens + max(window, 0) + PAGE_TOKENS - 1) // PAGE_TOKENS,
-                    requests * ((max(window, 0) + 8 + PAGE_TOKENS - 1) // PAGE_TOKENS))
+                    requests * ((max(window, 0) + max_verify_width + PAGE_TOKENS - 1) // PAGE_TOKENS))
         return cls(zeros(tokens, 2 * heads * geometry.key_dim + kv_heads * (geometry.key_dim + geometry.value_dim)),
             zeros(tokens, heads, geometry.key_dim), zeros(tokens, kv_heads, geometry.key_dim),
             zeros(tokens, kv_heads, geometry.value_dim), zeros(tokens, heads, geometry.value_dim),
@@ -60,20 +60,45 @@ def head_norm(values, eps):
 
 
 class PreparedAttention(torch.nn.Module):
+    """Gated attention over one projection buffer.
+
+    ``weights.qkv`` rows are ordered ``[q | k | v | gate]`` (``heads × key_dim``, ``kv_heads × key_dim``,
+    ``kv_heads × value_dim``, ``heads × value_dim``) and fill ``scratch.projected`` with one projection.
+    When ``weights.gate`` is present ``weights.qkv`` carries ``[q | k | v]`` only and the gate is a second
+    projection: the two write disjoint contiguous regions of ``scratch.projected``'s storage (q/k/v
+    leading, gate trailing), which the packed kernels require. ``output_norm`` applies the per-head RMS
+    norm to the attended value before the sigmoid gate (Spark); ``False`` gates the raw attended value
+    (Glimmer).
+    """
+
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
-                 runtime, coordinator, session, name, workspace, buffers=None):
+                 runtime, coordinator, session, name, workspace, buffers=None, output_norm=True):
         super().__init__()
         self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Muse Spark attention mode: {mode}")
-        self.mode, self.pool, self.layer = mode, pool, layer
-        self.projection = UnquantizedProjection(source, weights.qkv, scratch.projected,
-            session=session, name=name + ".qkv_gate")
-        self.output_projection = UnquantizedProjection(scratch.gated.flatten(1), weights.output, scratch.partial,
-            session=session, name=name + ".output")
+        self.mode, self.pool, self.layer, self.output_norm = mode, pool, layer, output_norm
+        heads, kv_heads = scratch.query.shape[1], scratch.key.shape[1]
+        geometry = self.geometry
+        self.widths = (heads * geometry.key_dim, kv_heads * geometry.key_dim,
+                       kv_heads * geometry.value_dim, heads * geometry.value_dim)
+        if sum(self.widths) != scratch.projected.shape[1]:
+            raise ValueError("Muse attention projection widths must fill the projected scratch rows")
+        self.gate_projection = None
+        if getattr(weights, "gate", None) is None:
+            self.projection = prepare_projection(source, weights.qkv, scratch.projected,
+                session=session, name=name + ".qkv_gate", workspace=workspace)
+        else:
+            tokens, qkv_width, gate_width = scratch.projected.shape[0], sum(self.widths[:3]), self.widths[3]
+            qkv_region, gate_region = scratch.projected.view(-1).split((tokens * qkv_width, tokens * gate_width))
+            self.projection = prepare_projection(source, weights.qkv, qkv_region.view(tokens, qkv_width),
+                session=session, name=name + ".qkv", workspace=workspace)
+            self.gate_projection = prepare_projection(source, weights.gate, gate_region.view(tokens, gate_width),
+                session=session, name=name + ".gate", workspace=workspace)
+        self.output_projection = prepare_projection(scratch.gated.flatten(1), weights.output, scratch.partial,
+            session=session, name=name + ".output", workspace=workspace)
         self.reduction = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime,
                                            coordinator=coordinator, session=session, name=name + ".reduce")
-        geometry = self.geometry
         self.inverse = (1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
             dtype=torch.float32, device=source.device) / geometry.rotary_dim))
             if geometry.rotary_dim else torch.empty(0, dtype=torch.float32, device=source.device))
@@ -134,10 +159,13 @@ class PreparedAttention(torch.nn.Module):
 
     def forward(self, hidden_states, **kwargs):
         s, m, a = self.scratch, self.metadata, self.geometry
-        projected = self.projection(hidden_states.reshape(-1, hidden_states.shape[-1]))
-        heads, kv_heads = s.query.shape[1], s.key.shape[1]
-        q, k, v, gate = projected.split((heads * a.key_dim, kv_heads * a.key_dim,
-                                        kv_heads * a.value_dim, heads * a.value_dim), -1)
+        rows = hidden_states.reshape(-1, hidden_states.shape[-1])
+        projected = self.projection(rows)
+        if self.gate_projection is None:
+            q, k, v, gate = projected.split(self.widths, -1)
+        else:
+            q, k, v = projected.split(self.widths[:3], -1)
+            gate = self.gate_projection(rows)
         q = head_norm(q.view_as(s.query), self.eps) * self.query_factor
         k = head_norm(k.view_as(s.key), self.eps)
         if a.rotary_dim:
@@ -176,7 +204,8 @@ class PreparedAttention(torch.nn.Module):
         if a.window > 0 and self.mode == "prefill":
             commit_window(self.key_cache, s.key, m.state_rows[0], m.starts[0], m.lengths[0])
             commit_window(self.value_cache, s.value, m.state_rows[0], m.starts[0], m.lengths[0])
-        s.gated.copy_(head_norm(s.attended, self.eps) * torch.sigmoid(gate.view_as(s.gated)))
+        attended = head_norm(s.attended, self.eps) if self.output_norm else s.attended
+        s.gated.copy_(attended * torch.sigmoid(gate.view_as(s.gated)))
         s.partial.copy_(self.output_projection(s.gated.flatten(1)))
         return self.reduction(s.partial).view_as(hidden_states), None
 

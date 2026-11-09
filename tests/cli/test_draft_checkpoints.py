@@ -15,7 +15,7 @@ from ignition.cli.preparation import Host, derive
 from ignition.recipes import ResolvedModel, recipes
 
 
-@pytest.mark.parametrize("name,embedded", [("nemotron_h", False), ("kimi3", False), ("kimi3", True), ("muse_spark", False), ("qwen38_dense", False)])
+@pytest.mark.parametrize("name,embedded", [("nemotron_h", False), ("kimi3", False), ("kimi3", True), ("muse_spark", False), ("qwen38_dense", False), ("muse_glimmer_nvfp4", False)])
 @pytest.mark.parametrize("custom_cache", [False, True])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, name, custom_cache, drafting, embedded):
@@ -70,7 +70,7 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
         snapshot = target / "dspark"
         snapshot.mkdir(parents=True)
     config = recipe.prepare(target, plan, compile_forwards=True, kernel_cache=None, progress=None)
-    if name in ("muse_spark", "qwen38_dense"):
+    if name in ("muse_spark", "qwen38_dense", "muse_glimmer_nvfp4"):
         if name == "qwen38_dense":
             assert config.mtp is drafting
         else:
@@ -79,7 +79,8 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
         if drafting:
             assert config.speculative_widths == plan.speculation.widths
             assert config.speculative_fixed_width == plan.speculation.fixed_width
-            assert config.speculative_token_capacity == (128 if name == "qwen38_dense" else 32)
+            assert config.speculative_token_capacity == {"qwen38_dense": 128, "muse_spark": 32,
+                                                         "muse_glimmer_nvfp4": recipe.speculation.token_capacity}[name]
             assert config.speculative_graph_budget == 64
     else:
         assert config.draft_checkpoint == (str(snapshot) if drafting else None)

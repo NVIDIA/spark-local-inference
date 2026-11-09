@@ -327,8 +327,12 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     path.write_text(configuration_text.format(alias=model.checkpoint.alias))
     configuration = Configuration.load(path)
     if expected is None:
-        expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
-                    (4, 4096, 32) if model.recipe.name == "muse_spark" else (32, 4096, 128))
+        # The recipe's own declaration: its concurrency, prefill chunk, and declared or derived token capacity.
+        from ignition.components.capacity import speculative_token_capacity
+
+        declared = model.recipe.speculation
+        expected = (model.recipe.concurrency, model.recipe.prefill_chunk,
+                    speculative_token_capacity(model.recipe.concurrency, max(declared.widths), declared.token_capacity))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,

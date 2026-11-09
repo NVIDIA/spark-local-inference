@@ -29,7 +29,7 @@ from qualify.speculative_workload import (
 
 VOCABULARY = 248320
 EOS = {248046, 248044}
-_ROUND = re.compile(r'^flare_speculative_(rounds|gpu_nanoseconds|emitted_tokens|offered_drafts|accepted_drafts)_total\{batch="([124])",width="([1-8])"\}$')
+_ROUND = re.compile(r'^flare_speculative_(rounds|gpu_nanoseconds|emitted_tokens|offered_drafts|accepted_drafts)_total\{batch="([124])",width="([0-9]+)"\}$')
 
 
 def read_sse(response, raw, *, elapsed_ns, limit=32 << 20):

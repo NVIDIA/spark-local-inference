@@ -5,6 +5,42 @@
 """Supported ModelOpt projection storage declarations."""
 
 from collections.abc import Mapping
+import fnmatch
+import re
+
+
+def matches_pattern(name: str, pattern: str) -> bool:
+    if pattern.startswith("re:"):
+        return bool(re.search(pattern[3:], name))
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+def modelopt_nvfp4_layers(config, candidates):
+    """Expand a ModelOpt NVFP4 ``quantization_config`` over the candidate linear names.
+
+    Requires ``config_groups.group_0`` to declare 4-bit group-16 weights and ``ignore``
+    to be a list of glob strings; every candidate no ignore pattern matches is returned
+    as an NVFP4 group-16 entry.
+    """
+    quant = config.get("quantization_config")
+    if not isinstance(quant, Mapping) or quant.get("quant_method") != "modelopt" or quant.get("quant_algo") != "NVFP4":
+        raise ValueError("expected modelopt NVFP4 quantization_config")
+    groups = quant.get("config_groups")
+    group_0 = groups.get("group_0") if isinstance(groups, Mapping) else None
+    if not isinstance(group_0, Mapping):
+        raise ValueError("modelopt NVFP4 quantization requires config_groups.group_0")
+    weights = group_0.get("weights")
+    if not isinstance(weights, Mapping) or weights.get("num_bits") != 4 or weights.get("group_size") != 16:
+        raise ValueError("modelopt NVFP4 quantization requires 4-bit group_size=16 weights")
+    ignore = quant.get("ignore", ())
+    if not isinstance(ignore, list) or any(not isinstance(pattern, str) for pattern in ignore):
+        raise ValueError("modelopt NVFP4 ignore list must contain glob strings")
+    entry = {"quant_algo": "NVFP4", "group_size": 16}
+    return {
+        name: entry
+        for name in candidates
+        if not any(matches_pattern(name, pattern) for pattern in ignore)
+    }
 
 
 def quantized_layers(config):

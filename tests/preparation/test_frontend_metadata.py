@@ -21,7 +21,8 @@ from ignition.recipes.declaration import SamplingDefaults, SamplingRange
 @pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
 def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
     qwen = recipe.name in ("qwen38", "qwen38_dense")
-    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3") else .95,
+    # Muse Glimmer carries Muse Spark's defaults (temperature 1, top-p 1, top-k off); the card gives none.
+    expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3", "muse_spark", "muse_glimmer_nvfp4") else .95,
         top_k=20 if qwen else 64 if recipe.name == "gemma4" else -1, min_p=0., repetition_penalty=1., presence_penalty=0., frequency_penalty=0.)
     if qwen:
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
@@ -189,8 +190,11 @@ def test_cached_checkpoint_structural_metadata_extracts_without_model_weights(re
                 / "snapshots" / checkpoint.revision)
     if not (snapshot / "tokenizer_config.json").exists():
         pytest.skip("checkpoint structural metadata is not cached")
-    profiles = {"qwen38": "qwen", "mimo_v2": "mimo", "deepseek4": "deepseek4", "deepseek41": "deepseek_row_major"}
-    preprocessor = Path("ignition/recipes/deepseek4/assets/preprocessor_config.json") if recipe.name == "deepseek4" else None
+    profiles = {"qwen38": "qwen", "mimo_v2": "mimo", "deepseek4": "deepseek4", "deepseek41": "deepseek_row_major",
+                "muse_glimmer_nvfp4": "muse_glimmer"}
+    # Glimmer's snapshot stores the image settings in processor_config.json, as its frontend reads them.
+    preprocessor = {"deepseek4": Path("ignition/recipes/deepseek4/assets/preprocessor_config.json"),
+                    "muse_glimmer_nvfp4": snapshot / "processor_config.json"}.get(recipe.name)
     token_source = snapshot / "generation_config.json"
     if not token_source.exists():
         token_source = snapshot / "config.json"

@@ -15,6 +15,7 @@ pub(crate) mod layouts;
 mod mimo;
 mod glm;
 mod moonvit;
+mod muse_glimmer;
 mod orientation;
 mod conditioned;
 mod record;
@@ -193,6 +194,13 @@ pub struct ProcessedImages {
     pub interpolation_indices: Vec<[i64; 4]>,
     pub interpolation_weights: Vec<[f32; 4]>,
     pub cu_seqlens: Vec<i32>,
+    /// Window-attention segment boundaries in packed patch order; empty for profiles whose
+    /// encoder has no windowed layers (only `MuseGlimmer` fills it).
+    pub cu_window_seqlens: Vec<i32>,
+    /// Transformers' `reverse_indices = argsort(window_index)`: `reverse_index[r]` is the
+    /// packed (window-order) position of raster patch `r`, so gathering packed rows by it
+    /// restores raster order. Empty for profiles packed in raster order already.
+    pub reverse_index: Vec<i64>,
 }
 
 impl ProcessedImages {
@@ -255,6 +263,7 @@ pub enum ImageSettings {
     Step {},
     Radio {},
     Glm {},
+    MuseGlimmer(MuseGlimmerImageSettings),
 }
 
 impl ImageSettings {
@@ -270,6 +279,7 @@ impl ImageSettings {
             Self::Step {} => ImagePreparationKind::Step,
             Self::Radio {} => ImagePreparationKind::Radio,
             Self::Glm {} => ImagePreparationKind::Glm,
+            Self::MuseGlimmer(_) => ImagePreparationKind::MuseGlimmer,
         }
     }
 }
@@ -314,6 +324,19 @@ pub struct PatchMergeImageSettings {
     pub end_token: String,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuseGlimmerImageSettings {
+    pub patch_size: usize,
+    pub merge_size: usize,
+    pub max_image_tokens: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub image_token: String,
+    pub start_token: String,
+    pub end_token: String,
+}
+
 #[derive(Clone)]
 enum Profile {
     Qwen(qwen::QwenProcessor),
@@ -325,6 +348,7 @@ enum Profile {
     Step,
     Radio,
     Glm,
+    MuseGlimmer(muse_glimmer::Processor),
 }
 
 impl ImageProcessor {
@@ -359,6 +383,9 @@ impl ImageProcessor {
             ImageSettings::Glm {} => Profile::Glm,
             ImageSettings::Mimo(settings) => Profile::MiMo(mimo::load(&settings, limits)?),
             ImageSettings::PatchMerge(settings) => Profile::PatchMerge(patch_merge::Processor::load(settings, limits)?),
+            ImageSettings::MuseGlimmer(settings) => {
+                Profile::MuseGlimmer(muse_glimmer::Processor::load(settings, limits)?)
+            }
             ImageSettings::Qwen(settings) => {
                 Profile::Qwen(qwen::QwenProcessor::load(&settings, limits)?)
             }
@@ -667,6 +694,7 @@ impl ImageProcessor {
             Profile::Step => step::geometry(self.limits, width, height),
             Profile::Radio => radio::geometry(self.limits, width, height),
             Profile::Glm => glm::geometry(self.limits, width, height),
+            Profile::MuseGlimmer(profile) => profile.geometry(width, height),
         }
     }
     pub fn resized_rgb(&self, image: &RgbImage) -> Result<(ImageGeometry, Vec<u8>)> {
@@ -680,6 +708,7 @@ impl ImageProcessor {
             Profile::Step => step::resized_rgb(self.limits, image),
             Profile::Radio => Err("RADIO resizing produces float32 pixels; use process".into()),
             Profile::Glm => glm::resized_rgb(self.limits, image),
+            Profile::MuseGlimmer(profile) => profile.resized_rgb(image),
         }
     }
     pub fn process(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
@@ -698,6 +727,7 @@ impl ImageProcessor {
             Profile::Step => step::process(self.limits, images),
             Profile::Radio => radio::process(self.limits, images),
             Profile::Glm => glm::process(self.limits, images),
+            Profile::MuseGlimmer(profile) => profile.process(images),
         }
     }
     pub fn expand_prompt(
@@ -715,6 +745,7 @@ impl ImageProcessor {
             Profile::Step => Err("Step image expansion requires its model contract".into()),
             Profile::Radio => Err("RADIO image expansion requires its model contract".into()),
             Profile::Glm => Err("GLM image expansion requires its prepared layout".into()),
+            Profile::MuseGlimmer(profile) => profile.expand_prompt(frontend, text, images),
         }
     }
 }

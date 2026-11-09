@@ -71,6 +71,8 @@ pub(super) fn process(limits: ImageLimits, images: &[RgbImage]) -> Result<Proces
         interpolation_indices: vec![],
         interpolation_weights: vec![],
         cu_seqlens: vec![0],
+        cu_window_seqlens: vec![],
+        reverse_index: vec![],
     };
     let geometries: Vec<_> = images
         .iter()

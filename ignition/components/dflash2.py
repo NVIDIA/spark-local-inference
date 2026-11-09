@@ -178,9 +178,9 @@ class DraftScratch:
     gathered_logits: torch.Tensor
     logits: torch.Tensor
     convolution: dict
+    block_size: int
     retained: list = field(default_factory=list)
     selectors: dict = field(default_factory=dict)
-    block_size: int = 8
 
     @classmethod
     def allocate(cls, config, shard, tokens, device, *, buffers, block_size=None):

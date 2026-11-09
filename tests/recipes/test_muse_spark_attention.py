@@ -164,6 +164,72 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
 
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires assigned CUDA GPU')
+@pytest.mark.parametrize('separate_gate', [False, True])
+def test_glimmer_form_gates_raw_attended_value(separate_gate):
+    """``output_norm=False`` (fused or separate gate) reproduces Glimmer's attention: no o_norm."""
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from transformers.models.muse_glimmer.modeling_muse_glimmer import MuseGlimmerRMSNorm, apply_rotary_pos_emb
+
+    device, shard = torch.device('cuda', 0), TensorParallelShard(0, 1)
+    torch.manual_seed(2382)
+    window, capacity, blocks = 2048, 129, 20
+    config = configuration(window)
+    pool = ContinuationPool.allocate(config, shard, 3, blocks, device)
+    fused = torch.randn((2304, 128), device=device).bfloat16() * .025
+    output = torch.randn((128, 1024), device=device).bfloat16() * .025
+    weights = (SimpleNamespace(qkv=fused[:1280].contiguous(), gate=fused[1280:].contiguous(), output=output)
+               if separate_gate else SimpleNamespace(qkv=fused, output=output))
+    source = torch.randn((capacity, 128), device=device).bfloat16()
+    metadata = Metadata.allocate(capacity, 1, blocks, device)
+    metadata.set(torch.tensor([0], device=device), torch.tensor([capacity], dtype=torch.int32, device=device),
+        torch.tensor([1], device=device), torch.arange(blocks, dtype=torch.int32, device=device)[None],
+        torch.zeros((1, capacity), device=device, dtype=torch.int64), torch.tensor([1], device=device))
+    with RecordedPreparationSession(device=device, checkpoint='muse-glimmer-attention-component',
+            workload_schema='muse-glimmer-attention', numerical_policy='default', compile_workers=1) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        scratch = AttentionScratch.allocate(config, shard, capacity, device)
+        attention = PreparedAttention(0, weights, config, shard, source, scratch, metadata, pool,
+            mode='prefill', runtime=None, coordinator=None, session=session, name='prefill', workspace=arena,
+            output_norm=False)
+        assert (attention.gate_projection is not None) == separate_gate
+        session.tune()
+        compiled = compile_forward(lambda: attention(source))
+        compiled()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        session.freeze()
+        pool.clear_for_preparation()
+        norm = MuseGlimmerRMSNorm(eps=1e-5, with_scale=False)
+        source.normal_()
+        q, k, v, gate = (source @ fused.T).split((1024, 128, 128, 1024), -1)
+        q = norm(q.view(capacity, 16, 64)) * config.text['qk_scale_factor']
+        k, v = norm(k.view(capacity, 2, 64)), v.view(capacity, 2, 64)
+        inv = 1 / (500000 ** (torch.arange(0, 64, 2, device=device).float() / 64))
+        freq = torch.arange(capacity, device=device).float()[:, None] * inv
+        cos, sin = torch.cat((freq, freq), -1).cos().bfloat16(), torch.cat((freq, freq), -1).sin().bfloat16()
+        q_ref, k_ref = apply_rotary_pos_emb(q.transpose(0, 1)[None], k.transpose(0, 1)[None], cos[None], sin[None])
+        q, k = q_ref[0].transpose(0, 1), k_ref[0].transpose(0, 1)
+        stored_k = k.clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16()
+        stored_v = v.clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16()
+        ks, vs = stored_k.repeat_interleave(8, 1).float(), stored_v.repeat_interleave(8, 1).float()
+        scores = torch.einsum('qhd,thd->hqt', q.float(), ks) / 8
+        positions = torch.arange(capacity, device=device)
+        valid = positions[None] <= positions[:, None]
+        prob = scores.masked_fill(~valid[None], float('-inf')).softmax(-1)
+        attended = torch.einsum('hqt,thd->qhd', prob, vs).bfloat16()
+        expected = (attended.flatten(1) * gate.sigmoid()) @ output.T
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(scratch.output, expected, atol=.02, rtol=.04)
+        torch.testing.assert_close(scratch.key, k, rtol=0, atol=.03125)
+        graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires assigned CUDA GPU')
 @pytest.mark.parametrize('window', [-1, 2048])
 def test_decode_wrap_and_inactive_lanes(window):
     from ignition.preparation.compilation import compile_forward
