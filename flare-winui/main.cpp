@@ -159,7 +159,9 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
     void show_error(std::wstring const& message) {
         auto notice = control<InfoBar>(L"Notice");
         notice.Title(L"Flare could not complete the operation");
-        notice.Message(message);
+        text(L"NoticeMessage",message);
+        text(L"ErrorCopyStatus",L"");
+        control<TextBlock>(L"ErrorCopyStatus").Visibility(Visibility::Collapsed);
         notice.Severity(InfoBarSeverity::Error);
         notice.Margin(Thickness{0,0,0,16});
         notice.IsOpen(true);
@@ -281,6 +283,15 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
         clicked(L"ViewDownloadsButton", [this] { select_page(2); });
         clicked(L"DownloadsFindButton", [this] { select_source(true); select_page(1); });
         clicked(L"CopyEndpointButton",[this]{if(endpoint_.empty())return;copy_text(endpoint_+L"/v1");copied_endpoint_=endpoint_;endpoint_copy_until_=std::chrono::steady_clock::now()+std::chrono::seconds(2);text(L"EndpointCopyStatus",L"Copied");});
+        clicked(L"CopyErrorButton",[this]{
+            try {
+                copy_text(std::wstring(control<TextBlock>(L"NoticeMessage").Text()));
+                text(L"ErrorCopyStatus",L"Copied");
+            } catch(hresult_error const&) {
+                text(L"ErrorCopyStatus",L"Clipboard unavailable. Select the message and press Ctrl+C.");
+            }
+            control<TextBlock>(L"ErrorCopyStatus").Visibility(Visibility::Visible);
+        });
         initialize_chat();
         clicked(L"RetryModelButton", [this] { if (!pending_model_id_.empty()) activate(pending_model_id_, pending_model_name_); });
         for (auto name : { L"StorageButton", L"DownloadStorageButton" }) clicked(name, [this] { storage_dialog(); });
