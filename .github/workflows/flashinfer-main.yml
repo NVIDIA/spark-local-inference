@@ -32,6 +32,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # The FlashInfer checkout (about 1 GB of source) and its CUDA wheels do not
+      # fit in the runner's free disk beside the preinstalled toolchains, which
+      # this job does not use. Every later uv command shares one cache, so
+      # FlashInfer is fetched once.
+      - name: Free runner disk and share one uv cache
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+          echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
       - name: Install uv
         run: python -m pip install uv==0.11.30
       - name: Resolve FlashInfer main
@@ -83,7 +94,6 @@ jobs:
           MAIN_SHA: ${{ steps.main.outputs.sha }}
           FLASHINFER_BUILD_NO_PIP: '1'
           BUILD_NVEP: '0'
-          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
         run: |
           set -euo pipefail
           venv="$RUNNER_TEMP/flashinfer-venv"
@@ -117,3 +127,4 @@ jobs:
           assert flashinfer.__git_commit__ == expected, (flashinfer.__git_commit__, expected)
           print(f"installed flashinfer {flashinfer.__version__} at {installed}")
           PY
+          df -h /
