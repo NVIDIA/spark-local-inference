@@ -745,14 +745,19 @@ fn capture_graph(
             })
         })
         .collect::<ExportResult<Vec<_>>>()?;
-    let mut flags = 0u64;
-    cu!(
-        cuda,
-        "cuGraphExecGetFlags",
-        (Handle, *mut u64),
-        graph.executable as Handle,
-        &mut flags
-    )?;
+    let flags = if let Some(flags) = graph.instantiate_flags {
+        flags
+    } else {
+        let mut flags = 0u64;
+        cu!(
+            cuda,
+            "cuGraphExecGetFlags",
+            (Handle, *mut u64),
+            graph.executable as Handle,
+            &mut flags
+        )?;
+        flags
+    };
     Ok((result, edges, flags))
 }
 
@@ -2496,10 +2501,15 @@ pub(crate) fn capture_rank(
         || request
             .graphs
             .iter()
-            .any(|g| g.name.is_empty() || g.graph == 0 || g.executable == 0)
+            .any(|g| {
+                g.name.is_empty()
+                    || g.graph == 0
+                    || (g.executable == 0) == g.instantiate_flags.is_none()
+                    || g.instantiate_flags.is_some_and(|flags| flags & !9 != 0)
+            })
     {
         return Err(invalid(
-            "named live graph templates and executables are required",
+            "named live graph templates require either an executable or supported instantiation flags",
         ));
     }
     if request

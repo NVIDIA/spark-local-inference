@@ -15,6 +15,68 @@ import pytest
 from ignition.preparation.runtime_core import FileSource
 
 
+@pytest.mark.parametrize("flags", [0, 1, 8, 9])
+def test_template_export_declares_flags_without_an_executable(flags):
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_core import _graphs
+
+    def no_executable():
+        pytest.fail("template export must not request or instantiate an executable")
+
+    graph = SimpleNamespace(raw_cuda_graph=lambda: 123, raw_cuda_graph_exec=no_executable,
+                            _flare_instantiation_flags=flags)
+    assert _graphs({"decode": graph}) == [dict(name="decode", graph=123, instantiate_flags=flags)]
+
+
+@pytest.mark.parametrize("flags", [-1, True, 2, 4, 16, 1.0])
+def test_template_export_rejects_unsupported_flags(flags):
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_core import _graphs
+
+    with pytest.raises(ValueError, match="instantiation flags"):
+        _graphs({"decode": SimpleNamespace(_flare_instantiation_flags=flags)})
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
+def test_export_manifest_validates_templates_without_weakening_native_handoff():
+    import ctypes as C
+    import torch
+    from ignition.preparation.execution import GraphSignature, PreparedExecution
+    from ignition.preparation.runtime_core import _Cuda
+
+    torch.cuda.set_device(0)
+    source = torch.empty(16, device="cuda")
+    output = torch.empty_like(source)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        output.copy_(source)
+    buffers = dict(source=source, output=output,
+        frame_index=torch.zeros(1, device="cuda", dtype=torch.int32),
+        submission_sequence=torch.zeros(1, device="cuda", dtype=torch.int64),
+        completion_records=torch.zeros((2, 1, 24), device="cuda", dtype=torch.int64))
+    signatures = {"decode": GraphSignature("decode", 1, 1, ("source",))}
+    bundle = PreparedExecution(device=0, graphs={"decode": graph}, buffers=buffers,
+                               max_active=1, signatures=signatures)
+    try:
+        manifest = bundle.export_manifest()
+        assert "handle" not in manifest["graphs"][0]
+        assert {item["name"] for item in manifest["buffers"]} == set(buffers)
+        with pytest.raises(ValueError, match="already be instantiated"):
+            bundle.manifest()
+        invalid = PreparedExecution(device=0, graphs={"decode": graph},
+            buffers={**buffers, "source": source[::2]}, max_active=1, signatures=signatures)
+        with pytest.raises(ValueError, match="contiguous"):
+            invalid.export_manifest()
+        graph.instantiate()
+        flags = C.c_uint64()
+        _Cuda().call("cuGraphExecGetFlags", C.c_void_p(graph.raw_cuda_graph_exec()), C.byref(flags))
+        # Retained capture records this exact Torch instantiation policy.
+        assert flags.value == 1
+        assert bundle.manifest()["graphs"][0]["handle"] == graph.raw_cuda_graph_exec()
+    finally:
+        graph.reset()
+
+
 def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path):
     import flare_heliopause
 
@@ -31,7 +93,19 @@ def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
-def test_native_graph_export_preserves_construction_order_across_branches(tmp_path):
+@pytest.mark.parametrize("template_only", [False, True])
+@pytest.mark.parametrize("flags", [0, 1, 8, 9])
+def test_native_graph_export_preserves_construction_order_across_branches(tmp_path, template_only, flags):
+    # CUPTI must observe module loading before another test primes ATen kernels.
+    subprocess.run([sys.executable, "-c",
+        "from pathlib import Path; import sys; "
+        "from tests.preparation.test_runtime_core import _check_native_graph_construction_order; "
+        "_check_native_graph_construction_order(Path(sys.argv[1]), sys.argv[2] == '1', int(sys.argv[3]))",
+        str(tmp_path), str(int(template_only)), str(flags)], check=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[2])
+
+
+def _check_native_graph_construction_order(tmp_path, template_only, flags):
     import ctypes as C
     from types import SimpleNamespace
 
@@ -63,18 +137,29 @@ def test_native_graph_export_preserves_construction_order_across_branches(tmp_pa
                       dependencies, C.c_size_t(int(bool(nodes))), C.byref(params), context)
             nodes.append(node)
         executable = C.c_void_p()
-        cuda.call("cuGraphInstantiateWithFlags", C.byref(executable),
-                  C.c_void_p(graph.raw_cuda_graph()), C.c_uint64(0))
+        expected_flags = flags
+        if not template_only:
+            cuda.call("cuGraphInstantiateWithFlags", C.byref(executable),
+                      C.c_void_p(graph.raw_cuda_graph()), C.c_uint64(flags))
+            reported_flags = C.c_uint64()
+            cuda.call("cuGraphExecGetFlags", executable, C.byref(reported_flags))
+            # Executables expose the driver's flags; templates retain the declared policy.
+            expected_flags = reported_flags.value
         try:
             owner = RuntimeCore(allocations=[Allocation("weight", data.data_ptr(), data.nbytes)],
                                    modules={}, kernels=[], recorder=images.native, owners=(data, graph))
             path = tmp_path / "rank.json"
-            owner.write(path, {"branches": SimpleNamespace(raw_cuda_graph=graph.raw_cuda_graph,
-                raw_cuda_graph_exec=lambda: executable.value)}, sources=True)
+            handle = SimpleNamespace(raw_cuda_graph=graph.raw_cuda_graph,
+                                     raw_cuda_graph_exec=lambda: executable.value)
+            if template_only:
+                handle._flare_instantiation_flags = flags
+            owner.write(path, {"branches": handle}, sources=True)
         finally:
-            cuda.call("cuGraphExecDestroy", executable)
+            if executable.value:
+                cuda.call("cuGraphExecDestroy", executable)
     index, locate = read_sources(path)
     description, = index.ranks[0].graphs
+    assert description.flags == expected_flags
     contents = bytearray()
     for source, offset, nbytes in locate(index.ranks[0].resources[description.resource]):
         with source.open("rb") as stream:

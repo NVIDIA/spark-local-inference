@@ -347,7 +347,7 @@ def main(args):
         split_speculation=args.split_speculation, speculation_reference_graphs=True,
         kernel_cache=configuration.directory('kernel_cache'),
         snapshot_budget_bytes=8 * RECIPE.ranks[4].state_row_bytes, headroom_bytes=1 << 30,
-        retain_graphs=True, compile_decoder=True, prefill_chunk_size=4096)
+        compile_decoder=True, prefill_chunk_size=4096)
     print(json.dumps(dict(preparation=asdict(config), sampling=dict(temperature=1., top_p=.95, top_k=0),
                           embedding_table_storage='ram'), default=str), flush=True)
     from tokenizers import Tokenizer

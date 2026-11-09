@@ -353,7 +353,10 @@ class HostRendezvous:
                                         timeout=_PREPARATION_TIMEOUT)
             model = prepare(snapshot, config, rank=0, group=dist.group.WORLD, progress=progress,
                             **({} if core_storage is None else {"core_storage": core_storage}))
-            model.manifest()
+            if getattr(config, "retain_graphs", False):
+                model.export_manifest()
+            else:
+                model.manifest()
             # Loading owns each socket's reader until its authenticated end marker is acknowledged.
             for reader in readers:
                 reader.join()
@@ -658,7 +661,10 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
             progress(f"received {source.stats['payload_bytes'] / (1 << 30):.2f} GiB of checkpoint ranges "
                      f"via {report['transport']} ({source.streams} streams, "
                      f"{report['payload_seconds']:.2f}s, {report['payload_gbps']:.2f} Gbit/s)")
-        model.manifest()
+        if getattr(config, "retain_graphs", False):
+            model.export_manifest()
+        else:
+            model.manifest()
         send_object(control, {"report": model.memory_report})
         command = receive_object(control)
         if isinstance(command, tuple) and command[0] == "export":
