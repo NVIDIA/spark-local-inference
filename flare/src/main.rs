@@ -144,12 +144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("multi-host serving is not supported on Windows".into());
     }
-    #[cfg(windows)]
-    unsafe {
-        if windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(stop_console), 1) == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
     let bind = args.bind_address();
     if args.rank.is_some_and(|rank| rank != 0) {
         args.serving.select_gpus(1);
@@ -577,6 +571,14 @@ fn serve(
     ));
     let phase = progress.phase("Start server", None);
     let context_tokens = bootstrap.model.limits.max_sequence_tokens;
+    // Loading keeps the default Ctrl-C termination because nothing observes STOP before serving.
+    // A registration failure must return before replay starts.
+    #[cfg(windows)]
+    unsafe {
+        if windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(stop_console), 1) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     let server = match unsafe {
         Server::start(
             manifest,
