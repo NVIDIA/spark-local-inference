@@ -84,7 +84,9 @@ pub(crate) fn resolve_model(
 }
 
 pub(crate) fn explicit_package_path(input: &Path) -> Result<bool, Failure> {
-    Ok(input.is_absolute()
+    // A Windows path rooted on the current drive, such as `\models\a.safetensors`,
+    // has a root but is not absolute.
+    Ok(input.has_root()
         || input.starts_with(".")
         || input.starts_with("..")
         || input.try_exists()?)

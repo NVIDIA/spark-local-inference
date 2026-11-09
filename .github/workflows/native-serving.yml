@@ -17,7 +17,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: windows-2022
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
@@ -44,17 +44,18 @@ jobs:
         id: build
         run: cargo build --locked --release --manifest-path flare/Cargo.toml
       - name: Test host OS helpers
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare/target
       - name: Test Selene and its manager on Linux
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'Linux' }}
         run: |
           cargo test --locked --release --manifest-path selene/Cargo.toml --features test-support --target-dir flare/target
           cargo test --locked --release --manifest-path selene-manager/Cargo.toml --features test-support --target-dir flare/target
       - name: Test host cache tiers on Windows
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'Windows' }}
         run: cargo test --locked --release --manifest-path selene/Cargo.toml --target-dir flare/target
       - name: Test native runtime on Linux
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'Linux' }}
         env:
           FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
         run: |
@@ -62,7 +63,7 @@ jobs:
           sudo prlimit --pid $$ --memlock=67108864:67108864
           cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare/target --features runtime-package,server
       - name: Test native runtime on Windows
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'Windows' }}
         env:
           FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
         run: cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare/target --features runtime-package,server

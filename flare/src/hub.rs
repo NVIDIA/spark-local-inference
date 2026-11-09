@@ -4795,6 +4795,11 @@ pub(crate) mod tests {
         }
         writer.finish().unwrap();
         output.sync_all().unwrap();
+        // Windows cannot replace an open or read-only file. Close both files and
+        // remove only this directory's link, so a shared cache object stays read-only.
+        drop(output);
+        drop(metadata);
+        std::fs::remove_file(&path).unwrap();
         std::fs::rename(temporary, path).unwrap();
     }
 
@@ -7597,7 +7602,10 @@ pub(crate) mod tests {
             expected_envelope,
         )
         .unwrap();
-        std::fs::remove_dir_all(transport.root()).unwrap();
+        // Windows cannot delete the acquisition lease while this transport holds it.
+        let transport_root = transport.root().to_owned();
+        drop(transport);
+        std::fs::remove_dir_all(&transport_root).unwrap();
         let offline = HubOptions {
             offline: true,
             revision: Some("gb202".into()),
@@ -7618,7 +7626,7 @@ pub(crate) mod tests {
                 assert!(verify_offline_entry(&hit, &requested, 1, &[]).is_err());
             }
         }
-        assert!(!transport.root().join("flare-packages").exists());
+        assert!(!transport_root.join("flare-packages").exists());
         let wrong_file = HubOptions {
             filename: Some("other.safetensors".into()),
             ..offline.clone()
@@ -8698,7 +8706,10 @@ pub(crate) mod tests {
                 .count(),
             0
         );
-        std::fs::remove_dir_all(transport.root()).unwrap();
+        // Windows cannot delete the acquisition lease while this transport holds it.
+        let transport_root = transport.root().to_owned();
+        drop(transport);
+        std::fs::remove_dir_all(&transport_root).unwrap();
         let error = download("owner/model", &options, 1, &[], None, &[])
             .err()
             .unwrap()
@@ -8707,7 +8718,7 @@ pub(crate) mod tests {
             error.contains("not available in the Flare cache"),
             "{error}"
         );
-        assert!(!transport.root().exists());
+        assert!(!transport_root.exists());
     }
 
     #[test]
