@@ -59,17 +59,19 @@ def test_kimi_eight_request_round_with_autotuning():
 
 
 def test_verification_matrix_keeps_the_full_draft_block():
-    value = settings("--verify-widths", "8,1,6,4", "--mtp-draft-tokens", "7")
-    assert value.verification_widths == (1, 4, 6, 8)
+    value = settings("--verify-prefixes", "8,1,6,4", "--mtp-draft-tokens", "7")
+    assert value.verification_prefixes == (1, 4, 6, 8)
     assert value.width == 8
+    assert value.batches == (1,)
+    assert settings("--verify-prefixes", "4,6").width == 8
 
 
 @pytest.mark.parametrize("flags", [
-    ("--verify-widths", "0,8"), ("--verify-widths", "4,6"),
-    ("--verify-widths", "1,8", "--verify-width", "8"),
-    ("--verify-widths", "1,8", "--prefill"),
-    ("--verify-widths", "1,8", "--speculation-study"),
-    ("--verify-widths", "1,8", "--mtp-draft-tokens", "3"),
+    ("--verify-prefixes", "0,8"), ("--verify-prefixes", "4,9"),
+    ("--verify-prefixes", "1,8", "--batches", "2"),
+    ("--verify-prefixes", "1,8", "--prefill"),
+    ("--verify-prefixes", "1,8", "--speculation-study"),
+    ("--verify-prefixes", "1,8", "--mtp-draft-tokens", "3"),
 ])
 def test_invalid_verification_matrix(flags):
     with pytest.raises(UsageError):

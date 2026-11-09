@@ -22,8 +22,9 @@ class BenchmarkCase:
 
     def __post_init__(self):
         if (self.batch not in (1, 2, 4, 8) or type(self.width) is not int or not 1 <= self.width <= 16
-                or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4,8, W=1 through 16, P=B*W and positive context")
+                or not self.batch <= self.packed_tokens <= self.batch * self.width
+                or self.packed_tokens % self.batch or self.context_tokens <= 0):
+            raise ValueError("round benchmark requires B=1,2,4,8, W=1 through 16, equal positive prefixes within W and positive context")
 
 
 @dataclass(frozen=True)
@@ -173,7 +174,7 @@ def _round(scheduler, case):
     if len(matches) != 1:
         raise ValueError(f"prepared catalog must contain exactly one complete round for {case}")
     shape, graph = matches[0]
-    lanes = [Lane(request, request.consumed, case.width) for request in scheduler.active]
+    lanes = [Lane(request, request.consumed, case.packed_tokens // case.batch) for request in scheduler.active]
     return scheduler._commit(Step("speculative", graph, case.batch, case.width, lanes, 0,
                                   packed_tokens=case.packed_tokens, draft_tokens=shape[4]))
 
@@ -222,7 +223,7 @@ def _check_metadata(model, step, case, *, proposal_before=None):
             raise RuntimeError("prefill metadata does not describe the exact benchmark chunk")
         return
     forward = model.benchmark_rounds[step.graph]
-    stages = [("target", forward.metadata, case.width)]
+    stages = [("target", forward.metadata, case.packed_tokens // case.batch)]
     if forward.draft is not None:
         stages.append(("draft", forward.draft_metadata, forward.draft_inputs.shape[1]))
     for role, metadata, width in stages:
@@ -366,6 +367,8 @@ def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, s
                                 samples[-1]["draft_forward_tokens_per_request"] = (
                                     forward.draft_inputs.shape[1] if forward.draft is not None else 0)
                                 samples[-1]["draft_context_updated"] = forward.context is not None
+                                samples[-1]["proposal_tokens_per_request"] = step.draft_tokens
+                                samples[-1]["target_tokens_per_request"] = case.packed_tokens // case.batch
                     if progress is not None:
                         progress(result("running"))
                 runner.restore()

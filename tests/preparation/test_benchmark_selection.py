@@ -106,14 +106,15 @@ def test_invalid_selection(values):
 
 
 @pytest.mark.parametrize("values", [
-    dict(verification_widths=(4, 1, 8)), dict(verification_widths=(1, 1, 8)),
-    dict(verification_widths=(1, 4)), dict(verification_widths=(0, 8)),
-    dict(verification_widths=(1, 9)), dict(verification_widths=(True, 8)),
-    dict(verification_widths=(1, 8), prefill_chunk=4096, batches=(1,)),
-    dict(verification_widths=(1, 8), speculation_study=True, batches=(1,)),
+    dict(verification_prefixes=(4, 1, 8)), dict(verification_prefixes=(1, 1, 8)),
+    dict(verification_prefixes=(1, 4), batches=(1, 2)), dict(verification_prefixes=(0, 8)),
+    dict(verification_prefixes=(1, 9)), dict(verification_prefixes=(True, 8)),
+    dict(verification_prefixes=(1, 8), prefill_chunk=4096, batches=(1,)),
+    dict(verification_prefixes=(1, 8), speculation_study=True, batches=(1,)),
 ])
-def test_invalid_serving_width_matrix(values):
-    with pytest.raises(ValueError, match="verification widths"):
+def test_invalid_serving_prefix_matrix(values):
+    values = {"batches": (1,), **values}
+    with pytest.raises(ValueError, match="verification prefixes"):
         BenchmarkSelection(**values)
 
 

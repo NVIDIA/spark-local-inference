@@ -197,7 +197,7 @@ storage according to those selections and available GPU memory.
 `ignition bench` prepares the target and draft checkpoints, captures the selected
 graph catalog, and measures complete speculative GPU rounds with CUDA events.
 It opens no HTTP listener and exports no package. Supported recipes are
-Qwen3.8-27B DFlash2 on one local GPU and Kimi K3.1 Pro DSpark on sixteen local
+Qwen3.8-27B DFlash2 on one local GPU and Kimi K3.1 Pro DSpark/DFlash2 on sixteen local
 GPUs. Tensor-parallel samples report the slowest rank's graph duration. Every
 rank finishes restoring request, cache, recurrent, and sampling state before
 the timed graph starts.
@@ -221,7 +221,7 @@ the timed graph starts.
 | `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4,8`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
 | `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
-| `--verify-widths LIST` | Serving widths measured from one shared prefix; maximum must be `8` or `16`. Replaces `--verify-width`; cannot accompany `--prefill` or `--speculation-study` | unset |
+| `--verify-prefixes LIST` | C1 packed prefixes measured from shared context, within `--verify-width`; proposal count remains fixed above prefix one. Cannot accompany `--prefill` or `--speculation-study` | unset |
 | `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
 | `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
@@ -241,19 +241,21 @@ that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
 
-For Kimi K3.1 Pro, compare verification widths without loading weights again:
+For Kimi K3.1 Pro, compare packed verification prefixes without loading weights again:
 
 ```sh
 .venv/bin/ignition bench kimi-k3.1-pro --gpus 0-15 \
   --speculative-method dflash2 --mtp-draft-tokens 7 \
-  --batches 1 --max-concurrency 1 --verify-widths 1,4,6,8 --contexts 8192 \
+  --batches 1 --max-concurrency 1 --verify-prefixes 1,4,6,8 --contexts 8192 \
   --speculative-token-capacity 8 --prefill-chunk-size 4096 --online-mxfp8 \
-  --autotune-effort default --output /tmp/kimi31-verification-widths.json
+  --autotune-effort default --output /tmp/kimi31-verification-prefixes.json
 ```
 
-Each width restores the same request, cache and sampling state before replay.
-DFlash2 keeps its eight-token draft forward at widths four, six and eight;
-only the verified prefix changes. Width one omits proposal generation but
+Each prefix restores the same request, cache and sampling state before replay.
+For prefixes four, six and eight, DFlash2 runs its eight-token draft forward
+and samples all seven proposals, then verifies the selected prefix. The graph
+retains logical width eight while physical target rows are four, six or eight.
+Prefix one uses the width-one serving graph: it omits proposal generation but
 updates draft context, so it is not a target-only model measurement. JSON records
 the executed draft-forward size and acceptance separately from replay latency.
 
