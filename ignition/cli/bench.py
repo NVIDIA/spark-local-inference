@@ -43,6 +43,8 @@ def arguments(parser):
                          help="preceding consumed tokens, multiples of 128 (default: 512,2048,8192,16384; --prefill: 0)")
     options.add_argument("--verify-width", type=int, metavar="N",
                          help="target tokens per request including pending token: 8 or 16; 8,13,16 with --speculation-study")
+    options.add_argument("--verify-widths", type=_integers, metavar="LIST",
+                         help="serving verification widths prepared together, e.g. 1,4,6,8; maximum must be 8 or 16; draft block stays at that maximum")
     options.add_argument("--warmup", type=int, default=5, metavar="N",
                          help="positive untimed restored replays per case and seed (default: 5)")
     options.add_argument("--repetitions", type=int, default=20, metavar="N",
@@ -64,6 +66,7 @@ class Settings:
     prefill: bool = False
     speculation_study: bool = False
     study_widths: tuple[int, ...] = ()
+    verification_widths: tuple[int, ...] = ()
 
     @classmethod
     def from_args(cls, args):
@@ -75,13 +78,21 @@ class Settings:
         if args.prefill and batches != (1,):
             raise UsageError("--prefill requires --batches 1")
         study_widths = getattr(args, "study_widths", None)
+        verification_widths = getattr(args, "verify_widths", None)
+        if verification_widths is not None:
+            if args.prefill or study or args.verify_width is not None:
+                raise UsageError("--verify-widths cannot accompany --prefill, --speculation-study or --verify-width")
+            verification_widths = tuple(sorted(verification_widths))
+            if verification_widths[0] < 1 or verification_widths[-1] not in (8, 16):
+                raise UsageError("--verify-widths must contain positive widths with maximum 8 or 16")
         if study_widths is not None:
             if not study or any(w not in (8, 13, 16) for w in study_widths):
                 raise UsageError("--study-widths requires --speculation-study and widths from 8,13,16")
             if args.verify_width is not None or args.mtp_draft_tokens is not None:
                 raise UsageError("--study-widths replaces --verify-width and --mtp-draft-tokens")
             study_widths = tuple(sorted(study_widths))
-        width = max(study_widths) if study_widths else args.verify_width
+        width = (verification_widths[-1] if verification_widths else
+                 max(study_widths) if study_widths else args.verify_width)
         if width is None:
             width = 8 if args.mtp_draft_tokens is None else args.mtp_draft_tokens + 1
         if args.mtp_draft_tokens is not None and args.mtp_draft_tokens + 1 != width:
@@ -107,7 +118,8 @@ class Settings:
         if args.official_source is not None:
             raise UsageError("--official-source applies to package publishing; ignition bench exports no package")
         return cls(tuple(sorted(batches)), tuple(sorted(contexts)), 8 if args.prefill else width,
-                   args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or ())
+                   args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or (),
+                   verification_widths or ())
 
 
 def table(result):
@@ -161,7 +173,7 @@ def run(args):
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
         prefill_chunk=plan.prefill_chunk if settings.prefill else 0, speculation_study=settings.speculation_study,
-        study_widths=settings.study_widths))
+        study_widths=settings.study_widths, verification_widths=settings.verification_widths))
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     progress = _progress(args.verbose)
     hub_cache = configuration.directory("hub_cache")
@@ -260,7 +272,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
                                for context in settings.contexts) if settings.prefill else
                          tuple((StudyCase if settings.speculation_study else BenchmarkCase)(batch=batch, width=width, packed_tokens=batch * width,
                                context_tokens=context) for batch in settings.batches for context in settings.contexts
-                               for width in settings.study_widths or (settings.width,)))
+                               for width in settings.study_widths or settings.verification_widths or (settings.width,)))
             execute = run_study if settings.speculation_study else run_benchmark
             result = execute(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
                 repetitions=settings.repetitions, seeds=settings.seeds, progress=record)

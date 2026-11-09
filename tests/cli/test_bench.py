@@ -58,6 +58,24 @@ def test_kimi_eight_request_round_with_autotuning():
     assert args.max_concurrency == 8 and args.speculative_token_capacity == 64
 
 
+def test_verification_matrix_keeps_the_full_draft_block():
+    value = settings("--verify-widths", "8,1,6,4", "--mtp-draft-tokens", "7")
+    assert value.verification_widths == (1, 4, 6, 8)
+    assert value.width == 8
+
+
+@pytest.mark.parametrize("flags", [
+    ("--verify-widths", "0,8"), ("--verify-widths", "4,6"),
+    ("--verify-widths", "1,8", "--verify-width", "8"),
+    ("--verify-widths", "1,8", "--prefill"),
+    ("--verify-widths", "1,8", "--speculation-study"),
+    ("--verify-widths", "1,8", "--mtp-draft-tokens", "3"),
+])
+def test_invalid_verification_matrix(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)
+
+
 def test_kimi_rejects_private_dflash_studies_before_preparation(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text("")

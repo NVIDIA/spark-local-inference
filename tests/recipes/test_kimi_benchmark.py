@@ -32,6 +32,21 @@ def test_selected_kimi_round_preserves_serving_configuration():
     assert len(ordinary.speculative_round_shapes) == 68
 
 
+def test_verification_width_matrix_preserves_k7_owner_and_backing():
+    selection = BenchmarkSelection(batches=(1, 4), contexts=(512, 8192),
+                                   verification_widths=(1, 4, 6, 8))
+    config = PreparationConfig(max_active=4, draft_checkpoint=Path("dflash2"),
+                               speculative_token_capacity=32, benchmark_selection=selection)
+    assert config.draft_tokens == 7
+    assert config.completion_token_capacity == 8
+    assert config.speculative_round_shapes == (
+        (1, 1, 1), (1, 4, 4), (1, 6, 6), (1, 8, 8),
+        (4, 1, 4), (4, 4, 16), (4, 6, 24), (4, 8, 32))
+    assert selection.physical_pages(2048) == 21
+    with pytest.raises(ValueError, match="width capacities"):
+        replace(config, speculative_widths=(1, 8))
+
+
 @pytest.mark.parametrize("changes,match", [
     (dict(draft_checkpoint=None), "complete unscored"),
     (dict(prompt_logprobs=True), "complete unscored"),

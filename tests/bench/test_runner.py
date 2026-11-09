@@ -123,7 +123,7 @@ def test_missing_or_invalid_measurements_are_not_latency_estimates(times):
         summarize_case(BenchmarkCase(1, 8, 8, 512), [dict(seed=0, times_ms=times)])
 
 
-@pytest.mark.parametrize("arguments", [(3, 8, 24, 512), (1, 4, 4, 512), (2, 8, 8, 512), (1, 8, 8, 0)])
+@pytest.mark.parametrize("arguments", [(3, 8, 24, 512), (1, 0, 0, 512), (2, 8, 8, 512), (1, 8, 8, 0)])
 def test_case_rejects_shapes_outside_complete_round_matrix(arguments):
     with pytest.raises(ValueError):
         BenchmarkCase(*arguments)
@@ -258,3 +258,27 @@ def test_acceptance_observation_separates_verification_from_committed_clipping()
     sample = dict(seed=0, times_ms=[1.] * 20, acceptance=result)
     summary = summarize_case(BenchmarkCase(1, 8, 8, 8192), [sample])
     assert summary["samples"][0]["acceptance"]["observations_per_request"] == 1
+
+
+def test_width_one_preserves_proposal_rng_and_advances_target_rng():
+    from types import SimpleNamespace as NS
+    import torch
+    from ignition.bench.runner import _check_metadata
+
+    metadata = NS(live_counts=torch.tensor([1, 1]), starts=torch.tensor([512]),
+                  lengths=torch.tensor([1]), query_start_loc=torch.tensor([0, 1]))
+    owner = NS(generation=torch.tensor([2]), offset=torch.tensor([28]),
+               rng=NS(generation=torch.tensor([3]), target_offset=torch.tensor([4])))
+    forward = NS(metadata=metadata, draft=None, owner=owner,
+                 operations=(None, (), NS(draw_reservation=4), None))
+    model = NS(benchmark_rounds={"round1": forward})
+    step = NS(graph="round1", lanes=[NS(request=NS(slot=0, generation=3))], draft_tokens=0)
+    case = BenchmarkCase(1, 1, 1, 512)
+    _check_metadata(model, step, case, proposal_before=[(2, 28)])
+    owner.offset.add_(4)
+    with pytest.raises(RuntimeError, match="without proposals changed"):
+        _check_metadata(model, step, case, proposal_before=[(2, 28)])
+    owner.offset.sub_(4)
+    owner.rng.target_offset.zero_()
+    with pytest.raises(RuntimeError, match="draw reservations"):
+        _check_metadata(model, step, case, proposal_before=[(2, 28)])

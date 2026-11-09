@@ -14,6 +14,7 @@ class BenchmarkSelection:
     prefill_chunk: int = 0
     speculation_study: bool = False
     study_widths: tuple[int, ...] = ()
+    verification_widths: tuple[int, ...] = ()
 
     def __post_init__(self):
         for name, values in (("batches", self.batches), ("contexts", self.contexts)):
@@ -40,6 +41,17 @@ class BenchmarkSelection:
                     or any(type(w) is not int or w not in (8, 13, 16) for w in self.study_widths)
                     or self.width != max(self.study_widths)):
                 raise ValueError("study widths must be increasing distinct widths in 8,13,16 with width equal to their maximum")
+        if self.verification_widths:
+            if (self.speculation_study or self.prefill_chunk
+                    or not isinstance(self.verification_widths, tuple)
+                    or tuple(sorted(set(self.verification_widths))) != self.verification_widths
+                    or any(type(w) is not int or not 1 <= w <= self.width for w in self.verification_widths)
+                    or self.verification_widths[-1] != self.width):
+                raise ValueError("verification widths must be distinct increasing serving widths through the prepared maximum")
+
+    @property
+    def selected_verification_widths(self):
+        return self.verification_widths or (self.width,)
 
     @property
     def selected_study_widths(self):
@@ -57,7 +69,8 @@ class BenchmarkSelection:
     def speculative_round_shapes(self):
         if self.prefill_chunk:
             return ()
-        return tuple((batch, self.width, batch * self.width) for batch in self.batches)
+        return tuple((batch, width, batch * width) for batch in self.batches
+                     for width in self.selected_verification_widths)
 
     @property
     def required_context(self):
@@ -77,4 +90,5 @@ class BenchmarkSelection:
     def to_dict(self):
         return dict(batches=self.batches, contexts=self.contexts, width=self.width,
                     prefill_chunk=self.prefill_chunk, speculation_study=self.speculation_study, study_widths=self.selected_study_widths,
+                    verification_widths=self.selected_verification_widths,
                     speculative_round_shapes=self.speculative_round_shapes)
