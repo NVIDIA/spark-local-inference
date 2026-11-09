@@ -47,7 +47,7 @@ class OwnerPipeline:
         return self.selection()
 
 
-def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128, 32, 8, 6, 4, 3, 1), profile=False):
+def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128, 32, 8, 6, 4, 3, 1), profile=False, tune=False):
     from ignition import runtime_patches
     runtime_patches.apply()
     import torch.distributed as dist
@@ -198,6 +198,67 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                 torch.cuda.synchronize()
                 assert all(torch.equal(snapshot.cpu(), control) for snapshot, control in zip(snapshots, controls, strict=True))
 
+                choices = []
+                if tune:
+                    from b12x.preparation import PreparedCall
+                    from ignition.preparation.composition_tuning import PreparedComposition, race_compositions
+                    for rows in sorted(rows_catalog):
+                        patterns, references = [], []
+                        control = cases[rows, "replicated"]
+                        for seed, count in ((101, 256), (102, 8192), (103, 32768), (207, 4096)):
+                            scores, ids, active = source_rows(rows, seed, count=count)
+                            pattern = (scores[:, rank*2048:(rank+1)*2048].to(device),
+                                       ids[:, rank*2048:(rank+1)*2048].to(device), active.to(device))
+                            patterns.append(pattern)
+                            for target, source in zip((control.local_scores, control.local_ids, control.active), pattern, strict=True):
+                                target.copy_(source)
+                            torch.cuda.synchronize()
+                            dist.barrier()
+                            calls[rows, "replicated"]()
+                            torch.cuda.synchronize()
+                            references.append(control.output_ids.clone())
+                        candidates, producers = {}, {}
+                        for kind in ("replicated", "owner"):
+                            operation, forward = cases[rows, kind], calls[rows, kind]
+                            state = [0]
+                            def produce(index, operation=operation, state=state):
+                                state[0] = index
+                                for target, source in zip((operation.local_scores, operation.local_ids, operation.active), patterns[index], strict=True):
+                                    target.copy_(source)
+                            from functools import partial
+                            producers[kind] = tuple(partial(produce, index) for index in range(4))
+                            def validate(operation=operation, state=state):
+                                assert torch.equal(operation.output_ids, references[state[0]])
+                            if kind == "replicated":
+                                plans = (("transport", operation.gather.plan), ("selection", operation.fold.plan))
+                            else:
+                                plans = (("transport", operation.selection.transport.plan),
+                                         ("selection", operation.selection.fold.plan),
+                                         ("replication", operation.selection.broadcast.reduction.plan))
+                            candidates[kind] = PreparedComposition(forward, plans, PreparedCall(
+                                run=forward, output=operation.output_ids, produce=producers[kind][0],
+                                benchmark_producers=producers[kind][:3], validate=validate,
+                                reset=partial(operation.output_ids.fill_, -91), capture_safe=True,
+                                benchmark_repetitions=8, owners=(operation, patterns, references)))
+                        for attempt in range(2):
+                            chosen = race_compositions(candidates, operation="candidate-selection",
+                                geometry=dict(rows=rows, world_size=16, local_topk=2048, output_topk=2048),
+                                numerics="exact-fp32-words-ordered-ties",
+                                workload=dict(version=1, seeds=(101,102,103), counts=(256,8192,32768)),
+                                default="replicated", session=session, coordinator=coordinator, cache_policy="warm")
+                            if attempt:
+                                assert chosen["source"] == "cached", chosen
+                            kind = chosen["implementation"]
+                            producers[kind][3]()
+                            torch.cuda.synchronize()
+                            dist.barrier()
+                            candidates[kind].forward()
+                            torch.cuda.synchronize()
+                            candidates[kind].call.validate()
+                            choices.append(dict(rows=rows, attempt=attempt, **chosen))
+                            if rank == 0:
+                                print(json.dumps(choices[-1]), flush=True)
+
                 timings = []
                 if profile:
                     torch.cuda.synchronize()
@@ -254,7 +315,8 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                     torch.cuda.cudart().cudaProfilerStop()
                 if rank == 0:
                     Path(destination).write_text(json.dumps(dict(compiled=compile_components,
-                        exact_selection_cases=checks, queued_variants_passed=True, timings=timings), indent=2) + "\n")
+                        exact_selection_cases=checks, queued_variants_passed=True,
+                        composition_choices=choices, timings=timings), indent=2) + "\n")
                 for graph in graphs:
                     graph.reset()
                 graphs.clear()
@@ -291,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=Path)
     parser.add_argument("--rows", type=int, nargs="+", default=[128, 32, 8, 6, 4, 3, 1])
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--tune", action="store_true")
     args = parser.parse_args()
     if args.config is not None:
         from ignition.cli.config import Configuration
@@ -304,5 +367,5 @@ if __name__ == "__main__":
     imported = import_module("tests.recipes.test_kimi31_owner_selection_tp16_cuda")
     with tempfile.TemporaryDirectory() as directory:
         mp.spawn(imported.worker, args=((Path(directory) / "gloo").as_uri(), str(args.output), args.compiled,
-                              tuple(sorted(set(args.rows), reverse=True)), args.profile),
+                              tuple(sorted(set(args.rows), reverse=True)), args.profile, args.tune),
                  nprocs=16, join=True)
