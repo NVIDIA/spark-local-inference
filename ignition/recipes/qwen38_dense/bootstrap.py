@@ -87,7 +87,8 @@ class PreparationConfig:
         if selection is not None:
             if (not self.mtp and not selection.prefill_chunk) or self.prompt_logprobs:
                 raise ValueError("benchmark preparation requires speculative unscored text graphs")
-            if selection.max_batch > self.max_active or (not selection.prefill_chunk and not selection.speculation_study and selection.width not in self.speculative_widths):
+            if selection.max_batch > self.max_active or (not selection.prefill_chunk and not selection.speculation_study
+                    and not set(selection.selected_verification_widths) <= set(self.speculative_widths)):
                 raise ValueError("benchmark shapes exceed the configured request or width capacities")
             if selection.required_context > self.context:
                 raise ValueError("benchmark workload and output allowance must fit the context")
