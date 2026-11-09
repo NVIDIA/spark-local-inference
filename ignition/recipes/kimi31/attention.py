@@ -129,13 +129,14 @@ class PreparedDSA(PreparedMLAProjection):
             part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
             self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
         self.indexer.project(source)
+        if self.indexer.sharded is not None:
+            # Selected IDs must outlive the index bytes that latent history reuses.
+            self.indexer.sharded()
         if self.history is not None:
             # Read the owning rank's cache after this layer writes the chunk;
             # replicated projection outputs need not be byte-identical across ranks.
             self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
             self.history()
-        if self.indexer.sharded is not None:
-            self.indexer.sharded()
         for part in self.parts:
             selector = part["selector"]
             if self.indexer.sharded is not None:

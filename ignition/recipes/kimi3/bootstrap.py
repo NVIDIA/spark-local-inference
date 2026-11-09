@@ -59,6 +59,20 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
+def allocate_prefill_histories(tokens, device):
+    """Reuse index-history bytes after selection for the latent-history copy.
+
+    Attention must complete index scoring and selected-ID exchange before it
+    overwrites this backing with latent records. Neither history survives the
+    layer; the paged KV and index caches retain independent persistent storage.
+    """
+    from .dcp import RECORD_BYTES
+
+    records = torch.zeros((tokens, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device)
+    indices = records.view(torch.uint8).view(-1)[:tokens * 132].view(tokens // 64, 64 * 132)
+    return records, indices
+
+
 def allocate_serial_workspace(buffers, *, text_rows, hidden_size, residual_count,
                               auxiliary_count, vision_patches):
     """Share text and vision backing while keeping each forward's live values disjoint.
@@ -432,9 +446,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 # Full-history staging is produced by complete prefill graphs.
                 # Kernel trials use private index inputs and selected MLA records.
                 with deferred_pool:
-                    records = torch.zeros((config.context, RECORD_BYTES), dtype=torch.float8_e4m3fn, device=device)
-                    context = replace(context, staged_records=records,
-                        index_records=torch.zeros((config.context // 64, 64 * 132), dtype=torch.uint8, device=device))
+                    records, indices = allocate_prefill_histories(config.context, device)
+                    context = replace(context, staged_records=records, index_records=indices)
         if context is not None and getattr(context, "staging", None) is not None:
             # The slab's address survives scratch unmapping, but its pointer table
             # must retain its contents when scratch is rematerialized as zeros.

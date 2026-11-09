@@ -1012,14 +1012,19 @@ records written by the current chunk. Projection shapes, normalization and
 weight formats are unchanged. Smaller captured prefill capacities retain direct
 peer reads; they still require peer KV mappings at startup.
 
-At a 1,048,576-token context limit and 4096-token prefill capacity, latent history
-and its peer staging reserve 612 MiB per rank. Index history, staging, selected
-IDs and their transport channel reserve another 238.535 MiB per rank, before
-query buffers and score scratch. Serial layers reuse these allocations, which
-reduce the remaining KV-page budget. Keep the default 4096-token capacity for
-this prefill path; `--prefill-chunk-size 2048` omits it and its fixed history
-storage. The component checks in `qualify/kimi_staged_prefill.py` and
-`qualify/kimi_query_prefill.py` cover the history transfers and query partitioning.
+At a 1,048,576-token context limit and 4096-token prefill capacity, latent and
+index history share 576 MiB per rank. Index scoring and selected-ID exchange
+finish before latent history overwrites the shared bytes. Independent history
+allocations would require 708 MiB; sharing removes the 132 MiB index allocation
+without changing the persistent KV or index caches. Latent peer staging reserves
+36 MiB, while index staging, selected IDs and their transport channel reserve
+another 106.535 MiB, before query buffers and score scratch. Serial layers reuse
+these allocations, which reduce the remaining KV-page budget. Keep the default
+4096-token capacity for this prefill path; `--prefill-chunk-size 2048` omits it
+and its fixed history storage. The component checks in
+`qualify/kimi_staged_prefill.py` and `qualify/kimi_query_prefill.py` cover history
+transfers and query partitioning. `qualify/kimi_history_alias.py` compares shared
+and independent history storage on one complete checkpoint attention layer.
 
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)

@@ -94,12 +94,12 @@ def _check_collective_edges(graph, query_functions, candidate_functions, *, over
 class RecordedAttentionTail:
     """Replay the original compiled attention/output nodes with recorded selection inputs."""
 
-    def __init__(self, graph, candidate_functions):
+    def __init__(self, graph, candidate_functions, *, expected_roots=1):
         from cuda.bindings import driver
 
         kernels, edges = _graph_nodes(graph)
         roots = [node for node, value in kernels.items() if value['symbol'] == '_selection_slots']
-        assert len(roots) == 1, 'recorded selection boundary is ambiguous'
+        assert len(roots) == expected_roots, 'recorded selection boundaries do not match the prepared slices'
         successors = {}
         for parent, child in edges:
             successors.setdefault(parent, []).append(child)
