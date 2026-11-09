@@ -101,7 +101,7 @@ impl ExecutionWorker {
                                         bytes: &upload.bytes,
                                     })
                                     .collect();
-                                let _ = reply.send(executor.submit(graph, &borrowed, grammar));
+                                let _ = reply.send(executor.submit(graph, &borrowed, &[], grammar));
                             }
                             Command::Poll(reply) => {
                                 let _ = reply.send(executor.poll());

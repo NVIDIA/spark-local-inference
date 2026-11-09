@@ -241,7 +241,7 @@ fn records(
     };
     records
 }
-fn init(scheduler: &mut RequestScheduler, fence: u64) {
+pub(super) fn init(scheduler: &mut RequestScheduler, fence: u64) {
     let step = scheduler.plan().unwrap();
     assert!(matches!(step.kind, GraphKind::Init | GraphKind::Restore));
     scheduler.commit(&step, Fence(fence)).unwrap();

@@ -7,7 +7,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
-use crate::cache::Fence;
+use crate::cache::{Fence, PageId};
 use crate::execution::{ExecutionManifest, FrameCompletion, OwnedUpload, RankStream, Upload};
 use crate::{Error, ExecutionError, Failure, Result};
 
@@ -183,7 +183,7 @@ pub(super) fn validate_completion_packet(manifest: &ExecutionManifest) -> Result
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
-        6,
+        7,
         manifest.completion_token_capacity,
         manifest.max_active,
         manifest.input_frame_bytes,
@@ -253,15 +253,21 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
 }
 
 /// Split validated uploads into bounded packets while preserving element alignment.
+/// The terminal packet carries the cleared page ids.
 pub(super) fn prepare(
     manifest: &ExecutionManifest,
     fence: Fence,
     graph: usize,
     grammar: bool,
     uploads: &[Upload<'_>],
+    cleared_pages: &[PageId],
     mut send: impl FnMut(u8, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let capacity = uploads.iter().fold(32usize, |size, upload| {
+    let clears = 8 * (1 + cleared_pages.len());
+    if 32 + clears > MAX_PACKET {
+        return Err(invalid("cleared pages exceed the rank control packet"));
+    }
+    let capacity = uploads.iter().fold(32 + clears, |size, upload| {
         size.saturating_add(24).saturating_add(upload.bytes.len())
     }).min(MAX_PACKET);
     let mut packet = Vec::with_capacity(capacity);
@@ -299,6 +305,13 @@ pub(super) fn prepare(
             bytes = &bytes[size..];
         }
     }
+    if packet.len() + clears > MAX_PACKET {
+        flush(&mut packet, &mut count, PREPARE_MORE)?;
+    }
+    number(&mut packet, cleared_pages.len());
+    for page in cleared_pages {
+        number(&mut packet, page.0 as usize);
+    }
     flush(&mut packet, &mut count, PREPARE)
 }
 
@@ -307,7 +320,7 @@ pub(super) fn receive_prepare(
     manifest: &ExecutionManifest,
     mut tag: u8,
     mut bytes: Vec<u8>,
-) -> Result<(Fence, usize, bool, Vec<OwnedUpload>)> {
+) -> Result<(Fence, usize, bool, Vec<OwnedUpload>, Vec<PageId>)> {
     let mut identity = None;
     let mut remaining = manifest.input_frame_bytes;
     let mut owned = Vec::new();
@@ -329,14 +342,28 @@ pub(super) fn receive_prepare(
         }
         identity = Some(received);
         let part = uploads(manifest, &mut reader, &mut remaining)?;
-        reader.end()?;
         if tag == PREPARE_MORE && part.is_empty() {
             return Err(invalid("empty rank prepare continuation"));
         }
         owned.extend(part);
         if tag == PREPARE {
-            return Ok((fence, graph, grammar, owned));
+            let count = reader.number()?;
+            let capacity = manifest.cache.as_ref().map_or(0, |cache| cache.page_capacity);
+            if count > reader.0.len() / 8 {
+                return Err(invalid("invalid rank cleared page count"));
+            }
+            let mut cleared = Vec::with_capacity(count);
+            for _ in 0..count {
+                let page = reader.number()?;
+                if page as u64 >= capacity {
+                    return Err(invalid("rank cleared page id is outside the cache"));
+                }
+                cleared.push(PageId(page as u32));
+            }
+            reader.end()?;
+            return Ok((fence, graph, grammar, owned, cleared));
         }
+        reader.end()?;
         (tag, bytes) = channel.wait(false)?;
     }
 }

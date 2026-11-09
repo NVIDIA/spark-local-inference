@@ -178,6 +178,7 @@ impl RequestScheduler {
                 *count = count.checked_sub(1).expect("snapshot alias ownership");
                 if *count == 0 {
                     self.stats.snapshot_backing_pages -= 1;
+                    self.page_holds_row_bytes[page as usize] = true;
                     assert!(self.free_pages.insert(PageId(page)));
                 }
             }
@@ -284,6 +285,35 @@ mod tests {
         s.release_snapshot(b);
         assert_eq!(s.free_page_count(), 16);
         assert_eq!(s.stats().snapshot_backing_pages, 0);
+    }
+
+    #[test]
+    fn released_alias_pages_are_cleared_when_a_request_first_writes_them() {
+        let mut s = super::super::tests::scheduler(2, 16, 1);
+        s.share_snapshot_pages(&[2..6]).unwrap();
+        let snapshot = s.reserve_snapshot(0).unwrap();
+        s.release_snapshot(snapshot);
+        let reused = s.reserve_snapshot(0).unwrap();
+        assert!((2..6).all(|page| s.page_holds_row_bytes[page]));
+        s.release_snapshot(reused);
+        let unused = s.admit(super::super::tests::spec(640, 1)).unwrap();
+        s.cancel(unused).unwrap();
+        let handle = s.admit(super::super::tests::spec(640, 1)).unwrap();
+        super::super::tests::init(&mut s, 1);
+        let step = s.plan().unwrap();
+        assert!(step.lane_kind(0).is_prefill());
+        s.commit(&step, Fence(2)).unwrap();
+        let private = s.request(handle).unwrap().private_pages.clone();
+        let mut cleared = s.cleared_pages(Fence(2)).unwrap().to_vec();
+        cleared.sort();
+        let mut expected: Vec<_> = private.iter().copied().filter(|p| (2..6).contains(&p.0)).collect();
+        expected.sort();
+        assert!(!expected.is_empty());
+        assert_eq!(cleared, expected);
+        for (page, holds) in s.page_holds_row_bytes.iter().enumerate() {
+            let page = PageId(page as u32);
+            assert_eq!(*holds, (2..6).contains(&page.0) && !private.contains(&page));
+        }
     }
 
     #[test]

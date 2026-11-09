@@ -8,7 +8,7 @@ use std::{marker::PhantomData, rc::Rc, time::Instant};
 
 use crate::{
     Error, ExecutionError, Failure, Result, Shutdown,
-    cache::Fence,
+    cache::{Fence, PageId},
     cuda::{BATCH_BYTES, BATCH_ENTRIES, Event, PinnedHost, Stream},
 };
 
@@ -613,10 +613,12 @@ impl GraphExecutor {
         &mut self,
         graph: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar: bool,
     ) -> Result<Option<Fence>> {
         let fence = self.next_fence()?;
         validate_uploads(&self.manifest, graph, uploads, &mut self.resolved_uploads)?;
+        validate_cleared_pages(&self.manifest, cleared_pages)?;
         if !self.can_submit(grammar || !matches!(self.manifest.graphs[graph].kind,
             GraphKind::Decode | GraphKind::Speculative)) {
             return Ok(None);
@@ -643,10 +645,12 @@ impl GraphExecutor {
     }
 
     /// Returns None on frame or grammar backpressure without changing CUDA state.
+    /// Pages in `cleared_pages` are zeroed in every cache plane before the graph reads them.
     pub fn submit(
         &mut self,
         graph_index: usize,
         uploads: &[Upload<'_>],
+        cleared_pages: &[PageId],
         grammar_constrained: bool,
     ) -> Result<Option<Fence>> {
         if let Some(error) = &self.poison {
@@ -672,6 +676,7 @@ impl GraphExecutor {
             uploads,
             &mut self.resolved_uploads,
         )?;
+        validate_cleared_pages(&self.manifest, cleared_pages)?;
         if (resources.frames.iter().any(|frame| frame.pending.is_some()) && grammar_constrained)
             || resources
                 .frames
@@ -738,6 +743,12 @@ impl GraphExecutor {
                 // Descriptor slices are consumed synchronously by the driver.
                 unsafe { resources.model.copy_batch(dst, src, sizes) }
             })?;
+            if let Some(cache) = &self.manifest.cache {
+                // SAFETY: Validated pages lie inside every plane. The scheduler
+                // clears a page only when it enters a request at this fence, so no
+                // queued work or other stream references its bytes.
+                unsafe { clear_pages(&resources.model, cache, cleared_pages)? };
+            }
             resources.model.record(&frame.started)?;
             if crate::engram::consumes(graph.kind) {
                 if let Some(engram) = &resources.engram {
@@ -1066,6 +1077,40 @@ impl ResolvedUploads<'_, '_, '_> {
             .copied()
             .chain([self.frame_index, self.submission_sequence])
     }
+}
+
+fn validate_cleared_pages(manifest: &ExecutionManifest, pages: &[PageId]) -> Result<()> {
+    if pages.is_empty() {
+        return Ok(());
+    }
+    let capacity = manifest.cache.as_ref().map_or(0, |cache| cache.page_capacity);
+    if pages.iter().any(|page| u64::from(page.0) >= capacity) {
+        return Err(Error::execution(
+            ExecutionError::Upload,
+            "cleared page id is outside the cache page capacity",
+        ));
+    }
+    Ok(())
+}
+
+/// Zeroes every plane of each page, coalescing consecutive ids into one fill per plane.
+///
+/// # Safety
+/// Every page lies inside `cache`, and no queued or concurrent work may access
+/// those pages until `stream` passes the fills.
+pub(crate) unsafe fn clear_pages(stream: &Stream, cache: &flare_selene::CacheGeometry, pages: &[PageId]) -> Result<()> {
+    let mut pages = pages.iter().map(|page| u64::from(page.0)).peekable();
+    while let Some(first) = pages.next() {
+        let mut end = first + 1;
+        while pages.next_if_eq(&end).is_some() {
+            end += 1;
+        }
+        for plane in &cache.planes {
+            // SAFETY: The caller keeps these pages inside every plane and unshared until the fill.
+            unsafe { stream.zero(plane.unit_address(first), ((end - first) * plane.unit_bytes) as usize)? };
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one command against an already validated, immutable manifest.

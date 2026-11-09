@@ -43,20 +43,20 @@ fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
             let confidence = [0.75, 0.25];
             let owned = [uploads(limits[0], confidence[0], true, terminal, slots[0]),
                          uploads(limits[1], confidence[1], false, false, slots[1])];
-            let first = executor.submit(0, &borrowed(&owned[0]), false).unwrap().unwrap();
+            let first = executor.submit(0, &borrowed(&owned[0]), &[], false).unwrap().unwrap();
             assert_eq!(executor.outstanding(), 1);
             assert!(!executor.can_submit(false));
             let deadline = Instant::now() + Duration::from_secs(30);
             let second = loop {
                 assert!(Instant::now() < deadline, "first frame preparation timed out");
-                if let Some(fence) = executor.submit(0, &borrowed(&owned[1]), false).unwrap() { break fence; }
+                if let Some(fence) = executor.submit(0, &borrowed(&owned[1]), &[], false).unwrap() { break fence; }
                 assert!(executor.poll().unwrap().is_none(), "first completion was consumed before the second reservation");
                 thread::yield_now();
             };
             assert_eq!(second.0, first.0 + 1);
             assert_eq!(executor.outstanding(), 2);
             assert!(!executor.can_submit(false));
-            assert!(executor.submit(0, &borrowed(&owned[1]), false).unwrap().is_none());
+            assert!(executor.submit(0, &borrowed(&owned[1]), &[], false).unwrap().is_none());
             for (round, fence) in [first, second].into_iter().enumerate() {
                 let completion = loop {
                     assert!(Instant::now() < deadline, "rank completion timed out");
@@ -99,9 +99,9 @@ fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
             }
         }
         let owned = uploads([2, 1, 0, 0], 0.5, true, false, [3, 0, 2, 1]);
-        executor.submit(0, &borrowed(&owned), false).unwrap().unwrap();
+        executor.submit(0, &borrowed(&owned), &[], false).unwrap().unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while executor.submit(0, &borrowed(&owned), false).unwrap().is_none() {
+        while executor.submit(0, &borrowed(&owned), &[], false).unwrap().is_none() {
             assert!(Instant::now() < deadline, "preparation before shutdown timed out");
             assert!(executor.poll().unwrap().is_none());
             thread::yield_now();
