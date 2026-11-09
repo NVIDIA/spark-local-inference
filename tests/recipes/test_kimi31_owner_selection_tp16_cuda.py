@@ -169,7 +169,8 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
 
                 # Queue graph variants without host synchronization. Slow one owner before
                 # the sequence and poison reused outputs to expose channel lifetime defects.
-                sequence = tuple(rows for rows in (8, 1, 32, 3, 128, 6, 4, 8) if rows in rows_catalog)
+                ordered_rows = sorted(rows_catalog)
+                sequence = tuple(ordered_rows[::2] + ordered_rows[1::2][::-1] + ordered_rows[:1])
                 patterns, snapshots, controls = [], [], []
                 for index, rows in enumerate(sequence):
                     scores, ids, active = source_rows(rows, index + 70, count=32768)
