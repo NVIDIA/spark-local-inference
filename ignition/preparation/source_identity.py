@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Source compatibility identity for preparation and package rebuild metadata."""
+"""Source compatibility identity for preparation and core rebuild metadata."""
 
 import hashlib
 from pathlib import Path

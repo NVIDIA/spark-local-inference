@@ -5,7 +5,7 @@
 
 //! The RoCE fabric a rank's transport uses, found on its host when it serves.
 //!
-//! A package records what its kernels need of the transport (world, region layout, proxy ABI),
+//! A core records what its kernels need of the transport (world, region layout, proxy ABI),
 //! but not the fabric it was prepared on: which RDMA devices a host has, their GIDs, and how
 //! hosts are cabled differ between clusters and even between launches. Each rank discovers its
 //! active RoCEv2 devices, ranks exchange those endpoint lists at the rendezvous, and every rank
@@ -61,7 +61,7 @@ pub struct Fabric {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// How the ranks of a multi-host package link over RoCE.
+/// How the ranks of a multi-host core link over RoCE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     /// Every rank links to every other rank.

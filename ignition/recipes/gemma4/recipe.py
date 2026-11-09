@@ -53,7 +53,7 @@ def prepare(
     kernel_cache,
     progress,
     retain_graphs=False,
-    package_storage=None,
+    core_storage=None,
     ranks=None,
 ):
     from ignition.preparation.rank_group import prepare_group
@@ -102,13 +102,13 @@ def prepare(
         **drafting,
     )
     if plan.world_size == 1:
-        return prepare_model(snapshot, config, progress=progress, package_storage=package_storage)
+        return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
     return prepare_group(
         snapshot,
         config,
         prepare_rank,
         progress=progress,
-        package_storage=package_storage,
+        core_storage=core_storage,
         ranks=ranks,
         checkpoint=plan.checkpoint,
     )

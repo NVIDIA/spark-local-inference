@@ -12,7 +12,7 @@ Formal verification complements ordinary tests and hardware qualification.
 | Sequential Rust must satisfy a property for every input in a stated domain | Kani proof harness calling production code | Completion counts cannot produce an invalid slice; state-view extent arithmetic cannot accept overflow. |
 | Safety depends on the order of events across actors or lifecycle transitions | TLA+ specification checked with TLC | Cancellation cannot free storage while a later frame or another rank still references it. |
 | CUDA ordering, captured state, inactive rows, allocation stability, or resource lifetimes | Real execution tests on assigned GPUs | A delayed copy cannot permit pinned-frame reuse; rollback preserves complete continuation state. |
-| Latency, throughput, or memory cost | The target benchmark or live trace | A scheduling change improves exported-package serving under the required workload. |
+| Latency, throughput, or memory cost | The target benchmark or live trace | A scheduling change improves exported-core serving under the required workload. |
 | Whether tests detect plausible implementation mistakes | Mutation testing | Changing an all-rank completion gate makes a relevant test fail. |
 
 Start with ordinary tests for a concrete defect or behavior change. Add Kani when
@@ -29,7 +29,7 @@ Examples of scoped combinations:
 - Cancellation with two submissions needs a Rust regression and a model of
   queued ownership. CUDA tests establish that the executor's completion and
   drain signals satisfy the model's assumptions.
-- A package field change needs loading and compatibility tests. A protocol
+- A core field change needs loading and compatibility tests. A protocol
   model is useful only if the field changes protocol states or ordering.
 - Documentation and formatting changes normally need inspection and applicable
   existing checks, without additional test machinery.

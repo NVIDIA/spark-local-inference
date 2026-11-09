@@ -102,13 +102,13 @@ def _restore_export_channels(channels, states):
         channel.sent, channel.received = state["sent"], state["received"]
 
 
-def send_export_sources(control, package, inventory, *, channels):
+def send_export_sources(control, core, inventory, *, channels):
     """Lend sockets exclusively to native export until every I/O worker returns."""
     import flare_heliopause
 
     states = flare_heliopause.export_send_rank(
-        package.native_output, json.dumps(inventory), control.fileno(),
-        json.dumps(_export_channels(channels)), (control, channels, package))
+        core.native_output, json.dumps(inventory), control.fileno(),
+        json.dumps(_export_channels(channels)), (control, channels, core))
     _restore_export_channels(channels, json.loads(states))
 
 
@@ -288,10 +288,10 @@ class HostRendezvous:
         else:
             reject(f"unknown rank channel {hello.get('channel')!r}")
 
-    def prepare(self, snapshot, config, prepare, *, checkpoint, progress=None, package_storage=None):
+    def prepare(self, snapshot, config, prepare, *, checkpoint, progress=None, core_storage=None):
         """Prepare every rank before returning the root-owned group; any failure ends every rank.
 
-        With `package_storage`, every rank prepares into its own package storage for export.
+        With `core_storage`, every rank prepares into its own core storage for export.
         """
         import torch.distributed as dist
 
@@ -346,13 +346,13 @@ class HostRendezvous:
                 self.store = dist.TCPStore(self.address[0], 0, self.world, True, timeout=_PREPARATION_TIMEOUT,
                                            wait_for_workers=False)
                 assignment = {"store": (self.address[0], self.store.port), "config": config, "prepare": prepare,
-                              "packaged": package_storage is not None}
+                              "exporting": core_storage is not None}
                 for control in controls:
                     send_object(control, assignment)
                 dist.init_process_group("gloo", store=self.store, rank=0, world_size=self.world,
                                         timeout=_PREPARATION_TIMEOUT)
             model = prepare(snapshot, config, rank=0, group=dist.group.WORLD, progress=progress,
-                            **({} if package_storage is None else {"package_storage": package_storage}))
+                            **({} if core_storage is None else {"core_storage": core_storage}))
             model.manifest()
             # Loading owns each socket's reader until its authenticated end marker is acknowledged.
             for reader in readers:
@@ -368,8 +368,8 @@ class HostRendezvous:
                     reports.append(message["report"])
                     stage.update(advance=1)
             group = HostRankGroup(self, model, reports,
-                                  checkpoint_fabric=fabric if package_storage is not None else None)
-            if package_storage is not None:
+                                  checkpoint_fabric=fabric if core_storage is not None else None)
+            if core_storage is not None:
                 fabric = None  # The group owns the authenticated channels through export.
             return group
         except BaseException:  # noqa: BLE001 - Preparation interruption must end every rank.
@@ -438,9 +438,9 @@ class HostRankGroup:
         """Combine rank manifests, receiving only content absent from the coordinator cache."""
         import flare_heliopause
         from ignition.progress import phase
-        from .package_snapshot import _OPTIONS, export_options
-        from .package_file import combine
-        from .runtime_package import export_model
+        from .core_snapshot import _OPTIONS, export_options
+        from .core_file import combine
+        from .runtime_core import export_model
         from .memory_inventory import print_inventory
 
         if self._started or self._closed:
@@ -449,11 +449,11 @@ class HostRankGroup:
             raise ValueError("final model publication requires a signing publisher")
         if self.checkpoint_fabric is None:
             raise RuntimeError("multi-host export requires established checkpoint fabric channels")
-        # Export always needs the configured package cache; fail before creating a
+        # Export always needs the configured core cache; fail before creating a
         # workspace or commanding peers rather than degrading to an unusable path.
         settings = _OPTIONS.get()
         if settings is None:
-            raise RuntimeError("export requires the configured package cache")
+            raise RuntimeError("export requires the configured core cache")
         cache_only = path is None
         native_stage = flare_heliopause.NativeExportStage(
             None if cache_only else Path(path), staging, settings.cache)
@@ -463,7 +463,7 @@ class HostRankGroup:
             for control in self.controls:
                 send_object(control, ("export", options, settings))
             with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights):
-                package = export_model(self.model, images, storage, roots[0], options=options,
+                core = export_model(self.model, images, storage, roots[0], options=options,
                                        progress=progress, sources=True)
                 channels = [[self.checkpoint_fabric.readers[rank, stream].channel
                              for stream in range(self.checkpoint_fabric.streams)]
@@ -479,7 +479,7 @@ class HostRankGroup:
                         _restore_export_channels(rank_channels, result["channels"])
                 finally:
                     self._close_checkpoint_fabric()
-                inventories = [package.memory_inventory, *(result["inventory"] for result in received)]
+                inventories = [core.memory_inventory, *(result["inventory"] for result in received)]
                 for rank, result in enumerate(received, 1):
                     report = result["stats"]
                     if progress is not None:
@@ -591,7 +591,7 @@ def knock(address, rank, world, *, identity, topology, timeout=600.0, report=Non
 
 
 def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, export_staging=None,
-               package_cache=None,
+               core_cache=None,
                checkpoint_token_file="~/.config/flare/agent.token", identity=None):
     """Prepare one peer from owned checkpoint metadata and requested source ranges, report
     memory, and serve until coordinated drain.
@@ -636,22 +636,22 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
         store = dist.TCPStore(store_host, store_port, world, False, timeout=_PREPARATION_TIMEOUT)
         dist.init_process_group("gloo", store=store, rank=rank, world_size=world, timeout=_PREPARATION_TIMEOUT)
         recorder = storage = None
-        if assignment.get("packaged"):
+        if assignment.get("exporting"):
             import torch
 
             from .module_images import ModuleImages
-            from .package_storage import PackageStorage
+            from .core_storage import CoreStorage
 
             recorder = ModuleImages()
             with recorder:
                 torch.cuda.set_device(0)
-                storage = PackageStorage(rank=rank, world=world, device=0, local_ranks=1)
+                storage = CoreStorage(rank=rank, world=world, device=0, local_ranks=1)
                 with storage:
                     model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, progress=progress,
-                                    package_storage=storage)
+                                    core_storage=storage)
         else:
             model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, progress=progress)
-        source.finish(keep_transport=bool(assignment.get("packaged")))
+        source.finish(keep_transport=bool(assignment.get("exporting")))
         model.memory_report["checkpoint_source"] = source.report()
         if progress is not None:
             report = source.report()
@@ -663,22 +663,22 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
         command = receive_object(control)
         if isinstance(command, tuple) and command[0] == "export":
             import flare_heliopause
-            from .runtime_package import export_model
-            from .package_snapshot import export_options
+            from .runtime_core import export_model
+            from .core_snapshot import export_options
 
             _, options, settings = command
             native_stage = flare_heliopause.NativeExportStage(
-                None, export_staging, package_cache)
+                None, export_staging, core_cache)
             try:
                 path = Path(native_stage.rank_path(rank))
                 if progress is not None:
                     progress(f"exporting rank {rank}")
-                context = export_options(package_cache, no_weights=settings.no_weights,
-                    reuse_weights=settings.reuse_weights) if package_cache is not None else contextlib.nullcontext()
+                context = export_options(core_cache, no_weights=settings.no_weights,
+                    reuse_weights=settings.reuse_weights) if core_cache is not None else contextlib.nullcontext()
                 with context:
-                    package = export_model(model, recorder, storage, path, options=options,
+                    core = export_model(model, recorder, storage, path, options=options,
                                            bundle_only=True, sources=True)
-                send_export_sources(control, package, package.memory_inventory,
+                send_export_sources(control, core, core.memory_inventory,
                                     channels=[channel for channel, _ in source.channel_stats])
                 source.close_transport()
             finally:

@@ -109,7 +109,7 @@ class PLETable:
     @classmethod
     def load(cls, manifest, device, *, tokens, progress=None, host_allocator=None):
         from b12x.sequence._shared.disk_table import MappedHostAllocation
-        from ignition.preparation.runtime_package import FileSource
+        from ignition.preparation.runtime_core import FileSource
 
         device = torch.device(device)
         config, layout = table_layout(manifest, device)

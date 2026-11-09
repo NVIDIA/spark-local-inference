@@ -237,8 +237,8 @@ def test_clustered_catalog_profiles_are_admitted_by_b12x(effort, filename):
 @pytest.mark.parametrize("clustered", [False, True])
 def test_native_export_preserves_ladder_contents(clustered):
     import json
-    from ignition.preparation.package_proto import serving
-    from ignition.preparation.runtime_package_pb2 import ModelIndex
+    from ignition.preparation.core_proto import serving
+    from ignition.preparation.runtime_core_pb2 import ModelIndex
     from tests.preparation.test_frontend_metadata import server
 
     data = clustered_ladder() if clustered else load(LADDER)

@@ -1,13 +1,15 @@
 # Third-party notices
 
-Flare's binary release consists of the native Rust executable and its linked
-dependencies. Ignition, Heliopause, Python, and Python dependencies are used only
+Flare's CLI binary consists of the native Rust executable and its linked
+dependencies. The Windows desktop also includes the C++/WinRT shell, its Rust
+launcher, and the bundled Windows App SDK runtime. Ignition, Heliopause, Python,
+and Python dependencies are used only
 for building, model preparation, or testing; they are not included in the binary
 release. The public source repository includes the preparation tools and their
-dependency declarations. Model weights, datasets, prepared model packages, and
+dependency declarations. Model weights, datasets, prepared model cores, and
 container images are not included in the binary release.
 
-## Native release dependencies
+## Native CLI release dependencies
 
 [third_party/rust/README.md](third_party/rust/README.md) groups the native Cargo
 dependencies by their declared license expression and links their complete license
@@ -72,9 +74,15 @@ part of Flare's source.
 
 The NVIDIA CUDA driver is loaded from the user's system. Linux aarch64 builds
 also link the system libibverbs and pthread interfaces for RoCE. Platform C/C++
-runtime libraries remain system dependencies. The release archive packager
-copies no shared libraries or CUDA SDK components; any future bundling of those
-libraries requires the corresponding distribution notices and terms.
+runtime libraries remain system dependencies for the CLI. The CLI release
+archive packager copies no shared libraries or CUDA SDK components.
+
+The Windows desktop instead bundles app-local Windows App SDK and Visual C++
+runtime files. Its dependency versions are pinned in
+`flare-winui/packages.config`, `flare-winui/bridge/Cargo.lock`, and
+`flare-winui/launcher/Cargo.lock`. The desktop single-file packager does not yet
+collect these dependencies' distribution notices; the CLI notice inventory
+above does not cover the complete desktop distribution.
 
 | System component | Terms and use |
 | --- | --- |
@@ -90,7 +98,7 @@ runtime version requirements with `dpkg-shlibdeps`.
 ## Source test fixtures
 
 The source tree includes small test inputs. The legacy `.safetensors` fixtures
-contain synthetic package data (byte patterns, text placeholders, and metadata),
+contain synthetic core data (byte patterns, text placeholders, and metadata),
 not pretrained model checkpoints. `tests/fixtures/qwen38_mtp_feedback.pt`
 contains five hidden-state activation rows and five token IDs for a numerical
 test; that test loads its actual model weights from a separate checkpoint.
@@ -114,9 +122,9 @@ Build with the locked manifest, then use the same toolchain to package that
 executable. For example, on Linux x86_64:
 
 ```sh
-cargo build --locked --release --manifest-path flare/Cargo.toml
+cargo build --locked --release --manifest-path flare-cli/Cargo.toml
 rustup component add rust-docs
-python3 packaging/archive.py --binary flare/target/release/flare \
+python3 packaging/archive.py --binary flare-cli/target/release/flare \
   --target x86_64-unknown-linux-gnu --output flare-linux-x86_64.tgz
 ```
 

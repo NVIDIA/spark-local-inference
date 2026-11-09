@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! CPython preparation hooks and native ownership at the package boundary.
+//! CPython preparation hooks and native ownership at the core boundary.
 
 pub use helios_core::*;
 

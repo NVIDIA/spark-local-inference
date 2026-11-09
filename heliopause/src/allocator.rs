@@ -13,7 +13,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::runtime_package::driver::{Access, AllocationProperties, Driver, Location};
+use crate::runtime_core::driver::{Access, AllocationProperties, Driver, Location};
 use crate::{Error, ExecutionError, Result};
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -210,11 +210,11 @@ pub(crate) fn memory_inventory() -> Result<MemoryInventory> {
     let arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
     let a = arena
         .as_ref()
-        .ok_or_else(|| invalid("native package allocator is uninitialized"))?;
+        .ok_or_else(|| invalid("native core allocator is uninitialized"))?;
     let (_, device) = crate::current_context()?;
     if device != a.device {
         return Err(invalid(
-            "memory inventory requires the package rank's CUDA context",
+            "memory inventory requires the core rank's CUDA context",
         ));
     }
     let (mut free, mut total) = (0, 0);
@@ -258,14 +258,14 @@ fn failure(error: impl ToString) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i32 {
+extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
     let initialize = || -> Result<()> {
         let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         if arena.is_some() {
-            return Err(invalid("native package allocator is already initialized"));
+            return Err(invalid("native core allocator is already initialized"));
         }
         if world == 0 || rank >= world || device < 0 {
-            return Err(invalid("invalid package rank or device"));
+            return Err(invalid("invalid core rank or device"));
         }
         let host_base = if cfg!(target_os = "windows") {
             HOST_BASE
@@ -274,7 +274,7 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
         };
         if u64::from(world) * EXTENT as u64 > BASE.abs_diff(host_base) {
             return Err(invalid(
-                "package host reservations would overlap device reservations",
+                "core host reservations would overlap device reservations",
             ));
         }
         let driver = Driver::load()?;
@@ -301,7 +301,7 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
                     }
                     driver.check("cuMemAddressReserve", status)?;
                     return Err(invalid(format!(
-                        "native package device address range {base:#x}+{EXTENT:#x} is unavailable; CUDA returned {address:#x}"
+                        "native core device address range {base:#x}+{EXTENT:#x} is unavailable; CUDA returned {address:#x}"
                     )));
                 }
                 reserved.push(address);
@@ -330,31 +330,31 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_allocate(
+extern "C" fn flare_core_allocate(
     size: usize,
     device: i32,
     _stream: *mut c_void,
 ) -> *mut c_void {
-    package_allocate(size, device, false)
+    core_allocate(size, device, false)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_transient_allocate(
+extern "C" fn flare_core_transient_allocate(
     size: usize,
     device: i32,
     _stream: *mut c_void,
 ) -> *mut c_void {
-    package_allocate(size, device, true)
+    core_allocate(size, device, true)
 }
 
-fn package_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
+fn core_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
     let allocate = || -> Result<u64> {
         let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         let a = guard
             .as_mut()
-            .ok_or_else(|| invalid("native package allocator is uninitialized"))?;
+            .ok_or_else(|| invalid("native core allocator is uninitialized"))?;
         if device != a.device {
-            return Err(invalid("allocation device differs from package rank"));
+            return Err(invalid("allocation device differs from core rank"));
         }
         let size = size
             .checked_add(a.granularity - 1)
@@ -371,7 +371,7 @@ fn package_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
             .free
             .iter()
             .position(|(_, n)| *n >= size)
-            .ok_or_else(|| invalid("native package address range exhausted"))?;
+            .ok_or_else(|| invalid("native core address range exhausted"))?;
         let (address, available) = a.free[index];
         let mut physical = 0;
         unsafe {
@@ -421,36 +421,36 @@ fn package_allocate(size: usize, device: i32, transient: bool) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_free(
+extern "C" fn flare_core_free(
     pointer: *mut c_void,
     _size: usize,
     _device: i32,
     _stream: *mut c_void,
 ) {
-    package_free(pointer, false);
+    core_free(pointer, false);
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_transient_free(
+extern "C" fn flare_core_transient_free(
     pointer: *mut c_void,
     _size: usize,
     _device: i32,
     _stream: *mut c_void,
 ) {
-    package_free(pointer, true);
+    core_free(pointer, true);
 }
 
-fn package_free(pointer: *mut c_void, transient: bool) {
+fn core_free(pointer: *mut c_void, transient: bool) {
     let release = || -> Result<()> {
         let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         let a = guard
             .as_mut()
-            .ok_or_else(|| invalid("native package allocator is uninitialized"))?;
+            .ok_or_else(|| invalid("native core allocator is uninitialized"))?;
         let address = pointer as u64;
         let size = *a
             .mappings
             .get(&address)
-            .ok_or_else(|| invalid("unknown native package allocation"))?;
+            .ok_or_else(|| invalid("unknown native core allocation"))?;
         let retain = transient && a.retained.defer_free()?;
         if retain {
             let driver = &a.driver;
@@ -496,7 +496,7 @@ fn package_free(pointer: *mut c_void, transient: bool) {
 fn retention_operation(operation: impl FnOnce(&mut Arena) -> Result<()>) -> i32 {
     let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
     let Some(a) = guard.as_mut() else {
-        failure(invalid("native package allocator is uninitialized"));
+        failure(invalid("native core allocator is uninitialized"));
         return -1;
     };
     match operation(a) {
@@ -546,12 +546,12 @@ fn finish_retention(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_retention_begin() -> i32 {
+extern "C" fn flare_core_retention_begin() -> i32 {
     retention_operation(|a| a.retained.begin())
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_retention_finish() -> i32 {
+extern "C" fn flare_core_retention_finish() -> i32 {
     retention_operation(|a| {
         let driver = &a.driver;
         finish_retention(
@@ -565,7 +565,7 @@ extern "C" fn flare_package_retention_finish() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_retention_abort() -> i32 {
+extern "C" fn flare_core_retention_abort() -> i32 {
     retention_operation(|a| {
         a.retained.abort();
         Ok(())
@@ -573,7 +573,7 @@ extern "C" fn flare_package_retention_abort() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_snapshot() -> *mut c_char {
+extern "C" fn flare_core_snapshot() -> *mut c_char {
     let arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
     let Some(a) = arena.as_ref() else {
         return null_mut();
@@ -589,7 +589,7 @@ extern "C" fn flare_package_snapshot() -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn flare_package_string_free(pointer: *mut c_char) {
+unsafe extern "C" fn flare_core_string_free(pointer: *mut c_char) {
     if !pointer.is_null() {
         unsafe {
             drop(CString::from_raw(pointer));
@@ -598,7 +598,7 @@ unsafe extern "C" fn flare_package_string_free(pointer: *mut c_char) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn flare_package_error() -> *const c_char {
+extern "C" fn flare_core_error() -> *const c_char {
     ERROR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1086,9 +1086,9 @@ mod tests {
                 retained_mappings,
             });
         }
-        let pointer = flare_package_transient_allocate(4095, 0, null_mut());
+        let pointer = flare_core_transient_allocate(4095, 0, null_mut());
         assert_eq!(pointer as u64, 0x10000);
-        flare_package_transient_free(pointer, 4095, 0, null_mut());
+        flare_core_transient_free(pointer, 4095, 0, null_mut());
         let first = ERROR
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1108,12 +1108,12 @@ mod tests {
                 .contains("retained reference bytes=4096, handles=1")
         );
 
-        assert!(flare_package_transient_allocate(4095, 0, null_mut()).is_null());
+        assert!(flare_core_transient_allocate(4095, 0, null_mut()).is_null());
         let after_allocate = ERROR
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        assert_eq!(flare_package_retention_finish(), -1);
+        assert_eq!(flare_core_retention_finish(), -1);
         let after_finish = ERROR
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1164,7 +1164,7 @@ mod tests {
                 retained_mappings,
             });
         }
-        assert_eq!(flare_package_retention_finish(), -1);
+        assert_eq!(flare_core_retention_finish(), -1);
         let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
         let allocator = arena.as_mut().unwrap();
         assert_eq!(allocator.retained_mappings.len(), 1);
@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn package_free_keeps_mapping_when_unmap_fails() {
+    fn core_free_keeps_mapping_when_unmap_fails() {
         let _guard = ARENA_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1209,7 +1209,7 @@ mod tests {
         }
         let pointer = 0x10000 as *mut c_void;
 
-        flare_package_free(pointer, 4096, 0, null_mut());
+        flare_core_free(pointer, 4096, 0, null_mut());
         let error = ERROR
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1228,7 +1228,7 @@ mod tests {
             assert!(allocator.free.is_empty());
         }
 
-        flare_package_free(pointer, 4096, 0, null_mut());
+        flare_core_free(pointer, 4096, 0, null_mut());
         {
             let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
             let allocator = arena.as_mut().unwrap();

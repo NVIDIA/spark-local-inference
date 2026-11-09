@@ -1641,7 +1641,7 @@ class DirectWeightLoader:
         else:
             block_scales = scale_scratch
         # A multi-expert buffer concatenates experts on axis 0 and up/gate on
-        # axis 1; the package schema's single concatenation axis cannot express
+        # axis 1; the core schema's single concatenation axis cannot express
         # both, so these buffers stay unprovenanced rather than claim a mapping
         # the consumer would misread.
         plan = moe.plan_weights(

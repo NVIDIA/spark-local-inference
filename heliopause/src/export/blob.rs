@@ -99,7 +99,7 @@ impl BlobStore {
         mut fill: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<PreparedBlob> {
         if size == 0 || size > MAX_PUBLISHED_BLOB_BYTES - 4096 {
-            return Err("package resource exceeds the 64 GB payload shard limit".into());
+            return Err("core resource exceeds the 64 GB payload shard limit".into());
         }
         let header = container_header(size, 0, "flare-data")?;
         let expected = self.budget.hash_generated(size, &header, &mut fill)?;
@@ -279,7 +279,7 @@ impl BlobStore {
             }
             Err(e) if e.raw_os_error() == Some(18) => {
                 return Err(
-                    "package snapshot and blob cache must be on the same filesystem".into(),
+                    "core snapshot and blob cache must be on the same filesystem".into(),
                 );
             }
             Err(e) => return Err(e.into()),

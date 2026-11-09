@@ -11,11 +11,11 @@ from .dspark_config import DSPARK_REPOSITORY, DSPARK_REVISION
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     if not plan.context_parallel:
         raise ValueError("Kimi K3.1 preparation requires context parallelism")
     return prepare_kimi(snapshot, plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache,
-        progress=progress, retain_graphs=retain_graphs, package_storage=package_storage, ranks=ranks,
+        progress=progress, retain_graphs=retain_graphs, core_storage=core_storage, ranks=ranks,
         recipe=RECIPE, draft_source=(DSPARK_REPOSITORY, DSPARK_REVISION))
 
 

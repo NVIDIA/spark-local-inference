@@ -36,7 +36,7 @@ def _rank(rank, rendezvous):
     from ignition.components.dense_mla import PreparedDenseMLA
     from ignition.components.row_topk import PreparedRowTopK
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import ContextShards, pack_candidates, selection_slots
@@ -48,7 +48,7 @@ def _rank(rank, rendezvous):
                             timeout=timedelta(minutes=5))
     candidate_runtime = head_runtime = graph = None
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             rows, local_heads, total_heads = 2, 6, 96
             logical_pages, physical_pages = MAX_VISIBLE // (128 * WORLD), MAX_VISIBLE // (128 * WORLD) + 3
             cache = torch.zeros((physical_pages, 128, RECORD_BYTES), device=device, dtype=torch.float8_e4m3fn)

@@ -1,24 +1,26 @@
 # Helios
 
 Helios (`flare-helios`) is Flare's Rust runtime library. It supplies a native
-frontend, prefix cache, live-request scheduler, CUDA package loader, and graph
-execution through direct driver calls. The `flare/` crate's binary links this library
-and serves a prepared package in the same process. Neither depends on Python
-or the internal preparation tools.
+frontend, prefix cache, live-request scheduler, CUDA core loader, and graph
+execution through direct driver calls. The `flare/` shared application library
+links Helios; `flare-cli/` provides the terminal client and `flare-winui/` the
+native Windows client. Prepared-core serving runs in each client's process.
+These application and runtime libraries do not depend on Python or the internal
+preparation tools.
 
 The internal `ignition` command imports the `flare_heliopause` CPython extension
 to prepare and export a model in its own process. Heliopause depends on Helios;
 its crate owns the Python bindings and export allocator and builds no executable.
-`ignition export` writes the package and closes the prepared model.
-`flare run PACKAGE` loads it in a separate serving process. See
-[runtime packages](../docs/runtime-package-design.md) for the resource contract.
+`ignition export` writes the core and closes the prepared model.
+`flare run CORE` loads it in a separate serving process. See
+[runtime cores](../docs/runtime-core-design.md) for the resource contract.
 
-The `server` feature supplies HTTP/SSE and model scheduling. Native package
+The `server` feature supplies HTTP/SSE and model scheduling. Native core
 serving uses the typed prepared contract for single-rank and tensor-parallel
 execution. Raw replay and two-frame graph execution are available through
 Rust APIs and heliopause's diagnostic Python bindings. In-process HTTP
 bindings require heliopause's `qualification` feature; normal installations
-serve only through a package.
+serve only through a core.
 
 During export, Ctrl-C and SIGTERM terminate Ignition directly, bypassing
 Python finalizers and CUDA graph destruction. While serving, `flare run`
@@ -89,6 +91,22 @@ Execution and presentation failures return 500. SSE terminal failures and diagno
 messages. Failed CUDA drains retain prepared resources. Worker recovery is unsupported.
 
 The server exposes `/health`, `/v1/models`, `/v1/chat/completions`, and `/metrics`.
+Embedded Rust applications can move a loaded `NativeModel` into
+`server::LoadedSession`, adjust its `ServerConfig`, and start a `ServingSession`.
+The session retains every local rank's native resources through confirmed GPU
+drain and releases them when the closed session is dropped. Failed startup or
+shutdown drain retains those resources until process exit. Multi-host rank
+coordination continues to use the explicit `Server::start` interface.
+`StartupProgress::observed` exposes a bounded latest-stage snapshot without
+terminal output, and owned sessions disable stderr diagnostics by default.
+`Server::snapshot` reads typed runtime and HTTP/frontend gauges with a session
+identifier and monotonic sample time. These independently read counters do not
+form a transactional sample. `pause_admission` rejects subsequent generation
+requests with 503 while admitted responses finish; `wait_for_requests` waits up
+to the caller's timeout. `resume_admission` reopens a healthy listener after a
+cancelled model switch. Closing a server retains the five-second HTTP grace
+period before stopping and draining native execution.
+
 `/v1/models` lists one card, using the first nonempty `served_names` entry as its
 `id`, or the checkpoint identifier when none is set. The card includes the
 effective context limit in `max_model_len` and prepared capabilities, with the
@@ -99,7 +117,7 @@ See [the API reference](../docs/api.md) for discovery fields and generation rout
 HTTP admission reserves at most `queue_capacity + max_active` requests before
 reading JSON bodies. Admitted requests await a bounded CPU preparation worker;
 the default two workers can prepare four simultaneous generation requests.
-`ignition` packages set the queue to four times the concurrency limit, one worker per
+`ignition` cores set the queue to four times the concurrency limit, one worker per
 concurrent request, and a body limit of the recipe's images plus 1 MiB.
 An admission permit survives CPU preparation and the streamed response lifetime.
 Disconnects cancel model scheduling. A paused reader keeps its response: each
@@ -151,7 +169,7 @@ not require CUDA libraries. Tests exercise queueing and teardown using explicit
 Rust test functions. Production always calls the CUDA driver.
 
 The `GraphReplayWorker` and `ReplayCompletion` Python bindings require the
-`qualification` Cargo feature. Production package builds omit them. The server
+`qualification` Cargo feature. Production core builds omit them. The server
 uses its native execution transport directly.
 
 Raw replay qualification entrypoints:
@@ -266,7 +284,7 @@ executor.close()
 ```
 
 `ExecutionCompletion.records` contains one ABI6 record per captured physical
-request slot, with 16 metadata fields followed by the package-defined number of
+request slot, with 16 metadata fields followed by the core-defined number of
 token fields. An omitted or zero `completion_token_capacity` resolves to eight.
 `consumed_tokens` and `generated_tokens` are cumulative.
 Submission failure poisons the executor. `close` drains both streams before
@@ -449,7 +467,7 @@ substitutions and omit endpoints inside replaced spans.
 
 The exact deployed Qwen3.8 and inference-transformed Step templates are upgraded
 in memory using bundled insertion offsets, guarded by source and result SHA-256
-hashes. Their upstream text is supplied by the package and is not embedded in
+hashes. Their upstream text is supplied by the core and is not embedded in
 Helios. The segmented Kimi K3 template uses its custom project renderer. Kimi K3
 uses segment-count marks at the preamble and complete-message endpoints.
 Other unannotated templates fail to load. Checkpoint-derived annotations must
@@ -457,7 +475,7 @@ reproduce the source bytes when removed. Gemma 4 selects one of two annotated
 Google canonical templates by model size across all supported quantization
 publishers; see
 [recipe frontend metadata](../docs/model-development.md#sampling-and-frontend-metadata).
-Package files and metadata formats remain unchanged.
+Core files and metadata formats remain unchanged.
 
 DeepSeek V4 and V4.1 use the canonical native encoder, patched to record byte
 positions in its normalized-message append loop. Adjacent users share a merged
@@ -570,7 +588,7 @@ the prepared graph contract maps them to backing storage and padding sentinels.
 ## Native image preparation
 
 The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
-and static WebP decoding; it also enables `frontend`. Typed package metadata
+and static WebP decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, DeepSeek, DeepSeek row-major, Moonvit, Step, and RADIO inputs.
 The Qwen processor uses an RGB8, bicubic-antialias profile with

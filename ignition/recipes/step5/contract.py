@@ -4,7 +4,7 @@
 """ChatML frontend, image crops, paged GQA and compressed region summaries."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .config import PAGE_TOKENS
 from .vision import FEATURES, PATCH_CAPACITIES

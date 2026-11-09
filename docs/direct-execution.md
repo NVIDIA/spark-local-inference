@@ -3,9 +3,9 @@
 `ignition debug-serve --direct` is a diagnostic and qualification path, requested by
 project owner Luke Alonso, for reproducing and bisecting model-level faults. It
 is not for actual serving or apples-to-apples performance comparisons against
-other runtimes. Those workflows use `ignition export` and `flare run PACKAGE`.
+other runtimes. Those workflows use `ignition export` and `flare run CORE`.
 Production serving loads an
-exported package in Helios, which owns scheduling, input packing, graph replay
+exported core in Helios, which owns scheduling, input packing, graph replay
 and output without Python ([AGENTS.md](../AGENTS.md), "Python prepares; Helios
 serves"). Direct execution prepares the model in the Ignition process, then
 drives the prepared graphs from Python: a small fixed scheduler decides each
@@ -20,7 +20,7 @@ scheduler, transport frames or native replay. A fault that reproduces under
 under `--eager` points at what request replay does differently (see "Eager forwards"
 below). Preparing with `--no-compile` additionally separates compiled forwards
 from the recipe's Python forwards. Every run prepares from the checkpoint;
-there is no package.
+there is no core.
 
 Both modes replay referenced startup tuning graphs before accepting requests.
 Ranks agree on producer order and binding schemas, then check every producer's

@@ -149,7 +149,7 @@ def _rank(rank, directory, history_capacity):
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.attention import PreparedDSA
@@ -166,7 +166,7 @@ def _rank(rank, directory, history_capacity):
     runtimes = []
     session = None
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             generator = torch.Generator(device=device).manual_seed(7391)
             def weight(shape, scale=.015625):
                 return (torch.randn(shape, device=device, dtype=torch.bfloat16, generator=generator) * scale)

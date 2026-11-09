@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64"><Configuration>Debug</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64"><Configuration>Release</Configuration><Platform>ARM64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{57FD67CB-10DF-4C9A-BE10-018A6348F835}</ProjectGuid>
+    <RootNamespace>FlareDesktop</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.22000.0</WindowsTargetPlatformMinVersion>
+    <AppContainerApplication>false</AppContainerApplication>
+    <WindowsPackageType>None</WindowsPackageType>
+    <AppxPackage>false</AppxPackage>
+    <UseWinUI>true</UseWinUI>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <WindowsAppSdkDeploymentManagerInitialize>false</WindowsAppSdkDeploymentManagerInitialize>
+    <CppWinRTOptimized>true</CppWinRTOptimized>
+    <CppWinRTRootNamespaceAutoMerge>false</CppWinRTRootNamespaceAutoMerge>
+    <NativePackages>$(MSBuildThisFileDirectory)..\.local-dev\native-packages\</NativePackages>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'!='Debug'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(NativePackages)Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.props" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.props" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.Foundation.1.8.260803002\build\native\Microsoft.WindowsAppSDK.Foundation.props" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260708001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.WinUI.1.8.260803003\build\native\Microsoft.WindowsAppSDK.WinUI.props" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\Microsoft.WindowsAppSDK.DWrite.props" />
+  </ImportGroup>
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\.local-dev\winui\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\.local-dev\winui-obj\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>flare-winui</TargetName>
+    <FlareBridgeLibrary Condition="'$(FlareBridgeLibrary)'==''">$(MSBuildThisFileDirectory)bridge\target\release\flare_winui_bridge.lib</FlareBridgeLibrary>
+    <GenerateManifest>true</GenerateManifest>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)bridge\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;WINRT_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level4</WarningLevel>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>$(FlareBridgeLibrary);windowsapp.lib;ole32.lib;shell32.lib;comctl32.lib;runtimeobject.lib;userenv.lib;ws2_32.lib;bcrypt.lib;ntdll.lib;secur32.lib;ncrypt.lib;crypt32.lib;propsys.lib;dwmapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
+      <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" /><ClInclude Include="Shell.xaml.h" /><ClInclude Include="Theme.xaml.h" /><ClInclude Include="Dashboard.inl" /><ClInclude Include="Details.inl" /><ClInclude Include="Chat.inl" /><ClInclude Include="Settings.inl" /><ClInclude Include="resource.h" />
+    <ResourceCompile Include="flare-winui.rc" />
+    <None Include="Assets\flare-app-128.png" />
+    <Manifest Include="app.manifest" />
+    <!-- WinUI's metadata references this type even when no WebView control is used. -->
+    <Reference Include="$(NativePackages)Microsoft.Web.WebView2.1.0.3179.45\lib\Microsoft.Web.WebView2.Core.winmd"><Private>false</Private></Reference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(NativePackages)Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.Base.1.8.251216001\build\native\Microsoft.WindowsAppSDK.Base.targets" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.Foundation.1.8.260803002\build\native\Microsoft.WindowsAppSDK.Foundation.targets" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.InteractiveExperiences.1.8.260708001\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.WinUI.1.8.260803003\build\native\Microsoft.WindowsAppSDK.WinUI.targets" />
+    <Import Project="$(NativePackages)Microsoft.WindowsAppSDK.DWrite.1.8.25122902\build\Microsoft.WindowsAppSDK.DWrite.targets" />
+  </ImportGroup>
+  <Target Name="MergeFlareResources" AfterTargets="Build">
+    <PropertyGroup>
+      <_FlareToolArchitecture Condition="'$(PROCESSOR_ARCHITECTURE)'=='ARM64'">arm64</_FlareToolArchitecture>
+      <_FlareToolArchitecture Condition="'$(_FlareToolArchitecture)'==''">x64</_FlareToolArchitecture>
+      <_FlareMakePri>$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\$(_FlareToolArchitecture)\makepri.exe</_FlareMakePri>
+    </PropertyGroup>
+    <ItemGroup><_FlareComponentPri Include="$(OutDir)*.pri" Exclude="$(OutDir)resources.pri" /></ItemGroup>
+    <MakeDir Directories="$(IntDir)pri-input" />
+    <Copy SourceFiles="@(_FlareComponentPri)" DestinationFolder="$(IntDir)pri-input" SkipUnchangedFiles="true" />
+    <Exec Command="&quot;$(_FlareMakePri)&quot; new /pr &quot;$(IntDir)pri-input&quot; /cf &quot;$(MSBuildThisFileDirectory)priconfig.xml&quot; /of &quot;$(OutDir)resources.pri&quot; /o" StdOutEncoding="utf-16" StdErrEncoding="utf-16" />
+  </Target>
+</Project>

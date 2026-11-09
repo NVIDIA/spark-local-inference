@@ -148,7 +148,7 @@ class CollectiveStartupTuning:
                   if owner in self.owner_groups}
         storage = self.session.benchmark_storage
         if needed and storage is None:
-            raise RuntimeError("collective startup capture requires package storage")
+            raise RuntimeError("collective startup capture requires core storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
         if any(self.groups[key].cache_policy == "cold" for key in needed):
             # Cold races only read their L2 eviction input; resident weights serve.

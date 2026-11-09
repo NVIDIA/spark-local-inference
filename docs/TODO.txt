@@ -1,18 +1,18 @@
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
-    Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
+    Payload cores report rebuild: null even when DeploymentBody.rebuild is present.
 
 [ ] Preserve explicit A16 activation arithmetic in SM103 MXFP8 projections.
     QuantizedProjection does not pass activation_mode to sm103_projection.query_for;
     PackedProjectionQuery.mode chooses quantized activations from output width.
     Trace affected recipes and validate on SM103 before changing the shared path.
 
-[ ] Preflight file-descriptor capacity before TP package assembly opens every
+[ ] Preflight file-descriptor capacity before TP core assembly opens every
     payload file and cache lease. Report the required limit before partially
-    assembling ranks; see heliopause/src/export/package.rs and model-preparation.md.
+    assembling ranks; see heliopause/src/export/core.rs and model-preparation.md.
 
-[ ] Restore loading and serving for packages with separate proposal and verification
+[ ] Restore loading and serving for cores with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in
-    helios/proto/runtime_package.proto. Validate their original captured graphs
+    helios/proto/runtime_core.proto. Validate their original captured graphs
     through native serving without re-export or re-signing.
 
 [ ] After merging dev/qwen27b in Flare and FlashInfer, evaluate combined MXFP8
@@ -72,18 +72,18 @@
     the sequence-limit guard and protocol verification additions.
     See roce-ring.md#protocol-model-and-runtime-checks.
 
-[ ] Validate the unbuffered Windows package guard and parallel disk workers with
+[ ] Validate the unbuffered Windows core guard and parallel disk workers with
     complete DeepSeek Engram serving; Qwen PLE is exercised. See
-    windows.md#serve-a-prepared-package and cli-design.md.
+    windows.md#serve-a-prepared-core and cli-design.md.
 
 [ ] Validate Windows prefix-cache offload across the other recipes and TP ranks;
     Qwen Flash TP1 disk-only and RAM/disk round trips pass. See
-    windows.md#serve-a-prepared-package.
+    windows.md#serve-a-prepared-core.
 
 [ ] Validate numeric weight metadata in complete model exports across packed
     formats and TP ranks, including a fresh Nemotron Bolt Spark export and
     Windows text/image/speculative replay. SM103 execution and CSF repacking
-    need GPU validation beyond metadata tests. See windows.md#serve-a-prepared-package.
+    need GPU validation beyond metadata tests. See windows.md#serve-a-prepared-core.
 
 [ ] Review scratch-memory lifetimes and sharing across every supported recipe
     and shared component, including Qwen, GLM, DeepSeek, MiMo, Kimi, Step, and
@@ -108,7 +108,7 @@
     pooled add-then-copy expressions can retain an extra device copy. Check
     Step 5 separately because its expert sum uses FP32 intermediates.
 
-[ ] Validate pooled vision and speculative scratch in complete exported packages
+[ ] Validate pooled vision and speculative scratch in complete exported cores
     across Qwen, GLM, DeepSeek V4, MiMo, Step, and Nemotron. Measure
     fixed memory and KV capacity with full catalogs and tensor parallelism;
     exercise alternating text/image graphs, proposal/verification, and rollback.
@@ -135,12 +135,12 @@
 [ ] Measure DeepSeek V4's sharded Markov projection against replicated weights;
     DeepSeek V4.1 uses replication to remove per-draft vocabulary gathers.
 
-[ ] Validate native runtime-package export on Windows, including unbuffered
+[ ] Validate native runtime-core export on Windows, including unbuffered
     bulk I/O, positioned tails, and cache reuse.
 
-[ ] Resolve fixed external-address package loading collisions: cuInit's
+[ ] Resolve fixed external-address core loading collisions: cuInit's
     randomized 8.0625 GiB host VA reservation can cover a recorded high 1 GiB
-    window. test_package_replays_without_python with fixed_package_fixture.py
+    window. test_core_replays_without_python with fixed_core_fixture.py
     and exec_handover reproduces with both Python and native exporters.
 
 [ ] Qualify retained graph costs and funded remeasurement in live Helios:
@@ -156,7 +156,7 @@
     see docs/logprobs-design.md for TP4 costs and numerical limits.
 
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
-    cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
+    cross-node RoCEnante TP cores for Qwen3.8 and DeepSeek V4.1.
 
 [ ] Measure cross-host rank handoff polling and completion yielding: CPU time,
     request p99, and complete-round latency under active and idle workloads.
@@ -170,17 +170,17 @@
     graphs before adding a preparation override. See performance-work.md.
 
 [ ] Run DeepSeek V4 packed-context native replay with its checkpoint and measure
-    exported V4/V4.1 packages with packed context projections. Compare GLM's
+    exported V4/V4.1 cores with packed context projections. Compare GLM's
     shared-expert launch order when the configured checkpoint shards are available.
 
 [ ] TP resharding is not qualified for full-model use. Export compressed Qwen
-    TP1 and native TP2 packages, complete combine and clean-cache acquisition,
+    TP1 and native TP2 cores, complete combine and clean-cache acquisition,
     compare materialized weights byte-for-byte against native TP2, and validate
     native replay. Resolve the observed combine derivation-cycle failure.
     Measure complete combine and acquisition costs against a successful baseline;
     the required 10x speed improvement has not been demonstrated. Fixture tests
     cover derivation replay and signed multi-host distribution, but do not
-    establish full-model TP2 correctness or performance. See package-format-design.md.
+    establish full-model TP2 correctness or performance. See core-format-design.md.
 
 [ ] Invalidate b12x preparation discovery's cached compiler context when
     Inductor selects a different libdevice in the same process. Repeated GPU
@@ -209,11 +209,11 @@
 
 [ ] Compare Kimi K3.1 output-sharded latent prefill and staged history gathers
     against selected-record prefill. Validate dynamic KV peer mappings through
-    fresh package export and native loading. See model-preparation.md.
+    fresh core export and native loading. See model-preparation.md.
 
 [ ] Reduce export memory with deferred graph executables and packed sparse
     initializers. Preflight aggregate metadata bounds before payload publication.
-    Preserve package compatibility. See runtime-package-design.md.
+    Preserve core compatibility. See runtime-core-design.md.
 
 [ ] Extend cached-weight reuse to retained tensor ranges when allocations
     disappear or compatible views move independently. See preparation-development.md.

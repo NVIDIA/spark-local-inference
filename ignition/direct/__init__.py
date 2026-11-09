@@ -4,7 +4,7 @@
 
 """Ignition's direct execution: a diagnostic and qualification path, not production serving.
 
-Production serving loads an exported package in Helios, which owns scheduling,
+Production serving loads an exported core in Helios, which owns scheduling,
 input packing and graph replay without Python (see AGENTS.md, "Python
 prepares; Helios serves"). At the project owner's request, `ignition debug-serve
 --direct` instead prepares a model in process and drives its prepared

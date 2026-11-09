@@ -51,7 +51,7 @@ before the session's capture guard forbids further kernel resolution.
   bind process-local kernel handles and caller-owned tensors at startup. Complete
   b12x preparation, tuning, binding refresh, and compiled warmup before capturing
   each serving graph. Warm the complete selected catalog before retaining a serving graph.
-  Package-backed eager warmups release their transient pools before capture, so
+  Core-backed eager warmups release their transient pools before capture, so
   their workspaces do not coexist with retained graph intermediates. Ranks
   synchronize before each warmup and each capture. Retain compiled kernel owners
   until native replay has drained.
@@ -80,15 +80,15 @@ helper compilation derives host identity without launching a subprocess.
 
 The runtime patch implementation contributes to both Ignition forward cache
 keys and Torch's compiler cache tag. Changing it invalidates compiled forwards
-and Torch graph caches. Captured packages execute independently of these Python
+and Torch graph caches. Captured cores execute independently of these Python
 patches.
 
-## Runtime package export
+## Runtime core export
 
-`ignition.preparation.runtime_package` hands live graph handles, typed storage
+`ignition.preparation.runtime_core` hands live graph handles, typed storage
 and execution metadata, tensor-view roles, compiler signatures, frontend assets,
 and retained owners to `flare_heliopause`. Recipes describe file-backed table
-ranges and generated frontend text without creating package files or payload
+ranges and generated frontend text without creating core files or payload
 offsets. Heliopause records CUPTI resources, traverses graphs and pointer-bearing
 storage, downloads retained bytes, serializes resources, and owns asset writes,
 hashing, zstd level-3 executable compression, signing, conversion, rank payload
@@ -102,10 +102,10 @@ available host memory and preparation rank count. Preserve direct bulk I/O,
 exact unaligned tails, cache verification before reuse, and hash-before-write
 publication. `--no-weights` must fail on any missing exact stored-data blob;
 correctness and cache checks remain required. See
-[runtime package transfers](runtime-package-design.md#native-export-transfers-and-progress)
+[runtime core transfers](runtime-core-design.md#native-export-transfers-and-progress)
 for the transfer budget and progress contract.
 
-`--reuse-weights` pins the cached default package and its weight objects through
+`--reuse-weights` pins the cached default core and its weight objects through
 publication. Native export authenticates its metadata, checks preparation inputs
 and named weight layouts, and rebinds the stored weight initializers to compatible
 allocation placements. Only declared numeric weight ranges may bypass live

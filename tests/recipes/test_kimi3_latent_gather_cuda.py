@@ -27,7 +27,7 @@ def worker(rank, rendezvous):
     from ignition.components.column_pair_gather import PreparedColumnPairGather
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.set_num_threads(2)
@@ -38,7 +38,7 @@ def worker(rank, rendezvous):
                             timeout=timedelta(minutes=15))
     runtime, graphs = None, []
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             runtime = create_head_exchange(dist.group.WORLD, device, max_rows=1024, heads=16, head_dim=336,
                                            ipc=storage.peer_storage)
             coordinator = CollectivePreparation(dist.group.WORLD)

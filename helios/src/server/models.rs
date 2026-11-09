@@ -51,7 +51,7 @@ impl ModelCatalog {
             .cloned()
             .collect();
         // One card represents the loaded model; its other names only resolve lookups.
-        // Bootstrap validated these capacities before serving; a text-only package has none.
+        // Bootstrap validated these capacities before serving; a text-only core has none.
         let limits = model
             .contract
             .vision

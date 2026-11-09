@@ -364,7 +364,7 @@ def test_gloo_value_agreement_reaches_every_rank_and_subgroup(tmp_path):
 
 
 @pytest.mark.parametrize("ring", [False, True])
-def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, ring):
+def test_roce_setup_preserves_routing_and_core_transport_owner(monkeypatch, ring):
     import sys
     from ignition.preparation.collectives import create_roce_runtime
 
@@ -375,7 +375,7 @@ def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, r
     monkeypatch.setitem(sys.modules, "b12x.comm", SimpleNamespace(roce=SimpleNamespace(AllReduce=Runtime)))
     storage = SimpleNamespace(transports=[])
     runtime = create_roce_runtime(object(), "cuda:0", max_tokens=32, pipe_tokens=4096,
-                                  hidden_size=4096, gather_bytes=4096, ring=ring, package_storage=storage)
+                                  hidden_size=4096, gather_bytes=4096, ring=ring, core_storage=storage)
     assert runtime.ring is ring and storage.transports == [runtime]
     assert runtime.options["max_size"] == 2 << 20
     assert runtime.options["pipe_bytes"] == 4096 * 4096 * 2

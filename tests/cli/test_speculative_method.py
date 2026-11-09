@@ -14,7 +14,7 @@ from ignition.cli import _parser, preparation
 from ignition.cli.config import Configuration
 from ignition.errors import UsageError
 from ignition.recipes import resolve
-from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
 
 def selected(*flags, model="qwen3.8-flash", configuration=None):

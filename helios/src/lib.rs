@@ -8,7 +8,7 @@ pub mod cache;
 #[path = "../tests/support/templates.rs"]
 mod template_fixtures;
 mod cuda;
-#[cfg_attr(not(feature = "runtime-package"), allow(dead_code))]
+#[cfg_attr(not(feature = "runtime-core"), allow(dead_code))]
 pub mod engram;
 pub mod error;
 pub mod execution;
@@ -19,11 +19,11 @@ pub mod offload;
 mod os;
 #[cfg(feature = "server")]
 pub mod output;
-#[cfg(feature = "runtime-package")]
-pub mod package;
+#[cfg(feature = "runtime-core")]
+pub mod core;
 mod replay;
-#[cfg(feature = "runtime-package")]
-pub mod runtime_package;
+#[cfg(feature = "runtime-core")]
+pub mod runtime_core;
 pub mod scheduler;
 #[cfg(feature = "server")]
 pub mod server;

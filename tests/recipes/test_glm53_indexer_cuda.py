@@ -127,7 +127,7 @@ def test_glm_indexer_checkpoint_native_replay(model_weights, mode, rows):
                 expected_indices, expected_lengths = scratch.physical.clone(), scratch.selected_lengths.clone()
                 state.cache.copy_(before_cache)
                 state.tail.copy_(before_tail)
-                # Package export zeroes index scratch; the graph must rebuild everything it reads there.
+                # Core export zeroes index scratch; the graph must rebuild everything it reads there.
                 for field in fields(scratch):
                     getattr(scratch, field.name).view(torch.uint8).zero_()
                 torch.cuda.synchronize(device)

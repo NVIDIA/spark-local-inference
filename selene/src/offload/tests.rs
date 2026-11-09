@@ -7,14 +7,14 @@ use super::*;
 
 fn prepare(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
     super::prepare(
         options,
-        package,
+        core,
         identity,
         geometry,
         contexts,
@@ -23,7 +23,7 @@ fn prepare(
 }
 fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
@@ -32,7 +32,7 @@ fn prepare_with_inputs(
 ) -> Result<Preparation> {
     super::prepare_with_inputs(
         options,
-        package,
+        core,
         identity,
         geometry,
         contexts,

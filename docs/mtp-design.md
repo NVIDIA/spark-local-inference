@@ -8,7 +8,7 @@ weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
 graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI6 token-vector completion contract.
 Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
 select the draft-token maximum and default verification policy.
-`flare run PACKAGE --history-drafts` augments Qwen's learned MTP proposals
+`flare run CORE --history-drafts` augments Qwen's learned MTP proposals
 with continuations from shared decoded history. `--no-history-drafts` disables
 that augmentation. History drafting defaults to off and is selected at startup;
 Ignition exports no history preference. Both settings use the same captured
@@ -283,7 +283,7 @@ With concurrency four and five drafts, this is eighteen speculative graphs.
 Flare reduces concurrency and draft depth by selecting the required subset
 before loading GPU resources; adaptive or fixed verification is a serving policy.
 
-Every package also captures ordinary prefill, decode, resume, and prefix-cache
+Every core also captures ordinary prefill, decode, resume, and prefix-cache
 operations without draft computation or state maintenance. A maximum draft count
 of zero selects those operations and disables speculative scheduling. Width one
 inside an enabled speculative catalog maintains draft state, allowing the next
@@ -373,7 +373,7 @@ prefix ceilings before submission. CUDA dependencies serialize model work and
 protect shared scratch independently of completion readback. Rust reserves each
 round's maximum page and output extent before submission. ABI6 uses two transfer
 frames, each containing one `int64` record per prepared request slot with
-16 metadata fields and the package-defined number of token fields.
+16 metadata fields and the core-defined number of token fields.
 Each record contains request
 identity, token counters, terminal status, emitted/offered/accepted counts,
 copy-source bits, draft-cache position, verification width, and padded token IDs. Confidence, logprob, survival, and

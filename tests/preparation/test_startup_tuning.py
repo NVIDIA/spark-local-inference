@@ -131,7 +131,7 @@ def test_standalone_registration_prepares_each_declared_consumer(monkeypatch):
 
 def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     from contextlib import contextmanager, nullcontext
-    from ignition.preparation.runtime_package import _graphs
+    from ignition.preparation.runtime_core import _graphs
     from ignition.preparation.startup_tuning import CollectiveStartupTuning
 
     events = []

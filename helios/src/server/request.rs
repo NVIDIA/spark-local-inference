@@ -99,16 +99,16 @@ pub(super) fn prepare_inference_cached(
     let opts = &request.options;
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
-            return Err("prompt logprobs are not available in this model package; export with --prompt-logprobs".into());
+            return Err("prompt logprobs are not available in this model core; export with --prompt-logprobs".into());
         }
         if top > crate::execution::MAX_TOP_LOGPROBS { return Err("prompt_logprobs exceeds 20".into()); }
     }
     if let Some(logprobs) = &opts.logprobs {
         if !logprobs.ids.is_empty() && config.logprob_token_id_capacity == 0 {
-            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+            return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());
         }
         if config.max_top_logprobs == 0 {
-            return Err("logprobs are not available in this model package".into());
+            return Err("logprobs are not available in this model core".into());
         }
         if logprobs
             .ids
@@ -118,7 +118,7 @@ pub(super) fn prepare_inference_cached(
             return Err("logprob_token_ids contains an ID outside the model vocabulary".into());
         }
         if logprobs.top > config.max_top_logprobs {
-            return Err(format!("top_logprobs exceeds this package's maximum of {}", config.max_top_logprobs).into());
+            return Err(format!("top_logprobs exceeds this core's maximum of {}", config.max_top_logprobs).into());
         }
     }
     let mut object = serde_json::to_value(&opts.sampling)
@@ -234,7 +234,7 @@ pub(super) fn prepare_inference_cached(
             token_ids.push(
                 frontend
                     .bos_token_id()
-                    .ok_or("empty prompt requires a packaged BOS token")?,
+                    .ok_or("empty prompt requires a BOS token declared by the core")?,
             );
         }
         (

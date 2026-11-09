@@ -699,13 +699,13 @@ def test_image_input(clients):
         assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
 
 
-def _logprob_package(http):
+def _logprob_core(http):
     card = http.get('/v1/models').json()['data'][0]
     if not card['permission'][0]['allow_logprobs']:
         response = http.post('/v1/chat/completions', json={'messages': USER, 'max_tokens': 1, 'logprobs': True})
         assert response.status_code == 400
-        assert 'not available in this model package' in response.text
-        pytest.skip('package predates generation logprobs')
+        assert 'not available in this model core' in response.text
+        pytest.skip('core predates generation logprobs')
     assert card['flare']['max_top_logprobs'] == 20
 
 
@@ -722,7 +722,7 @@ def _check_logprob_entry(entry, top):
 @pytest.mark.parametrize('streaming', [False, True])
 def test_generation_logprobs_single_token_continuation(clients, streaming):
     _, _, http = clients
-    _logprob_package(http)
+    _logprob_core(http)
     body = {'messages': [{'role': 'user', 'content': 'Choose A or B. Reply with only the letter.'},
                          {'role': 'assistant', 'content': 'Choice:'}],
             'max_tokens': 1, 'continue_final_message': True, 'add_generation_prompt': False,
@@ -755,7 +755,7 @@ def test_generation_logprobs_single_token_continuation(clients, streaming):
 @pytest.mark.parametrize('streaming', [False, True])
 def test_completion_logprob_arrays_and_offsets(clients, streaming):
     _, _, http = clients
-    _logprob_package(http)
+    _logprob_core(http)
     body = {'prompt': 'Once upon a time', 'max_tokens': 4, 'ignore_eos': True,
             'logprobs': 3, 'return_tokens_as_token_ids': True, 'stream': streaming}
     parts = []
@@ -784,7 +784,7 @@ def test_completion_logprob_arrays_and_offsets(clients, streaming):
 @pytest.mark.parametrize('streaming', [False, True])
 def test_responses_logprobs_belong_to_output_text(clients, streaming):
     _, _, http = clients
-    _logprob_package(http)
+    _logprob_core(http)
     body = {'input': USER, 'max_output_tokens': 16, 'include': ['message.output_text.logprobs'],
             'top_logprobs': 3, 'return_tokens_as_token_ids': True, 'stream': streaming, **EXTRA}
     deltas = []
@@ -833,7 +833,7 @@ def test_logprob_validation_preserves_other_request_semantics(clients):
 
 def test_concurrent_speculative_logprobs_keep_request_lengths_and_flags_separate(clients):
     _, _, http = clients
-    _logprob_package(http)
+    _logprob_core(http)
     for round in range(2):
         def generate(index):
             length = (1, 7, 23, 9)[index]

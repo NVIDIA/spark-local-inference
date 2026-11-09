@@ -113,7 +113,7 @@ def test_prefill_report_names_chunk_and_prefix():
     (("--no-mtp",), "requires draft state"),
     (("--mixed-prefill",), "speculative rounds"),
     (("--prompt-logprobs",), "speculative rounds"),
-    (("--official-source", "https://example.com/model"), "package publishing"),
+    (("--official-source", "https://example.com/model"), "core publishing"),
 ])
 def test_invalid_measurement_settings(flags, message):
     with pytest.raises(UsageError, match=message):

@@ -11,7 +11,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None, recipe=None, draft_source=None):
+            core_storage=None, ranks=None, recipe=None, draft_source=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
     from .config import DRAFT_DIRECTORY, DSPARK_REPOSITORY, DSPARK_REVISION
@@ -49,8 +49,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         frontend_template=str(Path(__file__).parent.parent / recipe.name / "assets" / "chat_template.jinja"),
         **drafting)
     if plan.world_size == 1:
-        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          checkpoint=plan.checkpoint)
 
 

@@ -135,15 +135,15 @@ def _replica(parent, prepare, snapshot, values, gpu_uuids, options):
     flare_heliopause.bind_parent_lifetime(parent)
     import torch
     from ignition.planning import Plan
-    from .package_storage import PackageStorage
+    from .core_storage import CoreStorage
 
     recipe = importlib.import_module(prepare.__module__).RECIPE
     plan = Plan(recipe=recipe, **values)
     torch.cuda.set_device(0)
-    with PackageStorage(world=plan.world_size) as storage:
+    with CoreStorage(world=plan.world_size) as storage:
         try:
             prepare(snapshot, plan, compile_forwards=False, retain_graphs=False, progress=None,
-                    package_storage=storage, **options)
+                    core_storage=storage, **options)
         except TuningComplete:
             torch.cuda.synchronize()
         else:

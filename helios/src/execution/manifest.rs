@@ -164,8 +164,8 @@ pub struct InputBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(deny_unknown_fields))]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-core"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(deny_unknown_fields))]
 pub struct TunedBinding {
     pub buffer: String,
     pub tuning_graph: String,

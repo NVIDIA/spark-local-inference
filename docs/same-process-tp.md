@@ -1,13 +1,13 @@
 # Tensor-parallel ranks in one process
 
-A tensor-parallel runtime package loads into one Helios process with one CUDA
+A tensor-parallel runtime core loads into one Helios process with one CUDA
 context and execution thread per rank. Each rank owns a fixed device arena,
 mapped host regions, modules, graphs, and replay streams. Peer buffers have
 the same addresses during preparation and serving.
 
-The [package design](runtime-package-design.md) defines serialization and
+The [core design](runtime-core-design.md) defines serialization and
 loading. The [core design](core-design.md) defines model contracts and request
-scheduling. Preparation uses Python rank processes; package serving uses
+scheduling. Preparation uses Python rank processes; core serving uses
 Rust rank threads.
 
 ## 1. CUDA contexts and peer access
@@ -21,9 +21,9 @@ A context owns streams, events, modules, functions, and graph executables.
 binds its rank's context before issuing CUDA work. Modules and functions are
 loaded per context; Flare preserves one graph per rank.
 
-The package allocator creates physical storage with `cuMemCreate`, maps it
+The core allocator creates physical storage with `cuMemCreate`, maps it
 with `cuMemMap`, and grants access with `cuMemSetAccess`, using one access
-descriptor per reader device. Access applies to the mapping. Package serving
+descriptor per reader device. Access applies to the mapping. Core serving
 uses these VMM grants; it does not import legacy CUDA IPC handles.
 
 Peer traffic crosses the PCIe fabric according to device topology. Process
@@ -55,7 +55,7 @@ only the owner stores a payload. The loader reserves all address ranges
 before mapping storage and checks that every requested address was honored.
 Address collisions fail startup.
 
-N-gram tables are stored once in the package. A shared reader gathers rows
+N-gram tables are stored once in the core. A shared reader gathers rows
 for all ranks; each rank copies them into its own compact GPU buffers.
 Portable mapped staging and readiness flags are shared, while request
 mailboxes belong to their rank's context. RAM and disk table storage use
@@ -63,7 +63,7 @@ the same rank graphs.
 
 ## 3. Loading and rank coordination
 
-[NativeModel](../helios/src/runtime_package/model.rs) validates GPU count,
+[NativeModel](../helios/src/runtime_core/model.rs) validates GPU count,
 architecture, rank layout, peer dependencies, and selected graph coverage
 before serving. Rank loading stages allocate fixed storage, load payloads,
 load kernels, and instantiate and upload graphs in parallel, joining rank
@@ -99,7 +99,7 @@ for prepare, ready, commit, and completion messages. Its rank supervisor
 terminates the group on peer failure or drain timeout. This diagnostic
 lifetime ends before Python resource owners are released.
 
-Production package loading reconstructs resources in Rust and uses rank
+Production core loading reconstructs resources in Rust and uses rank
 threads. No Python interpreter, peer process, or control socket participates
 in request execution.
 
@@ -112,7 +112,7 @@ A fatal device fault or stranded collective requires process termination.
 
 Process-image diagnostics require every rank thread to remain outside CUDA
 driver calls throughout checkpoint and restore. The
-[process-image constraints](runtime-package-design.md#7-process-images)
+[process-image constraints](runtime-core-design.md#7-process-images)
 apply to all contexts in the process.
 
 ## 6. Driver probe measurements

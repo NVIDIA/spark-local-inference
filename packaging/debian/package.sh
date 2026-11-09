@@ -14,7 +14,7 @@ arch=$(dpkg --print-architecture)
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 chmod 0755 "$stage"
-install -Dm755 flare/target/release/flare "$stage/usr/bin/flare"
+install -Dm755 flare-cli/target/release/flare "$stage/usr/bin/flare"
 docs="$stage/usr/share/doc/flare-inference"
 install -Dm644 packaging/debian/copyright "$docs/copyright"
 install -m644 LICENSE NOTICE THIRD_PARTY_NOTICES.md "$docs/"

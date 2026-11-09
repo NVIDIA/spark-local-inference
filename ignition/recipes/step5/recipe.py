@@ -17,7 +17,7 @@ from ignition.recipes.declaration import (
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
 
     from .bootstrap import PreparationConfig, prepare_rank
@@ -38,7 +38,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         speculative_fixed_width=None if speculation is None else speculation.fixed_width,
         speculative_token_capacity=None if speculation is None else plan.speculative_token_capacity,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          checkpoint=plan.checkpoint)
 
 

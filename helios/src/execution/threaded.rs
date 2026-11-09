@@ -808,6 +808,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 #[path = "threaded/cuda_tests.rs"]
 mod cuda_tests;

@@ -479,8 +479,8 @@ def _completed(pending):
 
 # Command-line, planning, display, and diagnostic direct-execution sources do not change compiled forwards.
 _COMMAND_SOURCES = ('cli', 'direct', 'errors.py', 'planning.py', 'progress.py')
-# Nor does writing and signing the package file after preparation.
-_PUBLICATION_SOURCES = ('preparation/model_package.py', 'preparation/package_file.py', 'preparation/protection.py')
+# Nor does writing and signing the core file after preparation.
+_PUBLICATION_SOURCES = ('preparation/model_core.py', 'preparation/core_file.py', 'preparation/protection.py')
 
 
 def _variant_compilers(selections):

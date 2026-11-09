@@ -232,7 +232,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
 @pytest.mark.parametrize("vision", [False, True])
 def test_contract_preserves_cache_planes_and_complete_round_bindings(vision):
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
     from ignition.preparation.execution import GraphSignature
     from ignition.recipes.minimax_m3.contract import prepare
     from ignition.recipes.minimax_m3.frontend import FRONTEND

@@ -9,7 +9,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
 
     from .bootstrap import PreparationConfig, prepare_rank
@@ -31,7 +31,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, stream_overlap=plan.stream_overlap,
         expert_scale_compression=plan.expert_scale_compression, dspark=speculation is not None,
         vision=not plan.language_model_only, **drafting)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 

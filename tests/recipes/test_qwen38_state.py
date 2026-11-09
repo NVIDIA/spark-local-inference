@@ -133,7 +133,7 @@ def test_partial_state_backing_initializes_and_resets_only_mapped_rows(monkeypat
     assert not pool.backing[0].count_nonzero()
     assert torch.equal(pool.ple_history[1], torch.tensor([EOS_TOKEN_ID, EOS_TOKEN_ID]))
     assert torch.all(pool.backing[2:] == 0xA5)
-    with pytest.raises(ValueError, match="package storage"):
+    with pytest.raises(ValueError, match="core storage"):
         HybridStatePool.allocate(4, "meta", backed_slots=2)
     for count in (0, 1, 5, True):
         with pytest.raises(ValueError, match="backed state slots"):

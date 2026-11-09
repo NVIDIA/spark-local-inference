@@ -164,7 +164,7 @@ def _benchmark_rank(rank, rendezvous, destination, pairs, seeds):
     from ignition.components.shared_pages import SharedPages
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -176,7 +176,7 @@ def _benchmark_rank(rank, rendezvous, destination, pairs, seeds):
     graphs, runtime, shared_cache, stage = [], None, None, None
     results = []
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             shared_cache = SharedPages(dist.group.WORLD, device, maximum // WORLD * WIDTH, ipc=storage.peer_storage)
             stage = SharedPages(dist.group.WORLD, device, maximum // WORLD * WIDTH, ipc=storage.peer_storage)

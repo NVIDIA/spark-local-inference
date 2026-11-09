@@ -180,7 +180,7 @@ def test_request_stop_policy_packs_eos_count_without_changing_token_ids(ignore_e
 
     from ignition.direct.packing import pack
     from ignition.direct.scheduler import Lane, Layout, Request, SamplingParameters, Step
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
 
     bindings = [c.binding("admission_eos_count", p.EOS_COUNT, indexing=p.REQUEST_ROW),
                 c.binding("admission_eos_token_ids", p.EOS_TOKEN_IDS, indexing=p.REQUEST_ROW)]

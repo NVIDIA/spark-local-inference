@@ -3,7 +3,7 @@
 
 """Kimi K3.1 text, sparse-context continuations, XTML, and vision through native serving.
 
-Set FLARE_RUN_CUDA_TESTS=1 and FLARE_KIMI31_TEST_URL to an exported package
+Set FLARE_RUN_CUDA_TESTS=1 and FLARE_KIMI31_TEST_URL to an exported core
 running with flare run, concurrency eight, 4096-token prefill, and vision.
 """
 

@@ -3299,7 +3299,7 @@ fn bounded_vector_records(h: RequestHandle, fence: u64, consumed: i64, generated
 }
 
 #[test]
-fn package_capacity_bounds_catalog_and_request_profiles() {
+fn core_capacity_bounds_catalog_and_request_profiles() {
     for capacity in [8, 13, 16, 32, 257] {
         let fixture = scheduler(1, 32, 4);
         let mut capabilities = fixture.capabilities.clone();

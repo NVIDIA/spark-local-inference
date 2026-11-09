@@ -31,7 +31,7 @@ prepare = [
     "accelerate==1.14.0",
     "Pillow==12.3.0",
     "flare-heliopause",
-    "protobuf>=7.35.1,<8",
+    "protobuf>=7.36.2,<8",
     "rich>=13",
 ]
 

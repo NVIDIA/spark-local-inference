@@ -95,7 +95,7 @@ def worker(rank, rendezvous, destination):
     import torch.distributed as dist
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from tests.components.test_ordered_row_topk import ordered_reference
 
@@ -106,7 +106,7 @@ def worker(rank, rendezvous, destination):
     dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=16, timeout=timedelta(minutes=15))
     graphs, runtime = [], None
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             runtime = create_head_exchange(dist.group.WORLD, device, max_rows=128, heads=16, head_dim=8192,
                                            ipc=storage.peer_storage)
             coordinator = CollectivePreparation(dist.group.WORLD)

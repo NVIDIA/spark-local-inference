@@ -57,7 +57,7 @@ def collect(destination, targets=TARGETS):
     for target in targets:
         metadata = json.loads(subprocess.check_output([
             "cargo", "metadata", "--locked", "--format-version", "1",
-            "--manifest-path", str(ROOT / "flare/Cargo.toml"), "--filter-platform", target,
+            "--manifest-path", str(ROOT / "flare-cli/Cargo.toml"), "--filter-platform", target,
         ], cwd=ROOT))
         packages.update((p["id"], p) for p in metadata["packages"])
         for package_id, kinds in dependency_roles(metadata).items():
@@ -103,7 +103,7 @@ def collect(destination, targets=TARGETS):
     for entry in entries:
         groups[entry["license"] or "See license files"].append(entry)
     lines = ["# Native Rust dependency licenses", "",
-             "Generated from the locked `flare/Cargo.toml` dependency graph. Python and",
+             "Generated from the locked `flare-cli/Cargo.toml` dependency graph. Python and",
              "Heliopause are preparation/build-only and are not part of this binary release.", "",
              "This inventory includes runtime dependencies and build/proc-macro tools,",
              "with target-specific roles in `packages.json`. Build-tool notices are included",

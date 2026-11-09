@@ -338,7 +338,7 @@ def _cache_barrier_peer_read_rank(rank, rendezvous, world, rows):
     from ignition.components.peer_record_gather import PreparedPeerRecordGather
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import RECORD_BYTES, TOPK, write_records
 
@@ -349,7 +349,7 @@ def _cache_barrier_peer_read_rank(rank, rendezvous, world, rows):
                             timeout=timedelta(minutes=5))
     graph = runtime = None
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             cache = storage.device_allocate("latent", (1, local_records, RECORD_BYTES), torch.float8_e4m3fn,
                 group="KV_PAGES", maximum=1)
             region = next(region for region in storage.dynamic_regions if region.address == cache.data_ptr())

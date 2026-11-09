@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ignition.preparation.package_storage import PackageStorage
+from ignition.preparation.core_storage import CoreStorage
 
 GRANULE = 2 << 20
 
@@ -29,7 +29,7 @@ class AddressSpace:
         self.calls += 1
         if name == "cuMemAlloc_v2":
             # The driver's next device allocation goes to the lowest free granule.
-            address = next(a for a in range(PackageStorage.LOW_SCAN_START, 1 << 45, GRANULE)
+            address = next(a for a in range(CoreStorage.LOW_SCAN_START, 1 << 45, GRANULE)
                            if self.free(a, GRANULE))
             C.cast(args[0], C.POINTER(C.c_uint64))[0] = address
         elif name == "cuMemAddressReserve":
@@ -43,14 +43,14 @@ class AddressSpace:
 
 
 def storage(space):
-    owner = object.__new__(PackageStorage)
+    owner = object.__new__(CoreStorage)
     owner.integrated, owner.granularity, owner.cuda, owner.low_reservations = True, GRANULE, space, []
     return owner
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows retains its low device allocation pool")
 def test_every_free_span_below_the_floor_is_reserved_and_frees_are_resealed():
-    floor, start = PackageStorage.EXTERNAL_FLOOR, PackageStorage.LOW_SCAN_START
+    floor, start = CoreStorage.EXTERNAL_FLOOR, CoreStorage.LOW_SCAN_START
     context = (0x327c00000, 0x32ee00000 - 0x327c00000)
     scratch = (0x380000000, 64 << 20)
     space = AddressSpace([context, scratch])
@@ -87,9 +87,9 @@ def test_setup_seals_the_window_and_verifies_allocations_land_above_the_floor():
 
 
 def test_windows_keeps_low_addresses_available_for_driver_allocations(monkeypatch):
-    from ignition.preparation import package_storage
+    from ignition.preparation import core_storage
 
-    monkeypatch.setattr(package_storage, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(core_storage, "os", SimpleNamespace(name="nt"))
     space = AddressSpace([])
     storage(space).seal_low_window()
     assert space.calls == 0

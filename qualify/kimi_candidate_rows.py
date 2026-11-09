@@ -76,7 +76,7 @@ def rank_main(rank, rendezvous, args):
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -88,7 +88,7 @@ def rank_main(rank, rendezvous, args):
     graphs, runtimes = [], []
     samples = []
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_head_exchange(dist.group.WORLD, device, max_rows=max(args.rows),
                 heads=WORLD, head_dim=TOPK * 4, ipc=storage.peer_storage)

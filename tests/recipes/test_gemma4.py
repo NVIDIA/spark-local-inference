@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from ignition import planning
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.recipes import resolve
 from ignition.recipes.gemma4.attention import (
@@ -462,8 +462,8 @@ def test_single_file_safetensors_checkpoint_resolution_and_inspection(tmp_path):
 def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
     seen = {}
 
-    def fake_prepare(snapshot, config, *, progress, package_storage):
-        seen.update(snapshot=snapshot, config=config, package_storage=package_storage)
+    def fake_prepare(snapshot, config, *, progress, core_storage):
+        seen.update(snapshot=snapshot, config=config, core_storage=core_storage)
         return "prepared"
 
     monkeypatch.setattr("ignition.recipes.gemma4.bootstrap.prepare", fake_prepare)
@@ -476,13 +476,13 @@ def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
         compile_forwards=True,
         kernel_cache=tmp_path / "cache",
         progress=None,
-        package_storage="storage",
+        core_storage="storage",
     ) == "prepared"
     assert seen["config"].max_active == 4
     assert seen["config"].context == 262144
     assert seen["config"].prefill_chunk_size == 4096
     assert seen["config"].compile_decoder is True
-    assert seen["package_storage"] == "storage"
+    assert seen["core_storage"] == "storage"
 
 
 def test_frontend_contract_and_cache_regions():
@@ -724,7 +724,7 @@ def test_gemma4_multi_rank_and_speculative_adapter(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
         "ignition.preparation.rank_group.prepare_group",
-        lambda snapshot, config, prepare, *, progress, package_storage=None, ranks=None, checkpoint=None: seen.append(
+        lambda snapshot, config, prepare, *, progress, core_storage=None, ranks=None, checkpoint=None: seen.append(
             (config, prepare, ranks, checkpoint)
         )
         or "group",

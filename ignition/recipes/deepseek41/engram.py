@@ -16,7 +16,7 @@ from ignition.components.readiness import ReadinessTimings
 from ignition.components.linear import QuantizedProjection
 from ignition.components.collectives import PreparedChunkedAllReduce
 from ignition.components.state import gather_rows, save_hidden
-from ignition.preparation.runtime_package import FileSource
+from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.tuning import declare
 from ignition.progress import phase
 
@@ -79,7 +79,7 @@ class Tables:
         return {f"engram_{layer}_ready": inputs.ready.cuda_event for layer, inputs in self.inputs.items()}
 
     def resident_catalog(self):
-        """Source spans and native bindings for shared RAM delivery without package export."""
+        """Source spans and native bindings for shared RAM delivery without core export."""
         return {"vocabulary": len(self.token_map), "tables": [
             {"planes": [{"segments": [
                             {"path": str(source.path), "offset": source.offset, "nbytes": source.nbytes}],

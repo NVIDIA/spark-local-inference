@@ -26,7 +26,7 @@ The reduction does not change sampling or Philox state.
 ## Persistent I/O
 
 `CompletionOutputs` owns records, one packed output, and request flags. `capacity`
-is the padded physical request capacity. T is the resolved package
+is the padded physical request capacity. T is the resolved core
 `completion_token_capacity`: zero or omission means eight, and positive values
 are literal. All tensors have contiguous row-major storage.
 
@@ -147,12 +147,12 @@ content without a source span receives no token entries.
 ## Compatibility
 
 No Protobuf field or completion-record ABI changes. Absent buffers mean K=0:
-old packages load and serve unchanged, advertise `allow_logprobs: false`, and
+old cores load and serve unchanged, advertise `allow_logprobs: false`, and
 reject logprob requests with HTTP 400 before admission. Present declarations
 require both buffers, their exact dtypes and frame/slot geometry, and 1<=K<=20.
 Sampling graphs must bind the flag vector. Malformed declarations fail loading.
 All newly prepared recipes allocate the complete bundle; enabling the feature on
-an old package requires a new export.
+an old core requires a new export.
 
 ## Prompt scoring
 
@@ -200,7 +200,7 @@ Accuracy comparisons must use fresh-run spread, rather than exact repeatability.
 On four RTX PRO 6000 GPUs, TP4 at concurrency 32, flag-on/off ABBA serving
 measurements found ordinary prefill and unrequested decode unchanged within noise.
 KV capacity fell 5.4%, from 21,714,176 to 20,539,648 tokens (Qwen TP1: 0.9%).
-The packages add about 1.0 GB of fixed device allocations per rank, including
+The cores add about 1.0 GB of fixed device allocations per rank, including
 about 408 MiB of graph scratch, 185 MiB of other tensors and additional capture
 storage; eight scored graphs add about 51,000 nodes. Scored-prefill service
 throughput was about 0.50× ordinary at K=0 and 0.37× at K=20 (Qwen estimate:
@@ -217,7 +217,7 @@ Requests without scoring never select this operation.
 
 Protobuf declares operation 12 and value source 39 without new message fields.
 Absent prompt buffers and graphs mean no scoring; partial or malformed layouts
-fail validation. Old packages retain their operations, default values, loading
+fail validation. Old cores retain their operations, default values, loading
 and serving behavior.
 
 Wire formats follow vLLM's [completion serving](https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/completion/serving.py),

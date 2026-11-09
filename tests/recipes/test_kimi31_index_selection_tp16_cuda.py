@@ -52,7 +52,7 @@ def _rank(rank, rendezvous):
     from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
     from ignition.components.dense_mla import PreparedDenseMLA
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import ContextShards, selection_slots
@@ -66,7 +66,7 @@ def _rank(rank, rendezvous):
     candidate_runtime = head_runtime = None
     graphs = []
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             logical_pages = MAX_VISIBLE // (128 * WORLD)
             physical_pages = logical_pages + 3
             page_map = ((torch.arange(logical_pages, device=device) * 2 + 3) % physical_pages).int()

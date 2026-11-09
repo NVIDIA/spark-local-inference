@@ -6,10 +6,10 @@ against a baseline with the same checkpoint, GPU assignment, activation
 precision, graph capacity, sampling settings, cache conditions, and completed
 work. Correctness failures block performance claims.
 
-Use `ignition export` and `flare run PACKAGE` for performance comparisons
+Use `ignition export` and `flare run CORE` for performance comparisons
 against other runtimes. `ignition debug-serve`, including native, `--direct`,
 and `--eager` execution, is for fault diagnosis only. Its preparation resources,
-cache backing, and loading lifecycle differ from package serving, so its timings
+cache backing, and loading lifecycle differ from core serving, so its timings
 cannot establish apples-to-apples serving performance.
 
 `ignition bench` supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark. It measures complete prepared speculative graph rounds
@@ -41,7 +41,7 @@ timelines with operator and layer attribution, kernel counts, summed kernel
 durations, and graph elapsed time. Host graph-launch traces alone cannot
 attribute GPU work.
 
-Verify improvements through an exported `.safetensors` package loaded by
+Verify improvements through an exported `.safetensors` core loaded by
 `flare run --embedding-table-storage ram`, including Helios's asynchronous
 row delivery. Measure disk delivery separately when it is the deployment
 configuration. For matching batch and verification width, graph rounds per

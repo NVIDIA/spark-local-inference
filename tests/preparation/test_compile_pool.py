@@ -118,14 +118,14 @@ def test_preparation_closures_cannot_execute_in_compiler():
 
 
 @pytest.mark.parametrize("kind", ["storage", "session", "recorded_session"])
-def test_preparation_resources_do_not_serialize_active_package_storage(kind):
+def test_preparation_resources_do_not_serialize_active_core_storage(kind):
     from b12x.preparation import PreparationSession
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tensor_metadata import NumericStorage, _NUMERIC_STORAGE
     from ignition.preparation.tuning import RecordedPreparationSession
 
     with NumericStorage() as registry:
-        storage = PackageStorage.__new__(PackageStorage)
+        storage = CoreStorage.__new__(CoreStorage)
         storage.numeric_storage = registry
         resource = storage
         if kind != "storage":

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""TP16 reductions and column gathers through package-owned CUDA memory."""
+"""TP16 reductions and column gathers through core-owned CUDA memory."""
 from datetime import timedelta
 import os
 import pytest
@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(os.getenv('FLARE_RUN_TP_CUDA_TESTS') != '1', rea
 
 
 def _rank(rank, rendezvous):
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_all_gather_runtime
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.components.collectives import PreparedAllReduce, PreparedAllGather
@@ -22,7 +22,7 @@ def _rank(rank, rendezvous):
     device = torch.device('cuda', rank)
     dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=16, timeout=timedelta(minutes=5))
     group = dist.group.WORLD
-    with PackageStorage(rank=rank, world=16, device=rank) as storage:
+    with CoreStorage(rank=rank, world=16, device=rank) as storage:
         coordinator = CollectivePreparation(group)
         reduce = create_all_reduce_runtime(group, device, max_tokens=4096, hidden_size=7168, ipc=storage.peer_storage)
         gather = create_all_gather_runtime(group, device, max_rows=4096, columns=7168, ipc=storage.peer_storage)
@@ -75,6 +75,6 @@ def _rank(rank, rendezvous):
     dist.destroy_process_group()
 
 
-def test_package_owned_tp16_collectives(tmp_path):
+def test_core_owned_tp16_collectives(tmp_path):
     assert torch.cuda.device_count() == 16
     mp.spawn(_rank, args=((tmp_path / 'rendezvous').as_uri(),), nprocs=16, join=True)

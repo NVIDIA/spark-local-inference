@@ -26,7 +26,7 @@ from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
-from ignition.preparation import runtime_package_pb2 as contract_proto
+from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
@@ -244,12 +244,12 @@ def _memory_breakdown(device, *, weights, continuation, kv, operator_scratch, de
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, progress=None, package_storage=None) -> PreparedModel:
+def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, progress=None, core_storage=None) -> PreparedModel:
     """Load, tune and capture vision and text variants on one supervised TP rank.
 
     The caller must terminate the complete rank group if any preparation fails.
     Successful cleanup requires every rank to close its IPC runtime together,
-    after native replay drains. No eager execution path is exported. Package
+    after native replay drains. No eager execution path is exported. Core
     storage backs device memory, collective mappings and graphs with addresses
     that native restore reproduces.
     """
@@ -280,11 +280,11 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     if expert_activation == "a16":
         # b12x retains activation scales for A4 prefill launches only while preparing with this switch.
         os.environ["B12X_W4A16_A4_PREFILL"] = "1"
-    # Loading, construction and tuning free most of what they allocate; a transient package pool returns
+    # Loading, construction and tuning free most of what they allocate; a transient core pool returns
     # that memory to the device once tuning completes, before graph measurement sizes the KV pages.
     transient = contextlib.ExitStack()
-    if package_storage is not None:
-        transient.enter_context(package_storage.transient())
+    if core_storage is not None:
+        transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp,
                                 expert_activation=expert_activation,
                                 expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only)
@@ -296,9 +296,9 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     with phase(progress, "Allocate model state and collectives") as stage:
         layer_types = weights.tree.config.text_config.layer_types
         layout = continuation_layout(layer_types, shard.world_size, mtp=config.mtp)
-        # Native loading sizes a package's continuation rows and KV pages from the serving host's
-        # memory, within their virtual extents. A package backs only what its tuning and capture use.
-        snapshots = 1 if package_storage is not None else layout.snapshot_capacity(config.snapshot_budget_bytes)
+        # Native loading sizes a core's continuation rows and KV pages from the serving host's
+        # memory, within their virtual extents. A core backs only what its tuning and capture use.
+        snapshots = 1 if core_storage is not None else layout.snapshot_capacity(config.snapshot_budget_bytes)
         if snapshots < 1:
             raise ValueError("GLM snapshot budget must hold at least one continuation row")
         pages, blocks = config.preparation_pages, config.context // config.page_tokens
@@ -308,16 +308,16 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         page_bytes = (layer_types.count("indexed_attention") + int(config.mtp)) * (4 * 64 * 528 + 64 * 132)
         max_cache_pages = minimum_across_ranks(torch.cuda.mem_get_info(device)[1] // page_bytes, group)
         context_ranks = shard.world_size if config.context_parallel and group is not None else 1
-        # Compiled forwards bind the page pools' shapes. Give in-process pools a package's
+        # Compiled forwards bind the page pools' shapes. Give in-process pools a core's
         # full virtual extent, backed by measured pages only after compilation. Context
         # ranks share their latent caches through CUDA IPC allocations instead.
         virtual_pages = None
-        if package_storage is None and context_ranks == 1:
+        if core_storage is None and context_ranks == 1:
             from ignition.preparation.virtual_storage import VirtualStorage
 
             virtual_pages = VirtualStorage(device)
         pool = ContinuationPool.allocate(layer_types, shard.world_size,
-            state_rows + 1, pages, device, mtp=config.mtp, storage=package_storage,
+            state_rows + 1, pages, device, mtp=config.mtp, storage=core_storage,
             maximum_pages=max_cache_pages, context_ranks=context_ranks, virtual=virtual_pages)
         requests = DeviceRequestState.allocate(device, vocab_size=154880, capacity=slots)
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
@@ -328,7 +328,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         # One rank holds whole sums and vocabularies: it prepares no collectives.
         coordinator = CollectivePreparation(group) if group is not None else None
-        ipc = None if package_storage is None else package_storage.peer_storage
+        ipc = None if core_storage is None else core_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None
         sample_rows = max(b * w for b, w in config.speculative_shapes) if config.mtp else config.request_capacity
         if coordinator is not None and coordinator.spans_hosts:
@@ -356,7 +356,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 varlen_bytes = min(WINDOW_RECORDS, blocks * 256) * 528
             collective = prefill_collective = vocabulary_collective = create_roce_runtime(
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
-                gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage, varlen_bytes=varlen_bytes)
+                gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
             collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
@@ -372,7 +372,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,
-            headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
+            headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
         register_benchmark_state(session, pool.decoder.layers[0].recurrent,
             storage=pool.backing, restore=pool.clear_for_preparation)
@@ -443,7 +443,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             forward_inputs += ("draft_page_tables",)
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     serving_modes = (True, False) if config.mtp else (False,)
     graph_count = (len(serving_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
@@ -540,19 +540,19 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
            f"weights={weights.allocated_bytes >> 20} MiB, continuation={pool.backing.nbytes >> 20} MiB, "
            f"operator scratch={arena.nbytes >> 20} MiB")
     stream = torch.cuda.Stream(device=device)
-    graph_pool = torch.cuda.graph_pool_handle() if package_storage is None else package_storage.graph_pool.id
+    graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
     trials, _ = capture_forwards(forwards, signatures, session=session, device=device,
         stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
-        compile_decoder=False, progress=progress, label="Measure graph memory", warmup_storage=package_storage)
+        compile_decoder=False, progress=progress, label="Measure graph memory", warmup_storage=core_storage)
     from ignition.preparation.host_memory import COMPILED_FORWARD_BYTES, device_memory_info
 
     # An integrated GPU's allocatable memory includes the reclaimable RAM CUDA's free memory excludes.
     integrated = torch.cuda.get_device_properties(device).is_integrated
-    binds_pages = package_storage is None and virtual_pages is None
-    if package_storage is not None:
+    binds_pages = core_storage is None and virtual_pages is None
+    if core_storage is not None:
         # Native loading checks the minimum KV capacity against the serving host's memory.
         pages = config.preparation_pages
-        memory(f"after graph measurement (the package backs {pages} preparation KV pages)")
+        memory(f"after graph measurement (the core backs {pages} preparation KV pages)")
     else:
         free = device_memory_info(device)[0]
         if integrated and config.compile_decoder:
@@ -594,11 +594,11 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
 
     def materialize_cache():
         with phase(progress, "Allocate KV cache") as stage:
-            if package_storage is not None:
-                package_storage.grow("KV_PAGES", pages)
+            if core_storage is not None:
+                core_storage.grow("KV_PAGES", pages)
                 # Ranks on one host read each other's latent caches through CUDA IPC.
                 if context_ranks > 1 and not remote:
-                    pool.share_pages(package_storage, group)
+                    pool.share_pages(core_storage, group)
             elif virtual_pages is not None:
                 virtual_pages.grow("KV_PAGES", pages)
             else:
@@ -617,7 +617,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
         stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
-        retain_graphs=config.retain_graphs, materialize=materialize_cache, warmup_storage=package_storage,
+        retain_graphs=config.retain_graphs, materialize=materialize_cache, warmup_storage=core_storage,
         compile_kinds=_COMPILED_KINDS)
     kv_bytes = pages * page_bytes
     if integrated:
@@ -628,7 +628,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         kv=kv_bytes, operator_scratch=arena.nbytes, decoder_scratch=_tensor_bytes(prefill_storage, decoder_storage),
         collective=collective, headroom=config.headroom_bytes,
         compiled_reservation=(sum(signature.kind in _COMPILED_KINDS for signature in signatures.values())
-                              * COMPILED_FORWARD_BYTES if integrated and config.compile_decoder and package_storage is None else 0))
+                              * COMPILED_FORWARD_BYTES if integrated and config.compile_decoder and core_storage is None else 0))
     report("memory breakdown (MiB): " + ", ".join(f"{key}={value >> 20}" for key, value in breakdown.items()))
     session.freeze()
     pool.clear_for_preparation()

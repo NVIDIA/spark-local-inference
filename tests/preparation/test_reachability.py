@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.preparation.runtime_package import Allocation
+from ignition.preparation.runtime_core import Allocation
 from ignition.preparation.tensor_metadata import NumericStorage, tensor_ranges
 
 
@@ -110,7 +110,7 @@ def test_repacked_weight_planes_remain_numeric_leaves(codec, kind):
     unrelated = Allocation("unrelated", 0xee9f4a000000, 10 * 1024 * 1024)
     for plane in planes:
         owner = Allocation("weight", plane.data_ptr(), plane.nbytes)
-        # The Windows-failing package had this unaligned address-shaped numeric word.
+        # The Windows-failing core had this unaligned address-shaped numeric word.
         data = b"\0" * 6 + struct.pack("<Q", unrelated.address + 0x31451f) + b"\0" * 2
         payload = plane.view(torch.uint8).reshape(-1)[:len(data)]
         payload.copy_(torch.tensor(list(data), dtype=torch.uint8, device=plane.device))

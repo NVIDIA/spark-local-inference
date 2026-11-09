@@ -3,18 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Who a package's signing key belongs to, resolved from the publisher's own repository.
+//! Who a core's signing key belongs to, resolved from the publisher's own repository.
 //!
-//! A package claims a signer fingerprint, a namespace, and an official source under that
+//! A core claims a signer fingerprint, a namespace, and an official source under that
 //! namespace on huggingface.co. The publisher proves the claim by publishing `publisher.json`,
 //! the profile `ignition keygen` writes, at the root of that repository. Every publisher is
 //! verified the same way; no key is privileged. A key file that exists but omits the signer is
 //! an impersonation or a revocation and fails loading outright.
 
-use flare_helios::runtime_package::{PackageClaim, Publisher};
+use flare_helios::runtime_core::{CoreClaim, Publisher};
 use std::time::Duration;
 
-use crate::cli::HubOptions;
+use crate::options::HubOptions;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -43,7 +43,7 @@ pub enum Fetched {
     Failed(String),
 }
 
-pub fn resolve(claim: &PackageClaim, options: &HubOptions) -> Result<Resolution> {
+pub fn resolve(claim: &CoreClaim, options: &HubOptions) -> Result<Resolution> {
     if options.offline {
         return Ok(Resolution::Unreachable("not consulted (--offline)".into()));
     }
@@ -84,7 +84,7 @@ fn fetch(url: &str, token: Option<&str>) -> Fetched {
 
 /// Interpret the key file. A readable file decides the claim one way or the other; only the
 /// absence of a file or of a connection leaves the identity unresolved.
-pub fn classify(claim: &PackageClaim, url: &str, fetched: Fetched) -> Result<Resolution> {
+pub fn classify(claim: &CoreClaim, url: &str, fetched: Fetched) -> Result<Resolution> {
     let body = match fetched {
         Fetched::Body(body) => body,
         Fetched::Status(404) => return Ok(Resolution::Absent),
@@ -98,16 +98,16 @@ pub fn classify(claim: &PackageClaim, url: &str, fetched: Fetched) -> Result<Res
         Fetched::Failed(reason) => return Ok(Resolution::Unreachable(reason)),
     };
     let profiles: Vec<Publisher> = serde_json::from_slice(&body).map_err(|error| {
-        format!("package rejected: {url} is not a Flare publisher profile: {error}")
+        format!("core rejected: {url} is not a Flare publisher profile: {error}")
     })?;
     for profile in &profiles {
         profile.validate().map_err(|error| {
-            format!("package rejected: {url} holds an invalid publisher profile: {error}")
+            format!("core rejected: {url} holds an invalid publisher profile: {error}")
         })?;
     }
     let Some(profile) = profiles.iter().find(|p| p.fingerprint() == claim.signer) else {
         return Err(format!(
-            "package rejected: signing key {} is not among the keys {} publishes at {url}; the package was not \
+            "core rejected: signing key {} is not among the keys {} publishes at {url}; the core was not \
              signed by its claimed publisher, or the key was revoked",
             claim.signer, claim.namespace
         )
@@ -115,7 +115,7 @@ pub fn classify(claim: &PackageClaim, url: &str, fetched: Fetched) -> Result<Res
     };
     if profile.namespace != claim.namespace || profile.development {
         return Err(format!(
-            "package rejected: {url} publishes signing key {} under namespace {}, not the package's {}",
+            "core rejected: {url} publishes signing key {} under namespace {}, not the core's {}",
             claim.signer, profile.namespace, claim.namespace
         )
         .into());
@@ -127,8 +127,8 @@ pub fn classify(claim: &PackageClaim, url: &str, fetched: Fetched) -> Result<Res
 mod tests {
     use super::*;
 
-    fn claim(signer: &str) -> PackageClaim {
-        PackageClaim {
+    fn claim(signer: &str) -> CoreClaim {
+        CoreClaim {
             signer: signer.into(),
             namespace: "example".into(),
             official_source: "https://huggingface.co/example/model".into(),

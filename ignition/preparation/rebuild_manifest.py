@@ -21,7 +21,7 @@ from types import MappingProxyType
 import math
 import re
 
-from . import runtime_package_pb2 as proto
+from . import runtime_core_pb2 as proto
 
 STABLE = 'stable'
 TUNED = 'tuned'

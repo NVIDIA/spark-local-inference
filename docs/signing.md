@@ -1,14 +1,14 @@
 # Production signing
 
-Ignition signs runtime packages with Ed25519. Source builds contain no embedded
+Ignition signs runtime cores with Ed25519. Source builds contain no embedded
 publisher profiles. Supply a public profile with `--publisher-keys`, or provision
 profiles when building a distribution as described in
-[runtime package protection](runtime-package-design.md#publisher-authentication-and-executable-access).
+[runtime core protection](runtime-core-design.md#publisher-authentication-and-executable-access).
 
 Publisher profiles verify signatures; they do not verify identity. Flare checks
-identity through `publisher.json` at the root of the package's official source
+identity through `publisher.json` at the root of the core's official source
 repository. Execution requires first-use acceptance. Private keys never belong
-in source control, packages, or publisher profiles.
+in source control, cores, or publisher profiles.
 
 ## Publish the verification key
 
@@ -17,8 +17,8 @@ every repository named as an official source. Flare fetches it from the default
 branch on every online load and requires it to list the key under the publisher
 namespace. The file is a list, so a rotated key stays valid
 by keeping the previous profile in it, and removing a profile revokes that key
-for every package it signed. A repository whose `publisher.json` omits the
-signing key makes the package fail to load everywhere; a repository without the
+for every core it signed. A repository whose `publisher.json` omits the
+signing key makes the core fail to load everywhere; a repository without the
 file leaves the identity unverified, and users must then supply the profile with
 `--publisher-keys`.
 
@@ -54,12 +54,12 @@ storage, with the passphrase recoverable separately. Verify that the backup can
 be decrypted before depending on it. Losing either the key or its passphrase
 prevents further signatures under that identity. File permissions and encryption
 protect the stored key; they do not protect an unlocked signing process from a
-compromised account or root. Sign only on a trusted host and review the package
+compromised account or root. Sign only on a trusted host and review the core
 being promoted.
 
 For rotation, generate into a different directory and supply the replacement public
 profile through `--publisher-keys` or a provisioned distribution. Previously signed
-packages require their original public key; execution acceptance is specific to
+cores require their original public key; execution acceptance is specific to
 the key and namespace. If a private key is
 compromised, remove its identity from distributed builds and revoke its acceptance
 in affected trust stores with `flare trust revoke FINGERPRINT`.
@@ -74,7 +74,7 @@ in affected trust stores with `flare trust revoke FINGERPRINT`.
 The command prompts for the existing passphrase, then the replacement twice.
 It writes an encrypted temporary file with owner-only permissions beside the key,
 flushes it to disk, and atomically replaces the key file. The key and fingerprint
-stay the same; publisher profiles, Helios builds, and signed packages need no
+stay the same; publisher profiles, Helios builds, and signed cores need no
 changes. A wrong existing passphrase or mismatched confirmation leaves the file
 untouched. An interruption before replacement can leave an encrypted hidden
 temporary file beside the key.
@@ -83,10 +83,10 @@ Update the encrypted backup after changing the passphrase. Existing backups
 still use their previous passphrase. A passphrase change does not revoke copies
 of the private key; use key rotation if a copy may be compromised.
 
-## Promote a development package
+## Promote a development core
 
 Use a distinct destination and the actual repository URL where the production
-package will be published:
+core will be published:
 
 ```sh
 .venv/bin/ignition sign /data/flare-runtime/development \
@@ -100,24 +100,24 @@ Replace `example-publisher` and `REPOSITORY` with your namespace and repository.
 The command does not upload anything. The three publishing values can instead come from `[publishing]`
 in the [configuration file](cli-design.md#signing-and-local-development); explicit
 flags take precedence. It locates `development-publisher.json` beside that config
-file. For a package prepared elsewhere, supply the original trusted public profile
+file. For a core prepared elsewhere, supply the original trusted public profile
 with `--development-publisher PATH`. The development private key is unnecessary.
 
-Signing a payload-format package verifies its source signatures and stored
+Signing a payload-format core verifies its source signatures and stored
 payloads, then signs its deployments and ranks under the production identity
-with a fresh package ID. Weight bytes, the model license the export recorded
+with a fresh core ID. Weight bytes, the model license the export recorded
 from the model card, and prepared execution contracts are preserved.
 Executable resources are authenticated, decoded, and re-encoded as
 independent zstd level-3 frames; decoded bytes remain exact, while compressed
 frame bytes may change.
 
 The output uses the directory canonical form with readable companion names.
-Use `ignition convert --form packed` to produce a single-file package afterward.
+Use `ignition convert --form packed` to produce a single-file core afterward.
 The payload format has no canonical size-sharded form or shard-size setting.
-The internal logical-resource package layout uses a separate signing path
+The internal logical-resource core layout uses a separate signing path
 that writes content-addressed snapshot companions with a fixed 64 GiB file limit.
 
-Invalid packages fail before publication, and existing destinations are never
+Invalid cores fail before publication, and existing destinations are never
 overwritten. Weight identities remain independent of executable resources.
 
 No checkpoint reload, compilation, graph capture, or GPU access is required.
@@ -133,7 +133,7 @@ payloads when the output is on another filesystem.
 Temporary files reside in a private directory beside the destination and are
 removed on normal completion or error. A forced kill can leave that directory;
 remove it only after confirming no signing process is using it. The source
-package remains intact. See [package snapshots](cli-design.md#package-snapshots)
+core remains intact. See [core snapshots](cli-design.md#core-snapshots)
 for conversion that preserves an existing signature without a private key.
 
 Rebuild Flare after changing embedded public profiles. A separately built or

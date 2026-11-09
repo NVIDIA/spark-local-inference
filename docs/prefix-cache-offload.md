@@ -21,7 +21,7 @@ loading and terminal sizing remain in `helios::os`.
 Host offload requires explicit configuration. Derived defaults remain disabled
 until correctness and the inference-latency thresholds in section 4 pass.
 Preparation, captured graphs, and the runtime
-package format retain their contracts. The
+core format retain their contracts. The
 [core design](core-design.md#4-prefix-checkpoints-and-complete-model-state)
 defines checkpoint contents and ownership; the [CLI design](cli-design.md)
 defines configuration precedence.
@@ -32,7 +32,7 @@ defines configuration precedence.
   A later matching request restores a retained checkpoint the GPU no longer holds.
 - Live request state, in-flight speculative rounds, and anything not published
   as a checkpoint are never offloaded.
-- Every model contract is covered through the package's runtime-sized
+- Every model contract is covered through the core's runtime-sized
   allocation groups. The offload path contains no model-specific code.
 - Offload work never blocks the model worker thread or the model stream.
   Section 2.10 states the isolation mechanisms and section 4 the measurements
@@ -69,7 +69,7 @@ The warm checkpoint budget rounds down to whole slots. If host headroom cannot
 hold the full intake, it shrinks toward two complete windows,
 `2 × (64 + row_slots)`, and one warning reports the memory needed for full intake.
 Prepared image inputs use one eighth of the warm budget, rounded down to 4 KiB,
-in ordinary CPU memory; the rest holds checkpoint slots. Text-only packages use
+in ordinary CPU memory; the rest holds checkpoint slots. Text-only cores use
 all warm bytes for checkpoints. CPU input serialization also has a separate
 bounded window derived from prepared image buffers, including with warm zero.
 
@@ -97,7 +97,7 @@ are unchanged.
 ### 2.1 Checkpoint bytes
 
 Each rank bundle declares runtime-sized allocations with a `Sizing` record in
-`helios/proto/runtime_package.proto`: exactly one in the `STATE_ROWS` group and
+`helios/proto/runtime_core.proto`: exactly one in the `STATE_ROWS` group and
 one or more in the `KV_PAGES` group. Every `KV_PAGES` allocation on a rank is
 indexed by the same physical page id, so one logical page occupies `unit_bytes`
 at `base + id × unit_bytes` in each of them. These allocations are called page
@@ -127,32 +127,32 @@ tensor and context parallelism.
 
 `CacheGeometry`, one per rank, records the row plane (name, address,
 `unit_bytes`), the page planes in name order, the row count, and the page
-count. `allocate_caches` in `helios/src/runtime_package/memory.rs` collects it
+count. `allocate_caches` in `helios/src/runtime_core/memory.rs` collects it
 before consuming the sizing records, and `execution_manifest` in
-`helios/src/runtime_package/model.rs` attaches it to the rank's
+`helios/src/runtime_core/model.rs` attaches it to the rank's
 `ExecutionManifest` as `cache: Option<CacheGeometry>`.
 
 A layout fingerprint is the 16-byte BLAKE2b digest of the rank count, the page
 token count, and for each rank the ordered page plane names and unit sizes and
 the row plane name and unit size. The disk namespace combines this fingerprint
-with a 32-byte identity derived from the package's model identity and the
+with a 32-byte identity derived from the core's model identity and the
 selected continuation-state mode: ordinary execution, learned speculation,
 or copy speculation. `offload_identity` in
-`helios/src/runtime_package/model.rs` computes that identity with BLAKE2b and
+`helios/src/runtime_core/model.rs` computes that identity with BLAKE2b and
 the domain `flare-prefix-state-v1`. Ordinary execution omits draft-state
 updates, so its records cannot be loaded into speculative execution even when
 the physical layouts match. Changes to positive draft limits, concurrency,
 and verification policy that retain speculation do not change the state mode.
 Permanently fixed width one selects ordinary execution. Token-prefix
-keys retain the package's model identity within this storage namespace.
+keys retain the core's model identity within this storage namespace.
 
 The fingerprint is required because model identity does not encode every
 row-layout parameter.
-Preparing draft history can add row regions and page planes. Packages that
+Preparing draft history can add row regions and page planes. Cores that
 share a model identity can therefore have incompatible checkpoint bytes.
 Unit sizes do not depend on the concurrency or verification width selected
 at load time, so the fingerprint is stable across `flare run` options for
-one package.
+one core.
 
 ### 2.2 Store interface
 
@@ -621,7 +621,7 @@ and device allocations are never released beneath outstanding transfers.
 
 ### 2.9 Loader integration
 
-`NativeModel::load` in `helios/src/runtime_package/model.rs` skips host-store
+`NativeModel::load` in `helios/src/runtime_core/model.rs` skips host-store
 preparation entirely when memory and disk retention are disabled. Otherwise,
 after `allocate_caches`, the `Prepare host prefix cache` phase derives the
 storage namespace from the selected serving configuration, resolves settings,
@@ -672,7 +672,7 @@ Offload limits interference through bounded work and explicit ownership:
   positive nice value to reduce contention with the model worker, HTTP runtime,
   and frontend workers. Measure serving latency before adding CPU affinity.
 - Page cache: all record I/O is direct, so disk writes neither grow the page
-  cache nor evict the package file's mappings.
+  cache nor evict the core file's mappings.
 - Memory: every slab pool is fixed at startup and sized by the defaults in
   section 2.11. Descriptor arrays, rings, and events are preallocated.
 - Backpressure: every queue is bounded. When the disk thread falls behind,
@@ -694,7 +694,7 @@ Offload limits interference through bounded work and explicit ownership:
   the model's record directory, `<identity prefix>-<layout fingerprint>`, is
   created. An unwritable directory selects no disk store and says so on the startup line.
   Until step 13, an unset directory selects no disk store. The derived default
-  for `flare run` is a directory beside the package file named after it with the
+  for `flare run` is a directory beside the core file named after it with the
   `.safetensors` extension replaced by `.prefix-cache`.
 - Disk limit: one tenth of the free space on the directory's filesystem at
   startup. `--prefix-cache-disk-limit SIZE` overrides it; zero selects no disk
@@ -812,13 +812,13 @@ fresh execution plan from the prefix actually restored.
 
 With host retention disabled, fully covered inputs still skip tensor
 preparation and vision replay. Source decoding remains necessary to establish
-semantic identity. Existing packages use these paths without re-export.
+semantic identity. Existing cores use these paths without re-export.
 Per-image graph capacities and live feature storage stay fixed; total image
 tokens across a conversation are bounded by context rather than one window.
 
 ### 2.14 Ranks on separate hosts
 
-When a multi-host package's ranks run as separate processes, no process can
+When a multi-host core's ranks run as separate processes, no process can
 copy another host's GPU memory, so each host keeps the records of its own rank
 in its own record directory. A file holds one rank's planes and row in the
 ordinary record format, so every host's files of one record have the same name
@@ -873,10 +873,10 @@ and row checksum, keeps its row only when every rank holds the row, and drops
 records whose parent it drops. Every rank deletes or truncates its files to
 that agreement before rank zero builds its index. Rank zero and each peer also
 compare the layout fingerprint of their own rank's geometry at join, so a
-package whose ranks have different plane or row sizes fails startup instead of
+core whose ranks have different plane or row sizes fails startup instead of
 silently never matching.
 
-A memory tier keeps every rank's bytes in one process, so a multi-host package
+A memory tier keeps every rank's bytes in one process, so a multi-host core
 supports disk-only retention; startup rejects a nonzero
 `--prefix-cache-memory`. A peer's record service holds its host intake pool and
 transfer threads until rank zero closes its store after draining every rank,
@@ -1114,7 +1114,7 @@ on the file format fixed in step 5.
    `NativeResources`, and attach it in `execution_manifest`. Add
    `cache: Option<CacheGeometry>` to `ExecutionManifest` and keep
    `same_layout` in `helios/src/execution/threaded.rs` comparing it.
-   Acceptance: a unit test over a synthetic `Package` with one row allocation,
+   Acceptance: a unit test over a synthetic `Core` with one row allocation,
    several page planes, and a peer allocation yields the expected planes, and
    the fingerprint is unchanged across different `LoadOptions`.
 
@@ -1159,7 +1159,7 @@ on the file format fixed in step 5.
 7. **Transfers.** `helios/src/offload/transfer.rs`: the per-rank threads,
    id-to-address expansion, windows, bounded batches, and the shared handle.
    Acceptance: an ignored GPU test, keyed by an environment variable naming
-   any exported package with sized allocations, that loads the package, writes
+   any exported core with sized allocations, that loads the core, writes
    patterns into chosen page ids and a cache row, copies them to registered
    slabs, poisons the device storage, copies them back into different ids,
    and compares byte-exact.
@@ -1203,7 +1203,7 @@ on the file format fixed in step 5.
 
 12. **Disk configurations.** Directory resolution and host-retention flags
     for `flare run`. Acceptance: restart the server with the same
-    package and directory, replay the conversation, and observe a disk hit,
+    core and directory, replay the conversation, and observe a disk hit,
     prefill launches limited to the new tokens through `prefill_launches` in
     `qualify/server.py`, and the retrieval check, with the composite and with the
     disk store alone. Ordinary and speculative execution must use separate
@@ -1215,7 +1215,7 @@ on the file format fixed in step 5.
     enable the derived defaults of section 2.11, including the
     integrated-memory check, replace the initial policy rates with measured
     values, and update `docs/core-design.md` section 4, `docs/cli-design.md`
-    sections 3 and 4, and `docs/runtime-package-design.md` section 4. A
+    sections 3 and 4, and `docs/runtime-core-design.md` section 4. A
     threshold that fails is attributed to its channel in section 2.10 and
     fixed before the default changes.
 
@@ -1255,24 +1255,24 @@ on the file format fixed in step 5.
 
 Run CPU ownership, corruption, eviction, namespace, scheduler, and shutdown
 regressions with `cargo test --manifest-path helios/Cargo.toml --all-features --lib`.
-Package-backed GPU tests verify exact page and continuation-row bytes, including
+Core-backed GPU tests verify exact page and continuation-row bytes, including
 multi-window transfers, RAM eviction, bounded disk streaming, and restarts:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 \
-FLARE_OFFLOAD_TEST_PACKAGE=/data/flare-runtime/qwen38-tp1-c4-mtp5-ordinary.safetensors \
+FLARE_OFFLOAD_TEST_CORE=/data/flare-runtime/qwen38-tp1-c4-mtp5-ordinary.safetensors \
 FLARE_OFFLOAD_TEST_DIR=/data/flare-offload-tests \
 cargo test --manifest-path helios/Cargo.toml --all-features offload:: -- --ignored --test-threads=1
 ```
 
 Choose an idle GPU and create the test directory on a filesystem supporting
 direct I/O. Build the native CLI and run the HTTP regressions against a Qwen TP1
-package containing ordinary and MTP5 graphs:
+core containing ordinary and MTP5 graphs:
 
 ```sh
-cargo build --release --manifest-path flare/Cargo.toml
+cargo build --release --manifest-path flare-cli/Cargo.toml
 CUDA_VISIBLE_DEVICES=0 FLARE_RUN_CUDA_TESTS=1 \
-FLARE_OFFLOAD_TEST_PACKAGE=/data/flare-runtime/qwen38-tp1-c4-mtp5-ordinary.safetensors \
+FLARE_OFFLOAD_TEST_CORE=/data/flare-runtime/qwen38-tp1-c4-mtp5-ordinary.safetensors \
 .venv/bin/python -m pytest tests/server/test_prefix_cache_offload.py -q \
   --basetemp /data/flare-offload-tests/http
 ```
@@ -1284,12 +1284,12 @@ its `--basetemp` directory; use a dedicated test path.
 
 CPU tests cover steps 3 through 6, 8 through 10, 15's decision table, and
 the worker's use of the trait without a GPU. GPU tests are ignored by default
-and keyed by environment variables that locate a package, following
-`helios/src/runtime_package/event_tests.rs`. Each package-backed test loads
-the whole package, so they run one at a time:
+and keyed by environment variables that locate a core, following
+`helios/src/runtime_core/event_tests.rs`. Each core-backed test loads
+the whole core, so they run one at a time:
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 FLARE_OFFLOAD_TEST_PACKAGE=/path/to/package.safetensors \
+CUDA_VISIBLE_DEVICES=0 FLARE_OFFLOAD_TEST_CORE=/path/to/core.safetensors \
 FLARE_OFFLOAD_TEST_DIR=/data/offload-tests \
 cargo test --manifest-path helios/Cargo.toml --all-features -- --ignored --test-threads=1 offload::
 ```
@@ -1317,18 +1317,18 @@ with its own record directory, so the sharded transport runs between processes
 as it does between hosts:
 
 ```sh
-python3 -m qualify.multihost_cache --package /data/model.safetensors \
+python3 -m qualify.multihost_cache --core /data/model.safetensors \
   --gpus 0,1,2,3 --artifacts /data/multihost-cache-qualification
 ```
 
-The package's rank count must equal the number of GPUs. The scenario requires a
+The core's rank count must equal the number of GPUs. The scenario requires a
 GPU-cache hit without a host hit, a host restore after evicting the GPU copies,
 and a restore after restarting every rank. After each phase it checks that
 every rank holds the same record files, because a record that one rank lacks is
 unusable everywhere.
 
 Isolation measurements gate the defaults. Each is run without offload as the
-baseline and then with the composite under the same package, flags, and GPU,
+baseline and then with the composite under the same core, flags, and GPU,
 with raw numbers recorded and noisy results rerun:
 
 | Measurement | Workload | Metric | Threshold |

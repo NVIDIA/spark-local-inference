@@ -3,9 +3,10 @@
 Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. Ignition, the
 Python package in `ignition/`, prepares models with PyTorch, Transformers, and
 FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
-`heliopause/` crate. The Rust CLI in `flare/` links Helios, the runtime library
-in `helios/`, to serve requests through prepared CUDA graphs. Both Flare and
-Heliopause depend on Helios; Helios has no Python or preparation-tool dependency.
+`heliopause/` crate. The Rust CLI in `flare-cli/` uses the application library in
+`flare/`, which links the Helios runtime in `helios/` to serve requests through
+prepared CUDA graphs. Flare and Heliopause depend on Helios; Helios has no Python
+or preparation-tool dependency.
 
 ## Required setup and commit review
 
@@ -115,7 +116,7 @@ and a fixed-length template are not.
 Flare prepares and serves supported model recipes on NVIDIA GPUs through
 FlashInfer/b12x and prepared CUDA graphs. Single-host execution and cross-node
 tensor parallelism are both in scope. Orbit manages the hosts, preparation,
-packages, and rank processes needed for those serving workflows.
+cores, and rank processes needed for those serving workflows.
 
 Every contribution must address an explicit maintainer request, a demonstrated
 defect, a measured performance or memory problem, or inaccurate documentation.
@@ -136,7 +137,7 @@ alone do not establish a need for a change.
   be used to bypass them.
 - **Reject weakened guarantees.** Preserve complete cache and speculative state,
   inactive-row behavior, asynchronous resource lifetimes, checkpoint precision,
-  model semantics, and the declared model package contract. Do not remove
+  model semantics, and the declared model core contract. Do not remove
   validation, suppress errors, silently substitute execution paths, or relax references,
   workloads, or numerical bounds to obtain passing checks or favorable metrics.
   Numerical bounds must follow the required arithmetic and measured repeatability.
@@ -180,7 +181,7 @@ and hardware sections of the preparation guide.
 | Add or change a model recipe or execution component | [Model development](docs/model-development.md), [preparation development](docs/preparation-development.md), and the relevant [core design](docs/core-design.md#2-model-preparation) sections |
 | Change tuning, compilation, memory planning, capture, or TP preparation | [Preparation development](docs/preparation-development.md) and [preparation resources](docs/model-preparation.md#preparation-resources) |
 | Change Helios runtime, scheduling, caches, transport, or frontend | [Prepared model contract](helios/model-contract.md), [execution manifest](helios/manifest.md), and the relevant [Helios runtime](helios/README.md) and [core design](docs/core-design.md#3-helios-runtime-and-graph-interface) sections |
-| Change Protobuf metadata or package loading/export | [Runtime package design](docs/runtime-package-design.md), [prepared model contract](helios/model-contract.md), and [package compatibility](#model-package-compatibility) |
+| Change Protobuf metadata or core loading/export | [Runtime core design](docs/runtime-core-design.md), [prepared model contract](helios/model-contract.md), and [core compatibility](#model-core-compatibility) |
 | Diagnose or optimize performance | [GPU performance work](docs/performance-work.md), plus model or preparation development guidance for affected code |
 | Change CLI, API, or configuration behavior | [CLI design](docs/cli-design.md) and the relevant [API](docs/api.md) sections |
 
@@ -195,7 +196,7 @@ Run commands from the repository root:
 
 ```sh
 uv sync --locked --extra prepare --extra test
-cargo build --release --manifest-path flare/Cargo.toml
+cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
 After changing `heliopause/` or Helios code used by the extension, rebuild the
@@ -209,33 +210,33 @@ The [preparation guide](docs/model-preparation.md) owns dependency updates,
 local FlashInfer installation, GPU selection, compiler and tuning resources,
 model-specific launch instructions, and hardware setup. The
 [CLI design](docs/cli-design.md) defines flags, configuration, signing, and
-package selection.
+core selection.
 
 Use the preparation guide's [DeepSeek V4.1](docs/model-preparation.md#deepseek-v41-flash)
 or [DeepSeek V4](docs/model-preparation.md#deepseek-v4-flash) commands for those
 models. For repeated exports with compatible weights, follow
 [re-exporting with cached weights](docs/model-preparation.md#re-exporting-with-cached-weights).
 
-For serving-only Rust changes, rebuild Flare and load a compatible package.
-To exercise changes to prepared kernels, capacities, or the package format,
-export a package containing those changes. Packages must satisfy the declared
-[package contract](#model-package-compatibility). Changing prepared kernels or
+For serving-only Rust changes, rebuild Flare and load a compatible core.
+To exercise changes to prepared kernels, capacities, or the core format,
+export a core containing those changes. Cores must satisfy the declared
+[core contract](#model-core-compatibility). Changing prepared kernels or
 capacities requires re-export; an engine upgrade does not.
-Launch an exported package with `flare/target/release/flare run PACKAGE` when
+Launch an exported core with `flare-cli/target/release/flare run CORE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
 
 `ignition debug-serve` is only for diagnosing model and preparation faults.
 Do not use it for actual serving or apples-to-apples performance comparisons
 against other runtimes, including its native, `--direct`, and `--eager` modes.
-Use `ignition export` followed by `flare run PACKAGE` for those workflows.
+Use `ignition export` followed by `flare run CORE` for those workflows.
 Debug execution retains preparation resources and bounded preparation caches;
-its process, memory, and loading paths differ from native package serving.
+its process, memory, and loading paths differ from native core serving.
 
 For debugging without export, native `ignition debug-serve` requires Heliopause's
 `qualification` Cargo feature. Diagnostic `ignition debug-serve --direct` does not.
 Follow the
-[development launch instructions](docs/cli-design.md#development-without-package-export).
+[development launch instructions](docs/cli-design.md#development-without-core-export).
 
 ## Architecture and ownership
 
@@ -310,8 +311,8 @@ architectural boundary before committing the change.
 
 - Python loads weights, resolves and autotunes kernels, plans storage, warms
   execution paths, and captures supported graph variants before serving starts.
-  `ignition export` writes a runtime package and closes the prepared model.
-  `flare run PACKAGE` loads that package in a separate Rust serving process.
+  `ignition export` writes a runtime core and closes the prepared model.
+  `flare run CORE` loads that core in a separate Rust serving process.
 - Helios owns sockets, request processing, tokenization, chat templates,
   scheduling, cache operations, graph replay, and output streaming. Serving
   must not call back into Python.
@@ -330,20 +331,20 @@ architectural boundary before committing the change.
   Prefix reuse, branching, and speculative rollback must preserve all relevant
   state, not just token positions and KV pages.
 
-## Model package compatibility
+## Model core compatibility
 
 - Every engine version must load models supported by previous engine versions
   without re-export, re-signing, or changes to captured graphs. Preserve loading
-  and serving compatibility when changing package metadata, storage contracts,
-  and execution code. Retain readers and tests needed by existing packages.
+  and serving compatibility when changing core metadata, storage contracts,
+  and execution code. Retain readers and tests needed by existing cores.
 - Execution ABI numbers are descriptive metadata, not loading gates. Validate
   actual graph operations, buffer layouts, capacities, and dependencies. Protobuf
-  additions must use defaults that preserve existing package behavior; an absent
+  additions must use defaults that preserve existing core behavior; an absent
   or zero completion token capacity means eight.
 - Version semantic changes without abandoning previously supported models.
   Reserve removed Protobuf fields and enum values. Preserve signature, resource,
-  hardware, and structural validation. Test previous package layouts through
-  loading and serving alongside newly exported packages.
+  hardware, and structural validation. Test previous core layouts through
+  loading and serving alongside newly exported cores.
 
 ## Configuration
 
@@ -392,7 +393,7 @@ domain, and TLA+ for protocol states and asynchronous ordering. Add only the
 checks the affected behavior needs. A passing model does not establish Rust
 conformance or CUDA correctness; validate those boundaries separately.
 
-- Compare other runtimes against an exported package running through `flare run`.
+- Compare other runtimes against an exported core running through `flare run`.
   Timings from `ignition debug-serve` are diagnostic measurements and cannot
   establish comparative serving performance.
 - When a potential correctness, memory, or performance deficiency appears in
