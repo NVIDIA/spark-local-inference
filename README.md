@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/images/flare-wordmark.png" alt="Flare — ASCII wordmark above a solar flare" width="912">
+  <img src="docs/images/hyperflare.png" alt="Flare — ASCII wordmark above a supermassive solar flare" width="912">
 </p>
 
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
-Flare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
+Hyperflare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
 long conversations, coding agents, and repeated tool use. Its goal is to make
 the memory, bandwidth, and compute in workstations and compact systems such
 as DGX Spark go further, while keeping generation responsive.
@@ -34,11 +34,11 @@ The design rests on a few principles:
   hardware and kernel stack keeps those boundaries manageable.
 
 [vLLM](https://docs.vllm.ai/en/latest/) covers a much broader range of models,
-hardware, and deployment patterns. Flare trades that breadth for a focused
-serving contract around selected models and local workloads. Flare is not, and
+hardware, and deployment patterns. Hyperflare trades that breadth for a focused
+serving contract around selected models and local workloads. Hyperflare is not, and
 will never, be a replacement for production inference englines like vLLM.
 
-Think of Flare as a specialized option when its hardware and model coverage
+Think of Hyperflare as a specialized option when its hardware and model coverage
 fit your machine.
 
 Start with [model preparation and serving](docs/model-preparation.md).
@@ -47,7 +47,7 @@ See the [CLI guide](docs/cli-design.md) for configuration and the
 
 ## Licensing and contributions
 
-Flare's project code is licensed under [Apache 2.0](LICENSE). Contributions
+Hyperflare's project code is licensed under [Apache 2.0](LICENSE). Contributions
 require the sign-off described in [CONTRIBUTING.md](CONTRIBUTING.md).
 Third-party attributions are listed in [NOTICE](NOTICE); upstream terms remain
 applicable to third-party code and assets.
