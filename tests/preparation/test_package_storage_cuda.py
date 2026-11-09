@@ -81,7 +81,7 @@ def test_projection_fixture_pools_release_after_trial_owners(mailbox_storage):
         second = acquire()
         assert first is second
         first.produce()
-        assert torch.equal(first.source, first.seed)
+        assert torch.equal(first.source.cpu(), first.seed)
         del first
         gc.collect()
         assert torch.cuda.memory_allocated() > baseline
@@ -119,7 +119,7 @@ def test_attention_fixture_releases_before_projection_tuning(mailbox_storage):
     assert first.nbytes == 6 * source.nbytes + 8
     first.q.fill_(float("nan"))
     second.produce()
-    assert torch.equal(second.q, second.seed_q)
+    assert torch.equal(second.q.cpu(), second.seed_q)
     del first, second
     gc.collect()
     torch.cuda.synchronize()

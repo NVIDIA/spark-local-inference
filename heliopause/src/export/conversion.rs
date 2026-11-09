@@ -182,6 +182,35 @@ fn export_payload_combine(
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+#[pyfunction]
+fn export_payload_edit(
+    py: Python<'_>,
+    source: String,
+    destination: String,
+    publisher: String,
+    profiles: String,
+    served_model_name: Option<String>,
+    chat_template: Option<Vec<u8>>,
+) -> PyResult<()> {
+    let request: PublisherRequest = serde_json::from_str(&publisher)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let publishers = payload_publishers(&profiles)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    py.detach(|| -> Result<()> {
+        let publisher = request.publisher()?;
+        helios_core::package::conversion::edit(&helios_core::package::conversion::EditRequest {
+            source: Path::new(&source),
+            output: Path::new(&destination),
+            publishers: &publishers,
+            key: publisher.signing_key(),
+            served_model_name: served_model_name.as_deref(),
+            chat_template: chat_template.as_deref(),
+        })?;
+        Ok(())
+    })
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Re-sign one payload package under a fresh identity, recompressing executables.
 #[pyfunction]
 fn export_payload_promote(
@@ -386,6 +415,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_payload_convert, module)?)?;
     module.add_function(wrap_pyfunction!(export_payload_combine, module)?)?;
     module.add_function(wrap_pyfunction!(export_payload_promote, module)?)?;
+    module.add_function(wrap_pyfunction!(export_payload_edit, module)?)?;
     module.add_function(wrap_pyfunction!(export_payload_convert_cache, module)?)?;
     Ok(())
 }

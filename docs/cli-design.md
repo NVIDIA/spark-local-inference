@@ -53,8 +53,8 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 The Python distribution and source package are named `ignition`. Install the
 preparation environment with `uv sync --extra prepare --extra test`, then use
 `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
-Preparation commands apply the bundled, version-checked Inductor and Triton patches before
-importing preparation libraries; `uv run --extra prepare ignition ...`
+Preparation commands install version-checked runtime patches after setting the
+dependency environment; `uv run --extra prepare ignition ...`
 uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
 for patch application in standalone Python tools.
 
@@ -73,6 +73,7 @@ ignition export  [MODEL] [flags]                prepare a model in the shared ca
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
 ignition bench [MODEL] [flags]                   measure prepared decode-round or prefill graph latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
+ignition edit PACKAGE --output PATH [flags]      edit frontend metadata without preparing the model
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
@@ -203,11 +204,13 @@ storage according to those selections and available GPU memory.
 
 ### GPU graph latency benchmark
 
-`ignition bench qwen3.8-27b` prepares the real Qwen3.8-27B target and DFlash2
-draft checkpoint, captures the selected graph catalog, and measures complete
-speculative GPU rounds with CUDA events. It opens no HTTP listener and exports
-no package. The benchmark supports the Qwen3.8-27B dense recipe on one local GPU;
-other recipes fail explicitly.
+`ignition bench` prepares the target and draft checkpoints, captures the selected
+graph catalog, and measures complete speculative GPU rounds with CUDA events.
+It opens no HTTP listener and exports no package. Supported recipes are
+Qwen3.8-27B DFlash2 on one local GPU and Kimi K3.1 Pro DSpark on sixteen local
+GPUs. Tensor-parallel samples report the slowest rank's graph duration. Every
+rank finishes restoring request, cache, recurrent, and sampling state before
+the timed graph starts.
 
 ```sh
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
@@ -215,13 +218,17 @@ other recipes fail explicitly.
   --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --prefill \
   --prefill-chunk-size 4096 --contexts 0,4096 --output /tmp/qwen38-prefill.json
+.venv/bin/ignition bench kimi-k3.1-pro --gpus 0-15 \
+  --batches 8 --max-concurrency 8 --verify-width 8 --contexts 8192 \
+  --speculative-token-capacity 64 --online-mxfp8 \
+  --autotune-effort default --output /tmp/kimi31-rounds.json
 ```
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
 | `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4,8`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
 | `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
 | `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
@@ -243,6 +250,11 @@ that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
 
+Kimi K3.1 Pro supports verification width eight. Its selected catalog contains
+the requested speculative rounds and the initialization and prefill graphs
+needed to establish their contexts. Vision weights retain their configured
+residency, while image graphs are omitted from this text benchmark.
+
 For fifteen drafts plus the pending token, select `--mtp-draft-tokens 15` or
 `--verify-width 16`. Specifying both requires matching values. This measures the
 native width-sixteen graph, including verification, commit, and completion
@@ -256,7 +268,7 @@ publication, with package-defined ABI 6 completion capacity:
   --output /tmp/qwen38-depth15-rounds.json
 ```
 
-With `--speculation-study`, batches and concurrency must be one; the default
+`--speculation-study` requires Qwen3.8-27B DFlash2. Batches and concurrency must be one; the default
 context is 8192. Widths 8, 13, and 16 prepare respectively 7, 12, and 15 drafts.
 The effective DFlash2 proposal block equals the selected width, independently
 of the checkpoint's eight-token block declaration. Weights and checkpoint
@@ -421,7 +433,7 @@ explicit flags take precedence.
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--force-moe-decode-a16` / `--no-force-moe-decode-a16` | Prepare Qwen3.8 Flash NVFP4 target routed experts as one packed weight owner: decode and speculative verification use W4A16 at every token-row count, and separate prefill graphs use calibrated A4. Requires SM120/121, checkpoint activation scales, and rank-local expert intermediate width divisible by 64 (TP1/2). Mixed prefill and other recipes/precisions reject the flag. Shared experts and stored A16 MTP experts retain their precision. Overrides `[preparation] force_moe_decode_a16`; the resolved value is recorded in the plan and package rebuild metadata. | off |
 | `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
-| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
+| `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3.1 converts only fused target KDA input projections; other target and DSpark draft projections retain checkpoint precision. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
 Speculative token capacity and packed graph budget also accept configuration-file
@@ -796,10 +808,10 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare packages, not source Transformers checkpoints. Hardware variants
-are separate Hugging Face revisions named `gb10` and `gb202`. Automatic selection
+are separate Hugging Face revisions named `gb10`, `gb202`, and `gb300`. Automatic selection
 queries the selected GPUs' PCI device identifiers through NVML without initializing
 CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
-6000 Blackwell, select `gb202`. All selected GPUs must belong to the same family.
+6000 Blackwell, select `gb202`; GB300 selects `gb300`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
 Revision detection runs in a short-lived process so NVML's worker threads cannot
@@ -830,7 +842,7 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10`, `gb202`, or `gb300` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
@@ -1027,6 +1039,34 @@ repository with the Hugging Face upload client as either canonical form. Export
 and conversion do not upload or change publisher trust. Removing an entry removes
 its hard links; shared payload objects remain available for other entries, and
 `flare models gc` reclaims objects nothing references.
+
+### Editing package frontend metadata
+
+`ignition edit` creates a development-signed copy of a payload-format package.
+`--served-model-name NAME` replaces the served alias in every deployment while
+preserving the canonical model identity. `--chat-template FILE` replaces the
+packaged UTF-8 Jinja template. The native renderer validates its syntax and
+message-boundary marks; templates for non-Jinja prompt encoders cannot be replaced.
+At least one edit is required, and `--output` must not exist.
+
+```sh
+ignition edit /data/flare-runtime/model --output /data/flare-runtime/model-medium \
+  --served-model-name nvidia/Qwen3.8-27B-NVFP4 \
+  --chat-template /data/flare-runtime/chat-template-medium.jinja \
+  --development-publisher /data/flare-runtime/development-publisher.json
+```
+
+The source stays unchanged. Stored weights, compressed kernels, CUDA graphs, and
+execution capacities retain their exact bytes. Editing does not load a model,
+compile, capture, or recompress executables. Companions are hardlinked on the same
+filesystem and copied otherwise. Source signatures and structural metadata are
+validated; unchanged weight bytes are not rehashed.
+
+`--publisher-keys PATH` adds source public profiles and can be repeated.
+`--development-publisher PATH` supplies a development source profile; it defaults
+to `development-publisher.json` beside the configuration file. The output always
+uses the local development key beside that configuration, regardless of configured
+production publishing settings. Use `ignition sign` afterward for publication.
 
 ### Signing and local development
 

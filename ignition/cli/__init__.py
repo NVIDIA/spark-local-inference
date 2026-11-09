@@ -104,6 +104,14 @@ def _parser() -> argparse.ArgumentParser:
     signing.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     signing.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     signing.add_argument("--development-publisher", type=Path, help="source public profile (default: beside config)")
+    editing = command("edit", publishing.edit, "edit package frontend metadata without rebuilding the model")
+    editing.add_argument("package", type=Path, help="signed payload package file or directory")
+    editing.add_argument("--output", required=True, type=Path, help="destination directory; must not exist")
+    editing.add_argument("--served-model-name", help="replace the served alias for every deployment")
+    editing.add_argument("--chat-template", type=Path, help="replacement UTF-8 Jinja template with message-boundary marks")
+    editing.add_argument("--publisher-keys", type=Path, action="append", default=[],
+                         help="public publisher profiles authenticating the source; repeatable")
+    editing.add_argument("--development-publisher", type=Path, help="source development public profile (default: beside config)")
     combining = command("combine", publishing.combine, "combine prepared TP packages into one signed package")
     combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format packages")
     combining.add_argument("--output", required=True, type=Path, help="destination package directory; must not exist")
@@ -238,7 +246,7 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="development: capture graphs without compiling forwards")
     advanced.add_argument("--online-mxfp8", action="store_true",
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading"
-                               " (Kimi K3 KDA, MLA except batched key/value, shared"
+                               " (Kimi K3.1 target KDA inputs only; Kimi K3 KDA, MLA except batched key/value, shared"
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
                                " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")

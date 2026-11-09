@@ -148,8 +148,8 @@ pool holds only graph-local intermediates and is also cleared, as are unused
 bytes in the preparation allocator. Weight tensors, MTP weights, rotary
 tables, pointer tables, and required initialized metadata retain their contents.
 
-Serving accepts payload format 2 and signed format-6 logical-resource containers,
-with structural contract validation in both carriers. Execution ABI numbers
+Serving accepts payload format 2 and signed format-4 and format-6 logical-resource
+containers, with structural contract validation in every carrier. Execution ABI numbers
 do not gate loading. Engine upgrades must preserve previously supported models. Unsigned rank staging cannot load.
 The canonical format uses signed content IDs, payload-relative initializers,
 and unsigned physical locations; see [payload packages](package-format-design.md).
@@ -278,6 +278,11 @@ leading bytes, and trailing bytes use positioned I/O where needed. Output files
 retain their exact declared lengths. Direct-I/O errors fail the operation.
 
 Payload publication verifies source bytes and existing cache objects before reuse.
+Cache publication checks up to eight payloads concurrently, retaining each
+verified object's file handle and cache lease until its staging link is created.
+Object installation, staging links, and location records remain serialized.
+Every duplicate source occurrence is verified; authorized cached-weight reuse
+retains its existing pinned-object checks.
 A cache miss installs an immutable object without replacing existing entries.
 `--no-weights` requires exact cached weight payloads, including tuned weights;
 missing or corrupt required payloads fail publication. Executable and initial-state
@@ -289,7 +294,8 @@ weight materialization, and frontend assets. Coordinators report export peer wai
 rank transfers, and preparation-resource release before publication.
 Publication reports payload assembly, validation, frontend verification, each rank's
 executable compression and installation, each rank's data verification and
-installation, shared data, metadata signing, and final package commit.
+installation, shared data, metadata signing, and final package commit. Combining
+several source deployments first reports source payload verification.
 
 Native phases animate and update elapsed time independently of Python. Byte totals
 count plaintext executable inputs or data source occurrences, including duplicate
@@ -323,6 +329,13 @@ collective preparation records the complete offline ladder as
 `RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
 original ladder file path. Helios does not interpret that preparation input.
 
+Online MXFP8 conversion records its resolved projection group in
+`RebuildManifest.online_mxfp8_scope`. An absent or empty field means `all`,
+independently of the recipe's preparation default. Explicit `all` and `kda-input`
+values retain their meanings. Weight reuse and package combination reject
+different conversion groups; changing a recipe default never changes stored
+weights or the serving behavior of an exported package.
+
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
 owner paths, packing-owner types, dtypes, shapes, element strides, and
@@ -333,6 +346,11 @@ share storage. Ignition describes live tensor metadata; Heliopause resolves its
 addresses against retained allocations and creates no weight copy.
 Meta tensors, discarded storage, and disposable scratch are listed as
 unavailable rather than treated as recoverable weights.
+
+Payload rank bodies retain these catalogs inline or in a lossless zstd frame.
+Verification authenticates rank metadata and checks decoded size bounds before
+catalog consumers decompress one catalog at a time. The catalog contents and
+weight reuse comparisons are independent of that encoding.
 
 These catalogs describe prepared storage, whose names and packing can differ
 from the original checkpoint. They do not serialize Python objects or execute
@@ -394,13 +412,21 @@ by 4 TiB. The decoder accepts one bounded zstd frame, caps its window at 8 MiB,
 and rejects truncated or extra frames, trailing bytes, and decoded length
 mismatch.
 
-Signatures authenticate the stored frame and its signed decoded length. Helios
-authenticates each compressed chunk against its signed commitment before feeding
+For payload format 2 and signed format 6, signatures authenticate the stored frame
+and its signed decoded length. Helios authenticates each compressed chunk against
+its signed commitment before feeding
 it to the decoder; it does not require hashing the entire combined executable
 payload first. Acceptance is a trust and license decision: the value passed to
 `authorize` equals the signed publisher namespace exactly. It is not key
 material. Weights and tables stay uncompressed and retain direct-I/O compatibility
 and storage deduplication.
+
+Signed format 4 uses the `flare-package-signature-v4` signature domain and
+AES-256-GCM executable encoding. Each encrypted chunk contains up to 4 MiB of plaintext and a 16-byte
+authentication tag. The reader validates the signed ciphertext hashes, derives the key
+from the publisher key, package ID, accepted namespace, and resource offset, and
+authenticates each chunk before exposing its plaintext. Loading these packages
+does not modify their signatures, weights, or captured graphs.
 
 `PackageClaim::read` returns what a package claims before verification: signer
 fingerprint, namespace, official source, and development marker, syntax-checked
@@ -411,8 +437,9 @@ license. `VerifiedPackage::authorize` requires the acceptance string to equal th
 signed publisher namespace exactly, records it, and optionally checks the
 stored-data contents. Only its `AuthorizedPackage` result can enter
 `NativeModel::load` or `NativeResources::load`. Executable resources are
-hash-checked, decompressed, and length-checked before CUDA receives them. Frontend assets retain
-signed digest checks. Open package descriptors remain alive through native
+hash-checked, decoded according to their signed format, and length-checked before
+CUDA receives them. Frontend assets retain signed digest checks. Open package
+descriptors remain alive through native
 use, including deferred frontend and embedding-table reads; replacing the
 pathname cannot redirect those reads. Package files must remain immutable while
 loaded. Signatures authenticate bytes and do not sandbox executable code.

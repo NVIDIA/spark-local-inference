@@ -4,6 +4,7 @@
 
 """Collective preparation cannot launch ahead of a peer or mismatched declaration."""
 
+import multiprocessing
 from types import SimpleNamespace
 
 import pytest
@@ -290,10 +291,76 @@ def test_sharded_finalists_preserve_empty_shards_and_rank_order():
 
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
     owner = coordinator(monkeypatch)
+    monkeypatch.setattr(dist, "get_rank", lambda: 4)
+
+    def broadcast(values, *, src, group):
+        assert src == 4 and group is owner.group
+        assert len(values) == 1
+
+    def reduce(matching, *, op, group):
+        import torch
+
+        assert group is owner.group and op == dist.ReduceOp.MIN
+        assert matching.device.type == "cpu" and matching.dtype == torch.int32
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(dist, "all_reduce", reduce)
     assert owner.same_on_every_rank("NVIDIA GB10")
-    monkeypatch.setattr(dist, "all_gather_object",
-                        lambda states, value, **kwargs: states.__setitem__(slice(None), [value, "NVIDIA GB300"]))
+    monkeypatch.setattr(dist, "all_reduce", lambda matching, **kwargs: matching.fill_(0))
     assert not owner.same_on_every_rank("NVIDIA GB10")
+
+
+def _equality_rank(rank, world, store, outcome):
+    from datetime import timedelta
+    import traceback
+
+    import torch
+
+    try:
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank,
+                                world_size=world, timeout=timedelta(seconds=15))
+        owner = CollectivePreparation(dist.group.WORLD)
+        catalog = ("NVIDIA GB202", (("projection", {"shape": (64, 128), "dtype": "bf16"}, ()),))
+        changed = ("NVIDIA GB202", (("projection", {"shape": (65, 128), "dtype": "bf16"}, ()),))
+        results = (owner.same_on_every_rank(catalog),
+                   owner.same_on_every_rank(changed if rank == world - 1 else catalog),
+                   owner.same_on_every_rank(False))
+        group = dist.new_group(ranks=[1, 2], backend="gloo", timeout=timedelta(seconds=15))
+        subgroup = None
+        if rank in (1, 2):
+            owner = CollectivePreparation(group)
+            subgroup = (owner.same_on_every_rank(catalog),
+                        owner.same_on_every_rank(changed if rank == 2 else catalog))
+        assert not torch.cuda.is_initialized()
+        outcome.put((rank, (*results, subgroup)))
+    except BaseException:
+        outcome.put((rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_gloo_value_agreement_reaches_every_rank_and_subgroup(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    world = 3
+    outcome = context.Queue()
+    processes = [context.Process(target=_equality_rank,
+        args=(rank, world, tmp_path / "store", outcome)) for rank in range(world)]
+    for process in processes:
+        process.start()
+    try:
+        results = dict(outcome.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        assert results == {0: (True, False, True, None),
+                           1: (True, False, True, (True, False)),
+                           2: (True, False, True, (True, False))}
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
 
 
 @pytest.mark.parametrize("ring", [False, True])

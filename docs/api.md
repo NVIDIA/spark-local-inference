@@ -370,6 +370,25 @@ or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
 
+The terminal event carries a termination cause, and each protocol maps the
+cause to its finish reason. An output limit reports `length` on Chat
+Completions and Completions, `max_tokens` on Messages, and `incomplete` with
+`incomplete_details.reason` `max_output_tokens` on Responses, even when parsed
+calls completed the answer. Otherwise, when parsed calls complete an answer the
+user did not stop, Chat Completions reports `tool_calls` and Messages
+`tool_use`; raw Completions rejects tool parameters. Any other cause reports
+`stop` on Chat Completions and Completions, `stop_sequence` on Messages for a
+matched string stop and `end_turn` for every other cause, including an honored
+end-of-sequence token and an explicit token stop, and `completed` on Responses.
+The cause is decided at the terminal token: an honored end-of-sequence token or
+a matched string stop that lands on the final allowed token is the cause, so
+the response reports the stop reason rather than the limit reason. A request
+admitted with `ignore_eos` does not treat end-of-sequence tokens as
+terminating, so one that exhausts its output limit reports the limit reason
+even when its last generated token is end-of-sequence. A request the scheduler
+cannot grow past page capacity also reports the limit reason before the
+declared limit is reached.
+
 A reasoning delimiter that the tokenizer encodes as one token, such as
 `<think>`, `</think>`, `</mm:think>`, or Gemma 4's `<channel|>`, opens or
 closes reasoning only when the model generates that token. When a model writes
@@ -557,7 +576,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `qwen38_dense` | 1 | 0.95 | 20 | Temperature [0.7, 1]; top-p [0.8, 0.95]; presence penalty [0, 2] | [Qwen3.8-27B thinking/instruct presets](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices) |
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
-| `deepseek41` | 1 | 1 | Disabled | Top-p [0.95, 1]; repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 defaults](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference); [V4.1-Flash top-p recommendations and benchmarks](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash#minimal-inference) |
+| `deepseek41` | 1 | 1 | Disabled | Repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
 | `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |

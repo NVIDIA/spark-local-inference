@@ -348,7 +348,7 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if self.version != 3 {
+        if !(1..=3).contains(&self.version) {
             return Err("unsupported prepared model contract version; re-export the model package".into());
         }
         if self.vocabulary == 0
@@ -681,6 +681,24 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_contract_versions_validate_declared_state_storage() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+        for version in [1, 2, 3] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            contract.validate(&manifest).unwrap();
+            contract.graphs[0].state[0].view.buffer = "missing_state".into();
+            assert!(contract.validate(&manifest).is_err());
+        }
+        for version in [0, 4, u32::MAX] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            assert!(contract.validate(&manifest).is_err());
+        }
+    }
 
     #[test]
     fn state_view_validation_resolves_buffers_and_preserves_storage_errors() {

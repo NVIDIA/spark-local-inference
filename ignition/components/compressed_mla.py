@@ -123,7 +123,7 @@ class PreparedCompressedMLA:
                 owners=prime_owners(workspace, inputs, scratch, binding))
 
         benchmark_inputs = candidate_inputs(partial(Inputs, query, window, indexed, self.inputs,
-            cache_format, window_page_size, indexed_page_size))
+            cache_format, window_page_size, indexed_page_size), session=session)
         declare(session, (self.plan.request(name=name, prepare_call=prepare,
             benchmark_call=partial(benchmark_call, inputs=benchmark_inputs, workspace=workspace)),))
         register_finalizer(session, self.rebind, workspace=workspace)

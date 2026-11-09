@@ -127,6 +127,9 @@ class ReplicaPreparation:
 
 def _replica(parent, prepare, snapshot, values, gpu_uuids, options):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
     import flare_heliopause
 
     flare_heliopause.bind_parent_lifetime(parent)

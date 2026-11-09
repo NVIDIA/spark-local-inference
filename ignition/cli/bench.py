@@ -28,7 +28,7 @@ def _integers(text):
 
 def arguments(parser):
     options = parser.add_argument_group("GPU graph latency benchmark",
-        "Qwen3.8-27B DFlash2 only for speculative rounds; --prefill also supports --no-mtp. "
+        "Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark; --prefill also supports --no-mtp. "
         "Measures complete captured graphs; excludes preparation, preceding context setup, "
         "state restoration, scheduling, and HTTP.")
     options.add_argument("--speculation-study", action="store_true",
@@ -38,7 +38,7 @@ def arguments(parser):
     options.add_argument("--prefill", action="store_true",
                          help="time one exact --prefill-chunk-size graph, compiled with Inductor by default")
     options.add_argument("--batches", type=_integers, metavar="LIST",
-                         help="request batches from 1,2,4 (default: 1,2,4; --prefill requires 1)")
+                         help="request batches from 1,2,4,8 (default: 1,2,4; --prefill requires 1)")
     options.add_argument("--contexts", type=_integers, metavar="LIST",
                          help="preceding consumed tokens, multiples of 128 (default: 512,2048,8192,16384; --prefill: 0)")
     options.add_argument("--verify-width", type=int, metavar="N",
@@ -90,8 +90,8 @@ class Settings:
             raise UsageError("--speculation-study requires --batches 1 and --verify-width 8,13,16 without --prefill")
         if not args.prefill and not study and width not in (8, 16):
             raise UsageError("ignition bench requires --verify-width 8 or 16 and matching --mtp-draft-tokens 7 or 15")
-        if any(value not in (1, 2, 4) for value in batches):
-            raise UsageError("--batches must select request counts from 1,2,4")
+        if any(value not in (1, 2, 4, 8) for value in batches):
+            raise UsageError("--batches must select request counts from 1,2,4,8")
         if any(value < (0 if args.prefill else 128) or value % 128 for value in contexts):
             raise UsageError("--contexts must contain positive multiples of 128 (zero also allowed with --prefill)")
         if args.warmup < 1:
@@ -101,7 +101,7 @@ class Settings:
         if any(not 0 <= seed < 2**63 for seed in args.seeds):
             raise UsageError("--seeds must contain integers from 0 through 2^63 - 1")
         if args.no_mtp and not args.prefill:
-            raise UsageError("ignition bench requires DFlash2 state; --no-mtp does not apply")
+            raise UsageError("ignition bench requires draft state; --no-mtp does not apply")
         if args.mixed_prefill or args.prompt_logprobs:
             raise UsageError("ignition bench measures speculative rounds or unscored prefill; --mixed-prefill and --prompt-logprobs do not apply")
         if args.official_source is not None:
@@ -132,8 +132,10 @@ def run(args):
     settings = Settings.from_args(args)
     configuration = Configuration.load(args.config)
     model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b")
-    if model.recipe.name != "qwen38_dense":
-        raise UsageError("ignition bench supports only the Qwen3.8-27B DFlash2 recipe")
+    if model.recipe.name not in ("qwen38_dense", "kimi31"):
+        raise UsageError("ignition bench supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark")
+    if settings.speculation_study and model.recipe.name != "qwen38_dense":
+        raise UsageError("--speculation-study requires Qwen3.8-27B DFlash2")
     from ignition.preparation.selection import BenchmarkSelection
 
     concurrency = configuration.max_concurrency(model.checkpoint.alias, max(settings.batches), args.max_concurrency)
@@ -224,7 +226,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "language_model_only")}}
+            "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(
@@ -250,7 +252,10 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             prepared = prepare_recipe(model.recipe.prepare, snapshot, plan, compile_forwards=compile_forwards,
                 kernel_cache=configuration.directory("kernel_cache"), progress=progress, package_storage=storage)
         with prepared:
-            tokenizer = Tokenizer.from_file(str(Path(snapshot) / "tokenizer.json"))
+            root = getattr(prepared, "model", prepared)
+            tokenizer_asset = root.server_config["assets"]["tokenizer"]
+            tokenizer = (Tokenizer.from_str(tokenizer_asset["text"]) if "text" in tokenizer_asset
+                         else Tokenizer.from_file(tokenizer_asset["path"]))
             scenarios = (tuple(PrefillCase(chunk_tokens=plan.prefill_chunk, context_tokens=context)
                                for context in settings.contexts) if settings.prefill else
                          tuple((StudyCase if settings.speculation_study else BenchmarkCase)(batch=batch, width=width, packed_tokens=batch * width,

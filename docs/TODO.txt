@@ -1,6 +1,20 @@
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
     Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
 
+[ ] Preserve explicit A16 activation arithmetic in SM103 MXFP8 projections.
+    QuantizedProjection does not pass activation_mode to sm103_projection.query_for;
+    PackedProjectionQuery.mode chooses quantized activations from output width.
+    Trace affected recipes and validate on SM103 before changing the shared path.
+
+[ ] Preflight file-descriptor capacity before TP package assembly opens every
+    payload file and cache lease. Report the required limit before partially
+    assembling ranks; see heliopause/src/export/package.rs and model-preparation.md.
+
+[ ] Restore loading and serving for packages with separate proposal and verification
+    graphs, whose operation identifiers 10, 11, and 13 are reserved in
+    helios/proto/runtime_package.proto. Validate their original captured graphs
+    through native serving without re-export or re-signing.
+
 [ ] After merging dev/qwen27b in Flare and FlashInfer, evaluate combined MXFP8
     GDN QKV/Z/B/A projections for Qwen3.8 Flash Next through shared loading and
     execution components. Preserve TP partitioning and compare complete graph
@@ -141,9 +155,6 @@
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.
 
-[ ] Respect ignore_eos when classifying EOS at the output limit;
-    see helios/src/server/runtime.rs.
-
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
 
@@ -192,3 +203,17 @@
     MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
+
+[ ] Integrate RadixArk/Kimi-K3.1-Dflash2-Preview with its checkpoint mapping,
+    convolution, attention, and continuation state. Preserve Inferact DSpark.
+
+[ ] Compare Kimi K3.1 output-sharded latent prefill and staged history gathers
+    against selected-record prefill. Validate dynamic KV peer mappings through
+    fresh package export and native loading. See model-preparation.md.
+
+[ ] Reduce export memory with deferred graph executables and packed sparse
+    initializers. Preflight aggregate metadata bounds before payload publication.
+    Preserve package compatibility. See runtime-package-design.md.
+
+[ ] Extend cached-weight reuse to retained tensor ranges when allocations
+    disappear or compatible views move independently. See preparation-development.md.

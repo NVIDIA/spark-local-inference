@@ -720,7 +720,7 @@ pub(crate) fn publish_payload(
             .iter()
             .find_map(|rank| rank.hardware.clone())
             .ok_or_else(|| {
-                invalid("export naming requires the capture device identity (gb10 or gb202)")
+                invalid("export naming requires the capture device identity")
             })?;
         let deployment_id = cluster
             .as_ref()
@@ -1927,8 +1927,8 @@ fn rank_plan(
             attributes: function.attributes.clone(),
         })
         .collect();
-    Ok(payload_export::PublishRank {
-        body: pwire::RankBody {
+    payload_export::coalesce_initializers(&mut initializers)?;
+    let mut body = pwire::RankBody {
             rank: rank_index,
             deployment_id: deployment_id.to_string(),
             context: bundle.context.clone(),
@@ -1945,7 +1945,11 @@ fn rank_plan(
             execution: bundle.execution.clone(),
             roce: bundle.roce.clone(),
             prepared_weights: prepared,
-        },
+            compressed_prepared_weights: None,
+    };
+    helios_core::package::prepared_weights::compact(&mut body)?;
+    Ok(payload_export::PublishRank {
+        body,
         payloads,
         resources,
     })
@@ -2862,6 +2866,13 @@ mod payload_export_tests {
         .to_string();
         let source = super::super::weight_reuse::open_source(root.path(), "model", &profiles)?;
         let mut metadata = serde_json::to_value(&source.source)?;
+        let signed_bytes: Vec<u8> = serde_json::from_value(metadata["envelope"].clone())?;
+        let envelope = helios_core::package::protection::envelope(&signed_bytes)?;
+        let stored_rank = helios_core::package::schema::wire::RankBody::decode(
+            envelope.ranks[0].body.as_slice(),
+        )?;
+        assert!(stored_rank.prepared_weights.is_none());
+        assert!(stored_rank.compressed_prepared_weights.is_some());
         metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
             "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1});
         // Live sources contain only fresh state; the weight bytes cannot be read here.

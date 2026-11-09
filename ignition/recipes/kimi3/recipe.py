@@ -11,11 +11,14 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            package_storage=None, ranks=None, recipe=None, draft_source=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
     from .config import DRAFT_DIRECTORY, DSPARK_REPOSITORY, DSPARK_REVISION
 
+    recipe = RECIPE if recipe is None else recipe
+    if recipe.speculation is None and plan.speculation is not None:
+        raise ValueError(f"{recipe.served_model_name} preparation does not support speculation")
     if ranks is not None:
         raise ValueError("Kimi K3 preparation requires GPUs on one host")
     drafting = {}
@@ -28,9 +31,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         else:
             from huggingface_hub import snapshot_download
 
-            drafting["draft_checkpoint"] = snapshot_download(DSPARK_REPOSITORY, revision=DSPARK_REVISION, cache_dir=plan.hub_cache,
+            repository, revision = (DSPARK_REPOSITORY, DSPARK_REVISION) if draft_source is None else draft_source
+            drafting["draft_checkpoint"] = snapshot_download(repository, revision=revision, cache_dir=plan.hub_cache,
                                                              allow_patterns=("config.json", "model.safetensors"))
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(benchmark_selection=plan.benchmark_selection,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -38,9 +43,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
+        retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
-        vision=not plan.language_model_only, **drafting)
+        vision=not plan.language_model_only, sampling_defaults=recipe.sampling_defaults.as_dict(),
+        frontend_template=str(Path(__file__).parent.parent / recipe.name / "assets" / "chat_template.jinja"),
+        **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
@@ -73,7 +80,7 @@ RECIPE = Recipe(
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.
-    online_mxfp8=True,
+    online_mxfp8=True, online_mxfp8_scopes=("all", "kda-input"),
     # Decode and verification run each MoE layer's shared experts beside its routing and routed experts.
     stream_overlap=True,
     # Text-only plans, as vLLM serves Kimi K3 with --language-model-only, leave the MoonViT encoder unloaded.

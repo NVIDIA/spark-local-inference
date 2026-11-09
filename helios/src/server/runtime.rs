@@ -1844,15 +1844,11 @@ impl<'a> Worker<'a> {
                                     None => GenerationEvent::Token(token),
                                 });
                         }
-                        let reason = if user_stop
-                            || request
+                        let eos = !request.incoming.prompt.ignore_eos
+                            && request
                                 .last_token
-                                .is_some_and(|token| self.config.eos_token_ids.contains(&token))
-                        {
-                            "stop"
-                        } else {
-                            "length"
-                        };
+                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
+                        let reason = if user_stop || eos { "stop" } else { "length" };
                         request
                             .incoming
                             .emit(GenerationEvent::Finished {

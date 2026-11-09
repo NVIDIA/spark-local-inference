@@ -458,3 +458,21 @@ fn literal_replacement_maps_hints_and_drops_cuts_inside_replaced_spans() {
         assert_eq!(rendered.marks,expected.map(super::Mark::Hint).into_iter().collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn json_object_members_preserves_literals_order_and_duplicate_keys() {
+    let source = r#" {"z":1e2,"a":[1,  2],"z":-0,"obj":{ "b" : false },"s":"café\n\u4e16","nil":null} "#;
+    let template = CompiledTemplate::compile("{{ json_object_members(source) | tojson(ensure_ascii=false) }}").unwrap();
+    let context = json!({"source": source});
+    let rendered = template.render(context.as_object().unwrap(), &[]).unwrap();
+    let members: Json = serde_json::from_str(&rendered.text).unwrap();
+    assert_eq!(members, json!([
+        ["z",100.0,"1e2"], ["a",[1,2],"[1,  2]"], ["z",-0.0,"-0"],
+        ["obj",{"b":false},"{ \"b\" : false }"], ["s","café\n世",r#""café\n\u4e16""#], ["nil",null,"null"]
+    ]));
+    for source in ["[]", "null", "1", "{", "{\"x\":1} trailing", "{\"x\":}"] {
+        let context = json!({"source":source});
+        assert!(template.render(context.as_object().unwrap(), &[]).is_err(), "{source}");
+    }
+    assert!(CompiledTemplate::compile("{{ json_object_members([]) }}").unwrap().render(&Map::new(), &[]).is_err());
+}

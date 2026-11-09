@@ -20,6 +20,8 @@ from torch._higher_order_ops.triton_kernel_wrap import get_mutated_tensors, kern
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from ignition import runtime_patches
+
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
@@ -294,6 +296,7 @@ def _compile_module(module, calls, owner, output_tree):
         node.kwargs = torch.fx.node.map_aggregate(node.kwargs, portable_device)
     cache_code = torch.fx.GraphModule({}, cache_graph).code
     key = hashlib.sha256(pickle.dumps(('compiled-forward-portable-device-v1', cache_code, metadata, _OPTIONS, torch_key(),
+        runtime_patches.identity(),
         torch.cuda.get_device_capability(), torch.cuda.get_device_name()))).hexdigest()
     path = DEFAULT_CACHE_ROOT / 'compiled' / (key + '.bin')
     cache_hit = path.is_file()
@@ -358,6 +361,7 @@ def compile_forward(fn, *, tracer=None):
     weight payloads or process-local kernel handles. Each callable retains its
     own prepared invocations, buffers, and forward owner.
     """
+    runtime_patches.apply()
     output_tree = None
 
     def trace():
@@ -483,35 +487,51 @@ def _lower_storage(module):
             accesses[node] = set().union(*(accesses[arg] for arg in node.all_input_nodes))
     positions = {node: index for index, node in enumerate(originals)}
     last_write = {keys[arg]: positions[node] for node in originals for arg in mutations.get(node, ())}
+
+    # Complete writes to a disjoint region can fuse into their destination.
+    def complete_write(arg):
+        value = arg.meta['val']
+        if not value.is_contiguous():
+            return False
+        if key_for(arg) not in bases:
+            return True
+        begin, end = regions[key_for(arg)]
+        return (int(value.storage_offset()) * value.element_size() == begin
+                and value.numel() * value.element_size() == end - begin)
+
+    def tensor_operands(node):
+        leaves, _ = tree_flatten((node.args, node.kwargs))
+        return [arg for arg in leaves if isinstance(arg, torch.fx.Node)
+                and isinstance(arg.meta.get('val'), torch.Tensor)]
+
+    # Inductor can recompute the source when writing inputs back after the graph, but it then
+    # substitutes that source for the destination in every later opaque call, whose region-relative
+    # operands require the region's own base. Such copies execute in order instead.
+    deferred, opaque = set(), set()
+    for node in reversed(originals):
+        mutated = mutations.get(node)
+        if not mutated:
+            continue
+        # Opaque operands retain their prepared alignment and contiguous layout, and a source that
+        # reads the destination region would be gathered in place by the writeback.
+        source = node.args[1].meta['val'] if node.target is torch.ops.aten.copy_.default else None
+        if (node.target is torch.ops.aten.copy_.default
+                and source.is_contiguous() and source.storage_offset() == 0
+                and {key_for(arg) for arg in mutated}.isdisjoint(accesses[node.args[1]])
+                and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
+                and all(complete_write(arg) and key_for(arg) not in opaque for arg in mutated)):
+            deferred.add(node)
+        else:
+            opaque.update(key_for(arg) for arg in tensor_operands(node) if key_for(arg) in bases)
     calls, mutation_calls = [], {}
     for node in originals:
         if node.op != 'call_function':
             continue
         target = node.target
         mutated = mutations[node]
-        if not mutated:
+        if not mutated or node in deferred:
             continue
-        # Complete writes to a disjoint region can fuse into their destination.
-        def complete_write(arg):
-            value = arg.meta['val']
-            if not value.is_contiguous():
-                return False
-            if key_for(arg) not in bases:
-                return True
-            begin, end = regions[key_for(arg)]
-            return (int(value.storage_offset()) * value.element_size() == begin
-                    and value.numel() * value.element_size() == end - begin)
-
         mutable_keys = {key_for(arg) for arg in mutated}
-        # Opaque operands retain their prepared alignment and contiguous layout.
-        source = node.args[1].meta['val'] if target is torch.ops.aten.copy_.default else None
-        # A source that reads the destination region would be gathered in place by the writeback.
-        if (target is torch.ops.aten.copy_.default
-                and source.is_contiguous() and source.storage_offset() == 0
-                and mutable_keys.isdisjoint(accesses[node.args[1]])
-                and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
-                and all(complete_write(arg) for arg in mutated)):
-            continue
         reads, writes, read_indices, write_indices = [], [], {}, {}
         leaves, tree = tree_flatten((node.args, node.kwargs))
         operands, integers, integer_positions = [], [], []
@@ -626,16 +646,33 @@ def _reads_across_mutations(nodes, keys, mutations):
                  for node, operands in mutations.items() if operands}
     mutable = set().union(*mutations.values()) if mutations else set()
     live, fresh, required = {}, set(), {}
+    fresh_by_storage = {}
+    expires = [[] for _ in range(len(nodes) + 1)]
+
+    def forget(value, pending):
+        if value in fresh:
+            for key in pending:
+                values = fresh_by_storage[key]
+                values.remove(value)
+                if not values:
+                    del fresh_by_storage[key]
+
     for index, node in enumerate(nodes):
         operands = node.all_input_nodes
         reads = set().union(*(live.get(arg, set()) for arg in operands)) if operands else set()
         reads.update(keys[arg] for arg in operands if keys.get(arg) in mutable)
         if node in mutations:
-            for previous, pending in live.items():
-                if previous in fresh and last_use[previous] > index and pending & mutations[node]:
+            affected = set().union(*(fresh_by_storage.get(key, ()) for key in mutations[node]))
+            for previous in affected:
+                if last_use[previous] > index:
                     required.setdefault(previous, []).append(node)
+                    pending = live.pop(previous)
+                    forget(previous, pending)
                     pending.clear()
-        live = {value: pending for value, pending in live.items() if pending and last_use[value] > index}
+        for value in expires[index]:
+            pending = live.pop(value, None)
+            if pending:
+                forget(value, pending)
         if (node in keys and node.op == 'call_function'
                 and isinstance(node.target, torch._ops.OpOverload) and node.target.namespace == 'aten'):
             if keys[node] not in {keys[arg] for arg in operands if arg in keys}:
@@ -643,4 +680,13 @@ def _reads_across_mutations(nodes, keys, mutations):
             live[node] = reads
         elif node in keys and keys[node] in mutable:
             live[node] = {keys[node]}
+        else:
+            continue
+        pending = live[node]
+        if node in fresh:
+            for key in pending:
+                fresh_by_storage.setdefault(key, set()).add(node)
+        # Values are read before expiry, including values inserted without users.
+        end = max(index + 1, last_use[node]) if pending else index + 1
+        expires[end].append(node)
     return {node: required[node] for node in nodes if node in required}

@@ -119,6 +119,13 @@ def _norm(weight, eps=None):
     return module
 
 
+def interpolate_positions(weight, indices, factors, output):
+    for start in range(0, indices.shape[0], 4096):
+        end = start + 4096
+        output[start:end].copy_((weight[indices[start:end]].float()
+            * factors[start:end, :, None]).sum(1).to(output.dtype))
+
+
 class _Attention(nn.Module):
     def __init__(self, weights, scratch, cu, positions, *, session, workspace, name):
         super().__init__()
@@ -190,8 +197,9 @@ class PreparedVision:
 
     def __call__(self):
         s = self.scratch
-        positions = (self.position_weight[self.interpolation_indices].float()
-                     * self.interpolation_weights[:, :, None]).sum(1).to(s.hidden.dtype)
+        # Position embeddings are consumed before the first attention layer writes queries.
+        positions = s.query.view(s.query.shape[0], -1)[:, :s.hidden.shape[1]]
+        interpolate_positions(self.position_weight, self.interpolation_indices, self.interpolation_weights, positions)
         hidden = self.patch(s.patches) + positions
         embeddings = self.rotary_embeddings()
         for block in self.blocks:

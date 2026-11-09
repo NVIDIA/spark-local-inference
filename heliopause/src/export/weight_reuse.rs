@@ -271,9 +271,12 @@ impl Source {
                 || previous.checkpoint_revision != expected.checkpoint_revision
                 || previous.local_checkpoint != expected.local_checkpoint
                 || previous.tensor_parallel != expected.tensor_parallel
+                || previous.online_mxfp8 != expected.online_mxfp8
+                || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
+                    != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, and tensor-parallel size",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and online MXFP8 conversion settings",
                 ));
             }
             return Ok(protection::verify(
@@ -407,7 +410,7 @@ fn map_groups(
         .as_ref()
         .ok_or_else(|| invalid("--reuse-weights requires declared weight views"))?;
     let current = super::package::convert_prepared(rebuild, bundle, Some(views))?;
-    let prior = previous.prepared_weights.as_ref().ok_or_else(|| {
+    let prior = helios_core::package::prepared_weights::catalog(previous)?.ok_or_else(|| {
         invalid("cached rank has no prepared weight catalog; export with weights first")
     })?;
     let old_views: BTreeMap<_, _> = prior

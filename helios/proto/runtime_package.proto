@@ -114,6 +114,8 @@ message RebuildManifest {
   string collective_ladder_json = 26;
   // Preparation-only routed W4A16 decode/verification with calibrated A4 prefill.
   bool force_moe_decode_a16 = 27;
+  // Preparation-only online conversion group; omitted means all eligible projections.
+  string online_mxfp8_scope = 30;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
@@ -728,7 +730,8 @@ message ExecutionGraph {
   optional bool speculation_enabled = 10;
   uint64 estimated_duration_ns = 11; // Zero denotes an indeterminate duration.
   uint64 prefill_capacity = 12; // Prompt capacity of a mixed graph; zero otherwise.
-  // Physical target rows of a complete speculative operation, including rectangular layouts.
+  // Physical target rows of a complete speculative operation. Zero retains the rectangular
+  // batch_capacity * token_capacity layout.
   uint64 packed_token_capacity = 13;
   // Number of confidence prefixes produced per request in the selected completion frame.
   uint32 confidence_width = 14;
