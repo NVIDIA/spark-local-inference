@@ -5,13 +5,11 @@
 
 import torch
 
-from ignition.components.candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllGather
+from ignition.components.candidate_selection import PreparedCandidateSelection
 from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
 
-from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
+from .dcp import TOPK, PREFILL_ROWS, index_pages
 
 
 class SharedBuffers:
@@ -58,13 +56,6 @@ class PreparedIndexSelection:
         self.lengths = storage.buffer("local_lengths", (rows,), torch.int32)
         self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
         self.scores = storage.buffer("local_scores", (rows, TOPK), torch.float32)
-        self.packed = storage.buffer("candidates", (rows, TOPK, 2), torch.float32)
-        self.gathered = storage.buffer("gathered", (rows, TOPK * shards.world, 2), torch.float32)
-        self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
-        self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
-        self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
-        self.active = storage.buffer("active", (rows,), torch.bool)
-        self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
         self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
@@ -75,32 +66,37 @@ class PreparedIndexSelection:
         runtime = None if context is None else context.candidates
         if shards.world > 1 and runtime is None:
             raise ValueError("Kimi sparse selection requires a candidate exchange for every context rank")
-        self.gather = PreparedAllGather(self.packed.view(torch.bfloat16).view(rows, TOPK * 4),
-            self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=runtime,
-            session=session, coordinator=None if context is None else context.coordinator,
-            name=name + ".candidates", dependencies=(latent_cache,))
-        self.fold = PreparedOrderedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
-            self.selected_scores, self.selected, session=session, name=name + ".fold",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="agreement."))
-        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
-            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
+        tuning = None if context is None else getattr(context, "selection_tuning", None)
+        tune = tuning is not None and mode != "prefill" and metadata.starts.numel() == 1
+        self.merge = PreparedCandidateSelection(self.local, self.scores, self.positions, shards.index,
+            self.selected, world=shards.world, gather_runtime=runtime,
+            owner_runtime=context.candidate_owners if tune else None,
+            reduction_runtime=tuning.reduction if tune else None, session=session,
+            coordinator=None if context is None else context.coordinator, name=name+".merge",
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="merge."),
+            dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",))
+        # Replicated intermediates remain available to component diagnostics;
+        # model execution consumes only the selected global IDs.
+        self.gather, self.packed, self.gathered = self.merge.gather, self.merge.packed, self.merge.gathered
+        self.global_scores, self.global_ids = self.merge.values, self.merge.global_ids
+        self.fold_lengths, self.active = self.merge.lengths, self.merge.active
+        self.selected_scores, self.fold, self.candidate_rows = (
+            self.merge.selected_scores, self.merge.fold, self.merge.candidates)
+        if tune:
+            tuning.register(self.merge)
+        else:
+            self.merge.bind("replicated")
 
     def prepare_local(self):
         """Produce rank-local candidates without using a peer communication channel."""
         index_pages(self.tables[:1] if self.mode == "prefill" else self.tables, self.pages)
         self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
         self.indexer()
-        pack_candidates(self.local, self.scores, self.packed, self.shards)
-        return self.packed
+        return self.merge.pack()
 
     def exchange(self):
         """Exchange local candidates, select global records, and agree on their order."""
-        self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
-        self.active.copy_(self.positions >= 0)
-        self.candidate_rows()
-        self.fold()
-        return self.selected
+        return self.merge.exchange()
 
     def __call__(self):
         self.prepare_local()

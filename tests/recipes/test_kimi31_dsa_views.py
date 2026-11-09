@@ -65,8 +65,10 @@ def test_equal_selection_stages_share_scratch_and_preserve_input_offsets(monkeyp
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
 
-    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedOrderedRowTopK"):
-        monkeypatch.setattr(indexer, name, operation)
+    from ignition.components import candidate_selection
+    monkeypatch.setattr(indexer, "PreparedFP8Indexer", operation)
+    for name in ("PreparedAllGather", "PreparedOrderedRowTopK"):
+        monkeypatch.setattr(candidate_selection, name, operation)
     rows = 257
     query = torch.zeros((rows, 4096), dtype=torch.bfloat16)
     weights = torch.zeros((rows, 32), dtype=torch.bfloat16)
