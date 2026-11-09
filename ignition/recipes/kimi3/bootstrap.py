@@ -59,6 +59,40 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
+def allocate_serial_workspace(buffers, *, text_rows, hidden_size, residual_count,
+                              auxiliary_count, vision_patches):
+    """Share text and vision backing while keeping each forward's live values disjoint.
+
+    First-fit allocation must see the largest slabs first. A smaller residual
+    reservation can otherwise force another vision QKV slab even though the
+    two forward families execute serially.
+    """
+    text_shapes = ((text_rows, hidden_size),) * 4
+    if auxiliary_count:
+        text_shapes += ((text_rows, auxiliary_count * hidden_size),)
+    text_elements = sum(rows * columns for rows, columns in text_shapes)
+    residual_shape = (text_rows, residual_count, hidden_size)
+    residual_elements = text_rows * residual_count * hidden_size
+    vision_first = (vision_patches > 0 and
+                    VisionScratch.workspace_elements(vision_patches) >= max(text_elements, residual_elements))
+
+    def reserve_vision():
+        VisionScratch.allocate(vision_patches, buffers.device, buffers=buffers.cursor())
+
+    if vision_first:
+        reserve_vision()
+    cursor = buffers.cursor()
+    if text_elements >= residual_elements:
+        shared = cursor.zeros((text_elements,), torch.bfloat16)
+        residual = cursor.zeros(residual_shape, torch.bfloat16)
+    else:
+        residual = cursor.zeros(residual_shape, torch.bfloat16)
+        shared = cursor.zeros((text_elements,), torch.bfloat16)
+    if vision_patches and not vision_first:
+        reserve_vision()
+    return cursor, residual, shared, text_shapes
+
+
 def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all"):
     """Scope kernel selections to target geometry, independently of attached drafts.
 
@@ -373,30 +407,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
         deferred_pool = package_storage.scratch_pool()
         with package_storage.scratch_pool() as scratch_pool:
-            # Completed residual blocks live through one text forward. Serial
-            # vision graphs can overwrite their slab before text execution.
-            residual_blocks = graph_buffers.cursor().zeros((max_tokens,
-                -(-len(weights.layers) // weights.config.text["attn_res_block_size"]),
-                weights.config.hidden), torch.bfloat16)
-            # Vision and text graphs execute serially and share disposable workspace.
-            text_shape = (max(config.prefill_chunk_size, config.decode_tokens), weights.config.hidden)
-            # KDA and MLA layers execute serially and share their attention output.
-            text_shapes = (text_shape,) * 4
-            if drafting:
-                text_shapes += ((text_shape[0], len(weights.config.draft.auxiliary_layers) * text_shape[1]),)
             patches = PATCH_CAPACITIES if config.vision and config.benchmark_selection is None else ()
-            cursor = graph_buffers.cursor()
-            cursor.zeros(residual_blocks.shape, torch.bfloat16)
-            shared_scratch = cursor.zeros((max(max(patches, default=0) * 3 * weights.config.vision["qkv_hidden_size"],
-                sum(rows * columns for rows, columns in text_shapes)),), torch.bfloat16)
-            if patches:
-                # Reserve the largest vision slabs before smaller text allocations share their chunks.
-                vision_cursor = graph_buffers.cursor()
-                vision_work = vision_cursor.zeros(shared_scratch.shape, torch.bfloat16)
-                VisionScratch.allocate(max(patches), device, work=vision_work, buffers=vision_cursor)
-                cursor = graph_buffers.cursor()
-                cursor.zeros(residual_blocks.shape, torch.bfloat16)
-                shared_scratch = cursor.zeros(shared_scratch.shape, torch.bfloat16)
+            cursor, residual_blocks, shared_scratch, text_shapes = allocate_serial_workspace(
+                graph_buffers, text_rows=max_tokens, hidden_size=weights.config.hidden,
+                residual_count=-(-len(weights.layers) // weights.config.text["attn_res_block_size"]),
+                auxiliary_count=len(weights.config.draft.auxiliary_layers) if drafting else 0,
+                vision_patches=max(patches, default=0))
             activation, total, kda_output, moe_output, *auxiliary = scratch_views(shared_scratch, text_shapes)
             mla_output = kda_output
             prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, weights.config, shard.world_size, device,
@@ -530,8 +546,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             name = f"vision{capacity}"
             with scratch_pool:
                 cursor = graph_buffers.cursor()
-                work = cursor.zeros(shared_scratch.shape, torch.bfloat16)
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, work=work, buffers=cursor)
+                vision_storage[capacity] = VisionScratch.allocate(capacity, device, buffers=cursor)
             encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
                 session=session, workspace=arena, name=name, buffers=cursor)
             forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence,

@@ -77,13 +77,18 @@ class VisionScratch:
     output: torch.Tensor
     normalized: torch.Tensor
 
+    @staticmethod
+    def workspace_elements(patches):
+        """BF16 elements in the fused QKV slab shared by serial vision stages."""
+        return patches * 4608
+
     @classmethod
     def allocate(cls, patches, device, *, work=None, buffers=None):
         def zeros(*shape):
             return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if buffers is None
                     else buffers.zeros(shape, torch.bfloat16))
-        work = zeros(patches * 4608) if work is None else work
-        if (work.ndim != 1 or work.numel() < patches * 4608 or not work.is_contiguous()
+        work = zeros(cls.workspace_elements(patches)) if work is None else work
+        if (work.ndim != 1 or work.numel() < cls.workspace_elements(patches) or not work.is_contiguous()
                 or work.dtype != torch.bfloat16 or work.device != torch.device(device)):
             raise ValueError("vision workspace requires contiguous BF16 storage for fused QKV")
         projected = zeros(patches, 1024)

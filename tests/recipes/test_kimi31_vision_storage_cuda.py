@@ -35,6 +35,8 @@ def test_full_encoder_matches_torch_norm_after_scratch_reuse(side):
     from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.vision import PreparedVision, VisionScratch, VisionWeights
+    from ignition.recipes.kimi3.bootstrap import allocate_serial_workspace
+    from ignition.recipes.kimi3.config import ModelConfig
 
     if not (CHECKPOINT / "config.json").is_file():
         pytest.skip("Kimi K3.1 checkpoint is not installed")
@@ -42,8 +44,11 @@ def test_full_encoder_matches_torch_norm_after_scratch_reuse(side):
     torch.cuda.set_device(device)
     weights = VisionWeights.load(inspect_indexed_checkpoint(CHECKPOINT), device)
     pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    # Text commits 24 residual blocks before vision can reuse the same slab.
-    residual = pool.cursor().zeros((4096, 24, 7168), torch.bfloat16)
+    config = ModelConfig.load(CHECKPOINT)
+    _, residual, _, _ = allocate_serial_workspace(pool,
+        text_rows=4096, hidden_size=config.hidden,
+        residual_count=-(-len(config.layers) // config.text["attn_res_block_size"]),
+        auxiliary_count=6, vision_patches=65536)
     cursor = pool.cursor()
     scratch = VisionScratch.allocate(rows, device, buffers=cursor)
     pixels = torch.empty_like(scratch.patches)
