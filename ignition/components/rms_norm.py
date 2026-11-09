@@ -7,11 +7,28 @@
 from dataclasses import replace
 
 import torch
+from b12x.norm import torch_rmsnorm
 from b12x.norm.hyperconnection import api as hyperconnection
 from b12x.preparation import PreparedCall
 
 from ignition.preparation.fixtures.hyperconnection import HyperconnectionBenchmarkInputs
 from ignition.preparation.tuning import benchmark_resource, declare
+
+
+class PreparedTorchRMSNorm:
+    """Caller-owned BF16 RMSNorm with Torch's vectorized FP32 arithmetic."""
+
+    def __init__(self, source, weight, output, *, eps, session, name):
+        self.weight, self.output = weight, output
+        self.eps = torch.finfo(torch.float32).eps if eps is None else float(eps)
+        query = torch_rmsnorm.query_from_call(source, weight, out=output, eps=self.eps)
+        self.plan = torch_rmsnorm.plan(query, device=source.device)
+        declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(source, weight, out=output, eps=self.eps), output=output)),))
+
+    def __call__(self, source):
+        torch.ops.b12x.torch_rmsnorm(source, self.weight, self.output, self.eps, self.plan.handle)
+        return self.output
 
 
 class PreparedRMSNorm:

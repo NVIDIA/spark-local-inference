@@ -34,6 +34,7 @@ def test_unused_bytes_include_live_block_padding_and_retired_pools(monkeypatch):
     storage = CoreStorage.__new__(CoreStorage)
     storage.device = 0
     storage._preparation_pools = {(0, 1), (0, 2)}
+    storage._weight_arenas = []
 
     def block(offset, size, requested, state="active_allocated"):
         return dict(address=base + offset, size=size, requested_size=requested, state=state)

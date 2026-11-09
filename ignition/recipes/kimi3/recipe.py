@@ -11,7 +11,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            core_storage=None, ranks=None, recipe=None, draft_source=None):
+            core_storage=None, ranks=None, recipe=None, draft_source=None, draft_directory=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
     from .config import DRAFT_DIRECTORY, DSPARK_REPOSITORY, DSPARK_REVISION
@@ -25,9 +25,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     if plan.speculation is not None:
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
                         speculative_token_capacity=plan.speculative_token_capacity,
-                        speculative_graph_budget=plan.speculation.graph_budget or 64)
-        if (Path(snapshot) / DRAFT_DIRECTORY).is_dir():
-            drafting["draft_checkpoint"] = str(Path(snapshot) / DRAFT_DIRECTORY)
+                        speculative_graph_budget=plan.speculation.graph_budget or 64,
+                        draft_head_quantization=plan.speculation.draft_head_quantization)
+        directory = DRAFT_DIRECTORY if draft_directory is None else draft_directory
+        if (Path(snapshot) / directory).is_dir():
+            drafting["draft_checkpoint"] = str(Path(snapshot) / directory)
         else:
             from huggingface_hub import snapshot_download
 

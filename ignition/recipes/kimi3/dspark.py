@@ -356,7 +356,10 @@ class SpeculativePreparation:
             from ignition.recipes.kimi31.dspark import PreparedContext as context_type
             from ignition.recipes.kimi31.dspark import PreparedDraft as draft_type
 
-            context_type = partial(context_type, context=collectives["context"])
+            # Accepted target taps remain live outside stage scratch. Their
+            # draft-context projection runs after target computation drains.
+            context_type = partial(context_type, context=collectives["context"],
+                                   allocator=decoder_buffers.stage_allocator("draft_context"))
             draft_type = partial(draft_type, context=collectives["context"],
                                  latents=collectives["latent_runtimes"][-1])
         self.forwards = DraftForwards(decoder,

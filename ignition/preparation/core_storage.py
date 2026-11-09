@@ -82,6 +82,7 @@ class CoreStorage:
         self.pool = torch.cuda.MemPool(allocator.allocator())
         self.graph_pool = torch.cuda.MemPool(allocator.allocator())
         self._preparation_pools = {self.pool.id}
+        self._weight_arenas = []
         self._scope = torch.cuda.use_mem_pool(self.pool, device=device)
         self.peer_storage = None
         # RoCEnante runtimes whose regions this storage holds; export records them for native ranks.
@@ -225,11 +226,19 @@ class CoreStorage:
         self._preparation_pools.add(pool.pool.id)
         return pool
 
+    def packed_weights(self):
+        """Own aligned immutable weight storage until graph users have drained."""
+        from .packed_weights import PackedWeights
+
+        arena = PackedWeights(self)
+        self._weight_arenas.append(arena)
+        return arena
+
     def unused_ranges(self):
         """Exclude free blocks and allocator padding from retained preparation pools."""
         import torch
 
-        ranges = []
+        ranges = [span for arena in self._weight_arenas for span in arena.inactive_ranges()]
         for segment in torch.cuda.memory_snapshot():
             if (segment["device"] != self.device
                     or tuple(segment["segment_pool_id"]) not in self._preparation_pools):

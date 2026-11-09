@@ -996,7 +996,7 @@ scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
 `--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
 `v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
-DSpark draft weights retain checkpoint precision. Omit the flag to retain
+DSpark and DFlash2 draft weights retain checkpoint precision. Omit the flag to retain
 checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
@@ -1078,6 +1078,41 @@ With seven drafts, logical pages use 2,912,256 bytes per rank and continuation
 rows use 33,238,272 bytes, including KDA verification history and partial draft
 pages. Prefix snapshots preserve the complete draft history. Loading a draft
 core with `--mtp-draft-tokens 0` selects its ordinary generation graphs.
+
+### DFlash2 proposals
+
+Select `--speculative-method dflash2` to use
+[`RadixArk/Kimi-K3.1-Dflash2-Preview`](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview)
+at revision `ea257b38a8ee755b65287bb8ccd0938b519ce26b`. Ignition downloads that
+draft when needed, or loads the same format from the target's `dflash2/`
+directory. Omitting the method keeps the Inferact DSpark configuration above.
+Both methods require sixteen target/context ranks.
+
+With the native CLI already built, this prepares the core and starts serving
+with four request slots, four image slots, and a 4096-token prefill chunk:
+
+```sh
+ulimit -Sn 65536
+PATH="$PWD/flare-cli/target/release:$PATH" .venv/bin/ignition run kimi-k3.1-pro \
+  --gpus 0-15 --speculative-method dflash2 --mtp-draft-tokens 7 \
+  --max-concurrency 4 --image-concurrency 4 --prefill-chunk-size 4096 \
+  --speculative-token-capacity 32 --speculative-graph-budget 16 \
+  --online-mxfp8 --autotune-effort default --compile-workers 32 --port 8000
+```
+
+DFlash2 consumes its checkpoint-declared AttnRes feature taps, applies grouped
+block convolutions and a candidate selector, and uses block-causal MLA over
+the declared sliding window. Accepted context records occupy a separate FP8
+ring; speculative records remain in scratch. Rollback and prefix snapshots
+therefore preserve the accepted window without committing rejected proposals.
+These state and feature contracts differ from Inferact DSpark's residual-block
+taps and full-context BF16 cache; the two draft formats are not interchangeable.
+
+The body and shared target vocabulary head remain BF16 with the KDA-input-only
+online conversion. An explicit `--draft-head-quantization mxfp8` or `nvfp4`
+prepares a separate proposal-head copy; it does not convert the target head.
+Its additional weight storage and effect on acceptance must be evaluated for
+the workload. The example keeps the BF16 head.
 
 Serving defaults follow the
 [model card](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results):

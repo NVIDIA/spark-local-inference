@@ -36,7 +36,8 @@ def _convolve(X, Delta, Base, Y, N: tl.constexpr, H: tl.constexpr, GROUP: tl.con
 
 
 class PreparedGroupedConvolution:
-    def __init__(self, source, weights, *, block_size, group_size, session, name, buffers, token_capacity=None):
+    def __init__(self, source, weights, *, block_size, group_size, session, name, buffers, token_capacity=None,
+                 runtime=None, coordinator=None):
         self.block_size, self.group_size = block_size, group_size
         self.base, self.tokens, self.hidden = weights["base"], *source.shape
         capacity = self.tokens if token_capacity is None else token_capacity
@@ -52,7 +53,18 @@ class PreparedGroupedConvolution:
             if key not in buffers:
                 buffers[key] = torch.zeros((capacity, width), dtype=torch.bfloat16, device=source.device)
         self.coefficients, self.before, self.after = (buffers[k][:self.tokens] for k in ("coefficients", "before", "after"))
-        self.project = UnquantizedProjection(source, weights["projection"], self.coefficients,
+        self.gather = None
+        local = self.coefficients
+        if runtime is not None:
+            from .collectives import PreparedChunkedAllGather
+
+            if "local_coefficients" not in buffers:
+                buffers["local_coefficients"] = torch.zeros((capacity, channels // runtime.world_size),
+                                                            dtype=source.dtype, device=source.device)
+            local = buffers["local_coefficients"][:self.tokens]
+            self.gather = PreparedChunkedAllGather(local, self.coefficients, runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".gather")
+        self.project = UnquantizedProjection(source, weights["projection"], local,
                                              session=session, name=name + ".coefficients")
 
     def convolve(self, source, side, output):
@@ -62,7 +74,9 @@ class PreparedGroupedConvolution:
         return output
 
     def prepare(self, source):
-        self.project(source)
+        local = self.project(source)
+        if self.gather is not None:
+            self.gather(local)
         return self.convolve(source, 0, self.before)
 
     def finish(self, source):

@@ -409,6 +409,36 @@ def test_trim_to_zero_releases_arena_owner_without_invalidating_existing_views()
     assert view.data_ptr() == pointer and view.untyped_storage().nbytes() == 256
 
 
+def test_trim_releases_unshared_candidate_before_selected_allocation(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def inspect(size, **kwargs):
+        if size == 512:
+            assert original() is None
+            assert arena.nbytes == 0
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", inspect)
+    arena.trim(257)
+    assert arena.nbytes == 512
+
+
+def test_trim_allocation_failure_leaves_empty_unfrozen_storage(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def fail(size, **kwargs):
+        if size == 512:
+            raise torch.OutOfMemoryError("selected allocation unavailable")
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", fail)
+    with pytest.raises(torch.OutOfMemoryError, match="selected allocation"):
+        arena.trim(257)
+    assert original() is None and arena.nbytes == 0 and not arena.frozen
+
+
 @pytest.mark.parametrize("nbytes", [-1, True, False, 1.5, "256", None, 257])
 def test_trim_rejects_invalid_or_larger_requirements_without_mutation(nbytes):
     arena = ScratchArena("cpu")
