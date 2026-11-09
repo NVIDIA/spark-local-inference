@@ -49,6 +49,7 @@ for _container, _fields in (
      ('router', 'correction', 'experts', 'shared', 'vision_correction')),
     ('ignition.recipes.deepseek41.weights.LayerWeights',
      ('attention', 'experts', 'residual', 'engram')),
+    ('ignition.recipes.deepseek41.weights.TrellisExpertLayer', ('weights',)),
     ('ignition.recipes.deepseek41.weights.DSparkWeights',
      ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm',
       'markov_embedding', 'markov_head', 'confidence_head', 'draft_head')),

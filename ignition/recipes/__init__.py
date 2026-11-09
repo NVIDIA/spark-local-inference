@@ -162,6 +162,18 @@ def _supporting(config_path: Path, source: str) -> tuple[Recipe, Checkpoint]:
 
 
 def _stored_bytes(index_path: Path, source: str) -> int:
+    root = index_path.parent
+    if (root / "trellismx" / "manifest.json").is_file():
+        # TrellisMX total_size covers only the model shards; the sidecar
+        # streams and Engram tables are separate files. Sum the snapshot so
+        # placement scaling is based on the stored bytes the recipe declares.
+        try:
+            stored = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+        except OSError as error:
+            raise UsageError(f"{source} has unreadable TrellisMX files: {error}") from error
+        if stored <= 0:
+            raise UsageError(f"{source} has an empty TrellisMX snapshot")
+        return stored
     try:
         stored = json.loads(index_path.read_text())["metadata"]["total_size"]
     except (OSError, ValueError, KeyError, TypeError) as error:

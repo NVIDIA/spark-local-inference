@@ -5,6 +5,7 @@
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import torch
 
@@ -14,6 +15,40 @@ from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
 
 from .config import ModelConfig
+
+
+@dataclass(frozen=True)
+class TrellisExpertLayer:
+    """One decoder layer's routed experts on the TrellisMX P8 driver.
+
+    The driver owns the rank's trellis streams, CSF scale views, coupled
+    boundary vectors and per-shape compiled kernels. It executes inside the
+    captured forward and returns this rank's BF16 partial.
+    """
+
+    driver: object
+    hidden: int
+    intermediate: int
+    experts: int
+
+    @property
+    def weights(self):
+        """Stored expert payload views, one pair per width group and layer.
+
+        Declaring these keeps the trellis streams in per-layer weight groups
+        instead of one ~72 GB opaque initial-state object.
+        """
+        views = []
+        groups = getattr(self.driver, "groups", None)
+        if groups:
+            for entry in groups:
+                child = entry[0] if isinstance(entry, tuple) else entry
+                views.append(child.w13_stream)
+                views.append(child.w2_stream)
+        else:
+            views.append(self.driver.w13_stream)
+            views.append(self.driver.w2_stream)
+        return tuple(views)
 
 
 @dataclass(frozen=True)
@@ -73,14 +108,24 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False):
+             vocabulary_parallel_sampling=False, prefill_chunk_tokens=0, trellis_root=None):
         config = ModelConfig.load(manifest.metadata_path)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
-                                 expert_scale_compression=expert_scale_compression) as loader:
+                                 expert_scale_compression=expert_scale_compression,
+                                 prefill_chunk_tokens=prefill_chunk_tokens, trellis_root=trellis_root) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
-            layers = tuple(loader.load_layer(i) for i in range(config.layers))
+            loaded = []
+            for index in range(config.layers):
+                loaded.append(loader.load_layer(index))
+                if config.trellismx:
+                    # Each layer stages a ~1.8 GB sidecar through the unified
+                    # memory pool; return the staging segments before the next.
+                    torch.cuda.empty_cache()
+                    from ignition.preparation.host_memory import release_unused
+                    release_unused()
+            layers = tuple(loaded)
             draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
             if draft is not None:
                 if vocabulary_parallel_sampling:
@@ -101,13 +146,15 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
+        if config.trellismx:
+            torch.cuda.empty_cache()
         return cls(config, shard, embedding, norm, head, layers, draft,
                    torch.cuda.memory_allocated(device) - before, vision)
 
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None):
+                 expert_scale_compression=None, prefill_chunk_tokens=0, trellis_root=None):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
@@ -115,6 +162,8 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
+        self.prefill_chunk_tokens = int(prefill_chunk_tokens)
+        self.trellis_root = None if trellis_root is None else Path(trellis_root)
         self._expert_scale_scratch = {}
 
     def load_experts(self, prefixes, interval):
@@ -162,9 +211,23 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             result["index_weights"] = self.load_tensor(attn + ".indexer.weights_proj.weight")
         ffn = prefix + ".ffn"
         interval = shard.partition(text["moe_intermediate_size"], alignment=32)
-        experts = self.load_experts(
-            [f"{ffn}.experts.{i}" for i in range(self.config.draft.experts if draft else text["n_routed_experts"])],
-            interval)
+        if self.config.trellismx and not draft:
+            from ds41_trellismx.runtime import DS41TrellisMXMoE
+
+            root = self.trellis_root if self.trellis_root is not None and (self.trellis_root / "trellismx").is_dir() else self.manifest.snapshot
+            driver = DS41TrellisMXMoE(str(root), device=self.device, layer=layer,
+                                      rank=self.shard.rank, prefill_chunk_tokens=self.prefill_chunk_tokens)
+            sliced = interval[1] - interval[0]
+            if driver.intermediate != sliced or driver.experts != text["n_routed_experts"]:
+                raise ValueError(
+                    f"TrellisMX sidecar slice mismatch: rank {self.shard.rank} has "
+                    f"{driver.intermediate} intermediate rows (expected {sliced}) and "
+                    f"{driver.experts} experts (expected {text['n_routed_experts']})")
+            experts = TrellisExpertLayer(driver, text["hidden_size"], driver.intermediate, driver.experts)
+        else:
+            experts = self.load_experts(
+                [f"{ffn}.experts.{i}" for i in range(self.config.draft.experts if draft else text["n_routed_experts"])],
+                interval)
         shared = MLPWeights(self.load_linear_group((ffn + ".shared_experts.w1", ffn + ".shared_experts.w3"),
             row_ranges=(interval, interval)), self.load_linear(ffn + ".shared_experts.w2", columns=interval))
         routed = ExpertWeights(self.load_tensor(ffn + ".gate.weight"),

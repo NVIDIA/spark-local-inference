@@ -115,6 +115,7 @@ pub(super) fn decode<F: super::payload::Files>(
             .map_err(|_| invalid("unknown n-gram encoding"))?;
         let (width, block, row_bytes, scale_bytes) = match encoding {
             wire::engram_table::Encoding::Fp8E4m3E8m0 => (256, 32, 256, 8),
+            wire::engram_table::Encoding::TrellisK4E4m3E8m0 => (256, 32, 128, 8),
             wire::engram_table::Encoding::Nvfp4E4m3Global
                 if table.global_scale.is_finite() && table.global_scale > 0.0 =>
             {

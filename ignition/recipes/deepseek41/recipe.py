@@ -4,6 +4,7 @@
 
 """DeepSeek V4.1 Flash checkpoint and tensor-parallel memory geometry."""
 
+from pathlib import Path
 from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
@@ -24,7 +25,20 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "draft_head_quantization": speculation.draft_head_quantization,
         "markov_head_quantization": speculation.markov_head_quantization,
         "vocabulary_parallel_sampling": speculation.vocabulary_parallel_sampling}
+    # Directly-read sidecars live in the checkpoint directory, which is the
+    # same absolute path on every preparing host. A transfer cache on a peer
+    # holds only indexed tensor ranges, so point the driver at the source.
+    checkpoint_root = str(snapshot) if (Path(snapshot) / "trellismx").is_dir() else None
+    if checkpoint_root is not None:
+        if plan.world_size != 2:
+            raise ValueError("the TrellisMX K2-Mix pack is split for exactly two tensor-parallel ranks")
+        vendor = Path(__file__).resolve().parents[3] / "vendor"
+        if not (vendor / "ds41_trellismx").is_dir() or not (vendor / "ds41_kern" / "b12x").is_dir():
+            raise ValueError(
+                "TrellisMX checkpoints require vendor/ds41_trellismx and "
+                "vendor/ds41_kern/b12x; install the pinned kit overlay")
     config = PreparationConfig(collective_tuning=plan.collective_tuning,
+        checkpoint_root=checkpoint_root,
         collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
@@ -60,13 +74,22 @@ RECIPE = Recipe(
         revision="1bae0e1088993b9b82de08f59de5be5a34e42170", architecture="DeepseekV41ForCausalLM",
         stored_bytes=510_286_023_000, device_bytes=306_557_453_640, draft_bytes=7_932_874_632,
         # Estimate half of backbone scale bytes saved; retain the full draft budget.
-        scale_compressed_device_bytes={"csf": 298_063_988_040}),),
+        scale_compressed_device_bytes={"csf": 298_063_988_040},),
+        Checkpoint(alias="deepseek-v4.1-flash-trellismx",
+            repository="brandonmusic/DeepSeek-V4.1-Flash-1017-TrellisMX-K2-Mix",
+            revision="451e938fbf5094767349df6d1b7b127a376e5618", architecture="DeepseekV41ForCausalLM",
+            # Both rank sidecars + main shards + the two 4-bit Engram tables.
+            stored_bytes=264_800_000_000,
+            # The kit's per-node estimate: 80.185 GB of routed experts and
+            # replicated weights on each of two ranks.
+            device_bytes=167_000_000_000, draft_bytes=7_932_874_632,
+            scale_compressed_device_bytes={"csf": 167_000_000_000},),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True,
                             draft_prefix_selection="gpu", graph_budget=64),
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
-    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4)}),
-    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4)}),
+    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (2, 3, 4)}),
+    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (2, 3, 4)}),
 )

@@ -532,7 +532,12 @@ message Engram {
   repeated EngramTable tables = 4;
 }
 message EngramTable {
-  enum Encoding { UNSPECIFIED = 0; FP8_E4M3_E8M0 = 1; NVFP4_E4M3_GLOBAL = 2; }
+  enum Encoding {
+    UNSPECIFIED = 0;
+    FP8_E4M3_E8M0 = 1;
+    NVFP4_E4M3_GLOBAL = 2;
+    TRELLIS_K4_E4M3_E8M0 = 3;
+  }
   uint32 layer = 1;
   uint64 rows = 2;
   uint32 embedding_width = 3;

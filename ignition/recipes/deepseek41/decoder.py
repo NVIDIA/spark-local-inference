@@ -24,6 +24,29 @@ from .attention import AttentionIndices, AttentionScratch, PreparedAttention, Pr
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
+from .weights import TrellisExpertLayer
+
+
+class PreparedTrellisExperts:
+    """Routed experts on the TrellisMX P8 driver.
+
+    The driver executes this rank's half of every route and returns a BF16
+    partial; the layer's existing all-reduce combines ranks. It is CUDA-graph
+    capture safe and keeps its compiled kernels and scratch stable per shape.
+    """
+
+    def __init__(self, source, ids, weights, output, *, driver, name):
+        if source.dtype != torch.bfloat16 or weights.dtype != torch.float32:
+            raise ValueError("TrellisMX experts need BF16 activations and FP32 route weights")
+        if ids.dtype != torch.int32:
+            raise ValueError("TrellisMX experts need int32 global route ids")
+        self.source, self.ids, self.weights, self.output = source, ids, weights, output
+        self.driver, self.name = driver, name
+
+    def __call__(self):
+        self.output.copy_(self.driver(self.source, self.weights, self.ids))
+        return self.output
+
 
 @dataclass(frozen=True)
 class Scratch:
@@ -181,14 +204,20 @@ class PreparedLayer:
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
             image_mask=self.image_mask)
-        self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
-            s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
-            router_plan=self.router.plan)
+        expert_weights = weights.experts.experts
+        if isinstance(expert_weights, TrellisExpertLayer):
+            self.experts = PreparedTrellisExperts(s.ffn_hc.normalized, s.router.ids, s.router.weights,
+                s.routed, driver=expert_weights.driver, name=name + ".experts")
+        else:
+            self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, expert_weights, s.router.ids,
+                s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
+                router_plan=self.router.plan)
         self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
             s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
             swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
         self.concurrent_shared = None
-        if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
+        if (not isinstance(expert_weights, TrellisExpertLayer)
+                and mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace,
