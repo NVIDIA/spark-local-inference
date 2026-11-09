@@ -26,8 +26,8 @@ pub const GB202_DEVICES: [u32; 9] = [
 /// RTX Spark N1X part, which NVML reports for the same SM121 platform.
 pub const GB10_DEVICES: [u32; 2] = [0x2e12, 0x2e03];
 
-/// GB300 device identifiers. `0x31c3` is the SM103 GPU of DGX Station GB300.
-pub const GB300_DEVICES: [u32; 1] = [0x31c3];
+/// GB300 device identifiers. `0x31c2` and `0x31c3` are SM103 GPUs of DGX Station GB300.
+pub const GB300_DEVICES: [u32; 2] = [0x31c2, 0x31c3];
 
 pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     if pci_id & 0xffff != 0x10de {
@@ -179,7 +179,13 @@ mod tests {
                 "{device:#06x}"
             );
         }
-        assert_eq!(platform_from_pci(0x31c3_10de), Some("gb300"));
+        for device in GB300_DEVICES {
+            assert_eq!(
+                platform_from_pci(device << 16 | 0x10de),
+                Some("gb300"),
+                "{device:#06x}"
+            );
+        }
         for device in GB202_DEVICES {
             assert_eq!(
                 platform_from_pci(device << 16 | 0x10de),
