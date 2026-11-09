@@ -69,7 +69,10 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
                     model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, package_storage=storage)
         else:
             model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD)
-        model.manifest()
+        if getattr(config, "retain_graphs", False):
+            model.export_manifest()
+        else:
+            model.manifest()
         control.send(model.memory_report)
         command = control.recv()
         if isinstance(command, tuple) and command[0] == "embedding_tables":
@@ -305,7 +308,10 @@ def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=N
                                     timeout=_PREPARATION_TIMEOUT)
         model = prepare(snapshot, config, rank=0, group=dist.group.WORLD, progress=progress,
                         **({} if package_storage is None else {"package_storage": package_storage}))
-        model.manifest()
+        if getattr(config, "retain_graphs", False):
+            model.export_manifest()
+        else:
+            model.manifest()
         with phase(progress, "Wait for tensor-parallel ranks", total=len(controls)) as stage:
             reports = []
             for control in controls:

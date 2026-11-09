@@ -119,7 +119,7 @@ class PreparedGraphBundle:
             self, context, self._device, handles, spans, queue_capacity=queue_capacity,
         )
 
-    def _validate_resources(self) -> tuple[int, list[int], list[tuple[int, int]]]:
+    def _validate_resources(self, *, graph_templates=False) -> tuple[int, list[int], list[tuple[int, int]]]:
         import torch
         import flare_heliopause
 
@@ -129,18 +129,22 @@ class PreparedGraphBundle:
                 raise ValueError(f"CUDA device {self._device} is SM{capability[0]}{capability[1]};"
                                  f" {SUPPORTED_ARCHITECTURES} is required")
             handles = []
+            kind = "retained template" if graph_templates else "instantiated executable"
             for name, graph in self._graphs.items():
                 if not isinstance(graph, torch.cuda.CUDAGraph):
                     raise TypeError(f"graph {name!r} must be a torch.cuda.CUDAGraph")
                 try:
-                    handle = graph.raw_cuda_graph_exec()
+                    handle = graph.raw_cuda_graph() if graph_templates else graph.raw_cuda_graph_exec()
                 except RuntimeError as error:
-                    raise ValueError(f"graph {name!r} must already be instantiated: {error}") from error
+                    message = (f"graph {name!r} requires a retained template: {error}" if graph_templates else
+                               f"graph {name!r} must already be instantiated: {error}")
+                    raise ValueError(message) from error
                 if not isinstance(handle, int) or handle <= 0:
-                    raise ValueError(f"graph {name!r} has no instantiated executable handle")
+                    raise ValueError(f"graph {name!r} has no {kind} handle")
                 handles.append(handle)
             if len(set(handles)) != len(handles):
-                raise ValueError("named graphs must have unique executable handles")
+                raise ValueError("named graphs must have unique template handles" if graph_templates else
+                                 "named graphs must have unique executable handles")
 
             spans = []
             for name, tensor in self._buffers.items():

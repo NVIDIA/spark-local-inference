@@ -144,8 +144,15 @@ class RuntimePackage:
 
 
 def _graphs(graphs):
-    return [dict(name=name, graph=int(graph.raw_cuda_graph()), executable=int(graph.raw_cuda_graph_exec()))
-            for name, graph in graphs.items()]
+    records = []
+    for name, graph in graphs.items():
+        flags = getattr(graph, "_flare_instantiation_flags", None)
+        if flags is not None and (type(flags) is not int or flags < 0 or flags & ~9):
+            raise ValueError("graph instantiation flags may only select automatic free and node priority")
+        policy = ({"executable": int(graph.raw_cuda_graph_exec())} if flags is None
+                  else {"instantiate_flags": flags})
+        records.append(dict(name=name, graph=int(graph.raw_cuda_graph()), **policy))
+    return records
 
 
 def _cache_options(cache, options=None):
@@ -226,7 +233,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
-        execution=prepared.manifest(all_variants=True), server=None if bundle_only else {**prepared.server_config, **options},
+        execution=prepared.export_manifest(), server=None if bundle_only else {**prepared.server_config, **options},
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
