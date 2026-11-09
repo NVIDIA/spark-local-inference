@@ -727,7 +727,7 @@ class ForwardCache:
                                                        before_run=None if before_run is None else lambda name=name: before_run(name))
                             compiled[name].prepare_capture()
                             selections.release(compiled[name])
-                            release_unused()
+                            release_unused(generation=0)
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -760,7 +760,7 @@ class ForwardCache:
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
                         compiled[name].prepare_capture()
                         selections.release(compiled[name])
-                        release_unused()
+                        release_unused(generation=0)
                     stage.update(advance=1)
         release_unused()
         return compiled
@@ -960,12 +960,15 @@ class ForwardCache:
                         published.append(path)
                     released += bound.prepare_capture()
                     selections.release(bound)
-                    release_unused()
+                    # Retained forward owners grow with the catalog. Collect
+                    # young binding temporaries without rescanning every owner.
+                    release_unused(generation=0)
                 except Exception as error:
                     failure = f"{name}: {type(error).__name__}: {error}"
                 selections._check(failure)
                 stage.update(advance=1)
             stage.update(f"{released >> 20} MiB portable state released; guards and kernel owners retained")
+        release_unused()
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
