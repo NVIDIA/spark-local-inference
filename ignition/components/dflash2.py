@@ -316,12 +316,13 @@ class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, embedding, head,
                  output_multiplier, final_logit_softcapping, examples=None,
-                 convolution_runtime=None):
+                 convolution_runtime=None, templates=None, attention_factory=DraftAttention):
         self.logit_shape = scratch.logit_shape
         self.logit_dtype, self.local_logit_dtype = torch.float32, torch.bfloat16
         self.local_logit_shape = (scratch.tokens, scratch.local_vocabulary_size)
         c = weights.config.draft
-        s = _draft_templates(weights.config.draft, weights.shard, scratch, embedding.device, examples=examples)
+        s = (_draft_templates(weights.config.draft, weights.shard, scratch, embedding.device, examples=examples)
+             if templates is None else templates)
         self.embedding = PreparedShardedEmbedding(embedding, metadata.token_ids, s.local_embedding, s.embedding,
             runtime=embedding_runtime, coordinator=coordinator, session=session, name=name + ".embedding",
             num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
@@ -335,7 +336,7 @@ class PreparedDraft:
                 coordinator=coordinator) for kind in ("attention_conv", "mlp_conv")}
             for operation in conv.values():
                 operation.functional(session=session)
-            attention = DraftAttention(index, layer, attention_source, c, weights.shard, s, metadata, pool,
+            attention = attention_factory(index, layer, attention_source, c, weights.shard, s, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=prefix + ".attention",
                 workspace=workspace)
             mlp = PreparedMLP(mlp_source, layer.mlp, s.mlp.gate_up, s.mlp.intermediate, s.mlp.output,

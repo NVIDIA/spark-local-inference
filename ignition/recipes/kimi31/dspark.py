@@ -21,7 +21,7 @@ from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch
 from ignition.components.vocabulary import PreparedVocabularyProjection
-from ignition.preparation.scratch import buffer_rows
+from ignition.preparation.persistent import persistent_copy
 from ignition.recipes.kimi3.attention import PreparedMLAProjection
 from ignition.recipes.kimi3.config import PAGE_TOKENS
 from ignition.recipes.kimi3.dcp import RECORD_BYTES, write_records
@@ -68,7 +68,7 @@ def rotate(values, positions, inverse, gain=1.):
 
 class Rotary:
     def __init__(self, config, device, *, inverse=None):
-        self.inverse = inverse_frequencies(config, device) if inverse is None else inverse
+        self.inverse = persistent_copy(inverse_frequencies(config, device)) if inverse is None else inverse
         self.gain = rotary_gain(config)
 
     def __call__(self, query, key, positions):
@@ -118,26 +118,21 @@ class PreparedContext:
     """Project accepted target output taps into each draft layer's paged latent history."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
-                 buffers, context, allocator=None):
+                 context):
         self.metadata, self.shards = metadata, context.shards
         config, draft = weights.config, weights.draft
         tokens, device = auxiliary.shape[0], auxiliary.device
         self.eps = config.draft.text["rms_norm_eps"]
 
-        def buffer(key, *shape, dtype=torch.bfloat16):
-            if key not in buffers:
-                buffers[key] = (torch.zeros((tokens, *shape), dtype=dtype, device=device) if allocator is None
-                                else allocator.zeros((tokens, *shape), dtype))
-            if buffers[key].shape[0] < tokens:
-                raise ValueError("draft context storage must be allocated for the largest capacity first")
-            return buffer_rows(buffers, key, tokens)
+        def buffer(*shape, dtype=torch.bfloat16):
+            return torch.zeros((tokens, *shape), dtype=dtype, device=device)
 
-        self.local = buffer("local", config.hidden // weights.shard.world_size)
-        self.projected = buffer("projected", config.hidden)
-        self.normalized = buffer("normalized", config.hidden)
-        self.kv = buffer("kv", draft.context_kv.shape[0])
-        self.latent = buffer("latent", RECORD_BYTES)
-        self.slots = buffer("slots", dtype=torch.int64)
+        self.local = buffer(config.hidden // weights.shard.world_size)
+        self.projected = buffer(config.hidden)
+        self.normalized = buffer(config.hidden)
+        self.kv = buffer(draft.context_kv.shape[0])
+        self.latent = buffer(RECORD_BYTES)
+        self.slots = buffer(dtype=torch.int64)
         self.hidden_norm = draft.hidden_norm
         self.project = projection(auxiliary, draft.projection, self.local, session=session,
                                   name=name + ".project", workspace=workspace)
@@ -148,22 +143,33 @@ class PreparedContext:
         self.rotary = Rotary(config, device)
         self.stages = tuple((layer.attention["kv_norm"], pool.draft_attention(index))
                             for index, layer in enumerate(draft.layers))
+        for operation in (self.project, self.gather, self.project_kv):
+            operation.functional(session=session)
+        self.metadata = self.local = self.projected = self.normalized = None
+        self.kv = self.latent = self.slots = None
 
-    def __call__(self, auxiliary, counts):
-        m = self.metadata
-        self.slots.copy_(accepted_slots(m, counts, self.shards))
-        self.gather(self.project(auxiliary))
-        rms_norm_columns(self.projected, self.hidden_norm, self.normalized, self.eps)
-        self.project_kv(self.normalized)
-        chunks = self.kv.view(self.kv.shape[0], len(self.stages), RECORD_BYTES)
+    def functional(self):
+        return self
+
+    def __call__(self, auxiliary, counts, metadata):
+        m = metadata
+        slots = accepted_slots(m, counts, self.shards)
+        local = self.project(auxiliary)
+        projected = self.gather(local)
+        normalized = torch.empty_like(projected)
+        rms_norm_columns(projected, self.hidden_norm, normalized, self.eps)
+        kv = self.project_kv(normalized)
+        chunks = kv.view(kv.shape[0], len(self.stages), RECORD_BYTES)
         for index, (norm, cache) in enumerate(self.stages):
-            rms_norm_columns(chunks[:, index, :512], norm, self.latent[:, :512], self.eps)
-            self.latent[:, 512:].copy_(chunks[:, index, 512:])
-            self.rotary.key(self.latent[:, 512:], m.positions)
-            write_records(self.latent, self.slots, cache)
+            latent = torch.empty((kv.shape[0], RECORD_BYTES), dtype=kv.dtype, device=kv.device)
+            rms_norm_columns(chunks[:, index, :512], norm, latent[:, :512], self.eps)
+            latent[:, 512:].copy_(chunks[:, index, 512:])
+            self.rotary.key(latent[:, 512:], m.positions)
+            write_records(latent, slots, cache)
+        return local, projected, normalized, kv
 
     def scratch_tensors(self):
-        return (self.local, self.projected, self.normalized, self.kv, self.latent, self.slots)
+        return ()
 
 
 @dataclass(frozen=True)
@@ -210,8 +216,8 @@ class DraftScratch:
             "history_lengths": zeros(tokens, dtype=torch.int32),
             "current_lengths": zeros(tokens, dtype=torch.int32),
         }
-        constants = {"starts": torch.arange(tokens + 1, dtype=torch.int32, device=device),
-                     "inverse": inverse_frequencies(config, device)}
+        constants = {"starts": persistent_copy(torch.arange(tokens + 1, dtype=torch.int32, device=device)),
+                     "inverse": persistent_copy(inverse_frequencies(config, device))}
         return cls(zeros(tokens, hidden // world), zeros(tokens, hidden), zeros(tokens, hidden),
                    MLPScratch.allocate(tokens, hidden, text["intermediate_size"] // world, device),
                    zeros(tokens, hidden), zeros(tokens, config.vocabulary // world),
@@ -257,7 +263,7 @@ class DraftAttention(torch.nn.Module):
         self.starts = scratch.constants["starts"][:tokens + 1]
         self.gather = PreparedAllGather(self.query.view(tokens, -1), self.gathered.view(tokens, -1),
             runtime=context.heads, session=session, coordinator=coordinator, name=name + ".gather_heads",
-            dependencies=(self.cache, self.block))
+            dependencies=(self.cache,)).functional(session=session)
         common = dict(device=device, mode="decode", q_dtype=torch.bfloat16, kv_dtype=torch.bfloat16, page_size=PAGE_TOKENS,
                       use_cuda_graph=True, partial_dtype=torch.float32, num_q_heads=config.draft.heads,
                       max_total_q=tokens, max_batch=tokens)
@@ -266,37 +272,42 @@ class DraftAttention(torch.nn.Module):
                                       num_cache_pages=self.cache.shape[0], **common)
         self.history_attention = PreparedDenseMLA(self.gathered, self.cache, self.history, self.history_pages,
             self.history_lengths, self.starts, caps=history_caps, scale=scale, session=session,
-            name=name + ".history", workspace=workspace, lse=self.history_lse)
+            name=name + ".history", workspace=workspace, lse=self.history_lse).functional(session=session)
         current_caps = dense_mla.Caps(max_cache_tokens=PAGE_TOKENS, max_page_table_width=1,
                                       num_cache_pages=requests, **common)
         self.current_attention = PreparedDenseMLA(self.gathered, self.block, self.current, self.current_pages,
             self.current_lengths, self.starts, caps=current_caps, scale=scale, session=session,
-            name=name + ".block", workspace=workspace, lse=self.current_lse)
+            name=name + ".block", workspace=workspace, lse=self.current_lse).functional(session=session, cache=None)
         self.combine = PreparedLseReduceScatter(self.history, self.history_lse, self.projected.attended,
-            runtime=context.heads, session=session, coordinator=coordinator, name=name + ".combine", threads=512, block_limit=8)
-        self.reduce = PreparedAllReduce(self.projected.projections["output"].output, scratch.output,
-            runtime=runtime, session=session, coordinator=coordinator, name=name + ".reduce")
+            runtime=context.heads, session=session, coordinator=coordinator, name=name + ".combine", threads=512, block_limit=8).functional(session=session)
+        self.reduce = PreparedAllReduce(scratch.projection["output"][:tokens], scratch.output,
+            runtime=runtime, session=session, coordinator=coordinator, name=name + ".reduce").functional(session=session)
+        self.projected.functional(session=session)
+        self.block_shape = tuple(self.block.shape)
+        self.metadata = None
+        for field in ("block", "query", "gathered", "history", "current", "history_lse", "current_lse",
+                      "slots", "history_pages", "current_pages", "history_lengths", "current_lengths"):
+            setattr(self, field, None)
 
-    def forward(self, hidden_states, **kwargs):
-        m, shards, p = self.metadata, self.shards, self.projected
-        p.project(hidden_states)
+    def forward(self, hidden_states, *, metadata, **kwargs):
+        m, shards, p = metadata, self.shards, self.projected
+        projected = p.project(hidden_states, metadata=m)
         live = m.positions >= 0
-        slots, history, current = proposal_metadata(m, shards)
-        self.slots.copy_(slots)
-        write_records(p.latent, self.slots, self.block)
-        self.history_pages.copy_(m.token_page_table)
-        self.current_pages[:, 0].copy_(m.requests)
-        self.history_lengths.copy_(history)
-        self.current_lengths.copy_(current)
-        self.query.copy_(p.absorbed)
-        self.gather(self.query.view(m.positions.numel(), -1))
-        self.history_attention(self.gathered, self.history)
-        self.current_attention(self.gathered, self.current)
-        merge_attention(self.history, self.history_lse, self.current, self.current_lse,
-                        self.history_lengths, self.current_lengths, self.history, self.history_lse)
-        self.combine(self.history, self.history_lse)
-        p.attended.copy_(torch.where(live[:, None, None], p.attended, 0.))
-        return self.reduce(p.finish()), None
+        slots, history_lengths, current_lengths = proposal_metadata(m, shards)
+        block = torch.zeros(self.block_shape, dtype=projected.latent.dtype, device=hidden_states.device)
+        write_records(projected.latent, slots, block)
+        query = projected.absorbed.contiguous()
+        gathered = self.gather(query.view(m.positions.numel(), -1)).view(m.positions.numel(), -1, RECORD_BYTES)
+        history, history_lse = self.history_attention(gathered, page_table=m.token_page_table,
+            lengths=history_lengths, starts=self.starts)
+        current, current_lse = self.current_attention(gathered, page_table=m.requests[:, None].int(),
+            lengths=current_lengths, starts=self.starts, cache=block)
+        merged, merged_lse = torch.empty_like(history), torch.empty_like(history_lse)
+        merge_attention(history, history_lse, current, current_lse,
+                        history_lengths, current_lengths, merged, merged_lse)
+        attended = self.combine(merged, merged_lse)
+        attended = torch.where(live[:, None, None], attended, 0.)
+        return self.reduce(p.finish(attended, projected)), None
 
 
 class PreparedDraft:
@@ -304,13 +315,14 @@ class PreparedDraft:
 
     def __init__(self, weights, scratch, metadata, pool, *, block, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, context, latents):
-        self.weights, self.scratch, self.metadata = weights, scratch, metadata
+        self.logit_shape, self.local_logit_shape = tuple(scratch.logits.shape), tuple(scratch.local_logits.shape)
+        self.logit_dtype, self.local_logit_dtype = scratch.logits.dtype, scratch.local_logits.dtype
         self.block = block
         config, draft = weights.config, weights.draft
         eps = config.draft.text["rms_norm_eps"]
         self.embedding = PreparedShardedEmbedding(draft.embedding, metadata.token_ids, scratch.local_embedding,
             scratch.embedding, runtime=embedding_runtime, coordinator=coordinator,
-            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
+            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         self.layers = []
         for index, layer_weights in enumerate(draft.layers):
             layer = Qwen3DecoderLayer.__new__(Qwen3DecoderLayer)
@@ -326,12 +338,18 @@ class PreparedDraft:
         self.norm = canonical_norm(draft.norm, eps)
         head = weights.head if draft.head is None else draft.head
         self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head").functional(session=session)
 
-    def __call__(self):
-        hidden = self.embedding.gather(self.embedding.lookup())
+    def release_outputs(self):
+        return self
+
+    def forward(self, metadata):
+        hidden = self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
         for layer in self.layers:
-            hidden = layer(hidden)
-        live = (self.metadata.lengths > 0).repeat_interleave(self.block)
-        self.scratch.hidden.copy_(torch.where(live[:, None], self.norm(hidden[self.metadata.sample_indices]), 0.))
-        self.head(self.scratch.hidden)
+            hidden = layer(hidden, metadata=metadata)
+        live = (metadata.lengths > 0).repeat_interleave(self.block)
+        hidden = torch.where(live[:, None], self.norm(hidden[metadata.sample_indices]), 0.)
+        return hidden, self.head(hidden)
+
+    def __call__(self, metadata):
+        return self.forward(metadata)[1]
