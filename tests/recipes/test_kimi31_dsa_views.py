@@ -65,9 +65,12 @@ def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometr
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
 
-    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedOrderedRowTopK",
-                 "UnquantizedProjection"):
+    from ignition.components import candidate_selection
+
+    for name in ("PreparedFP8Indexer", "UnquantizedProjection"):
         monkeypatch.setattr(indexer, name, operation)
+    for name in ("PreparedAllGather", "PreparedOrderedRowTopK"):
+        monkeypatch.setattr(candidate_selection, name, operation)
     rows = 257
     source = torch.empty((rows, 7168), dtype=torch.bfloat16)
     query = torch.empty((rows, 1536), dtype=torch.bfloat16)
@@ -94,7 +97,7 @@ def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometr
         assert part.indexer.args[6] is part.local
         assert part.indexer.kwargs["scores"] is part.scores
     assert full.indexer.plan is not tail.indexer.plan
-    assert full.fold.plan is not tail.fold.plan
+    assert full.merge.fold.plan is not tail.merge.fold.plan
 
 
 def test_worker_serialization_preserves_shared_prefix_identity():

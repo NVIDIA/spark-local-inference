@@ -146,8 +146,8 @@ def _rank(rank, rendezvous):
                     variants.append(variant)
                 large, tail = (variant["selector"] for variant in variants[:2])
                 assert large.selected.data_ptr() == tail.selected.data_ptr()
-                assert large.broadcast.send.data_ptr() == tail.broadcast.send.data_ptr()
-                assert large.broadcast.received.data_ptr() == tail.broadcast.received.data_ptr()
+                assert large.merge.packed.data_ptr() == tail.merge.packed.data_ptr()
+                assert large.merge.gathered.data_ptr() == tail.merge.gathered.data_ptr()
                 variants[0]["name"] = "prefill257"
                 variants[0]["end"] = 257
                 variants[0]["bounds"] = ((0, 128), (128, 256), (256, 257))

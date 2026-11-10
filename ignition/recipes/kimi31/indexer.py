@@ -5,14 +5,12 @@
 
 import torch
 
-from ignition.components.candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllGather
+from ignition.components.candidate_selection import PreparedCandidateSelection
 from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
 from ignition.preparation.scratch import buffer_rows
 
-from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
+from .dcp import TOPK, PREFILL_ROWS, index_pages
 
 
 class SharedBuffers:
@@ -49,13 +47,6 @@ class PreparedIndexSelection:
         self.lengths = storage.buffer("local_lengths", (rows,), torch.int32)
         self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
         self.scores = storage.buffer("local_scores", (rows, TOPK), torch.float32)
-        self.packed = storage.buffer("candidates", (rows, TOPK, 2), torch.float32)
-        self.gathered = storage.buffer("gathered", (rows, TOPK * shards.world, 2), torch.float32)
-        self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
-        self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
-        self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
-        self.active = storage.buffer("active", (rows,), torch.bool)
-        self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
         self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
@@ -66,27 +57,26 @@ class PreparedIndexSelection:
         runtime = None if context is None else context.candidates
         if shards.world > 1 and runtime is None:
             raise ValueError("Kimi sparse selection requires a candidate exchange for every context rank")
-        self.gather = PreparedAllGather(self.packed.view(torch.bfloat16).view(rows, TOPK * 4),
-            self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=runtime,
-            session=session, coordinator=None if context is None else context.coordinator,
-            name=name + ".candidates", dependencies=(latent_cache,))
-        self.fold = PreparedOrderedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
-            self.selected_scores, self.selected, session=session, name=name + ".fold",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="agreement."))
-        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
-            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
+        tuning = None if context is None else getattr(context, "selection_tuning", None)
+        tune = tuning is not None and mode != "prefill" and metadata.starts.numel() == 1
+        self.merge = PreparedCandidateSelection(self.local, self.scores, metadata.positions[start:end],
+            shards.index, self.selected, world=shards.world, gather_runtime=runtime,
+            owner_runtime=context.candidate_owners if tune else None,
+            reduction_runtime=tuning.reduction if tune else None, session=session,
+            coordinator=None if context is None else context.coordinator, name=name + ".merge",
+            buffers=SharedBuffers(buffers, query.device, allocator, prefix="merge."),
+            dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",))
+        if tune:
+            tuning.register(self.merge)
+        else:
+            self.merge.bind("replicated")
 
     def __call__(self, query, weights, positions, tables):
         index_pages(tables[:1] if self.mode == "prefill" else tables, self.pages)
         self.lengths.copy_(self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32))
         self.indexer(query.view(query.shape[0], 32, 128), weights)
-        pack_candidates(self.local, self.scores, self.packed, self.shards)
-        self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
-        self.active.copy_(positions >= 0)
-        self.candidate_rows()
-        self.fold()
-        return self.selected
+        self.merge.pack()
+        return self.merge.exchange(positions=positions)
 
 
 class PreparedDSAIndexer:
