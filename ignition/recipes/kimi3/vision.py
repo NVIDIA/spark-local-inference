@@ -4,6 +4,7 @@
 """MoonViT image execution with learned positions, axial RoPE, and spatial merging."""
 
 from dataclasses import dataclass
+from math import prod
 from types import SimpleNamespace
 
 import torch
@@ -78,18 +79,29 @@ class VisionScratch:
     activated: torch.Tensor
     output: torch.Tensor
     normalized: torch.Tensor
+    post_normalized: torch.Tensor
 
     @classmethod
     def allocate(cls, patches, device, *, examples=None):
-        shapes = ((patches, 588), (patches, 1024), (patches, 4608),
-                  *((patches, 12, 128),) * 3, (patches, 1536), (patches, 1024),
-                  (patches, 4096), (patches, 1024), (patches // 4, 4096),
-                  (patches // 4, 4096), (patches // 4, HIDDEN), (patches, 1024))
-        return cls(*(declaration_tensor(examples, f"vision.{name}", shape, torch.bfloat16, device)
-                     for name, shape in zip(cls.__dataclass_fields__, shapes, strict=True)))
+        examples = {} if examples is None else examples
+        shapes = dict(zip(cls.__dataclass_fields__, (
+            (patches, 588), (patches, 1024), (patches, 4608),
+            *((patches, 12, 128),) * 3, (patches, 1536), (patches, 1024),
+            (patches, 4096), (patches, 1024), (patches // 4, 4096),
+            (patches // 4, 4096), (patches // 4, HIDDEN), (patches, 1024),
+            (patches // 4, HIDDEN)), strict=True))
+        # Each prepared kernel has disjoint operands; serving forwards allocate their own tensors.
+        roles = dict.fromkeys(("patches", "qkv", "query", "projected", "mlp_up",
+                               "activated", "normalized", "post_normalized"), "projection_output")
+        roles.update(dict.fromkeys(("hidden", "attended", "mlp_down", "merged", "output"), "projection_input"))
+        roles.update(key="attention_key", value="attention_value")
+        tensors = {name: declaration_tensor(examples, f"vision.{roles[name]}", shapes[name],
+                                            torch.bfloat16, device)
+                   for name in sorted(shapes, key=lambda name: prod(shapes[name]), reverse=True)}
+        return cls(*(tensors[name] for name in cls.__dataclass_fields__))
 
     def rows(self, patches):
-        return type(self)(*(getattr(self, name)[:patches // 4 if name in ('merged', 'activated', 'output') else patches]
+        return type(self)(*(getattr(self, name)[:patches // 4 if name in ('merged', 'activated', 'output', 'post_normalized') else patches]
                            for name in self.__dataclass_fields__))
 
 
@@ -182,7 +194,7 @@ class PreparedVision:
                              session=session, name=name + '.merge_up')
         self.down = _Projection(tensors['mm_projector.proj.2.weight'], s.activated, s.output,
                                session=session, name=name + '.merge_down')
-        self.post_norm = _RMSNorm(tensors['mm_projector.post_norm.weight'], s.output, s.output, 1e-5,
+        self.post_norm = _RMSNorm(tensors['mm_projector.post_norm.weight'], s.output, s.post_normalized, 1e-5,
                                   session=session, name=name + '.post_norm')
 
     def rotary_embeddings(self, positions):
