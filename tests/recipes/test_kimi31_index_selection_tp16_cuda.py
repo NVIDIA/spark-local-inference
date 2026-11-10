@@ -115,7 +115,7 @@ def _rank(rank, rendezvous):
                     name = f"{mode}{rows}"
                     selector = PreparedIndexSelection(index_queries.view(257, -1), weights, index_cache,
                         metadata, shards, context, buffers, start=start, end=end, mode=mode,
-                        session=session, name=name, workspace=arena, allocator=None, latent_cache=cache)
+                        session=session, name=name, workspace=arena, latent_cache=cache)
                     variant = dict(name=name, selector=selector, start=start, end=end, metadata=metadata)
                     if mode == "decode":
                         owners = torch.empty_like(selector.selected)

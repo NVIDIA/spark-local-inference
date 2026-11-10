@@ -20,8 +20,7 @@ from .projections import prepare_projection
 
 
 class PreparedKDA:
-    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
-                 allocator=None):
+    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None):
         mode = "decode" if mode == "verify" else mode
         self.recording, self.state, self.metadata = records is not None, state, metadata
         self.weights, self.eps = weights, eps

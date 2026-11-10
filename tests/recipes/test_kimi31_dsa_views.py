@@ -21,18 +21,12 @@ def _assert_geometry(actual, expected):
     assert actual._version == expected._version
 
 
-class _OffsetAllocator:
-    def zeros(self, shape, dtype):
-        return torch.zeros((shape[0] + 2, *shape[1:]), dtype=dtype)[1:-1]
-
-
-@pytest.mark.parametrize("allocator", [None, _OffsetAllocator()])
-def test_shared_buffers_retain_equal_prefix_views(allocator):
+def test_shared_buffers_retain_equal_prefix_views():
     values = {}
-    first = indexer.SharedBuffers(values, "cpu", allocator)
+    first = indexer.SharedBuffers(values, "cpu")
     capacity = first.buffer("scores", (128, 8), torch.float32)
     partial = first.buffer("scores", (65, 8), torch.float32)
-    second = indexer.SharedBuffers(values, "cpu", allocator)
+    second = indexer.SharedBuffers(values, "cpu")
     assert second.buffer("scores", (128, 8), torch.float32) is capacity
     assert second.buffer("scores", (65, 8), torch.float32) is partial
     _assert_geometry(partial, capacity[:65])

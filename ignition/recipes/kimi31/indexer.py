@@ -17,7 +17,7 @@ from .dcp import TOPK, PREFILL_ROWS, index_pages
 class SharedBuffers:
     """Declaration examples shared by serial layers and query slices."""
 
-    def __init__(self, values, device, allocator=None, prefix=""):
+    def __init__(self, values, device, prefix=""):
         self.values, self.device, self.prefix = values, device, prefix
         self.ordinal = 0
 
@@ -39,11 +39,11 @@ class SharedBuffers:
 
 class PreparedIndexSelection:
     def __init__(self, query, weights, cache, metadata, shards, context, buffers, *, start, end,
-                 mode, session, name, workspace, allocator, latent_cache):
+                 mode, session, name, workspace, latent_cache):
         rows, width = end - start, metadata.token_page_table.shape[1]
         self.rows, self.width, self.latent_cache = rows, width, latent_cache
         self.shards, self.mode = shards, mode
-        storage = SharedBuffers(buffers, query.device, allocator)
+        storage = SharedBuffers(buffers, query.device)
         self.pages = storage.buffer("pages", (1 if mode == "prefill" else rows, width * 2), torch.int32)
         self.lengths = storage.buffer("local_lengths", (rows,), torch.int32)
         self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
@@ -54,7 +54,7 @@ class PreparedIndexSelection:
         self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
             cache, pages, self.lengths, None, self.local, mode="prefill" if mode == "prefill" else "decode", session=session,
             name=name + ".local", workspace=workspace,
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="fp8."), topk=TOPK, scores=self.scores,
+            buffers=SharedBuffers(buffers, query.device, prefix="fp8."), topk=TOPK, scores=self.scores,
             prefill_records_per_call=131072, head_weight_scale=1.0, hadamard=False, key_power_of_two=False)
         runtime = None if context is None else context.candidates
         if shards.world > 1 and runtime is None:
@@ -66,7 +66,7 @@ class PreparedIndexSelection:
             owner_runtime=context.candidate_owners if tune else None,
             reduction_runtime=tuning.reduction if tune else None, session=session,
             coordinator=None if context is None else context.coordinator, name=name + ".merge",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="merge."),
+            buffers=SharedBuffers(buffers, query.device, prefix="merge."),
             dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",),
             local_counts=self.candidate_counts if tune else None)
         if tune:
@@ -111,7 +111,7 @@ class PreparedDSAIndexer:
     """BF16 projections and head normalization, FP32 LayerNorm, and global top-2048 selection."""
 
     def __init__(self, weights, source, query_latent, metadata, cache, shards, *, context, eps, mode,
-                 session, name, workspace, buffers, latent_cache, allocator=None):
+                 session, name, workspace, buffers, latent_cache):
         rows = source.shape[0]
         expected = {"indexer.wq_b": (4096, 1536), "indexer.wk": (128, 7168),
             "indexer.weights_proj": (32, 7168), "indexer.k_norm.weight": (128,),
@@ -123,7 +123,7 @@ class PreparedDSAIndexer:
                 raise ValueError(f"Kimi sparse index weight {field} requires BF16{shape}")
         if cache.dtype != torch.uint8 or cache.numel() % (64 * 132):
             raise ValueError("Kimi sparse index cache requires planar 64-record uint8 pages")
-        storage = SharedBuffers(buffers, source.device, allocator)
+        storage = SharedBuffers(buffers, source.device)
         self.query = storage.buffer("query", (rows, 4096), torch.bfloat16)
         self.key = storage.buffer("key", (rows, 128), torch.bfloat16)
         self.normalized_key = storage.buffer("normalized_key", (rows, 128), torch.bfloat16)
@@ -146,14 +146,14 @@ class PreparedDSAIndexer:
 
             self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
                 metadata, shards, context, buffers.setdefault("query_selection", {}),
-                session=session, name=name + ".queries", workspace=workspace, allocator=allocator)
+                session=session, name=name + ".queries", workspace=workspace)
         self.selections = {}
         for start, end in (() if self.sharded is not None else self.bounds):
             rows = end - start
             if rows not in self.selections:
                 self.selections[rows] = PreparedIndexSelection(self.query, self.head_weights, cache_pages,
                     metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
-                    session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
+                    session=session, name=f"{name}.slice{start}", workspace=workspace,
                     latent_cache=latent_cache)
 
         for projection in self.projections:

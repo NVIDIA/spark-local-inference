@@ -43,7 +43,7 @@ class PreparedMLAProjection:
     """Kimi latent projections, optional rotary positions, and absorbed query arithmetic."""
 
     def __init__(self, weights, source, metadata, cache, *, eps, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None, gated=True, rotary=None):
+                 coordinator=None, context=None, peers=None, gated=True, rotary=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -140,10 +140,10 @@ class PreparedMLAProjection:
 
 class PreparedMLA(PreparedMLAProjection):
     def __init__(self, weights, source, metadata, cache, *, eps, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None):
+                 coordinator=None, context=None, peers=None):
         super().__init__(weights, source, metadata, cache, eps=eps, mode=mode, session=session, name=name,
                          workspace=workspace, buffers=buffers, latents=latents, coordinator=coordinator,
-                         context=context, peers=peers, allocator=allocator)
+                         context=context, peers=peers)
         tokens, heads = source.shape[0], weights["key"].shape[0]
         device, buffer = source.device, self.buffer
         self.shards = ContextShards() if context is None else context.shards

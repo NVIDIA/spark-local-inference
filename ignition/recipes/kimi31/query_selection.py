@@ -41,7 +41,7 @@ class PreparedQuerySelection:
     """
 
     def __init__(self, query, weights, cache, metadata, shards, context, buffers, *,
-                 session, name, workspace, allocator):
+                 session, name, workspace):
         from .indexer import SharedBuffers
 
         rows = query.shape[0]
@@ -55,7 +55,7 @@ class PreparedQuerySelection:
         self.query, self.weights, self.metadata, self.shards = query, weights, metadata, shards
         self.rows = rows
         self.local_rows = triton.cdiv(rows, shards.world)
-        storage = SharedBuffers(buffers, query.device, allocator)
+        storage = SharedBuffers(buffers, query.device)
         self.end = storage.buffer("end", (1,), torch.int64)
         self.local_query = storage.buffer("query", (self.local_rows, 32, 128), torch.bfloat16)
         self.local_weights = storage.buffer("weights", (self.local_rows, 32), torch.bfloat16)
@@ -84,7 +84,7 @@ class PreparedQuerySelection:
             indexer = PreparedFP8Indexer(self.local_query[begin:end], self.local_weights[begin:end],
                 history, self.pages.expand(count, -1), lengths, None,
                 selected, mode="prefill", session=session, name=f"{name}.rows{count}",
-                workspace=workspace, buffers=SharedBuffers(buffers, query.device, allocator, prefix="fp8."),
+                workspace=workspace, buffers=SharedBuffers(buffers, query.device, prefix="fp8."),
                 prefill_records_per_call=131072, topk=TOPK, head_weight_scale=1.0,
                 hadamard=False, key_power_of_two=False)
             indexer.functional(session=session, dynamic_cache=True)

@@ -27,12 +27,12 @@ class PreparedDSA(PreparedMLAProjection):
     """
 
     def __init__(self, weights, source, metadata, cache, *, index_cache, eps, mode, session, name, workspace,
-                 buffers, latents=None, coordinator=None, context=None, peers=None, allocator=None):
+                 buffers, latents=None, coordinator=None, context=None, peers=None):
         if mode not in ("decode", "verify", "prefill"):
             raise ValueError("Kimi K3.1 sparse attention requires decode, verify, or prefill")
         super().__init__(weights, source, metadata, cache, eps=eps, mode=mode, session=session, name=name,
             workspace=workspace, buffers=buffers, latents=latents, coordinator=coordinator,
-            context=context, peers=peers, allocator=allocator)
+            context=context, peers=peers)
         self.shards = ContextShards() if context is None else context.shards
         if self.shards.world != 16:
             raise ValueError("Kimi K3.1 sparse attention requires sixteen context ranks")
@@ -40,14 +40,14 @@ class PreparedDSA(PreparedMLAProjection):
             raise ValueError("Kimi sparse index cache requires two 64-record subpages per latent page")
         self.indexer = PreparedDSAIndexer(weights, source, self.query_norm, metadata, index_cache, self.shards,
             context=context, eps=eps, mode=mode, session=session, name=name + ".index", workspace=workspace,
-            buffers=buffers.setdefault("index", {}), latent_cache=cache, allocator=allocator)
+            buffers=buffers.setdefault("index", {}), latent_cache=cache)
         self.slots = self.buffer("cache_slots", dtype=torch.int64)
         self.mode = mode
         self.history = None
         if mode == "prefill" and source.shape[0] >= 4096:
             if context.staging is None or context.staged_records is None or metadata.starts.numel() != 1:
                 raise ValueError("large sparse prefill requires fixed staging for one request's history")
-            history_storage = SharedBuffers(buffers.setdefault("history", {}), source.device, allocator)
+            history_storage = SharedBuffers(buffers.setdefault("history", {}), source.device)
             self.history_end = history_storage.buffer("end", (1,), torch.int64)
             self.history_records = context.staged_records
             self.history = PreparedInterleavedHistory(cache, metadata.page_table[0], self.history_end,
@@ -55,7 +55,7 @@ class PreparedDSA(PreparedMLAProjection):
                 self.history_records, context.stage_signals, runtime=context.stage_runtime,
                 session=session, coordinator=coordinator, name=name + ".history")
         self.parts = {}
-        storage = SharedBuffers(buffers.setdefault("selected_attention", {}), source.device, allocator)
+        storage = SharedBuffers(buffers.setdefault("selected_attention", {}), source.device)
         heads = self.absorbed.shape[1]
         common = dict(device=source.device, kv_dtype=FP8, page_size=1, use_cuda_graph=True,
                       partial_dtype=torch.float32)
