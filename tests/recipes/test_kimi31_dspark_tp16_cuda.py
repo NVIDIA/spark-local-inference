@@ -871,7 +871,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     session=session, device=device, stream=stream,
                     pool=graph_pool, compile_decoder=compile_decoder, coordinator=coordinator,
                     cache_root=Path(cache_root),
-                    warmup_storage=storage, report_catalog=False)
+                    warmup_storage=storage, report_catalog=False, retain_forwards=True)
                 graphs.extend(captured.values())
                 assert set(compiled) == (set(functions) if compile_decoder else set())
                 session.freeze()

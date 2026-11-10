@@ -213,12 +213,21 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   selected variant must compile before collective warmup; ranks must not retrace
   or compile on a binding mismatch.
   Load, warm, freeze, and save one forward at a time in catalog order. Release
-  its portable compiler state and tuning registration after the cache write;
+  its portable compiler state, generated source, bundled tuning metadata, and
+  tuning registration after the cache write;
   retain canonical kernel selections, execution guards, live kernel owners, and
   bound storage. Standalone guards retain their full check tree and callbacks;
-  discard the unused Dynamo diff tree and duplicate debug lists, since type
-  invalidation finalizers can keep the wrapper alive for the process lifetime.
+  discard the unused Dynamo diff tree and duplicate debug lists. Artifact loading
+  omits guard construction stacks and Inductor diagnostic graph text and line maps;
+  executable guard predicates, generated source, and launchers remain intact. Guard wrappers
+  retain their invalidation managers; object finalizers refer to those managers
+  weakly, so discarding every wrapper owner releases the guard tree and runtime
+  globals even while guarded types remain alive.
   Complete warmup for the entire catalog before capturing any graph.
+  After successful capture and any required instantiation, release the compiled
+  Python wrapper and guards while retaining graph, kernel, and storage owners
+  through drain. Grouped forwards release shared guards after their final capture;
+  recipes exposing eager forwards retain guarded callables.
 
 ## Shape and graph-transition validation
 

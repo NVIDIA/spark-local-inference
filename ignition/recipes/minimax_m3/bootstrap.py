@@ -443,7 +443,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=package_storage, capture_names=config.diagnostic_graphs,
-            compile_kinds=("prefill", "decode", "resume", "speculative", "vision"))
+            compile_kinds=("prefill", "decode", "resume", "speculative", "vision"), retain_forwards=True)
     finally:
         scratch_pool.materialize()
     session.freeze()

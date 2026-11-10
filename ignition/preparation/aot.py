@@ -10,6 +10,7 @@ import inspect
 import operator
 import os
 import pickle
+import sys
 import tempfile
 import zlib
 from concurrent.futures import FIRST_COMPLETED, wait
@@ -45,11 +46,15 @@ _CHECK_BINDINGS = ContextVar("flare_check_bindings", default=False)
 def _load_inductor(data, original, *, frozen=False):
     runtime_patches.apply()
     from torch._functorch._aot_autograd.aot_autograd_result import deserialize_bundled_cache_entry
+    from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
     entry, kernels, constants = pickle.loads(data)
     if kernels or constants:
         raise ValueError("compiled native launches must use runtime kernel bindings")
+    # Torch copies graph attributes into runtime wrappers during deserialization.
+    entry.compiled_fw.result.inductor_post_grad_graph_str = None
+    entry.compiled_fw.result.cache_linemap = None
     relocate_inductor(entry, original, freeze_tuning=frozen)
     if frozen and entry.compiled_fw.result._triton_bundle is not None:
         from .inductor_tuning import _materialize_selected_cubin
@@ -59,6 +64,11 @@ def _load_inductor(data, original, *, frozen=False):
                 _materialize_selected_cubin(result)
     serialized = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
     compiled = deserialize_bundled_cache_entry(entry)
+    serializer = getattr(compiled.serialize, "__self__", None)
+    if (not isinstance(serializer, SerializableCompiledFunction)
+            or getattr(compiled, "__wrapped__", None) is not serializer
+            or getattr(compiled, "serialize_fn", None) is not serializer.serialize_fn):
+        raise RuntimeError("unsupported bundled Inductor serialization wrappers")
     if frozen and entry.compiled_fw.result._triton_bundle is not None:
         from .device_binding import _freeze_tuning_winners
 
@@ -72,6 +82,8 @@ def _load_inductor(data, original, *, frozen=False):
             graph._triton_bundle.kernel_artifacts.clear()
     artifact = AOTCompiledArtifact(compiled)
     artifact._flare_graph = entry.compiled_fw.result
+    # simple_wraps copies the serializer callback into the execution wrapper's dictionary.
+    artifact._flare_serialization_owners = (compiled, serializer)
     return artifact, serialized
 
 
@@ -150,10 +162,27 @@ def _guard_serialization():
 
 @contextmanager
 def _guard_code_cache(root):
-    from torch._dynamo import guards
+    """Reuse guard code without retaining construction stacks in executable guards."""
+    from torch._dynamo import guards, package
 
     with _GUARD_LOCK:
         original = guards.build_guard_function
+        original_manager = package.load_guard_manager
+
+        def load_manager(state, *args, **kwargs):
+            for guard in state.output_graph._guards:
+                guard.stack = None
+                guard.user_stack = None
+            original_parts = guards.get_verbose_code_parts
+
+            def shared_parts(*args, **kwargs):
+                return [sys.intern(part) for part in original_parts(*args, **kwargs)]
+
+            guards.get_verbose_code_parts = shared_parts
+            try:
+                return original_manager(state, *args, **kwargs)
+            finally:
+                guards.get_verbose_code_parts = original_parts
 
         def build(code_parts, closure_args):
             key = hashlib.sha256(pickle.dumps((tuple(code_parts), closure_args))).hexdigest()
@@ -174,9 +203,11 @@ def _guard_code_cache(root):
 
         token = _GUARD_TENSOR_MODE.set(torch._subclasses.FakeTensorMode())
         guards.build_guard_function = build
+        package.load_guard_manager = load_manager
         try:
             yield
         finally:
+            package.load_guard_manager = original_manager
             guards.build_guard_function = original
             _GUARD_TENSOR_MODE.reset(token)
 
@@ -209,6 +240,39 @@ class _Input:
             storage = _byte_storage(value) if self.region is None else _storage_region(value, *self.region)
             value = storage.view(dtype).as_strided(shape, stride, offset)
         return value
+
+
+def _share_storage_descriptors(inputs, signature, calls):
+    """Share immutable storage descriptors within one deserialized forward."""
+    integers, tuples = {}, {}
+
+    def share(value):
+        kind = type(value)
+        if kind is int:
+            return int, integers.setdefault(value, value)
+        if kind in (bool, type(None), torch.dtype, torch.device):
+            return kind, value
+        if kind is not tuple:
+            return None, value
+        parts = [share(part) for part in value]
+        if any(kind is None for kind, _ in parts):
+            return None, value
+        kinds = tuple(kind for kind, _ in parts)
+        result = tuple(part for _, part in parts)
+        pool = tuples.setdefault(kinds, {})
+        return (tuple, kinds), pool.setdefault(result, result)
+
+    for item in inputs:
+        item.index = share(item.index)[1]
+        item.view = share(item.view)[1]
+        item.region = share(item.region)[1]
+    signature = tuple(share(item)[1] for item in signature)
+    for _, _, _, operands, positions in calls:
+        for index, operand in enumerate(operands):
+            operands[index] = share(operand)[1]
+        for index, position in enumerate(positions):
+            positions[index] = share(position)[1]
+    return signature
 
 
 def _serialized_triton_launch(kernel, constants, arguments):
@@ -378,6 +442,7 @@ class StorageBackend(SerializableCallable):
         original_device = devices.pop()
         fn.signature = tuple((*item[:4], restore_device(item[4].type, item[4].index), item[5])
                              if isinstance(item, tuple) else item for item in fn.signature)
+        fn.signature = _share_storage_descriptors(fn.inputs, fn.signature, calls)
         fn.invocations = []
         for name, leaves, tree, operands, integers in calls:
             tree = treespec_loads(tree)
@@ -430,6 +495,14 @@ class _GuardedForwardCall:
 
 
 @dataclass
+class _CapturedForwardResources:
+    backend: StorageBackend
+
+    def __call__(self, owner):
+        raise RuntimeError("captured forward no longer supports Python execution")
+
+
+@dataclass
 class BoundForward:
     artifact: object
     owner: object
@@ -441,11 +514,13 @@ class BoundForward:
 
     @property
     def backend(self):
-        return (self.artifact.backend if isinstance(self.artifact, _GuardedForwardCall)
+        return (self.artifact.backend if isinstance(self.artifact, (_GuardedForwardCall, _CapturedForwardResources))
                 else self.artifact._artifacts.compiled_fn)
 
     def prepare_capture(self):
         """Retain execution guards and kernel owners after portable cache writes finish."""
+        if isinstance(self.artifact, _CapturedForwardResources):
+            raise RuntimeError("captured forward no longer supports Python execution")
         if isinstance(self.artifact, _GuardedForwardCall):
             return 0
         state = self.artifact._artifacts
@@ -456,9 +531,30 @@ class BoundForward:
         if guards.cache_entry is not None or guards.extra_state is not None:
             raise RuntimeError("capture requires standalone compiled guards")
         backend = state.compiled_fn
+        serialization_owners = getattr(backend.artifact, "_flare_serialization_owners", ())
+        if serialization_owners and any(owner.serialize_fn is not serialization_owners[0].serialize_fn
+                                        for owner in serialization_owners):
+            raise RuntimeError("bundled Inductor serializer changed before capture")
         released = len(state.guards_state) + len(backend._serialized_artifact or b"")
         backend._serialized_artifact = None
-        # Type-invalidation finalizers can retain this wrapper for the process lifetime.
+        for owner in serialization_owners:
+            owner.serialize_fn = None
+        if serialization_owners:
+            backend.artifact._flare_serialization_owners = ()
+        # Torch copies loading and serialization metadata into execution wrappers.
+        pending = [backend.artifact.inner_fn.compiled_fn, getattr(backend.artifact, "_flare_graph", None)]
+        visited = set()
+        while pending:
+            owner = pending.pop()
+            if owner is None or id(owner) in visited:
+                continue
+            visited.add(id(owner))
+            for field, value in (("source_code", ""), ("_triton_bundle", None), ("runnable_graph_str", ""),
+                                 ("inductor_provenance_mapping_str", None),
+                                 ("inductor_provenance_stack_traces_str", None)):
+                if hasattr(owner, field):
+                    setattr(owner, field, value)
+            pending.append(getattr(owner, "__wrapped__", None))
         # Standalone execution checks the full root, without Dynamo's diff tree or debug lists.
         guards.diff_guard_root = None
         guards.diff_guard_sources.clear()
@@ -466,6 +562,12 @@ class BoundForward:
         guards.verbose_code_parts = None
         self.artifact = _GuardedForwardCall(self.artifact.fn, guards, backend)
         return released
+
+    def retire_after_capture(self):
+        """Release Python guards after capture while retaining graph execution resources."""
+        if isinstance(self.artifact, _GuardedForwardCall):
+            self.artifact = _CapturedForwardResources(self.artifact.backend)
+            release_unused()
 
 
 def _completed(pending):

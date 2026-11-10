@@ -49,6 +49,7 @@ def test_capture_drains_after_prepare_and_sync_before_capture(monkeypatch):
     def forward():
         events.append('run')
     forward.prepare_capture = lambda: events.append('prepare_capture') or 0
+    forward.retire_after_capture = lambda: None
     class Cache:
         def __init__(self, **kwargs):
             pass

@@ -618,7 +618,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs, materialize=materialize_cache, warmup_storage=package_storage,
-        compile_kinds=_COMPILED_KINDS)
+        compile_kinds=_COMPILED_KINDS, retain_forwards=True)
     kv_bytes = pages * page_bytes
     if integrated:
         import resource

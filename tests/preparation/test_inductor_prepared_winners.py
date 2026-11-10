@@ -233,6 +233,8 @@ def test_artifact_binding_freezes_an_unpickled_entry_before_deserialization(monk
     from torch._inductor.async_compile import CompiledTritonKernels
     from torch._inductor.codecache import code_hash
     from torch._functorch._aot_autograd import aot_autograd_result
+    from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction
+    from torch._functorch._aot_autograd.utils import simple_wraps
     from ignition.preparation import aot
     standalone_compile = importlib.import_module('torch._inductor.standalone_compile')
 
@@ -263,7 +265,12 @@ def test_artifact_binding_freezes_an_unpickled_entry_before_deserialization(monk
         frozen = copied.compiled_fw.result._triton_bundle.static_autotuners[0].kernel
         assert frozen.inductor_meta["dynamic_scale_rblock"] is False
         assert "_could_rblock_scale" not in vars(frozen)
-        return SimpleNamespace(serialize=lambda: copied)
+        owner = SerializableCompiledFunction(lambda args: None, lambda: copied)
+        @simple_wraps(owner)
+        def compiled(*args):
+            return owner(list(args))
+        compiled.serialize = owner.serialize
+        return compiled
     monkeypatch.setattr(aot_autograd_result, "deserialize_bundled_cache_entry", deserialize)
     monkeypatch.setattr(standalone_compile, "AOTCompiledArtifact", lambda compiled: compiled)
     with bind_device(f"cuda:{target}", freeze_tuning=True):

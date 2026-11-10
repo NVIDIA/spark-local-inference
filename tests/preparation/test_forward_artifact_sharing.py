@@ -99,6 +99,7 @@ class _Artifact:
         from torch._dynamo.guards import GuardManagerWrapper
 
         backend = StorageBackend.__new__(StorageBackend)
+        backend.artifact = SimpleNamespace(inner_fn=SimpleNamespace(compiled_fn=execute))
         backend._serialized_artifact = b"portable backend"
         backend._tuning_frozen = False
         guards = SimpleNamespace(check=lambda arguments: isinstance(arguments["forward"], _Forward),

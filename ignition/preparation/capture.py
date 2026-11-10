@@ -21,9 +21,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
                      warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
-                     report_catalog=True,
+                     report_catalog=True, retain_forwards=False,
                      compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
-    """Retain compiled callables and capture with an optional b12x IPC runtime.
+    """Retain compiled resources and capture with an optional b12x IPC runtime.
 
     Persistent state and graph outputs must live in caller-owned storage.
     Only graph-local intermediates may use the shared graph memory pool;
@@ -35,6 +35,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     ``compile_group`` compiles one representative for same-signature trial
     forwards, then checks every owner's guards and storage aliases before
     capturing their distinct CUDA graphs.
+    ``retain_forwards`` preserves guarded Python execution for eager diagnostics.
     """
     if (report_catalog and progress is not None and not getattr(session, "_graph_catalog_reported", False)
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
@@ -79,6 +80,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         if compile_group is not None:
             compiled = cache.bind_group(template[compile_group], forwards,
                                         signature=signatures[first], coordinator=coordinator)
+            del template
         with phase(progress, "Release serialized compiler state", total=len(compiled)) as stage:
             released, counted = 0, set()
             for forward in compiled.values():
@@ -145,6 +147,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             except Exception as error:
                 error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
                 raise
+            if name in compiled and not retain_forwards:
+                function.retire_after_capture()
             graphs[name] = graph
             stage.update(advance=1)
             if progress is not None:

@@ -16,6 +16,7 @@ def test_support_forward_is_neither_compiled_nor_captured(monkeypatch):
     calls = []
     selected = lambda: calls.append("speculative")
     selected.prepare_capture = lambda: 0
+    selected.retire_after_capture = lambda: None
     support = lambda: calls.append("support")
     stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
 
@@ -87,6 +88,9 @@ def test_grouped_capture_compiles_one_representative_and_captures_each_owner(mon
 
         def prepare_capture(self):
             return 0
+
+        def retire_after_capture(self):
+            pass
 
         def __call__(self):
             events.append(("run", self.owner))
