@@ -96,6 +96,37 @@ def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
     assert metadata.indexed.token_slots.tolist() == [-1, -1, -1]
 
 
+def test_later_draft_passes_reuse_each_requests_first_selection():
+    op = PreparedRound.__new__(PreparedRound)
+    op.draft_metadata = DraftMetadata(3, 3, 2, "cpu")
+    index = SimpleNamespace(physical=torch.zeros((3, 2051), dtype=torch.int32),
+                            selected_lengths=torch.zeros(3, dtype=torch.int32))
+    op.draft = SimpleNamespace(attention=SimpleNamespace(scratch=SimpleNamespace(index=index)))
+    op.selection = (torch.zeros((3, 2051), dtype=torch.int32), torch.zeros(3, dtype=torch.int32))
+    slots, starts = torch.tensor([2, 0, 1]), torch.tensor([255, 510, 300])
+    state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
+    tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    hidden = torch.zeros((3, 4096), dtype=torch.bfloat16)
+    tokens = torch.tensor([7, 8, 9])
+    # The first pass packs requests one and two; request zero has no draft to propose.
+    op.draft_metadata.set(slots, torch.tensor([0, 1, 1]), starts, tokens, hidden, tables,
+                          capacity=1, state_rows=state_rows)
+    first = {1: torch.tensor([3, 5, 9]), 2: torch.tensor([4, 6, 8, 12])}
+    index.physical.fill_(-1)
+    for row, request in enumerate((1, 2)):
+        index.physical[row, :first[request].numel()] = first[request]
+        index.selected_lengths[row] = first[request].numel()
+    op.retain_selection()
+    # The second pass keeps only request two, which now occupies packed row zero.
+    op.draft_metadata.set(slots, torch.tensor([0, 0, 1]), starts + 1, tokens, hidden, tables,
+                          capacity=1, state_rows=state_rows)
+    index.physical.fill_(-2)
+    index.selected_lengths.fill_(-2)
+    op.reuse_selection()
+    assert index.selected_lengths.tolist() == [4, 0, 0]
+    assert index.physical[0, :4].tolist() == first[2].tolist()
+
+
 @pytest.fixture(autouse=True)
 def records_only_cpu_commit(monkeypatch):
     # These state-machine tests run without CUDA; reduction and graph ordering

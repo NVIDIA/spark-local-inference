@@ -14,6 +14,7 @@ from b12x.attention import sparse_mla
 from cuda.bindings import driver as cuda
 
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.sparse_mla import PreparedLatentCacheWriter
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
@@ -235,3 +236,74 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
             if worker is not None:
                 worker.close()
             graph.reset()
+
+
+@pytest.mark.parametrize("overlap", [True, False])
+@torch.no_grad()
+def test_reused_selection_attends_only_to_the_first_pass_records(model_weights, overlap):
+    """A draft pass that shares the first pass's selection excludes its own and later records."""
+    module, weights, world = model_weights
+    if world == 1:
+        pytest.skip("GLM prepares draft graphs for TP2 and TP4")
+    device = torch.device("cuda:0")
+    source = torch.zeros((2, 4096), dtype=torch.bfloat16, device=device)
+    scratch = MLAScratch.allocate(2, 64 // world, 64, "decode", device)
+    state = MLAState.allocate(128, 4, device)
+    metadata = IndexMetadata.allocate(2, 2, 64, device)
+    history = torch.zeros((256, 512), dtype=torch.bfloat16, device=device)
+    history_slots = torch.zeros(256, dtype=torch.int64, device=device)
+    arena = ScratchArena(device, overlap=overlap)
+    with RecordedPreparationSession(device=device, checkpoint="GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
+            workload_schema="glm-mla-shared-selection-v1", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        attention = PreparedGlmMLA(module, weights, source, scratch, state, metadata,
+            mode="decode", session=session, name="mla", workspace=arena)
+        writer = PreparedLatentCacheWriter(history, state.cache, history_slots, session=session, name="history")
+        session.tune()
+        state.cache.zero_()
+        state.index.cache.zero_()
+        state.index.tail.zero_()
+        generator = torch.Generator(device=device).manual_seed(173)
+        metadata.block_table.copy_(torch.randperm(128, device=device, generator=generator, dtype=torch.int32)
+                                   .reshape(2, 64))
+        # Request zero is live in state slot 2; request one is idle.
+        metadata.state_slots.copy_(torch.tensor([2, -1], device=device))
+        metadata.query_start_loc.copy_(torch.tensor([0, 1, 1], dtype=torch.int32, device=device))
+        metadata.requests.zero_()
+        page = metadata.block_table[0, 0].long()
+        # Latent records of positions 0 through 255 precede the first draft pass at position 256. With fewer
+        # than 512 complete C4 pools every pool is selected, so the selection does not depend on the query.
+        history.normal_(generator=generator)
+        history_slots.copy_(page * 256 + torch.arange(256, device=device))
+        writer()
+
+        def run(position, *, select, write=True):
+            slot = metadata.block_table[0, position // 256].long() * 256 + position % 256
+            metadata.positions.copy_(torch.tensor([position, -1], device=device))
+            metadata.token_slots.copy_(torch.where(torch.tensor([write, False], device=device), slot, -1))
+            return attention(source, select=select).clone()
+
+        source[0].normal_(std=.1, generator=generator)
+        run(256, select=True)
+        physical, lengths = scratch.index.physical.clone(), scratch.index.selected_lengths.clone()
+        # Sixty-four complete pools and the tail token at position 256.
+        assert lengths.tolist() == [257, 0]
+        index_cache, index_tail = state.index.cache.clone(), state.index.tail.clone()
+        source[0].normal_(std=.1, generator=generator)
+        reused = run(257, select=False)
+        # The pass writes its latent record and leaves the selection and C4 state unchanged.
+        assert torch.equal(scratch.index.physical, physical) and torch.equal(scratch.index.selected_lengths, lengths)
+        assert torch.equal(state.index.cache, index_cache) and torch.equal(state.index.tail, index_tail)
+        own = (metadata.block_table[0, 1].long() * 256 + 1).item()
+        assert state.cache.view(-1, 528)[own].count_nonzero()
+        assert not reused[1].count_nonzero()
+        # Selecting at the preceding position with the same query attends to the same records.
+        preceding = run(256, select=True, write=False)
+        assert torch.equal(scratch.index.physical[0, :257].sort().values, physical[0, :257].sort().values)
+        assert ((preceding.float() - reused.float()).norm() / reused.float().norm()).item() < 1e-3
+        # Selecting at the pass's own position also attends to its record.
+        state.index.cache.copy_(index_cache)
+        state.index.tail.copy_(index_tail)
+        current = run(257, select=True, write=False)
+        assert scratch.index.selected_lengths.tolist() == [258, 0]
+        assert ((current.float() - reused.float()).norm() / reused.float().norm()).item() > 2e-2

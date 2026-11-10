@@ -396,7 +396,11 @@ class PreparedGlmMLA:
             for slice in self.slices:
                 slice[4].rebind_cache(self.state.cache)
 
-    def __call__(self, source):
+    def __call__(self, source, *, select=True):
+        """Attend with the indexer's selection, or without `select` with the one already in index scratch.
+
+        A pass that reuses the selection writes its latent records but leaves the C4 cache and tail unchanged.
+        """
         s, p = self.scratch, self.projections
         p["qkv_a_proj"](source)
         rms_norm(s.query_input, self.module.q_a_layernorm.weight, s.query_residual,
@@ -411,7 +415,8 @@ class PreparedGlmMLA:
         rms_norm(s.latent_input, self.module.kv_a_layernorm.weight, s.latent,
             self.module.kv_a_layernorm.variance_epsilon, round_before_weight=True)
         self.writer()
-        self.indexer()
+        if select:
+            self.indexer()
         if self.context is None:
             s.visible.copy_(self.metadata.positions + 1)
             if self.end is not None:
