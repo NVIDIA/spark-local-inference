@@ -55,7 +55,7 @@ class MetadataLoader(weights.KimiWeightLoader):
     def __exit__(self, *exc):
         return False
 
-    def linear(self, prefix, *, rows=None, columns=None):
+    def linear(self, prefix, *, rows=None, columns=None, temporary=False):
         name = prefix.rsplit(".", 1)[-1]
         output, source = {
             "embed_tokens": (256, 64),
@@ -74,7 +74,7 @@ class MetadataLoader(weights.KimiWeightLoader):
             source = columns[1] - columns[0]
         return torch.empty((output, source), device="meta", dtype=torch.bfloat16)
 
-    def load_tensor(self, name, *, extent=None):
+    def load_tensor(self, name, *, extent=None, temporary=False):
         if "conv1d.weight" in name:
             shape, dtype = (2048, 1, 4), torch.bfloat16
         elif name.endswith("A_log"):
@@ -88,7 +88,7 @@ class MetadataLoader(weights.KimiWeightLoader):
         value = torch.empty(shape, device="meta", dtype=dtype)
         return value if extent is None else value[extent]
 
-    def load_tensors(self, names):
+    def load_tensors(self, names, *, temporary=False):
         return tuple(torch.empty(64, device="meta", dtype=torch.bfloat16) for _ in names)
 
     def load_fp4_experts(self, *args, **kwargs):

@@ -12,6 +12,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_cat, persistent_empty
 
 if TYPE_CHECKING:
     from b12x.gemm.blockscaled import Weight
@@ -77,37 +78,39 @@ class DraftWeights:
         def stored(weight):
             return quantize_bf16_linear_as_mxfp8(weight) if online_mxfp8 else weight
 
+        cat = torch.cat if online_mxfp8 else persistent_cat
         layers = []
         with DirectWeightLoader(manifest, device,
                 prefixes=("context_", "final_norm.", "layers.", "markov_head."),
                 progress=progress, progress_label="Load draft weights") as loader:
-            def matrix(name, *, rows=None, columns=None):
+            def matrix(name, *, rows=None, columns=None, temporary=False):
                 return loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                    slice(*(columns or (None, None)))))
+                    slice(*(columns or (None, None)))), temporary=temporary)
 
-            projection = stored(matrix("context_proj", rows=hidden_rows))
+            projection = stored(matrix("context_proj", rows=hidden_rows, temporary=online_mxfp8))
             hidden_norm, norm = loader.load_tensors(("context_norm.weight", "final_norm.weight"))
-            context_kv = torch.cat(loader.load_tensors(tuple(
-                f"layers.{index}.self_attn.kv_a_proj_with_mqa.weight" for index in range(d.layers))))
+            context_kv = persistent_cat(loader.load_tensors(tuple(
+                f"layers.{index}.self_attn.kv_a_proj_with_mqa.weight" for index in range(d.layers)), temporary=True))
             for index in range(d.layers):
                 prefix = f"layers.{index}"
                 attention = prefix + ".self_attn"
-                query = matrix(attention + ".q_a_proj", rows=q_rows)
+                query = matrix(attention + ".q_a_proj", rows=q_rows, temporary=True)
                 key_value = context_kv[index * kv_width + kv_rows[0]:index * kv_width + kv_rows[1]]
                 latent_width = query.shape[0] + key_value.shape[0]
-                latent = torch.cat((query, key_value, query.new_zeros((-latent_width % 8, hidden))))
-                kv = matrix(attention + ".kv_b_proj", rows=(h0 * 256, h1 * 256)).view(h1 - h0, 256, 512)
+                latent = cat((query, key_value, query.new_zeros((-latent_width % 8, hidden))))
+                kv = matrix(attention + ".kv_b_proj", rows=(h0 * 256, h1 * 256), temporary=True).view(h1 - h0, 256, 512)
                 query_norm, kv_norm, input_norm, post_norm = loader.load_tensors(tuple(prefix + name for name in
                     (".self_attn.q_a_layernorm.weight", ".self_attn.kv_a_layernorm.weight",
                      ".input_layernorm.weight", ".post_attention_layernorm.weight")))
                 projections = dict(latent_gate=stored(latent),
-                    q_b=stored(matrix(attention + ".q_b_proj", rows=(h0 * 192, h1 * 192))),
-                    key=kv[:, :128].contiguous(), value=kv[:, 128:].transpose(1, 2).contiguous(),
+                    q_b=stored(matrix(attention + ".q_b_proj", rows=(h0 * 192, h1 * 192), temporary=online_mxfp8)),
+                    key=persistent_empty((h1 - h0, 128, 512), dtype=kv.dtype, device=kv.device).copy_(kv[:, :128]),
+                    value=persistent_empty((h1 - h0, 512, 128), dtype=kv.dtype, device=kv.device).copy_(kv[:, 128:].transpose(1, 2)),
                     query_norm=query_norm, kv_norm=kv_norm,
-                    output=stored(matrix(attention + ".o_proj", columns=(h0 * 128, h1 * 128))))
-                mlp = MLPWeights(stored(torch.cat(tuple(matrix(prefix + ".mlp." + name, rows=intermediate)
+                    output=stored(matrix(attention + ".o_proj", columns=(h0 * 128, h1 * 128), temporary=online_mxfp8)))
+                mlp = MLPWeights(stored(cat(tuple(matrix(prefix + ".mlp." + name, rows=intermediate, temporary=True)
                     for name in ("gate_proj", "up_proj")))),
-                    stored(matrix(prefix + ".mlp.down_proj", columns=intermediate)))
+                    stored(matrix(prefix + ".mlp.down_proj", columns=intermediate, temporary=online_mxfp8)))
                 layers.append(DraftLayerWeights(projections, input_norm, post_norm, mlp))
             markov_embedding = matrix("markov_head.markov_w1")
             markov_head = matrix("markov_head.markov_w2", rows=vocabulary)
