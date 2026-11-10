@@ -101,17 +101,24 @@ each rank then reaches a cabled peer over the cable's devices and every other
 peer over the switch. The planner identifies a cable as an IPv4 subnet that only
 the two cabled ranks hold, so every cable needs subnets of its own, distinct from
 the switch's and from every other cable's. IPv4 link-local addresses
-(169.254.0.0/16) never identify a cable. Among equally verified links, a
+(169.254.0.0/16) never identify a cable. The two ranks of a group on one cabled
+pair hold every subnet in common, so the planner also identifies a cable by
+LLDP: each rank records its devices' MAC addresses and, when lldpd runs on the
+host, the port MAC addresses that `lldpctl` reports for their neighbors. LLDP
+frames do not cross a switch, so devices of two ranks that list each other share
+a cable. Without lldpd on both hosts, a two-rank group on a cabled pair uses the
+switch. Among equally verified links, a
 peer's two rails use devices behind different PCIe links: a DGX Spark's two
 ConnectX-7 functions behind one PCIe x4 link share its bandwidth, so a two-rank
 group on a cabled pair uses one function behind each link. Core distribution
 and Orbit prestaging connect each pair of ranks over the same devices as its RDMA
 rails.
 
-`--roce-switch-only` routes every peer over subnets every rank holds, as on the
-switch alone, for example to measure a switch-only baseline or to keep traffic
-off a faulty cable. With two ranks every subnet joins both, so the option cannot
-separate a cable from a switch. Peers started without it follow rank zero's
+`--roce-switch-only` routes every peer over subnets every rank holds between
+devices that are not LLDP neighbors, as on the switch alone, for example to
+measure a switch-only baseline or to keep traffic off a faulty cable. With two
+ranks every subnet joins both, so the option leaves a cable unused only where
+LLDP identifies it. Peers started without it follow rank zero's
 choice for core distribution, and ranks that still disagree stop when the
 transport connects, naming the rank. Every rank's `Connect RoCE transport`
 startup phase lists each peer's local devices in rail order and marks a peer
