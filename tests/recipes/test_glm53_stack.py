@@ -59,6 +59,22 @@ def test_scratch_views_reject_unavailable_token_sample_and_request_capacity():
             base.rows(tokens, mode, sample_rows=rows)
 
 
+def test_cp_prefill_query_value_alias_survives_layer_overlay():
+    base = DecoderScratch.allocate(65, 2, "prefill", "cpu", shard=TensorParallelShard(0, 2),
+        sample_rows=1, context_ranks=2, overlay_layers=True)
+    for rows in (65, 16, 65):
+        view = base.rows(rows, "prefill", sample_rows=1).mla
+        view.query.fill_(float("nan"))
+        view.expanded.fill_(rows)
+        assert torch.all(view.query == rows)
+    for mode, ranks in (("prefill", 1), ("decode", 2)):
+        separate = DecoderScratch.allocate(2, 2, mode, "cpu", shard=TensorParallelShard(0, 2),
+            sample_rows=1, context_ranks=ranks).mla
+        separate.query.fill_(7)
+        separate.expanded.zero_()
+        assert torch.all(separate.query == 7)
+
+
 @pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])
 def test_canonical_layers_share_intermediates_and_own_distinct_state(world, rank):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",

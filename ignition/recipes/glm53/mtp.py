@@ -126,13 +126,18 @@ def _draft_metadata(Lengths, Starts, Slots, Tokens, Hidden, Tables, StateRows, R
 
 
 class DraftMetadata:
-    def __init__(self, tokens, rows, blocks, device, *, shards=None):
+    def __init__(self, tokens, rows, blocks, device, *, shards=None, hidden=None):
         from .dcp import ContextShards
 
         self.shards = ContextShards() if shards is None else shards
         self.indexed = IndexMetadata.allocate(tokens, rows, blocks, device)
         self.token_ids = torch.zeros(tokens, dtype=torch.int64, device=device)
-        self.hidden = torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device)
+        if hidden is None:
+            hidden = torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device)
+        if (hidden.shape != (tokens, 4096) or hidden.dtype != torch.bfloat16
+                or hidden.device != self.token_ids.device or not hidden.is_contiguous()):
+            raise ValueError("GLM draft hidden storage must be contiguous BF16 [tokens, 4096] on the metadata device")
+        self.hidden = hidden
         self.indices = torch.arange(tokens, device=device)
         self.output_indices = torch.zeros(rows, dtype=torch.int64, device=device)
         self.num_tokens = torch.zeros(1, dtype=torch.int32, device=device)

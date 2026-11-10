@@ -78,6 +78,9 @@ class MLAScratch:
         # Fused layer-input projection: query 1536, latent 512, index key 128 and index head weights 32.
         projected = buffer(2208)
         prefill = context_ranks > 1 and mode == "prefill"
+        query = buffer(heads, 256)
+        # CP prefill consumes each query slice before expanding values into the same rows.
+        expanded = query if prefill else buffer(heads, 256)
         exchange = min(tokens, SLICE_ROWS) if context_ranks > 1 and not prefill else 0
         # Context-parallel rows absorb, attend and expand one slice at a time; otherwise every row at once.
         absorbed = exchange or (min(tokens, PREFILL_SLICE_ROWS) if prefill else tokens)
@@ -90,7 +93,7 @@ class MLAScratch:
 
         window = min(WINDOW_RECORDS, blocks * 256) if remote and prefill else 0
         return cls(projected, projected[:, :1536], buffer(1536), projected[:, 1536:2048], buffer(512),
-            buffer(heads, 256), zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), buffer(heads, 256),
+            query, zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), expanded,
             buffer(4096), zeros(tokens, dtype=torch.int32), index,
             zeros(exchange, heads * context_ranks, 512), zeros(exchange, heads * context_ranks, 512),
             zeros(exchange, heads * context_ranks, dtype=torch.float32), zeros(positions, 528, dtype=torch.uint8),
