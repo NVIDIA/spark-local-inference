@@ -194,7 +194,15 @@ class PreparedExecution(PreparedGraphBundle):
         self.export_events = dict(export_events or {})
 
     def manifest(self, *, all_variants=False) -> dict[str, Any]:
-        context, handles, spans = self._validate_resources()
+        return self._manifest(all_variants=all_variants, export_graphs=False)
+
+    def export_manifest(self) -> dict[str, Any]:
+        """Validate export metadata and storage without requiring executable handles."""
+        return self._manifest(all_variants=True, export_graphs=True)
+
+    def _manifest(self, *, all_variants, export_graphs) -> dict[str, Any]:
+        context, handles, spans = (self._validate_resources(export_graphs=True) if export_graphs
+                                  else self._validate_resources())
         descriptors = []
         offsets = {}
         cursor = 0
@@ -222,7 +230,8 @@ class PreparedExecution(PreparedGraphBundle):
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
             inputs = (*reserved, *signature.inputs)
-            graphs.append({"name": name, "kind": signature.kind, "handle": handle,
+            graphs.append({"name": name, "kind": signature.kind,
+                **({} if export_graphs else {"handle": handle}),
                 "sampling_mode": signature.sampling_mode,
                 "batch_capacity": signature.batch_capacity, "token_capacity": signature.token_capacity,
                 "prefill_capacity": signature.prefill_capacity,
@@ -244,7 +253,7 @@ class PreparedExecution(PreparedGraphBundle):
                 "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
-                "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
+                "tuning_graphs": [dict(name=name, **({} if export_graphs else {"handle": graph_handles[name]}), outputs=list(value.outputs),
                                        status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):

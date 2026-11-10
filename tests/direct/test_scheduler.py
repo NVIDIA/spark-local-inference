@@ -30,7 +30,7 @@ def layout(**overrides):
                   snapshots=2, prefill_chunk=512, vocabulary=VOCABULARY, eos=EOS, graphs=graphs,
                   widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=32)
     values.update(overrides)
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
     bindings = {name: list(c.text_inputs(key[0]).values()) for key, name in values["graphs"].items()}
     for name in values.get("confidence_widths", {}):
         bindings[name] = [b for b in bindings[name] if b["buffer"] != "query_lengths"]
@@ -632,7 +632,7 @@ def test_packed_completion_honors_explicit_absence_of_a_draft_cursor(bad_cursor)
 
 
 @pytest.mark.parametrize("width", [8, 13, 16, 32])
-def test_package_token_capacity_bounds_packed_upload_and_publication(width):
+def test_core_token_capacity_bounds_packed_upload_and_publication(width):
     graphs = {("speculative", b, 1): f"width-one-{b}" for b in (1, 2, 4)}
     graphs[("speculative", 4, width, 4 * width, width - 1)] = "packed"
     scheduler = Scheduler(layout(graphs=graphs, widths=(1, width), record_fields=16 + width,

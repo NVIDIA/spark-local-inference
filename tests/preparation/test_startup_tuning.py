@@ -129,21 +129,31 @@ def test_standalone_registration_prepares_each_declared_consumer(monkeypatch):
     assert snapshots == [(first,), (first, second)]
 
 
-def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
+@pytest.mark.parametrize("recording", [False, True])
+def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch, recording):
     from contextlib import contextmanager, nullcontext
-    from ignition.preparation.runtime_package import _graphs
+    from ignition.preparation.runtime_core import _graphs
     from ignition.preparation.startup_tuning import CollectiveStartupTuning
+    from ignition.preparation.module_images import ModuleImages
 
     events = []
     class Graph:
         def __init__(self, *, keep_graph):
             self.keep_graph = keep_graph
             self.instantiated = False
+            self.template = True
+            self.hooks = []
+        def register_post_instantiate_hook(self, hook):
+            self.hooks.append(hook)
+        def register_destroy_callback(self, callback):
+            self.cleanup = callback
         def instantiate(self):
             self.instantiated = True
             events.append("instantiate")
+            for hook in self.hooks:
+                hook(self)
         def raw_cuda_graph(self):
-            assert self.keep_graph
+            assert self.template
             return 11
         def raw_cuda_graph_exec(self):
             assert self.instantiated
@@ -169,6 +179,12 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
         events.append("capture-enter")
         yield
         events.append("capture-exit")
+        if not graph.keep_graph:
+            graph.instantiate()
+            graph.template = False
+    native = SimpleNamespace(record_graph=lambda template, executable: events.append(("record", template, executable)),
+                             release_graph=lambda executable: events.append(("release", executable)))
+    monkeypatch.setattr(ModuleImages, "current", classmethod(lambda cls: SimpleNamespace(native=native) if recording else None))
     monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
     monkeypatch.setattr(torch.cuda, "Stream", Stream)
     monkeypatch.setattr(torch.cuda, "device", device)
@@ -194,9 +210,12 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     assert selector.item() == 5
     assert resources == (producer,)
     assert _graphs({name: value.graph for name, value in tuners.items()}) == [
-        dict(name="collective-tuning-0", graph=11, executable=12)]
+        dict(name="collective-tuning-0", graph=0 if recording else 11, executable=12)]
     assert events == ["device-enter", "wait", "capture-enter", "run", "capture-exit",
-                      "instantiate", "drain", "device-exit"]
+                      "instantiate", *([("record", 11, 12)] if recording else []), "drain", "device-exit"]
+    if recording:
+        tuners["collective-tuning-0"].graph.cleanup()
+        assert events[-1] == ("release", 12)
 
 
 def test_storage_compiled_collective_records_actual_consumer(monkeypatch):

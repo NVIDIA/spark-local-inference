@@ -4,7 +4,7 @@
 """Typed M3 graph inputs, complete continuations, and GQA/index page bindings."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .config import PAGE_TOKENS
 

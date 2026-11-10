@@ -10,7 +10,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
@@ -27,7 +27,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             speculative_fixed_width=plan.speculation.fixed_width,
             speculative_token_capacity=plan.speculative_token_capacity,
             speculative_graph_budget=plan.speculation.graph_budget or 64)
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -36,7 +37,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache,
         dflash=plan.speculation is not None, **drafting)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          checkpoint=plan.checkpoint)
 
 

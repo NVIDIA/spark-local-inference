@@ -255,7 +255,7 @@ def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
     return rows
 
 
-def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output,
+def prepare_and_read(snapshot, config, *, rank, group, core_storage, progress=None, tokens, output,
                      measure=False, profile=False, fence=False, layer_outputs=False, repeat=False,
                      log_errors=False, check_compiled=False, cache_outputs=False):
     import torch
@@ -263,7 +263,7 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
     from ignition.recipes.muse_spark.bootstrap import prepare_rank
 
     with log_warmup_errors(rank, log_errors), fence_operations(rank, fence):
-        model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
+        model = prepare_rank(snapshot, config, rank=rank, group=group, core_storage=core_storage,
                              progress=progress)
     diagnostics = {}
     try:
@@ -598,7 +598,7 @@ def main():
         autotune_effort=args.autotune_effort)
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import torch
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.rank_group import prepare_group
     from ignition.recipes.muse_spark.bootstrap import PreparationConfig
     config = PreparationConfig(collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
@@ -608,16 +608,16 @@ def main():
         devices=tuple(range(plan.world_size)), context=plan.context, max_active=plan.concurrency,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=not args.no_compile,
-        kernel_cache=configuration.directory('kernel_cache'), retain_graphs=args.measure_replay)
+        kernel_cache=configuration.directory('kernel_cache'))
     torch.cuda.set_device(0)
-    storage = PackageStorage(world=plan.world_size)
+    storage = CoreStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),
                      measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations,
                      layer_outputs=args.layer_outputs, repeat=args.repeat_readback,
                      log_errors=args.log_warmup_errors, check_compiled=args.check_compiled,
                      cache_outputs=args.cache_outputs)
     with storage:
-        prepared = prepare_group(args.snapshot.resolve(), config, runner, package_storage=storage,
+        prepared = prepare_group(args.snapshot.resolve(), config, runner, core_storage=storage,
                                  progress=lambda text: print(text, flush=True))
     prepared.close()
     for region in storage.host_regions:

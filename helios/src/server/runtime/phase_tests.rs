@@ -3617,6 +3617,8 @@ fn http_state_for(
         input_store: None,
     });
     Arc::new(HttpState {
+        first_response: Arc::new(super::super::latency::FirstResponseSamples::default()),
+        log_to_stderr: false,
         model,
         frontend: Arc::new(fixture.frontend),
         images: None,
@@ -3634,7 +3636,41 @@ fn http_state_for(
         capacity_hint: String::new(),
         started: std::time::Instant::now(),
         generated: Default::default(),
+        accepting: Mutex::new(true),
     })
+}
+
+#[test]
+fn server_snapshot_and_request_drain_preserve_pause_resume_state() {
+    use super::super::{Server, HttpControl, IngressRejection};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let server = Server {
+        address: "127.0.0.1:0".parse().unwrap(),
+        model: state.model.clone(),
+        control: Mutex::new(HttpControl { stop: None, thread: None }),
+        shutdown: Mutex::new(None),
+        dashboard: Mutex::new(None),
+        state: state.clone(),
+        http_alive: Arc::new(AtomicBool::new(true)),
+    };
+    let admitted = super::super::acquire_ingress(&state.accepting, &state.ingress_slots)
+        .unwrap_or_else(|_| panic!("admission failed"));
+    let before = server.snapshot();
+    assert!(before.ready);
+    assert_eq!(before.ingress_active, 1);
+    server.pause_admission();
+    assert!(!server.snapshot().ready);
+    assert!(!server.wait_for_requests(std::time::Duration::ZERO));
+    assert!(matches!(super::super::acquire_ingress(&state.accepting, &state.ingress_slots), Err(IngressRejection::Paused)));
+    drop(admitted);
+    assert!(server.wait_for_requests(std::time::Duration::ZERO));
+    server.resume_admission();
+    let after = server.snapshot();
+    assert!(after.ready);
+    assert_eq!(after.ingress_active, 0);
+    assert_eq!(after.session_id, before.session_id);
+    assert!(after.sampled_at_ns >= before.sampled_at_ns);
 }
 
 async fn http_generation(
@@ -3654,12 +3690,126 @@ async fn http_generation(
     .await
 }
 
+#[test]
+fn http_worker_exit_or_panic_invalidates_readiness_while_model_stays_healthy() {
+    use super::super::{HttpControl, HttpLifetime, Server};
+    use std::time::{Duration, Instant};
+    for panic in [false, true] {
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let state = http_state(sender, None);
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = alive.clone();
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || -> Result<()> {
+            let _lifetime = HttpLifetime(worker_alive.clone());
+            worker_alive.store(true, Ordering::Release);
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+            if panic { panic!("HTTP worker panicked after readiness"); }
+            Ok(())
+        });
+        let server = Server {
+            address: "127.0.0.1:0".parse().unwrap(), model: state.model.clone(),
+            control: Mutex::new(HttpControl { stop: None, thread: Some(worker) }),
+            shutdown: Mutex::new(None), dashboard: Mutex::new(None), state: state.clone(), http_alive: alive.clone(),
+        };
+        ready_rx.recv().unwrap();
+        let before = server.snapshot();
+        release.send(()).unwrap();
+        let started = Instant::now();
+        while alive.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = server.snapshot();
+        let model_healthy = state.model.healthy();
+        let wait_healthy = server.wait(Duration::ZERO);
+        let shutdown = server.close();
+        assert!(before.ready);
+        assert!(model_healthy);
+        assert!(after.accepting);
+        assert!(!after.healthy);
+        assert!(!after.ready);
+        assert!(!wait_healthy);
+        assert_eq!(shutdown.error.is_some(), panic);
+    }
+}
+
+#[test]
+fn server_snapshot_does_not_wait_for_http_shutdown_join() {
+    use super::super::{HttpControl, HttpLifetime, Server};
+    use std::time::Duration;
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let alive = Arc::new(AtomicBool::new(true));
+    let worker_alive = alive.clone();
+    let (stop, stopped) = oneshot::channel();
+    let (joining, joining_rx) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || -> Result<()> {
+        let _lifetime = HttpLifetime(worker_alive);
+        let _ = stopped.blocking_recv();
+        joining.send(()).unwrap();
+        released.recv().unwrap();
+        Ok(())
+    });
+    let server = Arc::new(Server {
+        address: "127.0.0.1:0".parse().unwrap(), model: state.model.clone(),
+        control: Mutex::new(HttpControl { stop: Some(stop), thread: Some(worker) }),
+        shutdown: Mutex::new(None), dashboard: Mutex::new(None), state, http_alive: alive,
+    });
+    let closing = server.clone();
+    let admitted = super::super::acquire_ingress(&server.state.accepting, &server.state.ingress_slots)
+        .unwrap_or_else(|_| panic!("initial admission failed"));
+    let inflight = server.state.ingress_slots.available_permits();
+    let closer = thread::spawn(move || closing.close());
+    joining_rx.recv().unwrap();
+    let control_locked = server.control.try_lock().is_err();
+    // The HTTP thread is held after receiving stop, with its lifetime flag and
+    // model health still true. Resume must not reopen admission during this gap.
+    server.resume_admission();
+    let sampling = server.clone();
+    let (sample, sampled) = mpsc::sync_channel(1);
+    let sampler = thread::spawn(move || { sample.send(sampling.snapshot()).unwrap(); });
+    let snapshot = sampled.recv_timeout(Duration::from_secs(1));
+    // Always release the join before assertions so a failed check cannot strand a worker.
+    release.send(()).unwrap();
+    let shutdown = closer.join().unwrap();
+    sampler.join().unwrap();
+    assert!(control_locked);
+    let snapshot = snapshot.expect("snapshot waited for HTTP thread join");
+    assert!(!snapshot.ready);
+    assert!(!snapshot.accepting);
+    assert_eq!(server.state.ingress_slots.available_permits(), inflight);
+    assert!(server.state.ingress_slots.is_closed());
+    assert!(matches!(
+        super::super::acquire_ingress(&server.state.accepting, &server.state.ingress_slots),
+        Err(super::super::IngressRejection::Paused)
+    ));
+    drop(admitted);
+    assert_eq!(server.state.ingress_slots.available_permits(), server.state.ingress_capacity);
+    assert!(shutdown.drained);
+    assert!(!server.healthy());
+}
+
 async fn http_generation_request(
     path: &str,
     body: serde_json::Value,
 ) -> (
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
+) {
+    let (response, incoming, _) = http_generation_request_observed(path, body).await;
+    (response, incoming)
+}
+
+async fn http_generation_request_observed(
+    path: &str,
+    body: serde_json::Value,
+) -> (
+    tokio::task::JoinHandle<axum::response::Response>,
+    Vec<Incoming>,
+    Arc<super::super::HttpState>,
 ) {
     use super::super::http;
     use axum::{Extension, extract::State};
@@ -3672,7 +3822,7 @@ async fn http_generation_request(
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
-    let response = tokio::spawn(http::generate(State(state), Extension(ingress), request));
+    let response = tokio::spawn(http::generate(State(state.clone()), Extension(ingress), request));
     let incoming = tokio::task::spawn_blocking(move || {
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -3680,7 +3830,58 @@ async fn http_generation_request(
     })
     .await
     .unwrap();
-    (response, incoming)
+    (response, incoming, state)
+}
+
+#[tokio::test]
+async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodies() {
+    for (emit_text, poll_body) in [(false, true), (true, false), (true, true)] {
+        let (response, incoming, state) = http_generation_request_observed(
+            "/v1/completions",
+            serde_json::json!({"prompt":"a", "max_tokens":2, "stream":true}),
+        ).await;
+        let response = response.await.unwrap();
+        incoming[0].notify_admission(Ok(()));
+        if emit_text { incoming[0].emit_token(1); }
+        incoming[0].fail(Error::execution(ExecutionError::Worker, "fixture failure"));
+        assert_eq!(state.first_response.snapshot().samples, 0);
+        if poll_body {
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().contains("fixture failure"));
+        } else {
+            drop(response);
+        }
+        let snapshot = state.first_response.snapshot();
+        assert_eq!(snapshot.samples, u64::from(emit_text && poll_body));
+        assert_eq!(snapshot.median_seconds.is_some(), emit_text && poll_body);
+    }
+}
+
+#[tokio::test]
+async fn first_response_http_nonstream_records_only_when_completed_body_is_offered() {
+    for poll_body in [false, true] {
+        let (response, incoming, state) = http_generation_request_observed(
+            "/v1/completions",
+            serde_json::json!({"prompt":"a", "max_tokens":2, "stream":false}),
+        ).await;
+        incoming[0].notify_admission(Ok(()));
+        incoming[0].emit_token(1);
+        incoming[0].emit(GenerationEvent::Finished {
+            prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+            reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+            termination: crate::output::Termination::OutputLimit,
+        });
+        let response = response.await.unwrap();
+        assert_eq!(state.first_response.snapshot().samples, 0);
+        if poll_body {
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["choices"][0]["text"], "b");
+        } else {
+            drop(response);
+        }
+        assert_eq!(state.first_response.snapshot().samples, u64::from(poll_body));
+    }
 }
 
 #[tokio::test]
@@ -4029,8 +4230,8 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
         if hidden {
             request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
         }
-        let (response, mut incoming) =
-            http_generation_request("/v1/chat/completions", request).await;
+        let (response, mut incoming, state) =
+            http_generation_request_observed("/v1/chat/completions", request).await;
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .unwrap()
@@ -4074,6 +4275,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             role["choices"][0]["delta"],
             serde_json::json!({"role":"assistant","content":""})
         );
+        assert_eq!(state.first_response.snapshot().samples, 0);
         if hidden || eos {
             assert!(futures_util::poll!(body.next()).is_pending());
         } else {
@@ -4092,6 +4294,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             .clone();
         drop(body);
         assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(state.first_response.snapshot().samples, u64::from(!hidden && !eos));
     }
 }
 
@@ -4223,6 +4426,31 @@ async fn chat_stream_flushes_headers_over_tcp_before_admission_or_tokens() {
 }
 
 #[tokio::test]
+async fn http_pause_rejects_before_body_preparation_and_resume_restores_validation() {
+    use std::io::{Read, Write};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state.clone(), &[], 65536);
+    let serving = tokio::spawn(async move { axum::serve(listener, router).await });
+    for (accepting, expected) in [(false, "503"), (true, "400")] {
+        *state.accepting.lock().unwrap() = accepting;
+        let response = tokio::task::spawn_blocking(move || {
+            let mut socket = std::net::TcpStream::connect(address).unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n{").unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).unwrap();
+            response
+        }).await.unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {expected}")), "{response}");
+        assert_eq!(state.ingress_slots.available_permits(), state.ingress_capacity);
+    }
+    serving.abort();
+}
+
+#[tokio::test]
 async fn http_disconnect_while_waiting_cancels_queued_generation() {
     let (response, incoming) = http_generation(true, 1).await;
     drop(response.await.unwrap());
@@ -4291,7 +4519,7 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     state.model.metrics().progress(10, 3, 0, 0, 0, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let router = super::super::router(state, &[], 65536);
+    let router = super::super::router(state.clone(), &[], 65536);
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
     let get = |path: &'static str, accept: Option<&'static str>| {
         tokio::task::spawn_blocking(move || {
@@ -4328,6 +4556,8 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         "{body}"
     );
     assert!(body.contains("\nflare_prefill_tokens_total 10\n"));
+    assert!(body.contains("\nflare_first_response_samples 0\n"));
+    assert!(!body.contains("flare_first_response_median_seconds"));
     for (path, accept) in [
         ("/metrics", Some("application/json")),
         ("/metrics?format=json", Some("text/plain")),
@@ -4340,12 +4570,22 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         );
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["learned_drafter"], false);
+        assert!(value["first_response"]["median_seconds"].is_null());
+        assert_eq!(value["first_response"]["samples"], 0);
+        assert_eq!(value["first_response"]["window_seconds"], 60);
         let snapshot: super::super::Snapshot = serde_json::from_value(value).unwrap();
         assert_eq!(
             (snapshot.prefill_tokens, snapshot.generated_tokens),
             (10, 3)
         );
     }
+    state.first_response.observe(std::time::Instant::now()).output();
+    let (_, _, body) = get("/metrics?format=json", None).await.unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["first_response"]["samples"], 1);
+    assert!(value["first_response"]["median_seconds"].is_number());
+    let (_, _, body) = get("/metrics", None).await.unwrap();
+    assert!(body.contains("\nflare_first_response_median_seconds "));
     assert_eq!(get("/metrics?format=yaml", None).await.unwrap().0, 400);
     assert_eq!(get("/health", None).await.unwrap().0, 200);
     assert_eq!(get("/v1/models", None).await.unwrap().0, 401);

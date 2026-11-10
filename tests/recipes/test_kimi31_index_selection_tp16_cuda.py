@@ -52,7 +52,7 @@ def _rank(rank, rendezvous):
     from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
     from ignition.components.dense_mla import PreparedDenseMLA
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import ContextShards, selection_slots
@@ -66,7 +66,7 @@ def _rank(rank, rendezvous):
     candidate_runtime = head_runtime = None
     graphs = []
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             logical_pages = MAX_VISIBLE // (128 * WORLD)
             physical_pages = logical_pages + 3
             page_map = ((torch.arange(logical_pages, device=device) * 2 + 3) % physical_pages).int()
@@ -80,13 +80,13 @@ def _rank(rank, rendezvous):
             index_keys = torch.zeros((len(tokens), 128), device=device, dtype=torch.bfloat16)
             # The fixed maximum makes every key scale exactly one.
             index_keys[:, 127] = 448
-            index_queries = torch.zeros((129, 32, 128), device=device, dtype=torch.bfloat16)
+            index_queries = torch.zeros((257, 32, 128), device=device, dtype=torch.bfloat16)
             index_queries[:, :, 0] = 1
-            weights = torch.zeros((129, 32), device=device, dtype=torch.bfloat16)
+            weights = torch.zeros((257, 32), device=device, dtype=torch.bfloat16)
             weights[:, 0] = 1
             prefill_metadata = SimpleNamespace(
-                positions=torch.full((129,), -1, device=device, dtype=torch.int64),
-                token_page_table=page_map[None].repeat(129, 1))
+                positions=torch.full((257,), -1, device=device, dtype=torch.int64),
+                token_page_table=page_map[None].repeat(257, 1))
             decode_metadata = SimpleNamespace(
                 positions=torch.full((4,), -1, device=device, dtype=torch.int64),
                 token_page_table=page_map[None].repeat(4, 1))
@@ -107,15 +107,15 @@ def _rank(rank, rendezvous):
                 variants = []
                 for mode, start, end, metadata in (
                         ("prefill", 0, 128, prefill_metadata),
-                        ("prefill", 128, 129, prefill_metadata),
+                        ("prefill", 256, 257, prefill_metadata),
                         ("decode", 0, 4, decode_metadata),
                         ("decode", 0, 2, decode_metadata)):
                     rows = end - start
                     name = f"{mode}{rows}"
-                    selector = PreparedIndexSelection(index_queries.view(129, -1), weights, index_cache,
+                    selector = PreparedIndexSelection(index_queries.view(257, -1), weights, index_cache,
                         metadata, shards, context, buffers, start=start, end=end, mode=mode,
                         session=session, name=name, workspace=arena, allocator=None, latent_cache=cache)
-                    variant = dict(name=name, selector=selector)
+                    variant = dict(name=name, selector=selector, start=start, end=end, metadata=metadata)
                     if mode == "decode":
                         owners = torch.empty_like(selector.selected)
                         selected_slots = torch.empty_like(selector.selected)
@@ -141,23 +141,48 @@ def _rank(rank, rendezvous):
                         combine = PreparedLseReduceScatter(partial, lse, output, runtime=head_runtime,
                             session=session, coordinator=coordinator, name=name + ".combine")
                         variant.update(owners=owners, slots=selected_slots, counts=counts, query=query,
-                            partial=partial, lse=lse, output=output, gather=gather, attention=attention, combine=combine)
+                            partial=partial, lse=lse, output=output, gathered=gathered, gather=gather,
+                            attention=attention, combine=combine)
                     variants.append(variant)
                 large, tail = (variant["selector"] for variant in variants[:2])
                 assert large.selected.data_ptr() == tail.selected.data_ptr()
-                assert large.broadcast.send.data_ptr() == tail.broadcast.send.data_ptr()
-                assert large.broadcast.received.data_ptr() == tail.broadcast.received.data_ptr()
+                assert large.merge.packed.data_ptr() == tail.merge.packed.data_ptr()
+                assert large.merge.gathered.data_ptr() == tail.merge.gathered.data_ptr()
+                variants[0]["name"] = "prefill257"
+                variants[0]["end"] = 257
+                variants[0]["bounds"] = ((0, 128), (128, 256), (256, 257))
+                variants[0]["selections"] = {128: large, 1: tail}
+                for variant in variants:
+                    start, end = variant["start"], variant["end"]
+                    variant.setdefault("bounds", ((start, end),))
+                    variant.setdefault("selections", {end - start: variant["selector"]})
+                    variant["observed"] = {field: torch.empty((end - start, *value.shape[1:]),
+                        dtype=value.dtype, device=device) for field, value in (
+                            ("selected", variant["selector"].selected),
+                            ("quantized", variant["selector"].indexer.quantized),
+                            ("scales", variant["selector"].indexer.scales),
+                            ("scaled_weights", variant["selector"].indexer.scaled_weights),
+                            ("local", variant["selector"].local), ("scores", variant["selector"].scores))}
                 session.tune(show_progress=False)
 
                 def forward(variant):
-                    selector = variant["selector"]
-                    selected = selector()
-                    if selector.mode == "decode":
-                        selection_slots(selected, selector.positions, selector.tables, variant["owners"],
-                            variant["slots"], variant["counts"], shards, physical_pages, local=True)
-                        variant["gather"](variant["query"].view(selected.shape[0], -1))
-                        variant["attention"]()
-                        variant["combine"](variant["partial"], variant["lse"])
+                    metadata = variant["metadata"]
+                    for start, end in variant["bounds"]:
+                        selector = variant["selections"][end - start]
+                        positions, tables = metadata.positions[start:end], metadata.token_page_table[start:end]
+                        selected = selector(index_queries[start:end], weights[start:end], positions, tables)
+                        offset = start - variant["start"]
+                        for field in ("selected", "local", "scores"):
+                            variant["observed"][field][offset:offset + end - start].copy_(getattr(selector, field))
+                        for field in ("quantized", "scales", "scaled_weights"):
+                            variant["observed"][field][offset:offset + end - start].copy_(
+                                getattr(selector.indexer, field))
+                        if selector.mode == "decode":
+                            selection_slots(selected, positions, tables, variant["owners"],
+                                variant["slots"], variant["counts"], shards, physical_pages, local=True)
+                            variant["gather"](variant["query"].view(selected.shape[0], -1))
+                            variant["attention"](variant["gathered"], variant["partial"])
+                            variant["combine"](variant["partial"], variant["lse"])
 
                 index_keys[:, 0] = _scores(tokens, False)
                 large.indexer.write_keys(index_keys, slots)
@@ -183,16 +208,22 @@ def _rank(rank, rendezvous):
                     torch.testing.assert_close(physical_scales[slots], torch.ones_like(physical_scales[slots]),
                                               rtol=0, atol=0)
                     for long_context in (False, True):
-                        prefill_metadata.positions.copy_(torch.arange(129, device=device)
-                            + (MAX_VISIBLE - 129 if long_context else 0))
+                        prefill_metadata.positions.copy_(torch.arange(257, device=device)
+                            + (MAX_VISIBLE - 257 if long_context else 0))
                         decode_metadata.positions.copy_(torch.tensor(
                             [-1, MAX_VISIBLE - 1, 16, 9942] if long_context else [-1, 0, 2048, 9942],
                             device=device))
-                        for index in (2, 0, 3, 1):
+                        tail_position = MAX_VISIBLE - 1 if long_context else 256
+                        for index, tail_live in ((2, True), (0, True), (3, True), (1, True),
+                                                 (0, False), (1, False)):
+                            prefill_metadata.positions[-1] = tail_position if tail_live else -1
                             variant = variants[index]
                             selector = variant["selector"]
                             arena.tensor.fill_(255)
-                            selector.selected.fill_(-2)
+                            for operation in variant["selections"].values():
+                                operation.selected.fill_(-2)
+                            for value in variant["observed"].values():
+                                value.fill_(-2)
                             if selector.mode == "decode":
                                 variant["output"].fill_(17)
                                 variant["partial"].fill_(torch.nan)
@@ -206,19 +237,21 @@ def _rank(rank, rendezvous):
                             for field in ("allocation.all.allocated", "allocation.all.freed",
                                           "segment.all.allocated", "segment.all.freed"):
                                 assert before[field] == after[field], (variant["name"], field)
-                            chosen_rows = _check_selection(selector.selected, selector.positions, concentrated)
-                            expected_query = torch.zeros_like(selector.indexer.quantized, dtype=torch.float32)
+                            observed = variant["observed"]
+                            chosen_rows = _check_selection(observed["selected"],
+                                variant["metadata"].positions[variant["start"]:variant["end"]], concentrated)
+                            expected_query = torch.zeros_like(observed["quantized"], dtype=torch.float32)
                             expected_query[:, :, 0] = 256
-                            torch.testing.assert_close(selector.indexer.quantized.float(), expected_query, rtol=0, atol=0)
-                            torch.testing.assert_close(selector.indexer.scales,
-                                torch.full_like(selector.indexer.scales, 1 / 256), rtol=0, atol=0)
-                            expected_weights = torch.zeros_like(selector.indexer.scaled_weights)
+                            torch.testing.assert_close(observed["quantized"].float(), expected_query, rtol=0, atol=0)
+                            torch.testing.assert_close(observed["scales"],
+                                torch.full_like(observed["scales"], 1 / 256), rtol=0, atol=0)
+                            expected_weights = torch.zeros_like(observed["scaled_weights"])
                             expected_weights[:, 0] = (1 / 256) * 128 ** -.5
-                            torch.testing.assert_close(selector.indexer.scaled_weights, expected_weights, rtol=0, atol=0)
-                            local = selector.local.long()
+                            torch.testing.assert_close(observed["scaled_weights"], expected_weights, rtol=0, atol=0)
+                            local = observed["local"].long()
                             live = local >= 0
                             expected_scores = _scores(local * WORLD + rank, concentrated) * 128 ** -.5
-                            torch.testing.assert_close(selector.scores[live], expected_scores[live], rtol=0, atol=0)
+                            torch.testing.assert_close(observed["scores"][live], expected_scores[live], rtol=0, atol=0)
                             if selector.mode == "decode":
                                 for row, chosen in enumerate(chosen_rows):
                                     assert variant["counts"][row].item() == sum(token % WORLD == rank for token in chosen)

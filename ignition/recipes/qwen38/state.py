@@ -121,7 +121,7 @@ class HybridStatePool(StateStorage):
         if type(backed_slots) is not int or not 2 <= backed_slots <= slots:
             raise ValueError("backed state slots must include null and live slots within the virtual extent")
         if backed_slots != slots and storage is None:
-            raise ValueError("partial state backing requires package storage")
+            raise ValueError("partial state backing requires core storage")
         layout = HybridStateLayout.build(speculative_tokens=speculative_tokens, world_size=world_size, draft_config=draft_config)
         backing = (torch.zeros((slots, layout.row_bytes), dtype=torch.uint8, device=device) if storage is None else
             storage.device_allocate("continuations", (slots, layout.row_bytes), torch.uint8, group="STATE_ROWS",

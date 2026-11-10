@@ -12,13 +12,71 @@ import torch
 from b12x._lib.scratch import ScratchBufferSpec, scratch_tensor
 from b12x.preparation import PreparationSession
 
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena, bind_scratch, planned_scratch, scratch_storage
+from ignition.preparation.scratch import (
+    GraphBufferPool, ScratchArena, bind_scratch, buffer_rows, planned_scratch, scratch_storage,
+)
 from ignition.preparation.tuning import register_finalizer
 
 
 def spec(nbytes, *, dtype=torch.uint8, shape=None, device="cpu"):
     return ScratchBufferSpec(name="workspace", shape=(nbytes,) if shape is None else shape,
                              dtype=dtype, device=torch.device(device))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_named_row_views_reuse_identity_and_preserve_contents_and_geometry(dtype):
+    backing = torch.arange(60, dtype=dtype).reshape(6, 10)[:, 1:9:2]
+    values = {"source": backing}
+    full = buffer_rows(values, "source", 6)
+    prefix = buffer_rows(values, "source", 3)
+    assert full is not backing
+    assert buffer_rows(values, "source", 6) is full
+    assert buffer_rows(values, "source", 3) is prefix
+    assert prefix.shape == (3, 4)
+    assert prefix.dtype == dtype
+    assert prefix.stride() == backing.stride()
+    assert prefix.storage_offset() == backing.storage_offset()
+    assert prefix.untyped_storage()._cdata == backing.untyped_storage()._cdata
+    expected = backing.clone()
+    expected[:3].add_(2)
+    before = backing._version
+    prefix.add_(2)
+    assert backing._version == full._version == prefix._version == before + 1
+    assert torch.equal(buffer_rows(values, "source", 6), expected)
+
+
+@pytest.mark.parametrize("replacement_rows", [4, 8])
+def test_named_row_views_follow_source_replacement_and_retain_previous_storage(replacement_rows):
+    backing = torch.full((4, 3), 7, dtype=torch.int32)
+    values = {"source": backing}
+    original = buffer_rows(values, "source", 2)
+    replacement = torch.full((replacement_rows, 3), 11, dtype=torch.int32)
+    values["source"] = replacement
+    rebound = buffer_rows(values, "source", 2)
+    assert rebound is buffer_rows(values, "source", 2)
+    assert rebound is not original
+    assert rebound.shape == original.shape == (2, 3)
+    assert rebound.untyped_storage()._cdata == replacement.untyped_storage()._cdata
+    assert original.untyped_storage()._cdata == backing.untyped_storage()._cdata
+    rebound.fill_(13)
+    assert (replacement[:2] == 13).all()
+    assert (replacement[2:] == 11).all()
+    assert (original == 7).all() and (backing == 7).all()
+
+
+def test_named_row_views_keep_names_distinct_and_remain_exportable_scratch():
+    from ignition.preparation.disposable import storage_ranges
+
+    backing = torch.zeros((4, 3))
+    values = {"first": backing, "second": backing}
+    first = buffer_rows(values, "first", 2)
+    second = buffer_rows(values, "second", 2)
+    assert first is not second
+    assert first is buffer_rows(values, "first", 2)
+    assert second is buffer_rows(values, "second", 2)
+    assert first.untyped_storage()._cdata == second.untyped_storage()._cdata
+    storage = backing.untyped_storage()
+    assert storage_ranges(values) == ((storage.data_ptr(), storage.nbytes()),)
 
 
 def test_named_operands_share_capacity_across_shapes_without_overlapping_within_a_call():
@@ -407,6 +465,36 @@ def test_trim_to_zero_releases_arena_owner_without_invalidating_existing_views()
     arena.trim(0)
     assert arena.nbytes == 0 and view.eq(11).all()
     assert view.data_ptr() == pointer and view.untyped_storage().nbytes() == 256
+
+
+def test_trim_releases_unshared_candidate_before_selected_allocation(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def inspect(size, **kwargs):
+        if size == 512:
+            assert original() is None
+            assert arena.nbytes == 0
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", inspect)
+    arena.trim(257)
+    assert arena.nbytes == 512
+
+
+def test_trim_allocation_failure_leaves_empty_unfrozen_storage(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def fail(size, **kwargs):
+        if size == 512:
+            raise torch.OutOfMemoryError("selected allocation unavailable")
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", fail)
+    with pytest.raises(torch.OutOfMemoryError, match="selected allocation"):
+        arena.trim(257)
+    assert original() is None and arena.nbytes == 0 and not arena.frozen
 
 
 @pytest.mark.parametrize("nbytes", [-1, True, False, 1.5, "256", None, 257])

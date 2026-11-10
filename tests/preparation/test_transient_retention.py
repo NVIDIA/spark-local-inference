@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ignition.preparation.package_storage import PackageStorage
+from ignition.preparation.core_storage import CoreStorage
 from ignition.preparation import capture
 
 
@@ -17,13 +17,13 @@ def test_retention_scope_completion_and_exception(fail):
     def operation(name):
         events.append(name)
         return 0
-    storage = PackageStorage.__new__(PackageStorage)
+    storage = CoreStorage.__new__(CoreStorage)
     storage._retention_scope = False
     storage.library = SimpleNamespace(
-        flare_package_retention_begin=lambda: operation('begin'),
-        flare_package_retention_finish=lambda: operation('finish'),
-        flare_package_retention_abort=lambda: operation('abort'),
-        flare_package_error=lambda: None)
+        flare_core_retention_begin=lambda: operation('begin'),
+        flare_core_retention_finish=lambda: operation('finish'),
+        flare_core_retention_abort=lambda: operation('abort'),
+        flare_core_error=lambda: None)
     try:
         with storage.retain_transient_backing():
             assert storage._retention_scope
@@ -49,6 +49,7 @@ def test_capture_drains_after_prepare_and_sync_before_capture(monkeypatch):
     def forward():
         events.append('run')
     forward.prepare_capture = lambda: events.append('prepare_capture') or 0
+    forward.retire_after_capture = lambda: None
     class Cache:
         def __init__(self, **kwargs):
             pass

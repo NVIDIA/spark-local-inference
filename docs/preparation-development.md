@@ -51,7 +51,7 @@ before the session's capture guard forbids further kernel resolution.
   bind process-local kernel handles and caller-owned tensors at startup. Complete
   b12x preparation, tuning, binding refresh, and compiled warmup before capturing
   each serving graph. Warm the complete selected catalog before retaining a serving graph.
-  Package-backed eager warmups release their transient pools before capture, so
+  Core-backed eager warmups release their transient pools before capture, so
   their workspaces do not coexist with retained graph intermediates. Ranks
   synchronize before each warmup and each capture. Retain compiled kernel owners
   until native replay has drained.
@@ -80,32 +80,40 @@ helper compilation derives host identity without launching a subprocess.
 
 The runtime patch implementation contributes to both Ignition forward cache
 keys and Torch's compiler cache tag. Changing it invalidates compiled forwards
-and Torch graph caches. Captured packages execute independently of these Python
+and Torch graph caches. Captured cores execute independently of these Python
 patches.
 
-## Runtime package export
+## Runtime core export
 
-`ignition.preparation.runtime_package` hands live graph handles, typed storage
+`ignition.preparation.runtime_core` hands live graph handles, typed storage
 and execution metadata, tensor-view roles, compiler signatures, frontend assets,
 and retained owners to `flare_heliopause`. Recipes describe file-backed table
-ranges and generated frontend text without creating package files or payload
+ranges and generated frontend text without creating core files or payload
 offsets. Heliopause records CUPTI resources, traverses graphs and pointer-bearing
 storage, downloads retained bytes, serializes resources, and owns asset writes,
 hashing, zstd level-3 executable compression, signing, conversion, rank payload
 transfer, and publication. Each executable resource is one zstd level-3 frame
 with a signed decoded length and compressed-chunk commitments.
-Keep captured buffers, contexts, graph templates, and kernel owners alive until
-native work confirms a drain; an unsuccessful drain retains their owners.
+Export capture copies each graph's nodes, argument bytes, attributes, and
+annotated edges into native storage without instantiating an executable.
+Ignition retains the external CUDA memory pools and captured kernel owners,
+then resets the capture object to release its template. Diagnostic captures
+retain executables; their post-instantiation hooks can copy the same metadata
+before PyTorch releases their templates. Native export resolves allocations
+and validates bindings against the copied metadata. Keep captured buffers,
+contexts, copied metadata, pool owners, kernel owners, and any diagnostic
+executables alive until native work confirms a drain; an unsuccessful drain
+retains their owners.
 
 Native transfer pools bound file buffers and pinned CUDA download storage from
 available host memory and preparation rank count. Preserve direct bulk I/O,
 exact unaligned tails, cache verification before reuse, and hash-before-write
 publication. `--no-weights` must fail on any missing exact stored-data blob;
 correctness and cache checks remain required. See
-[runtime package transfers](runtime-package-design.md#native-export-transfers-and-progress)
+[runtime core transfers](runtime-core-design.md#native-export-transfers-and-progress)
 for the transfer budget and progress contract.
 
-`--reuse-weights` pins the cached default package and its weight objects through
+`--reuse-weights` pins the cached default core and its weight objects through
 publication. Native export authenticates its metadata, checks preparation inputs
 and named weight layouts, and rebinds the stored weight initializers to compatible
 allocation placements. Only declared numeric weight ranges may bypass live
@@ -213,12 +221,21 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
   selected variant must compile before collective warmup; ranks must not retrace
   or compile on a binding mismatch.
   Load, warm, freeze, and save one forward at a time in catalog order. Release
-  its portable compiler state and tuning registration after the cache write;
+  its portable compiler state, generated source, bundled tuning metadata, and
+  tuning registration after the cache write;
   retain canonical kernel selections, execution guards, live kernel owners, and
   bound storage. Standalone guards retain their full check tree and callbacks;
-  discard the unused Dynamo diff tree and duplicate debug lists, since type
-  invalidation finalizers can keep the wrapper alive for the process lifetime.
+  discard the unused Dynamo diff tree and duplicate debug lists. Artifact loading
+  omits guard construction stacks and Inductor diagnostic graph text and line maps;
+  executable guard predicates, generated source, and launchers remain intact. Guard wrappers
+  retain their invalidation managers; object finalizers refer to those managers
+  weakly, so discarding every wrapper owner releases the guard tree and runtime
+  globals even while guarded types remain alive.
   Complete warmup for the entire catalog before capturing any graph.
+  After successful capture and any required instantiation, release the compiled
+  Python wrapper and guards while retaining graph, kernel, and storage owners
+  through drain. Grouped forwards release shared guards after their final capture;
+  recipes exposing eager forwards retain guarded callables.
 
 ## Shape and graph-transition validation
 

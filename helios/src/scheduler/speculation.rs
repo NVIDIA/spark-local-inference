@@ -216,7 +216,7 @@ fn arbitrary_width_catalog_preserves_declared_values() {
 
 #[cfg(test)]
 #[test]
-fn acceptance_profiles_follow_package_capacity() {
+fn acceptance_profiles_follow_core_capacity() {
     for capacity in [1, 8, 13, 16, 32, 257] {
         let mut profile = AcceptanceProfile::new(capacity);
         assert_eq!(profile.curve(ProposalSource::Mtp, 0, false).len(), capacity - 1);

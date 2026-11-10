@@ -455,7 +455,7 @@ A mixed graph declares `batch_capacity` total physical request rows,
 `token_capacity` decode verification positions per row, and `prefill_capacity`
 prompt tokens. The batch capacity is a power of two from 2 through 64; decode
 width is 1 through 8; prompt capacity is positive and aligned to 64. Other graph
-families set `prefill_capacity` to zero. Package selection retains the explicit
+families set `prefill_capacity` to zero. Core selection retains the explicit
 `speculation_enabled` variant matching the loaded decode mode, including width
 one with draft-state maintenance enabled. Fixed-width limits apply to mixed and
 separate speculative graphs alike.
@@ -572,6 +572,6 @@ FLARE_RUN_CUDA_TESTS=1 FLARE_SCHEDULER_TEST_URL=http://127.0.0.1:18131 \
 
 The HTTP tests print actual prompt/output token counts, client SSE arrival
 gaps, and server graph-counter deltas. SSE arrival gaps are not GPU execution
-times or per-token latencies. Mixed capture correctness requires packages that
+times or per-token latencies. Mixed capture correctness requires cores that
 contain mixed model forwards. Synthetic scheduler traces do not establish GPU
 throughput.

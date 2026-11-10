@@ -175,8 +175,8 @@ def _size(ranges):
     return sum(end - start for start, end in merge_ranges(ranges))
 
 
-def collect_inventory(prepared, storage, package, *, external=()):
-    """Join Heliopause's physical snapshot to the graph-reachable package and its owners.
+def collect_inventory(prepared, storage, core, *, external=()):
+    """Join Heliopause's physical snapshot to the graph-reachable core and its owners.
 
     This is a preparation snapshot, not a prediction of serving cache size or
     driver overhead after loading. All byte counts exclude imported peer mappings
@@ -194,7 +194,7 @@ def collect_inventory(prepared, storage, package, *, external=()):
     for name, tensor in prepared.buffers.items():
         claims.extend(Claim(start, end, "Graph I/O / persistent state", f"buffers[{name!r}]", priority=40)
                       for start, end in tensor_ranges(tensor))
-    segments = [s for s in torch.cuda.memory_snapshot() if s["device"] == storage.device]
+    segments = [s for s in torch.cuda.memory_snapshot(include_traces=False) if s["device"] == storage.device]
     for segment in segments:
         graph_pool = tuple(segment["segment_pool_id"]) == tuple(storage.graph_pool.id)
         for block in segment["blocks"]:
@@ -211,18 +211,18 @@ def collect_inventory(prepared, storage, package, *, external=()):
     for region in dynamic.values():
         claims.append(Claim(region.address, region.address + region.nbytes,
                             "Preparation cache backing", region.name,
-                            "ignition/preparation/package_storage.py:PackageStorage.device_allocate", 110))
+                            "ignition/preparation/core_storage.py:CoreStorage.device_allocate", 110))
     peers = {} if storage.peer_storage is None else storage.peer_storage.owned
     for address, size in peers.items():
         if address not in dynamic:
             claims.append(Claim(address, address + size, "TP communication", "PeerStorage.owned",
                                 "ignition/preparation/peer_storage.py", 110))
-    for address, size, owner in package.module_globals:
+    for address, size, owner in core.module_globals:
         claims.append(Claim(address, address + size, "Kernel globals", owner, priority=110))
-    fixed = [(a.address, a.address + a.nbytes) for a in package.allocations
+    fixed = [(a.address, a.address + a.nbytes) for a in core.allocations
              if a.memory == "device" and a.sizing is None]
     cache = [(r.address, r.address + r.nbytes) for r in dynamic.values()]
-    globals = [(address, address + size) for address, size, _ in package.module_globals]
+    globals = [(address, address + size) for address, size, _ in core.module_globals]
     physical = merge_ranges([
         *((address, address + size) for address, size in native["mappings"]),
         *((address, address + size) for address, size in external),
@@ -230,8 +230,8 @@ def collect_inventory(prepared, storage, package, *, external=()):
         *cache, *globals,
     ])
     exported = merge_ranges([*fixed, *globals])
-    package_padding = subtract_ranges(exported, physical)
-    retained = subtract_ranges(exported, package_padding)
+    core_padding = subtract_ranges(exported, physical)
+    retained = subtract_ranges(exported, core_padding)
     preparation_only = subtract_ranges(physical, retained)
     used = native["total_bytes"] - native["free_bytes"]
     known = _size(physical)
@@ -241,14 +241,14 @@ def collect_inventory(prepared, storage, package, *, external=()):
                 device_unattributed_bytes=used - known,
                 torch_allocated_bytes=torch.cuda.memory_allocated(storage.device),
                 torch_reserved_bytes=torch.cuda.memory_reserved(storage.device),
-                fixed_package_bytes=_size(fixed), kernel_global_bytes=_size(globals),
-                package_padding_bytes=_size(package_padding),
+                fixed_core_bytes=_size(fixed), kernel_global_bytes=_size(globals),
+                core_padding_bytes=_size(core_padding),
                 cache_backing_bytes=_size(cache),
                 mapped_host_bytes=sum(r.extent for r in storage.host_regions if not r.closed),
                 imported_peer_bytes=(0 if storage.peer_storage is None else sum(
                     size for parts in storage.peer_storage.imported_mappings.values() for _, size in parts)),
                 entries=attribute(retained, claims), preparation_entries=attribute(preparation_only, claims),
-                graphs=len(prepared.graphs), **package.export_counts)
+                graphs=len(prepared.graphs), **core.export_counts)
 
 
 def format_inventory(reports):
@@ -264,10 +264,10 @@ def format_inventory(reports):
     for report in reports:
         lines.append(f"Rank {report['rank']} / CUDA {report['device']}: "
                      f"{display_size(report['device_used_bytes'])} used, {display_size(report['free_bytes'])} free")
-        lines.append(f"  Package fixed mappings: {display_size(report['fixed_package_bytes'])}; "
+        lines.append(f"  Core fixed mappings: {display_size(report['fixed_core_bytes'])}; "
                      f"kernel globals: {display_size(report['kernel_global_bytes'])}")
-        if report['package_padding_bytes']:
-            lines.append(f"  Additional mapping alignment at load: {display_size(report['package_padding_bytes'])}")
+        if report['core_padding_bytes']:
+            lines.append(f"  Additional mapping alignment at load: {display_size(report['core_padding_bytes'])}")
         for title, field in (("Retained storage", "entries"), ("Preparation-only storage", "preparation_entries")):
             categories = defaultdict(list)
             for row in report[field]:

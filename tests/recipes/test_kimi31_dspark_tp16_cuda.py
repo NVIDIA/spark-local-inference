@@ -550,8 +550,8 @@ def _sequence_draft(prepared, metadata, rank):
         operation.query.copy_(projection.absorbed)
         operation.gather(operation.query.flatten(1))
         stage["gathered"] = operation.gathered.clone()
-        operation.history_attention()
-        operation.current_attention()
+        operation.history_attention(operation.gathered, operation.history)
+        operation.current_attention(operation.gathered, operation.current)
         for name in ("history", "history_lse", "current", "current_lse"):
             stage[name] = getattr(operation, name).clone()
         merge_attention(operation.history, operation.history_lse, operation.current, operation.current_lse,
@@ -723,8 +723,8 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
     from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
         create_all_reduce_runtime, create_head_exchange)
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import ModelConfig
     from ignition.recipes.kimi3.dspark import PreparedMarkov
@@ -743,7 +743,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                             timeout=timedelta(minutes=20))
     runtimes, graphs, compiled = [], [], {}
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             from ignition.recipes.kimi3.dcp import write_records
 
             records = torch.linspace(-1024, 1024, 3 * RECORD, device=device).view(3, RECORD).bfloat16()
@@ -832,11 +832,16 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                 arena = ScratchArena(device)
                 session.register_scratch(arena)
                 buffers = {}
+                context_pool = GraphBufferPool(device, chunk_bytes=2 << 20)
+                context_cursor = context_pool.cursor()
+                retained = context_cursor.full((256,), 7, torch.bfloat16)
                 common = dict(session=session, workspace=arena, runtime=context_runtime,
-                              coordinator=coordinator, buffers=buffers, context=context)
+                              coordinator=coordinator, buffers=buffers, context=context,
+                              allocator=context_cursor.fork())
                 initial_context = PreparedContext(weights, auxiliary, initial, pool, name="initial", **common)
                 commit_context = PreparedContext(weights, feedback, commit, pool, name="commit", **common)
                 single_context = PreparedContext(weights, one_feedback, single, pool, name="single", **common)
+                assert bool((retained == 7).all())
                 assert initial_context.projected.data_ptr() == commit_context.projected.data_ptr()
                 assert commit_context.kv.data_ptr() == single_context.kv.data_ptr()
                 scratch = DraftScratch.allocate(config, shard, 14, BLOCK, device)
@@ -871,7 +876,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     session=session, device=device, stream=stream,
                     pool=graph_pool, compile_decoder=compile_decoder, coordinator=coordinator,
                     cache_root=Path(cache_root),
-                    warmup_storage=storage, report_catalog=False)
+                    warmup_storage=storage, report_catalog=False, retain_forwards=True)
                 graphs.extend(captured.values())
                 assert set(compiled) == (set(functions) if compile_decoder else set())
                 session.freeze()

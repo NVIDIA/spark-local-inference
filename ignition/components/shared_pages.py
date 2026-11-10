@@ -32,7 +32,7 @@ class SharedPages:
         if type(nbytes) is not int or nbytes <= 0 or nbytes % 16:
             raise ValueError("shared pages require a positive size of whole 16-byte packs")
         self.group, self.device, self.nbytes = group, torch.device(device), nbytes
-        # Package preparation supplies symmetric mappings that native restore reproduces.
+        # Core preparation supplies symmetric mappings that native restore reproduces.
         if ipc is None:
             ipc = CudaRTLibrary()
             ipc.cudaSetDevice(self.device.index)

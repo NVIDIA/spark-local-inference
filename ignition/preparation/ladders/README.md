@@ -3,7 +3,7 @@
 `--collective-tuning runtime --collective-ladder PATH` selects a joint PCIe
 kernel's compiled geometry from a JSON file. Preparation compiles that geometry
 without racing alternatives, regardless of `--autotune-effort`. Captured tuning
-graphs select among the file's submode and active-CTA profiles when the package
+graphs select among the file's submode and active-CTA profiles when the core
 loads. Serving replays the same compiled kernel with the selected profile.
 
 From the repository root, add these options to `ignition export`:
@@ -15,7 +15,7 @@ From the repository root, add these options to `ignition export`:
 
 The option is required whenever the resolved collective policy is `runtime`,
 including configuration-file and recipe defaults. Static policy rejects the
-option. File contents travel with the preparation plan and package rebuild
+option. File contents travel with the preparation plan and core rebuild
 settings; workers do not reopen the path.
 
 ## Version 2 format
@@ -122,8 +122,8 @@ Select the catalog with both phased modes during export:
 Use `gb202_pcie_tp4_clustered.json` in the same flag to exclude the phased Full
 choice at 80 KiB. `--collective-tuning static` uses preparation-time autotuning
 and accepts no ladder; these catalogs require the explicit `runtime` policy.
-Changing the catalog requires package export because cluster geometry is compiled
-into its kernels and captured launch attributes. Existing packages retain their
+Changing the catalog requires core export because cluster geometry is compiled
+into its kernels and captured launch attributes. Existing cores retain their
 prepared geometry and profiles.
 
 ## GB202 PCIe TP4 recommendations

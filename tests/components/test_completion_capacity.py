@@ -62,7 +62,7 @@ def test_record_geometry_rejects_empty_tokens_and_capacity_overflow_before_alloc
 
 @pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32])
 def test_prepared_execution_exports_explicit_capacity_and_protobuf_roundtrips(tokens, monkeypatch):
-    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.preparation import runtime_core_pb2 as p
 
     buffers = dict(_execution().buffers)
     buffers["completion_records"] = _tensor("int64", (2, 4, 16 + tokens))

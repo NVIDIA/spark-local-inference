@@ -40,7 +40,7 @@ fi
 commit=$(git -C "$root" rev-parse HEAD)
 epoch=$(git -C "$root" show -s --format=%ct HEAD)
 if [[ -z "$version" ]]; then
-    base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/flare/Cargo.toml" | head -1)
+    base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/flare-cli/Cargo.toml" | head -1)
     stamp=$(date -u -d "@$epoch" +%Y%m%d%H%M%S)
     version="${base}~git${stamp}.${commit:0:8}-1"
 fi

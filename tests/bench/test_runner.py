@@ -123,7 +123,7 @@ def test_missing_or_invalid_measurements_are_not_latency_estimates(times):
         summarize_case(BenchmarkCase(1, 8, 8, 512), [dict(seed=0, times_ms=times)])
 
 
-@pytest.mark.parametrize("arguments", [(3, 8, 24, 512), (1, 4, 4, 512), (2, 8, 8, 512), (1, 8, 8, 0)])
+@pytest.mark.parametrize("arguments", [(3, 8, 24, 512), (1, 0, 0, 512), (2, 8, 7, 512), (1, 8, 8, 0)])
 def test_case_rejects_shapes_outside_complete_round_matrix(arguments):
     with pytest.raises(ValueError):
         BenchmarkCase(*arguments)
@@ -180,7 +180,7 @@ def test_request_stop_policy_packs_eos_count_without_changing_token_ids(ignore_e
 
     from ignition.direct.packing import pack
     from ignition.direct.scheduler import Lane, Layout, Request, SamplingParameters, Step
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
 
     bindings = [c.binding("admission_eos_count", p.EOS_COUNT, indexing=p.REQUEST_ROW),
                 c.binding("admission_eos_token_ids", p.EOS_TOKEN_IDS, indexing=p.REQUEST_ROW)]
@@ -258,3 +258,155 @@ def test_acceptance_observation_separates_verification_from_committed_clipping()
     sample = dict(seed=0, times_ms=[1.] * 20, acceptance=result)
     summary = summarize_case(BenchmarkCase(1, 8, 8, 8192), [sample])
     assert summary["samples"][0]["acceptance"]["observations_per_request"] == 1
+
+
+def test_width_one_preserves_proposal_rng_and_advances_target_rng():
+    from types import SimpleNamespace as NS
+    import torch
+    from ignition.bench.runner import _check_metadata
+
+    metadata = NS(live_counts=torch.tensor([1, 1]), starts=torch.tensor([512]),
+                  lengths=torch.tensor([1]), query_start_loc=torch.tensor([0, 1]))
+    owner = NS(generation=torch.tensor([2]), offset=torch.tensor([28]),
+               rng=NS(generation=torch.tensor([3]), target_offset=torch.tensor([4])))
+    forward = NS(metadata=metadata, draft=None, owner=owner,
+                 operations=(None, (), NS(draw_reservation=4), None))
+    model = NS(benchmark_rounds={"round1": forward})
+    step = NS(graph="round1", lanes=[NS(request=NS(slot=0, generation=3))], draft_tokens=0)
+    case = BenchmarkCase(1, 1, 1, 512)
+    _check_metadata(model, step, case, proposal_before=[(2, 28)])
+    owner.offset.add_(4)
+    with pytest.raises(RuntimeError, match="without proposals changed"):
+        _check_metadata(model, step, case, proposal_before=[(2, 28)])
+    owner.offset.sub_(4)
+    owner.rng.target_offset.zero_()
+    with pytest.raises(RuntimeError, match="draw reservations"):
+        _check_metadata(model, step, case, proposal_before=[(2, 28)])
+
+
+@pytest.mark.parametrize("prefix", [4, 6, 8])
+def test_packed_prefix_keeps_seven_proposals_and_packs_only_verified_rows(prefix):
+    from ignition.bench.runner import _round
+    from ignition.direct.scheduler import Lane, Scheduler
+    from tests.direct.test_scheduler import layout, records, request, uploads
+
+    catalog = layout(capacity=1, max_active=1, widths=(1, 8), graphs={
+        ("init", 1, 1): "init1", ("prefill", 1, 512): "prefill512",
+        ("speculative", 1, 8, prefix, 7): "round"})
+    scheduler = Scheduler(catalog, prefix_cache=False)
+    member = request(1, [10] * 512, limit=64)
+    scheduler.submit(member)
+    step = scheduler.plan()
+    scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+    step = scheduler._step("prefill", 512, [Lane(member, 0, 512)])
+    scheduler.complete(step, records(scheduler, step, {member: (1, 512, [42], 0)}))
+    step = _round(scheduler, BenchmarkCase(1, 8, prefix, 512))
+    assert (step.width, step.draft_tokens, step.packed_tokens) == (8, 7, prefix)
+    packed = uploads(scheduler, step)
+    assert packed["query_lengths"] == {0: [prefix]}
+    assert step.lanes[0].tokens == prefix
+
+
+@pytest.mark.parametrize("prefix", [4, 6, 8])
+def test_packed_metadata_retains_full_proposal_draw_reservation(prefix):
+    from types import SimpleNamespace as NS
+    import torch
+    from ignition.bench.runner import _check_metadata
+
+    def metadata(rows):
+        return NS(live_counts=torch.tensor([rows, 1]), starts=torch.tensor([512]),
+                  lengths=torch.tensor([rows]), query_start_loc=torch.tensor([0, rows]))
+    owner = NS(generation=torch.tensor([3]), offset=torch.tensor([28]),
+               rng=NS(generation=torch.tensor([3]), target_offset=torch.tensor([12])))
+    forward = NS(metadata=metadata(prefix), draft=object(), draft_metadata=metadata(8),
+                 draft_inputs=torch.empty((1, 8)), owner=owner,
+                 operations=(None, (), NS(draw_reservation=12), None))
+    model = NS(benchmark_rounds={"round": forward})
+    step = NS(graph="round", lanes=[NS(request=NS(slot=0, generation=3))], draft_tokens=7)
+    _check_metadata(model, step, BenchmarkCase(1, 8, prefix, 512))
+    if prefix < 8:
+        owner.offset.fill_(4 * (prefix - 1))
+        with pytest.raises(RuntimeError, match="proposal RNG"):
+            _check_metadata(model, step, BenchmarkCase(1, 8, prefix, 512))
+
+
+def test_prefix_matrix_reuses_prefill_and_restores_each_replay(monkeypatch):
+    from types import SimpleNamespace as NS
+    import torch
+
+    from ignition.bench import runner
+    from ignition.direct.scheduler import Lane, Layout, Scheduler
+    from tests.direct.test_scheduler import layout, records, request
+
+    cases = (BenchmarkCase(1, 1, 1, 512), BenchmarkCase(1, 8, 4, 512),
+             BenchmarkCase(1, 8, 6, 512), BenchmarkCase(1, 8, 8, 512))
+    catalog = layout(capacity=1, max_active=1, widths=(1, 8), graphs={
+        ("init", 1, 1): "init1", ("prefill", 1, 512): "prefill512",
+        **{("speculative", case.batch, case.width, case.packed_tokens,
+            case.width - 1): str(case.packed_tokens) for case in cases}})
+    rounds = {str(case.packed_tokens): NS(owner=NS(generation=torch.tensor([0]),
+              offset=torch.tensor([0])), draft=object() if case.width > 1 else None,
+              draft_inputs=torch.empty((1, 7)), context=object()) for case in cases}
+    model = NS(benchmark_state={"requests": object()},
+               benchmark_requests=NS(generation=torch.tensor([0])), benchmark_rounds=rounds)
+
+    class Executor:
+        def __init__(self, prepared):
+            self.state, self.saved, self.seen = None, None, []
+
+        def snapshot(self):
+            assert self.saved is None
+            self.saved = self.state
+
+        def restore(self):
+            self.state = self.saved
+
+        def run(self, message):
+            assert self.state == self.saved
+            self.seen.append((message["graph"], self.state, message["frame"], message["sequence"]))
+            self.state = "mutated"
+            return 1_000_000
+
+        def release_snapshot(self):
+            assert self.state == self.saved
+            self.saved = None
+
+        def close(self):
+            assert self.saved is None
+
+    executor = Executor(model)
+    setups = []
+
+    def prefill(model, executor, layout, case, tokenizer, seed, generation):
+        setups.append((case.width, seed, generation))
+        executor.state = (seed, generation)
+        scheduler = Scheduler(layout, prefix_cache=False)
+        member = request(1, [10] * 512, limit=2 * case.width, seed=seed)
+        scheduler.submit(member)
+        step = scheduler.plan()
+        scheduler.complete(step, records(scheduler, step, {member: (1, 0, [], 0)}))
+        step = scheduler._step("prefill", 512, [Lane(member, 0, 512)])
+        scheduler.complete(step, records(scheduler, step, {member: (1, 512, [42], 0)}))
+        return scheduler
+
+    def complete(model, executor, scheduler, step, elapsed):
+        member = step.lanes[0].request
+        assert (member.consumed, member.generated, member.max_new_tokens) == (512, [42], 16)
+        member.consumed += 1
+        member.generated.append(43)
+
+    monkeypatch.setattr(Layout, "of", lambda model: catalog)
+    monkeypatch.setattr(runner, "BenchmarkExecutor", lambda prepared: executor)
+    monkeypatch.setattr(runner, "_prefill", prefill)
+    monkeypatch.setattr(runner, "_complete", complete)
+    monkeypatch.setattr(runner, "_check_request_state", lambda *args: None)
+    monkeypatch.setattr(runner, "_check_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "acceptance_observation", lambda forward: {})
+    result = runner.run_benchmark(model, None, scenarios=cases, warmup=1, repetitions=2, seeds=(3, 9))
+    assert setups == [(8, 3, 1), (8, 9, 2)]
+    assert len(executor.seen) == 32
+    for graph in ("1", "4", "6", "8"):
+        assert [state for name, state, _, _ in executor.seen if name == graph] == [(3, 1)] * 4 + [(9, 2)] * 4
+    assert len({(frame, sequence) for _, _, frame, sequence in executor.seen}) == 1
+    assert result["status"] == "complete"
+    assert all(sample["times_ms"] == [1., 1.] for case in result["cases"] for sample in case["samples"])

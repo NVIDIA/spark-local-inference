@@ -164,3 +164,24 @@ pub fn terminal_columns() -> usize {
     }
     (info.srWindow.Right - info.srWindow.Left + 1) as usize
 }
+
+/// Stable volume/file identity and hardlink count for cache ownership accounting.
+pub fn file_identity(path: &Path) -> Option<((u64, u64), u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let file = File::open(path).ok()?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: The file handle is live and information is a writable output buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return None;
+    }
+    Some((
+        (
+            u64::from(information.dwVolumeSerialNumber),
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        ),
+        u64::from(information.nNumberOfLinks),
+    ))
+}

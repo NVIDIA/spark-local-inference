@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared-model ownership through package export and diagnostic execution."""
+"""Prepared-model ownership through core export and diagnostic execution."""
 
 import json
 from threading import get_ident
@@ -21,7 +21,7 @@ class PreparedModel(PreparedExecution):
     them; it is None for recipes that do not retain them.
     """
 
-    def __init__(self, *, server_config, memory_report, session, close_resources=(), package_data=None,
+    def __init__(self, *, server_config, memory_report, session, close_resources=(), core_data=None,
                  forwards=None, embedding_catalog=None, rebuild_weights=None,
                  benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None,
                  benchmark_prefills=None, **kwargs):
@@ -43,7 +43,7 @@ class PreparedModel(PreparedExecution):
             self.server_config["model_contract"] = contract
         self.memory_report = memory_report if registry is None else {**memory_report, **registry.memory_report()}
         self.session = session
-        self.package_data = package_data
+        self.core_data = core_data
         self.rebuild_weights = rebuild_weights
         self.forwards = None if forwards is None else MappingProxyType(dict(forwards))
         self.benchmark_state = None if benchmark_state is None else MappingProxyType(dict(benchmark_state))
@@ -94,7 +94,7 @@ class PreparedModel(PreparedExecution):
 
         if not hasattr(flare_heliopause, "Server"):
             raise RuntimeError("in-process HTTP diagnostics require heliopause's qualification Cargo feature; "
-                               "use ignition export followed by flare run for package-based serving")
+                               "use ignition export followed by flare run for core-based serving")
         with self._handoff_lock:
             if self._consumed or self.closed:
                 raise RuntimeError("prepared model has already been consumed or closed")

@@ -1,6 +1,6 @@
 # Native inference APIs
 
-Helios serves the loaded runtime package through four generation protocols.
+Helios serves the loaded runtime core through four generation protocols.
 Every protocol uses the same tokenizer, prepared chat template, image processor,
 sampling defaults, scheduler, prefix cache, and CUDA graphs. Clients execute tools
 and return their results in subsequent requests.
@@ -27,7 +27,7 @@ is the effective serving context limit in tokens, including prompt and output.
 `local`. `created` is the serving instance's discovery initialization time in
 Unix seconds; cards and permission IDs stay stable until the server restarts.
 Permissions advertise sampling and viewing. `allow_logprobs` reflects the loaded
-package’s generation logprob outputs; fine-tuning, engine creation, and search
+core’s generation logprob outputs; fine-tuning, engine creation, and search
 indices remain disabled.
 
 The additional `flare` object reports prepared and selected serving metadata:
@@ -35,19 +35,19 @@ The additional `flare` object reports prepared and selected serving metadata:
 | Field | Meaning |
 | --- | --- |
 | `vocab_size` | Prepared output vocabulary size |
-| `max_top_logprobs` | Packaged alternative-token capacity; 20 for new packages, zero for older packages |
+| `max_top_logprobs` | Prepared alternative-token capacity; 20 for new cores, zero for older cores |
 | `max_concurrency` | Selected maximum active requests |
 | `prefill_chunk_size` | Maximum tokens in a prefill chunk, not the context limit |
 | `default_max_tokens` | Default output-token budget when a request omits it; remaining context still bounds output |
-| `sampling_defaults` | Packaged seed, temperature, filters, and penalties used for omitted request fields |
+| `sampling_defaults` | Prepared seed, temperature, filters, and penalties used for omitted request fields |
 | `thinking_token_budget` | Operator default reasoning-token cap for conversational requests; null when unset |
-| `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its packaged default; seed remains request-controlled |
-| `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only packages |
-| `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only packages |
+| `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its prepared default; seed remains request-controlled |
+| `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only cores |
+| `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only cores |
 | `image_feature_window_tokens` | Prepared feature storage per active image request; chunked prefill reuses this storage across windows, so it does not limit total conversation image tokens |
-| `max_image_tokens_per_image` | Image tokens one image may cost after the profile's normalization; the smaller of one prepared vision graph and one feature window; zero for text-only packages |
-| `max_image_pixels` | Largest decoded image extent (width times height) accepted before normalization; zero for text-only packages |
-| `max_image_bytes` | Largest encoded image accepted; zero for text-only packages |
+| `max_image_tokens_per_image` | Image tokens one image may cost after the profile's normalization; the smaller of one prepared vision graph and one feature window; zero for text-only cores |
+| `max_image_pixels` | Largest decoded image extent (width times height) accepted before normalization; zero for text-only cores |
+| `max_image_bytes` | Largest encoded image accepted; zero for text-only cores |
 | `input_modalities` | `text`, plus `image` when vision is prepared |
 | `output_modalities` | `text` |
 
@@ -108,8 +108,8 @@ uses the target model's distribution at each committed position. The chosen toke
 is always included, even when outside the alternatives. Natural alternatives are
 ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported package provides up to 20 natural alternatives and supports
-explicit token IDs. Older packages retain their natural request limit (1..20),
+Every newly exported core provides up to 20 natural alternatives and supports
+explicit token IDs. Older cores retain their natural request limit (1..20),
 or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
 no generation logprob outputs. Unsupported requests return HTTP 400.
 
@@ -138,7 +138,7 @@ parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset` arrays.
 `top_logprobs` contains one token-to-logprob object per generated token.
 `text_offset` counts Unicode characters from the start of the completion, including
 positions inside a decoder span released for several tokens. `echo: true` also
-returns prompt entries when the package was exported with
+returns prompt entries when the core was exported with
 `--prompt-logprobs`; see below.
 
 Responses accepts `include: ["message.output_text.logprobs"]` with optional
@@ -171,13 +171,13 @@ Prompt scores and echoed prompt entries remain natural. Completions accepts
 validated IDs with `echo: true, max_tokens: 0`, which returns no generation
 positions. Completions maps retain their existing decoded-string collision
 behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
-rejects `logprob_token_ids`. Older packages reject nonempty selections before
+rejects `logprob_token_ids`. Older cores reject nonempty selections before
 admission with an explanation to re-export.
 
 ### Prompt log probabilities
 
 Export with `ignition export … --prompt-logprobs` to capture scored prefill graphs.
-The flag defaults off. Packages without those graphs return HTTP 400 for prompt
+The flag defaults off. Cores without those graphs return HTTP 400 for prompt
 logprob requests and continue serving other requests unchanged.
 
 Completions and Chat Completions accept integer `prompt_logprobs: 0..20`, independently
@@ -287,7 +287,7 @@ instantaneous gauges.
 | --- | --- | --- |
 | `prefill_tokens` | Prompt tokens consumed by completed prefill, excluding padding and prefix reuse | `flare_prefill_tokens_total` |
 | `generated_tokens` | Committed generated tokens, including EOS and tokens withheld by text stops | `flare_generated_tokens_total` |
-| `decode_weight_bytes` | Bytes of weights one decode step reads for one request, as the package's recipe declares for its checkpoint; zero when undeclared. Times verification steps per second it is the weight bandwidth the model consumes, shown as WEIGHTS on the dashboards | `flare_decode_weight_bytes` |
+| `decode_weight_bytes` | Bytes of weights one decode step reads for one request, as the core's recipe declares for its checkpoint; zero when undeclared. Times verification steps per second it is the weight bandwidth the model consumes, shown as WEIGHTS on the dashboards | `flare_decode_weight_bytes` |
 | `draft_steps` | Draft positions run by the learned drafter; zero without one | none |
 | `verify_steps` | Completed speculative or verification graphs | sum of `flare_speculative_rounds_total` |
 | `verification_drafts` | Draft positions allocated for progressing request rounds, including rejected drafts and excluding padding | `flare_verification_draft_tokens_total` |
@@ -301,7 +301,7 @@ instantaneous gauges.
 | `failed` | Requests failed by admission, execution, grammar, or output processing | `flare_requests_failed_total` |
 | `replay_gpu_ns` | Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits | `flare_replay_gpu_nanoseconds_total` |
 | `replay_readiness_wait_ns` | Exposed embedding readiness delay measured across ranks, for both RAM and disk delivery | `flare_replay_readiness_wait_nanoseconds_total` |
-| `replay_readiness_samples` | Completed graphs with prepared readiness timing outputs; zero for packages without them | `flare_replay_readiness_samples_total` |
+| `replay_readiness_samples` | Completed graphs with prepared readiness timing outputs; zero for cores without them | `flare_replay_readiness_samples_total` |
 | `reused_tokens` | Tokens covered by GPU prefix-cache hits | `flare_cache_reused_tokens_total` |
 | `cached_pages` | KV pages owned by immutable checkpoints | `flare_cached_kv_pages` |
 | `free_pages` | KV pages reusable after completed GPU fences | `flare_free_kv_pages` |
@@ -338,7 +338,7 @@ failed lanes, and terminal rounds without progress do not enter this average.
 The neutral request representation in `helios/src/server/inference.rs` separates
 conversation messages from raw prompts. Conversation parts represent text,
 images, reasoning, tool calls, and tool results. Protocol decoders populate these
-types directly. `server/request.rs` lowers them into the packaged chat template
+types directly. `server/request.rs` lowers them into the prepared chat template
 and model frontend; no endpoint translates through another endpoint's JSON.
 When developer instructions are present, system and developer instructions become
 one leading system message. Instruction sections retain their role labels and
@@ -497,7 +497,7 @@ token. Admission costs every image before rejecting, so a budget rejection
 the first image that crossed the budget with its position, pixel size, and
 tokens. Oversized single images are rejected against
 `max_image_tokens_per_image` or `max_image_pixels` with the observed size.
-Each profile applies its packaged resizing rules independently to each image.
+Each profile applies its prepared resizing rules independently to each image.
 Flare does not reduce image resolution as conversation history grows or to fit
 a feature window. Chat templates add fixed framing tokens around each image that
 count toward `prompt_tokens` but not toward the image budget or
@@ -512,7 +512,7 @@ complete vision computation.
 
 Window transitions use a private snapshot of complete model state and restore
 it under a fresh execution generation before reusing the feature arena. They
-work with existing packages and with both host cache tiers disabled. These
+work with existing cores and with both host cache tiers disabled. These
 internal transitions do not count as cached prompt tokens.
 
 Configured host memory and disk retention also cache source descriptions and
@@ -526,7 +526,7 @@ Anthropic histories accept inline system text and preserve text, thinking, tool
 use/results, errors, and image blocks. Message-level control metadata, including
 `output_config.effort`, is ignored; top-level generation controls apply to the
 request. Empty system messages produce no prompt text. Assistant-prefill messages
-use the packaged template's continuation support. `context_management` may
+use the prepared template's continuation support. `context_management` may
 request preservation of all thinking blocks
 (`clear_thinking_20251015` with `keep: "all"`); active context edits are rejected.
 Cache-control hints do not alter the native prefix-cache policy.
@@ -555,12 +555,12 @@ provider reasoning signatures or encrypted continuation state.
 Prepared model defaults fill omitted sampling fields. Numeric request values for
 `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty`,
 and `frequency_penalty` are clamped to the inclusive ranges declared in the
-package. A parameter without a range is fixed at its packaged default, including
-in packages exported without range metadata. Ranges must contain their defaults
+core. A parameter without a range is fixed at its prepared default, including
+in cores exported without range metadata. Ranges must contain their defaults
 and valid sampler values; temperature bounds are positive. For example,
 `temperature: 0` becomes the declared minimum, or the default if no range exists.
 Malformed types still return HTTP 400; `top_k` must be an integer. `seed` remains
-request-controlled and uses its packaged default when omitted. Sampling defaults
+request-controlled and uses its prepared default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe,
 except for DeepSeek V4.1's repetition-penalty range based on measured use.
 
@@ -585,7 +585,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 All recipes default to `min_p=0`, `repetition_penalty=1`, and zero presence and
 frequency penalties. Unspecified filters are disabled and unspecified penalties
 are neutral. Disabled top-k is stored as `-1`; Step 5's recommended `0` has the
-same meaning. Packages exported without ranges continue to fix every distribution
+same meaning. Cores exported without ranges continue to fix every distribution
 parameter at their stored defaults, including Qwen presence penalties.
 
 Native extensions such as `top_k`, `min_p`, repetition penalties, token stops,
@@ -600,7 +600,7 @@ are included in the system prompt as well as enforced by token masks.
 `thinking_token_budget` is a positive 32-bit integer accepted by Chat Completions,
 Responses, and Messages. It caps generated reasoning tokens from the start of
 this request's output. At the cap, if reasoning is unambiguously open, output
-capacity remains, and any grammar allows it, Flare emits the packaged reasoning
+capacity remains, and any grammar allows it, Flare emits the prepared reasoning
 close token and continues with the remaining output limit. The forced close
 counts as a generated token within that limit; forced tokens are omitted from
 logprobs. No transition text is inserted.
@@ -608,7 +608,7 @@ If reasoning closed earlier, a tool opener is still undecided, or the grammar
 disallows the close, generation continues without an injected token.
 EOS, user stops, and errors terminate normally without continuation.
 
-The budget requires packaged reasoning syntax with a single-token close delimiter
+The budget requires prepared reasoning syntax with a single-token close delimiter
 when output starts in reasoning. Unsupported formats and raw Completions
 return HTTP 400 naming `thinking_token_budget`. When output starts in content,
 the budget is accepted without a cut.
@@ -616,7 +616,7 @@ the budget is accepted without a cut.
 `[server] thinking_token_budget = N` sets a default for Chat Completions, Responses,
 and Messages requests that omit a budget, including when the request field is null.
 An explicit request budget, including Messages `thinking.budget_tokens`, wins.
-The setting must be a positive 32-bit integer. Startup rejects packages without
+The setting must be a positive 32-bit integer. Startup rejects cores without
 reasoning syntax, a single-token close delimiter, or a supported default output start.
 The default does not select reasoning effort or apply to raw Completions. Omitting
 it leaves requests without a budget uncapped. `/v1/models` advertises it in
@@ -632,7 +632,7 @@ Messages budgets above the 32-bit output limit are accepted and never trigger a 
 Responses and Anthropic named effort settings
 (`reasoning.effort` and `output_config.effort`) accept named levels and map into
 the same neutral levels. They do not accept numeric scores. The frontend resolves
-those levels against the effort vocabulary accepted by the packaged template: for example Qwen uses
+those levels against the effort vocabulary accepted by the prepared template: for example Qwen uses
 `low/medium/xhigh`. Native DeepSeek V4 and V4.1 prompt encoders accept
 `low/high/xhigh/max` and default to thinking enabled and high effort.
 DeepSeek V4 rejects numeric effort. DeepSeek V4.1 additionally accepts a JSON
@@ -660,8 +660,8 @@ Anthropic `thinking.budget_tokens` also sets `thinking_token_budget` as describe
 
 Both native DeepSeek encoders reject `drop_thinking`, assistant continuation,
 and `add_generation_prompt=false`.
-Explicit values are validated by the selected encoder. Packages exported with
-Jinja templates retain their packaged template semantics.
+Explicit values are validated by the selected encoder. Cores exported with
+Jinja templates retain their prepared template semantics.
 Kimi K3 always uses thinking: its template ignores `enable_thinking=false` and
 `thinking=false` without an error, preserves assistant reasoning history, and
 accepts `low`, `high`, or `max` effort (default `max`).
@@ -710,7 +710,7 @@ chunks does not measure generated tokens. Final usage is still emitted.
 
 `prompt` accepts a string, an array of strings, a token-ID array, or an array of
 token-ID arrays. Text uses the prepared tokenizer's normal special-token policy;
-explicit IDs are preserved. Empty text requires a packaged BOS token; empty token
+explicit IDs are preserved. Empty text requires a prepared BOS token; empty token
 arrays are rejected. Raw prompts bypass chat templates and reasoning/tool parsers.
 
 `n` generates independent choices for each prompt. Choice indices are
@@ -733,12 +733,12 @@ is disabled. The SDK tests use OpenAI 2.54.0 and Anthropic 0.125.0.
 
 [Claude Code settings](clients/claude-code.json) configure its base URL, model,
 and API key. Client settings may use environment variables; Helios behavior is
-configured through its CLI, configuration file, and prepared package.
+configured through its CLI, configuration file, and prepared core.
 
 [Codex provider settings](clients/codex.toml) and its
 [model catalog](clients/codex-models.json) select HTTP Responses, disable hosted
 search, and describe local model capabilities. Set the catalog's context limit
-to the loaded package's capacity. The catalog uses Codex's freeform `apply_patch`
+to the loaded core's capacity. The catalog uses Codex's freeform `apply_patch`
 tool with completed-input grammar validation.
 The coding-client tests exercise Codex 0.162.1 and Claude Code 2.1.296 in normal
 and bare modes with actual file inspection, editing, and test execution in
@@ -752,7 +752,7 @@ FLARE_API_TEST_URL=http://127.0.0.1:8000 \
   .venv/bin/python -m pytest tests/server/test_protocols.py -q
 FLARE_API_TEST_URL=http://127.0.0.1:8000 FLARE_RUN_CLIENT_TESTS=1 \
   .venv/bin/python -m pytest tests/server/test_coding_clients.py -q
-cargo test --manifest-path helios/Cargo.toml --features server,runtime-package --lib
+cargo test --manifest-path helios/Cargo.toml --features server,runtime-core --lib
 ```
 
 `FLARE_API_TEST_KEY` supplies an authenticated test endpoint's key. Coding-client
@@ -787,7 +787,7 @@ questions. Instructions and descriptions preserve structured JSON. Choice has
 1–128 criteria; Score has 1–10 nonnull levels. Available single-token labels and
 prepared context/output capacities may lower these limits. Schema failures return
 Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
-unsupported packages return 400; authentication and operational errors use the
+unsupported cores return 400; authentication and operational errors use the
 existing generation error format.
 
 The native scorer compiles independent questions after a common state message,
@@ -801,11 +801,11 @@ request cancels its current child through the ordinary generation lifetime.
 The scorer uses the normal assistant generation prompt with thinking disabled
 where supported and an `Answer:` cue in the final user turn. Labels are verified
 as the first assistant token against the actual rendered prompt, including with
-the native DeepSeek encoders. Older packages without requested-ID outputs require
+the native DeepSeek encoders. Older cores without requested-ID outputs require
 re-export.
 
 PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
-`TypeSafe-Danger-Zone-Images: true` and a vision package. Supply base64 assets or
+`TypeSafe-Danger-Zone-Images: true` and a vision core. Supply base64 assets or
 uncompressed multipart/form-data with an application/json `request` part first,
 followed by uniquely named image parts. An asset's `part` takes precedence over
 `data_base64`; every part must belong to exactly one asset. References replace
@@ -854,5 +854,5 @@ Usage sums actual logical input and generated read tokens across questions,
 including `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens: 0`
 and `total_tokens`. Cache writes are not measured and are reported as zero.
 The route shares System One's prompt compilation, exact-ID reads, sequential
-child lifetime, template constraints and older-package rejection; it adds no
+child lifetime, template constraints and older-core rejection; it adds no
 second scoring path.

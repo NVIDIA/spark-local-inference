@@ -35,7 +35,7 @@ class _ColumnForward:
 def test_shard_columns_survive_export_scratch_clearing(tmp_path):
     from ignition.preparation.aot import aot_forward
     from ignition.preparation.disposable import storage_ranges
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.runtime_core import _Cuda
 
     torch.cuda.set_device(0)
     first = _ColumnForward(0)

@@ -66,7 +66,7 @@ class StudyModel:
         self.model, self.studies = model, studies
 
     def manifest(self, **kwargs):
-        raise ValueError("speculation studies cannot produce native package metadata")
+        raise ValueError("speculation studies cannot produce native core metadata")
 
     def __enter__(self):
         return self

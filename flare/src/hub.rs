@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Download prepared packages from hardware-specific Hugging Face revisions.
+//! Download prepared cores from hardware-specific Hugging Face revisions.
 
 use std::{
     io::{Read, Write},
@@ -12,16 +12,25 @@ use std::{
     time::Duration,
 };
 
-use flare_helios::package::progress::Counter;
 use hf_hub::{
     Cache, Repo, RepoType,
     api::sync::{Api, ApiBuilder},
 };
 use sha2::Digest as _;
+use flare_helios::core::progress::AcquisitionPhase;
 
-use crate::cli::HubOptions;
+use crate::options::HubOptions;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn check_cancel(
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<()> {
+    if progress.is_some_and(|progress| progress.is_cancelled()) {
+        return Err("model acquisition cancelled; partial transport content is retained".into());
+    }
+    Ok(())
+}
 
 pub fn is_repository(path: &Path) -> bool {
     !path.exists()
@@ -33,7 +42,7 @@ pub fn is_repository(path: &Path) -> bool {
         })
 }
 
-pub(crate) fn repository(text: &str) -> Result<(&str, Option<&str>)> {
+pub fn repository(text: &str) -> Result<(&str, Option<&str>)> {
     let (id, revision) = match text.split_once('@') {
         Some((id, revision)) if !revision.is_empty() => (id, Some(revision)),
         Some(_) => return Err("Hugging Face revision cannot be empty".into()),
@@ -97,7 +106,7 @@ fn choose_file(files: impl IntoIterator<Item = String>, requested: Option<&str>)
     if let Some(filename) = requested {
         validate_relative(filename)?;
         if !filename.ends_with(".safetensors") || is_companion(filename) {
-            return Err("--filename must name a prepared .safetensors package".into());
+            return Err("--filename must name a prepared .safetensors core".into());
         }
         return Ok(filename.to_owned());
     }
@@ -112,23 +121,9 @@ fn choose_file(files: impl IntoIterator<Item = String>, requested: Option<&str>)
             validate_relative(filename)?;
             Ok(filename.clone())
         }
-        [] => Err("revision contains no .safetensors package; choose a revision containing prepared Flare packages".into()),
+        [] => Err("revision contains no .safetensors core; choose a revision containing prepared Flare cores".into()),
         _ => Err(format!("revision contains several .safetensors files; select one with --filename:\n  {}", candidates.join("\n  ")).into()),
     }
-}
-
-pub fn run_download(args: crate::cli::Download) -> Result<()> {
-    crate::environment::configure(&args.gpus)?;
-    let entry = download(
-        &args.repository,
-        &args.hub,
-        args.gpus.len(),
-        &args.publisher_keys,
-        args.trust_store.as_deref(),
-        &[],
-    )?;
-    println!("{}", entry.directory().display());
-    Ok(())
 }
 
 pub fn download(
@@ -137,8 +132,8 @@ pub fn download(
     gpu_count: usize,
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
-) -> Result<flare_helios::package::cache::Entry> {
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+) -> Result<flare_helios::core::cache::Entry> {
     let access_token = if options.offline {
         None
     } else {
@@ -155,15 +150,15 @@ pub fn download(
     )
 }
 
-pub(crate) fn download_with_token(
+pub fn download_with_token(
     source: &str,
     options: &HubOptions,
     gpu_count: usize,
     access_token: Option<String>,
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
-) -> Result<flare_helios::package::cache::Entry> {
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+) -> Result<flare_helios::core::cache::Entry> {
     download_watched(
         source,
         options,
@@ -176,23 +171,18 @@ pub(crate) fn download_with_token(
     )
 }
 
-/// Acquire a prepared package, reporting into a caller-owned progress handle.
-///
-/// `Some(counters)` keeps every counter update and suppresses this function's
-/// own stderr summary, so a caller such as an agent can present progress itself.
-/// `None` retains the local summary. Acquisition never depends on the caller's
-/// observer: the handle is push-only, and a failed acquisition returns an error
-/// while retaining its resumable transport bytes.
-pub(crate) fn download_watched(
+/// Acquire a prepared core with caller-owned counters and durable resumable transport.
+/// Frontends own presentation; library diagnostics use the caller-configured logger.
+pub fn download_watched(
     source: &str,
     options: &HubOptions,
     gpu_count: usize,
     access_token: Option<String>,
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
-    counters: Option<flare_helios::package::progress::AcquisitionProgress>,
-) -> Result<flare_helios::package::cache::Entry> {
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+    counters: Option<flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<flare_helios::core::cache::Entry> {
     download_with_token_at(
         "https://huggingface.co",
         source,
@@ -215,9 +205,9 @@ fn download_with_token_at(
     access_token: Option<String>,
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
-    counters: Option<flare_helios::package::progress::AcquisitionProgress>,
-) -> Result<flare_helios::package::cache::Entry> {
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+    counters: Option<flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<flare_helios::core::cache::Entry> {
     download_for_model_at(
         endpoint,
         source,
@@ -228,6 +218,7 @@ fn download_with_token_at(
         trust_store,
         supplied_profiles,
         None,
+        true,
         counters,
     )
 }
@@ -241,22 +232,24 @@ fn download_for_model_at(
     access_token: Option<String>,
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
     expected_model: Option<&str>,
-    counters: Option<flare_helios::package::progress::AcquisitionProgress>,
-) -> Result<flare_helios::package::cache::Entry> {
+    select_default: bool,
+    counters: Option<flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<flare_helios::core::cache::Entry> {
+    check_cancel(counters.as_ref())?;
     let (id, given_revision) = repository(source)?;
     let revision = match options.revision.as_deref().or(given_revision) {
         Some(revision) => revision.to_owned(),
-        None => crate::hardware::detect_isolated(gpu_count)?,
+        None => crate::hardware::detect(gpu_count)?.to_owned(),
     };
     validate_relative(&revision)?;
     if let Some(filename) = &options.filename {
         choose_file([], Some(filename))?;
     }
-    let model_root = crate::cache_support::model_root(options.model_cache.as_deref())
+    let model_root = crate::cache_support::model_root(options.core_cache.as_deref())
         .map_err(|error| error.to_string())?;
-    eprintln!("Prepared-model cache: {}", model_root.display());
+    log::info!("Prepared-model cache: {}", model_root.display());
     if options.offline {
         let (entry, expected_envelope) =
             offline_entry_with_expected(&model_root, id, &revision, options, gpu_count)?;
@@ -270,24 +263,17 @@ fn download_for_model_at(
         )?;
         verify_offline_binding(&entry, expected_envelope, id, &revision, &resolved.profiles)?;
         verify_offline_entry(&entry, options, gpu_count, &resolved.profiles)?;
-        flare_helios::package::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+        if select_default {
+            flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+        }
         return Ok(entry);
     }
-    // Prepared package payloads are fetched into the durable transport shared by
+    // Prepared core payloads are fetched into the durable transport shared by
     // every acquisition under `--cache-dir`, or under the prepared-model cache
     // when it is not given. An interrupted transfer resumes from its partial file
     // in a later invocation, and completed content is reused by every repository
     // and revision that has the same bytes.
     let report = AcquisitionReport::with(counters);
-    // Local presentation only: an agent caller supplies its own counters and
-    // renders its own row, and a silent startup makes these stages inert.
-    let startup = if report.summarize {
-        flare_helios::startup::StartupProgress::stderr_rows()
-    } else {
-        flare_helios::startup::StartupProgress::silent()
-    };
-    let display =
-        flare_helios::package::progress::AcquisitionDisplay::new(&startup, &report.progress);
     // Reuse from the user Hugging Face cache is optional: a host without a
     // readable hub-cache setting still downloads normally. The path arrives from
     // this process's selected configuration, never from a reloaded default file.
@@ -296,7 +282,7 @@ fn download_for_model_at(
         .with_hub_cache(hub_cache);
     let cache = Cache::new(transport.root().to_owned());
     let repo = Repo::with_revision(id.to_owned(), RepoType::Model, revision.clone());
-    eprintln!("Package source: {id}@{revision}");
+    log::info!("Core source: {id}@{revision}");
     let (path, installed_folder, installed_commit) = {
         let api = ApiBuilder::from_cache(cache)
             .with_token(access_token.clone())
@@ -305,7 +291,9 @@ fn download_for_model_at(
             .with_retries(0)
             .build()?;
         let token = access_token.as_deref();
-        display.stage("Download package", Counter::Network, None);
+        check_cancel(Some(&report.progress))?;
+
+        report.progress.set_phase(AcquisitionPhase::Downloading);
         let (primary, pinned) = fetch_primary_with_progress(
             &api,
             &transport,
@@ -317,8 +305,9 @@ fn download_for_model_at(
         let filename = primary
             .strip_prefix(transport.snapshot_dir(&pinned.folder_name(), pinned.revision()))?
             .to_str()
-            .ok_or("package filename is not UTF-8")?
+            .ok_or("core filename is not UTF-8")?
             .to_owned();
+        report.progress.set_phase(AcquisitionPhase::Checking);
         // The shared resolver supplies remembered and explicit profiles plus the
         // established identity; download never accepts terms or decodes executables.
         let resolved = crate::trust::resolve_identity_with(
@@ -330,18 +319,18 @@ fn download_for_model_at(
         )
         .map_err(|error| transport_hint(transport.root(), error))?;
         let publishers = resolved.profiles;
-        let legacy = flare_helios::package::conversion::form(&primary)
+        let legacy = flare_helios::core::conversion::form(&primary)
             .map_err(|error| error.to_string())?
             .is_none();
         if let Some(expected) = expected_model.filter(|_| !legacy) {
-            use flare_helios::package::{cache, protection, reader};
+            use flare_helios::core::{cache, protection, reader};
             let metadata = reader::Metadata::open(&primary)?;
             let catalog = protection::verify(
                 &metadata.envelope,
                 &publishers,
                 protection::Selection::Catalog,
             )?;
-            let identity = catalog.package().model_identity.as_str();
+            let identity = catalog.core().model_identity.as_str();
             let model = cache::model_key(if identity.is_empty() { id } else { identity })
                 .map_err(|error| error.to_string())?;
             if model != expected {
@@ -363,15 +352,12 @@ fn download_for_model_at(
                 Some(entry) => entry,
                 None => {
                     let names = dependency_files(&primary, options, gpu_count, &publishers)?;
-                    let pending = if names.is_empty() {
-                        Some(PendingNetwork {
-                            total: Some(0),
-                            bound: 0,
-                        })
-                    } else {
-                        pending_network_bytes(&api, &transport, &pinned, &primary, &names, token)
-                    };
-                    let remaining = pending.as_ref().and_then(|pending| pending.total);
+                    let planned = plan_dependency_download(
+                        &api, &transport, &pinned, &primary, &names, token,
+                        Some(&report.progress),
+                    )?;
+                    let pending = planned.pending.as_ref();
+                    let remaining = pending.and_then(|pending| pending.total);
                     report
                         .progress
                         .record_network_total(remaining.map(|remaining| {
@@ -384,13 +370,14 @@ fn download_for_model_at(
                     announce_space(
                         &transport,
                         &model_root,
-                        pending.as_ref().map(|pending| pending.bound),
+                        pending.map(|pending| pending.bound),
                     );
                     if !names.is_empty() {
-                        display.stage("Download companions", Counter::Network, remaining);
+                        check_cancel(Some(&report.progress))?;
                     }
-                    for name in &names {
-                        fetch_dependency_with_progress(
+                    report.progress.set_phase(AcquisitionPhase::Downloading);
+                    for (index, name) in names.iter().enumerate() {
+                        fetch_dependency_with_identity(
                             &api,
                             &transport,
                             &pinned,
@@ -398,6 +385,7 @@ fn download_for_model_at(
                             name,
                             token,
                             Some(&report.progress),
+                            planned.identities[index].as_ref(),
                         )?;
                     }
                     // A completed transfer ends at exactly the bytes it pulled,
@@ -405,7 +393,9 @@ fn download_for_model_at(
                     report
                         .progress
                         .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    display.stage("Prepare package", Counter::Materialized, None);
+                    check_cancel(Some(&report.progress))?;
+
+                    report.progress.set_phase(AcquisitionPhase::Installing);
                     install_ready(&id, &primary, options, &model_root, gpu_count, &publishers)
                         .map_err(|error| transport_hint(transport.root(), error))?
                 }
@@ -415,7 +405,8 @@ fn download_for_model_at(
             // materializes and verifies payloads. Each row meters one counter, so
             // verification is presented while planning and materialization while
             // installing.
-            display.stage("Verify package", Counter::Verification, None);
+            check_cancel(Some(&report.progress))?;
+
             match plan_payload_acquisition(
                 &primary,
                 options,
@@ -431,15 +422,12 @@ fn download_for_model_at(
                 PayloadAcquisition::Ready(entry) => entry,
                 PayloadAcquisition::Planned { plan, staging } => {
                     let names = plan.remote_files();
-                    let pending = if names.is_empty() {
-                        Some(PendingNetwork {
-                            total: Some(0),
-                            bound: 0,
-                        })
-                    } else {
-                        pending_network_bytes(&api, &transport, &pinned, &primary, &names, token)
-                    };
-                    let remaining = pending.as_ref().and_then(|pending| pending.total);
+                    let planned = plan_dependency_download(
+                        &api, &transport, &pinned, &primary, &names, token,
+                        Some(&report.progress),
+                    )?;
+                    let pending = planned.pending.as_ref();
+                    let remaining = pending.and_then(|pending| pending.total);
                     report
                         .progress
                         .record_network_total(remaining.map(|remaining| {
@@ -452,13 +440,14 @@ fn download_for_model_at(
                     announce_space(
                         &transport,
                         &model_root,
-                        pending.as_ref().map(|pending| pending.bound),
+                        pending.map(|pending| pending.bound),
                     );
                     if !names.is_empty() {
-                        display.stage("Download companions", Counter::Network, remaining);
+                        check_cancel(Some(&report.progress))?;
                     }
-                    for name in &names {
-                        fetch_dependency_with_progress(
+                    report.progress.set_phase(AcquisitionPhase::Downloading);
+                    for (index, name) in names.iter().enumerate() {
+                        fetch_dependency_with_identity(
                             &api,
                             &transport,
                             &pinned,
@@ -466,6 +455,7 @@ fn download_for_model_at(
                             name,
                             token,
                             Some(&report.progress),
+                            planned.identities[index].as_ref(),
                         )?;
                     }
                     // A completed transfer ends at exactly the bytes it pulled,
@@ -473,7 +463,9 @@ fn download_for_model_at(
                     report
                         .progress
                         .record_network_total(Some(report.progress.snapshot().network_bytes));
-                    display.stage("Prepare package", Counter::Materialized, None);
+                    check_cancel(Some(&report.progress))?;
+
+                    report.progress.set_phase(AcquisitionPhase::Installing);
                     finish_payload_acquisition(&primary, &names, plan, staging, &model_root)
                         .map_err(|error| transport_hint(transport.root(), error))?
                 }
@@ -484,6 +476,7 @@ fn download_for_model_at(
         }
         let expected_envelope =
             authenticated_source_envelope(&primary, options, gpu_count, &publishers)?;
+        check_cancel(Some(&report.progress))?;
         remember_download(
             &model_root,
             id,
@@ -497,13 +490,15 @@ fn download_for_model_at(
         )?;
         // The default switches only after the source mapping is durable; a failed
         // source recording must not leave a different model version selected.
-        flare_helios::package::cache::Root::open(&model_root)?.publish_entry(&entry)?;
-        display.finish();
+        if select_default {
+            flare_helios::core::cache::Root::open(&model_root)?.publish_entry(&entry)?;
+        }
         (entry, pinned.folder_name(), pinned.revision().to_owned())
     };
     let mut report = report;
     report.success = true;
-    // The installed package no longer needs its transport copies. Cleanup runs
+    report.progress.set_phase(AcquisitionPhase::Complete);
+    // The installed core no longer needs its transport copies. Cleanup runs
     // only after this acquisition releases its shared lease, so a concurrent
     // acquisition or reclamation pass makes it skip instead of removing content
     // the other one still reads. A cleanup failure never undoes the install.
@@ -516,28 +511,27 @@ fn download_for_model_at(
         &installed_folder,
         &installed_commit,
     ) {
-        Ok(consumed) if consumed.complete_bytes > 0 => eprintln!(
+        Ok(consumed) if consumed.complete_bytes > 0 => log::info!(
             "Reclaimed {} bytes of consumed Hugging Face transport content",
             consumed.complete_bytes
         ),
         Ok(_) => {}
-        Err(error) => eprintln!(
-            "Warning: the package is installed, but its transport content was not reclaimed: {error}"
+        Err(error) => log::info!(
+            "Warning: the core is installed, but its transport content was not reclaimed: {error}"
         ),
     }
     Ok(path)
 }
 
 struct AcquisitionReport {
-    progress: flare_helios::package::progress::AcquisitionProgress,
+    progress: flare_helios::core::progress::AcquisitionProgress,
     success: bool,
-    /// Whether this call owns stderr presentation. A caller that supplies its own
-    /// counters renders progress and status itself.
+    /// Whether this call records its own final diagnostic summary.
     summarize: bool,
 }
 
 impl AcquisitionReport {
-    fn with(counters: Option<flare_helios::package::progress::AcquisitionProgress>) -> Self {
+    fn with(counters: Option<flare_helios::core::progress::AcquisitionProgress>) -> Self {
         match counters {
             Some(progress) => Self {
                 progress,
@@ -545,7 +539,7 @@ impl AcquisitionReport {
                 summarize: false,
             },
             None => Self {
-                progress: flare_helios::package::progress::AcquisitionProgress::new(),
+                progress: flare_helios::core::progress::AcquisitionProgress::new(),
                 success: false,
                 summarize: true,
             },
@@ -560,7 +554,7 @@ impl Drop for AcquisitionReport {
         }
         let snapshot = self.progress.snapshot();
         let state = if self.success { "completed" } else { "failed" };
-        eprintln!(
+        log::info!(
             "Acquisition {state}: network {} bytes, local source {} bytes, materialized {} bytes, verification {} bytes, elapsed {:.3}s",
             snapshot.network_bytes,
             snapshot.local_source_bytes,
@@ -602,7 +596,7 @@ const PART_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// The scope identifies the endpoint and repository; the key encodes the Hub
 /// ETag losslessly. Snapshot entries are hardlinks into
-/// `blobs/`, so package files are readable regular files without a second copy.
+/// `blobs/`, so core files are readable regular files without a second copy.
 /// The tree outlives the acquisition: a partial transfer resumes in a later
 /// invocation and completed content is reused instead of downloaded again.
 struct Transport {
@@ -614,7 +608,7 @@ struct Transport {
     model_root: PathBuf,
     /// Explicit `--cache-dir`, whose abandoned temporary trees are also scanned.
     explicit: Option<PathBuf>,
-    /// User Hugging Face cache that complete package files may be borrowed from
+    /// User Hugging Face cache that complete core files may be borrowed from
     /// read-only. Selected by `[paths].hub_cache` or the standard default.
     hub_cache: Option<PathBuf>,
     agent: ureq::Agent,
@@ -627,7 +621,7 @@ struct Transport {
 /// Free bytes on the filesystem that would hold `path`, walking up to the
 /// nearest existing ancestor. `None` means the query is unavailable, which is
 /// distinct from a filesystem with no free space.
-pub(crate) fn available_bytes(path: &Path) -> Option<u64> {
+pub fn available_bytes(path: &Path) -> Option<u64> {
     let mut candidate = path;
     loop {
         if candidate.exists() {
@@ -681,7 +675,7 @@ fn space_advisory(
     model_free: Option<u64>,
     remaining: Option<u64>,
 ) -> String {
-    use flare_helios::package::progress::format_bytes;
+    use flare_helios::core::progress::format_bytes;
     let free = |bytes: Option<u64>| match bytes {
         Some(bytes) => format_bytes(bytes),
         None => "unknown".to_owned(),
@@ -701,7 +695,7 @@ fn announce_space(transport: &Transport, model_root: &Path, remaining: Option<u6
     if remaining.is_none() {
         return;
     }
-    eprintln!(
+    log::info!(
         "{}",
         space_advisory(
             available_bytes(transport.root()),
@@ -713,7 +707,7 @@ fn announce_space(transport: &Transport, model_root: &Path, remaining: Option<u6
 
 /// Transport root for a prepared-model cache and optional `--cache-dir`, for
 /// callers that inspect free space without opening an acquisition.
-pub(crate) fn transport_root(model_root: &Path, explicit: Option<&Path>) -> PathBuf {
+pub fn transport_root(model_root: &Path, explicit: Option<&Path>) -> PathBuf {
     explicit
         .unwrap_or(model_root)
         .join("transport")
@@ -721,7 +715,7 @@ pub(crate) fn transport_root(model_root: &Path, explicit: Option<&Path>) -> Path
         .join("v1")
 }
 
-/// Declared byte sum of the package files this acquisition still needs, for a
+/// Declared byte sum of the core files this acquisition still needs, for a
 /// stage total. A missing size only omits the total; it never fails a download.
 /// Network bytes one acquisition still expects to pull.
 ///
@@ -737,6 +731,94 @@ struct PendingNetwork {
     bound: u64,
 }
 
+struct PlannedDownload {
+    pending: Option<PendingNetwork>,
+    identities: Vec<Option<FileIdentity>>,
+}
+
+const METADATA_WORKERS: usize = 8;
+
+/// Resolve only metadata concurrently; payload transfers remain serial.
+fn resolve_file_identities(
+    urls: &[String],
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<Vec<Option<FileIdentity>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let mut identities = vec![None; urls.len()];
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::new();
+        for _ in 0..urls.len().min(METADATA_WORKERS) {
+            let next = &next;
+            workers.push(scope.spawn(move || {
+                let mut resolved = Vec::new();
+                loop {
+                    if progress.is_some_and(|progress| progress.is_cancelled()) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(url) = urls.get(index) else { break };
+                    // A failed advisory probe leaves the total unknown. The
+                    // transfer still resolves its identity with normal retries.
+                    let identity = file_identity(url, token).ok();
+                    if let Some(progress) = progress {
+                        progress.record_planned_file();
+                    }
+                    resolved.push((index, identity));
+                }
+                resolved
+            }));
+        }
+        for worker in workers {
+            for (index, identity) in worker
+                .join()
+                .map_err(|_| "download planning worker panicked")?
+            {
+                identities[index] = identity;
+            }
+        }
+        Ok(())
+    })?;
+    check_cancel(progress)?;
+    Ok(identities)
+}
+
+fn plan_dependency_download(
+    api: &Api,
+    transport: &Transport,
+    pinned: &Repo,
+    primary: &Path,
+    names: &[String],
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+) -> Result<PlannedDownload> {
+    check_cancel(progress)?;
+    if let Some(progress) = progress {
+        progress.begin_download_planning(names.len() as u64);
+    }
+    let remote = api.repo(pinned.clone());
+    let folder = pinned.folder_name();
+    let snapshot = transport.snapshot_dir(&folder, pinned.revision());
+    let filename = primary.strip_prefix(&snapshot).unwrap_or(primary);
+    let base = filename.parent().map(Path::to_owned).unwrap_or_default();
+    let relatives: Vec<_> = names
+        .iter()
+        .map(|name| base.join(name).to_string_lossy().replace('\\', "/"))
+        .collect();
+    let urls: Vec<_> = relatives
+        .iter()
+        .map(|relative| remote.url(relative))
+        .collect();
+    let identities = resolve_file_identities(&urls, token, progress)?;
+    let pending = pending_network_from_identities(transport, pinned, &relatives, &identities);
+    Ok(PlannedDownload {
+        pending,
+        identities,
+    })
+}
+
+#[cfg(test)]
 fn pending_network_bytes(
     api: &Api,
     transport: &Transport,
@@ -745,15 +827,19 @@ fn pending_network_bytes(
     names: &[String],
     token: Option<&str>,
 ) -> Option<PendingNetwork> {
-    let remote = api.repo(pinned.clone());
+    plan_dependency_download(api, transport, pinned, primary, names, token, None)
+        .ok()?
+        .pending
+}
+
+fn pending_network_from_identities(
+    transport: &Transport,
+    pinned: &Repo,
+    relatives: &[String],
+    identities: &[Option<FileIdentity>],
+) -> Option<PendingNetwork> {
     let folder = pinned.folder_name();
     let snapshot = transport.snapshot_dir(&folder, pinned.revision());
-    let base = primary
-        .strip_prefix(&snapshot)
-        .ok()?
-        .parent()
-        .map(Path::to_owned)
-        .unwrap_or_default();
     let mut pending = PendingNetwork {
         total: Some(0),
         bound: 0,
@@ -761,9 +847,11 @@ fn pending_network_bytes(
     // Transfers are keyed by content identity, so several paths that share an
     // ETag are filled by one transfer and counted once.
     let mut contents: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for name in names {
-        let relative = base.join(name).to_string_lossy().replace('\\', "/");
-        let identity = file_identity(&remote.url(&relative), token).ok()?;
+    for (relative, identity) in relatives.iter().zip(identities) {
+        let identity = identity.as_ref()?;
+        if identity.commit_hash() != pinned.revision() {
+            return None;
+        }
         let size = identity.size();
         if snapshot.join(&relative).is_file() {
             continue;
@@ -1360,7 +1448,7 @@ struct HubOrigin {
 }
 
 impl HubOrigin {
-    fn from_reference(reference: &flare_helios::package::cache::SourceRef) -> Result<Self> {
+    fn from_reference(reference: &flare_helios::core::cache::SourceRef) -> Result<Self> {
         let (provider, repository_id, revision, filename, sizes): (
             String,
             String,
@@ -1393,8 +1481,8 @@ impl HubOrigin {
 }
 
 fn entry_origin(
-    store: &flare_helios::package::cache::Root,
-    entry: &flare_helios::package::cache::Entry,
+    store: &flare_helios::core::cache::Root,
+    entry: &flare_helios::core::cache::Entry,
 ) -> Result<Option<HubOrigin>> {
     if let Some(reference) = store.entry_source(entry)? {
         return HubOrigin::from_reference(&reference).map(Some);
@@ -1442,46 +1530,18 @@ fn entry_origin(
     Ok(origin)
 }
 
-pub(crate) fn refresh_model(
-    store: &flare_helios::package::cache::Root,
-    entry: flare_helios::package::cache::Entry,
-    pinned: bool,
-    args: &crate::cli::Run,
-) -> Result<(flare_helios::package::cache::Entry, Option<String>)> {
-    let entry = refresh_model_at(
-        "https://huggingface.co",
-        store,
-        entry,
-        pinned,
-        &args.hub,
-        args.gpus.len().max(1),
-        &args.publisher_keys,
-        args.trust_store.as_deref(),
-        &[],
-    )?;
-    let repository = if pinned || args.hub.offline {
-        None
-    } else {
-        store
-            .entry_source(&entry)?
-            .map(|reference| HubOrigin::from_reference(&reference).map(|origin| origin.repository))
-            .transpose()?
-    };
-    Ok((entry, repository))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn refresh_model_at(
     endpoint: &str,
-    store: &flare_helios::package::cache::Root,
-    entry: flare_helios::package::cache::Entry,
+    store: &flare_helios::core::cache::Root,
+    entry: flare_helios::core::cache::Entry,
     pinned: bool,
     options: &HubOptions,
     gpu_count: usize,
     publisher_keys: &[PathBuf],
     trust_store: Option<&Path>,
-    supplied_profiles: &[flare_helios::runtime_package::Publisher],
-) -> Result<flare_helios::package::cache::Entry> {
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+) -> Result<flare_helios::core::cache::Entry> {
     if pinned {
         if options.revision.is_some() || options.filename.is_some() {
             return Err("a local model version is pinned; use models download to select a Hugging Face revision".into());
@@ -1513,7 +1573,7 @@ fn refresh_model_at(
         }
     }
     let mut requested = options.clone();
-    requested.model_cache = Some(store.path().to_owned());
+    requested.core_cache = Some(store.path().to_owned());
     requested.revision.get_or_insert(origin.revision.clone());
     if requested.filename.is_none() {
         requested.filename = origin.filename.clone();
@@ -1550,7 +1610,7 @@ fn refresh_model_at(
         .with_retries(0)
         .build()?;
     let revision = requested.revision.as_deref().unwrap();
-    eprintln!("Checking model origin: {}@{revision}", origin.repository);
+    log::info!("Checking model origin: {}@{revision}", origin.repository);
     let info = with_transient_retry(|| {
         api.repo(Repo::with_revision(
             origin.repository.clone(),
@@ -1570,7 +1630,7 @@ fn refresh_model_at(
     {
         return Ok(entry);
     }
-    eprintln!("Updating model from {}@{revision}", origin.repository);
+    log::info!("Updating model from {}@{revision}", origin.repository);
     download_for_model_at(
         endpoint,
         &origin.repository,
@@ -1581,6 +1641,7 @@ fn refresh_model_at(
         trust_store,
         supplied_profiles,
         Some(entry.model()),
+        true,
         None,
     )
 }
@@ -1589,15 +1650,15 @@ fn authenticated_source_envelope(
     primary: &Path,
     options: &HubOptions,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<[u8; 32]> {
-    use flare_helios::package::{conversion, reader};
-    use flare_helios::runtime_package::VerifiedPackage;
+    use flare_helios::core::{conversion, reader};
+    use flare_helios::runtime_core::VerifiedCore;
     if conversion::form(primary)
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        return Ok(VerifiedPackage::open(primary, publishers, None)?.envelope_digest());
+        return Ok(VerifiedCore::open(primary, publishers, None)?.envelope_digest());
     }
     let metadata = reader::Metadata::open(primary)?;
     let sizes =
@@ -1612,12 +1673,12 @@ fn authenticated_source_envelope(
     // identity. Opening payload companions here would require materializing the
     // Hub snapshot and duplicate the acquisition's closure work.
     Ok(
-        flare_helios::package::protection::verify(&metadata.envelope, publishers, selection)?
+        flare_helios::core::protection::verify(&metadata.envelope, publishers, selection)?
             .envelope_digest(),
     )
 }
 
-pub(crate) fn remember_download(
+pub fn remember_download(
     root: &Path,
     repository: &str,
     revision: &str,
@@ -1625,10 +1686,10 @@ pub(crate) fn remember_download(
     filename: &str,
     options: &HubOptions,
     gpu_count: usize,
-    entry: &flare_helios::package::cache::Entry,
+    entry: &flare_helios::core::cache::Entry,
     expected_envelope: [u8; 32],
 ) -> Result<()> {
-    let store = flare_helios::package::cache::Root::open(root)?;
+    let store = flare_helios::core::cache::Root::open(root)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
@@ -1666,7 +1727,7 @@ fn offline_entry(
     revision: &str,
     options: &HubOptions,
     gpu_count: usize,
-) -> Result<flare_helios::package::cache::Entry> {
+) -> Result<flare_helios::core::cache::Entry> {
     offline_entry_with_expected(root, repository, revision, options, gpu_count)
         .map(|(entry, _)| entry)
 }
@@ -1683,8 +1744,8 @@ fn offline_entry_with_expected(
     revision: &str,
     options: &HubOptions,
     gpu_count: usize,
-) -> Result<(flare_helios::package::cache::Entry, [u8; 32])> {
-    let store = flare_helios::package::cache::Root::open(root)?;
+) -> Result<(flare_helios::core::cache::Entry, [u8; 32])> {
+    let store = flare_helios::core::cache::Root::open(root)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
@@ -1719,27 +1780,27 @@ fn offline_entry_with_expected(
 }
 
 fn verify_offline_binding(
-    entry: &flare_helios::package::cache::Entry,
+    entry: &flare_helios::core::cache::Entry,
     expected: [u8; 32],
     repository: &str,
     revision: &str,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<()> {
-    use flare_helios::package::{PayloadId, conversion, reader};
-    use flare_helios::runtime_package::VerifiedPackage;
+    use flare_helios::core::{PayloadId, conversion, reader};
+    use flare_helios::runtime_core::VerifiedCore;
     let primary = entry_primary(entry)?;
     let actual = if conversion::form(&primary)
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        VerifiedPackage::open(&primary, publishers, None)?.envelope_digest()
+        VerifiedCore::open(&primary, publishers, None)?.envelope_digest()
     } else {
         let metadata = reader::Metadata::open(&primary)?;
         *PayloadId::of(&metadata.envelope).as_bytes()
     };
     if actual != expected {
         return Err(format!(
-            "cached package for {repository}@{revision} does not match the signed envelope recorded for its source; refresh source online or load cached entry by explicit path"
+            "cached core for {repository}@{revision} does not match the signed envelope recorded for its source; refresh source online or load cached entry by explicit path"
         )
         .into());
     }
@@ -1754,14 +1815,14 @@ fn missing_source(
     root: &Path,
 ) -> String {
     format!(
-        "package {repository}@{revision} (filename: {}, TP: {sizes:?}) is not available in the Flare cache {}; download it online first",
+        "core {repository}@{revision} (filename: {}, TP: {sizes:?}) is not available in the Flare cache {}; download it online first",
         options.filename.as_deref().unwrap_or("automatic"),
         root.display(),
     )
 }
 
 fn enforce_legacy_tensor_parallel(
-    verified: &flare_helios::runtime_package::VerifiedPackage,
+    verified: &flare_helios::runtime_core::VerifiedCore,
     sizes: &[u32],
 ) -> Result<()> {
     let ranks = verified
@@ -1770,7 +1831,7 @@ fn enforce_legacy_tensor_parallel(
         .tensor_parallel;
     if sizes.len() != 1 || sizes[0] != ranks {
         return Err(format!(
-            "legacy package provides exactly tensor-parallel size {ranks}, requested {sizes:?}"
+            "legacy core provides exactly tensor-parallel size {ranks}, requested {sizes:?}"
         )
         .into());
     }
@@ -1778,23 +1839,23 @@ fn enforce_legacy_tensor_parallel(
 }
 
 fn verify_offline_entry(
-    entry: &flare_helios::package::cache::Entry,
+    entry: &flare_helios::core::cache::Entry,
     options: &HubOptions,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<()> {
     use flare_helios::{
-        package::{conversion, reader},
-        runtime_package::VerifiedPackage,
+        core::{conversion, reader},
+        runtime_core::VerifiedCore,
     };
     let primary = entry_primary(entry)?;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
     if conversion::form(&primary)?.is_none() {
-        let verified = VerifiedPackage::open(&primary, publishers, None)?;
+        let verified = VerifiedCore::open(&primary, publishers, None)?;
         // A node-side download with neither an explicit TP request nor a GPU
-        // count does not constrain a legacy package's signed rank topology.
+        // count does not constrain a legacy core's signed rank topology.
         if !options.tensor_parallel.is_empty() || gpu_count > 0 {
             enforce_legacy_tensor_parallel(&verified, &sizes)?;
         }
@@ -1804,14 +1865,14 @@ fn verify_offline_entry(
         let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
         for selection in selections {
-            VerifiedPackage::open_selected(&primary, publishers, selection)?
+            VerifiedCore::open_selected(&primary, publishers, selection)?
                 .verify_stored_data()?;
         }
     }
     Ok(())
 }
 
-fn entry_primary(entry: &flare_helios::package::cache::Entry) -> Result<PathBuf> {
+fn entry_primary(entry: &flare_helios::core::cache::Entry) -> Result<PathBuf> {
     let files = std::fs::read_dir(entry.directory())?
         .map(|file| Ok(file?.file_name().to_string_lossy().into_owned()))
         .collect::<Result<Vec<_>>>()?;
@@ -1821,10 +1882,10 @@ fn entry_primary(entry: &flare_helios::package::cache::Entry) -> Result<PathBuf>
 /// Verify stored signatures and compressed executable bytes, select signed deployments,
 /// and install the ready union as one leased cache entry. No terms acceptance and no
 /// executable decoding happen here; acceptance stays at load time.
-/// Resolve a transport package into a local tree of real files.
+/// Resolve a transport core into a local tree of real files.
 ///
 /// Hub snapshots store each file as a symlink into the shared blob cache. The
-/// package reader opens components with `O_NOFOLLOW`, so acquisition materializes
+/// core reader opens components with `O_NOFOLLOW`, so acquisition materializes
 /// the signed location closure into acquisition staging: canonical targets are
 /// hardlinked (or copied across devices) under the same relative paths, and the
 /// tree is removed after installation. Nothing here is a persistent store.
@@ -1837,7 +1898,7 @@ fn resolve_transport(
     let mut files = vec![
         primary
             .file_name()
-            .ok_or("package primary has no file name")?
+            .ok_or("core primary has no file name")?
             .to_string_lossy()
             .into_owned(),
     ];
@@ -1874,7 +1935,7 @@ fn resolve_transport(
         for name in &files {
             let source = directory.join(name);
             let canonical = std::fs::canonicalize(&source)
-                .map_err(|error| format!("package file is unavailable: {name}: {error}"))?;
+                .map_err(|error| format!("core file is unavailable: {name}: {error}"))?;
             let target = tree.join(name);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1888,7 +1949,7 @@ fn resolve_transport(
         }
         let name = primary
             .strip_prefix(directory)
-            .map_err(|_| "package primary escapes its directory")?;
+            .map_err(|_| "core primary escapes its directory")?;
         Ok(tree.join(name))
     })();
     match result {
@@ -1901,27 +1962,27 @@ fn resolve_transport(
 }
 
 fn legacy_key(repository: &str) -> Result<String> {
-    use flare_helios::package::cache;
+    use flare_helios::core::cache;
     Ok(cache::model_key(repository)?)
 }
 
 enum PayloadAcquisition<'a> {
-    Ready(flare_helios::package::cache::Entry),
+    Ready(flare_helios::core::cache::Entry),
     Planned {
-        plan: flare_helios::package::cache::AcquisitionPlan<'a>,
-        staging: flare_helios::package::cache::Staging,
+        plan: flare_helios::core::cache::AcquisitionPlan<'a>,
+        staging: flare_helios::core::cache::Staging,
     },
 }
 
 fn acquisition_model_key(
-    source: &flare_helios::package::cache::PackageSource<'_>,
+    source: &flare_helios::core::cache::CoreSource<'_>,
     repository: &str,
 ) -> Result<String> {
-    use flare_helios::package::cache;
+    use flare_helios::core::cache;
     match source
         .verified()
         .first()
-        .map(|verified| verified.package().model_identity.clone())
+        .map(|verified| verified.core().model_identity.clone())
     {
         Some(identity) if !identity.is_empty() => {
             Ok(cache::model_key(&identity).map_err(|error| error.to_string())?)
@@ -1931,11 +1992,11 @@ fn acquisition_model_key(
 }
 
 fn signed_hardware(
-    source: &flare_helios::package::cache::PackageSource<'_>,
+    source: &flare_helios::core::cache::CoreSource<'_>,
 ) -> Result<(Option<String>, Vec<u32>)> {
-    use flare_helios::package::naming;
+    use flare_helios::core::naming;
     let mut sizes = std::collections::BTreeSet::new();
-    let mut package_platform: Option<&str> = None;
+    let mut core_platform: Option<&str> = None;
     let mut conventional_platform: Option<&str> = None;
     let mut conventional = true;
     for verified in source.verified() {
@@ -1947,17 +2008,17 @@ fn signed_hardware(
         }
         sizes.insert(deployment.tensor_parallel);
 
-        let signed_platform = verified.package().hardware_identity.as_str();
+        let signed_platform = verified.core().hardware_identity.as_str();
         if naming::PLATFORMS.contains(&signed_platform) {
-            if let Some(previous) = package_platform {
+            if let Some(previous) = core_platform {
                 if previous != signed_platform {
                     return Err(format!(
-                        "selected packages span {previous} and {signed_platform}; names require one device identity"
+                        "selected cores span {previous} and {signed_platform}; names require one device identity"
                     )
                     .into());
                 }
             } else {
-                package_platform = Some(signed_platform);
+                core_platform = Some(signed_platform);
             }
         }
 
@@ -1985,15 +2046,15 @@ fn signed_hardware(
         }
     }
     if sizes.is_empty() {
-        return Err("selected package lacks an authenticated tensor-parallel size".into());
+        return Err("selected core lacks an authenticated tensor-parallel size".into());
     }
     let platform =
-        package_platform.or_else(|| conventional.then_some(conventional_platform).flatten());
+        core_platform.or_else(|| conventional.then_some(conventional_platform).flatten());
     Ok((platform.map(str::to_owned), sizes.into_iter().collect()))
 }
 
 fn acquisition_candidate(platform: Option<&str>, sizes: &[u32]) -> Result<String> {
-    flare_helios::package::naming::deployment_candidate(
+    flare_helios::core::naming::deployment_candidate(
         platform,
         sizes,
         std::time::SystemTime::now(),
@@ -2016,11 +2077,11 @@ fn plan_payload_acquisition<'a>(
     commit: &str,
     filename: &str,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
     model_root: &Path,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<PayloadAcquisition<'a>> {
-    use flare_helios::package::{cache, derivation, reader};
+    use flare_helios::core::{cache, derivation, reader};
 
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
@@ -2032,7 +2093,7 @@ fn plan_payload_acquisition<'a>(
         let metadata = reader::Metadata::open(&resolved)?;
         let selections = crate::cache_support::select_deployments(&metadata, publishers, &sizes)
             .map_err(|error| error.to_string())?;
-        let source = cache::PackageSource::open(&resolved, publishers, selections[0])?
+        let source = cache::CoreSource::open(&resolved, publishers, selections[0])?
             .union(publishers, &selections)?;
         let model_key = acquisition_model_key(&source, repository)?;
         let store = cache::Root::open(model_root)?;
@@ -2078,11 +2139,11 @@ fn plan_payload_acquisition<'a>(
 fn finish_payload_acquisition(
     primary: &Path,
     names: &[String],
-    mut plan: flare_helios::package::cache::AcquisitionPlan<'_>,
-    staging: flare_helios::package::cache::Staging,
+    mut plan: flare_helios::core::cache::AcquisitionPlan<'_>,
+    staging: flare_helios::core::cache::Staging,
     model_root: &Path,
-) -> Result<flare_helios::package::cache::Entry> {
-    use flare_helios::package::cache;
+) -> Result<flare_helios::core::cache::Entry> {
+    use flare_helios::core::cache;
     let (resolved, cleanup) = resolve_transport(primary, names, model_root)?;
     let result = (|| {
         plan.relocate_source(&resolved)?;
@@ -2118,10 +2179,10 @@ fn legacy_warm_entry(
     commit: &str,
     filename: &str,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
     model_root: &Path,
-) -> Result<Option<flare_helios::package::cache::Entry>> {
-    use flare_helios::package::cache;
+) -> Result<Option<flare_helios::core::cache::Entry>> {
+    use flare_helios::core::cache;
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
             .map_err(|error| error.to_string())?;
@@ -2132,16 +2193,16 @@ fn legacy_warm_entry(
         let model_key = legacy_key(repository)?;
         let digest = file_digest(&resolved)?;
 
-        // Preserve existing package-hash legacy entries without fetching companions,
+        // Preserve existing core-hash legacy entries without fetching companions,
         // but apply the same signed closure and TP checks as named source refs.
         let old_id = format!(
             "{}-legacy",
-            flare_helios::package::PayloadId::from_bytes(digest)
+            flare_helios::core::PayloadId::from_bytes(digest)
         );
         if let Ok(entry) = store.entry(&model_key, &old_id) {
             if let Ok(entry_primary) = entry_primary(&entry) {
                 if file_digest(&entry_primary).is_ok_and(|candidate| candidate == digest) {
-                    if let Ok(entry_verified) = flare_helios::runtime_package::VerifiedPackage::open(
+                    if let Ok(entry_verified) = flare_helios::runtime_core::VerifiedCore::open(
                         &entry_primary,
                         publishers,
                         None,
@@ -2184,7 +2245,7 @@ fn legacy_warm_entry(
             if !file_digest(&entry_primary).is_ok_and(|candidate| candidate == digest) {
                 continue;
             }
-            let Ok(entry_verified) = flare_helios::runtime_package::VerifiedPackage::open(
+            let Ok(entry_verified) = flare_helios::runtime_core::VerifiedCore::open(
                 &entry_primary,
                 publishers,
                 None,
@@ -2213,9 +2274,9 @@ fn install_ready(
     options: &HubOptions,
     model_root: &Path,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
-) -> Result<flare_helios::package::cache::Entry> {
-    use flare_helios::package::{cache, conversion};
+    publishers: &[flare_helios::runtime_core::Publisher],
+) -> Result<flare_helios::core::cache::Entry> {
+    use flare_helios::core::{cache, conversion};
 
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
@@ -2246,17 +2307,17 @@ fn install_ready(
         };
     }
 
-    let names = flare_helios::runtime_package::package_companions(path)?;
+    let names = flare_helios::runtime_core::core_companions(path)?;
     let (resolved, cleanup) = resolve_transport(path, &names, model_root)?;
     let install = (|| {
         let verified =
-            flare_helios::runtime_package::VerifiedPackage::open(&resolved, publishers, None)?;
+            flare_helios::runtime_core::VerifiedCore::open(&resolved, publishers, None)?;
         if !options.tensor_parallel.is_empty() || gpu_count > 0 {
             enforce_legacy_tensor_parallel(&verified, &sizes)?;
         }
         let signed = verified.identity().map_err(|error| error.to_string())?;
         let platform =
-            if flare_helios::package::naming::PLATFORMS.contains(&signed.hardware.as_str()) {
+            if flare_helios::core::naming::PLATFORMS.contains(&signed.hardware.as_str()) {
                 Some(signed.hardware.as_str())
             } else {
                 None
@@ -2264,11 +2325,11 @@ fn install_ready(
         let candidate = acquisition_candidate(platform, &[signed.tensor_parallel])?;
         let store = cache::Root::open(model_root).map_err(|error| error.to_string())?;
         let model_key = legacy_key(repository)?;
-        // Existing legacy entries keep their historical package-hash names.
+        // Existing legacy entries keep their historical core-hash names.
         let primary_bytes = std::fs::read(&resolved).map_err(|error| error.to_string())?;
         let old_id = format!(
             "{}-legacy",
-            flare_helios::package::PayloadId::of(&primary_bytes)
+            flare_helios::core::PayloadId::of(&primary_bytes)
         );
         if let Ok(entry) = store.entry(&model_key, &old_id) {
             return Ok(entry);
@@ -2288,7 +2349,7 @@ fn install_ready(
 }
 
 /// The access token named by `--token-file`, for private repositories.
-pub(crate) fn token(options: &HubOptions) -> Result<Option<String>> {
+pub fn token(options: &HubOptions) -> Result<Option<String>> {
     options
         .token_file
         .as_ref()
@@ -2320,8 +2381,9 @@ fn fetch_primary_with_progress(
     repo: &Repo,
     requested: Option<&str>,
     token: Option<&str>,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<(PathBuf, Repo)> {
+    check_cancel(progress)?;
     let info = with_transient_retry(|| api.repo(repo.clone()).info())?;
     if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err("Hugging Face returned an invalid commit ID".into());
@@ -2331,10 +2393,10 @@ fn fetch_primary_with_progress(
         requested,
     )?;
     let pinned = Repo::with_revision(repo.url(), RepoType::Model, info.sha.clone());
-    eprintln!("Resolved package: {}@{} / {filename}", repo.url(), info.sha);
+    log::info!("Resolved core: {}@{} / {filename}", repo.url(), info.sha);
     let recovered = transport.adopt_legacy(&pinned.folder_name());
     if recovered > 0 {
-        eprintln!(
+        log::info!(
             "Recovered {recovered} bytes of interrupted Hugging Face transfers from an older staging tree"
         );
     }
@@ -2355,6 +2417,7 @@ fn fetch_dependency(
     fetch_dependency_with_progress(api, transport, repo, primary, name, None, None)
 }
 
+#[cfg(test)]
 fn fetch_dependency_with_progress(
     api: &Api,
     transport: &Transport,
@@ -2362,32 +2425,46 @@ fn fetch_dependency_with_progress(
     primary: &Path,
     name: &str,
     token: Option<&str>,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<()> {
+    fetch_dependency_with_identity(api, transport, repo, primary, name, token, progress, None)
+}
+
+fn fetch_dependency_with_identity(
+    api: &Api,
+    transport: &Transport,
+    repo: &Repo,
+    primary: &Path,
+    name: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    identity: Option<&FileIdentity>,
+) -> Result<()> {
+    check_cancel(progress)?;
     let filename = primary
         .strip_prefix(transport.snapshot_dir(&repo.folder_name(), repo.revision()))
         .unwrap_or(primary);
     let base = Path::new(filename).parent().unwrap_or(Path::new(""));
     let relative = base.join(name).to_string_lossy().replace('\\', "/");
-    fetch_file_with_progress(api, transport, repo, &relative, token, progress)?;
+    fetch_file_with_identity(api, transport, repo, &relative, token, progress, identity)?;
     Ok(())
 }
 
 /// Files the downloaded primary depends on.
 ///
-/// Payload-format packages name their companions through signed location records,
-/// so only the selected closure is fetched. Legacy packages keep their own
+/// Payload-format cores name their companions through signed location records,
+/// so only the selected closure is fetched. Legacy cores keep their own
 /// companion enumeration.
 fn dependency_files(
     primary: &Path,
     options: &HubOptions,
     gpu_count: usize,
-    publishers: &[flare_helios::runtime_package::Publisher],
+    publishers: &[flare_helios::runtime_core::Publisher],
 ) -> Result<Vec<String>> {
-    use flare_helios::package::{derivation, protection, reader};
+    use flare_helios::core::{derivation, protection, reader};
 
     let Ok(metadata) = reader::Metadata::open(primary) else {
-        return Ok(flare_helios::runtime_package::package_companions(primary)?);
+        return Ok(flare_helios::runtime_core::core_companions(primary)?);
     };
     let sizes =
         crate::cache_support::requested_tensor_parallel(&options.tensor_parallel, gpu_count)
@@ -2410,7 +2487,7 @@ fn dependency_files(
                 .map_err(|error| error.to_string())?,
         );
     }
-    let needed = flare_helios::package::cache::selected_derivation_closure(
+    let needed = flare_helios::core::cache::selected_derivation_closure(
         &metadata,
         &selected,
         &derivation::Limits::default(),
@@ -2440,8 +2517,21 @@ fn fetch_file_with_progress(
     pinned: &Repo,
     filename: &str,
     token: Option<&str>,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<PathBuf> {
+    fetch_file_with_identity(api, transport, pinned, filename, token, progress, None)
+}
+
+fn fetch_file_with_identity(
+    api: &Api,
+    transport: &Transport,
+    pinned: &Repo,
+    filename: &str,
+    token: Option<&str>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
+    identity: Option<&FileIdentity>,
+) -> Result<PathBuf> {
+    check_cancel(progress)?;
     let path = transport
         .snapshot_dir(&pinned.folder_name(), pinned.revision())
         .join(filename);
@@ -2449,7 +2539,17 @@ fn fetch_file_with_progress(
         return Ok(path);
     }
     let remote = api.repo(pinned.clone());
-    let metadata = with_identity_retry(|| file_identity(&remote.url(filename), token))?;
+    let metadata = match identity {
+        Some(identity) => identity.clone(),
+        None => with_identity_retry(|| {
+            if progress.is_some_and(|progress| progress.is_cancelled()) {
+                return Err(IdentityFailure::permanent(
+                    "model acquisition cancelled; partial transport content is retained",
+                ));
+            }
+            file_identity(&remote.url(filename), token)
+        })?,
+    };
     if metadata.commit_hash() != pinned.revision() {
         return Err("Hugging Face returned an invalid file identity".into());
     }
@@ -2474,10 +2574,10 @@ fn fetch_file_with_progress(
                 && !blob_matches(&blob, metadata.size(), digest, progress)?
             {
                 quarantine(&blob)?;
-                eprintln!(
+                log::info!(
                     "Discarded corrupt transport content for {filename}: its bytes do not match the Hub digest"
                 );
-                eprintln!("Downloading model file: {filename}...");
+                log::info!("Downloading model file: {filename}...");
                 transfer_blob(
                     &transport.agent,
                     &transport.part(&folder, &key),
@@ -2489,7 +2589,7 @@ fn fetch_file_with_progress(
                     progress,
                 )?;
             } else {
-                eprintln!("Reusing cached model file: {filename}");
+                log::info!("Reusing cached model file: {filename}");
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2508,7 +2608,7 @@ fn fetch_file_with_progress(
                 _ => false,
             };
             if !adopted {
-                eprintln!("Downloading model file: {filename}...");
+                log::info!("Downloading model file: {filename}...");
                 transfer_blob(
                     &transport.agent,
                     &transport.part(&folder, &key),
@@ -2623,7 +2723,7 @@ impl ReuseHasher {
     }
 }
 
-/// Borrow one complete prepared-package file from the user's Hugging Face cache.
+/// Borrow one complete prepared-core file from the user's Hugging Face cache.
 ///
 /// The cache is a read-only source: this opens the pinned commit's snapshot entry
 /// for reading and never creates, renames, links, locks, or changes permissions
@@ -2640,8 +2740,9 @@ fn adopt_hub_file(
     identity: CachedIdentity,
     key: &str,
     blob: &Path,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<bool> {
+    check_cancel(progress)?;
     let source = hub_cache
         .join(folder)
         .join("snapshots")
@@ -2662,6 +2763,7 @@ fn adopt_hub_file(
     let mut buffer = vec![0u8; TRANSFER_BUFFER];
     let mut written = 0u64;
     loop {
+        check_cancel(progress)?;
         let count = match input.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => count,
@@ -2680,13 +2782,13 @@ fn adopt_hub_file(
         }
     }
     if written != size || !hasher.matches(identity) {
-        eprintln!(
+        log::info!(
             "Ignoring Hugging Face cache file {filename}: it does not match its published identity"
         );
         return Ok(false);
     }
     copy.publish(blob)?;
-    eprintln!("Reusing Hugging Face cache file: {filename}");
+    log::info!("Reusing Hugging Face cache file: {filename}");
     Ok(true)
 }
 
@@ -2758,7 +2860,7 @@ impl Resume {
         path: &Path,
         size: u64,
         verify: bool,
-        progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+        progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -2791,6 +2893,7 @@ impl Resume {
             let mut buffer = vec![0u8; TRANSFER_BUFFER];
             let mut remaining = resume.offset;
             while remaining > 0 {
+                check_cancel(progress)?;
                 let limit = remaining.min(TRANSFER_BUFFER as u64) as usize;
                 let count = resume.file.read(&mut buffer[..limit])?;
                 if count == 0 {
@@ -3026,8 +3129,13 @@ fn attempt_transfer(
     url: &str,
     token: Option<&str>,
     resume: &mut Resume,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> std::result::Result<(), Attempt> {
+    if progress.is_some_and(|progress| progress.is_cancelled()) {
+        return Err(Attempt::Fatal(
+            "model acquisition cancelled; partial transport content is retained".into(),
+        ));
+    }
     let offset = resume.offset;
     let local = |error: String| Attempt::Fatal(format!("cannot write the partial file: {error}"));
     let response = ranged_get(agent, url, token, offset)?;
@@ -3118,6 +3226,12 @@ fn attempt_transfer(
     let mut synced = resume.offset;
     let mut synced_at = std::time::Instant::now();
     loop {
+        if progress.is_some_and(|progress| progress.is_cancelled()) {
+            return Err(Attempt::Fatal(
+                "model acquisition cancelled; partial transport content is retained".into(),
+            ));
+        }
+
         let count = match reader.read(&mut buffer) {
             Ok(count) => count,
             Err(error) => {
@@ -3156,6 +3270,7 @@ fn attempt_transfer(
 }
 
 /// Identity and size the Hub states for one repository file.
+#[derive(Clone, Debug)]
 struct FileIdentity {
     commit: String,
     etag: String,
@@ -3330,7 +3445,7 @@ fn with_identity_retry(
                 if attempt >= TRANSFER_STALLED_ATTEMPTS || !failure.transient {
                     return Err(failure.message.into());
                 }
-                eprintln!(
+                log::info!(
                     "Retrying after a transient Hugging Face error: {}",
                     failure.message
                 );
@@ -3372,7 +3487,7 @@ fn with_transient_retry<T>(
                 if attempt >= TRANSFER_STALLED_ATTEMPTS || !transient_hub_error(&error) {
                     return Err(error.into());
                 }
-                eprintln!("Retrying after a transient Hugging Face error: {error}");
+                log::info!("Retrying after a transient Hugging Face error: {error}");
                 std::thread::sleep(retry_delay(attempt, None));
             }
         }
@@ -3386,7 +3501,7 @@ fn content_failure(error: &str) -> bool {
         "payload digest",
         "does not match its declared identity",
         "differs from its commitment",
-        "package signature verification failed",
+        "core signature verification failed",
     ]
     .iter()
     .any(|phrase| error.contains(phrase))
@@ -3413,13 +3528,15 @@ fn blob_matches(
     blob: &Path,
     size: u64,
     digest: [u8; 32],
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<bool> {
+    check_cancel(progress)?;
     let mut file = std::fs::File::open(blob)?;
     let mut hasher = sha2::Sha256::new();
     let mut buffer = vec![0u8; TRANSFER_BUFFER];
     let mut read = 0u64;
     loop {
+        check_cancel(progress)?;
         let count = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => count,
@@ -3471,13 +3588,13 @@ fn transfer_blob(
     token: Option<&str>,
     filename: &str,
     metadata: &FileIdentity,
-    progress: Option<&flare_helios::package::progress::AcquisitionProgress>,
+    progress: Option<&flare_helios::core::progress::AcquisitionProgress>,
 ) -> Result<()> {
     let size = metadata.size();
     let expected = content_digest(metadata.etag());
     if std::fs::symlink_metadata(part).is_ok_and(|info| info.len() > size) {
         let quarantined = quarantine(part)?;
-        eprintln!(
+        log::info!(
             "Partial for {filename} is larger than its declared {size} bytes; moved it to {}",
             quarantined.display()
         );
@@ -3487,6 +3604,11 @@ fn transfer_blob(
     let mut retried_after_digest = false;
     let mut failure = String::from("no transfer attempted");
     loop {
+        if let Err(error) = check_cancel(progress) {
+            resume.sync()?;
+            return Err(error);
+        }
+
         if resume.offset == resume.size {
             if let Some(expected) = expected {
                 let actual = resume.take_digest();
@@ -3496,19 +3618,19 @@ fn transfer_blob(
                     let quarantined = quarantine(part)?;
                     let actual = actual
                         .map(|digest| {
-                            flare_helios::package::PayloadId::from_bytes(digest).to_string()
+                            flare_helios::core::PayloadId::from_bytes(digest).to_string()
                         })
                         .unwrap_or_else(|| "<unavailable>".into());
                     if retried_after_digest {
                         return Err(format!(
                             "{filename}: content digest {actual} still does not match the Hub ETag {}; kept the quarantined bytes in {}",
-                            flare_helios::package::PayloadId::from_bytes(expected),
+                            flare_helios::core::PayloadId::from_bytes(expected),
                             quarantined.display()
                         )
                         .into());
                     }
                     retried_after_digest = true;
-                    eprintln!(
+                    log::info!(
                         "Downloaded content for {filename} does not match the Hub digest; kept it in {} and retrying the source once",
                         quarantined.display()
                     );
@@ -3526,7 +3648,10 @@ fn transfer_blob(
         let mut retry_after = None;
         match attempt_transfer(agent, url, token, &mut resume, progress) {
             Ok(()) => {}
-            Err(Attempt::Fatal(message)) => return Err(format!("{filename}: {message}").into()),
+            Err(Attempt::Fatal(message)) => {
+                resume.sync()?;
+                return Err(format!("{filename}: {message}").into());
+            }
             Err(Attempt::Retry {
                 message,
                 retry_after: after,
@@ -3544,7 +3669,15 @@ fn transfer_blob(
         if stalled >= TRANSFER_STALLED_ATTEMPTS {
             break;
         }
-        std::thread::sleep(retry_delay(stalled, retry_after));
+        let deadline = std::time::Instant::now() + retry_delay(stalled, retry_after);
+        while std::time::Instant::now() < deadline {
+            check_cancel(progress)?;
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
+        }
     }
     Err(format!(
         "{filename}: download failed after {TRANSFER_STALLED_ATTEMPTS} attempts without progress: {failure}; kept {} of {size} bytes for resume in {}",
@@ -3580,13 +3713,13 @@ fn link_snapshot(snapshot: &Path, filename: &str, blob: &Path) -> Result<()> {
     }
     let parent = path
         .parent()
-        .ok_or("package file has no parent directory")?;
+        .ok_or("core file has no parent directory")?;
     std::fs::create_dir_all(parent)?;
     match std::fs::hard_link(blob, &path) {
         Ok(()) => sync_directory(parent),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(format!(
-            "cannot link cached package file {}: {error}",
+            "cannot link cached core file {}: {error}",
             path.display()
         )
         .into()),
@@ -3594,7 +3727,7 @@ fn link_snapshot(snapshot: &Path, filename: &str, blob: &Path) -> Result<()> {
 }
 
 /// Cached primary inside the Hub snapshot, without any second export tree.
-/// Payload companions are not candidates for the package primary.
+/// Payload companions are not candidates for the core primary.
 fn is_canonical_primary(file: &str) -> bool {
     let segments: Vec<&str> = file.split('/').collect();
     segments.len() == 1 || (segments.len() == 2 && segments[1] == "model.safetensors")
@@ -3612,16 +3745,16 @@ pub(crate) mod tests {
 
     const COMMIT: &str = "0123456789012345678901234567890123456789";
 
-    /// Build a minimal signed payload package plus its trusted public profile.
+    /// Build a minimal signed payload core plus its trusted public profile.
     ///
     /// Used by Orbit's offline success fixture so the node verifies a real
     /// signature and a real payload closure without HOME or embedded profiles.
-    pub(crate) fn signed_payload_fixture(
+    pub fn signed_payload_fixture(
         parent: &std::path::Path,
     ) -> (
         std::path::PathBuf,
         std::path::PathBuf,
-        flare_helios::runtime_package::Publisher,
+        flare_helios::runtime_core::Publisher,
         String,
     ) {
         signed_payload_fixture_with(parent, "gb10-tp1", "sm120")
@@ -3634,7 +3767,7 @@ pub(crate) mod tests {
     ) -> (
         std::path::PathBuf,
         std::path::PathBuf,
-        flare_helios::runtime_package::Publisher,
+        flare_helios::runtime_core::Publisher,
         String,
     ) {
         signed_payload_fixture_identity(parent, deployment_id, hardware_identity, "owner/offline")
@@ -3648,15 +3781,15 @@ pub(crate) mod tests {
     ) -> (
         PathBuf,
         PathBuf,
-        flare_helios::runtime_package::Publisher,
+        flare_helios::runtime_core::Publisher,
         String,
     ) {
-        use flare_helios::package::{PayloadId, container, export, schema::wire};
-        use flare_helios::runtime_package::Publisher;
+        use flare_helios::core::{PayloadId, container, export, schema::wire};
+        use flare_helios::runtime_core::Publisher;
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
-        let package = parent.join("package");
-        std::fs::create_dir_all(&package).unwrap();
+        let core = parent.join("core");
+        std::fs::create_dir_all(&core).unwrap();
         let weights = b"offline orbit weights".repeat(4);
         let id = PayloadId::of(&weights);
         let raw = parent.join("weights.bin");
@@ -3672,7 +3805,7 @@ pub(crate) mod tests {
             public_key,
             development: true,
         };
-        let contract = flare_helios::runtime_package::wire::ServingContract {
+        let contract = flare_helios::runtime_core::wire::ServingContract {
             model_id: "orbit-offline".into(),
             identity: "orbit-offline-sm120".into(),
             max_sequence_tokens: 8,
@@ -3680,9 +3813,9 @@ pub(crate) mod tests {
             pages: 1,
             state_rows: 1,
             page_tokens: 1,
-            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+            model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
                 vocabulary: 8,
-                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                graphs: vec![flare_helios::runtime_core::wire::GraphContract {
                     graph: "decode".into(),
                     ..Default::default()
                 }],
@@ -3721,12 +3854,12 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let request = export::PublishRequest {
-            package: wire::PackageBody {
+            core: wire::CoreBody {
                 model_identity: model.into(),
                 hardware_identity: hardware_identity.into(),
-                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
                 sampling_defaults: Some(
-                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                    flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
                 ),
                 publisher: Some(wire::PublisherMetadata {
                     namespace: "local-development".into(),
@@ -3767,22 +3900,22 @@ pub(crate) mod tests {
                     }],
                 }],
             }],
-            package_id: [23u8; 32],
+            core_id: [23u8; 32],
             public_key,
             accepted: "local-development".into(),
             no_weights: false,
         };
-        export::publish(&request, &key, export::Destination::Directory(&package)).unwrap();
+        export::publish(&request, &key, export::Destination::Directory(&core)).unwrap();
         let profile = parent.join("publisher.json");
         std::fs::write(
             &profile,
             serde_json::to_vec(&vec![publisher.clone()]).unwrap(),
         )
         .unwrap();
-        (package, profile, publisher, COMMIT.to_owned())
+        (core, profile, publisher, COMMIT.to_owned())
     }
 
-    pub(crate) fn fixture(companions: &[&str]) -> Vec<u8> {
+    pub fn fixture(companions: &[&str]) -> Vec<u8> {
         fn bytes(field: u8, body: &[u8]) -> Vec<u8> {
             let mut out = vec![field * 8 + 2];
             let mut n = body.len();
@@ -3822,21 +3955,21 @@ pub(crate) mod tests {
     fn origin_fixture(
         parent: &Path,
     ) -> (
-        flare_helios::package::cache::Root,
-        flare_helios::package::cache::Entry,
-        flare_helios::runtime_package::Publisher,
+        flare_helios::core::cache::Root,
+        flare_helios::core::cache::Entry,
+        flare_helios::runtime_core::Publisher,
         HubOptions,
     ) {
-        let (package, _, publisher, _) = signed_payload_fixture(parent);
+        let (core, _, publisher, _) = signed_payload_fixture(parent);
         let options = HubOptions {
-            model_cache: Some(parent.join("models")),
+            core_cache: Some(parent.join("models")),
             ..Default::default()
         };
-        let store = flare_helios::package::cache::Root::open(options.model_cache.as_ref().unwrap())
+        let store = flare_helios::core::cache::Root::open(options.core_cache.as_ref().unwrap())
             .unwrap();
         let entry = install_ready(
             "publisher/prepared",
-            &package,
+            &core,
             &options,
             store.path(),
             1,
@@ -3844,7 +3977,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let digest =
-            authenticated_source_envelope(&package, &options, 1, std::slice::from_ref(&publisher))
+            authenticated_source_envelope(&core, &options, 1, std::slice::from_ref(&publisher))
                 .unwrap();
         remember_download(
             store.path(),
@@ -3868,7 +4001,7 @@ pub(crate) mod tests {
         let (store, entry, publisher, options) = origin_fixture(temp.path());
         assert_ne!(
             entry.model(),
-            flare_helios::package::cache::model_key("publisher/prepared").unwrap()
+            flare_helios::core::cache::model_key("publisher/prepared").unwrap()
         );
         let original = entry.id().to_owned();
         let (endpoint, worker) = mock_hub(HubRoutes::default().document(
@@ -3957,9 +4090,9 @@ pub(crate) mod tests {
                 origin.expected_envelope,
             )
             .unwrap();
-        let (package, _, updated_publisher, _) =
+        let (core, _, updated_publisher, _) =
             signed_payload_fixture(&temp.path().join("updated"));
-        let routes = package_routes(&package, "publisher/prepared", "gb10");
+        let routes = core_routes(&core, "publisher/prepared", "gb10");
         let (endpoint, worker, _) = mock_hub_counted(routes);
         let selected = refresh_model_at(
             &endpoint,
@@ -4014,13 +4147,13 @@ pub(crate) mod tests {
                     origin.expected_envelope,
                 )
                 .unwrap();
-            let (package, _, other, _) = signed_payload_fixture_identity(
+            let (core, _, other, _) = signed_payload_fixture_identity(
                 &temp.path().join("updated"),
                 "gb10-tp1",
                 "sm120",
                 model,
             );
-            let routes = package_routes(&package, "publisher/prepared", "gb10");
+            let routes = core_routes(&core, "publisher/prepared", "gb10");
             let (endpoint, worker, _) = mock_hub_counted(routes);
             let mut profiles = vec![publisher];
             if trusted {
@@ -4126,7 +4259,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn package_selection_rejects_ambiguous_and_escaping_filenames() {
+    fn core_selection_rejects_ambiguous_and_escaping_filenames() {
         assert_eq!(
             choose_file(["README.md".into(), "model.safetensors".into()], None).unwrap(),
             "model.safetensors"
@@ -4599,7 +4732,7 @@ pub(crate) mod tests {
         (endpoint, worker, log)
     }
 
-    fn package_files(root: &Path) -> Vec<String> {
+    fn core_files(root: &Path) -> Vec<String> {
         fn walk(root: &Path, directory: &Path, files: &mut Vec<String>) {
             for entry in std::fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
@@ -4622,9 +4755,9 @@ pub(crate) mod tests {
         files
     }
 
-    fn package_routes(root: &Path, repository: &str, revision: &str) -> HubRoutes {
+    fn core_routes(root: &Path, repository: &str, revision: &str) -> HubRoutes {
         use sha2::{Digest, Sha256};
-        let files = package_files(root);
+        let files = core_files(root);
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         let mut routes = HubRoutes::default().document(
             format!("/api/models/{repository}/revision/{revision}"),
@@ -4642,13 +4775,13 @@ pub(crate) mod tests {
     }
 
     fn counted_download(
-        package: &Path,
+        core: &Path,
         repository: &str,
         revision: &str,
         options: &HubOptions,
-        publisher: &flare_helios::runtime_package::Publisher,
+        publisher: &flare_helios::runtime_core::Publisher,
     ) -> (TransferLog, String) {
-        let routes = package_routes(package, repository, revision);
+        let routes = core_routes(core, repository, revision);
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let entry = download_with_token_at(
             &endpoint,
@@ -4684,9 +4817,9 @@ pub(crate) mod tests {
         endpoint: &str,
         repository: &str,
         options: &HubOptions,
-        publisher: &flare_helios::runtime_package::Publisher,
+        publisher: &flare_helios::runtime_core::Publisher,
         log: &std::sync::Arc<std::sync::Mutex<TransferLog>>,
-    ) -> (flare_helios::package::cache::Entry, TransferLog) {
+    ) -> (flare_helios::core::cache::Entry, TransferLog) {
         let entry = download_with_token_at(
             endpoint,
             &format!("{repository}@gb10"),
@@ -4716,11 +4849,11 @@ pub(crate) mod tests {
 
     fn rewrite_payload_primary(
         directory: &Path,
-        locations: Vec<flare_helios::package::schema::wire::PayloadLocation>,
-        derivations: Option<&flare_helios::package::schema::wire::DerivationSet>,
+        locations: Vec<flare_helios::core::schema::wire::PayloadLocation>,
+        derivations: Option<&flare_helios::core::schema::wire::DerivationSet>,
         tensors: &[(&str, &[u8])],
     ) {
-        use flare_helios::package::{container, reader, schema::wire};
+        use flare_helios::core::{container, reader, schema::wire};
         use prost::Message;
         let metadata = reader::Metadata::open(directory).unwrap();
         let manifest = metadata.primary().tensor(reader::MANIFEST).unwrap();
@@ -4795,14 +4928,28 @@ pub(crate) mod tests {
         }
         writer.finish().unwrap();
         output.sync_all().unwrap();
+        drop(output);
+        drop(metadata);
+        #[cfg(unix)]
         std::fs::rename(temporary, path).unwrap();
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            let readonly = permissions.readonly();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            crate::windows::replace(&temporary, &path).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
     }
 
     fn location_bytes(
         directory: &Path,
-        location: &flare_helios::package::schema::wire::PayloadLocation,
+        location: &flare_helios::core::schema::wire::PayloadLocation,
     ) -> Vec<u8> {
-        use flare_helios::package::container;
+        use flare_helios::core::container;
         let container = if location.file.is_empty() {
             container::Container::open(&directory.join("model.safetensors")).unwrap()
         } else {
@@ -4826,36 +4973,37 @@ pub(crate) mod tests {
     fn warm_download_ignores_malformed_optional_hints_without_dependency_transfer() {
         for variant in ["malformed", "overlimit"] {
             let temp = tempfile::tempdir().unwrap();
-            let (package, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
-            let metadata = flare_helios::package::reader::Metadata::open(&package).unwrap();
+            let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+            let metadata = flare_helios::core::reader::Metadata::open(&core).unwrap();
             let locations = metadata.locations.locations.clone();
+            drop(metadata);
             let hints = if variant == "malformed" {
-                flare_helios::package::schema::wire::DerivationSet {
-                    version: flare_helios::package::derivation::DERIVATION_VERSION + 1,
+                flare_helios::core::schema::wire::DerivationSet {
+                    version: flare_helios::core::derivation::DERIVATION_VERSION + 1,
                     derivations: Vec::new(),
                 }
             } else {
                 let count =
-                    flare_helios::package::derivation::Limits::default().max_derivations + 1;
-                flare_helios::package::schema::wire::DerivationSet {
-                    version: flare_helios::package::derivation::DERIVATION_VERSION,
+                    flare_helios::core::derivation::Limits::default().max_derivations + 1;
+                flare_helios::core::schema::wire::DerivationSet {
+                    version: flare_helios::core::derivation::DERIVATION_VERSION,
                     derivations: (0..count)
-                        .map(|_| flare_helios::package::schema::wire::Derivation {
+                        .map(|_| flare_helios::core::schema::wire::Derivation {
                             target_payload_id: Vec::new(),
                             operations: Vec::new(),
                         })
                         .collect(),
                 }
             };
-            rewrite_payload_primary(&package, locations, Some(&hints), &[]);
+            rewrite_payload_primary(&core, locations, Some(&hints), &[]);
             let model_root = temp.path().join("models");
             let options = HubOptions {
                 revision: Some("gb10".into()),
                 tensor_parallel: vec![1],
-                model_cache: Some(model_root.clone()),
+                core_cache: Some(model_root.clone()),
                 ..Default::default()
             };
-            let routes = package_routes(&package, "owner/offline", "gb10");
+            let routes = core_routes(&core, "owner/offline", "gb10");
             let (endpoint, worker, log) = mock_hub_counted(routes);
             let (cold_entry, cold) =
                 counted_download_entry(&endpoint, "owner/offline", &options, &publisher, &log);
@@ -4864,7 +5012,7 @@ pub(crate) mod tests {
             let blobs = blob_count(&model_root);
             drop(cold_entry);
 
-            let routes = package_routes(&package, "owner/offline", "gb10");
+            let routes = core_routes(&core, "owner/offline", "gb10");
             let (endpoint, worker, log) = mock_hub_counted(routes);
             let (warm_entry, warm) =
                 counted_download_entry(&endpoint, "owner/offline", &options, &publisher, &log);
@@ -4880,9 +5028,9 @@ pub(crate) mod tests {
                 blobs,
                 "{variant}: optional hints caused materialization"
             );
-            let key = flare_helios::package::cache::model_key("owner/offline").unwrap();
+            let key = flare_helios::core::cache::model_key("owner/offline").unwrap();
             assert_eq!(
-                flare_helios::package::cache::Root::open(&model_root)
+                flare_helios::core::cache::Root::open(&model_root)
                     .unwrap()
                     .ref_entry(&key)
                     .unwrap()
@@ -4898,24 +5046,24 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_resolution_rejects_corrupt_embedded_payload_before_default_update() {
-        let (_source_scratch, primary, publishers) = selected_tp_package();
+        let (_source_scratch, primary, publishers) = selected_tp_core();
         let source_root = primary.parent().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("tp1".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
-        let routes = package_routes(source_root, "sel/model", "tp1");
+        let routes = core_routes(source_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (entry, _) =
             counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
         let selected = entry.id().to_owned();
         worker.join().unwrap();
 
-        let locations = flare_helios::package::reader::Metadata::open(entry.directory())
+        let locations = flare_helios::core::reader::Metadata::open(entry.directory())
             .unwrap()
             .locations
             .locations;
@@ -4951,9 +5099,9 @@ pub(crate) mod tests {
                 || error.to_string().contains("verification"),
             "unexpected offline failure: {error}"
         );
-        let key = flare_helios::package::cache::model_key("sel").unwrap();
+        let key = flare_helios::core::cache::model_key("sel").unwrap();
         assert_eq!(
-            flare_helios::package::cache::Root::open(&model_root)
+            flare_helios::core::cache::Root::open(&model_root)
                 .unwrap()
                 .ref_entry(&key)
                 .unwrap()
@@ -4965,25 +5113,25 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_source_ref_rejects_a_different_valid_envelope_without_mutation() {
-        let (_source_scratch, primary, publishers) = selected_tp_package();
-        let (_other_scratch, other_primary, other_publishers) = selected_tp_package();
+        let (_source_scratch, primary, publishers) = selected_tp_core();
+        let (_other_scratch, other_primary, other_publishers) = selected_tp_core();
         let source_root = primary.parent().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("tp1".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
-        let routes = package_routes(source_root, "sel/model", "tp1");
+        let routes = core_routes(source_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (entry, _) =
             counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
         let selected = entry.id().to_owned();
         worker.join().unwrap();
         let ref_selector = source_selector("sel/model", "tp1", None, &[]);
-        let expected = flare_helios::package::cache::Root::open(&model_root)
+        let expected = flare_helios::core::cache::Root::open(&model_root)
             .unwrap()
             .read_source_ref(&ref_selector)
             .unwrap()
@@ -5023,8 +5171,8 @@ pub(crate) mod tests {
                 .contains("does not match the signed envelope recorded for its source"),
             "unexpected offline failure: {error}"
         );
-        let key = flare_helios::package::cache::model_key("sel").unwrap();
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let key = flare_helios::core::cache::model_key("sel").unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(selected.as_str()),
@@ -5045,12 +5193,12 @@ pub(crate) mod tests {
         root: &Path,
         repository: &str,
         revision: &str,
-        entry: &flare_helios::package::cache::Entry,
+        entry: &flare_helios::core::cache::Entry,
     ) -> PathBuf {
         let selector = source_selector(repository, revision, None, &[]);
         let path = root
             .join("sources")
-            .join(flare_helios::package::PayloadId::of(selector.as_bytes()).to_string());
+            .join(flare_helios::core::PayloadId::of(selector.as_bytes()).to_string());
         std::fs::write(
             &path,
             serde_json::to_vec(&(selector, revision, entry.model(), entry.id())).unwrap(),
@@ -5061,17 +5209,17 @@ pub(crate) mod tests {
 
     #[test]
     fn legacy_unbound_source_ref_fails_offline_and_refreshes_online_without_dependencies() {
-        let (_source_scratch, primary, publishers) = selected_tp_package();
+        let (_source_scratch, primary, publishers) = selected_tp_core();
         let source_root = primary.parent().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("tp1".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
-        let routes = package_routes(source_root, "sel/model", "tp1");
+        let routes = core_routes(source_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (entry, _) =
             counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
@@ -5100,13 +5248,13 @@ pub(crate) mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains(
-                "refresh source online or load cached entry by explicit path"
-            ),
+            error
+                .to_string()
+                .contains("refresh source online or load cached entry by explicit path"),
             "unexpected offline failure: {error}"
         );
-        let key = flare_helios::package::cache::model_key("sel").unwrap();
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let key = flare_helios::core::cache::model_key("sel").unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(selected.as_str()),
@@ -5124,7 +5272,7 @@ pub(crate) mod tests {
 
         // Online resolution reuses the existing entry and writes a bound source
         // record without fetching dependency payloads.
-        let routes = package_routes(source_root, "sel/model", "tp1");
+        let routes = core_routes(source_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (refreshed, warm) =
             counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
@@ -5160,8 +5308,8 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_binding_keeps_the_selected_ref_across_a_concurrent_update() {
-        let (_first_scratch, first_primary, first_publishers) = selected_tp_package();
-        let (_second_scratch, second_primary, second_publishers) = selected_tp_package();
+        let (_first_scratch, first_primary, first_publishers) = selected_tp_core();
+        let (_second_scratch, second_primary, second_publishers) = selected_tp_core();
         let first_root = first_primary.parent().unwrap();
         let second_root = second_primary.parent().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -5169,16 +5317,16 @@ pub(crate) mod tests {
         let first_options = HubOptions {
             revision: Some("tp1".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let second_options = HubOptions {
             revision: Some("tp1".into()),
             tensor_parallel: vec![2],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
-        let routes = package_routes(first_root, "sel/model", "tp1");
+        let routes = core_routes(first_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (first, _) = counted_download_entry(
             &endpoint,
@@ -5198,7 +5346,7 @@ pub(crate) mod tests {
         assert_eq!(leased.id(), first_id);
         drop(first);
 
-        let routes = package_routes(second_root, "sel/model", "tp1");
+        let routes = core_routes(second_root, "sel/model", "tp1");
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let (second, _) = counted_download_entry(
             &endpoint,
@@ -5212,7 +5360,7 @@ pub(crate) mod tests {
         worker.join().unwrap();
         drop(second);
 
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         let unqualified = source_selector("sel/model", "tp1", None, &[]);
         assert_eq!(
             store
@@ -5242,7 +5390,7 @@ pub(crate) mod tests {
         )
         .expect("exact TP1 source binding must survive a concurrent unqualified update");
         assert_eq!(selected.id(), first_id);
-        let key = flare_helios::package::cache::model_key("sel").unwrap();
+        let key = flare_helios::core::cache::model_key("sel").unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(first_id.as_str())
@@ -5251,15 +5399,15 @@ pub(crate) mod tests {
 
     #[test]
     fn warm_download_repairs_corrupt_entry_from_signed_source() {
-        let (_scratch, primary, publishers) = selected_tp_package();
+        let (_scratch, primary, publishers) = selected_tp_core();
         let source_root = primary.parent().unwrap();
-        let source_metadata = flare_helios::package::reader::Metadata::open(&primary).unwrap();
+        let source_metadata = flare_helios::core::reader::Metadata::open(&primary).unwrap();
         let source_envelope = source_metadata.envelope.clone();
         let source_primary = std::fs::read(&primary).unwrap();
         let other = tempfile::tempdir().unwrap();
-        let (other_package, _, _, _) = signed_payload_fixture(other.path());
-        let other_primary = other_package.join("model.safetensors");
-        let key = flare_helios::package::cache::model_key("sel").unwrap();
+        let (other_core, _, _, _) = signed_payload_fixture(other.path());
+        let other_primary = other_core.join("model.safetensors");
+        let key = flare_helios::core::cache::model_key("sel").unwrap();
 
         for tamper in ["embedded", "tensor", "envelope"] {
             let temp = tempfile::tempdir().unwrap();
@@ -5267,10 +5415,10 @@ pub(crate) mod tests {
             let options = HubOptions {
                 revision: Some("tp1".into()),
                 tensor_parallel: vec![1],
-                model_cache: Some(model_root.clone()),
+                core_cache: Some(model_root.clone()),
                 ..Default::default()
             };
-            let routes = package_routes(source_root, "sel/model", "tp1");
+            let routes = core_routes(source_root, "sel/model", "tp1");
             let (endpoint, worker, log) = mock_hub_counted(routes);
             let (first, cold) =
                 counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
@@ -5281,7 +5429,7 @@ pub(crate) mod tests {
 
             match tamper {
                 "embedded" => {
-                    let locations = flare_helios::package::reader::Metadata::open(&entry_directory)
+                    let locations = flare_helios::core::reader::Metadata::open(&entry_directory)
                         .unwrap()
                         .locations
                         .locations;
@@ -5293,10 +5441,10 @@ pub(crate) mod tests {
                     );
                 }
                 "tensor" => {
-                    let source = flare_helios::package::cache::PackageSource::open(
+                    let source = flare_helios::core::cache::CoreSource::open(
                         &primary,
                         std::slice::from_ref(&publishers[0]),
-                        flare_helios::package::protection::Selection::Deployment {
+                        flare_helios::core::protection::Selection::Deployment {
                             deployment: 0,
                             rank: None,
                         },
@@ -5306,11 +5454,11 @@ pub(crate) mod tests {
                         .verified()
                         .iter()
                         .flat_map(|verified| {
-                            flare_helios::package::reader::required_payloads(verified).unwrap()
+                            flare_helios::core::reader::required_payloads(verified).unwrap()
                         })
                         .collect();
                     let mut locations =
-                        flare_helios::package::reader::Metadata::open(&entry_directory)
+                        flare_helios::core::reader::Metadata::open(&entry_directory)
                             .unwrap()
                             .locations
                             .locations;
@@ -5331,7 +5479,7 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
 
-            let routes = package_routes(source_root, "sel/model", "tp1");
+            let routes = core_routes(source_root, "sel/model", "tp1");
             let (endpoint, worker, log) = mock_hub_counted(routes);
             let (repaired, warm) =
                 counted_download_entry(&endpoint, "sel/model", &options, &publishers[0], &log);
@@ -5341,14 +5489,14 @@ pub(crate) mod tests {
                 "{tamper}: corrupt entry was returned"
             );
             assert_eq!(
-                flare_helios::package::reader::Metadata::open(repaired.directory())
+                flare_helios::core::reader::Metadata::open(repaired.directory())
                     .unwrap()
                     .envelope,
                 source_envelope,
                 "{tamper}: repaired entry changed signed semantics"
             );
             assert_eq!(
-                flare_helios::package::cache::Root::open(&model_root)
+                flare_helios::core::cache::Root::open(&model_root)
                     .unwrap()
                     .ref_entry(&key)
                     .unwrap()
@@ -5357,7 +5505,7 @@ pub(crate) mod tests {
                 "{tamper}: repaired entry was not selected"
             );
             let entry_metadata =
-                flare_helios::package::reader::Metadata::open(repaired.directory()).unwrap();
+                flare_helios::core::reader::Metadata::open(repaired.directory()).unwrap();
             for location in &entry_metadata.locations.locations {
                 let Some(source_location) = source_metadata
                     .locations
@@ -5371,7 +5519,7 @@ pub(crate) mod tests {
                     location_bytes(repaired.directory(), location),
                     location_bytes(source_root, source_location),
                     "{tamper}: payload {} changed",
-                    flare_helios::package::PayloadId::from_bytes(
+                    flare_helios::core::PayloadId::from_bytes(
                         location.payload_id.as_slice().try_into().unwrap(),
                     )
                 );
@@ -5445,7 +5593,7 @@ pub(crate) mod tests {
 
     #[test]
     fn transport_resumes_an_interrupted_body_from_the_received_offset() {
-        use flare_helios::package::progress::AcquisitionProgress;
+        use flare_helios::core::progress::AcquisitionProgress;
         let body: Vec<u8> = (0..64u8).collect();
         let etag = sha256_hex(&body);
         let key = blob_key(&etag).unwrap();
@@ -5477,7 +5625,7 @@ pub(crate) mod tests {
 
     #[test]
     fn transport_resumes_across_invocations_without_recounting_the_prefix() {
-        use flare_helios::package::progress::AcquisitionProgress;
+        use flare_helios::core::progress::AcquisitionProgress;
         let body: Vec<u8> = (0..64u8).collect();
         let etag = sha256_hex(&body);
         let key = blob_key(&etag).unwrap();
@@ -6475,13 +6623,13 @@ pub(crate) mod tests {
         assert!(acquisition_candidate(Some("gb202"), &[0]).is_err());
     }
 
-    fn inverse_tp_package(
+    fn inverse_tp_core(
         directory: &Path,
         canonical: &[u8],
         derived: &[u8],
-    ) -> flare_helios::runtime_package::Publisher {
-        use flare_helios::package::{PayloadId, conversion, derivation, export, schema::wire};
-        use flare_helios::runtime_package::Publisher;
+    ) -> flare_helios::runtime_core::Publisher {
+        use flare_helios::core::{PayloadId, conversion, derivation, export, schema::wire};
+        use flare_helios::runtime_core::Publisher;
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
         std::fs::create_dir_all(directory).unwrap();
@@ -6520,7 +6668,7 @@ pub(crate) mod tests {
                     nbytes: 32,
                     alignment: 4096,
                     address: Some(0x1000_0000),
-                    memory: flare_helios::runtime_package::wire::Memory::Device as i32,
+                    memory: flare_helios::runtime_core::wire::Memory::Device as i32,
                     ..Default::default()
                 }],
                 initializers: vec![wire::Initializer {
@@ -6553,8 +6701,8 @@ pub(crate) mod tests {
         let canonical_id = PayloadId::of(canonical);
         let derived_id = PayloadId::of(derived);
         let request = export::PublishRequest {
-            package: wire::PackageBody {
-                package_id: vec![19; 32],
+            core: wire::CoreBody {
+                core_id: vec![19; 32],
                 model_identity: "inverse/tp".into(),
                 hardware_identity: "sm120".into(),
                 publisher: Some(wire::PublisherMetadata {
@@ -6624,7 +6772,7 @@ pub(crate) mod tests {
                     payloads: vec![],
                 },
             ],
-            package_id: [19; 32],
+            core_id: [19; 32],
             public_key: publisher.public_key,
             accepted: publisher.namespace.clone(),
             no_weights: false,
@@ -6661,25 +6809,25 @@ pub(crate) mod tests {
     #[test]
     fn tp2_target_cache_recovers_tp1_over_http_without_canonical_transfer() {
         let temp = tempfile::tempdir().unwrap();
-        let package = temp.path().join("package");
+        let core = temp.path().join("core");
         let canonical: Vec<u8> = (0..16).collect();
         let mut derived = canonical[8..16].to_vec();
         derived.extend_from_slice(&canonical[..8]);
-        let publisher = inverse_tp_package(&package, &canonical, &derived);
+        let publisher = inverse_tp_core(&core, &canonical, &derived);
         let model_root = temp.path().join("models");
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
-        let derived_id = flare_helios::package::PayloadId::of(&derived);
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
+        let derived_id = flare_helios::core::PayloadId::of(&derived);
         store
             .insert_payload(derived_id, derived.len() as u64, derived.as_slice())
             .unwrap();
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (log, entry_id) =
-            counted_download(&package, "inverse/tp", "gb10", &options, &publisher);
+            counted_download(&core, "inverse/tp", "gb10", &options, &publisher);
         assert!(entry_id.starts_with("gb10-tp1-"), "{entry_id}");
         assert!(
             !log.files
@@ -6698,33 +6846,33 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires FLARE_LEGACY_FIXTURE with model.safetensors and publisher.json"]
     fn legacy_fixture_cold_and_warm_use_friendly_names_and_default() {
-        let package = PathBuf::from(
+        let core = PathBuf::from(
             std::env::var_os("FLARE_LEGACY_FIXTURE")
-                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy package directory"),
+                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy core directory"),
         );
-        let profile = package.join("publisher.json");
+        let profile = core.join("publisher.json");
         assert!(
-            package.join("model.safetensors").is_file(),
+            core.join("model.safetensors").is_file(),
             "legacy fixture lacks model.safetensors: {}",
-            package.display()
+            core.display()
         );
         assert!(
             profile.is_file(),
             "legacy fixture lacks publisher.json: {}",
-            package.display()
+            core.display()
         );
-        let publishers: Vec<flare_helios::runtime_package::Publisher> =
+        let publishers: Vec<flare_helios::runtime_core::Publisher> =
             serde_json::from_slice(&std::fs::read(profile).unwrap()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("custom-branch".into()),
             tensor_parallel: vec![2],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (cold, cold_id) = counted_download(
-            &package,
+            &core,
             "legacy/cluster",
             "custom-branch",
             &options,
@@ -6741,7 +6889,7 @@ pub(crate) mod tests {
         );
 
         let (warm, warm_id) = counted_download(
-            &package,
+            &core,
             "legacy/cluster",
             "custom-branch",
             &options,
@@ -6755,8 +6903,8 @@ pub(crate) mod tests {
             !warm.files.keys().any(|path| path.contains("model-data-")),
             "warm legacy download transferred companions: {warm:?}"
         );
-        let key = flare_helios::package::cache::model_key("legacy/cluster").unwrap();
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let key = flare_helios::core::cache::model_key("legacy/cluster").unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(warm_id.as_str()),
@@ -6767,22 +6915,22 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires FLARE_LEGACY_FIXTURE with model.safetensors and publisher.json"]
     fn legacy_historical_hash_warm_validates_signed_tp() {
-        let package = PathBuf::from(
+        let core = PathBuf::from(
             std::env::var_os("FLARE_LEGACY_FIXTURE")
-                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy package directory"),
+                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy core directory"),
         );
-        let primary = package.join("model.safetensors");
-        let publishers: Vec<flare_helios::runtime_package::Publisher> =
-            serde_json::from_slice(&std::fs::read(package.join("publisher.json")).unwrap())
+        let primary = core.join("model.safetensors");
+        let publishers: Vec<flare_helios::runtime_core::Publisher> =
+            serde_json::from_slice(&std::fs::read(core.join("publisher.json")).unwrap())
                 .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
-        let key = flare_helios::package::cache::model_key("legacy/cluster").unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
+        let key = flare_helios::core::cache::model_key("legacy/cluster").unwrap();
         let primary_bytes = std::fs::read(&primary).unwrap();
         let old_id = format!(
             "{}-legacy",
-            flare_helios::package::PayloadId::of(&primary_bytes)
+            flare_helios::core::PayloadId::of(&primary_bytes)
         );
         store.import_legacy_staged(&primary, &key, &old_id).unwrap();
 
@@ -6832,30 +6980,30 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires FLARE_LEGACY_FIXTURE with model.safetensors and publisher.json"]
     fn legacy_warm_rejects_mismatched_explicit_tp_without_default_change() {
-        let package = PathBuf::from(
+        let core = PathBuf::from(
             std::env::var_os("FLARE_LEGACY_FIXTURE")
-                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy package directory"),
+                .expect("FLARE_LEGACY_FIXTURE must name a signed legacy core directory"),
         );
-        let profile = package.join("publisher.json");
-        let publishers: Vec<flare_helios::runtime_package::Publisher> =
+        let profile = core.join("publisher.json");
+        let publishers: Vec<flare_helios::runtime_core::Publisher> =
             serde_json::from_slice(&std::fs::read(profile).unwrap()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("custom-branch".into()),
             tensor_parallel: vec![2],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (_log, entry_id) = counted_download(
-            &package,
+            &core,
             "legacy/cluster",
             "custom-branch",
             &options,
             &publishers[0],
         );
-        let key = flare_helios::package::cache::model_key("legacy/cluster").unwrap();
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let key = flare_helios::core::cache::model_key("legacy/cluster").unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(entry_id.as_str())
@@ -6864,7 +7012,7 @@ pub(crate) mod tests {
         let mut wrong = options.clone();
         wrong.tensor_parallel = vec![1, 2];
         let warm = legacy_warm_entry(
-            &package.join("model.safetensors"),
+            &core.join("model.safetensors"),
             &wrong,
             "legacy/cluster",
             "custom-branch",
@@ -6882,7 +7030,7 @@ pub(crate) mod tests {
         assert!(
             install_ready(
                 "legacy/cluster",
-                &package.join("model.safetensors"),
+                &core.join("model.safetensors"),
                 &wrong,
                 &model_root,
                 1,
@@ -6901,16 +7049,16 @@ pub(crate) mod tests {
     #[test]
     fn custom_revision_uses_signed_device_identity() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("custom-branch".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (_log, entry_id) = counted_download(
-            &package,
+            &core,
             "owner/offline",
             "custom-branch",
             &options,
@@ -6923,19 +7071,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn signed_custom_cluster_id_uses_package_hardware_identity() {
+    fn signed_custom_cluster_id_uses_core_hardware_identity() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _commit) =
+        let (core, _profile, publisher, _commit) =
             signed_payload_fixture_with(temp.path(), "cluster-west", "gb10");
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("custom-branch".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (_log, entry_id) = counted_download(
-            &package,
+            &core,
             "owner/offline",
             "custom-branch",
             &options,
@@ -6948,22 +7096,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn old_sm_only_package_gets_unknown_device_label() {
+    fn old_sm_only_core_gets_unknown_device_label() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _commit) =
+        let (core, _profile, publisher, _commit) =
             signed_payload_fixture_with(temp.path(), "sm120-tp1", "sm120");
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("gb202".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (_log, entry_id) =
-            counted_download(&package, "owner/offline", "gb202", &options, &publisher);
+            counted_download(&core, "owner/offline", "gb202", &options, &publisher);
         assert!(
             entry_id.starts_with("unknown-device-tp1-"),
-            "old SM-only package must get an explicit unknown-device label, got {entry_id}"
+            "old SM-only core must get an explicit unknown-device label, got {entry_id}"
         );
         assert!(!entry_id.contains("sm120"), "{entry_id}");
         assert!(!entry_id.starts_with("gb202"), "{entry_id}");
@@ -6972,16 +7120,16 @@ pub(crate) mod tests {
     #[test]
     fn cold_and_warm_downloads_report_actual_transfers() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let (cold, cold_id) =
-            counted_download(&package, "owner/offline", "gb10", &options, &publisher);
+            counted_download(&core, "owner/offline", "gb10", &options, &publisher);
         assert!(
             cold.files
                 .keys()
@@ -6992,17 +7140,17 @@ pub(crate) mod tests {
         assert!(cold_id.starts_with("gb10-tp1-"), "{cold_id}");
         assert!(
             !cold_id.chars().all(|c| c.is_ascii_hexdigit()),
-            "entry name must not be a package hash: {cold_id}"
+            "entry name must not be a core hash: {cold_id}"
         );
         let selector = source_selector("owner/offline", "gb10", Some("model.safetensors"), &[1]);
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert!(
             store.read_source_ref(&selector).unwrap().is_some(),
             "cold download did not record its source selector"
         );
 
         let (warm, warm_id) =
-            counted_download(&package, "owner/offline", "gb10", &options, &publisher);
+            counted_download(&core, "owner/offline", "gb10", &options, &publisher);
         assert_eq!(
             warm_id, cold_id,
             "warm download did not reuse the ready entry"
@@ -7015,7 +7163,7 @@ pub(crate) mod tests {
             !warm.files.keys().any(|name| name.contains("deployments/")),
             "warm download transferred executables {warm:?}"
         );
-        let key = flare_helios::package::cache::model_key("owner/offline").unwrap();
+        let key = flare_helios::core::cache::model_key("owner/offline").unwrap();
         assert_eq!(
             store.ref_entry(&key).unwrap().as_deref(),
             Some(warm_id.as_str()),
@@ -7083,19 +7231,19 @@ pub(crate) mod tests {
 
     /// Two deployments with derivations; a selecting TP1 must fetch only TP1's
     /// dependency source, never the unselected TP2 source or embedded frontend.
-    fn selected_tp_package() -> (
+    fn selected_tp_core() -> (
         tempfile::TempDir,
         std::path::PathBuf,
-        Vec<flare_helios::runtime_package::Publisher>,
+        Vec<flare_helios::runtime_core::Publisher>,
     ) {
-        use flare_helios::package::{
+        use flare_helios::core::{
             PayloadId, container, conversion, derivation, export, schema::wire,
         };
-        use flare_helios::runtime_package::Publisher;
+        use flare_helios::runtime_core::Publisher;
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
         let scratch = tempfile::tempdir().unwrap();
-        let directory = scratch.path().join("package");
+        let directory = scratch.path().join("core");
         std::fs::create_dir_all(&directory).unwrap();
         let s1 = b"tp1 canonical source".to_vec();
         let t1 = s1[..s1.len() - 3].to_vec();
@@ -7139,7 +7287,7 @@ pub(crate) mod tests {
                 id,
             }
         };
-        let contract = |id: &str| flare_helios::runtime_package::wire::ServingContract {
+        let contract = |id: &str| flare_helios::runtime_core::wire::ServingContract {
             model_id: "sel".into(),
             identity: format!("sel-{id}"),
             max_sequence_tokens: 8,
@@ -7147,9 +7295,9 @@ pub(crate) mod tests {
             pages: 1,
             state_rows: 1,
             page_tokens: 1,
-            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+            model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
                 vocabulary: 8,
-                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                graphs: vec![flare_helios::runtime_core::wire::GraphContract {
                     graph: "decode".into(),
                     ..Default::default()
                 }],
@@ -7188,12 +7336,12 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let request = export::PublishRequest {
-            package: wire::PackageBody {
+            core: wire::CoreBody {
                 model_identity: "sel".into(),
                 hardware_identity: "sm120".into(),
-                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
                 sampling_defaults: Some(
-                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                    flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
                 ),
                 publisher: Some(wire::PublisherMetadata {
                     namespace: "sel".into(),
@@ -7210,7 +7358,7 @@ pub(crate) mod tests {
                         }),
                         role: wire::PayloadRole::Frontend as i32,
                     }),
-                    sha256: flare_helios::package::protection::sha256(&tokenizer).to_vec(),
+                    sha256: flare_helios::core::protection::sha256(&tokenizer).to_vec(),
                 }],
                 ..Default::default()
             },
@@ -7310,7 +7458,7 @@ pub(crate) mod tests {
                     ],
                 },
             ],
-            package_id: [43u8; 32],
+            core_id: [43u8; 32],
             public_key,
             accepted: "sel".into(),
             no_weights: false,
@@ -7345,7 +7493,7 @@ pub(crate) mod tests {
 
     #[test]
     fn selected_tp_fetches_only_its_own_dependency_companions() {
-        let (_scratch, primary, publishers) = selected_tp_package();
+        let (_scratch, primary, publishers) = selected_tp_core();
         let options = HubOptions {
             tensor_parallel: vec![1],
             ..Default::default()
@@ -7368,8 +7516,8 @@ pub(crate) mod tests {
 
     #[test]
     fn payload_download_fetches_only_the_selected_closure_over_http() {
-        use flare_helios::package::{PayloadId, container, export, reader, schema::wire};
-        use flare_helios::runtime_package::Publisher;
+        use flare_helios::core::{PayloadId, container, export, reader, schema::wire};
+        use flare_helios::runtime_core::Publisher;
         use ring::signature::{Ed25519KeyPair, KeyPair};
 
         let temp = tempfile::tempdir().unwrap();
@@ -7390,7 +7538,7 @@ pub(crate) mod tests {
             public_key,
             development: false,
         };
-        let runtime = flare_helios::runtime_package::wire::ServingContract {
+        let runtime = flare_helios::runtime_core::wire::ServingContract {
             model_id: "closure".into(),
             identity: "closure-sm120".into(),
             max_sequence_tokens: 8,
@@ -7398,9 +7546,9 @@ pub(crate) mod tests {
             pages: 1,
             state_rows: 1,
             page_tokens: 1,
-            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+            model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
                 vocabulary: 8,
-                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                graphs: vec![flare_helios::runtime_core::wire::GraphContract {
                     graph: "decode".into(),
                     ..Default::default()
                 }],
@@ -7439,12 +7587,12 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let request = export::PublishRequest {
-            package: wire::PackageBody {
+            core: wire::CoreBody {
                 model_identity: "owner/closure".into(),
                 hardware_identity: "sm120".into(),
-                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
                 sampling_defaults: Some(
-                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                    flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
                 ),
                 publisher: Some(wire::PublisherMetadata {
                     namespace: "test".into(),
@@ -7469,7 +7617,7 @@ pub(crate) mod tests {
                         role: wire::PayloadRole::Weights,
                         relative: "weights/layer-000.safetensors".into(),
                         tensor: Some(container::COMPANION_TENSOR.into()),
-                        source: flare_helios::package::container::Slice::new(
+                        source: flare_helios::core::container::Slice::new(
                             std::sync::Arc::new(std::fs::File::open(&raw).unwrap()),
                             0,
                             (weights.len() as u64) as u64,
@@ -7484,7 +7632,7 @@ pub(crate) mod tests {
                     }],
                 }],
             }],
-            package_id: [17u8; 32],
+            core_id: [17u8; 32],
             public_key,
             accepted: "test".into(),
             no_weights: false,
@@ -7597,11 +7745,13 @@ pub(crate) mod tests {
             expected_envelope,
         )
         .unwrap();
-        std::fs::remove_dir_all(transport.root()).unwrap();
+        let removed_transport = transport.root().to_owned();
+        drop(transport);
+        std::fs::remove_dir_all(&removed_transport).unwrap();
         let offline = HubOptions {
             offline: true,
             revision: Some("gb202".into()),
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             token_file: Some(temp.path().join("nonexistent-token")),
             ..options.clone()
         };
@@ -7618,7 +7768,8 @@ pub(crate) mod tests {
                 assert!(verify_offline_entry(&hit, &requested, 1, &[]).is_err());
             }
         }
-        assert!(!transport.root().join("flare-packages").exists());
+        // Legacy transport-local trees must not be recreated by offline resolution.
+        assert!(!removed_transport.as_path().join("flare-packages").exists());
         let wrong_file = HubOptions {
             filename: Some("other.safetensors".into()),
             ..offline.clone()
@@ -7642,7 +7793,7 @@ pub(crate) mod tests {
         std::fs::write(&payload, corrupted).unwrap();
         assert!(verify_offline_entry(&entry, &offline, 1, &[publisher]).is_err());
 
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert!(store.evict(entry.model(), entry.id()).is_err());
         let (model, id) = (entry.model().to_owned(), entry.id().to_owned());
         drop(entry);
@@ -7694,9 +7845,9 @@ pub(crate) mod tests {
     #[test]
     fn requested_rank_count_mismatch_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
-        let verified = flare_helios::runtime_package::VerifiedPackage::open(
-            &package,
+        let (core, _profile, publisher, _commit) = signed_payload_fixture(temp.path());
+        let verified = flare_helios::runtime_core::VerifiedCore::open(
+            &core,
             std::slice::from_ref(&publisher),
             None,
         )
@@ -7719,7 +7870,7 @@ pub(crate) mod tests {
         revision: &str,
         etag: impl Fn(&[u8]) -> String,
     ) -> HubRoutes {
-        let files = package_files(root);
+        let files = core_files(root);
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         let mut routes = HubRoutes::default().document(
             format!("/api/models/{repository}/revision/{revision}"),
@@ -7759,12 +7910,12 @@ pub(crate) mod tests {
     }
 
     /// Lay out the repository cache the Hugging Face library builds for one commit.
-    fn write_hub_cache(root: &Path, folder: &str, commit: &str, package: &Path) -> PathBuf {
+    fn write_hub_cache(root: &Path, folder: &str, commit: &str, core: &Path) -> PathBuf {
         let blobs = root.join(folder).join("blobs");
         let snapshot = root.join(folder).join("snapshots").join(commit);
         std::fs::create_dir_all(&blobs).unwrap();
-        for file in package_files(package) {
-            let body = std::fs::read(package.join(&file)).unwrap();
+        for file in core_files(core) {
+            let body = std::fs::read(core.join(&file)).unwrap();
             let digest = format!("{:x}", sha2::Sha256::digest(&body));
             std::fs::write(blobs.join(&digest), &body).unwrap();
             let entry = snapshot.join(&file);
@@ -7808,14 +7959,14 @@ pub(crate) mod tests {
 
     /// Fetch one repository through a transport that may borrow from `hub_cache`.
     fn fetch_with_hub_cache(
-        package: &Path,
+        core: &Path,
         repository: &str,
         hub_cache: PathBuf,
         routes: HubRoutes,
     ) -> (PathBuf, Transport, Option<usize>) {
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let api = transport_api(endpoint);
-        let transport = Transport::open(package.parent().unwrap(), None, "http://mock")
+        let transport = Transport::open(core.parent().unwrap(), None, "http://mock")
             .unwrap()
             .with_hub_cache(Some(hub_cache));
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
@@ -7828,21 +7979,21 @@ pub(crate) mod tests {
     #[test]
     fn complete_hugging_face_cache_files_are_reused_without_a_transfer() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
         let cached = tree_contents(&hub_cache);
-        let routes = routes_with(&package, repository, COMMIT, sha256_etag);
+        let routes = routes_with(&core, repository, COMMIT, sha256_etag);
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let api = transport_api(endpoint);
         let transport = Transport::open(temp.path(), None, "http://mock")
@@ -7880,21 +8031,21 @@ pub(crate) mod tests {
     #[test]
     fn unprefixed_lfs_identity_reuses_a_hugging_face_cache_file() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
         let cached = tree_contents(&hub_cache);
-        let routes = routes_with(&package, repository, COMMIT, lfs_etag);
+        let routes = routes_with(&core, repository, COMMIT, lfs_etag);
         let (primary, transport, bytes) =
-            fetch_with_hub_cache(&package, repository, hub_cache.clone(), routes);
+            fetch_with_hub_cache(&core, repository, hub_cache.clone(), routes);
         assert_eq!(bytes, Some(0), "an LFS ETag states the file's SHA-256");
         assert!(transport.root().is_dir());
         assert_eq!(
             std::fs::read(&primary).unwrap(),
-            std::fs::read(package.join("model.safetensors")).unwrap()
+            std::fs::read(core.join("model.safetensors")).unwrap()
         );
         assert_eq!(
             tree_contents(&hub_cache),
@@ -7906,20 +8057,20 @@ pub(crate) mod tests {
     #[test]
     fn git_blob_identity_reuses_a_hugging_face_cache_file() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
         let cached = tree_contents(&hub_cache);
-        let routes = routes_with(&package, repository, COMMIT, git_blob_etag);
+        let routes = routes_with(&core, repository, COMMIT, git_blob_etag);
         let (primary, _transport, bytes) =
-            fetch_with_hub_cache(&package, repository, hub_cache.clone(), routes);
+            fetch_with_hub_cache(&core, repository, hub_cache.clone(), routes);
         assert_eq!(bytes, Some(0), "a Git blob identity is verifiable");
         assert_eq!(
             std::fs::read(&primary).unwrap(),
-            std::fs::read(package.join("model.safetensors")).unwrap()
+            std::fs::read(core.join("model.safetensors")).unwrap()
         );
         assert_eq!(tree_contents(&hub_cache), cached);
     }
@@ -7927,12 +8078,12 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_hugging_face_cache_file_is_ignored_and_downloaded() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
         let primary_entry = hub_cache
             .join(repo.folder_name())
             .join("snapshots")
@@ -7943,16 +8094,16 @@ pub(crate) mod tests {
         bytes[last] ^= 0xff;
         std::fs::write(&primary_entry, &bytes).unwrap();
         let cached = tree_contents(&hub_cache);
-        let routes = routes_with(&package, repository, COMMIT, lfs_etag);
+        let routes = routes_with(&core, repository, COMMIT, lfs_etag);
         let (primary, _transport, transferred) =
-            fetch_with_hub_cache(&package, repository, hub_cache.clone(), routes);
+            fetch_with_hub_cache(&core, repository, hub_cache.clone(), routes);
         assert!(
             transferred.unwrap_or_default() > 0,
             "a file that fails its stated identity must be downloaded"
         );
         assert_eq!(
             std::fs::read(&primary).unwrap(),
-            std::fs::read(package.join("model.safetensors")).unwrap(),
+            std::fs::read(core.join("model.safetensors")).unwrap(),
             "the transport copy must hold the downloaded, verified bytes"
         );
         assert_eq!(
@@ -7980,24 +8131,24 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_reused_content_with_a_stated_digest_is_quarantined_and_refetched() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, _) = signed_payload_fixture(temp.path());
         let model_root = temp.path().join("models");
         let downloads = temp.path().join("downloads");
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
-        let routes = routes_with(&package, "owner/model", "gb10", sha256_etag);
+        let routes = routes_with(&core, "owner/model", "gb10", sha256_etag);
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let folder =
             Repo::with_revision("owner/model".into(), RepoType::Model, "gb10".into()).folder_name();
         let scope = Transport::scope_for(&endpoint, &folder);
         let root = Transport::path(&model_root, Some(&downloads));
         // A size-correct but corrupt copy of the primary is already in the transport.
-        let good = std::fs::read(package.join("model.safetensors")).unwrap();
+        let good = std::fs::read(core.join("model.safetensors")).unwrap();
         let mut corrupt = good.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
@@ -8030,7 +8181,7 @@ pub(crate) mod tests {
         assert_eq!(quarantined.len(), 1, "the suspect bytes are preserved");
         assert_eq!(std::fs::read(quarantined[0].path()).unwrap(), corrupt);
         let primary = entry_primary(&entry).unwrap();
-        let verified = flare_helios::runtime_package::VerifiedPackage::open(
+        let verified = flare_helios::runtime_core::VerifiedCore::open(
             &primary,
             std::slice::from_ref(&publisher),
             None,
@@ -8042,8 +8193,8 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_opaque_reuse_is_preserved_and_reported_not_silently_retried() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(temp.path());
-        let names = package_files(&package);
+        let (core, _profile, publisher, _) = signed_payload_fixture(temp.path());
+        let names = core_files(&core);
         let companion = names
             .iter()
             .find(|name| name.as_str() != "model.safetensors")
@@ -8054,18 +8205,18 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
         // Bare 64-hex ETags are opaque for mandatory verification.
-        let routes = routes_with(&package, "owner/model", "gb10", lfs_etag);
+        let routes = routes_with(&core, "owner/model", "gb10", lfs_etag);
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let folder =
             Repo::with_revision("owner/model".into(), RepoType::Model, "gb10".into()).folder_name();
         let scope = Transport::scope_for(&endpoint, &folder);
         let root = Transport::path(&model_root, Some(&downloads));
-        let good = std::fs::read(package.join(&companion)).unwrap();
+        let good = std::fs::read(core.join(&companion)).unwrap();
         let mut corrupt = good.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
@@ -8113,17 +8264,17 @@ pub(crate) mod tests {
     #[test]
     fn opaque_file_identity_does_not_reuse_a_hugging_face_cache_file() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
-        let routes = routes_with(&package, repository, COMMIT, |_| {
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
+        let routes = routes_with(&core, repository, COMMIT, |_| {
             "opaquetag0123456789abcdef012345".into()
         });
         let (_primary, _transport, transferred) =
-            fetch_with_hub_cache(&package, repository, hub_cache, routes);
+            fetch_with_hub_cache(&core, repository, hub_cache, routes);
         assert!(
             transferred.unwrap_or_default() > 0,
             "an opaque ETag certifies no digest, so the file must be downloaded"
@@ -8133,55 +8284,24 @@ pub(crate) mod tests {
     #[test]
     fn configured_acquisition_reuses_a_matching_bare_lfs_cache_file_without_a_transfer() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let model_root = temp.path().join("models");
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &package);
+        write_hub_cache(&hub_cache, &repo.folder_name(), COMMIT, &core);
         let cached = tree_contents(&hub_cache);
 
-        // Options come from an explicitly selected configuration file, exactly as
-        // `flare --config PATH download` builds them. The default configuration
-        // location is elsewhere, so any reload of it would lose the hub cache and
-        // transfer the files again.
-        let config_path = temp.path().join("explicit.toml");
-        std::fs::write(
-            &config_path,
-            format!("[paths]\nhub_cache = '{}'\n", hub_cache.display()),
-        )
-        .unwrap();
-        use clap::{CommandFactory, FromArgMatches};
-        let matches = crate::cli::Cli::command()
-            .try_get_matches_from([
-                "flare",
-                "--config",
-                config_path.to_str().unwrap(),
-                "download",
-                "owner/offline@gb10",
-                "--revision",
-                "gb10",
-                "--gpus",
-                "1",
-                "--model-cache",
-                model_root.to_str().unwrap(),
-            ])
-            .unwrap();
-        let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        crate::config::Configuration::load(&config_path, true)
-            .unwrap()
-            .apply(&mut parsed, &matches, temp.path())
-            .unwrap();
-        let options = match parsed.command {
-            crate::cli::Command::Download(args) => args.hub,
-            _ => panic!("download command"),
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            core_cache: Some(model_root.clone()),
+            hub_cache: Some(hub_cache.clone()),
+            ..Default::default()
         };
-        assert_eq!(options.hub_cache.as_deref(), Some(hub_cache.as_path()));
-        assert_eq!(options.model_cache.as_deref(), Some(model_root.as_path()));
 
         // The acquisition resolves the requested branch, then fetches the commit.
-        let routes = routes_with(&package, repository, "gb10", lfs_etag);
+        let routes = routes_with(&core, repository, "gb10", lfs_etag);
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let entry = download_for_model_at(
             &endpoint,
@@ -8193,6 +8313,7 @@ pub(crate) mod tests {
             None,
             std::slice::from_ref(&publisher),
             None,
+            true,
             None,
         )
         .unwrap();
@@ -8211,19 +8332,247 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn download_planning_bounds_parallel_probes_and_honors_cancellation() {
+        use flare_helios::core::progress::AcquisitionProgress;
+        for cancel in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let progress = AcquisitionProgress::new();
+            let count = METADATA_WORKERS * 2 + 1;
+            progress.begin_download_planning(count as u64);
+            let urls: Vec<_> = (0..count)
+                .map(|index| format!("{endpoint}/{index}"))
+                .collect();
+            let observation = progress.clone();
+            let server = thread::spawn(move || {
+                let mut served = 0;
+                while served < count {
+                    let batch = (count - served).min(METADATA_WORKERS);
+                    let mut sockets = Vec::new();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while sockets.len() < batch {
+                        match listener.accept() {
+                            Ok((socket, _)) => sockets.push(socket),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "probes were serialized"
+                                );
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                    // With every worker blocked awaiting its response, a ninth
+                    // connection would demonstrate that the bound was exceeded.
+                    for _ in 0..20 {
+                        assert_eq!(
+                            listener.accept().unwrap_err().kind(),
+                            std::io::ErrorKind::WouldBlock
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    if cancel {
+                        assert_eq!(observation.snapshot().planning_completed, 0);
+                        observation.request_cancel();
+                    }
+                    for mut socket in sockets {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut reader = BufReader::new(&mut socket);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" {
+                                break;
+                            }
+                            assert!(!line.is_empty());
+                        }
+                        write!(socket, "HTTP/1.1 206 Partial Content\r\nx-repo-commit: {COMMIT}\r\netag: identity\r\nContent-Range: bytes 0-0/10\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx").unwrap();
+                        served += 1;
+                    }
+                    if cancel {
+                        thread::sleep(Duration::from_millis(30));
+                        assert_eq!(
+                            listener.accept().unwrap_err().kind(),
+                            std::io::ErrorKind::WouldBlock
+                        );
+                        break;
+                    }
+                }
+                served
+            });
+            let result = resolve_file_identities(&urls, None, Some(&progress));
+            let served = server.join().unwrap();
+            let snapshot = progress.snapshot();
+            assert_eq!(snapshot.planning_total, Some(count as u64));
+            assert_eq!(snapshot.network_total, None);
+            assert_eq!(snapshot.planning_completed, served as u64);
+            if cancel {
+                assert!(result.unwrap_err().to_string().contains("cancelled"));
+                assert_eq!(served, METADATA_WORKERS);
+            } else {
+                let identities = result.unwrap();
+                assert_eq!(identities.len(), count);
+                assert!(identities.iter().all(Option::is_some));
+                assert_eq!(served, count);
+            }
+        }
+    }
+
+    #[test]
+    fn download_planning_probe_failure_leaves_total_unknown_and_transfer_retries_identity() {
+        use flare_helios::core::progress::AcquisitionProgress;
+        let body = b"companion content";
+        let routes = HubRoutes::default().file(
+            format!("/owner/retry/resolve/{COMMIT}/weights.bin"),
+            MockFile::new(&sha256_hex(body), body.as_slice())
+                .identity_faults([MockFault::MetadataStatus(503)]),
+        );
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let api = transport_api(endpoint);
+        let (_temp, transport) = transport_fixture();
+        let repo = retry_repo();
+        let primary = transport
+            .snapshot_dir(&retry_folder(), COMMIT)
+            .join("model.safetensors");
+        let progress = AcquisitionProgress::new();
+        let planned = plan_dependency_download(
+            &api,
+            &transport,
+            &repo,
+            &primary,
+            &["weights.bin".into()],
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+        assert!(planned.pending.is_none());
+        assert!(planned.identities[0].is_none());
+        assert_eq!(progress.snapshot().network_total, None);
+        assert_eq!(progress.snapshot().planning_completed, 1);
+        fetch_dependency_with_identity(
+            &api,
+            &transport,
+            &repo,
+            &primary,
+            "weights.bin",
+            None,
+            Some(&progress),
+            planned.identities[0].as_ref(),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            std::fs::read(primary.parent().unwrap().join("weights.bin")).unwrap(),
+            body
+        );
+        assert_eq!(progress.snapshot().network_bytes, body.len() as u64);
+        let log = log.lock().unwrap();
+        assert_eq!(log.metadata_requests, 2);
+        assert_eq!(log.bytes, body.len());
+    }
+
+    #[test]
+    fn download_planning_reuses_identities_and_counts_resumed_shared_content_once() {
+        use flare_helios::core::progress::AcquisitionProgress;
+        let shared = b"0123456789";
+        let unique = b"abcdefghijklmnopqrst";
+        let names = vec!["first.bin".into(), "alias.bin".into(), "other.bin".into()];
+        let mut routes = HubRoutes::default();
+        for (name, body) in [
+            ("first.bin", shared.as_slice()),
+            ("alias.bin", shared.as_slice()),
+            ("other.bin", unique.as_slice()),
+        ] {
+            routes = routes.file(
+                format!("/owner/retry/resolve/{COMMIT}/{name}"),
+                MockFile::new(&sha256_hex(body), body)
+                    .identity_faults([MockFault::Status(200), MockFault::MetadataStatus(401)]),
+            );
+        }
+        let (endpoint, worker, log) = mock_hub_counted(routes);
+        let api = transport_api(endpoint);
+        let (_temp, transport) = transport_fixture();
+        let repo = retry_repo();
+        seed_part(
+            &transport,
+            &retry_folder(),
+            &blob_key(&sha256_hex(shared)).unwrap(),
+            &shared[..3],
+        );
+        let primary = transport
+            .snapshot_dir(&retry_folder(), COMMIT)
+            .join("model.safetensors");
+        let progress = AcquisitionProgress::new();
+        progress.record_network_bytes(17);
+        let planned = plan_dependency_download(
+            &api,
+            &transport,
+            &repo,
+            &primary,
+            &names,
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+        let pending = planned.pending.unwrap();
+        assert_eq!(pending.total, Some(27));
+        assert_eq!(pending.bound, 27);
+        progress.record_network_total(Some(17 + pending.total.unwrap()));
+        progress.set_phase(AcquisitionPhase::Downloading);
+        for (index, name) in names.iter().enumerate() {
+            fetch_dependency_with_identity(
+                &api,
+                &transport,
+                &repo,
+                &primary,
+                name,
+                None,
+                Some(&progress),
+                planned.identities[index].as_ref(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(primary.parent().unwrap().join(name)).unwrap(),
+                if index < 2 {
+                    shared.as_slice()
+                } else {
+                    unique.as_slice()
+                }
+            );
+        }
+        worker.join().unwrap();
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.network_bytes, 44);
+        assert_eq!(snapshot.network_total, Some(44));
+        assert_eq!(snapshot.planning_completed, 3);
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.metadata_requests, 3,
+            "transfer must reuse the planning identities"
+        );
+        assert_eq!(log.bytes, 27);
+        assert_eq!(log.files.len(), 2);
+    }
+
+    #[test]
     fn pending_network_bytes_excludes_saved_prefixes_and_cached_files() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let folder = repo.folder_name();
         // The helper meters every named file, so the primary participates here as
         // the treating-cache wiring itself would see it.
-        let names = package_files(&package);
+        let names = core_files(&core);
         assert!(names.len() >= 3, "fixture files: {names:?}");
         assert!(names.iter().any(|name| name == "model.safetensors"));
-        let routes = routes_with(&package, repository, COMMIT, lfs_etag);
+        let routes = routes_with(&core, repository, COMMIT, lfs_etag);
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let api = transport_api(endpoint);
         let hub_cache = temp.path().join("hf");
@@ -8237,7 +8586,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(complete_path.parent().unwrap()).unwrap();
         std::fs::write(
             &complete_path,
-            std::fs::read(package.join(&complete)).unwrap(),
+            std::fs::read(core.join(&complete)).unwrap(),
         )
         .unwrap();
 
@@ -8247,7 +8596,7 @@ pub(crate) mod tests {
             .find(|name| name.as_str() != complete)
             .unwrap()
             .clone();
-        let resumed_body = std::fs::read(package.join(&resumed)).unwrap();
+        let resumed_body = std::fs::read(core.join(&resumed)).unwrap();
         let half = (resumed_body.len() / 2) as u64;
         let key = blob_key(&lfs_etag(&resumed_body)).unwrap();
         let part = transport.part(&folder, &key);
@@ -8262,7 +8611,7 @@ pub(crate) mod tests {
         let other = names
             .iter()
             .find(|name| name.as_str() != complete && **name != resumed)
-            .map(|name| std::fs::metadata(package.join(name)).unwrap().len())
+            .map(|name| std::fs::metadata(core.join(name)).unwrap().len())
             .unwrap();
         let missing = resumed_body.len() as u64 - half + other;
         let pending =
@@ -8282,7 +8631,7 @@ pub(crate) mod tests {
             .find(|name| name.as_str() != complete && **name != resumed)
             .unwrap()
             .clone();
-        let cached_body = std::fs::read(package.join(&cached)).unwrap();
+        let cached_body = std::fs::read(core.join(&cached)).unwrap();
         let cached_path = hub_cache
             .join(&folder)
             .join("snapshots")
@@ -8306,14 +8655,14 @@ pub(crate) mod tests {
     #[test]
     fn opaque_identity_still_counts_a_saved_resume_prefix() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let folder = repo.folder_name();
         // Distinct opaque ETags: content addressing keys every file separately.
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let routes = routes_with(&package, repository, COMMIT, |_| {
+        let routes = routes_with(&core, repository, COMMIT, |_| {
             format!(
                 "opaque-{}",
                 next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -8322,9 +8671,9 @@ pub(crate) mod tests {
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let api = transport_api(endpoint);
         let transport = Transport::open(temp.path(), None, "http://mock").unwrap();
-        let names = package_files(&package);
+        let names = core_files(&core);
         let resumed = names[0].clone();
-        let body = std::fs::read(package.join(&resumed)).unwrap();
+        let body = std::fs::read(core.join(&resumed)).unwrap();
         let half = (body.len() / 2) as u64;
         let key = blob_key("opaque-0").unwrap();
         let part = transport.part(&folder, &key);
@@ -8338,7 +8687,7 @@ pub(crate) mod tests {
         worker.join().unwrap();
         let other: u64 = names[1..]
             .iter()
-            .map(|name| std::fs::metadata(package.join(name)).unwrap().len())
+            .map(|name| std::fs::metadata(core.join(name)).unwrap().len())
             .sum();
         assert_eq!(
             pending.total,
@@ -8397,18 +8746,18 @@ pub(crate) mod tests {
     #[test]
     fn pending_network_bytes_reports_unknown_for_an_unverified_sha256_blob() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let folder = repo.folder_name();
-        let routes = routes_with(&package, repository, COMMIT, sha256_etag);
+        let routes = routes_with(&core, repository, COMMIT, sha256_etag);
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let api = transport_api(endpoint);
         let transport = Transport::open(temp.path(), None, "http://mock").unwrap();
-        let names = package_files(&package);
+        let names = core_files(&core);
         let cached = names[0].clone();
-        let body = std::fs::read(package.join(&cached)).unwrap();
+        let body = std::fs::read(core.join(&cached)).unwrap();
         let key = blob_key(&sha256_etag(&body)).unwrap();
         let blob = transport.blob(&folder, &key);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -8425,7 +8774,7 @@ pub(crate) mod tests {
         );
         let rest: u64 = names[1..]
             .iter()
-            .map(|name| std::fs::metadata(package.join(name)).unwrap().len())
+            .map(|name| std::fs::metadata(core.join(name)).unwrap().len())
             .sum();
         assert_eq!(
             pending.bound,
@@ -8437,17 +8786,17 @@ pub(crate) mod tests {
     #[test]
     fn pending_network_bytes_counts_a_shared_identity_once() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, _publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, _publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
-        let mut names = package_files(&package);
+        let mut names = core_files(&core);
         // Two paths that the Hub serves with identical bytes: one content
         // identity, one transfer.
         let shared = names[0].clone();
         let other = names[1].clone();
-        let shared_body = std::fs::read(package.join(&shared)).unwrap();
-        let mut routes = routes_with(&package, repository, COMMIT, lfs_etag);
+        let shared_body = std::fs::read(core.join(&shared)).unwrap();
+        let mut routes = routes_with(&core, repository, COMMIT, lfs_etag);
         routes = routes.file(
             format!("/{repository}/resolve/{COMMIT}/{other}"),
             MockFile::new(&lfs_etag(&shared_body), shared_body.clone()),
@@ -8473,18 +8822,18 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_transport_blob_progress_stays_unknown_then_downloads() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let folder = repo.folder_name();
-        let routes = routes_with(&package, repository, "gb10", sha256_etag);
+        let routes = routes_with(&core, repository, "gb10", sha256_etag);
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let model_root = temp.path().join("models");
         let cache_dir = temp.path().join("downloads");
         let transport = Transport::open(&model_root, Some(&cache_dir), "http://mock").unwrap();
         // A same-sized corrupt blob: only digest validation can reject it.
-        let primary_body = std::fs::read(package.join("model.safetensors")).unwrap();
+        let primary_body = std::fs::read(core.join("model.safetensors")).unwrap();
         let key = blob_key(&sha256_etag(&primary_body)).unwrap();
         let blob = transport.blob(&folder, &key);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -8513,11 +8862,11 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(cache_dir.clone()),
             ..Default::default()
         };
-        let counters = flare_helios::package::progress::AcquisitionProgress::new();
+        let counters = flare_helios::core::progress::AcquisitionProgress::new();
         let entry = download_with_token_at(
             &endpoint,
             "owner/offline@gb10",
@@ -8533,13 +8882,13 @@ pub(crate) mod tests {
         worker.join().unwrap();
         assert!(entry.directory().join("model.safetensors").is_file());
         let snapshot = counters.snapshot();
-        let declared: u64 = package_files(&package)
+        let declared: u64 = core_files(&core)
             .iter()
-            .map(|name| std::fs::metadata(package.join(name)).unwrap().len())
+            .map(|name| std::fs::metadata(core.join(name)).unwrap().len())
             .sum();
         assert_eq!(
             snapshot.network_bytes, declared,
-            "the corrupt blob is refetched with the rest of the package"
+            "the corrupt blob is refetched with the rest of the core"
         );
         assert!(!log.lock().unwrap().files.is_empty());
         assert_eq!(
@@ -8552,13 +8901,13 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_hugging_face_cache_progress_stays_unknown_then_downloads() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (core, _profile, publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let repository = "owner/offline";
         let repo = Repo::with_revision(repository.into(), RepoType::Model, COMMIT.into());
         let folder = repo.folder_name();
         let hub_cache = temp.path().join("hf");
-        write_hub_cache(&hub_cache, &folder, COMMIT, &package);
+        write_hub_cache(&hub_cache, &folder, COMMIT, &core);
         let cached = hub_cache
             .join(&folder)
             .join("snapshots")
@@ -8568,7 +8917,7 @@ pub(crate) mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         std::fs::write(&cached, &bytes).unwrap();
-        let routes = routes_with(&package, repository, "gb10", lfs_etag);
+        let routes = routes_with(&core, repository, "gb10", lfs_etag);
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let model_root = temp.path().join("models");
         let cache_dir = temp.path().join("downloads");
@@ -8597,12 +8946,12 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(cache_dir.clone()),
             hub_cache: Some(hub_cache.clone()),
             ..Default::default()
         };
-        let counters = flare_helios::package::progress::AcquisitionProgress::new();
+        let counters = flare_helios::core::progress::AcquisitionProgress::new();
         let entry = download_with_token_at(
             &endpoint,
             "owner/offline@gb10",
@@ -8618,7 +8967,7 @@ pub(crate) mod tests {
         worker.join().unwrap();
         assert!(entry.directory().join("model.safetensors").is_file());
         let snapshot = counters.snapshot();
-        let corrupt_size = std::fs::metadata(package.join("model.safetensors"))
+        let corrupt_size = std::fs::metadata(core.join("model.safetensors"))
             .unwrap()
             .len();
         assert_eq!(
@@ -8635,13 +8984,13 @@ pub(crate) mod tests {
     #[test]
     fn offline_download_never_consults_the_hugging_face_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let (_package, _profile, publisher, _revision) =
-            signed_payload_fixture(&temp.path().join("package"));
+        let (_core, _profile, publisher, _revision) =
+            signed_payload_fixture(&temp.path().join("core"));
         let model_root = temp.path().join("models");
         let options = HubOptions {
             offline: true,
             revision: Some("gb10".into()),
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             ..Default::default()
         };
         let error = download_with_token_at(
@@ -8680,7 +9029,7 @@ pub(crate) mod tests {
         let options = HubOptions {
             offline: true,
             revision: Some("gb202".into()),
-            model_cache: Some(temp.path().join("flare")),
+            core_cache: Some(temp.path().join("flare")),
             token_file: Some(temp.path().join("nonexistent-token")),
             ..Default::default()
         };
@@ -8698,7 +9047,9 @@ pub(crate) mod tests {
                 .count(),
             0
         );
-        std::fs::remove_dir_all(transport.root()).unwrap();
+        let removed_transport = transport.root().to_owned();
+        drop(transport);
+        std::fs::remove_dir_all(&removed_transport).unwrap();
         let error = download("owner/model", &options, 1, &[], None, &[])
             .err()
             .unwrap()
@@ -8707,12 +9058,12 @@ pub(crate) mod tests {
             error.contains("not available in the Flare cache"),
             "{error}"
         );
-        assert!(!transport.root().exists());
+        assert!(!removed_transport.as_path().exists());
     }
 
     #[test]
     fn offline_branch_does_not_select_an_older_commit_for_its_tp() {
-        use flare_helios::package::cache::Root;
+        use flare_helios::core::cache::Root;
         let temp = tempfile::tempdir().unwrap();
         let root = Root::open(temp.path()).unwrap();
         let first = root.stage("model", "first").unwrap().commit().unwrap();
@@ -8770,14 +9121,14 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_download_selects_an_already_installed_nondefault_entry() {
-        use flare_helios::package::cache::{Root, model_key};
+        use flare_helios::core::cache::{Root, model_key};
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, commit) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, commit) = signed_payload_fixture(temp.path());
         let model_root = temp.path().join("models");
         let options = HubOptions {
             revision: Some("gb202".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             offline: true,
             ..Default::default()
         };
@@ -8789,7 +9140,7 @@ pub(crate) mod tests {
         // Install the signed entry but leave the prior default selected.
         let installed = install_ready(
             "owner/offline",
-            &package,
+            &core,
             &options,
             &model_root,
             1,
@@ -8802,7 +9153,7 @@ pub(crate) mod tests {
             Some(installed_id.as_str())
         );
         let expected_envelope =
-            authenticated_source_envelope(&package, &options, 1, std::slice::from_ref(&publisher))
+            authenticated_source_envelope(&core, &options, 1, std::slice::from_ref(&publisher))
                 .unwrap();
         remember_download(
             &model_root,
@@ -8843,7 +9194,7 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_source_ref_recording_preserves_the_prior_default() {
-        use flare_helios::package::cache::{Root, model_key};
+        use flare_helios::core::cache::{Root, model_key};
         let temp = tempfile::tempdir().unwrap();
         let model_root = temp.path().join("models");
         let root = Root::open(&model_root).unwrap();
@@ -8862,7 +9213,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(
             model_root
                 .join("sources")
-                .join(flare_helios::package::PayloadId::of(selector.as_bytes()).to_string()),
+                .join(flare_helios::core::PayloadId::of(selector.as_bytes()).to_string()),
         )
         .unwrap();
         assert!(
@@ -8890,7 +9241,7 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_exact_tp_entry_survives_eviction_of_the_latest_union() {
-        use flare_helios::package::cache::Root;
+        use flare_helios::core::cache::Root;
         let temp = tempfile::tempdir().unwrap();
         let root = Root::open(temp.path()).unwrap();
         let tp1_entry = root.stage("model", "tp1").unwrap().commit().unwrap();
@@ -8958,10 +9309,10 @@ pub(crate) mod tests {
     /// the transport root the acquisition used.
     fn fixture_download(
         temp: &Path,
-        package: &Path,
-        publisher: &flare_helios::runtime_package::Publisher,
+        core: &Path,
+        publisher: &flare_helios::runtime_core::Publisher,
     ) -> (
-        flare_helios::package::cache::Entry,
+        flare_helios::core::cache::Entry,
         std::path::PathBuf,
         String,
         String,
@@ -8972,11 +9323,11 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
-        let routes = package_routes(package, "owner/model", "gb10");
+        let routes = core_routes(core, "owner/model", "gb10");
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let entry = download_with_token_at(
             &endpoint,
@@ -9000,7 +9351,7 @@ pub(crate) mod tests {
 
     #[test]
     fn local_acquisition_reports_advisory_space_without_rejecting() {
-        use flare_helios::package::progress::format_bytes;
+        use flare_helios::core::progress::format_bytes;
         let temp = tempfile::tempdir().unwrap();
         let existing = temp.path().join("cache");
         std::fs::create_dir_all(&existing).unwrap();
@@ -9055,14 +9406,14 @@ pub(crate) mod tests {
         };
         let repository = std::env::var("FLARE_TEST_DOWNLOAD_REPOSITORY").unwrap();
         let revision = std::env::var("FLARE_TEST_DOWNLOAD_REVISION").unwrap();
-        let model_cache = std::env::var("FLARE_TEST_DOWNLOAD_MODEL_CACHE").unwrap();
+        let core_cache = std::env::var("FLARE_TEST_DOWNLOAD_MODEL_CACHE").unwrap();
         let cache_dir = std::env::var("FLARE_TEST_DOWNLOAD_CACHE_DIR").unwrap();
-        let profile: flare_helios::runtime_package::Publisher =
+        let profile: flare_helios::runtime_core::Publisher =
             serde_json::from_str(&std::env::var("FLARE_TEST_DOWNLOAD_PUBLISHER").unwrap()).unwrap();
         let options = HubOptions {
             revision: Some(revision.clone()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_cache.into()),
+            core_cache: Some(core_cache.into()),
             cache_dir: Some(cache_dir.into()),
             ..Default::default()
         };
@@ -9123,21 +9474,21 @@ pub(crate) mod tests {
 
     #[test]
     fn a_killed_acquisition_resumes_the_partial_and_reuses_completed_files() {
-        use flare_helios::package::cache::Root;
+        use flare_helios::core::cache::Root;
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) =
-            signed_payload_fixture(&temp.path().join("package"));
-        let names = package_files(&package);
+        let (core, _profile, publisher, _) =
+            signed_payload_fixture(&temp.path().join("core"));
+        let names = core_files(&core);
         let interrupted = names
             .iter()
             .rev()
             .find(|name| name.as_str() != "model.safetensors")
             .expect("fixture has a companion")
             .clone();
-        let interrupted_body = std::fs::read(package.join(&interrupted)).unwrap();
+        let interrupted_body = std::fs::read(core.join(&interrupted)).unwrap();
         let half = (interrupted_body.len() / 2) as u64;
         let etag = sha256_hex(&interrupted_body);
-        let routes = package_routes(&package, "owner/model", "gb10").file(
+        let routes = core_routes(&core, "owner/model", "gb10").file(
             format!("/owner/model/resolve/{COMMIT}/{interrupted}"),
             MockFile::new(&etag, interrupted_body.clone()).with_faults([
                 MockFault::Short(half as usize),
@@ -9194,11 +9545,11 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(cache_dir.clone()),
             ..Default::default()
         };
-        let counters = flare_helios::package::progress::AcquisitionProgress::new();
+        let counters = flare_helios::core::progress::AcquisitionProgress::new();
         let entry = download_with_token_at(
             &endpoint,
             "owner/model@gb10",
@@ -9220,7 +9571,7 @@ pub(crate) mod tests {
             Some(snapshot.network_bytes),
             "a completed resume must not leave an incomplete fraction"
         );
-        let row = flare_helios::package::progress::format_progress(
+        let row = flare_helios::core::progress::format_progress(
             snapshot.network_bytes,
             snapshot.network_total,
             Some(1.0),
@@ -9253,7 +9604,7 @@ pub(crate) mod tests {
         );
         let expected: u64 = names
             .iter()
-            .map(|name| std::fs::metadata(package.join(name)).unwrap().len())
+            .map(|name| std::fs::metadata(core.join(name)).unwrap().len())
             .sum();
         assert_eq!(
             log.bytes as u64, expected,
@@ -9262,7 +9613,7 @@ pub(crate) mod tests {
         drop(log);
 
         let primary = entry_primary(&entry).unwrap();
-        let verified = flare_helios::runtime_package::VerifiedPackage::open(
+        let verified = flare_helios::runtime_core::VerifiedCore::open(
             &primary,
             std::slice::from_ref(&publisher),
             None,
@@ -9270,16 +9621,16 @@ pub(crate) mod tests {
         .unwrap();
         verified.verify_stored_data().unwrap();
         let store = Root::open(&model_root).unwrap();
-        let key = flare_helios::package::cache::model_key("owner/offline").unwrap();
+        let key = flare_helios::core::cache::model_key("owner/offline").unwrap();
         assert_eq!(store.ref_entry(&key).unwrap().as_deref(), Some(entry.id()));
     }
 
     #[test]
     fn successful_install_reclaims_consumed_transport_content() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, _) = signed_payload_fixture(temp.path());
         let (entry, root, scope, folder, _endpoint) =
-            fixture_download(temp.path(), &package, &publisher);
+            fixture_download(temp.path(), &core, &publisher);
         assert!(
             retained_transport_files(&root, &scope).is_empty(),
             "consumed transport copies are reclaimed after install"
@@ -9294,9 +9645,9 @@ pub(crate) mod tests {
                 .exists(),
             "the installed commit's snapshot tree is reclaimed"
         );
-        // The installed package verifies from the model cache alone.
+        // The installed core verifies from the model cache alone.
         let primary = entry_primary(&entry).unwrap();
-        let verified = flare_helios::runtime_package::VerifiedPackage::open(
+        let verified = flare_helios::runtime_core::VerifiedCore::open(
             &primary,
             std::slice::from_ref(&publisher),
             None,
@@ -9308,9 +9659,9 @@ pub(crate) mod tests {
     #[test]
     fn a_changed_commit_fetches_new_weights_and_reuses_cached_companions() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(&temp.path().join("first"));
+        let (core, _profile, publisher, _) = signed_payload_fixture(&temp.path().join("first"));
         let (_, root, _, _, endpoint) =
-            fixture_download(&temp.path().join("first"), &package, &publisher);
+            fixture_download(&temp.path().join("first"), &core, &publisher);
         // The successful install reclaimed its transport content, so the update
         // can only reuse payload objects already published in the model cache.
         assert!(
@@ -9320,11 +9671,11 @@ pub(crate) mod tests {
             )
             .is_empty()
         );
-        // A second signed package supplies a new primary (new weights and a new
+        // A second signed core supplies a new primary (new weights and a new
         // signature) while its companion payload bytes are unchanged.
         let (updated, _, updated_publisher, _) =
             signed_payload_fixture(&temp.path().join("second"));
-        let names = package_files(&updated);
+        let names = core_files(&updated);
         let other_commit = "abcdef0123456789012345678901234567890123";
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut routes = HubRoutes::default().document(
@@ -9344,7 +9695,7 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb202".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
@@ -9371,7 +9722,7 @@ pub(crate) mod tests {
             "the changed weights are fetched and the unchanged companion is reused"
         );
         let primary = entry_primary(&entry).unwrap();
-        let verified = flare_helios::runtime_package::VerifiedPackage::open(
+        let verified = flare_helios::runtime_core::VerifiedCore::open(
             &primary,
             std::slice::from_ref(&updated_publisher),
             None,
@@ -9383,17 +9734,17 @@ pub(crate) mod tests {
     #[test]
     fn failed_install_preserves_resumable_transport_content() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(temp.path());
-        let names = package_files(&package);
+        let (core, _profile, publisher, _) = signed_payload_fixture(temp.path());
+        let names = core_files(&core);
         let companion = names
             .iter()
             .find(|name| name.as_str() != "model.safetensors")
             .expect("fixture has a companion")
             .clone();
-        let primary_bytes = std::fs::read(package.join("model.safetensors")).unwrap();
-        let companion_bytes = std::fs::read(package.join(&companion)).unwrap();
+        let primary_bytes = std::fs::read(core.join("model.safetensors")).unwrap();
+        let companion_bytes = std::fs::read(core.join(&companion)).unwrap();
         let companion_etag = sha256_hex(&companion_bytes);
-        let routes = package_routes(&package, "owner/model", "gb10").file(
+        let routes = core_routes(&core, "owner/model", "gb10").file(
             format!("/owner/model/resolve/{COMMIT}/{companion}"),
             MockFile::new(&companion_etag, companion_bytes)
                 .script([MockFault::Short(4), MockFault::Status(400)]),
@@ -9404,7 +9755,7 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
@@ -9453,10 +9804,10 @@ pub(crate) mod tests {
                 .exists(),
             "an incomplete file is never published into the snapshot"
         );
-        let store = flare_helios::package::cache::Root::open(&model_root).unwrap();
+        let store = flare_helios::core::cache::Root::open(&model_root).unwrap();
         assert!(
             store
-                .ref_entry(&flare_helios::package::cache::model_key("owner/offline").unwrap())
+                .ref_entry(&flare_helios::core::cache::model_key("owner/offline").unwrap())
                 .unwrap()
                 .is_none()
         );
@@ -9465,7 +9816,7 @@ pub(crate) mod tests {
     #[test]
     fn concurrent_acquisition_defers_reclamation_until_it_finishes() {
         let temp = tempfile::tempdir().unwrap();
-        let (package, _profile, publisher, _) = signed_payload_fixture(temp.path());
+        let (core, _profile, publisher, _) = signed_payload_fixture(temp.path());
         let model_root = temp.path().join("models");
         let downloads = temp.path().join("downloads");
         // A second acquisition of the same transport root is active.
@@ -9479,11 +9830,11 @@ pub(crate) mod tests {
         let options = HubOptions {
             revision: Some("gb10".into()),
             tensor_parallel: vec![1],
-            model_cache: Some(model_root.clone()),
+            core_cache: Some(model_root.clone()),
             cache_dir: Some(downloads.clone()),
             ..Default::default()
         };
-        let routes = package_routes(&package, "owner/model", "gb10");
+        let routes = core_routes(&core, "owner/model", "gb10");
         let (endpoint, worker, _log) = mock_hub_counted(routes);
         let holder = Transport::open(&model_root, Some(&downloads), &endpoint).unwrap();
         let entry = download_with_token_at(
@@ -9522,8 +9873,8 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let transport = Transport::open(temp.path(), None, "http://mock").unwrap();
         let repo = Repo::with_revision("owner/model".into(), RepoType::Model, "gb202".into());
-        let package = fixture(&[]);
-        let etag = sha256_hex(&package);
+        let core = fixture(&[]);
+        let etag = sha256_hex(&core);
         let routes = HubRoutes::default()
             .document(
                 "/api/models/owner/model/revision/gb202",
@@ -9531,14 +9882,14 @@ pub(crate) mod tests {
             )
             .file(
                 format!("/owner/model/resolve/{COMMIT}/model.safetensors"),
-                MockFile::new(&etag, package.clone()),
+                MockFile::new(&etag, core.clone()),
             );
         let (endpoint, worker) = mock_hub(routes);
         let path = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
             .unwrap()
             .0;
         worker.join().unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), package);
+        assert_eq!(std::fs::read(&path).unwrap(), core);
         assert_eq!(
             std::fs::read_to_string(
                 transport
@@ -9608,18 +9959,18 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let transport = Transport::open(temp.path(), None, "http://mock").unwrap();
         let repo = Repo::with_revision("owner/model".into(), RepoType::Model, "gb10".into());
-        let package = fixture(&[]);
-        let etag = sha256_hex(&package);
+        let core = fixture(&[]);
+        let etag = sha256_hex(&core);
         let key = blob_key(&etag).unwrap();
         let folder = repo.folder_name();
         let blob = transport.blob(&folder, &key);
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-        std::fs::write(&blob, &package).unwrap();
+        std::fs::write(&blob, &core).unwrap();
         let routes = HubRoutes::default()
             .document("/api/models/owner/model/revision/gb10", metadata_response())
             .file(
                 format!("/owner/model/resolve/{COMMIT}/model.safetensors"),
-                MockFile::new(&etag, package.clone()),
+                MockFile::new(&etag, core.clone()),
             );
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let path = fetch_primary(&transport_api(endpoint), &transport, &repo, None)
@@ -9632,7 +9983,7 @@ pub(crate) mod tests {
                 .snapshot_dir(&folder, COMMIT)
                 .join("model.safetensors")
         );
-        assert_eq!(std::fs::read(&path).unwrap(), package);
+        assert_eq!(std::fs::read(&path).unwrap(), core);
         assert!(
             log.lock().unwrap().files.is_empty(),
             "a published blob must not be transferred again"
@@ -9701,15 +10052,15 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let transport = Transport::open(temp.path(), None, "http://mock").unwrap();
         let repo = Repo::with_revision("owner/model".into(), RepoType::Model, COMMIT.into());
-        let package = fixture(&[]);
-        let etag = sha256_hex(&package);
+        let core = fixture(&[]);
+        let etag = sha256_hex(&core);
         let key = blob_key(&etag).unwrap();
         let folder = repo.folder_name();
         let blob = transport.blob(&folder, &key);
         let lock = content_lock(&transport.lock(&folder, &key)).unwrap();
         let routes = HubRoutes::default().file(
             format!("/owner/model/resolve/{COMMIT}/model.safetensors"),
-            MockFile::new(&etag, package.clone()),
+            MockFile::new(&etag, core.clone()),
         );
         let (endpoint, worker, log) = mock_hub_counted(routes);
         let clients: Vec<_> = (0..2)
@@ -9734,7 +10085,7 @@ pub(crate) mod tests {
         drop(lock);
         for client in clients {
             let path = client.join().unwrap().unwrap();
-            assert_eq!(std::fs::read(&path).unwrap(), package);
+            assert_eq!(std::fs::read(&path).unwrap(), core);
             #[cfg(unix)]
             assert_same_file(&blob, &path);
         }
@@ -9807,4 +10158,138 @@ pub(crate) mod tests {
             assert!(!transport.snapshot_dir(&repo.folder_name(), COMMIT).exists());
         }
     }
+    #[test]
+    fn observed_acquisition_installs_without_selecting_a_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let (core, _, publisher, _) = signed_payload_fixture(&temp.path().join("core"));
+        let model_root = temp.path().join("models");
+        let options = HubOptions {
+            revision: Some("gb10".into()),
+            core_cache: Some(model_root.clone()),
+            tensor_parallel: vec![1],
+            ..Default::default()
+        };
+        let (endpoint, worker, _) =
+            mock_hub_counted(routes_with(&core, "owner/offline", "gb10", lfs_etag));
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        let entry = download_for_model_at(
+            &endpoint,
+            "owner/offline",
+            &options,
+            1,
+            None,
+            &[],
+            None,
+            std::slice::from_ref(&publisher),
+            None,
+            false,
+            Some(progress.clone()),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        let store = flare_helios::core::cache::Root::open(model_root).unwrap();
+        assert!(store.resolve(entry.model()).unwrap().is_none());
+        assert!(entry.directory().join("model.safetensors").is_file());
+        assert!(progress.snapshot().network_bytes > 0);
+        store.publish_entry(&entry).unwrap();
+        assert_eq!(
+            store.resolve(entry.model()).unwrap().unwrap().id(),
+            entry.id()
+        );
+    }
+
+    #[test]
+    fn cancelled_acquisition_preserves_a_saved_partial_without_contacting_the_source() {
+        let (_temp, transport) = transport_fixture();
+        let bytes: Vec<u8> = (0..64u8).collect();
+        let etag = sha256_hex(&bytes);
+        let key = blob_key(&etag).unwrap();
+        seed_part(&transport, &retry_folder(), &key, &bytes[..16]);
+        let progress = flare_helios::core::progress::AcquisitionProgress::new();
+        progress.request_cancel();
+        let metadata = FileIdentity {
+            commit: COMMIT.into(),
+            etag,
+            size: bytes.len() as u64,
+        };
+        let error = transfer_blob(
+            &transfers(),
+            &transport.part(&retry_folder(), &key),
+            &transport.blob(&retry_folder(), &key),
+            "http://127.0.0.1:1/unused",
+            None,
+            "model.safetensors",
+            &metadata,
+            Some(&progress),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(
+            std::fs::read(transport.part(&retry_folder(), &key)).unwrap(),
+            bytes[..16]
+        );
+        assert!(!transport.blob(&retry_folder(), &key).exists());
+    }
+}
+
+/// Install a Hugging Face core without changing the selected local version.
+pub fn acquire_watched(
+    source: &str,
+    options: &HubOptions,
+    gpu_count: usize,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+    supplied_profiles: &[flare_helios::runtime_core::Publisher],
+    progress: flare_helios::core::progress::AcquisitionProgress,
+) -> Result<flare_helios::core::cache::Entry> {
+    let access_token = if options.offline {
+        None
+    } else {
+        token(options)?
+    };
+    download_for_model_at(
+        "https://huggingface.co",
+        source,
+        options,
+        gpu_count,
+        access_token,
+        publisher_keys,
+        trust_store,
+        supplied_profiles,
+        None,
+        false,
+        Some(progress),
+    )
+}
+
+/// Refresh a selected model using its recorded origin and the caller's explicit acquisition options.
+pub fn refresh_model(
+    store: &flare_helios::core::cache::Root,
+    entry: flare_helios::core::cache::Entry,
+    pinned: bool,
+    options: &HubOptions,
+    gpu_count: usize,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+) -> Result<(flare_helios::core::cache::Entry, Option<String>)> {
+    let entry = refresh_model_at(
+        "https://huggingface.co",
+        store,
+        entry,
+        pinned,
+        options,
+        gpu_count,
+        publisher_keys,
+        trust_store,
+        &[],
+    )?;
+    let repository = if pinned || options.offline {
+        None
+    } else {
+        store
+            .entry_source(&entry)?
+            .map(|reference| HubOrigin::from_reference(&reference).map(|origin| origin.repository))
+            .transpose()?
+    };
+    Ok((entry, repository))
 }

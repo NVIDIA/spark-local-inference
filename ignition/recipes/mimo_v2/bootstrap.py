@@ -18,6 +18,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.capacity import (
+    serving_modes,
     speculative_token_capacity,
     batch_capacities,
     prefill_capacities,
@@ -34,7 +35,7 @@ from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
-from ignition.preparation import runtime_package_pb2 as contract_proto
+from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
@@ -89,8 +90,12 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dflash
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("MiMo V2 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -157,9 +162,9 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
-    if package_storage is None:
-        raise ValueError("MiMo preparation requires package storage")
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
+    if core_storage is None:
+        raise ValueError("MiMo preparation requires core storage")
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
@@ -167,7 +172,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
@@ -187,7 +192,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             state_rows + 1,
             initial_pages,
             device,
-            storage=package_storage,
+            storage=core_storage,
             maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(state_rows + 1, 1 + 2 * slots),
@@ -200,7 +205,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        ipc = package_storage.peer_storage
+        ipc = core_storage.peer_storage
         draft_rows = slots * weights.config.draft.block_size if config.dflash else 0
         tokens = max(config.prefill_chunk_size, config.decode_tokens, draft_rows)
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=6144, ipc=ipc)
@@ -235,7 +240,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             numerical_policy="default",
             coordinator=coordinator,
             headroom_bytes=config.headroom_bytes,
-            benchmark_storage=package_storage,
+            benchmark_storage=core_storage,
         )
         session.__enter__()
         session.register_benchmark_resource("continuations", pool, restore=pool.clear_for_preparation)
@@ -289,13 +294,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             )
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
-    modes = (True, False) if config.dflash else (False,)
+    modes = serving_modes(config.dflash, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(config.prefill_capacities, scoring) + 4 * len(config.batch_capacities))
         + len(config.speculative_round_shapes)
-        + len(config.batch_capacities)
+        + (len(config.batch_capacities) if False in modes else 0)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -467,7 +472,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     pages = initial_pages
 
     def materialize_cache():
@@ -487,7 +492,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
-        warmup_storage=package_storage,
+        warmup_storage=core_storage,
         compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
     )
     session.freeze()

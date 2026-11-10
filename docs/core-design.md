@@ -111,8 +111,8 @@ behavior it adds around that common foundation.
 Flare keeps Python where model work benefits from that ecosystem. Ignition
 loads checkpoints, composes forwards, tunes kernels, plans scratch, compiles,
 and captures the supported executions. It exports their kernels, graphs,
-storage layouts, and frontend assets as a runtime package. Python can do
-substantial work to construct that package because it finishes before serving.
+storage layouts, and frontend assets as a runtime core. Python can do
+substantial work to construct that core because it finishes before serving.
 
 Helios then owns a different problem: admit requests into bounded resources,
 maintain complete continuation state, submit prepared work, and deliver
@@ -137,7 +137,7 @@ global selection, collective ordering, and scratch lifetimes. Efficient
 prefill and decode can require different exchanges. Flare's
 [GLM context layout](../ignition/recipes/glm53/dcp.py) declares the rank
 placement and page geometry; its prepared attention uses bounded query
-exchange for decode and gathered context for prefill. The runtime package
+exchange for decode and gathered context for prefill. The runtime core
 carries the resulting storage and execution contract into Helios.
 
 Keeping a conversation outside GPU memory imposes related requirements. A
@@ -150,7 +150,7 @@ admission, cancellation, and cache reset. A disk transport depends on all of the
 
 The [tiered prefix-cache design](prefix-cache-offload.md) extends the checkpoint
 object Helios already owns. Stores retain published immutable page chains and
-their complete endpoint rows. The runtime package declares every rank's byte
+their complete endpoint rows. The runtime core declares every rank's byte
 layout, so storage needs no model-specific interpretation. Memory and disk
 stores use the same lookup and completion interface; staged I/O and direct
 storage transfers preserve the same checkpoint semantics.
@@ -199,7 +199,7 @@ residency and migration behavior in that accounting. Memory that can be made
 allocatable through reclamation is not automatically suitable for predictable
 token latency.
 
-Exporting a runtime package lets compiler and model-construction resources
+Exporting a runtime core lets compiler and model-construction resources
 disappear before the native service starts. A narrow hardware target makes
 the remaining decisions specific enough to measure. SM121 acceptance must
 cover preparation and loading peaks, resident serving memory, memory traffic,
@@ -214,7 +214,7 @@ is valuable and expensive to reproduce. Flare chooses NVIDIA SM103/SM120/SM121,
 FlashInfer/b12x, selected model recipes, and interactive workloads on one host
 or supported cross-node tensor-parallel groups. [Multi-host serving](multi-host.md)
 uses prepared RoCEnante collectives; [Orbit](orbit.md) manages the hosts,
-preparation, packages, and rank processes needed for those deployments.
+preparation, cores, and rank processes needed for those deployments.
 Interchangeable backends and general-purpose cluster orchestration remain
 outside that serving scope. Flare does not aim for vLLM's feature matrix.
 
@@ -247,12 +247,12 @@ The design has three ownership boundaries:
 
 | Component | Responsibility |
 |---|---|
-| Ignition, in `ignition/` | Checkpoint loading, model composition, kernel tuning, memory planning, forward compilation, graph capture, and package export |
+| Ignition, in `ignition/` | Checkpoint loading, model composition, kernel tuning, memory planning, forward compilation, graph capture, and core export |
 | Heliopause, in `heliopause/` | CPython extension providing the preparation allocator, CUDA resource inspection, and native replay diagnostics |
-| Flare and Helios, in `flare/` and `helios/` | Package loading, native frontend, request scheduling, cache ownership, graph replay, and output delivery |
+| Flare and Helios, in `flare/` and `helios/` | Core loading, native frontend, request scheduling, cache ownership, graph replay, and output delivery |
 
 Both Flare and Heliopause depend on Helios. Helios has no Python dependency.
-The [runtime package design](runtime-package-design.md) specifies the
+The [runtime core design](runtime-core-design.md) specifies the
 `.safetensors` boundary. The [CLI design](cli-design.md) defines configuration
 and capacity selection; the [MTP design](mtp-design.md) defines speculative
 state transactions; the [tensor-parallel design](same-process-tp.md) defines
@@ -320,13 +320,13 @@ same boundary; violations must be resolved before committing.
   allowlist. Shared code derives behavior from concrete geometry and dataflow.
   Independent enum identifiers select reusable tool/reasoning parsers and image
   preparation/layout implementations only. Review every field and all consumers.
-- **Engine upgrades preserve model package compatibility.** Every engine version
+- **Engine upgrades preserve model core compatibility.** Every engine version
   must load models supported by previous versions without re-export, re-signing,
   or graph changes. Execution ABI numbers describe exports; loading validates
   actual operations, buffers, capacities, dependencies, signatures, and resources.
   Protobuf additions preserve existing behavior through compatible defaults.
   Reserve removed wire identifiers and retain readers and tests needed by existing
-  packages. Exercise previous packages through loading and serving.
+  cores. Exercise previous cores through loading and serving.
 - **Numerical and performance requirements are separate.** State copies and
   metadata are exact. Arithmetic comparisons follow each operator's precision
   and reduction semantics. Complete graph and service measurements determine
@@ -382,7 +382,7 @@ its b12x operators and FlashInfer sampling supply the prepared GPU computation.
 - Preparation resolves kernels, allocates storage, warms execution paths, and
   captures every supported graph variant.
 - Ignition performs bootstrap, model loading, preparation, and capture, then
-  exports a runtime package and closes the prepared model. `flare run PACKAGE`
+  exports a runtime core and closes the prepared model. `flare run CORE`
   loads it in a separate Rust serving process.
 - Rust owns all runtime sockets, HTTP/SSE, queues, tokenization, chat-template
   rendering, image preprocessing, grammar advancement, sampling control,
@@ -436,7 +436,7 @@ preserve draft context. Standalone proposal and verification dispatches are not
 part of the execution contract.
 
 `--no-mtp` omits draft weights and state during preparation. Load-time
-`--mtp-draft-tokens 0` selects ordinary decode while retaining package storage.
+`--mtp-draft-tokens 0` selects ordinary decode while retaining core storage.
 Runtime reductions require actual captured programs. Fixed selection supports
 host-allocated rectangular and ragged programs; GPU confidence allocation
 requires adaptive selection. Concurrency three requires the batch-four bucket.
@@ -489,7 +489,7 @@ exceeds the entire pool fail admission.
 For Qwen's target cache, BF16 KV and compressed selector keys cost 24.75 KiB
 per token; MTP pages, continuation rows, and graph resources add separate
 costs. The loader reports actual capacities. The [CLI design](cli-design.md)
-and [package memory layout](runtime-package-design.md#4-rebuild-and-serving)
+and [core memory layout](runtime-core-design.md#4-rebuild-and-serving)
 specify sizing and load-time selection.
 
 ## 2. Model preparation
@@ -650,7 +650,7 @@ The loader must:
   it, and qualify the numerical effect.
 - Exclude MTP tensors explicitly while MTP is disabled.
 - Release loading intermediates incrementally.
-- Append immutable PLE table slices to the runtime package without
+- Append immutable PLE table slices to the runtime core without
   materializing the full table in preparation memory. Graphs consume compact
   GPU row buffers; Helios supplies their contents at replay.
 
@@ -669,7 +669,7 @@ The local snapshot's safetensors headers give this storage breakdown:
 | Decoder routed experts | 59.94 | GPU |
 | Other decoder tensors | 6.57 | GPU |
 | Vision tensors | 0.30 | GPU |
-| PLE tables | 26.82 | Package payload; disk or resident RAM at serving |
+| PLE tables | 26.82 | Core payload; disk or resident RAM at serving |
 | MTP tensors | 1.49 | GPU when learned MTP is prepared |
 | **Total checkpoint** | **95.12** | |
 | **GPU-bound stored tensors without MTP** | **66.82** | |
@@ -930,13 +930,13 @@ Preparation proceeds in this order:
 7. Warm every variant in rank order and capture each rank's graphs. Preserve
    mutations, aliases, forks, and joins. Freeze storage and retain compiled
    kernel owners through native drain.
-8. Validate the catalog and frontend assets, export the runtime package, and
-   close the prepared model. `flare run PACKAGE` loads the exported package.
+8. Validate the catalog and frontend assets, export the runtime core, and
+   close the prepared model. `flare run CORE` loads the exported core.
 
 `--no-compile` skips forward compilation for development; b12x preparation,
 tuning, warmup, and graph capture still run. Unresolved selections, failed
 bindings, missing variants, or insufficient memory prevent export. Neither
-serving nor package loading invokes the tuner or Python.
+serving nor core loading invokes the tuner or Python.
 
 Weight loading and kernel preparation use `ignition.progress.phase`. Detailed
 b12x panels share its console and remain transient; only the root TP rank
@@ -952,13 +952,13 @@ CPython extension used by Ignition. Helios has no dependency on either caller.
 ### Process and ownership model
 
 Ignition prepares and exports a model in its own Python process.
-`flare run PACKAGE` starts a separate Rust process, loads the package through
+`flare run CORE` starts a separate Rust process, loads the core through
 `NativeResources`, binds listening
 sockets, and owns the server lifetime and request paths. The
-[runtime-package design](runtime-package-design.md) specifies storage, kernel,
+[runtime-core design](runtime-core-design.md) specifies storage, kernel,
 graph, and frontend reconstruction.
 
-`Server` and `ModelRuntime` consume the package's
+`Server` and `ModelRuntime` consume the core's
 [`PreparedContract`](../helios/src/model/contract.rs). Shared code validates
 vocabulary and capacities, resolves each graph's value sources and byte views
 into a `BoundContract`, packs uploads, and validates completion records.
@@ -975,7 +975,7 @@ writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. ABI6 completions contain 16 metadata fields plus the package-defined token
+history. ABI6 completions contain 16 metadata fields plus the core-defined token
 capacity for every serving operation. An omitted or zero
 `completion_token_capacity` resolves to eight; positive values are literal.
 
@@ -987,7 +987,7 @@ component bounds.
 
 `NativeResources` owns restored CUDA contexts, modules, graphs, device memory,
 and host mappings until the server confirms that all replay has drained.
-The live graph bundle contains process-local handles; packages serialize
+The live graph bundle contains process-local handles; cores serialize
 descriptions and data from which the loader creates those handles.
 
 Heliopause's optional `qualification` feature also supports in-process replay
@@ -1117,7 +1117,7 @@ match exactly when given the same decoded pixels.
 Images replay individually into a shared request feature buffer. Admission bounds
 each image by the prepared patch graphs and their combined features by that
 buffer's capacity. The serialized image-support count remains readable in existing
-packages; runtime image counts follow feature storage rather than a four-image cap.
+cores; runtime image counts follow feature storage rather than a four-image cap.
 
 ### Prepared graph bundle
 
@@ -1268,11 +1268,11 @@ launching its executable; a raw launch bypasses that bookkeeping.
 Sampling defaults are declared in each Ignition recipe after manual verification
 against the model card for the default serving mode. `generation_config.json`
 and `config.json` do not select sampling policy. Unspecified filters are disabled
-and penalties are neutral. Complete defaults are stored in the package's
+and penalties are neutral. Complete defaults are stored in the core's
 `DefaultSamplingParameters` protobuf message; missing or invalid defaults reject
 loading. Optional inclusive ranges in that message bound request distribution
 parameters; values outside those ranges clamp to the nearest endpoint. An absent
-range fixes the parameter at its declared default, including for packages without
+range fixes the parameter at its declared default, including for cores without
 range metadata. Seed remains request-controlled. Qwen's default thinking-mode
 recommendation is temperature 1.0, top-k 20, and top-p 0.95.
 
@@ -1310,7 +1310,7 @@ Equal endpoints share one checkpoint. Parent-linked complete-page chains,
 ancestor pinning, and eviction preserve ownership across active branches.
 
 The [Rust prefix cache](../helios/src/cache.rs) manages ownership, readiness,
-pinning, and eviction. Helios allocates backing storage when loading the package;
+pinning, and eviction. Helios allocates backing storage when loading the core;
 [captured maintenance operations](../ignition/recipes/qwen38/maintenance.py)
 reset, restore, and snapshot its contents.
 
@@ -1576,7 +1576,7 @@ the contracts established by the preceding stages.
    operands, then validate metadata preparation, cache writes, sampling,
    arbitrary tails, maintenance, and full-prompt resume. Compile and capture
    every supported shape with explicit state and scratch lifetimes.
-3. **Native package execution.** Export and load the actual package, validate
+3. **Native core execution.** Export and load the actual core, validate
    request packing and completion interpretation, and compare Python and Rust
    replay under the same arithmetic policy. Test multi-rank agreement and
    coordinated shutdown.

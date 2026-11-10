@@ -53,22 +53,22 @@ class PreparedDSA(PreparedMLAProjection):
                 self.shards.index, context.staging.tensor.view(-1, RECORD_BYTES), context.staging.addresses,
                 self.history_records, context.stage_signals, runtime=context.stage_runtime,
                 session=session, coordinator=coordinator, name=name + ".history")
-        self.parts = []
+        self.parts = {}
         storage = SharedBuffers(buffers.setdefault("selected_attention", {}), source.device, allocator)
         heads = self.absorbed.shape[1]
         common = dict(device=source.device, kv_dtype=FP8, page_size=1, use_cuda_graph=True,
                       partial_dtype=torch.float32)
         constants = context.attention_constants
         cache_records = cache.view(-1, 1, RECORD_BYTES)
-        row_views, record_views = {}, {}
-        for (start, end), selector in zip(self.indexer.bounds, self.indexer.parts, strict=True):
+        for start, end in self.indexer.bounds:
             rows = end - start
+            if rows in self.parts:
+                continue
+            selector = None if self.indexer.sharded is not None else self.indexer.selections[rows]
             owners = storage.buffer("owners", (rows, TOPK), torch.int32)
             slots = storage.buffer("slots", (rows, TOPK), torch.int32)
             counts = storage.buffer("counts", (rows,), torch.int32)
-            if rows not in row_views:
-                row_views[rows] = (constants.starts[:rows + 1], constants.pages[:rows])
-            starts, pages = row_views[rows]
+            starts, pages = constants.starts[:rows + 1], constants.pages[:rows]
             part = dict(selector=selector, owners=owners, slots=slots, counts=counts)
             if mode == "prefill":
                 if peers is None or peers.shape != (self.shards.world,):
@@ -80,12 +80,10 @@ class PreparedDSA(PreparedMLAProjection):
                     peer_records=self.history_records.shape[0] if local_history else cache.shape[0] * cache.shape[1],
                     session=session, name=f"{name}.records{start}",
                     dependencies=(self.history_records, self.history.completed) if local_history else ())
-                if rows not in record_views:
-                    record_views[rows] = selected.view(-1, 1, RECORD_BYTES)
                 caps = dense_mla.Caps(mode="decode", q_dtype=torch.bfloat16, num_q_heads=heads,
                     max_total_q=rows, max_batch=rows, max_cache_tokens=TOPK, max_page_table_width=TOPK,
                     num_cache_pages=rows * TOPK, **common)
-                part["attention"] = PreparedDenseMLA(self.absorbed[start:end], record_views[rows],
+                part["attention"] = PreparedDenseMLA(self.absorbed[start:end], selected.view(-1, 1, RECORD_BYTES),
                     self.attended[start:end], pages, counts, starts, caps=caps, scale=192 ** -.5,
                     session=session, name=f"{name}.attention{start}", workspace=workspace,
                     kv_scale=constants.scale, q_scale=constants.scale)
@@ -109,14 +107,13 @@ class PreparedDSA(PreparedMLAProjection):
                 part["combine"] = PreparedLseReduceScatter(partial, lse, self.attended,
                     runtime=context.heads, session=session, coordinator=context.coordinator, name=name + ".combine",
                     threads=512, block_limit=8)
-            self.parts.append(part)
+            self.parts[rows] = part
         self.query_overlap = None
         if mode == "decode" and self.absorbed.shape[0] == 1 and workspace is not None and workspace.overlap:
-            part, = self.parts
-            # The fork follows cache production. Candidate transport follows the joined
-            # query output, so the two channels never execute concurrently on any rank.
+            part, = self.parts.values()
+            # Both candidate transports consume the joined query before reusing the channel.
             part["gather"].dependencies.append(cache)
-            part["selector"].gather.dependencies.append(part["gather"].output)
+            part["selector"].merge.dependencies.append(part["gather"].output)
             self.query_overlap = ConcurrentAllGather(part["gather"], workspace=workspace, session=session,
                                                      parallel_plans=self.indexer.local_plans)
 
@@ -125,37 +122,40 @@ class PreparedDSA(PreparedMLAProjection):
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
         if self.query_overlap is not None:
-            part, = self.parts
+            part, = self.parts.values()
             part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
             self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
         self.indexer.project(source)
-        if self.history is not None:
-            # Read the owning rank's cache after this layer writes the chunk;
-            # replicated projection outputs need not be byte-identical across ranks.
-            self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
-            self.history()
         if self.indexer.sharded is not None:
             self.indexer.sharded()
-        for part in self.parts:
-            selector = part["selector"]
+        if self.history is not None:
+            self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
+            self.history()
+        for start, end in self.indexer.bounds:
+            part = self.parts[end - start]
+            positions = self.metadata.positions[start:end]
+            tables = self.metadata.token_page_table[start:end]
             if self.indexer.sharded is not None:
-                selected = selector.selected
+                selected = self.indexer.sharded.selected[start:end]
             elif self.query_overlap is None:
-                selected = selector()
+                selected = part["selector"](self.indexer.query[start:end], self.indexer.head_weights[start:end],
+                                             positions, tables)
             else:
-                dependency = selector.prepare_local()
+                selector = part["selector"]
+                dependency = selector.prepare_local(self.indexer.query[start:end],
+                    self.indexer.head_weights[start:end], positions, tables)
                 self.query_overlap.finish(part["quantized"].view(self.absorbed.shape[0], -1), dependency)
-                selected = selector.exchange()
-            selection_slots(selected, selector.positions, selector.tables, part["owners"], part["slots"],
+                selected = selector.exchange(positions)
+            selection_slots(selected, positions, tables, part["owners"], part["slots"],
                 part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill",
                 global_records=self.history is not None)
             if self.mode == "prefill":
                 part["gather"]()
-                part["attention"]()
+                part["attention"](self.absorbed[start:end], self.attended[start:end])
             else:
                 if self.query_overlap is None:
                     part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
                     part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
-                part["attention"]()
+                part["attention"](part["gathered"], part["partial"])
                 part["combine"](part["partial"], part["lse"])
         return self.finish()

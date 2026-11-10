@@ -43,10 +43,10 @@ class ModelWeights:
     vision: object = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, package_storage=None,
+    def load(cls, manifest, device, *, shard, progress=None, core_storage=None,
              expert_scale_compression=None, dspark=False, vision=True):
         before = torch.cuda.memory_allocated(device)
-        loading = nullcontext if package_storage is None else package_storage.transient
+        loading = nullcontext if core_storage is None else core_storage.transient
         with loading(), MiniMaxWeightLoader(manifest, device, shard=shard, progress=progress,
                                           expert_scale_compression=expert_scale_compression) as loader:
             config = loader.config

@@ -21,7 +21,7 @@ from types import MappingProxyType
 import math
 import re
 
-from . import runtime_package_pb2 as proto
+from . import runtime_core_pb2 as proto
 
 STABLE = 'stable'
 TUNED = 'tuned'
@@ -238,6 +238,7 @@ def from_plan(model, plan, *, compiled_forwards):
         result['joint_tuning'] = True
     if (s := plan.speculation) is not None:
         result['speculation'] = dict(draft_tokens=s.draft_tokens,
+            mtp_only=s.mtp_only,
             adaptive=s.adaptive,
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
             draft_prefix_selection=s.draft_prefix_selection,

@@ -5,6 +5,8 @@
 """Kimi K3 direct transfers with sharded attention, latent projections, and experts."""
 
 from dataclasses import dataclass, replace
+import json
+from pathlib import Path
 import sys
 
 import torch
@@ -36,30 +38,46 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
-             online_mxfp8_scope="all", peers=None, vision=True):
+             online_mxfp8_scope="all", peers=None, vision=True, weight_storage=None, draft_head_quantization=None):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
-        ``draft_checkpoint`` loads the target model's DSpark checkpoint.
+        ``draft_checkpoint`` loads the declared DSpark or DFlash2 checkpoint.
         Without ``vision``, the vision encoder stays on disk.
         """
         before = torch.cuda.memory_allocated(device)
+        pack = (lambda value: value) if weight_storage is None else weight_storage.tree
         with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
                               online_mxfp8_scope=online_mxfp8_scope, peers=peers) as loader:
             config = loader.config
-            embedding = loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64))
+            embedding = pack(loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64)))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
                 ("norm", "output_attn_res_norm", "output_attn_res_proj")))
-            head = loader.load_tensor("language_model.lm_head.weight",
-                extent=slice(*shard.partition(config.vocabulary, alignment=64)))
-            layers = tuple(loader.load_layer(i) for i in range(len(config.layers)))
+            norm, output_res_score = pack(norm), pack(score_weight(res_norm, res_proj))
+            del res_norm, res_proj
+            head = pack(loader.load_tensor("language_model.lm_head.weight",
+                extent=slice(*shard.partition(config.vocabulary, alignment=64))))
+            layers = []
+            for index in range(len(config.layers)):
+                layer = loader.load_layer(index)
+                # Expert owners retain their prepared representations and handles.
+                # Only finalized dense numeric fields enter the immutable arena.
+                layers.append({key: value if key == "experts" else pack(value)
+                               for key, value in layer.items()})
+                del layer
         if vision:
             from .vision import VisionWeights
-            vision = VisionWeights.load(manifest, device, progress=progress)
+            vision = pack(VisionWeights.load(manifest, device, progress=progress))
         else:
             vision = None
         draft = None
         if draft_checkpoint is not None:
-            if config.dsa is None:
+            raw_draft = json.loads((Path(draft_checkpoint) / "config.json").read_text())
+            if raw_draft.get("architectures") == ["DFlash2DraftModel"]:
+                from ignition.recipes.kimi31.dflash_weights import DraftWeights
+                draft_config, draft_args = DSparkConfig, dict(draft_head_quantization=draft_head_quantization)
+            elif draft_head_quantization is not None:
+                raise ValueError("Kimi draft head conversion requires the MLA DFlash2 draft")
+            elif config.dsa is None:
                 from .dspark_weights import DraftWeights
 
                 draft_config, draft_args = DSparkConfig, {}
@@ -69,9 +87,11 @@ class ModelWeights:
 
                 draft_args = dict(target_embedding=embedding)
             config = replace(config, draft=draft_config.load(draft_checkpoint, config))
-            draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8 and online_mxfp8_scope == "all", **draft_args)
-        return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
+            draft = pack(DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
+                                      online_mxfp8=online_mxfp8 and online_mxfp8_scope == "all", **draft_args))
+        if weight_storage is not None:
+            weight_storage.freeze()
+        return cls(config, shard, embedding, norm, head, output_res_score, tuple(layers),
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
 
@@ -200,7 +220,7 @@ class KimiWeightLoader(DirectWeightLoader):
                     else (("input",) if self.config.layers[index] == "kda" else ()))
             for key in keys:
                 if key in attention:
-                    attention[key] = quantize_bf16_linear_as_mxfp8(attention[key])
+                    attention[key] = quantize_bf16_linear_as_mxfp8(attention[key], retain_scale_rows=False)
         return attention
 
     def load_layer(self, index):

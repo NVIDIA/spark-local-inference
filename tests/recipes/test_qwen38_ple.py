@@ -122,7 +122,7 @@ def test_ple_fixed_buffer_contracts():
 
 def test_export_metadata_preserves_hashes_encoding_scale_and_source_spans(tmp_path):
     from types import SimpleNamespace
-    from ignition.preparation.runtime_package import FileSource
+    from ignition.preparation.runtime_core import FileSource
 
     geometry = SimpleNamespace(multipliers=(13, 17, 19, 23), prime_sizes=(29, 31, 37, 41),
                                table_offsets=(0, 29, 60, 97))

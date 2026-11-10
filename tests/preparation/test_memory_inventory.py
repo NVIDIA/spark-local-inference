@@ -117,15 +117,18 @@ def test_overlapping_views_bound_claims_and_preserve_first_owner():
     assert not any(row['category'] == 'Unknown storage' for row in rows)
 
 
-def test_inventory_separates_physical_cache_host_peers_and_package_alignment(monkeypatch):
+def test_inventory_separates_physical_cache_host_peers_and_core_alignment(monkeypatch):
     import flare_heliopause
     import torch
     from ignition.preparation import memory_inventory
-    from ignition.preparation.runtime_package import Allocation
+    from ignition.preparation.runtime_core import Allocation
 
     monkeypatch.setattr(flare_heliopause, 'memory_inventory', lambda: dict(
         device=0, total_bytes=10000, free_bytes=8000, mappings=[(100, 300)]))
-    monkeypatch.setattr(torch.cuda, 'memory_snapshot', lambda: [])
+    def snapshot(*, include_traces):
+        assert include_traces is False
+        return [dict(device=1)]
+    monkeypatch.setattr(torch.cuda, 'memory_snapshot', snapshot)
     monkeypatch.setattr(torch.cuda, 'memory_allocated', lambda device: 300)
     monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda device: 300)
     monkeypatch.setattr(memory_inventory, 'owner_claims', lambda prepared: [
@@ -136,15 +139,15 @@ def test_inventory_separates_physical_cache_host_peers_and_package_alignment(mon
             address=1000, nbytes=200, extent=1 << 40, name='KV')],
         peer_storage=SimpleNamespace(owned={300: 100}, imported_mappings={9000: [(9000, 500)]}),
         host_regions=[SimpleNamespace(extent=4000, closed=False)])
-    package = SimpleNamespace(allocations=[Allocation('fixed', 100, 300),
+    core = SimpleNamespace(allocations=[Allocation('fixed', 100, 300),
         Allocation('external', 500, 100), Allocation('cache', 1000, 1 << 40, sizing={'capacity': 'KV'}),
         Allocation('peer', 9000, 500, memory='peer'), Allocation('host', 10000, 4000, memory='mapped_host')],
         module_globals=[(700, 10, 'kernel.constant')],
         export_counts={'kernels': 1, 'modules': 1, 'cubin_bytes': 3})
-    report = collect_inventory(prepared, storage, package, external=[(520, 20)])
-    assert report['fixed_package_bytes'] == 400
+    report = collect_inventory(prepared, storage, core, external=[(520, 20)])
+    assert report['fixed_core_bytes'] == 400
     assert report['cache_backing_bytes'] == 200
-    assert report['package_padding_bytes'] == 80
+    assert report['core_padding_bytes'] == 80
     assert report['tracked_physical_bytes'] == 530
     assert report['device_unattributed_bytes'] == 1470
     assert sum(row['nbytes'] for row in report['entries']) == 330
@@ -172,8 +175,8 @@ from types import SimpleNamespace
 import torch
 import flare_heliopause
 from ignition.preparation.memory_inventory import collect_inventory, owner_claims
-from ignition.preparation.package_storage import PackageStorage
-from ignition.preparation.runtime_package import Allocation
+from ignition.preparation.core_storage import CoreStorage
+from ignition.preparation.runtime_core import Allocation
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
@@ -183,7 +186,7 @@ class Forward:
     hidden: torch.Tensor
 
 torch.cuda.set_device(0)
-with PackageStorage() as storage:
+with CoreStorage() as storage:
     weight = torch.ones(1024, device='cuda')
     record_numeric_tensor(weight)
     pool = GraphBufferPool('cuda:0', chunk_bytes=4096)
@@ -200,9 +203,9 @@ with PackageStorage() as storage:
         buffers={'cache': cache}, device=0, export_zero_ranges=(), graphs={'prefill': None, 'decode': None})
     allocations = [Allocation(str(i), a.address, a.nbytes) for i, a in enumerate(storage.mappings.values())]
     allocations.append(Allocation('KV', region.address, region.extent, sizing={'capacity': 'kv_pages'}))
-    package = SimpleNamespace(allocations=allocations, module_globals=[],
+    core = SimpleNamespace(allocations=allocations, module_globals=[],
         export_counts={'kernels': 0, 'modules': 0, 'cubin_bytes': 0})
-    report = collect_inventory(prepared, storage, package)
+    report = collect_inventory(prepared, storage, core)
     def size(category, field='entries'):
         return sum(row['nbytes'] for row in report[field] if row['category'] == category)
     assert size('Weights / numeric constants') == weight.nbytes

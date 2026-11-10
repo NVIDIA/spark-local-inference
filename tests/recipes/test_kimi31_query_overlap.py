@@ -92,11 +92,12 @@ def test_query_overlap_only_declared_for_single_row_decode(monkeypatch, rows, mo
         self.query_norm = torch.zeros((rows, 1536), dtype=torch.bfloat16)
         self.buffer = lambda name, dtype: torch.zeros(rows, dtype=dtype)
 
-    selector = SimpleNamespace(gather=SimpleNamespace(dependencies=[]))
+    selector = SimpleNamespace(merge=SimpleNamespace(dependencies=[]))
     plans = (Plan(), Plan())
     monkeypatch.setattr(attention.PreparedMLAProjection, '__init__', projection)
     monkeypatch.setattr(attention, 'PreparedDSAIndexer', lambda *args, **kwargs:
-                        SimpleNamespace(bounds=((0, rows),), parts=(selector,), local_plans=plans))
+                        SimpleNamespace(bounds=((0, rows),), selections={rows: selector}, sharded=None,
+                                        local_plans=plans))
     monkeypatch.setattr(attention, 'PreparedDenseMLA', lambda *args, **kwargs: SimpleNamespace(plan=Plan()))
     monkeypatch.setattr(attention, 'PreparedLseReduceScatter', lambda *args, **kwargs: object())
     monkeypatch.setattr(attention, 'PreparedPeerRecordGather', lambda *args, **kwargs: object())
@@ -120,19 +121,41 @@ def test_query_overlap_only_declared_for_single_row_decode(monkeypatch, rows, mo
         gather, options = forks[0]
         assert options['parallel_plans'] is plans
         assert gather.dependencies == [cache]
-        assert selector.gather.dependencies == [gather.output]
+        assert selector.merge.dependencies == [gather.output]
     else:
-        assert selector.gather.dependencies == []
+        assert selector.merge.dependencies == []
 
 
 def test_split_selection_keeps_sequential_composition():
     operation = indexer.PreparedIndexSelection.__new__(indexer.PreparedIndexSelection)
     calls = []
-    operation.prepare_local = lambda: calls.append('local')
+    query, weights, positions, tables = (object() for _ in range(4))
+    operation.prepare_local = lambda *args: calls.append(('local', args))
     output = object()
-    operation.exchange = lambda: calls.append('exchange') or output
-    assert operation() is output
-    assert calls == ['local', 'exchange']
+    operation.exchange = lambda value: calls.append(('exchange', value)) or output
+    assert operation(query, weights, positions, tables) is output
+    assert calls == [('local', (query, weights, positions, tables)), ('exchange', positions)]
+
+
+def test_candidate_alternatives_share_query_join_dependency(monkeypatch):
+    from ignition.components import candidate_selection
+
+    monkeypatch.setattr(candidate_selection, 'PreparedAllGather', lambda *args, **kwargs:
+                        SimpleNamespace(dependencies=[]))
+    monkeypatch.setattr(candidate_selection, 'PreparedOrderedRowTopK', lambda *args, **kwargs: object())
+    monkeypatch.setattr(candidate_selection, 'PreparedOwnerTopK', lambda *args, **kwargs:
+                        SimpleNamespace(transport=SimpleNamespace(dependencies=[])))
+    buffers = indexer.SharedBuffers({}, 'cpu')
+    cache, joined_query = torch.zeros(4), torch.ones(4)
+    selection = candidate_selection.PreparedCandidateSelection(
+        torch.zeros((1, 4), dtype=torch.int32), torch.zeros((1, 4)), torch.zeros(1, dtype=torch.int64),
+        torch.zeros(1, dtype=torch.int64), torch.zeros((1, 4), dtype=torch.int32), world=16,
+        gather_runtime=None, owner_runtime=SimpleNamespace(world_size=16), reduction_runtime=object(),
+        session=None, coordinator=None, name='selection', buffers=buffers, dependencies=(cache,))
+    selection.dependencies.append(joined_query)
+    assert selection.gather.dependencies is selection.dependencies
+    assert selection.owner.transport.dependencies is selection.dependencies
+    assert selection.gather.dependencies == [cache, joined_query]
 
 
 @pytest.mark.parametrize('overlap', [False, True])
@@ -149,24 +172,24 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
     op.history = None
     op.project = lambda source: events.append('projection')
     monkeypatch.setattr(attention, 'write_records', lambda *args: events.append('cache_write'))
-    op.indexer = SimpleNamespace(project=lambda source: events.append('index_projection'), sharded=None)
+    op.indexer = SimpleNamespace(project=lambda source: events.append('index_projection'), sharded=None,
+        bounds=((0, 1),), query=torch.zeros((1, 4096)), head_weights=torch.zeros((1, 32)))
     packed, selected = torch.ones(4), torch.ones(4)
     query = torch.zeros_like(op.absorbed, dtype=torch.float8_e4m3fn)
     gathered = torch.zeros_like(query)
     pending = []
 
     class Selection:
-        positions = tables = None
-        def prepare_local(self):
+        def prepare_local(self, query, weights, positions, tables):
             events.append('local_selection')
             return packed
-        def exchange(self):
+        def exchange(self, positions):
             assert not pending
             events.append('candidate_exchange')
             return selected
-        def __call__(self):
-            self.prepare_local()
-            return self.exchange()
+        def __call__(self, query, weights, positions, tables):
+            self.prepare_local(query, weights, positions, tables)
+            return self.exchange(positions)
 
     class Fork:
         def start(self, source):
@@ -182,13 +205,13 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
         gathered.copy_(source.view_as(gathered))
     monkeypatch.setattr(attention, 'selection_slots', lambda *args, **kwargs: events.append('slots'))
     result = torch.zeros(1)
-    def attend():
+    def attend(query, output):
         assert not pending
         events.append('attention')
         result.copy_(gathered.float().sum().reshape(1))
-    op.parts = [dict(selector=Selection(), quantized=query, gather=gather, attention=attend,
+    op.parts = {1: dict(selector=Selection(), quantized=query, gathered=gathered, gather=gather, attention=attend,
                      owners=None, slots=None, counts=None, partial=None, lse=None,
-                     combine=lambda *args: events.append('combine'))]
+                     combine=lambda *args: events.append('combine'))}
     op.query_overlap = Fork() if overlap else None
     op.finish = lambda: result
     assert op(torch.ones(1)).item() == RECORD_BYTES

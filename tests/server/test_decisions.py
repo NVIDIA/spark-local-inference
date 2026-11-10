@@ -90,7 +90,7 @@ def test_systemone_assets_use_existing_vision_and_multipart_paths(service):
 def test_decision_routes_match_requested_raw_label_reads(service, endpoint):
     checkpoint = os.environ.get('FLARE_DECISION_TEST_CHECKPOINT')
     if not checkpoint:
-        pytest.skip('requires the served package tokenizer checkpoint')
+        pytest.skip('requires the served core tokenizer checkpoint')
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     http, card = service
@@ -263,8 +263,8 @@ def test_decision_disconnect_cancels_child_and_drains_native_ownership(service, 
     assert http.get('/health').status_code == 200
 
 
-@pytest.mark.skipif(not os.environ.get('FLARE_DECISION_LEGACY_URL'), reason='requires an older package service')
-def test_older_packages_still_serve_and_reject_exact_id_routes_before_admission():
+@pytest.mark.skipif(not os.environ.get('FLARE_DECISION_LEGACY_URL'), reason='requires an older core service')
+def test_older_cores_still_serve_and_reject_exact_id_routes_before_admission():
     import httpx
     with httpx.Client(base_url=os.environ['FLARE_DECISION_LEGACY_URL'], timeout=120,
                       headers={'Authorization': 'Bearer ' + os.environ.get('FLARE_API_TEST_KEY', 'local')}) as http:

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from ignition.components.capacity import (
+    serving_modes,
     batch_capacities,
     prefill_capacities,
     request_capacity,
@@ -92,6 +93,7 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    mtp_only: bool = False
 
     @property
     def speculative_shapes(self):
@@ -106,6 +108,9 @@ class PreparationConfig:
         return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if self.mtp_only and (self.draft_checkpoint is None
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Gemma 4 draft model supports at most seven draft tokens")
         if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
@@ -149,7 +154,7 @@ class PreparationConfig:
 
 
 @torch.no_grad()
-def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package_storage=None):
+def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_storage=None):
     from .recipe import RECIPE
 
     snapshot = Path(snapshot).resolve()
@@ -162,8 +167,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
-    if package_storage is not None:
-        transient.enter_context(package_storage.transient())
+    if core_storage is not None:
+        transient.enter_context(core_storage.transient())
     draft_checkpoint = config.draft_checkpoint
     if draft_checkpoint is not None and not (Path(draft_checkpoint) / "config.json").is_file():
         from huggingface_hub import snapshot_download
@@ -190,7 +195,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         raise ValueError("Gemma 4 prefill chunk size exceeds the checkpoint's max_position_embeddings")
     layout = continuation_layout(weights.config, shard)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
-    if package_storage is None:
+    if core_storage is None:
         snapshots = min(snapshots, 256)
     if snapshots < 1:
         raise ValueError("snapshot budget must hold a complete Gemma 4 continuation")
@@ -199,9 +204,9 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     tokens = max(config.prefill_chunk_size, decode_tokens)
     state_rows = slots + snapshots
     prep_pages = config.prefill_chunk_size // PAGE_TOKENS + 2 * slots
-    # Development serving keeps this bounded cache; exported packages size KV from the serving host's memory.
+    # Development serving keeps this bounded cache; exported cores size KV from the serving host's memory.
     pages = max(prep_pages, config.minimum_pages)
-    initial_pages = prep_pages if package_storage is not None else pages
+    initial_pages = prep_pages if core_storage is not None else pages
     bytes_per_page = page_bytes(weights.config, shard)
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
@@ -211,10 +216,10 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             initial_pages,
             device,
             shard=shard,
-            storage=package_storage,
+            storage=core_storage,
             maximum_pages=max(pages, total_memory // bytes_per_page),
             maximum_rows=total_memory // layout.row_bytes,
-            backed_slots=min(state_rows + 1, 1 + 2 * slots) if package_storage is not None else None,
+            backed_slots=min(state_rows + 1, 1 + 2 * slots) if core_storage is not None else None,
         )
         vocabulary = weights.config.vocabulary
         requests = DeviceRequestState.allocate(device, vocab_size=vocabulary, capacity=slots)
@@ -225,7 +230,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group) if group is not None else None
-        ipc = None if package_storage is None else package_storage.peer_storage
+        ipc = None if core_storage is None else core_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None
         local_vocab = weights.config.vocabulary_partition(shard)[2]
         if coordinator is not None and coordinator.spans_hosts:
@@ -238,7 +243,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
                 hidden_size=weights.config.hidden,
                 gather_bytes=gather_bytes,
                 ring=config.roce_ring,
-                package_storage=package_storage,
+                core_storage=core_storage,
             )
         elif group is not None:
             collective = create_all_reduce_runtime(
@@ -286,7 +291,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             numerical_policy="default",
             coordinator=coordinator,
             headroom_bytes=config.headroom_bytes,
-            benchmark_storage=package_storage,
+            benchmark_storage=core_storage,
         )
         session.__enter__()
         register_benchmark_state(
@@ -297,7 +302,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         )
         arena = ScratchArena(device)
         session.register_scratch(arena)
-        scratch_pool = contextlib.nullcontext() if package_storage is None else package_storage.scratch_pool()
+        scratch_pool = contextlib.nullcontext() if core_storage is None else core_storage.scratch_pool()
         scratch_buffers, graph_buffers, layer_buffers = (
             GraphBufferPool(device),
             GraphBufferPool(device),
@@ -347,10 +352,10 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     )
     forwards, signatures, metadata = {}, {}, {}
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
-    modes = (True, False) if drafting else (False,)
+    modes = serving_modes(drafting, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
-        + len(batch_sizes)
+        + (len(batch_sizes) if False in modes else 0)
         + len(config.speculative_shapes)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -474,15 +479,15 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
     stream = torch.cuda.Stream(device=device)
-    graph_pool = torch.cuda.graph_pool_handle() if package_storage is None else package_storage.graph_pool.id
-    if config.compile_decoder and package_storage is not None:
+    graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
+    if config.compile_decoder and core_storage is not None:
         scratch_pool.release_backing()
 
     def materialize():
-        if package_storage is not None:
+        if core_storage is not None:
             scratch_pool.materialize()
             if pages > initial_pages:
-                package_storage.grow("KV_PAGES", pages)
+                core_storage.grow("KV_PAGES", pages)
                 pool.memory_capacity[1] = pages
         pool.clear_for_preparation()
 
@@ -501,11 +506,11 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             cache_root=config.kernel_cache,
             retain_graphs=config.retain_graphs,
             materialize=materialize,
-            warmup_storage=package_storage,
+            warmup_storage=core_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative"),
         )
     finally:
-        if package_storage is not None:
+        if core_storage is not None:
             scratch_pool.materialize()
     session.freeze()
     pool.clear_for_preparation()
@@ -656,5 +661,5 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     )
 
 
-def prepare(snapshot, config, *, progress=None, package_storage):
-    return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
+def prepare(snapshot, config, *, progress=None, core_storage):
+    return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)

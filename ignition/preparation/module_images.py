@@ -4,6 +4,11 @@
 
 """Preparation-scoped native CUPTI module and allocation recording."""
 
+from contextvars import ContextVar
+
+
+_CURRENT = ContextVar("flare_module_images", default=None)
+
 
 def cupti_library(library=None):
     if library is None:
@@ -34,13 +39,16 @@ def global_symbols(image):
 class ModuleImages:
     """Keep native module images and driver allocation records through export."""
 
-    active = 0
-
     def __init__(self, library=None):
         from flare_heliopause import NativeModuleRecorder
 
         self.native = NativeModuleRecorder(str(cupti_library(library)))
         self._active = False
+        self._token = None
+
+    @classmethod
+    def current(cls):
+        return _CURRENT.get()
 
     @property
     def allocations(self):
@@ -52,8 +60,8 @@ class ModuleImages:
 
     def __enter__(self):
         self.native.start()
+        self._token = _CURRENT.set(self)
         self._active = True
-        ModuleImages.active += 1
         return self
 
     def __exit__(self, kind, value, traceback):
@@ -61,5 +69,6 @@ class ModuleImages:
             self.native.stop()
         finally:
             if self._active:
-                ModuleImages.active -= 1
+                _CURRENT.reset(self._token)
+                self._token = None
                 self._active = False

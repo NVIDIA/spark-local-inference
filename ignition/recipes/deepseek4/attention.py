@@ -546,8 +546,8 @@ class PreparedAttention:
                     self.index_query(s.query_low)
                     self.rotate(s.index_query)
                     self.index_weight(source)
-                for selector in self.selectors:
-                    selector()
+                for first, selector in zip(range(0, s.index_query.shape[0], INDEX_ROWS), self.selectors, strict=True):
+                    selector(s.index_query[first:first + INDEX_ROWS], s.index_weights[first:first + INDEX_ROWS])
                 logical = s.selected.long()
                 records = PAGE_TOKENS // 4
                 physical = m.token_page_table.gather(1, (logical // records).clamp(0, m.page_table.shape[1] - 1))

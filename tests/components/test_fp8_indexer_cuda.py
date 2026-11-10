@@ -55,7 +55,7 @@ def test_rotated_fp8_selection_preserves_cache_and_replay_storage(mode, rows):
 
         def forward():
             indexer.write_keys(keys, slots)
-            indexer()
+            indexer(query, weights)
             arena.tensor.fill_(255)
 
         compiled = compile_forward(forward)

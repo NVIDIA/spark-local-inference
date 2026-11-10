@@ -6,10 +6,10 @@ in `ModelIndex.contract`, a typed Protobuf `ServingContract`. Its versioned
 `ModelContract` is decoded as `model::PreparedContract`; there is no per-model
 native implementation or model-name dispatch.
 
-The [Protobuf schema](proto/runtime_package.proto) defines the wire contract.
+The [Protobuf schema](proto/runtime_core.proto) defines the wire contract.
 The [execution manifest](manifest.md) describes physical buffers, graph handles,
 transport, and completion records. The
-[runtime package design](../docs/runtime-package-design.md) specifies resource
+[runtime core design](../docs/runtime-core-design.md) specifies resource
 ownership, signatures, loading, and cache allocation.
 
 ## Ownership and bootstrap
@@ -20,7 +20,7 @@ shared admission, sampling, state transfer, and paged-text components. A recipe
 may bind different buffer names to the same value source. It cannot install
 native scheduling or state-update code.
 
-Build Helios with `server,runtime-package`. `NativeModel::load` selects graph
+Build Helios with `server,runtime-core`. `NativeModel::load` selects graph
 capacities, loads each rank's resources, and backs declared cache storage.
 `NativeModel::manifests` exposes the resulting execution geometry.
 `Bootstrap::load` validates the prepared contract and loads the tokenizer, chat
@@ -33,7 +33,7 @@ no Python calls, CUDA allocation, compilation, or graph capture. Missing graph
 variants and inconsistent contracts fail startup; requests outside prepared
 capacities fail admission.
 
-Payload packages use `PackageBody.format_version` 2 with a signed payload
+Payload cores use `CoreBody.format_version` 2 with a signed payload
 envelope and unsigned `LocationSet`. Each executable resource is one zstd
 level-3 frame with a signed decoded length and compressed-chunk commitments.
 Execution ABI, prepared model contract, and payload format are independent
@@ -43,7 +43,7 @@ previously supported models without re-export.
 
 Payload format 2 and signed format 6 encode each executable resource as one
 mandatory zstd level-3 frame. Signed format 4 retains its authenticated AES-GCM
-chunk reader. In payload packages, the signed `ExecutableResource` binds its
+chunk reader. In payload cores, the signed `ExecutableResource` binds its
 stored frame, signed decoded length,
 resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
 compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
@@ -61,9 +61,9 @@ reduce captured concurrency and speculative width. Physical cache capacities
 are chosen after graph loading and replace preparation's working-set counts.
 History drafting is a startup option that requires enabled learned speculation
 and concrete copied-token inputs in each selected wider graph. Export records
-no history preference. Package defaults fill missing settings; explicit startup options take precedence.
+no history preference. Core defaults fill missing settings; explicit startup options take precedence.
 
-The optional package rebuild manifest and per-rank weight catalogs describe
+The optional core rebuild manifest and per-rank weight catalogs describe
 preparation inputs and stored tensor views. They do not select serving behavior.
 Missing fields, or catalog versions unknown to a serving runtime, leave the
 serving contract and replay path unchanged.
@@ -251,7 +251,7 @@ frames. A frame carries one invocation; parallel calls use consecutive assistant
 frames. The generic `tool` recipient accepts the request's registered invocation
 names. A named tool recipient requires the invocation to match that exact name.
 `<|eom|>` closes an internal message and permits another assistant
-header. Generation ends only at the package's EOS IDs. Header controls delimit
+header. Generation ends only at the core's EOS IDs. Header controls delimit
 frames only when observed as their tokenizer tokens. An initially open
 `<|start|>assistant` header accepts the generated recipient suffix; assistant
 continuation starts inside the prepared reasoning, content, or tool body.

@@ -21,6 +21,7 @@ from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.preparation.scratch import buffer_rows
 from ignition.recipes.kimi3.attention import PreparedMLAProjection
 from ignition.recipes.kimi3.config import PAGE_TOKENS
 from ignition.recipes.kimi3.dcp import RECORD_BYTES, write_records
@@ -117,7 +118,7 @@ class PreparedContext:
     """Project accepted target output taps into each draft layer's paged latent history."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
-                 buffers, context):
+                 buffers, context, allocator=None):
         self.metadata, self.shards = metadata, context.shards
         config, draft = weights.config, weights.draft
         tokens, device = auxiliary.shape[0], auxiliary.device
@@ -125,10 +126,11 @@ class PreparedContext:
 
         def buffer(key, *shape, dtype=torch.bfloat16):
             if key not in buffers:
-                buffers[key] = torch.zeros((tokens, *shape), dtype=dtype, device=device)
+                buffers[key] = (torch.zeros((tokens, *shape), dtype=dtype, device=device) if allocator is None
+                                else allocator.zeros((tokens, *shape), dtype))
             if buffers[key].shape[0] < tokens:
                 raise ValueError("draft context storage must be allocated for the largest capacity first")
-            return buffers[key][:tokens]
+            return buffer_rows(buffers, key, tokens)
 
         self.local = buffer("local", config.hidden // weights.shard.world_size)
         self.projected = buffer("projected", config.hidden)
@@ -288,8 +290,8 @@ class DraftAttention(torch.nn.Module):
         self.current_lengths.copy_(current)
         self.query.copy_(p.absorbed)
         self.gather(self.query.view(m.positions.numel(), -1))
-        self.history_attention()
-        self.current_attention()
+        self.history_attention(self.gathered, self.history)
+        self.current_attention(self.gathered, self.current)
         merge_attention(self.history, self.history_lse, self.current, self.current_lse,
                         self.history_lengths, self.current_lengths, self.history, self.history_lse)
         self.combine(self.history, self.history_lse)

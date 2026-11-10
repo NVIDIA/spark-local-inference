@@ -206,7 +206,7 @@ def test_rank_preparation_rejects_invalid_k31_inputs_before_cuda(raw_config, tmp
 
     (tmp_path / "config.json").write_text(json.dumps(raw_config))
     with pytest.raises(ValueError, match=reason):
-        prepare_rank(tmp_path, PreparationConfig(**options), rank=0, group=None, package_storage=None)
+        prepare_rank(tmp_path, PreparationConfig(**options), rank=0, group=None, core_storage=None)
 
 
 def test_native_quantization_covers_all_routed_experts(config):

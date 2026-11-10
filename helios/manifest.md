@@ -2,7 +2,7 @@
 
 Execution ABI `6` describes graph execution and transport over one existing CUDA
 context. A resource owner retains the context, graphs and allocations through
-shutdown. `NativeResources` reconstructs these resources from a runtime package written
+shutdown. `NativeResources` reconstructs these resources from a runtime core written
 by Ignition before native serving starts. The model recipe defines the numerical behavior of each executable.
 
 The Python representation is a dictionary with these fields:
@@ -77,22 +77,22 @@ and deadlines retain the normal coordinated drain requirements.
 
 Tuning graphs implement measurement and selection. Native execution treats their
 outputs as opaque values; it neither interprets kernel protocols nor searches
-configurations. Outputs remain fixed during serving. Package graph selection
+configurations. Outputs remain fixed during serving. Core graph selection
 retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
 Execution ABI numbers are descriptive metadata and do not gate loading or rank
-agreement. Engine upgrades preserve previously supported package layouts. The
+agreement. Engine upgrades preserve previously supported core layouts. The
 runtime validates graph operations, buffer geometry, and storage dependencies.
 
 ## Serving graph transport
 
-`Execution.completion_token_capacity` is a uint32 package field. An omitted or
+`Execution.completion_token_capacity` is a uint32 core field. An omitted or
 zero value resolves to eight tokens; a positive value is the token capacity T.
 All ranks use the same resolved value. Completion records have 16 metadata fields
 and T token fields. Generation logprobs have T token positions, and optional
 survival outputs have T−1 positions. Proposal-confidence buffers may have
-one through T−1 positions and must cover each graph’s confidence width. Packages
+one through T−1 positions and must cover each graph’s confidence width. Cores
 with T=1 omit these zero-depth outputs. Graph verification widths cannot exceed T; model
 and operator limits may be smaller. Continuation-state geometry is independent
 of completion token capacity.
@@ -114,7 +114,7 @@ captured proposal depth, per-request target capacity, and aggregate target rows.
 W is from 1 through T, the resolved completion token capacity; P is from B
 through B × W, including rectangular P = B × W.
 An omitted or zero packed token capacity resolves to B × W for speculative
-graphs, preserving packages exported before that field was added.
+graphs, preserving cores exported before that field was added.
 Width-one speculative graphs have D = 0 and maintain draft context. No standalone
 proposal, verification, or packed-speculative graph kind exists.
 Prefill has batch capacity 1. Token capacities are 1, 16, or a multiple of 64
@@ -170,17 +170,17 @@ and appends its chosen pair only when absent from explicit alternatives.
 
 For a reporting frame, one pitched D2H copy transfers `TC * 4(2+2W)` bytes,
 with W the larger of 20 and the frame's largest explicit count. Source pitch
-follows package storage; compact pinned decoding uses the copied pitch, while
-mapped-host decoding uses package pitch. Frames without reporting copy no
+follows core storage; compact pinned decoding uses the copied pitch, while
+mapped-host decoding uses core pitch. Frames without reporting copy no
 generation payload. Natural width-20 readback uses 168TC bytes; explicit
 width 128 uses 1,032TC.
 Prompt output geometry and readback are independent of generation width.
 
-Relative to width-20 packages, persistent generation output adds 1,728TC bytes
+Relative to width-20 cores, persistent generation output adds 1,728TC bytes
 per rank and inputs add 516C. Each private output adds another 1,728TC; two
 pinned generation frames add 1,728TC on discrete GPUs. Two input staging frames
 add 1,032C before alignment. Allocator rounding and resulting KV capacity must
-be measured for the complete package.
+be measured for the complete core.
 
 Each submission adds 4C H2D count bytes per rank and one upload descriptor even
 without explicit IDs. Explicit prefixes add `4ΣN` H2D bytes. The existing remote
@@ -197,7 +197,7 @@ GPU timestamps before its external readiness wait, after readiness, and after a
 prepared all-rank reduction. Table indices follow the embedding catalog. Every
 graph consuming embedding tables writes all triples for its selected frame.
 Other graphs leave them untouched. The executor retains each frame's readback
-through its transfer fence. Packages without this output retain raw replay-cost
+through its transfer fence. Cores without this output retain raw replay-cost
 estimation.
 
 Across ranks, the estimator takes the minimum readiness-through-reduction span
@@ -318,14 +318,14 @@ request-state, page-table, positional and sampling input names are additional
 named buffers and bindings. Shared input packing validates their semantic
 bindings before serving requests.
 
-## Native runtime package
+## Native runtime core
 
-`ignition export MODEL --gpus N[,N...]` prepares a native package in the shared
-cache and prints its entry path. `flare run CACHE_ENTRY` loads that package.
+`ignition export MODEL --gpus N[,N...]` prepares a native core in the shared
+cache and prints its entry path. `flare run CACHE_ENTRY` loads that core.
 Each TP rank has its own resource bundle. Helios serves ranks as threads in one Rust
 process. Ignition exits or replaces its Python process through `execv` before
 the native server starts. The CUDA driver creates context, module, function,
-graph, and executable handles from the package descriptions.
+graph, and executable handles from the core descriptions.
 
 The safetensors file contains two one-dimensional `U8` tensors:
 `flare.payload` holds all resource bytes and alignment padding;
@@ -353,7 +353,7 @@ launching the consumer. Transfer N+1 waits for the compute-stream start event
 following graph N, protecting reusable device scratch. A host frame is reusable
 only after every participating rank completes its consumer. Shutdown drains row
 copy, model, and completion streams; their owners survive an unconfirmed drain.
-The package memory budget includes both host staging frames once per shared
+The core memory budget includes both host staging frames once per shared
 rank group.
 
 Graph declarations specify operation, sampling mode, B/D/W/P, confidence output
@@ -371,14 +371,14 @@ number of nodes followed by its edges, encoded as u32 little-endian lengths
 and Protobuf records. Records are limited to 1 MiB. Helios decodes one record
 at a time and drops CUDA graph templates after instantiation. Tensor loading
 uses 16 MiB of pinned staging memory across all ranks; module images are
-mapped from the package while loading.
+mapped from the core while loading.
 
-The schema is `proto/runtime_package.proto`. `prost-build` generates Rust
-bindings during builds with `runtime-package`; these builds require `protoc`.
+The schema is `proto/runtime_core.proto`. `prost-build` generates Rust
+bindings during builds with `runtime-core`; these builds require `protoc`.
 Regenerate checked-in Python bindings with:
 
 ```sh
-protoc --proto_path=helios/proto --python_out=ignition/preparation helios/proto/runtime_package.proto
+protoc --proto_path=helios/proto --python_out=ignition/preparation helios/proto/runtime_core.proto
 ```
 
 Allocation references name an allocation and byte offset. Explicit relocations
@@ -395,7 +395,7 @@ page counts. Serving performs no allocation or remapping.
 Supported graph nodes are kernels, empty nodes, memset operations, named
 external event waits, and contiguous device-to-device copies. Other node types and device-updatable
 kernels reject export. Qwen and GLM use the shared native loader and scheduler.
-Packages are trusted executable input. Listener configuration and API keys are
+Cores are trusted executable input. Listener configuration and API keys are
 supplied when launching. Resources remain owned until replay drains; a failed
 drain retains them until process termination. Incompatible files require
-re-export; there is no directory or JSON package loader.
+re-export; there is no directory or JSON core loader.

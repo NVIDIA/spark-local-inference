@@ -19,7 +19,10 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.parallel import TensorParallelShard
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_token_capacity
+from ignition.components.capacity import (
+    batch_capacities, prefill_capacities, request_capacity,
+    speculative_token_capacity, serving_modes,
+)
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -76,6 +79,7 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    mtp_only: bool = False
 
     @property
     def speculative_round_shapes(self):
@@ -94,6 +98,9 @@ class PreparationConfig:
         return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if self.mtp_only and (self.draft_checkpoint is None
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
@@ -119,7 +126,7 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare(snapshot, config, *, progress=None, package_storage):
+def prepare(snapshot, config, *, progress=None, core_storage):
     from .recipe import RECIPE
 
     snapshot = Path(snapshot).resolve()
@@ -128,7 +135,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=TensorParallelShard(0, 1), progress=progress,
                                 draft_checkpoint=config.draft_checkpoint)
     drafting = weights.draft is not None
@@ -143,7 +150,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     total_memory = torch.cuda.mem_get_info(device)[1]
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(weights.config, state_rows + 1, pages, device,
-            storage=package_storage, maximum_pages=total_memory // page_bytes(weights.config),
+            storage=core_storage, maximum_pages=total_memory // page_bytes(weights.config),
             maximum_rows=total_memory // layout.row_bytes, backed_slots=min(state_rows + 1, 1 + 2 * slots))
         vocabulary = weights.config.vocabulary
         requests = DeviceRequestState.allocate(device, vocab_size=vocabulary, capacity=slots)
@@ -163,13 +170,13 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="nemotron-h", numerical_policy="default", coordinator=coordinator,
-            headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
+            headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
-        scratch_pool = package_storage.scratch_pool()
+        scratch_pool = core_storage.scratch_pool()
         graph_buffers, layer_buffers = GraphBufferPool(device), GraphBufferPool(device)
         with scratch_pool:
             vision_inputs = VisionInputs.allocate(device)
@@ -191,9 +198,9 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         speculation = SpeculativePreparation(weights, pool, requests, inputs, completion=completion, frame=frame,
             sequence=sequence, session=session, workspace=arena, coordinator=coordinator,
             buffers=graph_buffers, layer_buffers=layer_buffers)
-    modes = (True, False) if drafting else (False,)
+    modes = serving_modes(drafting, config.mtp_only)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
-             + len(batch_sizes) + len(config.speculative_round_shapes) + len(PATCH_CAPACITIES))
+             + (len(batch_sizes) if False in modes else 0) + len(config.speculative_round_shapes) + len(PATCH_CAPACITIES))
     with phase(progress, "Construct graph catalog", total=count) as stage:
         def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
             if kind == "scored_prefill":
@@ -265,7 +272,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None, console=stage.console)
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
 
@@ -278,7 +285,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
             stream=stream, pool=graph_pool, collective=None, coordinator=coordinator,
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
-            retain_graphs=config.retain_graphs, materialize=materialize, warmup_storage=package_storage,
+            retain_graphs=config.retain_graphs, materialize=materialize, warmup_storage=core_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
     finally:
         scratch_pool.materialize()

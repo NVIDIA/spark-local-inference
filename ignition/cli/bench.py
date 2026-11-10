@@ -43,6 +43,8 @@ def arguments(parser):
                          help="preceding consumed tokens, multiples of 128 (default: 512,2048,8192,16384; --prefill: 0)")
     options.add_argument("--verify-width", type=int, metavar="N",
                          help="target tokens per request including pending token: 8 or 16; 8,13,16 with --speculation-study")
+    options.add_argument("--verify-prefixes", type=_integers, metavar="LIST",
+                         help="single-request packed verification prefixes, e.g. 1,4,6,8; retains the full proposal count for prefixes above one")
     options.add_argument("--warmup", type=int, default=5, metavar="N",
                          help="positive untimed restored replays per case and seed (default: 5)")
     options.add_argument("--repetitions", type=int, default=20, metavar="N",
@@ -64,17 +66,23 @@ class Settings:
     prefill: bool = False
     speculation_study: bool = False
     study_widths: tuple[int, ...] = ()
+    verification_prefixes: tuple[int, ...] = ()
 
     @classmethod
     def from_args(cls, args):
         study = getattr(args, "speculation_study", False)
-        batches = args.batches if args.batches is not None else ((1,) if args.prefill or study else (1, 2, 4))
+        batches = args.batches if args.batches is not None else ((1,) if args.prefill or study or args.verify_prefixes else (1, 2, 4))
         contexts = args.contexts if args.contexts is not None else ((0,) if args.prefill else (8192,) if study else (512, 2048, 8192, 16384))
         if args.prefill and args.verify_width is not None:
             raise UsageError("--verify-width does not apply to --prefill")
         if args.prefill and batches != (1,):
             raise UsageError("--prefill requires --batches 1")
         study_widths = getattr(args, "study_widths", None)
+        verification_prefixes = getattr(args, "verify_prefixes", None)
+        if verification_prefixes is not None:
+            if args.prefill or study or batches != (1,):
+                raise UsageError("--verify-prefixes requires --batches 1 without --prefill or --speculation-study")
+            verification_prefixes = tuple(sorted(verification_prefixes))
         if study_widths is not None:
             if not study or any(w not in (8, 13, 16) for w in study_widths):
                 raise UsageError("--study-widths requires --speculation-study and widths from 8,13,16")
@@ -90,6 +98,8 @@ class Settings:
             raise UsageError("--speculation-study requires --batches 1 and --verify-width 8,13,16 without --prefill")
         if not args.prefill and not study and width not in (8, 16):
             raise UsageError("ignition bench requires --verify-width 8 or 16 and matching --mtp-draft-tokens 7 or 15")
+        if verification_prefixes and (verification_prefixes[0] < 1 or verification_prefixes[-1] > width):
+            raise UsageError("--verify-prefixes must be positive and no larger than --verify-width")
         if any(value not in (1, 2, 4, 8) for value in batches):
             raise UsageError("--batches must select request counts from 1,2,4,8")
         if any(value < (0 if args.prefill else 128) or value % 128 for value in contexts):
@@ -105,9 +115,10 @@ class Settings:
         if args.mixed_prefill or args.prompt_logprobs:
             raise UsageError("ignition bench measures speculative rounds or unscored prefill; --mixed-prefill and --prompt-logprobs do not apply")
         if args.official_source is not None:
-            raise UsageError("--official-source applies to package publishing; ignition bench exports no package")
+            raise UsageError("--official-source applies to core publishing; ignition bench exports no core")
         return cls(tuple(sorted(batches)), tuple(sorted(contexts)), 8 if args.prefill else width,
-                   args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or ())
+                   args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or (),
+                   verification_prefixes or ())
 
 
 def table(result):
@@ -161,7 +172,7 @@ def run(args):
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
         batches=settings.batches, contexts=settings.contexts, width=settings.width,
         prefill_chunk=plan.prefill_chunk if settings.prefill else 0, speculation_study=settings.speculation_study,
-        study_widths=settings.study_widths))
+        study_widths=settings.study_widths, verification_prefixes=settings.verification_prefixes))
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     progress = _progress(args.verbose)
     hub_cache = configuration.directory("hub_cache")
@@ -209,7 +220,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
     from tokenizers import Tokenizer
     from ignition.bench.runner import BenchmarkCase, PrefillCase, run_benchmark
     from ignition.bench.study import StudyCase, run_study
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning_replicas import prepare_recipe
 
     snapshot = model.snapshot(configuration.directory("hub_cache"))
@@ -221,6 +232,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
     details["configuration"] = {"model": model.model_id, "checkpoint_directory": str(snapshot),
         "repository": model.checkpoint.repository, "revision": model.checkpoint.revision,
         "compiled_forwards": compile_forwards, "torch_version": torch.__version__,
+        "verification_prefixes": settings.verification_prefixes, "logical_verification_width": settings.width,
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
@@ -246,21 +258,29 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             print(f"Measured {counts}", file=sys.stderr, flush=True)
 
     torch.cuda.set_device(0)
-    storage = PackageStorage(world=plan.world_size)
+    storage = CoreStorage(world=plan.world_size)
     try:
         with storage:
             prepared = prepare_recipe(model.recipe.prepare, snapshot, plan, compile_forwards=compile_forwards,
-                kernel_cache=configuration.directory("kernel_cache"), progress=progress, package_storage=storage)
+                kernel_cache=configuration.directory("kernel_cache"), progress=progress, core_storage=storage)
         with prepared:
             root = getattr(prepared, "model", prepared)
             tokenizer_asset = root.server_config["assets"]["tokenizer"]
             tokenizer = (Tokenizer.from_str(tokenizer_asset["text"]) if "text" in tokenizer_asset
                          else Tokenizer.from_file(tokenizer_asset["path"]))
-            scenarios = (tuple(PrefillCase(chunk_tokens=plan.prefill_chunk, context_tokens=context)
-                               for context in settings.contexts) if settings.prefill else
-                         tuple((StudyCase if settings.speculation_study else BenchmarkCase)(batch=batch, width=width, packed_tokens=batch * width,
-                               context_tokens=context) for batch in settings.batches for context in settings.contexts
-                               for width in settings.study_widths or (settings.width,)))
+            if settings.prefill:
+                scenarios = tuple(PrefillCase(chunk_tokens=plan.prefill_chunk, context_tokens=context)
+                                  for context in settings.contexts)
+            elif settings.speculation_study:
+                scenarios = tuple(StudyCase(batch=batch, width=width, packed_tokens=batch * width,
+                                           context_tokens=context)
+                                  for batch in settings.batches for context in settings.contexts
+                                  for width in settings.study_widths or (settings.width,))
+            else:
+                scenarios = tuple(BenchmarkCase(batch=batch, width=width, packed_tokens=packed,
+                                               context_tokens=context)
+                                  for batch, width, packed in plan.benchmark_selection.speculative_round_shapes
+                                  for context in settings.contexts)
             execute = run_study if settings.speculation_study else run_benchmark
             result = execute(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
                 repetitions=settings.repetitions, seeds=settings.seeds, progress=record)

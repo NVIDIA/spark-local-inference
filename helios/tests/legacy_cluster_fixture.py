@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build a signed two-rank legacy package with a custom primary basename.
+"""Build a signed two-rank legacy core with a custom primary basename.
 
-The package is ordinary test data: both ranks have distinct weights, kernels,
+The core is ordinary test data: both ranks have distinct weights, kernels,
 module globals, and graph executables, plus one shared tokenizer asset. Its
 signed ModelIndex carries a model identity and the cluster identity used by
 distribution rank closure selection.
@@ -16,8 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ignition.preparation import runtime_package_pb2 as proto
-import legacy_package
+from ignition.preparation import runtime_core_pb2 as proto
+import legacy_core
 from signing import publisher
 
 
@@ -79,7 +79,7 @@ def build(path: Path, *, shard_size: int = 4096) -> None:
         asset.sha256 = hashlib.sha256(tokenizer).hexdigest()
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        legacy_package.publish_legacy(
+        legacy_core.publish_legacy(
             path,
             index,
             payload,

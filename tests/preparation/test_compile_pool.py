@@ -13,19 +13,18 @@ from torch._subclasses import FakeTensor
 from ignition.preparation.forward_metadata import dumps, loads
 
 
-@pytest.mark.parametrize("integrated,expected,threads", [(False, 8, 2), (True, 4, 1)])
-def test_compiler_concurrency_accounts_for_shared_device_ram(monkeypatch, integrated, expected, threads):
+@pytest.mark.parametrize("integrated,expected", [(False, 2), (True, 1)])
+def test_compiler_concurrency_accounts_for_shared_device_ram(monkeypatch, integrated, expected):
     from ignition.preparation import compile_pool, host_memory
 
     free = (24 if host_memory.os.name == "nt" else 2) if integrated else 40
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free << 30, 121 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=integrated))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     pool = compile_pool.CompilePool("cuda:0")
     assert pool.workers == expected
-    # Four integrated workers leave no RAM for additional Inductor subprocesses.
-    assert pool.options["compile_threads"] == threads
+    assert pool.options["compile_threads"] == 1
 
 
 def test_forward_compiler_uses_explicit_host_budget_without_eight_worker_cap(monkeypatch):
@@ -33,9 +32,10 @@ def test_forward_compiler_uses_explicit_host_budget_without_eight_worker_cap(mon
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (96 << 30, 96 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 128 << 30)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 1024 << 30)
+    monkeypatch.setattr(host_memory, "cpu_workers", lambda requested=None: requested or 64)
+    monkeypatch.setattr(compile_pool, "cpu_workers", host_memory.cpu_workers)
     assert compile_pool.CompilePool("cuda:0", compile_workers=32).workers == 32
-    assert compile_pool.CompilePool("cuda:0", compile_workers=32, pools=4).workers == 8
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (12 << 30, 96 << 30))
     # A discrete GPU's worker holds 1 GiB.
     assert compile_pool.CompilePool("cuda:0", compile_workers=32, headroom_bytes=2 << 30).workers == 10
@@ -118,14 +118,14 @@ def test_preparation_closures_cannot_execute_in_compiler():
 
 
 @pytest.mark.parametrize("kind", ["storage", "session", "recorded_session"])
-def test_preparation_resources_do_not_serialize_active_package_storage(kind):
+def test_preparation_resources_do_not_serialize_active_core_storage(kind):
     from b12x.preparation import PreparationSession
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tensor_metadata import NumericStorage, _NUMERIC_STORAGE
     from ignition.preparation.tuning import RecordedPreparationSession
 
     with NumericStorage() as registry:
-        storage = PackageStorage.__new__(PackageStorage)
+        storage = CoreStorage.__new__(CoreStorage)
         storage.numeric_storage = registry
         resource = storage
         if kind != "storage":
@@ -175,28 +175,22 @@ def test_attention_layout_restores_before_forwarding_attribute_lookups():
 
 
 
-@pytest.mark.parametrize(("available_gib", "threads"), [(12, 1), (16, 8), (64, 16)])
-def test_integrated_compile_threads_fit_the_ram_workers_leave(available_gib, threads):
-    from ignition.preparation.host_memory import compile_threads
-
-    assert compile_threads(16, workers=1, available=available_gib << 30, device_bytes=2 << 30) == threads
-
-
 # A discrete GPU's worker holds 1 GiB, so 3 GiB free compile three forwards at once.
 @pytest.mark.parametrize(("requested", "free_gib", "workers", "threads"),
-                         [(None, 95, 8, 2), (None, 3, 3, 5), (32, 95, 32, 1), (32, 3, 3, 1)])
+                         [(None, 95, 8, 1), (None, 3, 3, 1), (32, 95, 32, 1), (32, 3, 3, 1)])
 def test_compile_pool_sizes_workers_from_free_device_memory(monkeypatch, requested, free_gib, workers, threads):
     from ignition.preparation import compile_pool
 
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free_gib << 30, 96 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
-    monkeypatch.setattr("ignition.preparation.host_memory.available_bytes", lambda: 128 << 30)
+    monkeypatch.setattr("ignition.preparation.host_memory.available_bytes", lambda: 1024 << 30)
+    monkeypatch.setattr(compile_pool, "cpu_workers", lambda requested=None: requested or 64)
     pool = compile_pool.CompilePool("cuda:0", compile_workers=requested)
     assert (pool.workers, pool.options["compile_threads"]) == (workers, threads)
 
 
-@pytest.mark.parametrize("integrated,workers,threads", [(False, 8, 2), (True, 4, 1)])
+@pytest.mark.parametrize("integrated,workers,threads", [(False, 2, 1), (True, 1, 1)])
 def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integrated, workers, threads):
     from concurrent.futures import Future
     from torch._inductor.compile_worker import subproc_pool
@@ -205,7 +199,7 @@ def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integra
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40 << 30, 121 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=integrated))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
     executors = []
 
     class Executor:
@@ -238,30 +232,29 @@ def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integra
     assert executor.closed and compile_pool._OPTIONS["compile_threads"] == 16
 
 
-@pytest.mark.parametrize("integrated,workers", [(False, 8), (True, 2)])
+@pytest.mark.parametrize("integrated,workers", [(False, 2), (True, 1)])
 def test_compilation_preserves_configured_headroom(monkeypatch, integrated, workers):
     from ignition.preparation import compile_pool, host_memory
 
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40 << 30, 121 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=integrated))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
     assert compile_pool.CompilePool("cuda:0", headroom_bytes=16 << 30).workers == workers
     with pytest.raises(MemoryError, match="headroom"):
         compile_pool.CompilePool("cuda:0", headroom_bytes=(40 << 30) - (512 << 20))
 
 
-@pytest.mark.parametrize("pools,workers", [(1, 8), (2, 4), (4, 2)])
+@pytest.mark.parametrize("pools,workers", [(1, [2]), (2, [1, 1]), (4, [1, 1, 0, 0])])
 def test_ranks_sharing_a_host_split_its_compilers(monkeypatch, pools, workers):
     from ignition.preparation import compile_pool, host_memory
 
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (40 << 30, 96 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 << 30)
-    pool = compile_pool.CompilePool("cuda:0", pools=pools)
-    # Every rank's pool together stays within the host's threads and RAM.
-    assert pool.workers == workers and pools * pool.workers * pool.options["compile_threads"] == 16
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
+    resources = [compile_pool.compiler_resources("cuda:0") for _ in range(pools)]
+    assert compile_pool.allocate_workers(resources, [16] * pools, ["host"] * pools) == workers
 
 
 def test_windows_compiler_workers_fit_host_ram_with_larger_device_budget(monkeypatch):
@@ -271,9 +264,83 @@ def test_windows_compiler_workers_fit_host_ram_with_larger_device_budget(monkeyp
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     monkeypatch.setattr(compile_pool, "device_memory_info", lambda device: (105 << 30, 110 << 30))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
-    monkeypatch.setattr(host_memory, "available_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 48 << 30)
     pool = compile_pool.CompilePool("cuda:0", headroom_bytes=8 << 30)
-    assert (pool.workers, pool.options["compile_threads"]) == (4, 1)
+    assert (pool.workers, pool.options["compile_threads"]) == (2, 1)
+
+
+def test_host_admission_leaves_zero_worker_ranks_when_ram_cannot_cover_every_owner():
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(32, 104 << 30, 16, 16 << 30, 8 << 30)] * 16
+    workers = allocate_workers(resources, [8] * 16, ["host"] * 16)
+    assert workers == [1] * 6 + [0] * 10
+    assert sum(workers) * (16 << 30) + (8 << 30) == 104 << 30
+
+
+@pytest.mark.parametrize("limit,capacity,jobs,expected", [(3, 8, 100, 3), (16, 1, 100, 2), (16, 8, 1, 1)])
+def test_host_admission_respects_cpu_device_and_missing_work_limits(limit, capacity, jobs, expected):
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(capacity, 1024 << 30, limit, 16 << 30, 8 << 30)] * 2
+    workers = allocate_workers(resources, [jobs, 0], ["host"] * 2)
+    assert sum(workers) == expected
+    assert max(workers) <= capacity
+
+
+def test_shared_device_admission_counts_host_and_device_storage_once():
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(16, 44 << 30, 16, 18 << 30, 8 << 30)] * 4
+    assert allocate_workers(resources, [10] * 4, ["host"] * 4) == [1, 1, 0, 0]
+    resources = [CompilerResources(16, 52 << 30, 16, 18 << 30, 16 << 30)] * 4
+    assert allocate_workers(resources, [10] * 4, ["host"] * 4) == [1, 1, 0, 0]
+
+
+def test_host_admission_uses_conservative_peer_samples_and_independent_host_budgets():
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(8, free << 30, limit, 16 << 30, 8 << 30)
+                 for free, limit in [(104, 16), (104, 4), (40, 16), (104, 16)]]
+    assert allocate_workers(resources, [10] * 4, ["a", "b", "a", "b"]) == [1, 2, 1, 2]
+
+
+def test_cached_host_needs_no_compiler_capacity_but_missing_work_requires_one():
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(0, 0, 16, 16 << 30, 8 << 30)]
+    assert allocate_workers(resources, [0], ["cached"]) == [0]
+    with pytest.raises(MemoryError, match="host 'missing'.*1 missing forwards.*no capacity"):
+        allocate_workers(resources, [1], ["missing"])
+
+
+@pytest.mark.parametrize("shared_bytes,available", [(0, 10), (2, 12), (2, 24)])
+def test_minimum_worker_allowance_preserves_one_worker_per_host(shared_bytes, available):
+    from ignition.preparation.compile_pool import CompilerResources, allocate_workers
+
+    resources = [CompilerResources(8, available << 30, 16, (16 + shared_bytes) << 30, 8 << 30)] * 4
+    assert allocate_workers(resources, [10] * 4, ["a", "b", "a", "b"]) == [1, 1, 0, 0]
+    resources = [CompilerResources(8, 11 << 30, 16, 18 << 30, 8 << 30)] * 2
+    with pytest.raises(MemoryError, match="no capacity"):
+        allocate_workers(resources, [10] * 2, ["a"] * 2)
+
+
+def test_explicit_forward_workers_are_bounded_by_cpu_affinity(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda _: set(range(3)))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 1024 << 30)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (96 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    assert compile_pool.CompilePool("cuda:0", compile_workers=32).workers == 3
+
+
+def test_admitted_pool_does_not_resample_resources(monkeypatch):
+    from ignition.preparation import compile_pool
+
+    monkeypatch.setattr(compile_pool, "compiler_resources", lambda *args, **kwargs: pytest.fail("resampled"))
+    pool = compile_pool.CompilePool("cuda:0", workers=2)
+    assert pool.workers == 2 and pool.options["compile_threads"] == 1
 
 
 @pytest.mark.parametrize("recorded", [False, True])

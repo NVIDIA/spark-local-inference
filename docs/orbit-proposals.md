@@ -63,7 +63,7 @@ agent would write them to a private temporary file and pass its path through
 `--checkpoint-token-file`, a proposed flag for `ignition export` and
 `ignition join` that would override `[preparation] checkpoint_token_file`. The
 token would last only for that preparation. Output would stream to the
-controller with `[rank R name]` prefixes, and the exported package would stay
+controller with `[rank R name]` prefixes, and the exported core would stay
 on rank zero's host, from where
 `flare orbit run maxwell:/data/flare-runtime/glm53-spark-tp4.safetensors`
 serves it.
@@ -77,7 +77,7 @@ their placement. Stops would precede starts so placement can use released GPUs.
 `--dry-run` would report the plan without applying it.
 
 The existing `run`, `stop`, and `push` commands would remain the execution
-primitives. Grants, package verification, placement, metrics, and one rank zero
+primitives. Grants, core verification, placement, metrics, and one rank zero
 per group would retain their roles. This proposal adds no consensus service;
 controllers need a shared desired configuration to reconcile the same intent.
 
@@ -86,7 +86,7 @@ controllers need a shared desired configuration to reconcile the same intent.
 - Discovery must report the same node identity as an authenticated connection.
 - Fabric validation must agree with the rails serving selects and report a
   deliberately missing link before preparation.
-- Agent-managed preparation must produce a signed TP4 package that serves
+- Agent-managed preparation must produce a signed TP4 core that serves
   equivalently to preparation started directly on the hosts.
 - Reconciliation must preserve unchanged running groups, show changes without
   applying them in dry-run mode, and release GPUs before replacement launches.

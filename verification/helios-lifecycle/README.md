@@ -337,7 +337,7 @@ token IDs and consumed position, vector lengths zero through sixteen, optional
 vectors/cursors, and speculative or decode operation kind. Cursor arithmetic
 uses an `i128` oracle. Separate soundness and completeness harnesses check
 acceptance and rejection against the same requirements. Unrelated metadata is
-fixed; package validation is outside these harnesses. Counts, token lower bounds,
+fixed; core validation is outside these harnesses. Counts, token lower bounds,
 and status validity belong to the transport and scheduler validators. Cursor lags larger
 than `u32::MAX` are outside this proof's domain.
 
@@ -365,7 +365,7 @@ That test checks lookup before geometry validation, exact error classifications
 and messages, malformed geometry, and equality boundaries. The numerical Kani
 proof excludes manifest lookup and diagnostic construction. Shape and stride
 vectors represent empty and single-element inputs; the predicate reads only
-their lengths and first elements. Package validity, allocation failure,
+their lengths and first elements. Core validity, allocation failure,
 resource-owner destruction, GPU state, and rank interleavings require their
 separate checks.
 

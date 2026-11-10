@@ -46,7 +46,7 @@ class PreparedDenseMLA:
         self.arguments = dict(q=query, kv_cache=cache, output=output, page_table=page_table,
                               cache_seqlens=lengths, cu_seqlens_q=starts, kv_scale=kv_scale, q_scale=q_scale)
         self.plan = dense_mla.plan(caps, invocation=dense_mla.invocation_from_tensors(caps, **self.arguments))
-        self.output, self.scale = output, float(scale)
+        self.scale = float(scale)
         self.lse = lse
 
         def prepare(state, arguments):
@@ -96,9 +96,9 @@ class PreparedDenseMLA:
 
         register_finalizer(session, finalize, workspace=workspace)
 
-    def __call__(self):
+    def __call__(self, query, output):
         a = self.arguments
-        _attend(a["q"], a["kv_cache"], a["output"], a["page_table"], a["cache_seqlens"],
+        _attend(query, a["kv_cache"], output, a["page_table"], a["cache_seqlens"],
                 a["cu_seqlens_q"], self.scratch, self.plan.handle, self.scale, self.lse,
                 a["kv_scale"], a["q_scale"])
-        return self.output
+        return output

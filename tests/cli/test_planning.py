@@ -146,7 +146,7 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
     assert (f"draft head {(draft or '').upper()}" in summary) == bool(draft)
     assert (f"markov head {(markov or '').upper()}" in summary) == bool(markov)
     from google.protobuf import json_format
-    from ignition.preparation import runtime_package_pb2 as proto
+    from ignition.preparation import runtime_core_pb2 as proto
 
     manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), result, compiled_forwards=True)
     encoded = proto.RebuildManifest()
@@ -177,7 +177,7 @@ def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
 def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="deepseek41"))
@@ -271,7 +271,7 @@ def test_speculation_settings_are_validated_and_described():
     assert fixed.widths == (1, 2, 3) and fixed.fixed_width == 3
     assert Speculation(0).widths == (1,) and Speculation(0, adaptive=False).fixed_width == 1
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
-    assert record == {"draft_tokens": 5, "adaptive": True,
+    assert record == {"draft_tokens": 5, "adaptive": True, "mtp_only": False,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
                       "draft_head_quantization": None, "markov_head_quantization": None,
                       "vocabulary_parallel_sampling": False}
@@ -363,7 +363,7 @@ def test_kimi_online_mxfp8_recipe_default_reaches_cli_plan_and_metadata(tmp_path
     from google.protobuf import json_format
     from ignition.cli import _parser, preparation
     from ignition.cli.config import Configuration
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from ignition.recipes import resolve
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
@@ -738,7 +738,7 @@ def test_recipe_b12x_settings_name_b12x_variables():
 def test_sharded_hyperconnections_require_qwen_tp_and_survive_rebuild_serialization(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="qwen38"), gpus=(gpu(0, 95), gpu(1, 95)), selected=(0, 1))
@@ -816,7 +816,7 @@ def test_cli_derive_carries_resolved_collective_policy(tmp_path, configured, fla
 
 def test_collective_ladder_plan_and_rebuild_round_trip():
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from ignition.preparation.collective_ladder import load
 
     ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
@@ -839,7 +839,7 @@ def test_collective_ladder_plan_and_rebuild_round_trip():
 def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="qwen38"))

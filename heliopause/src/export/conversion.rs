@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Convert and re-sign payload-format packages without CUDA initialization.
+//! Convert and re-sign payload-format cores without CUDA initialization.
 use super::{ExportResult as Result, invalid};
 use super::protection::PublisherRequest;
 #[cfg(test)]
@@ -11,16 +11,16 @@ use super::protection::Publisher;
 use pyo3::{exceptions::PyValueError, prelude::*};
 use std::{collections::BTreeSet, path::Path, time::SystemTime};
 
-/// Report which canonical form a package uses, or `legacy` for the blob format.
+/// Report which canonical form a core uses, or `legacy` for the blob format.
 #[pyfunction]
 fn export_payload_form(py: Python<'_>, source: String) -> PyResult<String> {
     py.detach(|| {
-        let form = helios_core::package::conversion::form(Path::new(&source))?;
+        let form = helios_core::core::conversion::form(Path::new(&source))?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
             match form {
                 None => "legacy",
-                Some(helios_core::package::conversion::Form::Packed) => "packed",
-                Some(helios_core::package::conversion::Form::Directory) => "directory",
+                Some(helios_core::core::conversion::Form::Packed) => "packed",
+                Some(helios_core::core::conversion::Form::Directory) => "directory",
             }
             .to_string(),
         )
@@ -28,7 +28,7 @@ fn export_payload_form(py: Python<'_>, source: String) -> PyResult<String> {
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Convert a payload-format package between its packed and directory forms.
+/// Convert a payload-format core between its packed and directory forms.
 ///
 /// This is keyless: signed bodies, signatures, compressed executables and payload bytes are
 /// copied exactly; only the unsigned location tensor is re-encoded.
@@ -42,11 +42,11 @@ fn export_payload_convert(
     py.detach(|| {
         let (source, destination) = (Path::new(&source), Path::new(&destination));
         match form.as_str() {
-            "packed" => helios_core::package::conversion::pack(source, destination)?,
-            "directory" => helios_core::package::conversion::unpack(source, destination)?,
+            "packed" => helios_core::core::conversion::pack(source, destination)?,
+            "directory" => helios_core::core::conversion::unpack(source, destination)?,
             other => {
                 return Err(super::invalid(format!(
-                    "unknown payload package form {other:?}"
+                    "unknown payload core form {other:?}"
                 )));
             }
         }
@@ -89,12 +89,12 @@ struct PublicProfile {
     development: bool,
 }
 
-pub(crate) fn payload_publishers(profiles: &str) -> Result<Vec<helios_core::runtime_package::Publisher>> {
+pub(crate) fn payload_publishers(profiles: &str) -> Result<Vec<helios_core::runtime_core::Publisher>> {
     let profiles: Vec<PublicProfile> = serde_json::from_str(profiles)?;
     profiles
         .into_iter()
         .map(|profile| {
-            Ok(helios_core::runtime_package::Publisher {
+            Ok(helios_core::runtime_core::Publisher {
                 name: if profile.name.is_empty() {
                     profile.namespace.clone()
                 } else {
@@ -112,7 +112,7 @@ pub(crate) fn payload_publishers(profiles: &str) -> Result<Vec<helios_core::runt
         .collect()
 }
 
-/// Combine independently prepared TP packages into one signed package.
+/// Combine independently prepared TP cores into one signed core.
 #[pyfunction]
 fn export_payload_combine(
     py: Python<'_>,
@@ -130,11 +130,11 @@ fn export_payload_combine(
         payload_publishers(&profiles).map_err(|e| PyValueError::new_err(e.to_string()))?;
     if form != "directory" && form != "packed" {
         return Err(PyValueError::new_err(format!(
-            "unknown package form {form:?}"
+            "unknown core form {form:?}"
         )));
     }
     py.detach(|| {
-        use helios_core::package::conversion;
+        use helios_core::core::conversion;
         let source_paths: Vec<std::path::PathBuf> =
             sources.iter().map(std::path::PathBuf::from).collect();
         let publisher = request.publisher()?;
@@ -147,7 +147,7 @@ fn export_payload_combine(
             let staging = tempfile::Builder::new()
                 .prefix(".flare-packed-")
                 .tempdir_in(parent)?;
-            let directory = staging.path().join("package");
+            let directory = staging.path().join("core");
             let published = conversion::combine(&conversion::CombineRequest {
                 sources: &source_paths,
                 output: &directory,
@@ -198,7 +198,7 @@ fn export_payload_edit(
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     py.detach(|| -> Result<()> {
         let publisher = request.publisher()?;
-        helios_core::package::conversion::edit(&helios_core::package::conversion::EditRequest {
+        helios_core::core::conversion::edit(&helios_core::core::conversion::EditRequest {
             source: Path::new(&source),
             output: Path::new(&destination),
             publishers: &publishers,
@@ -211,7 +211,7 @@ fn export_payload_edit(
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Re-sign one payload package under a fresh identity, recompressing executables.
+/// Re-sign one payload core under a fresh identity, recompressing executables.
 #[pyfunction]
 fn export_payload_promote(
     py: Python<'_>,
@@ -227,14 +227,14 @@ fn export_payload_promote(
         serde_json::from_str(&publisher).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let publishers =
         payload_publishers(&profiles).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let target_publisher: Option<helios_core::package::conversion::TargetPublisher> =
+    let target_publisher: Option<helios_core::core::conversion::TargetPublisher> =
         target_publisher
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
     py.detach(|| {
         let publisher = request.publisher()?;
-        let published = helios_core::package::conversion::promote(
+        let published = helios_core::core::conversion::promote(
             Path::new(&source),
             Path::new(&destination),
             &publishers,
@@ -255,7 +255,7 @@ fn export_payload_promote(
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Install a payload package into the shared cache as a committed leased entry,
+/// Install a payload core into the shared cache as a committed leased entry,
 /// optionally exporting that entry to an exact destination path.
 ///
 /// Cache entries use the directory canonical form. Packed input and a primary
@@ -273,7 +273,7 @@ fn export_payload_convert_cache(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Install one payload package into the shared cache without selecting it until
+/// Install one payload core into the shared cache without selecting it until
 /// the optional standalone export has succeeded.
 fn convert_cache(
     source: &str,
@@ -304,11 +304,11 @@ fn convert_cache_at(
     if form != "directory" {
         return Err(invalid("cache entries use the directory canonical form"));
     }
-    use helios_core::package::cache::{PackageSource, Root};
-    use helios_core::package::protection::Selection;
+    use helios_core::core::cache::{CoreSource, Root};
+    use helios_core::core::protection::Selection;
     let root = Root::open(cache)?;
-    let metadata = helios_core::package::reader::Metadata::open(Path::new(source))?;
-    let envelope = helios_core::package::protection::envelope(&metadata.envelope)?;
+    let metadata = helios_core::core::reader::Metadata::open(Path::new(source))?;
+    let envelope = helios_core::core::protection::envelope(&metadata.envelope)?;
     let mut selections = Vec::with_capacity(envelope.deployments.len());
     for index in 0..envelope.deployments.len() {
         selections.push(Selection::Deployment {
@@ -317,27 +317,27 @@ fn convert_cache_at(
         });
     }
     if selections.is_empty() {
-        return Err(invalid("payload package has no deployment"));
+        return Err(invalid("payload core has no deployment"));
     }
-    let mut package_source = PackageSource::open(Path::new(source), &publishers, selections[0])?;
+    let mut core_source = CoreSource::open(Path::new(source), &publishers, selections[0])?;
     if selections.len() > 1 {
-        package_source = package_source.union(&publishers, &selections[1..])?;
+        core_source = core_source.union(&publishers, &selections[1..])?;
     }
-    let model = package_source
+    let model = core_source
         .verified()
         .first()
-        .map(|verified| verified.package().model_identity.as_str())
+        .map(|verified| verified.core().model_identity.as_str())
         .filter(|identity| !identity.is_empty())
-        .ok_or_else(|| invalid("payload package has no model identity"))?;
-    let model = helios_core::package::cache::model_key(model)?;
-    let candidate = converted_package_candidate(package_source.verified(), at)?;
+        .ok_or_else(|| invalid("payload core has no model identity"))?;
+    let model = helios_core::core::cache::model_key(model)?;
+    let candidate = converted_core_candidate(core_source.verified(), at)?;
     // Reserve the readable name before installation. The reservation stays held
     // through commit, so same-minute conversions receive numeric suffixes rather
     // than racing a caller-chosen entry string.
     let staging = root.stage_named(&model, &candidate)?;
     let plan = root.plan_acquisition(
-        package_source,
-        &helios_core::package::derivation::Limits::default(),
+        core_source,
+        &helios_core::core::derivation::Limits::default(),
     )?;
     // Commit the entry without selecting it: a standalone export may still
     // fail, and a failed conversion must leave the prior default untouched.
@@ -377,23 +377,23 @@ fn convert_cache_at(
     )
 }
 
-/// Name a converted package from its authenticated deployment identities.
-fn converted_package_candidate(
-    verified: &[helios_core::package::protection::VerifiedPackage],
+/// Name a converted core from its authenticated deployment identities.
+fn converted_core_candidate(
+    verified: &[helios_core::core::protection::VerifiedCore],
     at: SystemTime,
 ) -> Result<String> {
-    use helios_core::package::naming;
+    use helios_core::core::naming;
     let mut sizes = BTreeSet::new();
     let mut platform: Option<&str> = None;
-    for package in verified {
-        let deployment = package
+    for core in verified {
+        let deployment = core
             .deployment()
-            .ok_or_else(|| invalid("converted package lacks a deployment"))?;
+            .ok_or_else(|| invalid("converted core lacks a deployment"))?;
         if deployment.tensor_parallel == 0 {
-            return Err(invalid("converted package has a zero tensor-parallel size"));
+            return Err(invalid("converted core has a zero tensor-parallel size"));
         }
         sizes.insert(deployment.tensor_parallel);
-        let hardware = package.package().hardware_identity.as_str();
+        let hardware = core.core().hardware_identity.as_str();
         if naming::PLATFORMS.contains(&hardware) {
             if let Some(previous) = platform {
                 if previous != hardware {
@@ -407,8 +407,8 @@ fn converted_package_candidate(
         }
     }
     let sizes: Vec<u32> = sizes.into_iter().collect();
-    helios_core::package::naming::deployment_candidate(platform, &sizes, at)
-        .ok_or_else(|| invalid("converted package naming requires a tensor-parallel size"))
+    helios_core::core::naming::deployment_candidate(platform, &sizes, at)
+        .ok_or_else(|| invalid("converted core naming requires a tensor-parallel size"))
 }
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_payload_form, module)?)?;
@@ -423,9 +423,9 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Publish one signed payload package whose model identity is `t/model`.
-    fn payload_package(root: &std::path::Path) -> (std::path::PathBuf, Publisher) {
-        use helios_core::package::{PayloadId, container, export as payload_export, schema::wire};
+    /// Publish one signed payload core whose model identity is `t/model`.
+    fn payload_core(root: &std::path::Path) -> (std::path::PathBuf, Publisher) {
+        use helios_core::core::{PayloadId, container, export as payload_export, schema::wire};
         let publisher = Publisher::from_seed(
             &[7u8; 32],
             "t".into(),
@@ -434,7 +434,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let directory = root.join("package");
+        let directory = root.join("core");
         std::fs::create_dir_all(&directory).unwrap();
         let weights = b"convert cache weights".to_vec();
         let weights_id = PayloadId::of(&weights);
@@ -442,7 +442,7 @@ mod tests {
         std::fs::write(&weights_path, &weights).unwrap();
         let graph = root.join("graph.bin");
         std::fs::write(&graph, b"graph-bytes").unwrap();
-        let runtime = helios_core::runtime_package::wire::ServingContract {
+        let runtime = helios_core::runtime_core::wire::ServingContract {
             model_id: "t/model".into(),
             identity: "t/model".into(),
             max_sequence_tokens: 8,
@@ -450,9 +450,9 @@ mod tests {
             pages: 1,
             state_rows: 1,
             page_tokens: 1,
-            model_contract: Some(helios_core::runtime_package::wire::ModelContract {
+            model_contract: Some(helios_core::runtime_core::wire::ModelContract {
                 vocabulary: 8,
-                graphs: vec![helios_core::runtime_package::wire::GraphContract {
+                graphs: vec![helios_core::runtime_core::wire::GraphContract {
                     graph: "decode".into(),
                     ..Default::default()
                 }],
@@ -491,12 +491,12 @@ mod tests {
             ..Default::default()
         };
         let request = payload_export::PublishRequest {
-            package: wire::PackageBody {
+            core: wire::CoreBody {
                 model_identity: "t/model".into(),
                 hardware_identity: "sm120".into(),
-                frontend: Some(helios_core::runtime_package::wire::FrontendSettings::default()),
+                frontend: Some(helios_core::runtime_core::wire::FrontendSettings::default()),
                 sampling_defaults: Some(
-                    helios_core::runtime_package::wire::DefaultSamplingParameters::default(),
+                    helios_core::runtime_core::wire::DefaultSamplingParameters::default(),
                 ),
                 publisher: Some(wire::PublisherMetadata {
                     namespace: "t".into(),
@@ -536,7 +536,7 @@ mod tests {
                     }],
                 }],
             }],
-            package_id: [51u8; 32],
+            core_id: [51u8; 32],
             public_key: publisher.public_key().try_into().unwrap(),
             accepted: "t".into(),
             no_weights: false,
@@ -566,21 +566,21 @@ mod tests {
 
     #[test]
     fn cache_conversion_selects_only_after_a_successful_standalone_export() {
-        use helios_core::package::cache::{PackageSource, Root};
+        use helios_core::core::cache::{CoreSource, Root};
         let scratch = tempfile::tempdir().unwrap();
-        let (source, publisher) = payload_package(scratch.path());
+        let (source, publisher) = payload_core(scratch.path());
         let cache = scratch.path().join("cache");
-        let model = helios_core::package::cache::model_key("t/model").unwrap();
+        let model = helios_core::core::cache::model_key("t/model").unwrap();
         let publishers = payload_publishers(&profiles(&publisher)).unwrap();
-        let selection = helios_core::package::protection::Selection::Deployment {
+        let selection = helios_core::core::protection::Selection::Deployment {
             deployment: 0,
             rank: None,
         };
         {
             // The prior default is a verified payload entry.
-            let source_package = PackageSource::open(&source, &publishers, selection).unwrap();
+            let source_core = CoreSource::open(&source, &publishers, selection).unwrap();
             let root = Root::open(&cache).unwrap();
-            root.install_package(source_package, &model, "prior")
+            root.install_core(source_core, &model, "prior")
                 .unwrap();
         }
 
@@ -617,9 +617,9 @@ mod tests {
             fixed_time(),
         )
         .unwrap();
-        // The exported tree verifies as a signed package and still matches the
+        // The exported tree verifies as a signed core and still matches the
         // installed entry's payload closure.
-        let exported = PackageSource::open(
+        let exported = CoreSource::open(
             &destination.join("model.safetensors"),
             &publishers,
             selection,
@@ -637,9 +637,9 @@ mod tests {
     #[test]
     fn payload_cache_conversion_reserves_same_minute_names() {
         let scratch = tempfile::tempdir().unwrap();
-        let (source, publisher) = payload_package(scratch.path());
+        let (source, publisher) = payload_core(scratch.path());
         let cache = scratch.path().join("cache");
-        let model = helios_core::package::cache::model_key("t/model").unwrap();
+        let model = helios_core::core::cache::model_key("t/model").unwrap();
         for _ in 0..2 {
             convert_cache_at(
                 &source.display().to_string(),
@@ -651,7 +651,7 @@ mod tests {
             )
             .unwrap();
         }
-        let root = helios_core::package::cache::Root::open(&cache).unwrap();
+        let root = helios_core::core::cache::Root::open(&cache).unwrap();
         let mut versions = root.versions(&model).unwrap();
         versions.sort();
         assert_eq!(

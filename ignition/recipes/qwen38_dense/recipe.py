@@ -11,7 +11,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from .bootstrap import PreparationConfig, prepare as prepare_model
 
     if plan.world_size != 1 or ranks is not None:
@@ -27,7 +27,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             draft_head_quantization=speculation.draft_head_quantization,
             speculative_graph_budget=speculation.graph_budget or 64)
     selection = plan.benchmark_selection
-    config = PreparationConfig(benchmark_selection=selection, collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        benchmark_selection=selection, collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         online_mxfp8=plan.online_mxfp8,
@@ -40,7 +41,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         speculative_widths=(1,) if speculation is None else speculation.widths,
         speculative_fixed_width=None if speculation is None else speculation.fixed_width,
         speculative_token_capacity=None if speculation is None else plan.speculative_token_capacity, **drafting)
-    return prepare_model(snapshot, config, progress=progress, package_storage=package_storage)
+    return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
 
 
 def usage(prepared):

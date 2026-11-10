@@ -6,7 +6,7 @@ for the installed system's architecture. The ARM64 build includes RoCE support
 for DGX Spark. The package contains serving, host-agent, and Orbit commands.
 Ignition, Python, model weights,
 and the CUDA toolkit are separate preparation inputs. Serving uses the NVIDIA
-driver installed by DGX OS and a model package matching the GPU architecture and
+driver installed by DGX OS and a model core matching the GPU architecture and
 tensor-parallel size.
 
 The Debian package name distinguishes the inference server from Ubuntu's `flare`

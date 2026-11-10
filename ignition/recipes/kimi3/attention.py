@@ -18,6 +18,7 @@ from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.preparation.scratch import buffer_rows
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES, ContextShards, pull_context, write_records
@@ -44,7 +45,7 @@ class PreparedMLAProjection:
                 dtype = source.dtype if dtype is None else dtype
                 buffers[key] = (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
                                 else allocator.zeros(shape, dtype))
-            return buffers[key][:tokens]
+            return buffer_rows(buffers, key, tokens)
 
         latent_width = weights["query_norm"].shape[0] + RECORD_BYTES
         self.query_norm = buffer("query_norm", latent_width - RECORD_BYTES)
@@ -172,7 +173,7 @@ class PreparedMLA(PreparedMLAProjection):
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
         if shards.world == 1:
             self.lengths.copy_(torch.where(m.lengths > 0, m.starts + m.lengths, 0))
-            self.attention()
+            self.attention(self.absorbed, self.attended)
         elif self.mode == "prefill":
             self.prefill(self.latent)
         else:
@@ -181,7 +182,7 @@ class PreparedMLA(PreparedMLAProjection):
             self.gather(self.quantized.view(tokens, -1))
             self.token_pages.copy_(m.token_page_table)
             self.token_lengths.copy_(shards.local_tokens(m.positions + 1).to(torch.int32))
-            self.attention()
+            self.attention(self.gathered, self.partial)
             self.combine(self.partial, self.lse)
         return self.finish()
 
@@ -206,6 +207,7 @@ class PreparedContextPrefill:
                 or slab.shape[0] < window + tokens):
             raise ValueError("context-parallel prefill requires every rank's cache address and a context slab")
         self.metadata, self.peers, self.shards, self.attended = metadata, peers, context.shards, attended
+        self.absorbed = absorbed
         self.slab, self.window = slab, window
         self.words = slab.view(torch.uint8).view(torch.int32).view(slab.shape[0], RECORD_BYTES // 4)[:window]
         self.windows = -(-width * PAGE_TOKENS * world // window)
@@ -247,7 +249,7 @@ class PreparedContextPrefill:
         self.records.copy_(torch.where(m.positions >= 0, m.positions - latest, -1))
         write_records(latent, self.records, self.slab)
         self.lengths.copy_(torch.where(m.lengths > 0, m.starts - latest + m.lengths, 0))
-        self.attention()
+        self.attention(self.absorbed, self.attended)
         if self.context_attention is None:
             return self.attended
         self.merged.copy_(self.attended.float())
@@ -257,7 +259,7 @@ class PreparedContextPrefill:
             present = bounds[1] > bounds[0]
             self.window_lengths.copy_((bounds[1] - bounds[0]).to(self.window_lengths.dtype).expand_as(
                 self.window_lengths))
-            self.context_attention()
+            self.context_attention(self.absorbed, self.window_attended)
             # An empty window contributes nothing; a query row without positions keeps a zero output.
             peak = torch.maximum(self.lse, torch.where(present, self.window_lse, -torch.inf)).clamp(min=-1e30)
             kept = torch.exp(self.lse - peak)

@@ -14,9 +14,9 @@
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
 //! produced by prefill and one restored from the host.
 //!
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod gpu_tests;
-#[cfg(feature = "runtime-package")]
+#[cfg(feature = "runtime-core")]
 pub(crate) mod pool;
 mod registrar;
 pub mod shard;
@@ -34,17 +34,17 @@ pub use flare_selene::offload::{
 
 pub fn prepare(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, package, identity, geometry, contexts, 1, 0, None)
+    prepare_with_inputs(options, core, identity, geometry, contexts, 1, 0, None)
 }
 
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
@@ -54,7 +54,7 @@ pub fn prepare_with_inputs(
 ) -> Result<Preparation> {
     Ok(flare_selene::offload::prepare_with_inputs(
         options,
-        package,
+        core,
         identity,
         geometry,
         contexts,

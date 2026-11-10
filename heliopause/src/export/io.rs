@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Bounded aligned storage transfers used while constructing runtime packages.
+//! Bounded aligned storage transfers used while constructing runtime cores.
 
 use super::ExportResult as Result;
 use std::{

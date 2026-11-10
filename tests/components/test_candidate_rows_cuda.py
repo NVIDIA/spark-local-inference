@@ -198,12 +198,12 @@ class CandidateAttention:
 
     def __call__(self):
         self.selection()
-        for selected, (owners, counts, gather, attention, _, _) in zip(
+        for selected, (owners, counts, gather, attention, output, _) in zip(
                 self.selection.selected_indices, self.parts, strict=True):
             owners.copy_(torch.where(selected >= 0, 0, -1))
             counts.copy_((selected >= 0).sum(-1).to(torch.int32))
             gather()
-            attention()
+            attention(self.query, output)
         return self.parts[1][4]
 
 

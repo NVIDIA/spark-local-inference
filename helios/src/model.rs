@@ -31,11 +31,11 @@ pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, reasoning_
 pub(crate) use prompt::validate_conditioned_inputs;
 
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub struct ModelConfig {
     pub speculative_fixed_width: Option<usize>,
     /// Maximum target-token rows in wider speculative graphs.
     pub speculative_token_capacity: usize,
-    /// Bytes of weights one decode step reads for one request, as the package declares; zero
+    /// Bytes of weights one decode step reads for one request, as the core declares; zero
     /// when it declares none.
     pub decode_weight_bytes: u64,
     pub history_drafts: bool,
@@ -141,11 +141,11 @@ impl Default for SamplingParameters {
 }
 
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,11 +164,11 @@ impl<T: Copy> SamplingRange<T> {
 }
 
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     serde(default, deny_unknown_fields)
 )]
 #[derive(Clone, Debug, Default, PartialEq)]

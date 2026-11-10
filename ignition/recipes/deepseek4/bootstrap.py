@@ -18,6 +18,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.capacity import (
+    serving_modes,
     speculative_token_capacity,
     batch_capacities,
     prefill_capacities,
@@ -90,8 +91,12 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     # Run single-row decode's shared expert on an auxiliary stream; without overlap it runs serially.
     stream_overlap: bool = True
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dspark
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -164,9 +169,9 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
-    if package_storage is None:
-        raise ValueError("DeepSeek preparation requires package storage")
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
+    if core_storage is None:
+        raise ValueError("DeepSeek preparation requires core storage")
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
@@ -175,7 +180,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                 draft_head_quantization=config.draft_head_quantization,
                                 markov_head_quantization=config.markov_head_quantization)
@@ -197,7 +202,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             state_rows + 1,
             initial_pages,
             device,
-            storage=package_storage,
+            storage=core_storage,
             maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(state_rows + 1, 1 + execution_rows + slots),
@@ -210,7 +215,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        ipc = package_storage.peer_storage
+        ipc = core_storage.peer_storage
         tokens = max(config.prefill_chunk_size, config.decode_tokens, slots * config.draft_tokens)
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=4096, ipc=ipc)
         prefill_collective = create_dma_all_reduce_runtime(
@@ -244,7 +249,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             numerical_policy="default",
             coordinator=coordinator,
             headroom_bytes=config.headroom_bytes,
-            benchmark_storage=package_storage,
+            benchmark_storage=core_storage,
         )
         session.__enter__()
         session.register_benchmark_resource("continuations", pool, restore=pool.clear_for_preparation)
@@ -303,13 +308,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             )
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
-    modes = (True, False) if config.dspark else (False,)
+    modes = serving_modes(config.dspark, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(config.prefill_capacities, scoring) + 4 * len(config.batch_capacities))
         + len(config.speculative_round_shapes)
-        + len(config.batch_capacities)
+        + (len(config.batch_capacities) if False in modes else 0)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -482,7 +487,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     pages = initial_pages
 
     def materialize_cache():
@@ -502,7 +507,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
-        warmup_storage=package_storage,
+        warmup_storage=core_storage,
         compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
     )
     session.freeze()

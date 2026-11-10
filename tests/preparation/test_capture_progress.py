@@ -41,6 +41,8 @@ def test_capture_reports_catalog_once_before_compilation_and_on_recapture(captur
         cache_hit = True
         def prepare_capture(self):
             return 0
+        def retire_after_capture(self):
+            pass
         def __call__(self):
             calls.append("cached")
     class Cache:

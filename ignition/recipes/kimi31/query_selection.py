@@ -2,8 +2,6 @@
 
 """Shard prefill index queries while preserving stored key and scale bytes."""
 
-from dataclasses import dataclass
-
 import torch
 import triton
 import triton.language as tl
@@ -29,15 +27,6 @@ def _owned_queries(Query, Weights, Positions, Rank, LocalQuery, LocalWeights, Le
     weight = tl.load(Weights + original * weight_stride + head, active, other=0)
     tl.store(LocalWeights + row * 32 + head, weight)
     tl.store(Lengths + row, tl.where(active, position + 1, 0).to(tl.int32))
-
-
-@dataclass(frozen=True)
-class SelectedQueryRows:
-    """A contiguous view consumed by the existing sparse attention slice."""
-
-    positions: torch.Tensor
-    tables: torch.Tensor
-    selected: torch.Tensor
 
 
 class PreparedQuerySelection:
@@ -82,24 +71,26 @@ class PreparedQuerySelection:
             shards.index, context.index_staging.tensor.view(-1, 64 * 132), context.index_staging.addresses,
             history, context.index_signals, runtime=context.stage_runtime, session=session,
             coordinator=context.coordinator, name=name + ".history")
-        self.indexers = []
+        self.indexers = {}
         for begin in range(0, self.local_rows, PREFILL_ROWS):
             end = min(begin + PREFILL_ROWS, self.local_rows)
-            self.indexers.append(PreparedFP8Indexer(self.local_query[begin:end], self.local_weights[begin:end],
-                history, self.pages.expand(end - begin, -1), self.lengths[begin:end], None,
-                self.local_selected[begin:end], mode="prefill", session=session, name=f"{name}.rows{begin}",
+            count = end - begin
+            if count in self.indexers:
+                continue
+            lengths = storage.buffer("slice_lengths", (count,), torch.int32)
+            selected = storage.buffer("slice_selected", (count, TOPK), torch.int32)
+            indexer = PreparedFP8Indexer(self.local_query[begin:end], self.local_weights[begin:end],
+                history, self.pages.expand(count, -1), lengths, None,
+                selected, mode="prefill", session=session, name=f"{name}.rows{count}",
                 workspace=workspace, buffers=SharedBuffers(buffers, query.device, allocator, prefix="fp8."),
                 prefill_records_per_call=131072, topk=TOPK, head_weight_scale=1.0,
-                hadamard=False, key_power_of_two=False))
+                hadamard=False, key_power_of_two=False)
+            self.indexers[count] = indexer, lengths, selected
         self.send = self.local_selected.view(torch.bfloat16).view(self.local_rows, TOPK * 2)
         self.gather = PreparedAllGather(self.send,
             self.gathered.view(torch.bfloat16).view(self.local_rows, TOPK * shards.world * 2),
             runtime=context.selections, session=session, coordinator=context.coordinator,
             name=name + ".selected", dependencies=(history, self.history.completed))
-        self.parts = tuple(SelectedQueryRows(metadata.positions[begin:end],
-            metadata.token_page_table[begin:end], self.selected[begin:end])
-            for begin, end in ((begin, min(begin + PREFILL_ROWS, rows))
-                               for begin in range(0, rows, PREFILL_ROWS)))
 
     def __call__(self):
         self.end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
@@ -111,7 +102,11 @@ class PreparedQuerySelection:
             self.local_query, self.local_weights, self.lengths,
             self.query.stride(0), self.weights.stride(0),
             ROWS=self.query.shape[0], WORLD=self.shards.world, num_warps=8)
-        for indexer in self.indexers:
-            indexer()
+        for begin in range(0, self.local_rows, PREFILL_ROWS):
+            end = min(begin + PREFILL_ROWS, self.local_rows)
+            indexer, lengths, selected = self.indexers[end - begin]
+            lengths.copy_(self.lengths[begin:end])
+            indexer(self.local_query[begin:end], self.local_weights[begin:end])
+            self.local_selected[begin:end].copy_(selected)
         self.gather(self.send)
         return self.selected

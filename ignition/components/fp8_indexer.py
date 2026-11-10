@@ -67,18 +67,19 @@ class PreparedFP8Indexer:
         rows, heads, width = query.shape
         if width != 128 or query.dtype != torch.bfloat16 or cache.shape[1] != 64 * 132:
             raise ValueError("FP8 indexing requires BF16 128-channel queries and 64-record pages")
-        self.query, self.weights, self.cache = query, weights, cache
+        self.cache = cache
         self.hadamard, self.key_power_of_two = hadamard, key_power_of_two
         self.quantized = buffers.zeros(query.shape, torch.float8_e4m3fn)
         self.scales = buffers.zeros((rows, heads), torch.float32)
         self.scaled_weights = buffers.zeros((rows, heads), torch.float32)
         self.weight_normalization = ((32 / heads) ** 0.5 if head_weight_scale is None
                                      else 32 ** 0.5 * head_weight_scale)
-        self.query_arguments = (query.view(-1, 128), self.quantized.view(-1, 128),
-                                self.scales.view(-1), self.scaled_weights.view(-1))
-        self.query_plan = glm_pool.plan_queries(*self.query_arguments, hadamard=hadamard)
+        self.query_outputs = (self.quantized.view(-1, 128), self.scales.view(-1),
+                              self.scaled_weights.view(-1))
+        query_arguments = (query.view(-1, 128), *self.query_outputs)
+        self.query_plan = glm_pool.plan_queries(*query_arguments, hadamard=hadamard)
         declare(session, (self.query_plan.request(name=name + ".query",
-            prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*self.query_arguments))),))
+            prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*query_arguments))),))
         self.pages = pages
         self.packed_pages = pages if mode == "prefill" else buffers.zeros(pages.shape, torch.int32)
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
@@ -93,10 +94,10 @@ class PreparedFP8Indexer:
         write_fp8_index_keys(keys, slots, self.cache,
                             hadamard=self.hadamard, power_of_two=self.key_power_of_two)
 
-    def __call__(self):
-        self.scaled_weights.copy_(self.weights)
+    def __call__(self, query, weights):
+        self.scaled_weights.copy_(weights)
         self.scaled_weights.mul_(self.weight_normalization)
-        glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
+        glm_pool.quantize_queries(query.view(-1, 128), *self.query_outputs, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)
         return self.selection()

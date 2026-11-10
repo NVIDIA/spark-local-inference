@@ -42,9 +42,9 @@ def caches(monkeypatch, tmp_path):
     aot.runtime_patches.apply()
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', _Selections)
     monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: SimpleNamespace(synchronize=lambda: None))
-    package = tmp_path / 'ignition' / 'preparation'
-    package.mkdir(parents=True)
-    backend = package / 'aot.py'
+    core = tmp_path / 'ignition' / 'preparation'
+    core.mkdir(parents=True)
+    backend = core / 'aot.py'
     backend.write_text('backend = 1\n')
     kernels = tmp_path / 'flashinfer'
     kernels.mkdir()

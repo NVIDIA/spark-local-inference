@@ -27,7 +27,7 @@ class AttentionForward:
     def __call__(self):
         self.output.copy_(self.operation(self.source))
         # The gather's input may be overwritten once its join has completed.
-        self.operation.parts[0]['quantized'].zero_()
+        self.operation.parts[1]['quantized'].zero_()
         return self.output
 
 
@@ -142,31 +142,39 @@ class RecordedAttentionTail:
         assert driver.cuGraphDestroy(self.graph)[0] == driver.CUresult.CUDA_SUCCESS
 
 
-def _rank(rank, directory, history_capacity):
+def _rank(rank, directory, history_capacity, implementation, measure_latency):
     import torch.distributed as dist
     from cuda.bindings import driver
 
     from ignition.preparation.capture import capture_forwards
-    from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
+    from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
+    from ignition.preparation.collectives import (CollectivePreparation, create_head_exchange,
+                                                 create_all_reduce_runtime)
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.attention import PreparedDSA
     from ignition.recipes.kimi31.dcp import AttentionConstants, ContextParallel, ContextShards, RECORD_BYTES
 
+    from ignition import runtime_patches
+    runtime_patches.apply()
+
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
     directory = Path(directory)
+    from ignition.preparation import compilation
+    compilation.DEFAULT_CACHE_ROOT = directory / 'kernels'
     dist.init_process_group('gloo', init_method=(directory / 'group').as_uri(), rank=rank, world_size=16,
                             timeout=timedelta(minutes=20))
     graphs = {}
+    compiled = {}
     tails = {}
     runtimes = []
     session = None
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             generator = torch.Generator(device=device).manual_seed(7391)
             def weight(shape, scale=.015625):
                 return (torch.randn(shape, device=device, dtype=torch.bfloat16, generator=generator) * scale)
@@ -187,7 +195,8 @@ def _rank(rank, directory, history_capacity):
             pages = history_capacity // (16 * 128)
             physical_pages = pages + 3
             page_map = (torch.arange(pages, device=device, dtype=torch.int32) + 2) % physical_pages
-            metadata = SimpleNamespace(positions=torch.tensor([16], dtype=torch.int64, device=device),
+            metadata = SimpleNamespace(starts=torch.zeros(1, dtype=torch.int64, device=device),
+                                       positions=torch.tensor([16], dtype=torch.int64, device=device),
                                        token_page_table=page_map[None])
             cache = torch.zeros((physical_pages, 128, RECORD_BYTES), device=device, dtype=torch.float8_e4m3fn)
             index_cache = torch.zeros((physical_pages * 2, 64 * 132), device=device, dtype=torch.uint8)
@@ -199,8 +208,15 @@ def _rank(rank, directory, history_capacity):
             latents = create_head_exchange(dist.group.WORLD, device, max_rows=1, heads=16,
                 head_dim=136, ipc=storage.peer_storage)
             runtimes.extend((heads, candidates, latents))
+            owner = PCIeDCPTopKOwnerExchange.from_process_group(process_group=dist.group.WORLD,
+                device=device, max_rows=1, topk=2048, stream_affine=False, ipc=storage.peer_storage)
+            reduction = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1, hidden_size=8192,
+                                                  ipc=storage.peer_storage)
+            runtimes.extend((owner, reduction))
+            tuning = SimpleNamespace(reduction=reduction, register=lambda selection: selection.bind(implementation))
             context = ContextParallel(ContextShards.on(rank, 16, device), heads, coordinator, {},
-                                      AttentionConstants.allocate(device, query_capacity=1), candidates=candidates)
+                                      AttentionConstants.allocate(device, query_capacity=1), candidates=candidates,
+                                      candidate_owners=owner, selection_tuning=tuning)
             session = RecordedPreparationSession(device=device, checkpoint='kimi31-query-overlap',
                 workload_schema='one-row-local-index-and-serialized-collectives', numerical_policy='exact',
                 coordinator=coordinator, autotune_effort='default', compile_workers=16)
@@ -214,17 +230,19 @@ def _rank(rank, directory, history_capacity):
             serial.query_overlap = None
             forwards = {'serial': AttentionForward(serial, source), 'overlap': AttentionForward(operation, source)}
             session.tune(show_progress=False)
-            assert operation.parts[0]['gather'].plan.memory_requirements().scratch_nbytes == 0
+            assert operation.parts[1]['gather'].plan.memory_requirements().scratch_nbytes == 0
             local_positions = torch.arange(pages * 128, device=device, dtype=torch.int64)
             physical = page_map[local_positions // 128].long() * 128 + local_positions % 128
             cache.view(-1, RECORD_BYTES)[physical] = weight((pages * 128, RECORD_BYTES), .125).to(cache.dtype)
-            operation.indexer.parts[0].indexer.write_keys(weight((pages * 128, 128), .125), physical)
+            operation.indexer.selections[1].indexer.write_keys(weight((pages * 128, 128), .125), physical)
             torch.cuda.synchronize(device)
             saved_cache, saved_index = cache.clone(), index_cache.clone()
-            part = operation.parts[0]
+            part = operation.parts[1]
             selector = part['selector']
+            merge = selector.merge
             outputs = (part['gathered'], part['partial'], part['lse'], selector.local, selector.scores,
-                       selector.packed, selector.gathered, selector.selected, selector.selected_scores,
+                       merge.packed, merge.gathered, selector.selected, merge.selected_scores,
+                       merge.planar, merge.owner.packed, merge.owner.selected_ids,
                        part['owners'], part['slots'], part['counts'], operation.attended)
 
             def restore():
@@ -248,9 +266,9 @@ def _rank(rank, directory, history_capacity):
             def eager_tail():
                 from ignition.recipes.kimi31.dcp import selection_slots
 
-                selection_slots(selector.selected, selector.positions, selector.tables, part['owners'], part['slots'],
+                selection_slots(selector.selected, metadata.positions, metadata.token_page_table, part['owners'], part['slots'],
                     part['counts'], operation.shards, cache.shape[0], local=True)
-                part['attention']()
+                part['attention'](part['gathered'], part['partial'])
                 part['combine'](part['partial'], part['lse'])
                 eager_tail_output.copy_(operation.finish())
 
@@ -282,8 +300,11 @@ def _rank(rank, directory, history_capacity):
                         same(name, actual[name], expected[name])
                 # Selection permits arbitrary order and arbitrary cutoff-tie membership.
                 # Each returned ID must attain the exact FP32 kth score of this invocation.
-                ids = selector.global_ids[0].cpu()
-                scores = selector.global_scores[0].cpu()
+                candidates = [None] * 16
+                dist.all_gather_object(candidates, (selector.local[0].cpu(), selector.scores[0].cpu()))
+                ids = torch.cat([torch.where(local >= 0, local * 16 + owner, -1)
+                                 for owner, (local, _) in enumerate(candidates)])
+                scores = torch.cat([values for _, values in candidates])
                 chosen = selector.selected[0].cpu()
                 valid = ids >= 0
                 live_scores, live_ids = scores[valid], ids[valid]
@@ -328,12 +349,16 @@ def _rank(rank, directory, history_capacity):
             # Capture each exact prepared call to identify its CUfunction handles in
             # the complete graph. No kernel-name substring substitutes for this mapping.
             collective_functions = {}
-            for name, gather, value in (
-                    ('query', part['gather'], part['quantized'].view(1, -1)),
-                    ('candidate', selector.gather, selector.packed.view(torch.bfloat16).view(1, -1))):
+            transport = ((lambda: merge.gather(merge.packed.view(torch.bfloat16).view(1, -1)))
+                         if implementation == 'replicated' else (lambda: merge.owner.transport()))
+            for name, launch in (
+                    ('query', lambda: part['gather'](part['quantized'].view(1, -1))),
+                    ('candidate', transport)):
+                launch()
+                torch.cuda.synchronize(device)
                 probe = torch.cuda.CUDAGraph(keep_graph=True)
                 with session.capture(), torch.cuda.graph(probe):
-                    gather(value)
+                    launch()
                 kernels, _ = _graph_nodes(probe)
                 assert kernels
                 collective_functions[name] = {entry['function'] for entry in kernels.values()}
@@ -344,6 +369,7 @@ def _rank(rank, directory, history_capacity):
             graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
                 stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(),
                 coordinator=coordinator, cache_root=directory / 'compiled', retain_graphs=True,
+                retain_forwards=True,
                 before_run=lambda name: restore())
             session.freeze()
             for name, graph in graphs.items():
@@ -359,7 +385,9 @@ def _rank(rank, directory, history_capacity):
             rebound = copy(forwards['overlap'])
             rebound.source = source.clone()
             rebound.output = torch.empty_like(source)
-            for step, visible in enumerate((0, 17, 2051, 16384, 65536, history_capacity, 17)):
+            contexts = tuple(value for value in (0, 17, 2051, 16384, 65536) if value <= history_capacity)
+            contexts += (history_capacity, 17)
+            for step, visible in enumerate(contexts):
                 source.copy_(seed * (step + 1) / 4)
                 rebound.source.copy_(source)
                 metadata.positions.fill_(visible - 1)
@@ -394,6 +422,8 @@ def _rank(rank, directory, history_capacity):
                 dist.all_gather_object(agreed, selector.selected.cpu())
                 assert all(torch.equal(value, agreed[0]) for value in agreed)
             print(f'rank {rank}: correctness and captured dependency checks passed', flush=True)
+            if not measure_latency:
+                return
             samples = []
             source.copy_(seed)
             repetitions = 100
@@ -431,6 +461,8 @@ def _rank(rank, directory, history_capacity):
             tail.close()
         for graph in graphs.values():
             graph.reset()
+        for forward in compiled.values():
+            forward.retire_after_capture()
         if session is not None:
             session.close()
         for runtime in reversed(runtimes):
@@ -438,9 +470,11 @@ def _rank(rank, directory, history_capacity):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('history_capacity', [1048576])
-def test_tp16_query_overlap_eager_compiled_rebinding_and_queued_replay(tmp_path, history_capacity):
+@pytest.mark.parametrize('history_capacity,measure_latency', [(8192, False), (1048576, True)])
+@pytest.mark.parametrize('implementation', ['replicated', 'owner'])
+def test_tp16_query_overlap_eager_compiled_rebinding_and_queued_replay(
+        tmp_path, history_capacity, implementation, measure_latency):
     import torch.multiprocessing as mp
 
     assert torch.cuda.device_count() == 16
-    mp.spawn(_rank, args=(str(tmp_path), history_capacity), nprocs=16, join=True)
+    mp.spawn(_rank, args=(str(tmp_path), history_capacity, implementation, measure_latency), nprocs=16, join=True)
