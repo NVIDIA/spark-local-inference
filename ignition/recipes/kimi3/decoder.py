@@ -287,7 +287,8 @@ class PreparedDecoder:
             (tokens, len(self.auxiliary_layers) * hidden), source.dtype, source.device))
         for index, w in enumerate(weights.layers):
             prefix, kind = f"{name}.layer{index}", config.layers[index]
-            kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace)
+            kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
+                          buffers=examples.setdefault(kind, {}))
             if kind == "kda":
                 attention = PreparedKDA(w["attention"], source, pool.recurrent(index), delta,
                     eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
