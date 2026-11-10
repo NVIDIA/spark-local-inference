@@ -174,6 +174,7 @@ class PreparedAssistant:
                 name=name + ".head",
                 activation_mode="auto",
                 buffers=buffers,
+                workspace=workspace,
             )
 
     def step(

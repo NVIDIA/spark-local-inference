@@ -399,8 +399,19 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             sampling_workspace = bind_scratch(PreparedSampling.scratch_layout(slots, requests.vocab_size), device=device)
             inputs = DecoderInputs.allocate(device, context=config.context, tokens=config.token_capacity, capacity=slots)
             graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+            dflash_buffers = None
+            if has_dflash:
+                from ignition.components.dflash2_preparation import DFlash2Buffers
+
+                window = draft_config.attention.window
+                captures = [(min(capacity, window), capacity > window)
+                            for capacity in config.prefill_capacities]
+                captures.extend((batch * width, False) for batch, width in config.speculative_shapes)
+                dflash_buffers = DFlash2Buffers(graph_buffers, config.speculative_shapes, captures,
+                    vocabulary=requests.vocab_size, columns=2560 * len(draft_config.target_layers))
+            decoder_buffers = graph_buffers.cursor() if dflash_buffers is None else dflash_buffers.stage.fork()
             scratch = DecoderScratch.allocate(config.token_capacity, device, sample_rows=sample_rows,
-                world_size=shard.world_size, buffers=graph_buffers.cursor(),
+                world_size=shard.world_size, buffers=decoder_buffers,
                 hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320)
             workspaces = ScratchArena(device, overlap=config.stream_overlap)
             rotary = RotaryTables.allocate(weights.tree.config.text_config, config.context, device)
@@ -432,7 +443,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 if has_dflash:
                     from .dflash import SpeculativePreparation
                     draft_options = dict(draft_weights=draft_weights, draft_config=draft_config, draft_head=draft_head,
-                                         gather_runtime=hidden_gather_collective)
+                                         gather_runtime=hidden_gather_collective, buffer_layout=dflash_buffers,
+                                         gdn_buffers=decoder_buffers)
                 else:
                     from .speculative_model import SpeculativePreparation
                     draft_options = dict(mtp_weights=mtp_weights)
@@ -500,7 +512,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                         decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
                             completion, frame, sequence, session=session, name=name,
                             embedding_injection=injection, max_cache_pages=planned_pages,
-                            sampling_workspace=sampling_workspace,
+                            sampling_workspace=sampling_workspace, gdn_buffers=decoder_buffers.fork(),
                             scoring=scoring if kind == "scored_prefill" else None, **collectives)
                         forward = speculation.prefill(decoder, name) if enabled else decoder
                         add(name, forward, kind, rows,

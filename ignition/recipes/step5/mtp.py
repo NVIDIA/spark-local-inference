@@ -53,7 +53,7 @@ class PreparedPredictor:
                 session=session, name=name + ".norm", zero_centered=True)
             self.local_logits = zeros((logits.shape[0], w["head"].shape[0]), logits.dtype)
             self.head = PreparedVocabularyProjection(self.normalized, w["head"], self.local_logits, logits,
-                runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers)
+                runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
 
     def __call__(self, previous):
         embedded = self.external_embedding

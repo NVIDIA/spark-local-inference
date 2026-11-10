@@ -98,7 +98,7 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.normalized, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto", workspace=workspace)
 
     def commit(self, counts):
         self.replay.commit(counts, width=self.width)

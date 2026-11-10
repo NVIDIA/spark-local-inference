@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ignition.preparation.persistent import persistent_empty
+
 
 @dataclass(frozen=True)
 class VisionWeights:
@@ -45,8 +47,8 @@ class VisionWeights:
         for i in range(c["layers"]):
             prefix = f"transformer.resblocks.{i}."
             shape = (3 * (last - first), h)
-            qkv = torch.empty(shape, dtype=torch.bfloat16, device=loader.device)
-            bias = torch.empty(shape[0], dtype=torch.bfloat16, device=loader.device)
+            qkv = persistent_empty(shape, torch.bfloat16, loader.device)
+            bias = persistent_empty((shape[0],), torch.bfloat16, loader.device)
             for j in range(3):
                 output = slice(j * (last - first), (j + 1) * (last - first))
                 source = slice(j * h + first, j * h + last)

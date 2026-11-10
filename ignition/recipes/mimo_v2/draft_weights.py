@@ -9,6 +9,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_cat, persistent_copy
 
 
 @dataclass(frozen=True)
@@ -54,8 +55,9 @@ class DraftWeights:
             hidden_norm, norm = loader.load_tensors(("hidden_norm.weight", "norm.weight"))
             for i in range(config.layers):
                 prefix = f"layers.{i}"
-                qkv = torch.cat([matrix(prefix + ".self_attn." + name, rows=rows)
-                                 for name, rows in (("q_proj", q_range), ("k_proj", k_range), ("v_proj", v_range))])
+                qkv = loader.load_linear_group(
+                    tuple(prefix + ".self_attn." + name for name in ("q_proj", "k_proj", "v_proj")),
+                    row_ranges=(q_range, k_range, v_range))
                 q_rows = q_range[1] - q_range[0]
                 context.append(qkv[q_rows:])
                 output = matrix(prefix + ".self_attn.o_proj",
@@ -65,8 +67,9 @@ class DraftWeights:
                      ".post_attention_layernorm.weight")))
                 sink = loader.load_tensor(prefix + ".self_attn.attention_sink_bias", dtype=torch.float32,
                     extent=slice(*shard.partition(a.heads))) if a.sinks else None
-                mlp = MLPWeights(torch.cat([matrix(prefix + ".mlp." + name, rows=intermediate)
-                                           for name in ("gate_proj", "up_proj")]),
+                mlp = MLPWeights(loader.load_linear_group(
+                                     tuple(prefix + ".mlp." + name for name in ("gate_proj", "up_proj")),
+                                     row_ranges=(intermediate, intermediate)),
                                  matrix(prefix + ".mlp.down_proj", columns=intermediate))
                 layers.append(DraftLayerWeights(qkv, output, query_norm, key_norm, sink, input_norm, post_norm, mlp))
         mask = torch.load(snapshot / "mask_embedding.pt", map_location="cpu", weights_only=True)
@@ -75,4 +78,5 @@ class DraftWeights:
                 or mask["embedding"].shape != (c["hidden_size"],)
                 or mask["embedding"].dtype != torch.bfloat16):
             raise ValueError("DFlash mask_embedding.pt disagrees with the draft configuration")
-        return cls(projection, hidden_norm, torch.cat(context), norm, mask["embedding"].to(device), tuple(layers))
+        embedding = persistent_copy(mask["embedding"].to(device))
+        return cls(projection, hidden_norm, persistent_cat(context), norm, embedding, tuple(layers))

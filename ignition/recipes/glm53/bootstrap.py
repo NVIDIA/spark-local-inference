@@ -520,7 +520,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 name = f"resume{capacity}" + suffix
                 resume = PreparedResume(weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name)
+                    coordinator=coordinator, session=session, name=name, workspace=arena)
                 add(name, resume, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix

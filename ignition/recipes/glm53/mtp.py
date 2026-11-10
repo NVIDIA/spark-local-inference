@@ -233,7 +233,7 @@ class PreparedMTP:
             head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.head
             self.head = PreparedVocabularyProjection(self.hidden, head,
                 self.local_logits, self.logits, runtime=vocabulary_runtime, coordinator=coordinator,
-                session=session, name=f"{name}.lm_head")
+                session=session, name=f"{name}.lm_head", workspace=workspace)
 
     def rebind_pages(self):
         self.attention.rebind_pages()

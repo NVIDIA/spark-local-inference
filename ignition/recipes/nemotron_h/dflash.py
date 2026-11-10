@@ -173,7 +173,7 @@ class PreparedDraft:
         self.norm = PreparedRMSNorm(s.activations, weights.draft.norm, s.normalized,
             eps=c.text["rms_norm_eps"], residual=previous, session=session, name=name + ".norm")
         self.head = PreparedVocabularyProjection(s.hidden, weights.head, s.local_logits, s.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto", workspace=workspace)
         self.anchor = buffers.zeros((metadata.lengths.numel(), weights.config.hidden), torch.bfloat16)
         self.saved_anchor = pool.reserved_region("draft_anchor")
         self.selector = PreparedLatticeSelector(weights.draft.lattice, c, weights.embedding,

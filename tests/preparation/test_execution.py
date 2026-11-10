@@ -28,6 +28,59 @@ def _execution(*, model_class=PreparedExecution, **changes):
     return model_class(**(arguments | changes))
 
 
+def test_model_closes_private_graphs_before_kernel_plans_and_storage(monkeypatch):
+    import torch
+    from ignition.preparation.model import PreparedModel
+
+    order = []
+    graph = SimpleNamespace(reset=lambda: order.append("serving graph"))
+    observer = SimpleNamespace(close=lambda: order.append("private graph"))
+    session = SimpleNamespace(close=lambda: order.append("kernel plans"))
+    storage = SimpleNamespace(close=lambda: order.append("storage"))
+    model = _execution(model_class=PreparedModel,
+        graphs={"decode": graph, "prefill": graph}, server_config={}, memory_report={},
+        session=session, graph_resources=(observer,), close_resources=(storage,))
+    model.runtime = SimpleNamespace(close=lambda: order.append("native drain"), drained=True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: order.append("synchronize"))
+
+    model.close()
+
+    assert order == ["native drain", "synchronize", "serving graph", "serving graph",
+                     "private graph", "kernel plans", "storage"]
+    assert model.closed and not model._graph_resources and not model._close_resources
+    model.close()
+    assert order.count("private graph") == 1
+
+
+@pytest.mark.parametrize("failure", ("native drain", "synchronize", "private graph"))
+def test_model_retains_graph_owners_when_shutdown_fails(monkeypatch, failure):
+    import torch
+    from ignition.preparation.model import PreparedModel
+
+    order = []
+    def step(name):
+        order.append(name)
+        if name == failure:
+            raise RuntimeError(name)
+    graph = SimpleNamespace(reset=lambda: step("serving graph"))
+    observer = SimpleNamespace(close=lambda: step("private graph"))
+    session = SimpleNamespace(close=lambda: step("kernel plans"))
+    storage = SimpleNamespace(close=lambda: step("storage"))
+    model = _execution(model_class=PreparedModel,
+        graphs={"decode": graph, "prefill": graph}, server_config={}, memory_report={},
+        session=session, graph_resources=(observer,), close_resources=(storage,), resources=(observer,))
+    model.runtime = SimpleNamespace(close=lambda: step("native drain"), drained=failure != "native drain")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: step("synchronize"))
+
+    with pytest.raises(RuntimeError, match=failure):
+        model.close()
+
+    assert not model.closed
+    assert model._graph_resources == (observer,) and model._close_resources == (storage,)
+    assert model.resources == (observer,)
+    assert "kernel plans" not in order and "storage" not in order
+
+
 def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     execution = _execution(estimated_durations_ns={"decode": 123_000, "prefill": 456_000})
     spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1)]

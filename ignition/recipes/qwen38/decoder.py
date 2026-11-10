@@ -15,6 +15,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 from ignition.preparation.checkpoint import CheckpointManifest
 from ignition.preparation.host_memory import device_memory_info
+from ignition.preparation.persistent import allocated_tensor_bytes
 from ignition.preparation.qwen38 import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 
@@ -67,12 +68,12 @@ class ModelWeights:
         if free_bytes < stored // shard.world_size + (8 << 30):
             raise MemoryError(f"model weight loading requires at least {stored // shard.world_size + (8 << 30)} free CUDA bytes; found {free_bytes}")
         tree = create_model_tree(manifest)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         layers = []
         with QwenWeightLoader(manifest, device, progress=progress, shard=shard,
                               force_moe_decode_a16=force_moe_decode_a16) as loader:
-            def parameters(paths, extents=None):
-                for path, value in zip(paths, loader.load_tensors(paths, extents=extents), strict=True):
+            def parameters(paths, extents=None, *, temporary=False):
+                for path, value in zip(paths, loader.load_tensors(paths, extents=extents, temporary=temporary), strict=True):
                     parent, _, attribute = path.rpartition(".")
                     setattr(tree.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))
 
@@ -81,8 +82,13 @@ class ModelWeights:
                 if tree.get_submodule(prefix).block_inject_weight is not None:
                     names += ("block_inject_weight",)
                 extents = hyperconnection_extents(shard, shard_hyperconnections)
-                parameters(tuple(f"{prefix}.{name}.weight" for name in names),
-                           tuple(extents.get(f"{name}.weight") for name in names))
+                packed = tree.get_submodule(prefix).block_inject_weight is not None
+                for temporary in (False, True):
+                    selected = tuple(name for name in names
+                        if (packed and name in ("input_mix_weight_down", "block_inject_weight")) == temporary)
+                    if selected:
+                        parameters(tuple(f"{prefix}.{name}.weight" for name in selected),
+                                   tuple(extents.get(f"{name}.weight") for name in selected), temporary=temporary)
                 packed_down_projection(tree.get_submodule(prefix))
 
             parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
@@ -108,8 +114,10 @@ class ModelWeights:
                     parameters(tuple(f"{attention_prefix}.{name}" for name in ("A_log", "dt_bias", "norm.weight")),
                                (heads, heads, None))
                     channels = shard.fused_partitions((2048, 2048, 6144))
-                    convolution = torch.cat(loader.load_tensors((f"{attention_prefix}.conv1d.weight",) * 3,
-                        extents=tuple(slice(*part) for part in channels)))
+                    from ignition.preparation.persistent import persistent_cat
+
+                    convolution = persistent_cat(loader.load_tensors((f"{attention_prefix}.conv1d.weight",) * 3,
+                        extents=tuple(slice(*part) for part in channels), temporary=True))
                     module = tree.get_submodule(attention_prefix)
                     module.conv1d.weight = torch.nn.Parameter(convolution, requires_grad=False)
                     module.num_k_heads //= shard.world_size
@@ -129,7 +137,7 @@ class ModelWeights:
             vision = VisionWeights.load(tree.model.visual, loader)
         torch.cuda.synchronize(device)
         return cls(tree, tuple(layers), vision,
-                   torch.cuda.memory_allocated(device) - before, shard)
+                   allocated_tensor_bytes(device) - before, shard)
 
 
 @dataclass(frozen=True)
@@ -220,7 +228,7 @@ class PreparedDecoder:
                  max_cache_pages: int | None = None,
                  residual_output: torch.Tensor | None = None, verification: bool = False,
                  gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None, coordinator=None,
-                 sampling_workspace=None, scoring=None):
+                 sampling_workspace=None, scoring=None, gdn_buffers=None):
         from ignition.components.embedding import PreparedEmbedding
         from ignition.components.linear import UnquantizedProjection
 
@@ -272,7 +280,8 @@ class PreparedDecoder:
                     session=session, name=f"{prefix}.gdn", checkpoint_export=False,
                     workspace=workspaces, projection_workspace=workspaces,
                     records=None if gdn_records is None else gdn_records[index], in_place=gdn_in_place,
-                    partitions=getattr(state, "gdn_partitions", None))
+                    partitions=getattr(state, "gdn_partitions", None),
+                    gdn_buffers=None if gdn_buffers is None else gdn_buffers.fork())
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=scratch.moe, workspace=workspaces,
                 projection_workspace=workspaces, prefill=state.mode == "prefill")

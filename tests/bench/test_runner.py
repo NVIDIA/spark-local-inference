@@ -218,8 +218,9 @@ def test_acceptance_observation_separates_verification_from_committed_clipping()
         accepted_drafts=torch.tensor([1, 0]), emitted_count=torch.tensor([2, 0]),
         emitted_ids=torch.tensor([[11, 12, -1, -1], [-1, -1, -1, -1]]),
     )
-    forward = SimpleNamespace(operations=(None, (), SimpleNamespace(output=acceptance), commit))
-    result = acceptance_observation(forward)
+    observations = {f"acceptance.{name}": value for name, value in vars(acceptance).items()}
+    observations.update({f"commit.{name}": value for name, value in vars(commit).items()})
+    result = acceptance_observation(observations)
     assert result["observations_per_request"] == 1
     assert result["requests"] == [
         dict(valid=True, offered_draft_count=3, accepted_draft_count=3,
@@ -231,3 +232,193 @@ def test_acceptance_observation_separates_verification_from_committed_clipping()
     sample = dict(seed=0, times_ms=[1.] * 20, acceptance=result)
     summary = summarize_case(BenchmarkCase(1, 8, 8, 8192), [sample])
     assert summary["samples"][0]["acceptance"]["observations_per_request"] == 1
+
+
+@pytest.mark.parametrize("field", ["live_counts", "starts", "lengths", "query_start_loc"])
+def test_prefill_metadata_uses_explicit_forward_observations(field):
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.runner import PrefillCase, _check_metadata
+
+    case = PrefillCase(128, 512)
+    observations = {f"target.{name}": torch.tensor(value) for name, value in dict(
+        live_counts=[128, 1], starts=[512], lengths=[128], query_start_loc=[0, 128]).items()}
+    _check_metadata(SimpleNamespace(), SimpleNamespace(), case, observations)
+    observations[f"target.{field}"][-1] += 1
+    with pytest.raises(RuntimeError, match="exact benchmark chunk"):
+        _check_metadata(SimpleNamespace(), SimpleNamespace(), case, observations)
+
+
+def test_round_metadata_observes_distinct_target_and_draft_widths():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.runner import _check_metadata
+
+    case = BenchmarkCase(2, 8, 16, 512)
+    owner = SimpleNamespace(block_size=16, generation=torch.tensor([0, 11, 0, 12]),
+        offset=torch.tensor([0, 28, 0, 28]), rng=SimpleNamespace(
+            generation=torch.tensor([0, 11, 0, 12]), target_offset=torch.tensor([0, 12, 0, 12])))
+    forward = SimpleNamespace(owner=owner, operations=(None, (), SimpleNamespace(draw_reservation=12), None))
+    model = SimpleNamespace(benchmark_rounds={"round": forward})
+    step = SimpleNamespace(graph="round", draft_tokens=7, lanes=[SimpleNamespace(
+        request=SimpleNamespace(slot=slot, generation=generation)) for slot, generation in ((1, 11), (3, 12))])
+    observations = {f"{role}.{name}": torch.tensor(value) for role, width in (("target", 8), ("draft", 16))
+        for name, value in dict(live_counts=[2 * width, 2], starts=[512, 512],
+                               lengths=[width, width], query_start_loc=[0, width, 2 * width]).items()}
+    _check_metadata(model, step, case, observations)
+    observations["draft.lengths"][1] = 8
+    with pytest.raises(RuntimeError, match="draft metadata"):
+        _check_metadata(model, step, case, observations)
+    observations["draft.lengths"][1] = 16
+    owner.rng.target_offset[3] = 8
+    with pytest.raises(RuntimeError, match="draw reservations"):
+        _check_metadata(model, step, case, observations)
+
+
+def test_native_acceptance_reads_production_completion_without_clipping():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.runner import _completion_observation
+
+    records = torch.zeros(2, 32, dtype=torch.int64)
+    records[1, 5] = 1
+    records[1, 8:11] = torch.tensor([3, 7, 2])
+    records[1, 16:19] = torch.tensor([21, 23, 29])
+    survival = torch.full((2, 2, 15), -1.)
+    survival[1, 1, :7] = .5
+    eos_count = torch.zeros(2, dtype=torch.int32)
+    model = SimpleNamespace(buffers={"completion_speculative_survival": survival},
+                            benchmark_requests=SimpleNamespace(eos_count=eos_count))
+    request = SimpleNamespace(slot=1, generated=[19, 21, 23, 29], max_new_tokens=16)
+    step = SimpleNamespace(frame=1, lanes=[SimpleNamespace(request=request)])
+    case = BenchmarkCase(1, 8, 8, 512)
+    result = _completion_observation(model, step, records.numpy(), case)
+    assert result["observation_source"] == "production_completion"
+    assert result["requests"] == [dict(valid=True, offered_draft_count=7, accepted_draft_count=2,
+        committed_draft_count=2, emitted_count=3, emitted_token_ids=[21, 23, 29], proposal_survival=[.5] * 7)]
+    request.max_new_tokens = 5
+    with pytest.raises(RuntimeError, match="unclipped verification"):
+        _completion_observation(model, step, records.numpy(), case)
+    request.max_new_tokens = 16
+    eos_count[1] = 1
+    with pytest.raises(RuntimeError, match="unclipped verification"):
+        _completion_observation(model, step, records.numpy(), case)
+
+
+def test_study_observation_destinations_retain_call_local_results():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.observations import ObservationForward
+
+    call = 0
+    local = {}
+
+    def observe():
+        nonlocal call, local
+        call += 1
+        local = {f"{role}.{name}": torch.tensor(value, dtype=dtype)
+            for role, width in (("target", 8), ("draft", 16))
+            for name, value, dtype in (("live_counts", [width, 1], torch.int32),
+                ("starts", [call * 128], torch.int64), ("lengths", [width], torch.int32),
+                ("query_start_loc", [0, width], torch.int32))}
+        local.update({"acceptance.offered_drafts": torch.tensor([7], dtype=torch.int32),
+            "acceptance.accepted_drafts": torch.tensor([call], dtype=torch.int32),
+            "acceptance.survival": torch.full((1, 7), .5), "acceptance.valid": torch.tensor([True]),
+            "commit.accepted_drafts": torch.tensor([call], dtype=torch.int32),
+            "commit.emitted_count": torch.tensor([call + 1], dtype=torch.int32),
+            "commit.emitted_ids": torch.full((1, 8), 20 + call, dtype=torch.int64)})
+        return local
+
+    forward = SimpleNamespace(batch=1, width=8, draft=object(), observe=observe,
+        owner=SimpleNamespace(requests=SimpleNamespace(generation=torch.zeros(1, dtype=torch.int64))))
+    observer = ObservationForward(forward, rows=1, device="cpu", draft=True, acceptance_width=8)
+    observer()
+    assert observer.outputs["target.starts"].tolist() == [128]
+    local["target.starts"].zero_()
+    assert observer.outputs["target.starts"].tolist() == [128]
+    observer()
+    assert observer.outputs["target.starts"].tolist() == [256]
+    assert observer.outputs["commit.emitted_count"].tolist() == [3]
+    assert observer.outputs["commit.emitted_ids"].tolist() == [[22] * 8]
+
+
+def test_observer_uploads_preserve_native_input_offsets_and_frame_identity():
+    from types import SimpleNamespace
+    import struct
+
+    from ignition.bench.runner import _upload_step
+
+    values = {name: bytearray(size) for name, size in
+              (("query_lengths", 8), ("frame_index", 4), ("submission_sequence", 8))}
+
+    def upload(name, offset, data):
+        values[name][offset:offset + len(data)] = data
+
+    runner = SimpleNamespace(inputs={"round": frozenset(values)}, _upload=upload)
+    message = dict(graph="round", uploads=[("query_lengths", 4, struct.pack("<i", 8))],
+                   frame=1, sequence=2**40 + 3)
+    _upload_step(runner, message)
+    assert struct.unpack("<ii", values["query_lengths"]) == (0, 8)
+    assert struct.unpack("<i", values["frame_index"]) == (1,)
+    assert struct.unpack("<q", values["submission_sequence"]) == (2**40 + 3,)
+    for name in ("frame_index", "submission_sequence", "unbound"):
+        with pytest.raises(ValueError, match="does not bind input"):
+            _upload_step(runner, dict(message, uploads=[(name, 0, b"x")]))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_study_captures_observations_separately_from_timed_forward(monkeypatch, compiled):
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.study import SpeculationStudy
+
+    production = SimpleNamespace(batch=1, width=8, draft=None)
+    owner = SimpleNamespace(block_size=16,
+        requests=SimpleNamespace(generation=torch.zeros(1, dtype=torch.int64)),
+        round=lambda *args, **kwargs: production)
+    production.owner = owner
+    captured = {}
+
+    def capture(functions, signatures, **kwargs):
+        captured.update(functions=functions, signatures=signatures, kwargs=kwargs)
+        return {name: object() for name in functions}, {}
+
+    monkeypatch.setattr("ignition.preparation.capture.capture_forwards", capture)
+    study = SpeculationStudy(owner, 8)
+    study.capture(cache_root=None, compile_decoder=compiled)
+    assert captured["functions"][study.name] is production
+    assert captured["functions"][study.observation_name] is study.observer
+    assert study.observer.forward is production
+    assert set(study.graphs) == {study.name, study.observation_name}
+    assert study.observation_source == ("compiled_untimed_diagnostic_graph" if compiled else "untimed_diagnostic_graph")
+
+
+
+def test_study_rates_use_actual_replay_emitted_deltas():
+    from types import SimpleNamespace
+    import torch
+
+    from ignition.bench.study import StudyCase, _check_request_state
+
+    case = StudyCase(1, 13, 13, 512)
+    histogram = torch.zeros(1, 100, dtype=torch.int32)
+    histogram[0, 1], histogram[0, 19], histogram[0, 21], histogram[0, 23] = 512, 1, 1, 1
+    state = SimpleNamespace(error_code=torch.tensor([0]), generated_tokens=torch.tensor([3]),
+        rng_counter=torch.tensor([3]), generation=torch.tensor([11]), seed=torch.tensor([17]),
+        histogram=histogram, consumed_tokens=torch.tensor([514]), pending_token=torch.tensor([23]))
+    model = SimpleNamespace(benchmark_requests=state)
+    request = SimpleNamespace(slot=0, generated=[19], prompt=[1] * 512, generation=11,
+                              sampling=SimpleNamespace(seed=17))
+    scheduler = SimpleNamespace(active=[request])
+    assert _check_request_state(model, scheduler, case) == 2
+    state.generated_tokens[0], state.rng_counter[0], state.consumed_tokens[0] = 4, 4, 515
+    histogram[0, 23] += 1
+    assert _check_request_state(model, scheduler, case) == 3
+    state.pending_token[0] = 29
+    with pytest.raises(RuntimeError, match="invalid committed request state"):
+        _check_request_state(model, scheduler, case)

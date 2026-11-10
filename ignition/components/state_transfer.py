@@ -10,9 +10,16 @@ import torch
 import triton
 import triton.language as tl
 
+from ignition.preparation.persistent import persistent_empty
+
 from .capacity import BATCH_CAPACITIES
 from .sampling import _check_tensor, _compile
 from .state import StateStorage
+
+
+def _pointer_table(values, device):
+    table = persistent_empty((len(values), 2), torch.int64, device)
+    return table.copy_(torch.tensor(values, dtype=torch.int64, device="cpu"))
 
 
 @dataclass(frozen=True)
@@ -238,9 +245,8 @@ class PreparedStateTransfer:
                 _check_tensor(cache, cache.shape, torch.uint8, device, name)
                 names.add(name)
                 trailing_groups[region.nbytes].append((cache.data_ptr(), region.offset))
-        self.trailing_pointers = {size: torch.tensor(values, dtype=torch.int64, device=device)
-                                 for size, values in trailing_groups.items()}
-        self.pointers = {size: torch.tensor(values, dtype=torch.int64, device=device) for size, values in groups.items()}
+        self.trailing_pointers = {size: _pointer_table(values, device) for size, values in trailing_groups.items()}
+        self.pointers = {size: _pointer_table(values, device) for size, values in groups.items()}
         c = commands
         self.validate_args = (c.source_slots, c.destination_slots, c.operation, c.expected_consumed, c.num_ops,
             c.errors, consumed, tables, c.request_slots, state_rows, requests.consumed_tokens, requests.consumed_tokens.stride(0), pool.memory_capacity, consumed.stride(0), tables.shape[1], page_tokens, self.capacity)

@@ -60,6 +60,7 @@ class BlockFP8Projection:
         for tensor in (weight.values, weight.scales):
             record_numeric_tensor(tensor)
         self.output = output
+        self.output_layout = None
         if output is not None and (output.shape != (source.shape[0], n) or output.dtype != source.dtype
                                    or output.device != source.device):
             raise ValueError("block-FP8 output must match projection rows, columns, dtype and device")
@@ -94,6 +95,18 @@ class BlockFP8Projection:
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare, benchmark_call=prepare),))
 
+    def functional(self, *, session):
+        """Allocate projection outputs inside the forward with the prepared layout."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+        self.output = None
+        return self
+
     def __call__(self, source):
         result = _project(source, self.weight.values, self.weight.scales, self.plan.handle)
+        if self.output is None and self.output_layout is not None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            return output.copy_(result)
         return result if self.output is None else self.output.copy_(result)

@@ -15,6 +15,7 @@ from ignition.components.weights import (
     _aligned_range,
     quantize_bf16_linear_as_mxfp8,
 )
+from ignition.preparation.persistent import persistent_empty, persistent_zeros, allocated_tensor_bytes
 
 from .config import ModelConfig
 
@@ -50,7 +51,7 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=True,
              expert_scale_compression=None, package_storage=None):
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         loading = nullcontext if package_storage is None else package_storage.transient
         # Reuse conversion buffers across layers before retiring the loading pool.
         with loading(), Step5WeightLoader(manifest, device, shard=shard, progress=progress, mtp=mtp,
@@ -65,7 +66,7 @@ class ModelWeights:
             draft = tuple(loader.load_predictor(i) for i in range(config.text["num_nextn_predict_layers"])) if mtp else None
             from .vision_weights import VisionWeights
             vision = VisionWeights.load(loader)
-        return cls(config, shard, embedding, norm, head, layers, torch.cuda.memory_allocated(device) - before,
+        return cls(config, shard, embedding, norm, head, layers, allocated_tensor_bytes(device) - before,
                    draft, vision, scale_scratch)
 
 
@@ -119,18 +120,18 @@ class Step5WeightLoader(DirectWeightLoader):
                 for name in self._sources if name.endswith(".weight")
                 and self.config.projection_format(name.removesuffix(".weight")) == "nvfp4"}
 
-    def norm(self, name, width):
+    def norm(self, name, width, *, dtype=None):
         source = self._sources[name]
         if source.shape != (width,) or source.dtype != torch.float32:
             raise ValueError(f"{name}: expected a {width}-element FP32 normalization parameter")
-        return self.load_tensor(name)
+        return self.load_tensor(name, dtype=dtype)
 
     def head(self, name):
         source = self._sources[name]
         if source.dtype != torch.bfloat16 or source.shape != (self.config.vocabulary, self.config.hidden):
             raise ValueError(f"{name}: expected the checkpoint's BF16 vocabulary projection")
         first, last, width = self.config.vocabulary_partition(self.shard)
-        output = torch.zeros((width, self.config.hidden), dtype=torch.bfloat16, device=self.device)
+        output = persistent_zeros((width, self.config.hidden), dtype=torch.bfloat16, device=self.device)
         self._copy(output[:last-first], source[first:last])
         self._session.flush()
         return output
@@ -145,11 +146,12 @@ class Step5WeightLoader(DirectWeightLoader):
             "norm": self.norm(prefix + ".transformer.shared_head.norm.weight", self.config.hidden),
             "head": self.head(prefix + ".transformer.shared_head.output.weight")}
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, temporary=False):
         prefixes = tuple(prefixes)
         formats = {self.config.projection_format(p) for p in prefixes}
         if formats != {"bf16"}:
-            return super().load_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range)
+            return super().load_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range,
+                                             temporary=temporary)
         ranges = (None,) * len(prefixes) if row_ranges is None else row_ranges
         views = []
         for prefix, rows in zip(prefixes, ranges, strict=True):
@@ -161,7 +163,8 @@ class Step5WeightLoader(DirectWeightLoader):
             r0, r1 = _aligned_range(rows, source.shape[0], 1)
             c0, c1 = _aligned_range(column_range, source.shape[1], 1)
             views.append(source[r0:r1, c0:c1])
-        output = torch.empty((sum(v.shape[0] for v in views), views[0].shape[1]),
+        allocate = torch.empty if temporary else persistent_empty
+        output = allocate((sum(v.shape[0] for v in views), views[0].shape[1]),
                              dtype=torch.bfloat16, device=self.device)
         offset = 0
         for source in views:
@@ -173,7 +176,8 @@ class Step5WeightLoader(DirectWeightLoader):
     def mlp(self, prefix, intermediate):
         interval = self.shard.partition(intermediate, alignment=32)
         gate_up = self.load_linear_group((prefix + ".gate_proj", prefix + ".up_proj"),
-                                        row_ranges=(interval, interval))
+                                        row_ranges=(interval, interval),
+                                        temporary=self.config.projection_format(prefix + ".gate_proj") == "bf16")
         if isinstance(gate_up, torch.Tensor):
             gate_up = quantize_bf16_linear_as_mxfp8(gate_up)
         return MLPWeights(gate_up,
@@ -199,9 +203,9 @@ class Step5WeightLoader(DirectWeightLoader):
             h0, h1 = k0 * per_group, k1 * per_group
             projections += tuple(attention + ".sparse_indexer_" + p for p in ("q", "k", "z", "w"))
             projection_rows += ((h0 * dim, h1 * dim), None, None, (h0, h1))
-            indexer = {"q_norm": self.norm(attention + ".sparse_indexer_q_norm.weight", dim).bfloat16(),
-                "k_norm": self.norm(attention + ".sparse_indexer_k_norm.weight", dim).bfloat16(),
-                "k_bias": self.norm(attention + ".sparse_indexer_k_norm.bias", dim).bfloat16()}
+            indexer = {"q_norm": self.norm(attention + ".sparse_indexer_q_norm.weight", dim, dtype=torch.bfloat16),
+                "k_norm": self.norm(attention + ".sparse_indexer_k_norm.weight", dim, dtype=torch.bfloat16),
+                "k_bias": self.norm(attention + ".sparse_indexer_k_norm.bias", dim, dtype=torch.bfloat16)}
         qkvg = self.load_linear_group(projections, row_ranges=projection_rows)
         routed = layer in c["moe_layer_list"]
         mlp = self.mlp(prefix + (".share_expert" if routed else ".mlp"),

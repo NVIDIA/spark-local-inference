@@ -144,10 +144,14 @@ class PreparedLogprobs:
         if not 1 <= width <= completion.token_capacity:
             raise ValueError("raw logprob width exceeds completion token capacity")
         tiles = triton.cdiv(vocab, _VOCAB_TILE)
-        cursor = completion.scratch.cursor()
-        self.stats = cursor.zeros((batch, width, tiles, 2), torch.float32)  # Maximum and exponential mass.
-        self.lse = cursor.zeros((batch, width), torch.float32)
-        self.keys = cursor.zeros((batch, width, tiles, _TILE_CANDIDATES), torch.uint64)
+        self.logits = logits
+        self.layout = {
+            "stats": ((batch, width, tiles, 2), torch.float32),
+            "lse": ((batch, width), torch.float32),
+            "keys": ((batch, width, tiles, _TILE_CANDIDATES), torch.uint64),
+        }
+        for name, (shape, dtype) in self.layout.items():
+            setattr(self, name, torch.empty(shape, dtype=dtype, device=logits.device))
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         dimensions = (vocab, width, tiles, completion.records.shape[1], completion.records.shape[2])
         self._preparation = (
@@ -169,16 +173,45 @@ class PreparedLogprobs:
             return
         operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
                            for kernel, args, grid, warps in self._preparation)
+        names = {id(getattr(self, name)): name for name in self.layout}
+        for operation in operations:
+            operation.scratch_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                            if id(value) in names)
+            slots = {index for index, _ in operation.scratch_slots}
+            operation.args = tuple(None if index in slots else value for index, value in enumerate(operation.args))
         self.statistics, self.normalization, self.candidates, self.finish = operations
+        for operation in (self.statistics, self.candidates, self.finish):
+            operation.args = (None, *operation.args[1:])
         self._preparation = ()
+        for name in self.layout:
+            setattr(self, name, None)
 
     def __call__(self):
+        return self.run(self.logits)
+
+    def functional(self):
+        self.release_logits()
+        return self
+
+    def release_logits(self):
+        self.logits = None
+
+    def run(self, logits):
+        from ignition.preparation.triton import launch_triton
+
         if self.statistics is None:
             raise RuntimeError("logprob reduction prepare() must finish before capture")
-        self.statistics()
-        self.normalization()
-        self.candidates()
-        self.finish()
+        if logits.ndim == 2:
+            logits = logits[:, None, :]
+        scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
+                   for name, (shape, dtype) in self.layout.items()}
+        for operation in (self.statistics, self.normalization, self.candidates, self.finish):
+            args = list(operation.args)
+            if operation is not self.normalization:
+                args[0] = logits
+            for index, name in operation.scratch_slots:
+                args[index] = scratch[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
 
 
 @triton.jit

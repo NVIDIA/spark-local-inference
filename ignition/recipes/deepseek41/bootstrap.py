@@ -541,7 +541,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
                     coordinator=coordinator, session=session, name=name, logits_dtype=torch.float32,
-                    buffers=graph_buffers.cursor())
+                    buffers=graph_buffers.cursor(), workspace=arena)
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix

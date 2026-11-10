@@ -50,6 +50,7 @@ class PackageStorage:
             raise ValueError("local preparation ranks must be positive and fit the rank group")
         properties = torch.cuda.get_device_properties(device)
         self.integrated = properties.is_integrated
+        self._persistent_total_bytes = properties.total_memory
         self._retention_scope = False
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
@@ -57,6 +58,11 @@ class PackageStorage:
 
         self.host_regions = []
         self.dynamic_regions = []
+        self.persistent_regions = []
+        self._persistent_arena = None
+        self._persistent_closed = False
+        self._persistent_model_owned = False
+        self._context_tokens = []
         from .tensor_metadata import NumericStorage
 
         self.numeric_storage = NumericStorage()
@@ -68,6 +74,9 @@ class PackageStorage:
             raise self.error or RuntimeError("cannot initialize native package allocator")
         layout = self._snapshot()
         self.granularity = layout["granularity"]
+        gpudirect = C.c_int()
+        self.cuda.call("cuDeviceGetAttribute", C.byref(gpudirect), C.c_int(116), C.c_int(device))
+        self.gpudirect = bool(gpudirect.value)
         self.HOST_BASE = layout["host_base"]
         self._host_cursor = self.HOST_BASE
         self.low_reservations = []
@@ -165,8 +174,11 @@ class PackageStorage:
 
     @property
     def mappings(self):
-        return {int(address): Mapping(int(address), size, "device")
-                for address, size in self._snapshot()["mappings"].items()}
+        result = {int(address): Mapping(int(address), size, "device")
+                  for address, size in self._snapshot()["mappings"].items()}
+        result.update((region.address, Mapping(region.address, region.nbytes, "device"))
+                      for region in self.persistent_regions if region.nbytes)
+        return result
 
     @property
     def error(self):
@@ -238,7 +250,33 @@ class PackageStorage:
                 live = 0 if block["state"] == "inactive" else block["requested_size"]
                 if live < block["size"]:
                     ranges.append((block["address"] + live, block["address"] + block["size"]))
+        if getattr(self, "_persistent_arena", None) is not None:
+            ranges.extend(self._persistent_arena.unused_ranges())
         return ranges
+
+    def _persistent_empty(self, shape, stride, dtype, nbytes, alignment):
+        from .persistent import PersistentTensorArena
+
+        if self._persistent_closed:
+            raise RuntimeError("persistent tensor storage is closed")
+        if self._persistent_arena is None:
+            capacity = -(-self._persistent_total_bytes // self.granularity) * self.granularity
+            address = self._device_cursor
+            if address + capacity > self.DEVICE_BASE + self.RESERVATION_BYTES:
+                raise MemoryError("persistent storage address range exhausted")
+            region = DeviceRegion(self.cuda, address, 0, self.device, gpudirect=self.gpudirect)
+            self._persistent_arena = PersistentTensorArena(region, capacity, self.granularity)
+            self.persistent_regions.append(region)
+            self._device_cursor += capacity
+        return self._persistent_arena.empty(shape, stride, dtype, nbytes, alignment)
+
+    def close(self):
+        """Release persistent mappings after every referencing graph and tensor has drained."""
+        if not self._persistent_closed:
+            self.cuda.call("cuCtxSynchronize")
+            if self._persistent_arena is not None:
+                self._persistent_arena.close()
+            self._persistent_closed = True
 
     def host_allocate(self, name, shape, dtype):
         size = math.prod(shape) * dtype.itemsize
@@ -288,17 +326,37 @@ class PackageStorage:
                 region.grow(size)
 
     def __enter__(self):
+        from .persistent import _ACTIVE_STORAGE
+
         self._scope.__enter__()
         self.numeric_storage.__enter__()
+        self._context_tokens.append(_ACTIVE_STORAGE.set(self))
         return self
 
     def __exit__(self, kind, value, traceback):
+        from .persistent import _ACTIVE_STORAGE
+
         try:
             self._scope.__exit__(kind, value, traceback)
         finally:
-            self.numeric_storage.__exit__(kind, value, traceback)
-        if kind is None and self.error is not None:
-            raise RuntimeError("native package allocator failed") from self.error
+            try:
+                self.numeric_storage.__exit__(kind, value, traceback)
+            finally:
+                _ACTIVE_STORAGE.reset(self._context_tokens.pop())
+        native_error = self.error if kind is None else None
+        if (self._persistent_arena is not None and not self._persistent_model_owned
+                and (kind is not None or native_error is not None)):
+            try:
+                self.close()
+            except BaseException as cleanup:
+                if kind is not None:
+                    value.add_note(f"Persistent storage cleanup failed; mappings retained: {cleanup}")
+                else:
+                    failure = RuntimeError("native package allocator failed")
+                    failure.add_note(f"Persistent storage cleanup failed; mappings retained: {cleanup}")
+                    raise failure from native_error
+        if native_error is not None:
+            raise RuntimeError("native package allocator failed") from native_error
 
 class HostRegion:
     """Registered storage with identical CPU and device addresses."""
@@ -473,12 +531,16 @@ class ScratchPool:
 
 
 class DeviceRegion:
-    def __init__(self, cuda, address, nbytes, device):
+    def __init__(self, cuda, address, nbytes, device, *, gpudirect=False):
         self.cuda, self.device, self.address, self.nbytes = cuda, device, address, 0
+        self.gpudirect = gpudirect
+        self.closed = False
         self.mappings = []
         self.grow(nbytes)
 
     def grow(self, nbytes):
+        if self.closed:
+            raise RuntimeError("device mapping is closed")
         if nbytes < self.nbytes:
             raise ValueError("preparation storage cannot shrink")
         if nbytes == self.nbytes:
@@ -486,18 +548,30 @@ class DeviceRegion:
         cuda, device = self.cuda, self.device
         address, size = self.address + self.nbytes, nbytes - self.nbytes
         handle = C.c_uint64()
-        properties = _Properties(1, 0 if os.name == "nt" else 1, _Location(1, device), None, (C.c_ubyte * 8)())
+        properties = _Properties(1, 0 if os.name == "nt" else 1, _Location(1, device), None,
+                                 (C.c_ubyte * 8)(0, int(self.gpudirect), 0, 0, 0, 0, 0, 0))
         cuda.call("cuMemCreate", C.byref(handle), C.c_size_t(size), C.byref(properties), C.c_uint64(0))
+        mapped = False
         try:
-            cuda.call("cuMemMap", C.c_uint64(address), C.c_size_t(size), C.c_size_t(0), handle, C.c_uint64(0))
-        finally:
-            cuda.call("cuMemRelease", handle)
-        access = _Access(_Location(1, device), 3)
-        try:
+            try:
+                cuda.call("cuMemMap", C.c_uint64(address), C.c_size_t(size), C.c_size_t(0), handle, C.c_uint64(0))
+                mapped = True
+            finally:
+                cuda.call("cuMemRelease", handle)
+            access = _Access(_Location(1, device), 3)
             cuda.call("cuMemSetAccess", C.c_uint64(address), C.c_size_t(size), C.byref(access), C.c_size_t(1))
             cuda.call("cuMemsetD8_v2", C.c_uint64(address), C.c_ubyte(0), C.c_size_t(size))
         except BaseException:
-            cuda.call("cuMemUnmap", C.c_uint64(address), C.c_size_t(size))
+            if mapped:
+                cuda.call("cuMemUnmap", C.c_uint64(address), C.c_size_t(size))
             raise
         self.nbytes = nbytes
         self.mappings.append((address, size))
+
+    def close(self):
+        while self.mappings:
+            address, size = self.mappings[-1]
+            self.cuda.call("cuMemUnmap", C.c_uint64(address), C.c_size_t(size))
+            self.mappings.pop()
+            self.nbytes -= size
+        self.closed = True

@@ -93,6 +93,7 @@ class PreparedDraft:
             coordinator=coordinator,
             session=session,
             name=name + ".head",
+            workspace=workspace,
         )
 
     def __call__(self):

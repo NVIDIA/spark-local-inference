@@ -428,6 +428,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         self.sampled = sampled
         self.broadcast = None
         self.source_logits, self.source_bias = None, None
+        self.has_source_logits = False
         self._candidate_kernels = None
         self._restore_support = None
 
@@ -450,6 +451,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                 or bias.device != logits.device or bias.stride(-1) != 1 or bias.stride(0) < shape[1]):
             raise ValueError("draft bias requires BF16/FP32 contiguous vocabulary rows on the logit device")
         self.source_logits, self.source_bias = logits, bias
+        self.has_source_logits = True
 
     def prepare_broadcast(self, *, runtime, session, coordinator, name, buffers=None):
         if runtime is None:
@@ -528,6 +530,129 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         for kernel in self._score_kernels:
             kernel()
 
+    def release_scratch(self):
+        scratch = {id(getattr(self, name)): name for name in self.layout if name != "valid"}
+        scratch[id(self.logits)] = "logits"
+        if self.source_logits is not None:
+            scratch[id(self.source_logits)] = "source_logits"
+        if self.proposal._shortlist_args is not None:
+            scratch[id(self.proposal._shortlist_args[1])] = "shortlist_ids"
+        kernels = (*self._score_kernels, *(self._candidate_kernels or ()),
+                   *self.proposal._kernels, *((self._restore_support,) if self._restore_support is not None else ()))
+        seen = set()
+        for kernel in kernels:
+            if id(kernel) in seen:
+                continue
+            seen.add(id(kernel))
+            kernel.scratch_slots = tuple((index, scratch[id(value)]) for index, value in enumerate(kernel.args)
+                                         if id(value) in scratch)
+            slots = {index for index, _ in kernel.scratch_slots}
+            kernel.args = tuple(None if index in slots else value for index, value in enumerate(kernel.args))
+        self._runtime_shortlist = self.proposal._shortlist_args is not None
+        self.proposal._block_args = None
+        self.proposal._select_args = None
+        self.proposal._shortlist_args = None
+        self.proposal._candidate_source = None
+        self.proposal.candidates = None
+        self.proposal.selected = None
+        for name in self.layout:
+            if name != "valid":
+                setattr(self, name, None)
+        self.normalization.output = None
+        self.normalization.valid = None
+        self.logits = None
+        self.source_logits = None
+
+    def functional(self, *, session=None):
+        if getattr(self, "_functional", False):
+            return self
+        if not self._prepared:
+            raise RuntimeError("draft proposal requires prepare() before functional conversion")
+        has_support = self.proposal._support is not None
+        if not hasattr(self, "_runtime_shortlist"):
+            self.release_scratch()
+
+        def runtime_slots(kernel, slots):
+            bindings = dict(kernel.scratch_slots)
+            bindings.update(slots)
+            kernel.scratch_slots = tuple(sorted(bindings.items()))
+            kernel.args = tuple(None if index in bindings else value for index, value in enumerate(kernel.args))
+
+        runtime_slots(self._score_kernels[0], {2: "candidates"})
+        runtime_slots(self._score_kernels[1], {1: "candidates", 10: "valid"})
+        if self._candidate_kernels is not None:
+            runtime_slots(self._candidate_kernels[0], {3: "candidates"})
+        runtime_slots(self.proposal._kernels[-1], {3: "valid", 8: "seed", 9: "offset", 10: "sampled"})
+        if has_support:
+            runtime_slots(self.proposal._kernels[-1], {16: "support_ids", 17: "support_probabilities"})
+        if self._restore_support is not None:
+            runtime_slots(self._restore_support, {1: "support_ids", 2: "support_probabilities"})
+        self._has_support = has_support
+        self.proposal._support = None
+        self.sampled = self.valid = self.candidates = None
+        self.rows = self.columns = None
+        self.normalization.functional()
+        self.support_ids = self.support_probabilities = None
+        if self.broadcast is not None:
+            self.broadcast.functional(session=session)
+        self._functional = True
+        return self
+
+    def run(self, scratch, logits, *, source_logits=None, shortlist_ids=None, candidates=None,
+            seed=None, offset=None, sampled=None):
+        from ignition.preparation.triton import launch_triton
+
+        if not self._prepared:
+            raise RuntimeError("draft proposal requires prepare() before capture")
+
+        functional = getattr(self, "_functional", False)
+        runtime = dict(logits=logits, source_logits=source_logits, shortlist_ids=shortlist_ids,
+                       candidates=candidates, seed=seed, offset=offset, sampled=sampled)
+        if functional and self._has_support:
+            scratch = dict(scratch)
+            batch = logits.shape[0]
+            scratch["support_ids"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.int64, device=logits.device)
+            scratch["support_probabilities"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.float32, device=logits.device)
+
+        def launch(kernel):
+            args = list(kernel.args)
+            for index, name in kernel.scratch_slots:
+                args[index] = runtime[name] if name in runtime else scratch[name]
+            if functional:
+                if kernel is self._score_kernels[0]:
+                    args[11] = candidates.stride(0)
+                elif kernel is self._score_kernels[1]:
+                    args[13] = candidates.stride(0)
+                elif self._candidate_kernels is not None and kernel is self._candidate_kernels[0]:
+                    args[14] = candidates.stride(0)
+                    args[15] = source_logits.stride(0)
+                    args[16] = (source_logits if self.source_bias is None else self.source_bias).stride(0)
+                elif self._runtime_shortlist and kernel is self.proposal._kernels[0]:
+                    args[3] = shortlist_ids.stride(0)
+            launch_triton(kernel.kernel, kernel.compiled, tuple(args), kernel.grid, **kernel.options)
+
+        if self._candidate_kernels is None:
+            if source_logits is not None:
+                logits[:, 0].copy_(source_logits.float())
+                if self.source_bias is not None:
+                    logits[:, 0].add_(self.source_bias)
+            for kernel in self._score_kernels:
+                launch(kernel)
+        else:
+            for kernel in self._candidate_kernels:
+                launch(kernel)
+        if self._runtime_shortlist:
+            scratch["probabilities"].zero_()
+        for kernel in self.proposal._kernels:
+            launch(kernel)
+        if self.broadcast is not None:
+            if functional:
+                self.broadcast((scratch["support_ids"], scratch["support_probabilities"], sampled, scratch["valid"]))
+            else:
+                self.broadcast()
+            launch(self._restore_support)
+        return scratch["probabilities"]
+
     def __call__(self):
         if not self._prepared:
             raise RuntimeError("draft proposal requires prepare() before capture")
@@ -587,7 +712,9 @@ class PreparedDraftBlockBroadcast:
         self.sampled[position].copy_(proposal.sampled)
         self.valid[position].copy_(proposal.valid[:, 0])
 
-    def finish(self, active, limits):
+    def finish(self, active, limits, probabilities=None):
+        if probabilities is None:
+            probabilities = self.probabilities
         self.broadcast()
         self.drafts.copy_(self.sampled.T)
         self.output_sampled.copy_(self.sampled[-1])
@@ -595,6 +722,6 @@ class PreparedDraftBlockBroadcast:
                                 & (self.positions[None, :] < limits[:, None] - 1))
         # Local supports can differ at every position. Clear the complete retained
         # rows before restoring root q; padding repeats token zero with identical bits.
-        self.probabilities.zero_()
-        self.probabilities.scatter_(2, self.support_ids.permute(1, 0, 2),
+        probabilities.zero_()
+        probabilities.scatter_(2, self.support_ids.permute(1, 0, 2),
                                    self.support_probabilities.permute(1, 0, 2))

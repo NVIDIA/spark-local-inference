@@ -431,6 +431,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     coordinator=coordinator,
                     session=session,
                     name=name,
+                    workspace=arena,
                 )
                 add(
                     name,

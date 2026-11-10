@@ -254,7 +254,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                 name = f"resume{capacity}" + suffix
                 forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=None, vocabulary_runtime=None, coordinator=coordinator,
-                    session=session, name=name, activation_mode="auto", buffers=graph_buffers.cursor())
+                    session=session, name=name, activation_mode="auto", buffers=graph_buffers.cursor(), workspace=arena)
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix

@@ -10,6 +10,8 @@ from functools import cached_property
 import torch
 
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_empty, persistent_zeros, allocated_tensor_bytes
+
 from .config import ModelConfig
 
 PREFIX = "model.language_model"
@@ -54,7 +56,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, package_storage=None, draft_snapshot=None):
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         loading = nullcontext if package_storage is None else package_storage.transient
         with loading(), MuseSparkWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
             config = loader.config
@@ -65,7 +67,7 @@ class ModelWeights:
             embedding = loader.load_tensor(PREFIX + ".embed_tokens.weight", extent=(slice(None), slice(first, last)))
             norm = loader.load_tensor(PREFIX + ".norm.weight")
             first, last, width = config.vocabulary_partition(shard)
-            head = torch.zeros((width, config.hidden), dtype=torch.bfloat16, device=device)
+            head = persistent_zeros((width, config.hidden), dtype=torch.bfloat16, device=device)
             loader._copy(head[:last-first], loader._sources["lm_head.weight"][first:last])
             loader._session.flush()
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -74,7 +76,7 @@ class ModelWeights:
             from .draft_weights import DraftWeights
             with loading():
                 draft = DraftWeights.load(draft_snapshot, config.draft, device, shard, progress=progress)
-        return cls(config, shard, embedding, norm, head, layers, torch.cuda.memory_allocated(device) - before, draft=draft)
+        return cls(config, shard, embedding, norm, head, layers, allocated_tensor_bytes(device) - before, draft=draft)
 
 
 class MuseSparkWeightLoader(DirectWeightLoader):
@@ -102,8 +104,7 @@ class MuseSparkWeightLoader(DirectWeightLoader):
                                      row_ranges=((q0, q1), kv, kv, (q0, q1)))
         mlp = prefix + ".mlp"
         def tensor(suffix, *, fp32=False):
-            value = self.load_tensor(prefix + "." + suffix)
-            return value.float() if fp32 else value
+            return self.load_tensor(prefix + "." + suffix, dtype=torch.float32 if fp32 else None)
         return LayerWeights(qkv, self.load_linear(attn + ".o_proj", columns=(q0, q1)),
             tensor("input_layernorm.weight"), tensor("pre_feedforward_layernorm.weight"),
             tensor("post_feedforward_layernorm.weight"), tensor("post_attention_residual_gate.gate", fp32=True),
@@ -129,8 +130,8 @@ class MuseSparkWeightLoader(DirectWeightLoader):
             if (gate_up.dtype != torch.bfloat16 or down.dtype != torch.bfloat16
                     or gate_up.shape != (count, 2 * inter, hidden) or down.shape != (count, hidden, inter)):
                 raise ValueError(f"{prefix}: declared BF16 experts disagree with checkpoint storage")
-            gate_target = torch.empty((len(ids), local * 2, hidden), dtype=torch.bfloat16, device=self.device)
-            down_target = torch.empty((len(ids), hidden, local), dtype=torch.bfloat16, device=self.device)
+            gate_target = persistent_empty((len(ids), local * 2, hidden), dtype=torch.bfloat16, device=self.device)
+            down_target = persistent_empty((len(ids), hidden, local), dtype=torch.bfloat16, device=self.device)
             for target, expert in enumerate(ids):
                 self._copy(gate_target[target, :local], gate_up[expert, first:last])
                 self._copy(gate_target[target, local:], gate_up[expert, inter+first:inter+last])

@@ -19,6 +19,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.components.vision_delivery import PreparedFeaturePublication
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_cat
 
 PATCH_CAPACITIES = (256, 1024, 2304)
 FEATURES = 2304
@@ -65,25 +66,25 @@ class VisionWeights:
             progress_label="Load vision weights",
         ) as loader:
 
-            def tensor(name, extent=None, *, dtype=torch.bfloat16):
+            def tensor(name, extent=None, *, dtype=torch.bfloat16, temporary=False):
                 value = loader._sources[name]
                 if value.dtype != dtype:
                     raise ValueError(
                         f"{name}: vision weights require {dtype} checkpoint storage"
                     )
-                return loader.load_tensor(name, extent=extent)
+                return loader.load_tensor(name, extent=extent, temporary=temporary)
 
-            def affine(prefix, rows=None, columns=None):
+            def affine(prefix, rows=None, columns=None, *, temporary=False):
                 return (
                     tensor(
                         prefix + ".weight",
                         (
                             slice(None) if rows is None else slice(*rows),
                             slice(None) if columns is None else slice(*columns),
-                        ),
+                        ), temporary=temporary,
                     ),
                     tensor(
-                        prefix + ".bias", slice(None) if rows is None else slice(*rows)
+                        prefix + ".bias", slice(None) if rows is None else slice(*rows), temporary=temporary
                     ),
                 )
 
@@ -97,7 +98,7 @@ class VisionWeights:
             for index in range(32):
                 prefix = f"vision_tower.vision_model.encoder.layers.{index}"
                 projections = [
-                    affine(prefix + ".self_attn." + role + "_proj", rows=h)
+                    affine(prefix + ".self_attn." + role + "_proj", rows=h, temporary=True)
                     for role in ("q", "k", "v")
                 ]
                 layers.append(
@@ -105,8 +106,8 @@ class VisionWeights:
                         norm1=norm(prefix + ".layer_norm1"),
                         norm2=norm(prefix + ".layer_norm2"),
                         qkv=(
-                            torch.cat([w for w, _ in projections]),
-                            torch.cat([b for _, b in projections]),
+                            persistent_cat([w for w, _ in projections]),
+                            persistent_cat([b for _, b in projections]),
                         ),
                         output=affine(prefix + ".self_attn.out_proj", columns=h),
                         up=affine(prefix + ".mlp.fc1", rows=m),

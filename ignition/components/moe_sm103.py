@@ -34,6 +34,7 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
+from ignition.preparation.persistent import persistent_empty, persistent_zeros
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
@@ -162,7 +163,7 @@ def _interleaved_scales(scales, permutation):
     from flashinfer.fp4_quantization import block_scale_interleave
 
     experts, rows, columns = scales.shape
-    output = torch.empty((experts, rows, columns), dtype=torch.uint8, device=scales.device)
+    output = persistent_empty((experts, rows, columns), dtype=torch.uint8, device=scales.device)
     flat = output.view(experts, -1)
     for start in range(0, experts, _CHUNK):
         part = scales[start:start + _CHUNK].view(torch.uint8)
@@ -209,15 +210,17 @@ def prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, *, swiglu_limi
     scales2 = _interleaved_scales(s2, s2_rows.to(w13.device)).view(torch.float8_e4m3fn)
     gate = w13_global / a1
     device = w13.device
-    as_device = partial(torch.as_tensor, dtype=torch.float32, device=device)
+    def as_device(values):
+        values = torch.as_tensor(values, dtype=torch.float32)
+        return persistent_empty(values.shape, dtype=values.dtype, device=device).copy_(values)
     return TrtllmNvfp4Experts(
         w13=w13, w13_scale=scales13, w2=w2, w2_scale=scales2,
         input_global_scale=as_device(a1[:1] if shared_input_scale else a1),
         output1_scale=as_device(a2 * gate),
         output1_gate_scale=as_device(gate),
         output2_scale=as_device(w2_global / a2),
-        gate_alpha=torch.ones(experts, dtype=torch.float32, device=device),
-        gate_beta=None if swiglu_limit is None else torch.zeros(experts, dtype=torch.float32, device=device),
+        gate_alpha=persistent_empty((experts,), dtype=torch.float32, device=device).fill_(1),
+        gate_beta=None if swiglu_limit is None else persistent_zeros((experts,), dtype=torch.float32, device=device),
         # trtllm-gen clamps raw FC1 accumulators, before the gate dequantization scale.
         clamp_limit=None if swiglu_limit is None else as_device(float(swiglu_limit) / gate),
     )
@@ -236,7 +239,8 @@ def prepare_cute_w4a16_experts(w13, s13, w2, s2, w13_global, w2_global, *, swigl
     storage13 = _interleaved_scales(s13, rows)
     storage2 = _interleaved_scales(s2, None)
     device = w13.device
-    alphas = tuple(torch.as_tensor(_vector(v, experts, device, name), dtype=torch.float32, device=device)
+    alphas = tuple(persistent_empty((experts,), dtype=torch.float32, device=device).copy_(
+                       _vector(v, experts, device, name).to(torch.float32))
                    for v, name in ((w13_global, "FC1 weight global scales"),
                                    (w2_global, "FC2 weight global scales")))
     return CuteW4A16Experts(

@@ -9,6 +9,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights, _aligned_range
 from ignition.components.block_fp8 import BlockFP8Weight
+from ignition.preparation.persistent import persistent_empty, persistent_zeros, allocated_tensor_bytes
 
 from .config import ModelConfig
 
@@ -40,7 +41,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dflash=True):
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with MiMoWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
             config = loader.config
             embedding, norm = loader.load_tensors(("model.embed_tokens.weight", "model.norm.weight"))
@@ -56,7 +57,7 @@ class ModelWeights:
 
         vision = VisionWeights.load(manifest, config.text, device, shard, progress=progress)
         return cls(config, shard, embedding, norm, head, layers,
-                   torch.cuda.memory_allocated(device) - before, draft, vision)
+                   allocated_tensor_bytes(device) - before, draft, vision)
 
 
 class MiMoWeightLoader(DirectWeightLoader):
@@ -70,35 +71,44 @@ class MiMoWeightLoader(DirectWeightLoader):
                 if name.startswith("model.layers.")
                 or name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")}
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, temporary=False):
         prefixes = tuple(prefixes)
         formats = {self.config.projection_format(prefix) for prefix in prefixes}
         if not prefixes or len(formats) != 1 or formats == {"mxfp4"}:
             raise ValueError("dense projection fusion requires matching BF16 or block-FP8 formats")
         ranges = (None,) * len(prefixes) if row_ranges is None else row_ranges
         values, scales = [], []
+        quantized = formats == {"block_fp8"}
         for prefix, rows in zip(prefixes, ranges, strict=True):
             source = self._sources[prefix + ".weight"]
-            quantized = formats == {"block_fp8"}
             if source.ndim != 2 or source.dtype != (torch.float8_e4m3fn if quantized else torch.bfloat16):
                 raise ValueError(f"{prefix}: weight dtype disagrees with quantization metadata")
             n, k = source.shape
             r0, r1 = _aligned_range(rows, n, 128 if quantized else 1)
             c0, c1 = _aligned_range(column_range, k, 128 if quantized else 1)
-            value = torch.empty((r1 - r0, c1 - c0), dtype=source.dtype, device=self.device)
-            self._copy(value, source[r0:r1, c0:c1])
-            values.append(value)
+            values.append(source[r0:r1, c0:c1])
             if quantized:
                 scale = self._sources[prefix + ".weight_scale_inv"]
                 if scale.dtype != torch.float32 or scale.shape != ((n + 127) // 128, (k + 127) // 128):
                     raise ValueError(f"{prefix}: invalid FP32 block scale geometry")
-                target = torch.empty(((r1 - r0) // 128, (c1 - c0) // 128),
-                                     dtype=torch.float32, device=self.device)
-                self._copy(target, scale[r0 // 128:r1 // 128, c0 // 128:c1 // 128])
-                scales.append(target)
+                scales.append(scale[r0 // 128:r1 // 128, c0 // 128:c1 // 128])
+        if any(value.shape[1] != values[0].shape[1] for value in values):
+            raise ValueError("fused MiMo projections must share an input width")
+        allocate = torch.empty if temporary else persistent_empty
+
+        def transfer(parts):
+            target = allocate((sum(part.shape[0] for part in parts), parts[0].shape[1]),
+                              dtype=parts[0].dtype, device=self.device)
+            offset = 0
+            for part in parts:
+                self._copy(target[offset:offset + part.shape[0]], part)
+                offset += part.shape[0]
+            return target
+
+        weight = transfer(values)
+        scale = transfer(scales) if scales else None
         self._session.flush()
-        weight = torch.cat(values) if len(values) > 1 else values[0]
-        return weight if not scales else BlockFP8Weight(weight, torch.cat(scales) if len(scales) > 1 else scales[0])
+        return weight if scale is None else BlockFP8Weight(weight, scale)
 
     def load_qkv(self, layer):
         prefix = f"model.layers.{layer}.self_attn.qkv_proj"
@@ -111,8 +121,8 @@ class MiMoWeightLoader(DirectWeightLoader):
                 or scale.dtype != torch.float32 or scale.shape != (first[-1].scale_rows[1], hidden // 128)):
             raise ValueError(f"{prefix}: chunked QKV weights or padded scale rows differ from checkpoint geometry")
         rows = sum(c.padded_rows for c in chunks)
-        values = torch.zeros((rows, hidden), dtype=weight.dtype, device=self.device)
-        scales = torch.empty((rows // 128, hidden // 128), dtype=torch.float32, device=self.device)
+        values = persistent_zeros((rows, hidden), dtype=weight.dtype, device=self.device)
+        scales = persistent_empty((rows // 128, hidden // 128), dtype=torch.float32, device=self.device)
         offset = 0
         for chunk in chunks:
             start, end = chunk.weight_rows

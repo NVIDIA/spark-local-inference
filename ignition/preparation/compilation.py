@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
+            'memory_planning': True, 'memory_pool': 'combined',
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
             'triton.cooperative_reductions': True,
             'compile_threads': min(16, os.cpu_count() or 1)}

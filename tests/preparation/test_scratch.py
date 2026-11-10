@@ -163,6 +163,57 @@ def test_arena_owns_one_aligned_highwater_storage_across_operator_specs():
     assert arena.nbytes == 512
 
 
+def test_preparation_release_drops_backing_after_binding_finalization():
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    backing = weakref.ref(arena.tensor)
+    bound_sizes = []
+    arena.register_finalizer(lambda: bound_sizes.append(arena.nbytes))
+    arena.freeze()
+    arena.finalize()
+    assert bound_sizes == [1024]
+    arena.release_preparation()
+    assert backing() is None
+    assert arena.nbytes == 0 and arena.device == torch.device("cpu")
+    empty = arena.tensor
+    arena.release_preparation()
+    assert arena.tensor is empty
+
+
+def test_preparation_release_rejects_unfinished_binding_without_dropping_storage():
+    arena = ScratchArena("cpu")
+    backing = arena.reserve(256)
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    arena.register_finalizer(lambda: None)
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    assert arena.tensor is backing and arena.nbytes == 256
+    arena.finalize()
+    arena.release_preparation()
+    assert arena.nbytes == 0
+
+
+@pytest.mark.parametrize("operation", [
+    lambda arena: arena.reserve(0),
+    lambda arena: arena.reserve(256),
+    lambda arena: arena.views(((0,), torch.uint8)),
+    lambda arena: arena.trim(0),
+    lambda arena: arena.finalize(),
+    lambda arena: arena.auxiliary_stream,
+])
+def test_released_arena_rejects_storage_and_binding_reuse(operation):
+    arena = ScratchArena("cpu")
+    arena.reserve(256)
+    arena.freeze()
+    arena.finalize()
+    arena.release_preparation()
+    with pytest.raises(RuntimeError, match="storage has been released"):
+        operation(arena)
+    assert arena.nbytes == 0
+
+
 def test_serial_arena_admits_no_auxiliary_stream_or_concurrent_plans():
     plan = SimpleNamespace(memory_requirements=lambda: SimpleNamespace(scratch_nbytes=256))
     assert ScratchArena("cpu").overlap

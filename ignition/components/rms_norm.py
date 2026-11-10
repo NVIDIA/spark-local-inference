@@ -4,7 +4,7 @@
 
 """Prepared RMS normalization reading projection slices with explicit row strides."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 from b12x.norm.hyperconnection import api as hyperconnection
@@ -66,6 +66,10 @@ class PreparedRMSNorm:
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(prepared_source, weight, output, **kwargs)),
             benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalRMSNorm(self.weight, self.plan, self.eps, self.zero_centered,
+                                  self.add_residual, self.staging is not None)
+
     def __call__(self, source, residual=None):
         original_source = source
         if self.staging is not None:
@@ -80,6 +84,31 @@ class PreparedRMSNorm:
             torch.ops.b12x.hyperconnection_grouped_rmsnorm(
                 source, self.weight, self.output, self.eps, self.plan.handle, self.zero_centered)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+    zero_centered: bool
+    add_residual: bool
+    stage_source: bool
+
+    def __call__(self, source, residual=None):
+        original = source
+        if self.stage_source:
+            source = source.contiguous()
+        output = torch.empty(source.shape, dtype=torch.bfloat16, device=source.device)
+        if self.add_residual:
+            torch.ops.b12x.hyperconnection_residual_rmsnorm(
+                source, residual, self.weight, output, self.eps, self.plan.handle, self.zero_centered)
+            if self.stage_source:
+                original.copy_(source)
+        else:
+            torch.ops.b12x.hyperconnection_grouped_rmsnorm(
+                source, self.weight, output, self.eps, self.plan.handle, self.zero_centered)
+        return output
 
 
 class PreparedIndexedRMSNorm:

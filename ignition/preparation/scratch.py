@@ -50,6 +50,7 @@ class ScratchArena:
         self.allocation_pool = allocation_pool
         self.overlap = overlap
         self.frozen = False
+        self._released = False
         self._finalizers = []
         self._parallel_plans = []
         self._auxiliary_stream = None
@@ -66,6 +67,7 @@ class ScratchArena:
 
     @property
     def auxiliary_stream(self):
+        self._require_active()
         if not self.overlap:
             raise RuntimeError("stream overlap is disabled; compose this branch on the main stream")
         if self._auxiliary_stream is None:
@@ -109,6 +111,7 @@ class ScratchArena:
                     for group in self._parallel_plans), default=0)
 
     def reserve(self, nbytes):
+        self._require_active()
         if type(nbytes) is not int or nbytes < 0:
             raise ValueError("scratch size must be a nonnegative integer")
         if nbytes > self.nbytes:
@@ -123,7 +126,28 @@ class ScratchArena:
     def freeze(self):
         self.frozen = True
 
+    def release_preparation(self):
+        """Retire finalized workspace before capture when all consumers use local scratch.
+
+        The caller must finish tuning and binding finalizers, synchronize their
+        work, and ensure no execution depends on this arena's storage. Existing
+        tensor views retain their own storage ownership; this method does not
+        inspect consumers or infer whether release is safe.
+        """
+        if self._released:
+            return
+        if not self.frozen or self._finalizers:
+            raise RuntimeError("scratch preparation release requires completed binding finalization")
+        self.tensor = torch.empty(0, dtype=torch.uint8, device=self.device)
+        self._parallel_plans.clear()
+        self._released = True
+
+    def _require_active(self):
+        if self._released:
+            raise RuntimeError("scratch preparation storage has been released")
+
     def trim(self, nbytes):
+        self._require_active()
         if type(nbytes) is not int or nbytes < 0:
             raise ValueError("scratch size must be a nonnegative integer")
         capacity = (nbytes + 255) // 256 * 256
@@ -169,6 +193,7 @@ class ScratchArena:
 
     def finalize(self, *, group=None, retain=False):
         """Bind scratch views, retaining callbacks only for preparation trial graphs."""
+        self._require_active()
         if group is None:
             for callback in self._finalizers:
                 callback()
@@ -347,7 +372,7 @@ class GraphBufferPool:
     Values retained across layers or until speculative acceptance need separate storage.
     """
 
-    def __init__(self, device, *, chunk_bytes=64 << 20, allocation_pool=None):
+    def __init__(self, device, *, chunk_bytes=2 << 20, allocation_pool=None):
         if type(chunk_bytes) is not int or chunk_bytes <= 0 or chunk_bytes % 256:
             raise ValueError("graph buffer chunks must be a positive multiple of 256 bytes")
         self.device, self.chunk_bytes = torch.device(device), chunk_bytes

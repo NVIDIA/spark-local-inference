@@ -130,6 +130,7 @@ class PreparedMaintenance:
         self.history = PreparedRequestHistory(transfer.pool, requests, c, snapshot=mode == "snapshot")
         self.snapshot = mode == "snapshot"
         self._stage = None
+        self.local_metadata = False
 
     def prepare(self):
         self.transfer.prepare()
@@ -139,24 +140,64 @@ class PreparedMaintenance:
         self._agree = _compile(_agree, self.agree_args, (1, 1, 1))
         self._complete = _compile(_complete, self.complete_args, (self.slots, 1, 1))
 
+    def functional(self):
+        if self._stage is None:
+            raise RuntimeError("maintenance prepare() must complete before functional conversion")
+        self._stage.args = tuple(None if i in (8, 11) else value
+                                 for i, value in enumerate(self._stage.args))
+        self._agree.args = tuple(None if i in (0, 2) else value
+                                 for i, value in enumerate(self._agree.args))
+        self.stage_args = self.agree_args = ()
+        if self.admission is not None:
+            self.admission.functional()
+        self.validation_input = self.validation_sum = self.admission_errors = None
+        self.local_metadata = True
+        return self
+
     def validate(self):
         if self._stage is None:
             raise RuntimeError("maintenance prepare() must complete before capture")
         self.transfer.validate()
-        if self.admission is not None:
-            self.admission.validate()
-        self._stage()
-        return self.validation_input
+        if self.local_metadata:
+            from ignition.preparation.triton import launch_triton
 
-    def apply(self):
+            device = self.requests.generation.device
+            validation = torch.zeros((1, max(8, 2 * self.slots)), dtype=torch.bfloat16, device=device)
+            admission_errors = (self.admission.validate() if self.admission is not None
+                                else torch.zeros(self.slots, dtype=torch.int32, device=device))
+            args = list(self._stage.args)
+            args[8], args[11] = admission_errors, validation
+            launch_triton(self._stage.kernel, self._stage.compiled, tuple(args), self._stage.grid,
+                          **self._stage.options)
+            return validation, admission_errors
+        else:
+            if self.admission is not None:
+                self.admission.validate()
+            self._stage()
+            return self.validation_input
+
+    def apply(self, totals=None, *, admission_errors=None):
         if self._stage is None:
             raise RuntimeError("maintenance prepare() must complete before capture")
-        self._agree()
+        if self.local_metadata:
+            from ignition.preparation.triton import launch_triton
+
+            if totals is None or admission_errors is None:
+                raise ValueError("functional maintenance requires validation totals and admission errors")
+            args = list(self._agree.args)
+            args[0], args[2] = totals, admission_errors
+            launch_triton(self._agree.kernel, self._agree.compiled, tuple(args), self._agree.grid,
+                          **self._agree.options)
+        else:
+            self._agree()
         if self.snapshot:
             self.history()
         self.transfer.apply()
         if not self.snapshot:
             self.history()
         if self.admission is not None:
-            self.admission.apply()
+            if self.local_metadata:
+                self.admission.apply(admission_errors)
+            else:
+                self.admission.apply()
         self._complete()

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights
+from ignition.preparation.persistent import persistent_cat, persistent_copy
 
 
 @dataclass(frozen=True)
@@ -50,29 +51,34 @@ class VisionWeights:
         layers = []
         with DirectWeightLoader(manifest, device, prefixes=("visual.",), progress=progress,
                                 progress_label="Load image weights") as loader:
-            def tensor(name, extent=None):
-                value = loader.load_tensor("visual." + name, extent=extent)
+            def tensor(name, extent=None, *, temporary=False):
+                value = loader.load_tensor("visual." + name, extent=extent, temporary=temporary)
                 if value.dtype != torch.bfloat16:
                     raise ValueError(f"MiMo vision requires BF16 weights: {name}")
                 return value
 
-            def matrix(name, rows=None, columns=None):
+            def matrix(name, rows=None, columns=None, *, temporary=False):
                 return tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                                                        slice(*(columns or (None, None)))))
+                                                        slice(*(columns or (None, None)))),
+                              temporary=temporary)
 
             patch = tensor("patch_embed.proj.weight").flatten(1)
             for i in range(c["depth"]):
                 p = f"blocks.{i}"
                 ranges = (q, (2048 + k[0], 2048 + k[1]), (2560 + k[0], 2560 + k[1]))
-                qkv = torch.cat([matrix(p + ".attn.qkv", rows=extent) for extent in ranges])
-                bias = torch.cat([tensor(p + ".attn.qkv.bias", extent=slice(*extent)) for extent in ranges])
-                sink = (tensor(p + ".attn.sinks", extent=slice(*shard.partition(c["num_heads"]))).float()
+                qkv = persistent_cat([matrix(p + ".attn.qkv", rows=extent, temporary=True) for extent in ranges])
+                bias = persistent_cat([tensor(p + ".attn.qkv.bias", extent=slice(*extent), temporary=True)
+                                       for extent in ranges])
+                sink = (persistent_copy(tensor(p + ".attn.sinks", extent=slice(*shard.partition(c["num_heads"])),
+                                               temporary=True).float())
                         if c["use_sink"] and i not in c["fullatt_block_indexes"] else None)
-                mlp = MLPWeights(torch.cat([matrix(p + ".mlp." + kind, rows=intermediate)
-                                           for kind in ("gate_proj", "up_proj")]),
+                mlp = MLPWeights(persistent_cat([matrix(p + ".mlp." + kind, rows=intermediate, temporary=True)
+                                                  for kind in ("gate_proj", "up_proj")]),
                                  matrix(p + ".mlp.down_proj", columns=intermediate))
-                gate_bias = torch.cat([tensor(p + ".mlp." + kind + ".bias", extent=slice(*intermediate))
-                                       for kind in ("gate_proj", "up_proj")])
+                gate_bias = persistent_cat([
+                    tensor(p + ".mlp." + kind + ".bias", extent=slice(*intermediate), temporary=True)
+                    for kind in ("gate_proj", "up_proj")
+                ])
                 layers.append(VisionLayerWeights(tensor(p + ".norm1.weight"), tensor(p + ".norm2.weight"),
                     qkv, bias, matrix(p + ".attn.proj", columns=q), tensor(p + ".attn.proj.bias"), sink,
                     mlp, gate_bias, tensor(p + ".mlp.down_proj.bias")))

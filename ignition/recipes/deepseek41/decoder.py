@@ -311,9 +311,9 @@ class PreparedDecoder:
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True,
             logits_dtype=torch.float32)
         self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
-            coordinator=coordinator, session=session, name=name)
+            coordinator=coordinator, session=session, name=name, workspace=workspace)
 
-    def _prepare_head(self, *, vocabulary_parallel, vocabulary_runtime, coordinator, session, name):
+    def _prepare_head(self, *, vocabulary_parallel, vocabulary_runtime, coordinator, session, name, workspace=None):
         scratch, weights = self.scratch, self.weights
         self.compact_head = scratch.hidden.shape[0] > self.output_metadata.token_ids.numel()
         head_rows = self.output_metadata.token_ids.numel() if self.compact_head else scratch.hidden.shape[0]
@@ -327,7 +327,8 @@ class PreparedDecoder:
             head_output = scratch.logits.view(-1)[:scratch.local_logits.numel()].view_as(scratch.local_logits)
         self.head = PreparedVocabularyProjection(self.head_hidden, weights.head, scratch.local_logits[:head_rows],
             head_output, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            row_indices=self.output_metadata.sample_indices if self.compact_head else None, gather=not vocabulary_parallel)
+            row_indices=self.output_metadata.sample_indices if self.compact_head else None, gather=not vocabulary_parallel,
+            workspace=workspace)
 
         self.local_logits = self.head.output if vocabulary_parallel else scratch.local_logits
 

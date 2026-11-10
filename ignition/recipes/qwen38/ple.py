@@ -110,6 +110,7 @@ class PLETable:
     def load(cls, manifest, device, *, tokens, progress=None, host_allocator=None):
         from b12x.sequence._shared.disk_table import MappedHostAllocation
         from ignition.preparation.runtime_package import FileSource
+        from ignition.preparation.persistent import persistent_empty
 
         device = torch.device(device)
         config, layout = table_layout(manifest, device)
@@ -135,8 +136,10 @@ class PLETable:
                 mailbox.host_view.zero_()
                 ready = torch.cuda.Event(external=True)
                 ready.record(torch.cuda.current_stream(device))
-                table = cls(config, layout, ple_embedding.allocate_geometry(layout.geometry, device=device),
-                    scale.to(device), torch.zeros((tokens * heads, 80), dtype=torch.uint8, device=device),
+                table = cls(config, layout, ple_embedding.allocate_geometry(layout.geometry, device=device,
+                    allocate=persistent_empty),
+                    persistent_empty(scale.shape, scale.dtype, device).copy_(scale),
+                    torch.zeros((tokens * heads, 80), dtype=torch.uint8, device=device),
                     torch.zeros((tokens * heads, 10), dtype=torch.uint8, device=device),
                     torch.full((tokens, heads), -1, dtype=torch.int64, device=device), mailbox, ready, tuple(sources),
                     float(scale.item()))

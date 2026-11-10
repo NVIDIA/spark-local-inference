@@ -136,7 +136,8 @@ class PreparedFeedForward(torch.nn.Module):
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, embedding_runtime, preexpert_runtime,
-                 vocabulary_runtime, coordinator, session, name, workspace, buffers=None, scoring=None):
+                 vocabulary_runtime, coordinator, session, name, workspace, buffers=None, scoring=None,
+                 capture_buffers=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         c = weights.config.text
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, scratch.local_embedding,
@@ -156,8 +157,9 @@ class PreparedDecoder:
         self.norm = norm("rms", weights.norm, dimension=c["hidden_size"], eps=c["rms_norm_eps"])
         self.target_layers = () if weights.draft is None else weights.config.draft.target_layers
         shape = (scratch.embedding.shape[0], len(self.target_layers) * c["hidden_size"])
+        captured = buffers if capture_buffers is None else capture_buffers
         self.auxiliary = (torch.zeros(shape, dtype=torch.bfloat16, device=scratch.embedding.device)
-                          if buffers is None else buffers.zeros(shape, torch.bfloat16))
+                          if captured is None else captured.zeros(shape, torch.bfloat16))
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=weights.config.vocabulary, session=session, coordinator=coordinator,
             name=name + ".prompt", copy_source=True)
@@ -165,7 +167,7 @@ class PreparedDecoder:
             self.scoring.parts = [(source, SoftcappedProjection(projection, c["output_multiplier"],
                 c["final_logit_softcapping"]), reduction) for source, projection, reduction in self.scoring.parts]
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
         self.output_multiplier, self.softcap = c["output_multiplier"], c["final_logit_softcapping"]
 
     def __call__(self):

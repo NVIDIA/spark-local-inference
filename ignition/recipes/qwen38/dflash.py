@@ -10,10 +10,8 @@ import torch
 from ignition.components.dflash2 import PreparedContext
 from ignition.components.dflash2_preparation import DFlash2Preparation, PreparedContextAbsorption
 from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
-from ignition.components.parallel_draft import PreparedParallelDraftRound
 from ignition.components.recurrent import DeltaMetadata
 from ignition.components.token_state import PreparedTokenState
-from ignition.preparation.scratch import GraphBufferPool
 
 from .attention import QSAMetadata
 from .decoder import PreparedDecoder
@@ -99,16 +97,18 @@ class PreparedTargetState:
 class PreparedTarget:
     """Expose Qwen's target forward to the shared speculative round."""
 
-    def __init__(self, owner, scratch, metadata, *, session, name, workspace, mode, **collectives):
+    def __init__(self, owner, scratch, metadata, *, session, name, workspace, mode,
+                 capture_buffers, **collectives):
         self.state = PreparedTargetState(owner, metadata)
         wide = metadata.max_query_tokens > 1
         self.forward = PreparedDecoder(owner.target_weights, scratch, self.state,
             owner.cache, owner.rotary, owner.table, workspace,
             owner.completion, owner.frame, owner.sequence, session=session, name=name,
             max_cache_pages=owner.max_cache_pages, verification=True,
-            gdn_records=owner.records if wide else None, gdn_in_place=not wide, **collectives)
+            gdn_records=owner.records if wide else None, gdn_in_place=not wide,
+            gdn_buffers=owner.gdn_buffers, **collectives)
         self.forward.capture_context(metadata, owner.weights.config.draft,
-            buffers=owner.target_buffers.cursor())
+            buffers=capture_buffers)
         self.auxiliary = self.forward.auxiliary
         self.scratch = SimpleNamespace(logits=self.forward.scratch.logits,
             hidden=self.forward.scratch.sample_hidden)
@@ -137,12 +137,12 @@ class SpeculativePreparation(DFlash2Preparation):
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages, draft_head=None,
                  runtime=None, vocabulary_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None, graph_buffers=None, gather_runtime=None):
+                 sampling_workspace=None, graph_buffers=None, gather_runtime=None, buffer_layout=None,
+                 gdn_buffers=None):
         self.target_weights, self.cache, self.rotary, self.table = weights, cache, rotary, table
         self.context, self.max_cache_pages = context, max_cache_pages
+        self.gdn_buffers = gdn_buffers
         device = pool.backing.device
-        self.target_buffers, self.context_buffers, self.draft_buffers, self.round_buffers = (
-            GraphBufferPool(device) for _ in range(4))
         self.decoders, self.owners = [], []
         self.previous_accepted = torch.ones(requests.capacity, dtype=torch.int32, device=device)
         self.draft_tables = None
@@ -161,20 +161,12 @@ class SpeculativePreparation(DFlash2Preparation):
             embedding=weights.tree.model.language_model.embed_tokens.weight[:, first:last],
             head=weights.tree.lm_head.weight if draft_head is None else draft_head,
             page_tokens=64, completion=completion, frame=frame, sequence=sequence,
-            session=session, workspace=workspaces, buffers=self.draft_buffers.cursor(),
-            context_buffers=self.context_buffers, verification_width=verification_width,
+            session=session, workspace=workspaces, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
-            block_size=draft_config.block_size, gather_runtime=gather_runtime)
+            block_size=draft_config.block_size, gather_runtime=gather_runtime, buffer_layout=buffer_layout)
 
     def buffers(self):
         return {}
-
-    def round(self, batch, width, name):
-        operation = PreparedParallelDraftRound(self, batch, width, name,
-            buffers=self.round_buffers.cursor())
-        operation.prepare()
-        self.owners.append(operation)
-        return operation
 
     def prefill(self, decoder, name):
         s = decoder.state
@@ -183,11 +175,11 @@ class SpeculativePreparation(DFlash2Preparation):
             requests=s.qsa.request_ids, state_rows=s.gdn.convolution_slots,
             query_start_loc=s.gdn.query_start_loc)
         decoder.capture_context(metadata, self.weights.config.draft,
-            buffers=self.target_buffers.cursor(), compact_prefill=True)
+            buffers=self.buffer_layout.capture.fork(), compact_prefill=True)
         context = PreparedContext(self.weights, decoder.auxiliary, metadata, self.pool,
             session=self.session, name=name + ".context", workspace=self.workspace,
             runtime=self.gather_runtime, coordinator=self.collectives["coordinator"],
-            buffers=self.context_buffers.cursor(), compact_prefill=True)
+            buffers=self.buffer_layout.stage.fork(), compact_prefill=True)
         operation = PreparedContextAbsorption(decoder, context, metadata)
         self.owners.append(operation)
         return operation
@@ -199,8 +191,7 @@ class SpeculativePreparation(DFlash2Preparation):
         self.cache = cache
 
     def scratch_tensors(self):
-        values = [super().scratch_tensors(), self.records, self.target_buffers,
-                  self.context_buffers, self.draft_buffers, self.round_buffers]
+        values = [super().scratch_tensors(), self.records, self.buffer_layout.pool]
         for operation in self.owners:
             if isinstance(operation, PreparedContextAbsorption):
                 continue

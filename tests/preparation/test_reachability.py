@@ -41,12 +41,13 @@ def test_checkpoint_role_tracks_storage_lifetime_without_retaining_weights():
 
 
 def test_sampling_indices_do_not_retain_allocations_from_unaligned_token_ids():
+    from ignition.components.sampling import DeviceRequestState
     from ignition.components.speculation import PreparedSpeculativeDistributions
 
     with NumericStorage() as numeric:
         sampling = PreparedSpeculativeDistributions(
             torch.empty((1, 2, 256)),
-            SimpleNamespace(vocab_size=256, generation=torch.zeros(1, dtype=torch.int64)),
+            DeviceRequestState.allocate("cpu", vocab_size=256, capacity=1),
             torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int64),
             torch.ones(1, dtype=torch.int32), torch.zeros((1, 1), dtype=torch.int64))
     indices = sampling.vocab_ids

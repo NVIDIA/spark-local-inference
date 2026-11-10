@@ -107,6 +107,7 @@ class PreparedTokenState:
             history, rows, token_ids.numel(),
             state.consumed_tokens.stride(0), 0 if history is None else history.stride(0), history is not None, state.capacity)
         self._rows = rows
+        self._token_capacity = token_ids.numel()
         self._prepared = False
 
     def prepare(self) -> None:
@@ -114,12 +115,51 @@ class PreparedTokenState:
         self._consume = _compile(_consume, self._consume_args, (self.state.capacity, 1, 1))
         self._prepared = True
 
-    def gather(self) -> None:
+    def functional(self):
+        """Keep prepared kernels while supplying packed storage at each invocation."""
+        if not self._prepared:
+            raise RuntimeError("token state prepare() must complete before functional execution")
+        if self._gather_args is not None:
+            self._gather_inputs, self._gather_constants = self._gather_args[:8], self._gather_args[12:]
+            self._consume_inputs = self._consume_args[2:]
+            self._gather_args = self._consume_args = None
+            self._gather.args = self._consume.args = None
+            self.pending_tokens = self.positions = self.history = self.active = None
+        return self
+
+    def gather(self):
         if not self._prepared:
             raise RuntimeError("token state prepare() must complete before capture")
+        if self._gather_args is None:
+            from ignition.preparation.triton import launch_triton
+
+            device = self.state.generation.device
+            pending = torch.empty((self._rows,), dtype=torch.int64, device=device)
+            positions = torch.empty_like(pending)
+            history = (torch.empty((self._rows, 2), dtype=torch.int64, device=device)
+                       if self._gather_constants[3] else None)
+            active = torch.empty((self._rows,), dtype=torch.int32, device=device)
+            args = (*self._gather_inputs, pending, positions, history, active, *self._gather_constants)
+            launch_triton(self._gather.kernel, self._gather.compiled, args, self._gather.grid,
+                          **self._gather.options)
+            return pending, positions, history, active
         self._gather()
 
-    def consume(self) -> None:
+    def consume(self, token_ids=None, cu_seqlens=None) -> None:
         if not self._prepared:
             raise RuntimeError("token state prepare() must complete before capture")
+        if self._consume_args is None:
+            from ignition.preparation.triton import launch_triton
+
+            if token_ids is None or cu_seqlens is None:
+                raise ValueError("functional token consumption requires tokens and packed row boundaries")
+            device = self.state.generation.device
+            _check_tensor(token_ids, (self._token_capacity,), torch.int64, device, "token_ids")
+            _check_tensor(cu_seqlens, (self._rows + 1,), torch.int32, device, "cu_seqlens")
+            args = (token_ids, cu_seqlens, *self._consume_inputs)
+            launch_triton(self._consume.kernel, self._consume.compiled, args, self._consume.grid,
+                          **self._consume.options)
+            return
+        if token_ids is not None or cu_seqlens is not None:
+            raise ValueError("runtime token operands require functional token state")
         self._consume()

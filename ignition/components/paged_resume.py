@@ -10,7 +10,6 @@ from ignition.components.collectives import PreparedAllReduce
 from ignition.components.resume import PreparedResumeState
 from ignition.components.sampling import PreparedSampling
 from ignition.components.vocabulary import PreparedVocabularyProjection
-from ignition.preparation.scratch import bind_scratch
 
 
 class PreparedResume:
@@ -33,6 +32,8 @@ class PreparedResume:
         activation_mode="a16",
         logits_dtype=torch.bfloat16,
         buffers=None,
+        workspace=None,
+        local_metadata=False,
     ):
         if logits_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("resume logits require BF16 or FP32 storage")
@@ -44,7 +45,6 @@ class PreparedResume:
             inputs.live_rows,
             world_size=weights.shard.world_size,
             state_rows=inputs.request_state_rows,
-            buffers=buffers,
         )
         self.validation = PreparedAllReduce(
             self.state.validation_input,
@@ -55,8 +55,7 @@ class PreparedResume:
             name=name + ".validation",
         )
         def empty(shape):
-            return (torch.empty(shape, dtype=logits_dtype, device=pool.backing.device) if buffers is None
-                    else buffers.zeros(shape, logits_dtype))
+            return torch.empty(shape, dtype=logits_dtype, device=pool.backing.device)
         self.local_logits = empty((rows, weights.head.shape[0] if isinstance(weights.head, torch.Tensor)
                                    else weights.head.out_features))
         self.logits = empty((rows, requests.vocab_size))
@@ -70,8 +69,8 @@ class PreparedResume:
             session=session,
             name=name + ".head",
             activation_mode=activation_mode,
-            buffers=buffers,
-        )
+            workspace=workspace,
+        ).functional(session=session)
         args = (
             requests,
             inputs.row_slot_ids[:rows],
@@ -81,16 +80,27 @@ class PreparedResume:
             frame,
             sequence,
         )
-        sampling_workspace = None if buffers is None else bind_scratch(
-            PreparedSampling.scratch_layout(rows, requests.vocab_size),
-            device=self.logits.device, workspace=buffers)
-        self.completion = PreparedSampling(self.logits, *args, workspace=sampling_workspace)
+        self.completion = PreparedSampling(self.logits, *args)
         self.completion.prepare()
         self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
-            coordinator=coordinator, name=name + ".sampling", buffers=buffers)
+            coordinator=coordinator, name=name + ".sampling")
+        self.completion.functional(session=session)
+        self.local_metadata = local_metadata
+        if local_metadata:
+            self.validation.functional(session=session)
+            self.state.functional(local_metadata=True)
+        else:
+            self.state.functional()
+        self.local_logits = self.logits = None
         self.compilation_variant = "sample"
 
     def __call__(self):
-        self.validation(self.state.validate())
-        self.projection(self.state.gather())
-        self.completion()
+        if self.local_metadata:
+            validation, present = self.state.validate()
+            totals = self.validation(validation)
+            hidden = self.state.gather(totals, present=present)
+        else:
+            self.validation(self.state.validate())
+            hidden = self.state.gather()
+        logits = self.projection(hidden)
+        self.completion.run(logits)

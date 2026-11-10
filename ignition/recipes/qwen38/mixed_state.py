@@ -131,6 +131,41 @@ class StatePartitions:
     def combine(self, values, output):
         self.packing.combine(values, output)
 
+    def functional(self):
+        p = self.packing
+        parts = tuple(FunctionalStatePartition(part.mode, part.metadata, indices, valid)
+                      for part, indices, valid in zip(self.parts,
+                          (p.prompt_indices, p.decode_indices), (p.prompt_valid, p.decode_valid), strict=True))
+        return FunctionalStatePartitions(parts, p.is_prompt, p.prompt_source, p.decode_source)
+
+
+@dataclass(frozen=True)
+class FunctionalStatePartition:
+    """Gather one sequence role through persistent row maps into graph-local storage."""
+
+    mode: str
+    metadata: object
+    indices: torch.Tensor
+    valid: torch.Tensor
+
+    def gather(self, source):
+        return torch.where(self.valid.view((-1,) + (1,) * (source.ndim - 1)), source[self.indices], 0)
+
+
+@dataclass(frozen=True)
+class FunctionalStatePartitions:
+    """Combine prompt and decode results through persistent token-role maps."""
+
+    parts: tuple
+    is_prompt: torch.Tensor
+    prompt_source: torch.Tensor
+    decode_source: torch.Tensor
+
+    def combine(self, values):
+        prompt, decode = values
+        shape = (self.is_prompt.numel(),) + (1,) * (prompt.ndim - 1)
+        return torch.where(self.is_prompt.view(shape), prompt[self.prompt_source], decode[self.decode_source])
+
 
 class PreparedMixedState:
     """One target forward; prompt consumption and decode acceptance remain separate."""

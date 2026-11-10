@@ -140,7 +140,7 @@ class PreparedDecoder:
             indexer.prepares_tables = False
         self.lm_head = PreparedVocabularyProjection(scratch.hidden, weights.head,
             scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator,
-            session=session, name=f"{name}.lm_head")
+            session=session, name=f"{name}.lm_head", workspace=workspace)
 
     def rebind_pages(self):
         """Rebind every sparse-attention layer to the continuation pool's current page pools."""

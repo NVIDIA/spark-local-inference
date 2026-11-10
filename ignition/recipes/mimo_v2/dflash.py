@@ -194,7 +194,7 @@ class PreparedDraft:
             self.layers.append(layer.eval())
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.norm, c.text["rms_norm_eps"])
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
 
     def __call__(self):
         hidden = torch.where((self.metadata.token_ids == self.weights.config.draft.noise_token)[:, None],

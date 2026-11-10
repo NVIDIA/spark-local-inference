@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+import torch
 from google.protobuf.json_format import ParseDict
 
 from ignition.components.paged_batch import BatchInputs
@@ -87,3 +88,41 @@ def test_dflash_catalog_covers_width_one_and_packed_full_depth(tmp_path):
     ordinary = PreparationConfig()
     assert not ordinary.speculative_round_shapes
     assert ordinary.decode_tokens == ordinary.decode_samples == 4
+
+
+def test_dflash_round_preserves_bound_metadata_and_storage(monkeypatch):
+    from ignition.components import parallel_draft
+    from ignition.components.dflash2_preparation import DFlash2Buffers
+    from ignition.components.sampling import DeviceRequestState
+    from ignition.preparation.scratch import GraphBufferPool
+    from ignition.recipes.muse_spark.dflash import SpeculativePreparation
+
+    draft = SimpleNamespace(block_size=8, attention=SimpleNamespace(window=16),
+                            text={"hidden_size": 64, "vocab_size": 128})
+    weights = SimpleNamespace(config=SimpleNamespace(draft=draft), shard=TensorParallelShard(0, 1))
+    requests = DeviceRequestState.allocate("cpu", vocab_size=128, capacity=2)
+    buffers = GraphBufferPool("cpu")
+    layout = DFlash2Buffers(buffers, [(2, 8)], [], vocabulary=128, columns=64)
+    owner = SpeculativePreparation(weights, SimpleNamespace(backing=torch.empty(0)), requests, None, None,
+        completion=None, frame=None, sequence=None, session=None, workspace=None, runtime=None,
+        vocabulary_runtime=None, context_runtime=None, embedding_runtime=None, preexpert_runtime=None,
+        coordinator=None, buffer_layout=layout, decoder_buffers=buffers.cursor())
+
+    class Round:
+        def __init__(self, preparation, batch, width, name, **options):
+            self.owner, self.geometry, self.options = preparation, (batch, width, name), options
+            self.prepared = False
+
+        def prepare(self):
+            self.prepared = True
+
+    monkeypatch.setattr(parallel_draft, "PreparedParallelDraftRound", Round)
+    operation = owner.round(2, 8, "speculative2x8", target_token_capacity=9)
+
+    assert owner.local_metadata is False
+    assert operation.owner is owner
+    assert operation.geometry == (2, 8, "speculative2x8")
+    assert operation.options["storage"] is layout.rounds[2, 8]
+    assert operation.options["verification_dummy"] is layout.dummy
+    assert operation.options["target_token_capacity"] == 9
+    assert operation.prepared and owner.owners == [operation]

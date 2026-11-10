@@ -7,7 +7,6 @@
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
-from ignition.preparation.scratch import bind_scratch
 
 
 class PreparedGeneration:
@@ -26,8 +25,10 @@ class PreparedGeneration:
         workspace,
         context_factory=None,
         buffers=None,
+        local_metadata=False,
     ):
         self.decoder, self.batch = decoder, batch
+        self.local_metadata = local_metadata
         self.validation = PreparedAllReduce(
             batch.validation_input,
             batch.validation_sum,
@@ -46,13 +47,11 @@ class PreparedGeneration:
             frame,
             sequence,
         )
-        sampling_workspace = None if buffers is None else bind_scratch(
-            PreparedSampling.scratch_layout(rows, batch.requests.vocab_size),
-            device=decoder.scratch.logits.device, workspace=buffers)
-        self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows], workspace=sampling_workspace)
+        self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
         self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
-            coordinator=coordinator, name=name + ".sampling", buffers=buffers)
+            coordinator=coordinator, name=name + ".sampling")
+        self.completion.functional(session=session)
         self.compilation_variant = "sample"
         self.context = None
         if decoder.weights.draft is not None:
@@ -67,17 +66,53 @@ class PreparedGeneration:
                 name=name + ".context",
                 workspace=workspace,
             )
+        release_outputs = getattr(decoder, "release_outputs", None)
+        if release_outputs is not None:
+            release_outputs()
+        if local_metadata:
+            self.validation.functional(session=session)
+            if self.context is not None:
+                self.context.functional()
+            self.batch.functional()
 
     def __call__(self):
-        self.batch.begin(self.validation(self.batch.validate()))
-        self.decoder()
-        if self.context is not None:
-            self.context(self.decoder.auxiliary, self.batch.metadata.lengths)
+        self._run()
+
+    def observe(self):
+        """Execute the forward and return its packed metadata for untimed checks."""
+        if not self.local_metadata:
+            raise RuntimeError("forward observations require call-local metadata")
+        return self._run(observe=True)
+
+    def _run(self, *, observe=False):
+        if self.local_metadata:
+            validation, present = self.batch.validate()
+            metadata = self.batch.begin(self.validation(validation), present=present)
+            result = self.decoder(metadata)
+        else:
+            self.batch.begin(self.validation(self.batch.validate()))
+            metadata = self.batch.metadata
+            result = self.decoder()
+        if result is None:
+            hidden, logits, auxiliary = self.decoder.scratch.hidden, self.decoder.scratch.logits, self.decoder.auxiliary
+        else:
+            hidden, logits, auxiliary = result[:3]
         save_hidden(
-            self.decoder.scratch.hidden,
+            hidden,
             self.decoder.pool.last_hidden,
-            self.batch.metadata.state_rows,
-            self.batch.token_state.active,
+            metadata.state_rows,
+            metadata.lengths > 0 if self.local_metadata else self.batch.token_state.active,
         )
-        self.batch.finish()
-        self.completion()
+        if self.local_metadata:
+            self.batch.finish(metadata)
+        else:
+            self.batch.finish()
+        self.completion.run(logits)
+        if self.context is not None:
+            if self.local_metadata:
+                self.context(auxiliary, metadata.lengths, metadata)
+            else:
+                self.context(auxiliary, metadata.lengths)
+        if observe:
+            return {"target." + name: getattr(metadata, name) for name in
+                    ("live_counts", "starts", "lengths", "query_start_loc")}

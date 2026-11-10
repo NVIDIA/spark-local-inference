@@ -183,13 +183,23 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
         graph_buffers, private_buffers = (GraphBufferPool(device, chunk_bytes=2 << 20) for _ in range(2))
-        target_buffers = GraphBufferPool(device, chunk_bytes=2 << 20) if config.dflash else None
-        context_buffers = GraphBufferPool(device, chunk_bytes=2 << 20) if config.dflash else None
+        dflash_buffers = None
+        if config.dflash:
+            from ignition.components.dflash2_preparation import DFlash2Buffers
+
+            round_shapes = [(batch, width) for batch, width, _ in config.speculative_round_shapes]
+            captures = [(capacity, False) for capacity in prefill_capacities(config.prefill_chunk_size)]
+            captures.extend((packed, False) for _, _, packed in config.speculative_round_shapes)
+            dflash_buffers = DFlash2Buffers(graph_buffers, round_shapes, captures,
+                vocabulary=weights.config.vocabulary,
+                columns=weights.config.hidden * len(weights.config.draft.target_layers))
+        prefill_cursor = graph_buffers.cursor() if dflash_buffers is None else dflash_buffers.stage.fork()
+        decode_cursor = graph_buffers.cursor() if dflash_buffers is None else dflash_buffers.stage.fork()
         with package_storage.scratch_pool() as scratch_pool:
             prefill_storage = Scratch.allocate(weights.config, shard, config.prefill_chunk_size, 1, device,
-                                               buffers=graph_buffers.cursor())
+                                               buffers=prefill_cursor)
             decode_storage = Scratch.allocate(weights.config, shard, config.decode_tokens, config.decode_samples, device,
-                                              buffers=graph_buffers.cursor())
+                                              buffers=decode_cursor)
         buffers = dict(inputs.buffers(), **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity, request_pending_token=requests.pending_token,
@@ -204,8 +214,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 context_runtime=embedding_collective, embedding_runtime=embedding_collective,
                 preexpert_runtime=preexpert_collective, coordinator=coordinator,
-                buffers=graph_buffers.cursor(), decoder_buffers=target_buffers.cursor(),
-                context_buffers=context_buffers.cursor())
+                buffer_layout=dflash_buffers, decoder_buffers=decode_cursor)
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
@@ -236,7 +245,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         embedding_runtime=embedding_collective, preexpert_runtime=preexpert_collective,
                         vocabulary_runtime=vocabulary_collective,
                         coordinator=coordinator, session=session, name=name, workspace=arena,
-                        buffers=private, scoring=scoring if kind == "scored_prefill" else None)
+                        buffers=private if dflash_buffers is None else (prefill_cursor if mode == "prefill" else decode_cursor).fork(),
+                        capture_buffers=None if dflash_buffers is None else dflash_buffers.capture.fork(),
+                        scoring=scoring if kind == "scored_prefill" else None)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool, buffers=private)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence,
                         runtime=collective, coordinator=coordinator, session=session,
@@ -245,14 +256,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, forward_inputs,
                         enabled=enabled)
         if speculation is not None:
-            from ignition.components.parallel_draft import PreparedParallelDraftRound
-
             for batch, width, packed in sorted(config.speculative_round_shapes,
                     key=lambda shape: (shape[2], shape[0]), reverse=True):
                 name = f"speculative{batch}x{width}-tokens{packed}"
-                forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                    buffers=private_buffers.cursor(), target_token_capacity=packed)
-                forward.prepare()
+                forward = speculation.round(batch, width, name, target_token_capacity=packed)
                 add(name, forward, "speculative", batch, width, forward_inputs, enabled=True,
                     packed_tokens=packed)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
@@ -263,7 +270,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 name = f"resume{capacity}" + suffix
                 forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence, rows=capacity,
                     runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
-                    session=session, name=name, buffers=private_buffers.cursor())
+                    session=session, name=name, buffers=private_buffers.cursor(), workspace=arena)
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix
@@ -326,8 +333,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     channels = (collective, prefill_collective, vocabulary_collective, embedding_collective, preexpert_collective)
     disposable = [prefill_storage, decode_storage, arena.tensor, metadata, graph_buffers.chunks, private_buffers.chunks]
     if speculation is not None:
-        disposable.extend((speculation.draft_scratch.scratch_tensors(), target_buffers.chunks, context_buffers.chunks))
-        memory.update(speculative_buffer_bytes=target_buffers.nbytes, context_buffer_bytes=context_buffers.nbytes)
+        disposable.append(speculation.draft_scratch.scratch_tensors())
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):
             forward = forward.forward
@@ -343,5 +349,5 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *storage_ranges(disposable), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage,
             decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, *channels,
-            scratch_pool, graph_buffers, private_buffers, target_buffers, context_buffers, speculation),
+            scratch_pool, graph_buffers, private_buffers, speculation),
         close_resources=tuple(c for c in (*channels, scoring) if c is not None))

@@ -340,7 +340,7 @@ class PreparedDecoder:
             eps=c["rms_norm_eps"], zero_centered=True, session=session, name=name + ".norm")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            activation_mode="auto", buffers=buffers)
+            activation_mode="auto", buffers=buffers, workspace=workspace)
         self.taps = ({layer + 1: index for index, layer in enumerate(weights.config.target_layers)}
                      if weights.draft is not None else {})
 

@@ -332,7 +332,7 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(self.residual.output, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
         # DSpark's context: the AttnRes mixture each auxiliary layer receives, before its input norm. Plans
         # without the draft keep none.
         self.auxiliary_layers = (config.draft.auxiliary_layers

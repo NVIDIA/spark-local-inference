@@ -8,8 +8,12 @@ import triton
 from b12x.attention import paged, paged_decode, paged_kv_write
 from b12x.preparation import PreparedCall, plan_from_handle
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
+
+
+_BOUND_OPERAND = object()
 
 
 def _scratch(specs, workspace):
@@ -56,12 +60,14 @@ def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_des
 class PreparedPagedAttention:
     def __init__(self, q, key, value, pages, lengths, cu, output, *, sink=None, mode,
                  window=-1, width=1, causal=True, k_descale=None, v_descale=None,
-                 selected_blocks=None, session, workspace, name, schedules=None, tuning_page_count=None, output_gate=None):
+                 selected_blocks=None, session, workspace, name, schedules=None, tuning_page_count=None, output_gate=None,
+                 caller_owned_placeholders=False):
         if tuning_page_count is None:
             tuning_page_count = min(key.shape[0], value.shape[0])
         if type(tuning_page_count) is not int or not 0 < tuning_page_count <= min(key.shape[0], value.shape[0]):
             raise ValueError("attention tuning requires a positive backed page count within both cache views")
         self.tuning_page_count = tuning_page_count
+        self.schedules = schedules
         from .paged_tma import PreparedTma, supports
 
         self.tma = None
@@ -77,9 +83,9 @@ class PreparedPagedAttention:
         self.schedule_storage, self.schedule_slot = None, -1
         if key.dtype == torch.float8_e4m3fn:
             if k_descale is None:
-                k_descale = torch.ones(1, dtype=torch.float32, device=key.device)
+                k_descale = persistent_empty((1,), torch.float32, key.device).fill_(1)
             if v_descale is None:
-                v_descale = torch.ones(1, dtype=torch.float32, device=value.device)
+                v_descale = persistent_empty((1,), torch.float32, value.device).fill_(1)
         self.selected_blocks = selected_blocks
         if selected_blocks is not None:
             if (selected_blocks.shape != (key.shape[2], q.shape[0], 16)
@@ -117,7 +123,8 @@ class PreparedPagedAttention:
             self.plan = paged_decode.plan(paged_decode.Caps(device=q.device, num_q_heads=q.shape[1],
                 num_kv_heads=key.shape[2], head_dim_qk=q.shape[2], head_dim_vo=value.shape[3],
                 page_size=key.shape[1], max_batch=pages.shape[0], max_q_per_req=width,
-                window_left=window, has_sinks=sink is not None, causal=causal, kv_dtype=key.dtype))
+                window_left=window, has_sinks=sink is not None, causal=causal, kv_dtype=key.dtype,
+                caller_owned_placeholders=caller_owned_placeholders))
         else:
             geometry = dict(device=q.device, q_dtype=q.dtype, kv_dtype=key.dtype,
                 num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
@@ -211,6 +218,29 @@ class PreparedPagedAttention:
         if not self.decode:
             paged.bind(self.plan, scratch=self.scratch, **self.arguments, window_left=self.window)
 
+    def functional(self, *, session, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND,
+                   cache_seqlens=_BOUND_OPERAND, page_table=_BOUND_OPERAND, cu_seqlens_q=_BOUND_OPERAND):
+        """Return attention with local output and selected-plan scratch.
+
+        Omitted operands retain their prepared bindings. Bind an operand to None
+        to require it at invocation without retaining its preparation tensor.
+        """
+        operation = _FunctionalPagedAttention(self)
+        for name, value in (("k_cache", k_cache), ("v_cache", v_cache), ("cache_seqlens", cache_seqlens),
+                            ("page_table", page_table), ("cu_seqlens_q", cu_seqlens_q)):
+            if value is not _BOUND_OPERAND:
+                operation.arguments[name] = value
+        if cu_seqlens_q is None and operation.compact_decode is not None:
+            operation.compact_decode = (None, operation.compact_decode[1])
+        if self.schedules is not None:
+            if (any(component is self for component in self.schedules.components)
+                    and operation.arguments["cache_seqlens"] is not self.schedules.lengths):
+                raise ValueError("shared attention schedules require their bound cache lengths")
+            self.schedules.components[:] = [operation if component is self else component
+                                           for component in self.schedules.components]
+        register_finalizer(session, operation.bind)
+        return operation
+
     def __call__(self):
         if self.tma is not None:
             q, key, value, pages, lengths, cu, output = self.tma.arguments
@@ -237,22 +267,121 @@ class PreparedPagedAttention:
         return a["output"]
 
 
+class _FunctionalPagedAttention:
+    def __init__(self, prepared):
+        self.plan = prepared.plan
+        self.tma = prepared.tma is not None
+        if self.tma:
+            q, key, value, pages, lengths, cu, output = prepared.tma.arguments
+            kernel_output = output
+            self.arguments = dict(k_cache=key, v_cache=value, page_table=pages,
+                cache_seqlens=lengths, cu_seqlens_q=cu, attention_sink_bias=None,
+                k_descale=None, v_descale=None)
+            self.decode, self.window = False, -1
+            self.selected_blocks, self.compact_decode = None, None
+            self.schedule_storage, self.schedule_slot = None, -1
+        else:
+            q, output = prepared.arguments["q"], prepared.arguments["output"]
+            kernel_output = output
+            self.arguments = {name: value for name, value in prepared.arguments.items()
+                              if name not in ("q", "output", "q2k_indices")}
+            self.decode, self.window = prepared.decode, prepared.window
+            self.selected_blocks = prepared.selected_blocks
+            self.compact_decode = None
+            if prepared.compact_decode is not None:
+                q, output, cu, selected = prepared.compact_decode
+                self.compact_decode = cu, selected
+                self.selected_blocks = None
+            self.schedule_storage, self.schedule_slot = prepared.schedule_storage, prepared.schedule_slot
+        self.query_shape, self.query_dtype = tuple(q.shape), q.dtype
+        self.output_shape, self.output_dtype = tuple(output.shape), output.dtype
+        self.kernel_output_shape = tuple(kernel_output.shape)
+        self.gated = prepared.output_gate is not None
+        self.scratch_layout = None
+
+    def bind(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+
+    def __call__(self, q, *, output_gate=None, k_cache=None, v_cache=None, cache_seqlens=None,
+                 page_table=None, cu_seqlens_q=None):
+        if self.scratch_layout is None:
+            raise RuntimeError("functional paged attention requires finalized preparation")
+        if tuple(q.shape) != self.query_shape or q.dtype != self.query_dtype:
+            raise ValueError("functional paged attention query differs from prepared geometry")
+        if (output_gate is not None) != self.gated:
+            raise ValueError("functional paged attention gate differs from prepared geometry")
+        a = self.arguments
+        if (self.schedule_slot >= 0 and cache_seqlens is not None
+                and cache_seqlens is not a["cache_seqlens"]):
+            raise ValueError("shared attention schedules require their bound cache lengths")
+        key = a["k_cache"] if k_cache is None else k_cache
+        value = a["v_cache"] if v_cache is None else v_cache
+        lengths = a["cache_seqlens"] if cache_seqlens is None else cache_seqlens
+        pages = a["page_table"] if page_table is None else page_table
+        cu = a["cu_seqlens_q"] if cu_seqlens_q is None else cu_seqlens_q
+        if key is None or value is None or lengths is None or pages is None or cu is None:
+            raise ValueError("functional paged attention requires cache tensors and metadata at invocation")
+        output = (torch.empty(self.kernel_output_shape, dtype=self.output_dtype, device=q.device) if self.tma
+                  else torch.zeros(self.kernel_output_shape, dtype=self.output_dtype, device=q.device))
+        scratch = [torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in self.scratch_layout]
+        selected = self.selected_blocks
+        if self.compact_decode is not None:
+            bound_cu, selected = self.compact_decode
+            cu = cu if bound_cu is None else bound_cu
+            indices = cu[:-1].long().clamp(0, q.shape[0] - 1)
+            active = cu[1:] > cu[:-1]
+            q = torch.where(active[:, None, None], q[indices], 0)
+            if selected is not None:
+                selected = torch.where(active[None, :, None], selected[:, indices], -1)
+        _attend(q, key, value, pages, lengths,
+            cu, a["attention_sink_bias"], output, scratch,
+            a["k_descale"], a["v_descale"], selected, self.plan.handle, self.decode,
+            self.window, self.schedule_storage, self.schedule_slot, output_gate)
+        if self.compact_decode is not None:
+            positions = torch.arange(self.output_shape[0], device=output.device)
+            requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)
+            return torch.where((positions < cu[-1])[:, None, None], output[requests], 0)
+        return output
+
+
 class PreparedPagedKVWriter:
-    def __init__(self, key, value, key_cache, value_cache, slots, *, session, name, k_scale=None, v_scale=None):
+    def __init__(self, key, value, key_cache, value_cache, slots, *, session, name, k_scale=None, v_scale=None,
+                 caller_owned_placeholders=False):
         if key_cache.dtype == torch.float8_e4m3fn:
             if k_scale is None:
-                k_scale = torch.ones(1, dtype=torch.float32, device=key.device)
+                k_scale = persistent_empty((1,), torch.float32, key.device).fill_(1)
             if v_scale is None:
-                v_scale = torch.ones(1, dtype=torch.float32, device=value.device)
+                v_scale = persistent_empty((1,), torch.float32, value.device).fill_(1)
         self.arguments = dict(key=key, value=value, k_cache=key_cache, v_cache=value_cache, slot_mapping=slots,
                               k_scale=k_scale, v_scale=v_scale)
+        if caller_owned_placeholders:
+            self.arguments["dummy_scale"] = torch.empty((1,), dtype=torch.float32, device=key.device)
         self.plan = paged_kv_write.plan(paged_kv_write.Caps(device=key.device, num_kv_heads=key.shape[1],
-            head_dim_k=key.shape[2], head_dim_v=value.shape[2], page_size=key_cache.shape[1], kv_dtype=key_cache.dtype))
+            head_dim_k=key.shape[2], head_dim_v=value.shape[2], page_size=key_cache.shape[1], kv_dtype=key_cache.dtype,
+            caller_owned_placeholders=caller_owned_placeholders))
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(**self.arguments))),))
 
     def __call__(self):
         paged_kv_write.run(self.plan, **self.arguments)
+
+    def functional(self):
+        """Bind cache storage while accepting projected rows and slots at each call."""
+        return _FunctionalPagedKVWriter(self)
+
+
+class _FunctionalPagedKVWriter:
+    def __init__(self, prepared):
+        self.plan = prepared.plan
+        self.arguments = {name: value for name, value in prepared.arguments.items()
+                          if name not in ("key", "value", "slot_mapping", "dummy_scale")}
+        self.caller_owned_placeholders = "dummy_scale" in prepared.arguments
+
+    def __call__(self, key, value, slots):
+        dummy_scale = (torch.empty((1,), dtype=torch.float32, device=key.device)
+                       if self.caller_owned_placeholders else None)
+        paged_kv_write.run(self.plan, key=key, value=value,
+            slot_mapping=slots, dummy_scale=dummy_scale, **self.arguments)
 
 
 class PagedAttentionMetadata:

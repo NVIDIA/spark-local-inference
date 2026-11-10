@@ -193,7 +193,7 @@ class PreparedDecoder:
             self.scoring.source, eps=weights.config.text["rms_norm_eps"], session=session,
             name=name + ".prompt_norm", zero_centered=True)
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
 
     def __call__(self):
         local = self.embedding.lookup()

@@ -85,7 +85,62 @@ file identities against the authenticated metadata. This mode trusts the cached
 weight contents and does not detect preexisting payload corruption. Missing or
 incompatible metadata is an error, with no live-weight fallback.
 
+## Persistent model tensor storage
+
+Model weights and immutable constants use the packed destinations in
+`ignition.preparation.persistent`. `persistent_empty`, `persistent_zeros`,
+`persistent_copy`, and `persistent_cat` place final tensors in a `PackageStorage`
+arena with aligned, disjoint storage descriptors. Intentional aliases remain
+views of the same parent tensor. The arena grows its physical backing at the
+device's allocation granularity while preserving every tensor address.
+
+Shared checkpoint loaders allocate final destinations there by default. Pass
+`temporary=True` for inputs discarded by concatenation, quantization, or another
+conversion. Packing and quantization helpers accept an allocation callback for
+their retained output planes; intermediate arithmetic stays in transient storage.
+Do not move already-bound tensors or put disposable conversion outputs in the
+persistent arena. Outside package preparation, the helpers use ordinary Torch
+storage for standalone loading.
+
+Library caches that outlive a model retain their own storage and must not hold
+pointers into its packed arena. Storage placement does not classify a tensor as
+numeric weight data; immutable pointer tables retain opaque metadata and pointer
+relocation handling.
+
+The arena exports through fixed device allocations and remains alive through
+native replay. `PreparedModel.close()` releases it after confirmed drain and graph
+cleanup. Leaving the allocation context does not release model-owned storage.
+Preparation failures before that ownership transfer drain and release their
+mappings; a failed drain retains them. Tensor-allocation accounting includes the
+arena's used bytes, and physical memory accounting includes its mapped backing.
+
 ## Scratch storage and concurrent lifetimes
+
+Compiler-local intermediates use Inductor's static memory planner with a combined
+pool. Captured graph variants share a CUDA graph pool when their executions are
+serialized and their outputs live in explicit caller-owned buffers. Functional
+components allocate their intermediates inside the compiled forward so the
+compiler can track their lifetimes. Bound operator interfaces still require the
+explicit scratch ownership described below.
+
+Dense Qwen target and draft forwards pass packed batch metadata, proposal
+state, recurrent correction records, and sampling intermediates as local tensor
+values. Their prepared operators retain kernel plans, weights, geometry, native
+inputs and outputs, and persistent cache state. Declaration examples are released
+after tuning, and the operator arena is retired before compilation. These forwards
+do not use `GraphBufferPool`. The shared CUDA graph pool backs Inductor's planned
+temporaries across serialized graph variants.
+
+Retained rotary frequencies, fixed page indices, and scalar quantization constants
+use persistent tensor storage. Attention placeholder operands belong to the
+forward's declared scratch rather than hidden plan allocations. Constructors may
+use temporary examples to select kernels, but those examples must not become
+serving storage through closures, argument tuples, or module fields.
+
+CUDA libraries can retain workspace without a Python tensor owner. Captured GEMMs
+may embed cuBLAS workspace pointers inside packed kernel arguments. Those
+allocations remain required for replay and must not be released as preparation
+caches. Account for them separately from inactive allocator blocks and alignment.
 
 - Supply caller-owned scratch through the kernel planning interfaces. Reuse
   storage across sequential work; preserve separate storage for overlapping

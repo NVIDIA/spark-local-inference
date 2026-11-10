@@ -274,7 +274,7 @@ class PreparedDraft:
         self.norm = canonical_norm(draft.norm, eps)
         head = weights.head if draft.head is None else draft.head
         self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
 
     def __call__(self):
         hidden = self.embedding.gather(self.embedding.lookup())

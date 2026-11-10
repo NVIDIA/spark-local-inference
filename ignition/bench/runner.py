@@ -9,6 +9,7 @@ import json
 import math
 import random
 import statistics
+import struct
 
 
 @dataclass(frozen=True)
@@ -233,26 +234,77 @@ def _check_request_state(model, step, records):
             raise RuntimeError(f"request {request.ident} device state disagrees with graph completion")
 
 
-def _check_metadata(model, step, case):
+def _bound_observations(model, step, case):
     if isinstance(case, PrefillCase):
-        metadata = model.benchmark_prefills[step.graph]
-        if (metadata.live_counts.cpu().tolist() != [case.chunk_tokens, 1]
-                or metadata.starts.cpu().tolist() != [case.context_tokens]
-                or metadata.lengths.cpu().tolist() != [case.chunk_tokens]
-                or metadata.query_start_loc.cpu().tolist() != [0, case.chunk_tokens]):
+        metadata = (("target", model.benchmark_prefills[step.graph]),)
+        forward = None
+    else:
+        forward = model.benchmark_rounds[step.graph]
+        metadata = (("target", forward.metadata), ("draft", forward.draft_metadata))
+    observations = {f"{role}.{name}": getattr(value, name) for role, value in metadata
+                    for name in ("live_counts", "starts", "lengths", "query_start_loc")}
+    if forward is not None:
+        _, _, verification, commit = forward.operations
+        observations.update({f"acceptance.{name}": getattr(verification.output, name) for name in
+                             ("offered_drafts", "accepted_drafts", "survival", "valid")})
+        observations.update({f"commit.{name}": getattr(commit, name) for name in
+                             ("accepted_drafts", "emitted_count", "emitted_ids")})
+    return observations
+
+
+def _upload_step(runner, message):
+    from ignition.direct.executor import _RESERVED
+
+    name = message["graph"]
+    allowed = runner.inputs.get(name)
+    if allowed is None:
+        raise ValueError(f"observation names unknown graph {name!r}")
+    for buffer, offset, data in message["uploads"]:
+        if buffer not in allowed or buffer in _RESERVED:
+            raise ValueError(f"graph {name} does not bind input {buffer}")
+        runner._upload(buffer, offset, data)
+    runner._upload("frame_index", 0, struct.pack("<i", message["frame"]))
+    runner._upload("submission_sequence", 0, struct.pack("<q", message["sequence"]))
+
+
+def _observe(runner, observer, message):
+    """Replay an untimed observation graph with the native graph's complete input uploads."""
+    import torch
+
+    with torch.cuda.stream(runner.stream), torch.no_grad():
+        _upload_step(runner, message)
+        observations = observer()
+    runner.stream.synchronize()
+    for runtime in runner.health:
+        runtime.check_health()
+    return observations
+
+
+def _check_metadata(model, step, case, observations):
+    if isinstance(case, PrefillCase):
+        if (observations["target.live_counts"].cpu().tolist() != [case.chunk_tokens, 1]
+                or observations["target.starts"].cpu().tolist() != [case.context_tokens]
+                or observations["target.lengths"].cpu().tolist() != [case.chunk_tokens]
+                or observations["target.query_start_loc"].cpu().tolist() != [0, case.chunk_tokens]):
             raise RuntimeError("prefill metadata does not describe the exact benchmark chunk")
         return
     forward = model.benchmark_rounds[step.graph]
-    for role, metadata, width in (("target", forward.metadata, case.width),
-                                  ("draft", forward.draft_metadata, forward.draft_inputs.shape[1])):
+    roles = [("target", case.width)]
+    if "draft.live_counts" in observations:
+        roles.append(("draft", forward.owner.block_size))
+    for role, width in roles:
         expected_starts = [case.context_tokens] * case.batch
         expected_lengths = [width] * case.batch
         expected_offsets = [row * width for row in range(case.batch + 1)]
-        if (metadata.live_counts.cpu().tolist() != [case.batch * width, case.batch]
-                or metadata.starts.cpu().tolist() != expected_starts
-                or metadata.lengths.cpu().tolist() != expected_lengths
-                or metadata.query_start_loc.cpu().tolist() != expected_offsets):
+        if (observations[f"{role}.live_counts"].cpu().tolist() != [case.batch * width, case.batch]
+                or observations[f"{role}.starts"].cpu().tolist() != expected_starts
+                or observations[f"{role}.lengths"].cpu().tolist() != expected_lengths
+                or observations[f"{role}.query_start_loc"].cpu().tolist() != expected_offsets):
             raise RuntimeError(f"{role} metadata does not describe the complete benchmark round")
+    _check_sampling_rng(forward, step)
+
+
+def _check_sampling_rng(forward, step):
     owner = forward.owner
     verification = forward.operations[2]
     for lane in step.lanes:
@@ -264,17 +316,15 @@ def _check_metadata(model, step, case):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
 
-def acceptance_observation(forward):
+def acceptance_observation(observations):
     """Read one input/RNG draw; restored timing replays are not additional observations."""
-    _, _, verification, commit = forward.operations
-    acceptance = verification.output
-    offered = acceptance.offered_drafts.cpu().tolist()
-    accepted = acceptance.accepted_drafts.cpu().tolist()
-    committed = commit.accepted_drafts.cpu().tolist()
-    emitted = commit.emitted_count.cpu().tolist()
-    tokens = commit.emitted_ids.cpu().tolist()
-    survival = acceptance.survival.cpu().tolist()
-    valid = acceptance.valid.cpu().tolist()
+    offered = observations["acceptance.offered_drafts"].cpu().tolist()
+    accepted = observations["acceptance.accepted_drafts"].cpu().tolist()
+    committed = observations["commit.accepted_drafts"].cpu().tolist()
+    emitted = observations["commit.emitted_count"].cpu().tolist()
+    tokens = observations["commit.emitted_ids"].cpu().tolist()
+    survival = observations["acceptance.survival"].cpu().tolist()
+    valid = observations["acceptance.valid"].cpu().tolist()
     return dict(
         observations_per_request=1,
         survival_semantics="cumulative acceptance probability along the sampled proposal chain",
@@ -285,6 +335,26 @@ def acceptance_observation(forward):
                        proposal_survival=survival[row][:count])
                   for row, count in enumerate(offered)],
     )
+
+
+def _completion_observation(model, step, records, case):
+    """Read acceptance from captured completion when request limits cannot clip the chain."""
+    survival = model.buffers["completion_speculative_survival"][step.frame].cpu().tolist()
+    requests = []
+    for lane in step.lanes:
+        request = lane.request
+        slot = request.slot
+        record = records[slot]
+        emitted, offered, accepted = map(int, (record[8], record[9], record[10]))
+        remaining_before = request.max_new_tokens - len(request.generated) + emitted
+        if remaining_before < case.width or int(model.benchmark_requests.eos_count[slot].item()) != 0:
+            raise RuntimeError("benchmark completion cannot expose unclipped verification acceptance")
+        requests.append(dict(valid=int(record[5]) in (1, 2) and int(record[6]) == 0,
+            offered_draft_count=offered, accepted_draft_count=accepted,
+            committed_draft_count=accepted, emitted_count=emitted,
+            emitted_token_ids=record[16:16 + emitted].tolist(), proposal_survival=survival[slot][:offered]))
+    return dict(observations_per_request=1, observation_source="production_completion",
+        survival_semantics="cumulative acceptance probability along the sampled proposal chain", requests=requests)
 
 
 def measurement_result(cases, measurements, *, warmup, repetitions, seeds, status, failure=None):
@@ -352,6 +422,16 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                 generation += 1
                 baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
                 snapshot = StateSnapshot(model.benchmark_state, runner.stream)
+                observers = getattr(model, "benchmark_observers", None)
+                if observers is not None:
+                    scheduler = deepcopy(baseline, {id(layout): layout})
+                    snapshot.restore(runner.stream)
+                    step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
+                    observations = _observe(runner, observers[step.graph], _message(scheduler, step))
+                    _check_metadata(model, step, case, observations)
+                    observed_records = _complete(model, runner, scheduler, step)
+                    _check_request_state(model, step, observed_records)
+                    del observations
                 for iteration in range(-1, warmup + repetitions):
                     scheduler = deepcopy(baseline, {id(layout): layout})
                     snapshot.restore(runner.stream)
@@ -369,9 +449,15 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                             or len(lane.request.generated) != 1 for lane in step.lanes):
                         raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
                     if iteration == -1:
-                        _check_metadata(model, step, case)
-                        if not isinstance(case, PrefillCase):
-                            samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
+                        if observers is None:
+                            observations = _bound_observations(model, step, case)
+                            _check_metadata(model, step, case, observations)
+                            if not isinstance(case, PrefillCase):
+                                samples[-1]["acceptance"] = acceptance_observation(observations)
+                            del observations
+                        elif not isinstance(case, PrefillCase):
+                            _check_sampling_rng(model.benchmark_rounds[step.graph], step)
+                            samples[-1]["acceptance"] = _completion_observation(model, step, records, case)
                 if progress is not None:
                     progress(result("running"))
                 snapshot.restore(runner.stream)

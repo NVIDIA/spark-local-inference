@@ -41,31 +41,57 @@ class PreparedResumeState:
         self.validation_sum = zeros(self.validation_input.shape)
         self.present = zeros((self.capacity,), torch.bool)
         self.hidden = zeros((rows, saved_hidden.shape[1]))
+        self.hidden_shape = (rows, saved_hidden.shape[1])
+        self.local_metadata = False
 
     def validate(self):
         r, slots = self.requests, self.slots.long()
+        row_ids = (torch.arange(self.slots.numel(), device=slots.device)
+                   if self.local_metadata else self.row_ids)
+        slot_ids = (torch.arange(self.capacity, device=slots.device)
+                    if self.local_metadata else self.slot_ids)
+        validation = (torch.zeros((1, max(8, 2 * self.capacity)), dtype=torch.bfloat16,
+                                  device=slots.device) if self.local_metadata else self.validation_input)
         safe = slots.clamp(0, self.capacity - 1)
-        present = (self.row_ids < self.count) & (slots >= 0) & (slots < self.capacity)
+        present = (row_ids < self.count) & (slots >= 0) & (slots < self.capacity)
         present &= (self.epochs == r.generation[safe]) & (r.status[safe] == RUNNING)
         duplicate = ((slots[:, None] == slots[None, :]) & present[:, None] & present[None, :]).sum(1) > 1
         valid = (self.count <= self.slots.numel()) & ~duplicate
         valid &= (r.consumed_tokens[safe] > 0) & (r.pending_token[safe] < 0)
-        slot_rows = self.slot_ids[:, None] == slots[None, :]
-        self.present.copy_((slot_rows & present[None, :]).any(1))
-        self.validation_input[0, :self.capacity].copy_((slot_rows & (present & ~valid)[None, :]).any(1))
-        self.validation_input[0, self.capacity:2 * self.capacity].copy_(self.present)
-        return self.validation_input
+        slot_rows = slot_ids[:, None] == slots[None, :]
+        validation[0, :self.capacity].copy_((slot_rows & (present & ~valid)[None, :]).any(1))
+        present = (slot_rows & present[None, :]).any(1)
+        validation[0, self.capacity:2 * self.capacity].copy_(present)
+        if self.local_metadata:
+            return validation, present
+        self.present.copy_(present)
+        return validation
 
-    def gather(self):
+    def functional(self, *, local_metadata=False):
+        self.hidden = None
+        self.local_metadata = local_metadata
+        if local_metadata:
+            self.validation_input = self.validation_sum = self.present = None
+            self.row_ids = self.slot_ids = None
+        return self
+
+    def gather(self, totals=None, *, present=None):
         r = self.requests
-        participants = self.validation_sum[0, self.capacity:2 * self.capacity]
+        totals = self.validation_sum if totals is None else totals
+        present = self.present if present is None else present
+        participants = totals[0, self.capacity:2 * self.capacity]
         mismatch = (participants > 0) & (participants != self.world_size)
-        bad = self.present & ((self.validation_sum[0, :self.capacity] > 0) | mismatch)
+        bad = present & ((totals[0, :self.capacity] > 0) | mismatch)
         r.status.copy_(torch.where(bad, ERROR, r.status))
         r.error_code.copy_(torch.where(bad, 33, r.error_code))
         safe = self.slots.long().clamp(0, self.capacity - 1)
-        active = (self.row_ids < self.count) & (self.slots >= 0) & (self.slots < self.capacity)
+        row_ids = (torch.arange(self.slots.numel(), device=self.slots.device)
+                   if self.local_metadata else self.row_ids)
+        active = (row_ids < self.count) & (self.slots >= 0) & (self.slots < self.capacity)
         active &= (self.epochs == r.generation[safe]) & (r.status[safe] == RUNNING)
-        gather_rows(self.saved_hidden, self.state_rows[safe, 0], self.hidden)
-        self.hidden.masked_fill_(~active[:, None], 0)
-        return self.hidden
+        hidden = self.hidden
+        if hidden is None:
+            hidden = torch.empty(self.hidden_shape, dtype=torch.bfloat16, device=self.saved_hidden.device)
+        gather_rows(self.saved_hidden, self.state_rows[safe, 0], hidden)
+        hidden.masked_fill_(~active[:, None], 0)
+        return hidden

@@ -17,6 +17,7 @@ from ignition.components.hyperconnection_gate import PreparedHyperconnectionGate
 from ignition.components.linear import UnquantizedProjection
 from ignition.preparation.fixtures import hyperconnection as hc_fixtures
 from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.persistent import persistent_copy, persistent_zeros
 
 
 def hyperconnection_extents(shard, sharded: bool):
@@ -30,6 +31,15 @@ def hyperconnection_extents(shard, sharded: bool):
             "input_mix_weight_up.weight": (slice(None), lowrank)}
 
 
+def normalization_gain(module):
+    """Retain one FP32 gain for every prepared use of an immutable mixer."""
+    gain = getattr(module, "_flare_norm_gain", None)
+    if gain is None:
+        gain = persistent_copy((1.0 + module.hc_norm.weight.detach().float()).contiguous())
+        module._flare_norm_gain = gain
+    return gain
+
+
 def packed_down_projection(module: torch.nn.Module) -> torch.Tensor:
     if module.block_inject_weight is None:
         return module.input_mix_weight_down.weight
@@ -38,7 +48,7 @@ def packed_down_projection(module: torch.nn.Module) -> torch.Tensor:
         down = module.input_mix_weight_down.weight
         injection = module.block_inject_weight.weight
         rows = down.shape[0] + injection.shape[0]
-        packed = down.new_zeros(((rows + 15) // 16 * 16, down.shape[1]))
+        packed = persistent_zeros(((rows + 15) // 16 * 16, down.shape[1]), dtype=down.dtype, device=down.device)
         with torch.no_grad():
             packed[:down.shape[0]].copy_(down)
             packed[down.shape[0]:rows].copy_(injection)
@@ -133,7 +143,7 @@ class PreparedHyperconnection:
             raise ValueError("Qwen hyperconnection requires four streams of width 2560")
         self.scratch = scratch
         self.eps = module.hc_norm.eps
-        self.norm_gain = (1.0 + module.hc_norm.weight.detach().float()).contiguous()
+        self.norm_gain = normalization_gain(module)
         device = scratch.normalized.device
         if self.norm_gain.device != device or device.type != "cuda":
             raise ValueError("hyperconnection weights and scratch must share a CUDA device")

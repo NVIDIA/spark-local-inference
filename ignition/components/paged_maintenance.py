@@ -34,6 +34,7 @@ class PreparedMaintenance:
         buffers=None,
         trailing_pages=(),
         trailing_tables=None,
+        local_metadata=False,
     ):
         self.pool, self.commands, self.inputs, self.requests = pool, commands, inputs, requests
         self.page_tokens = page_tokens
@@ -73,6 +74,10 @@ class PreparedMaintenance:
             session=session,
             name=name + ".validation",
         )
+        self.local_metadata = local_metadata
+        if local_metadata:
+            self.validation.functional(session=session)
+            self.state.functional()
 
     def _transfer(self):
         return PreparedStateTransfer(
@@ -89,5 +94,10 @@ class PreparedMaintenance:
         )
 
     def __call__(self):
-        self.validation(self.state.validate())
-        self.state.apply()
+        if self.local_metadata:
+            validation, admission_errors = self.state.validate()
+            totals = self.validation(validation)
+            self.state.apply(totals, admission_errors=admission_errors)
+        else:
+            self.validation(self.state.validate())
+            self.state.apply()

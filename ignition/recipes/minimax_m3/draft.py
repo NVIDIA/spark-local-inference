@@ -21,6 +21,7 @@ from ignition.components.paged_attention import PreparedPagedAttention, Prepared
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_zeros
 
 from .config import ModelConfig
 from .decoder import projection
@@ -176,17 +177,17 @@ class DraftWeights:
             source = loader._sources[PREFIX + ".markov_head.markov_w2.weight"]
             width = target_head.shape[0]
             first, last = shard.rank * width, min((shard.rank + 1) * width, d.text["vocab_size"])
-            markov_head = torch.zeros((width, d.markov_rank), dtype=torch.bfloat16, device=device)
+            markov_head = persistent_zeros((width, d.markov_rank), dtype=torch.bfloat16, device=device)
             loader._copy(markov_head[:last - first], source[first:last])
             confidence = loader.load_tensor(PREFIX + ".confidence_head.proj.weight")
-            bias = loader.load_tensor(PREFIX + ".confidence_head.proj.bias")
+            bias_source = loader._sources[PREFIX + ".confidence_head.proj.bias"]
+            bias = loader.load_tensor(PREFIX + ".confidence_head.proj.bias", dtype=torch.float32)
             loader._session.flush()
             if (markov_embedding.shape != (d.text["vocab_size"], d.markov_rank)
                     or markov_embedding.dtype != torch.bfloat16 or source.dtype != torch.bfloat16
                     or confidence.shape != (1, hidden + d.markov_rank) or confidence.dtype not in (torch.bfloat16, torch.float32)
-                    or bias.shape != (1,) or bias.dtype not in (torch.bfloat16, torch.float32)):
+                    or bias.shape != (1,) or bias_source.dtype not in (torch.bfloat16, torch.float32)):
                 raise ValueError("DSpark requires BF16 Markov weights and a biased confidence projection")
-            bias = bias.float()
         return cls(projection, hidden_norm, context, norm, target_embedding, target_head,
                    markov_embedding, markov_head, confidence, bias, tuple(layers))
 
@@ -402,7 +403,7 @@ class PreparedDraft:
         self.head_hidden = scratch.hidden
         self.selector = round_combined_logits
         self.head = PreparedVocabularyProjection(scratch.hidden, draft.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
 
     def __call__(self):
         hidden = self.embedding()

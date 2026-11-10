@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.triton import prepare_triton
@@ -66,8 +67,8 @@ def fp8_markov_head(weight: torch.Tensor, *, rows_per_chunk=4096) -> RowScaledFP
         raise ValueError("FP8 Markov conversion requires contiguous BF16 [vocabulary, rank] weights")
     if not bool(torch.isfinite(weight).all()):
         raise ValueError("FP8 Markov conversion requires finite checkpoint weights")
-    values = torch.empty(weight.shape, dtype=torch.float8_e4m3fn, device=weight.device)
-    scales = torch.empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
+    values = persistent_empty(weight.shape, dtype=torch.float8_e4m3fn, device=weight.device)
+    scales = persistent_empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
     for start in range(0, weight.shape[0], rows_per_chunk):
         block = weight[start:start + rows_per_chunk].float()
         scale = block.abs().amax(dim=1).clamp_min(1e-12) / 448.0

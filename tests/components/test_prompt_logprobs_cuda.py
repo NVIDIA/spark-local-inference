@@ -130,8 +130,9 @@ def test_prompt_partial_combination_excludes_padding_and_counts_cross_shard_ties
 
 
 @pytest.mark.parametrize('logits_dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('functional', [False, True])
 @torch.no_grad()
-def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(logits_dtype):
+def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(logits_dtype, functional):
     from ignition.components.prompt_logprobs import PromptOutputs, PreparedPromptScoring, BLOCK_ROWS
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
@@ -145,9 +146,11 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(lo
     with RecordedPreparationSession(device=torch.device('cuda'), checkpoint='prompt-projection-test',
             workload_schema='prompt-blocks-v1', numerical_policy='default') as session:
         op = PreparedPromptScoring(source, weight, outputs, frame, vocabulary=vocab,
-            session=session, name='score', logits_dtype=logits_dtype)
+            session=session, name='score', logits_dtype=logits_dtype, local_outputs=functional)
+        if functional:
+            op = op.functional(session=session)
         session.tune()
-        call = compile_forward(op)
+        call = compile_forward(lambda: op(source)) if functional else compile_forward(op)
         call()
         torch.cuda.synchronize()
         stream = torch.cuda.Stream()
@@ -167,7 +170,12 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(lo
         print(dict(rows=rows, vocabulary=vocab, replay_peak_bytes=peak,
                    scoring_pool_bytes=outputs.scratch.nbytes, replay_allocations=0))
         # Every declared projection output has the fixed block bound, including the tail.
-        assert max(projection.output.shape[0] for _, projection, _ in op.parts) == BLOCK_ROWS
+        if functional:
+            assert max(count for _, count, _, _ in op.parts) == BLOCK_ROWS
+            assert all(projection.output is None for _, _, projection, _ in op.parts)
+            assert outputs.scratch.nbytes == 0
+        else:
+            assert max(projection.output.shape[0] for _, projection, _ in op.parts) == BLOCK_ROWS
         assert op.parts[-1][0].shape[0] == 1
         assert all(projection.output.dtype == logits_dtype for _, projection, _ in op.parts)
         logits = (source.cpu().float() @ weight.cpu().float().T).to(logits_dtype).double()

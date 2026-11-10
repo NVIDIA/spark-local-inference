@@ -360,6 +360,7 @@ class PreparedDecoder:
             name=name + ".head",
             activation_mode="auto",
             buffers=buffers,
+            workspace=workspace,
         )
 
     def __call__(self):
