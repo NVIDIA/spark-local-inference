@@ -250,9 +250,11 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", buffers=None, window_metadata=None):
+                 mla_compute_mode="auto", buffers=None, window_metadata=None,
+                 preprojected=False, external_output=False):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
+        self.preprojected = preprojected
         self.replay_start = replay_start
         config = pool.config
         draft = mode == "draft"
@@ -305,10 +307,12 @@ class PreparedAttention:
             (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values,
             eps=self.eps, session=session, name=name + ".qkv_norm", buffers=buffers,
             release_dependents=tokens <= 8)
-            if paired_mxfp8 and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
+            if not preprojected and paired_mxfp8 and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
         for key, values, out in (
             ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
         ):
+            if preprojected:
+                break
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
                 getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
             self.projections[key] = QuantizedProjection(values, weights[key], out,
@@ -320,11 +324,12 @@ class PreparedAttention:
                 allow_bf16_atomic_reduction=not packed_mxfp8,
                 buffers=buffers)
         self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
-            eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
+            eps=self.eps, session=session, name=name + ".q_norm") if not preprojected and self.norm_quant is None else None)
         self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
-            eps=self.eps, session=session, name=name + ".kv_norm") if self.norm_quant is None else None)
-        self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
-            weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
+            eps=self.eps, session=session, name=name + ".kv_norm") if not preprojected and self.norm_quant is None else None)
+        self.output_projection = (None if external_output else PreparedGroupedOutputProjection(
+            scratch.attended.view(tokens, -1, 4096), weights["output"], scratch.output,
+            session=session, name=name + ".output", workspace=workspace))
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
             self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
@@ -380,7 +385,7 @@ class PreparedAttention:
             session=session, name=f"{name}.attention",
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
         self.concurrent_query = None
-        if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
+        if (not preprojected and mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap):
             parallel_plans = [self.window_writer.plan]
             if self.window_norm is not None:
@@ -405,18 +410,21 @@ class PreparedAttention:
         position = self.window_metadata.position
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
-        self.projections["qkv_a"](source)
-        if self.norm_quant is None:
-            self.query_norm(s.projected[:, :1280])
-        else:
-            self.norm_quant(s.projected)
-        if self.concurrent_query is not None:
-            self.concurrent_query.start(s.query_low)
-        if self.window_norm is not None:
-            self.window_norm(s.projected[:, 1280:])
-        if self.concurrent_query is None:
-            self.projections["q_b"](s.query_low)
+        if self.preprojected:
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))
+        else:
+            self.projections["qkv_a"](source)
+            if self.norm_quant is None:
+                self.query_norm(s.projected[:, :1280])
+            else:
+                self.norm_quant(s.projected)
+            if self.concurrent_query is not None:
+                self.concurrent_query.start(s.query_low)
+            if self.window_norm is not None:
+                self.window_norm(s.projected[:, 1280:])
+            if self.concurrent_query is None:
+                self.projections["q_b"](s.query_low)
+                self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
         self.window_writer(s.window_values)
         dependency = self.window_cache
@@ -437,10 +445,11 @@ class PreparedAttention:
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.attention()
         self.rotary.apply(s.attended, position, compressed=bool(self.ratio), inverse=True)
-        self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
+        if self.output_projection is not None:
+            self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
         if self.mode == "prefill":
             self.commit(m.lengths)
-        return s.output
+        return s.output if self.output_projection is not None else s.attended
 
     def commit(self, counts):
         m = self.metadata

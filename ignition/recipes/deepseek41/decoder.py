@@ -23,6 +23,7 @@ from ignition.preparation.scratch import GraphBufferPool, GraphBuffers
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+from .native_brrr import PreparedSmallVerification, eligible as brrr_eligible
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,7 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto", buffers=None,
-                 window_metadata=None):
+                 window_metadata=None, small_verification_fusion=True):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
@@ -161,14 +162,25 @@ class PreparedLayer:
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
-        self.attention_hc = None if boundary is not None else PreparedMHC(
+        self.brrr = (PreparedSmallVerification(index, weights, s, metadata, carry=carry, runtime=runtime,
+            shard=shard, session=session, coordinator=coordinator, name=name + ".brrr", buffers=buffers)
+            if small_verification_fusion and brrr_eligible(weights, source, mode=mode,
+                world=shard.world_size, boundary=boundary, text=text,
+                spans_hosts=coordinator.spans_hosts if coordinator is not None else False,
+                native_dense_activations=getattr(session, "native_dense_activations", False)) else None)
+        preprojected = self.brrr is not None and self.brrr.has_prologue
+        self.attention_hc = None if boundary is not None or preprojected else PreparedMHC(
             incoming, _mhc_weights(weights, "attn", "attn_norm"), s.attention_hc,
             session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=s.pre_mix, pre_out=s.attn_mix, **options)
         self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode, buffers=buffers,
-            window_metadata=window_metadata)
+            window_metadata=window_metadata, preprojected=preprojected, external_output=self.brrr is not None)
+        if self.brrr is not None:
+            self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
+                s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
+            return
         self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
@@ -207,9 +219,18 @@ class PreparedLayer:
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
         if self.boundary is None:
-            self.attention_hc(*incoming)
+            if self.brrr is not None and self.brrr.has_prologue:
+                self.brrr.prologue()
+            else:
+                self.attention_hc(*incoming)
         else:
             self.boundary(self.attention.selectors[0])
+        if self.brrr is not None:
+            self.attention(s.attention_hc.normalized)
+            self.brrr.suffix()
+            if self.post is not None:
+                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
+            return
         self.attention_reduce(self.attention(s.attention_hc.normalized))
         self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
         if self.concurrent_shared is not None:
@@ -231,7 +252,8 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False):
+                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None,
+                 vocabulary_parallel=False, small_verification_fusion=True):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -304,6 +326,7 @@ class PreparedDecoder:
                 carry=carry, defer_post=defer, boundary=boundary, replay_start=replay_start,
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode, buffers=layer_buffers,
+                small_verification_fusion=small_verification_fusion,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata)))
             carry = defer
         buffers.join(*layer_cursors)

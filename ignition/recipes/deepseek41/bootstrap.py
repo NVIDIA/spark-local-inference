@@ -67,10 +67,11 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision,
-                       draft_vocabulary_runtime=None):
+                       draft_vocabulary_runtime=None, small_verification_fusion=True):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
     return (partial(PreparedDecoder, window_staging=window_staging, suffix_scratch=suffix_scratch,
-                    vision=vision, mla_compute_mode=mla_compute_mode),
+                    vision=vision, mla_compute_mode=mla_compute_mode,
+                    small_verification_fusion=small_verification_fusion),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode))
 
@@ -444,9 +445,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"),
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
+        from .native_brrr import group_eligible as brrr_group_eligible
+        use_brrr = brrr_group_eligible(coordinator, device,
+            enabled=not config.joint_tuning and not config.native_dense_activations)
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective)
+            draft_vocabulary_runtime=draft_vocabulary_collective,
+            small_verification_fusion=use_brrr)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -671,6 +676,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
+    from .native_brrr import close_resource as brrr_close_resource
+    brrr_resource = brrr_close_resource(collective)
     model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
@@ -682,9 +689,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
             collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
             vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
-            scratch_pool, feature_pool),
+            scratch_pool, feature_pool, brrr_resource),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (brrr_resource, scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

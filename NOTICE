@@ -11,6 +11,21 @@ THIRD_PARTY_NOTICES.md and third_party/rust/README.md.
 Third-party code and attributions
 ================================
 
+BRRR DeepSeek V4.1 decoder fusion
+--------------------------------
+Copyright 2026 Fraser Price
+Licensed under the Apache License, Version 2.0.
+
+ignition/recipes/deepseek41/native_brrr adapts BRRR's CUDA decoder and
+preparation weight layouts from revision 0bc4dbd0a15458e0957b899d72c7a5089e3335a5:
+https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR/tree/0bc4dbd0a15458e0957b899d72c7a5089e3335a5
+Flare adds prepared-graph bindings, caller-owned projection outputs, scale and
+layout adaptation, and resource teardown. Rotary transforms, cache updates and
+native scheduling remain Flare operations. The original BRRR NOTICE, including
+its vLLM, Local Inference Lab, b12x and FlashInfer attribution, and Apache-2.0
+license are retained beside the adapted sources. These files belong to model
+preparation; they are not linked into the Flare CLI executable.
+
 FlashInfer/b12x RoCE proxy
 -------------------------
 helios/native/roce_proxy.c was contributed by its original author from:

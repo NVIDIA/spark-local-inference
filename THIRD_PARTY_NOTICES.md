@@ -54,6 +54,13 @@ The vLLM-derived sampler and DeepSeek recipe assets belong to the source and
 preparation tools. Their existing notices and license texts remain in the source
 tree. They are not part of the native executable's dependency graph.
 
+The BRRR-derived DeepSeek V4.1 CUDA decoder and Python weight-layout adaptation
+are retained in `ignition/recipes/deepseek41/native_brrr`, with Fraser Price's
+original NOTICE and Apache-2.0 license. Flare compiles the extension during model
+preparation; it is not linked into the CLI binary. Prepared cores containing its
+captured kernels retain the upstream licensing requirements. See the root
+[NOTICE](NOTICE) for the source revision and adaptation boundary.
+
 ## Preparation and build dependencies
 
 `pyproject.toml` and `uv.lock` describe the separately installed preparation and

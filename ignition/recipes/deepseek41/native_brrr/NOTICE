@@ -1,0 +1,25 @@
+DeepSeek-4.1-Flash-1017-BRRR
+Copyright 2026 Fraser Price
+https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR
+
+This project is built on, patches and extends the following projects, each
+licensed under the Apache License, Version 2.0 and remaining the copyright of
+its respective authors:
+
+vLLM
+  Copyright the vLLM project
+  https://github.com/vllm-project/vllm
+
+Local Inference Lab's vLLM fork, including the DeepSeek-V4.1 model code that
+vllm.patch modifies
+  https://github.com/local-inference-lab/vllm
+
+b12x, whose attention, MoE, linear, Engram and all-reduce backends this project
+builds on and patches
+  Copyright 2025 the b12x authors
+  https://github.com/local-inference-lab/b12x
+
+FlashInfer, which now hosts b12x
+  Copyright 2025-2026 NVIDIA
+  Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+  https://github.com/flashinfer-ai/flashinfer
