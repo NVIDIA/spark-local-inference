@@ -4,7 +4,7 @@
 
 """Kimi K3 attention residuals and latent MoE composed into complete forwards."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import triton
@@ -75,6 +75,7 @@ class DecoderStorage:
     hidden_columns: torch.Tensor
     latent_begin: torch.Tensor
     allocator: object = None
+    stage_allocators: dict = field(default_factory=dict)
 
     @classmethod
     def allocate(cls, config, shard, device, *, scratch=None, allocator=None):
@@ -85,6 +86,15 @@ class DecoderStorage:
 
     def scratch_tensors(self):
         return tuple(self.scratch.values())
+
+
+    def stage_allocator(self, name):
+        """Overlay serial stage storage after the decoder's persistent values."""
+        if self.allocator is None:
+            return None
+        if name not in self.stage_allocators:
+            self.stage_allocators[name] = self.allocator.fork()
+        return self.stage_allocators[name]
 
 
 @dataclass(frozen=True)
@@ -279,7 +289,12 @@ class PreparedDecoder:
         self.vision_state = vision_state if mode == "prefill" else None
         config, source = weights.config, scratch.activations
         allocator = buffers.allocator
-        self.local_embedding = torch.zeros((source.shape[0], weights.embedding.shape[1]), dtype=source.dtype, device=source.device)
+        if ("local_embedding" not in buffers.scratch
+                or buffers.scratch["local_embedding"].shape[0] < source.shape[0]):
+            shape = (source.shape[0], weights.embedding.shape[1])
+            buffers.scratch["local_embedding"] = (torch.zeros(shape, dtype=source.dtype, device=source.device)
+                if allocator is None else allocator.zeros(shape, source.dtype))
+        self.local_embedding = buffers.scratch["local_embedding"][:source.shape[0]]
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, self.local_embedding, source,
             runtime=embedding_runtime, coordinator=coordinator,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
@@ -295,12 +310,21 @@ class PreparedDecoder:
         if "residual" not in self.buffers:
             committed = -(-len(weights.layers) // config.text["attn_res_block_size"])
             self.buffers["residual"] = dict(blocks=zeros((tokens, committed, hidden)), prefix=zeros(source.shape))
+        if "total" not in self.buffers:
+            self.buffers["total"] = zeros(source.shape)
         self.auxiliary = None
+        # Auxiliary features remain live until draft context updates consume them.
+        self.auxiliary_layers = config.draft.auxiliary_layers if weights.draft is not None else ()
+        self.auxiliary_stream = config.draft.auxiliary_stream if self.auxiliary_layers else None
+        if self.auxiliary_layers:
+            if "auxiliary" not in self.buffers:
+                self.buffers["auxiliary"] = zeros((tokens, len(self.auxiliary_layers) * hidden))
+            self.auxiliary = self.buffers["auxiliary"][:tokens]
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
-                          buffers=self.buffers.setdefault(kind, {}), allocator=allocator)
+                          buffers=self.buffers.setdefault(kind, {}), allocator=buffers.stage_allocator(kind))
             if kind == "kda":
                 attention = PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
                     eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
@@ -322,7 +346,7 @@ class PreparedDecoder:
                 if "output" in self.buffers.get("moe", {}):
                     dense.setdefault("output", self.buffers["moe"]["output"])
                 mlp = PreparedMLP(w["mlp"], source, session=session, name=prefix + ".mlp", buffers=dense,
-                                  allocator=allocator)
+                                  allocator=buffers.stage_allocator("dense"))
             else:
                 # Shared experts write the sum buffer, which the preceding mixture consumed and the MoE
                 # reduction overwrites only after their output is added.
@@ -331,14 +355,14 @@ class PreparedDecoder:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
-                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=allocator)
+                    buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"))
             # The sum buffer is consumed before the next attention or MLP reduction.
-            if "total" not in self.buffers:
-                self.buffers["total"] = zeros(source.shape)
             total = self.buffers["total"][:source.shape[0]]
             reduce = PreparedChunkedAllReduce(source, total, runtime=runtime, coordinator=coordinator,
                                               session=session, name=prefix + ".reduce")
             self.layers.append((w, attention, mlp, reduce))
+        if allocator is not None:
+            allocator.join(*buffers.stage_allocators.values())
         # The running block sum and committed blocks persist through one forward; every forward
         # rewrites them from its embeddings before reading them.
         r = self.buffers["residual"]
@@ -350,14 +374,6 @@ class PreparedDecoder:
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
-        # Auxiliary outputs precede each selected layer's input normalization.
-        self.auxiliary_layers = (config.draft.auxiliary_layers
-                                 if weights.draft is not None else ())
-        self.auxiliary_stream = config.draft.auxiliary_stream if self.auxiliary_layers else None
-        if self.auxiliary_layers:
-            if "auxiliary" not in self.buffers:
-                self.buffers["auxiliary"] = zeros((tokens, len(self.auxiliary_layers) * hidden))
-            self.auxiliary = self.buffers["auxiliary"][:tokens]
         self.replay = None
         if mode == "verify":
             indices = kda_records.layers

@@ -266,7 +266,8 @@ class DraftAttention:
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, buffers, embedding, head,
-                 output_multiplier, final_logit_softcapping):
+                 output_multiplier, final_logit_softcapping, attention_factory=DraftAttention,
+                 convolution_runtime=None):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         c, s = weights.config.draft, scratch
         stages = buffers.fork()
@@ -278,8 +279,9 @@ class PreparedDraft:
             prefix = f"{name}.layer{index}"
             conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=s.block_size,
                 group_size=16, session=session, name=prefix + "." + kind, buffers=s.convolution,
-                token_capacity=s.convolution["before"].shape[0]) for kind in ("attention_conv", "mlp_conv")}
-            attention = DraftAttention(index, layer, conv["attention_conv"].before, c, weights.shard, s, metadata, pool,
+                token_capacity=s.convolution["before"].shape[0], runtime=convolution_runtime,
+                coordinator=coordinator) for kind in ("attention_conv", "mlp_conv")}
+            attention = attention_factory(index, layer, conv["attention_conv"].before, c, weights.shard, s, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=prefix + ".attention",
                 workspace=workspace, buffers=stages)
             mlp = PreparedMLP(conv["mlp_conv"].before, layer.mlp, s.mlp.gate_up, s.mlp.intermediate, s.mlp.output,

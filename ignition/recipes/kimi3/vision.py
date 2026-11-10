@@ -11,6 +11,7 @@ from torch import nn
 from transformers.models.kimi_k25.modeling_kimi_k25 import Kimi_K25VisionEncoderLayer
 
 from ignition.components.linear import UnquantizedProjection
+from ignition.components.rms_norm import PreparedTorchRMSNorm
 from ignition.components.rotary import apply_cached_rotary, prepare_cached_rotary
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.components.weights import DirectWeightLoader
@@ -74,14 +75,20 @@ class VisionScratch:
     merged: torch.Tensor
     activated: torch.Tensor
     output: torch.Tensor
+    normalized: torch.Tensor
+
+    @staticmethod
+    def workspace_elements(patches):
+        """BF16 elements in the fused QKV slab shared by serial vision stages."""
+        return patches * 4608
 
     @classmethod
     def allocate(cls, patches, device, *, work=None, buffers=None):
         def zeros(*shape):
             return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if buffers is None
                     else buffers.zeros(shape, torch.bfloat16))
-        work = zeros(patches * 4608) if work is None else work
-        if (work.ndim != 1 or work.numel() < patches * 4608 or not work.is_contiguous()
+        work = zeros(cls.workspace_elements(patches)) if work is None else work
+        if (work.ndim != 1 or work.numel() < cls.workspace_elements(patches) or not work.is_contiguous()
                 or work.dtype != torch.bfloat16 or work.device != torch.device(device)):
             raise ValueError("vision workspace requires contiguous BF16 storage for fused QKV")
         projected = zeros(patches, 1024)
@@ -91,7 +98,7 @@ class VisionScratch:
         # Patch projection, attention output, MLP activation, and spatial merging execute serially.
         return cls(view(patches, 588), projected, view(patches, 4608), q, k, v, view(patches, 1536), projected,
             view(patches, 4096), projected, view(patches // 4, 4096), projected.view(patches // 4, 4096),
-            view(patches // 4, HIDDEN))
+            view(patches // 4, HIDDEN), q.view(-1)[:patches * 1024].view(patches, 1024))
 
     def rows(self, patches):
         return type(self)(*(getattr(self, name)[:patches // 4 if name in ('merged', 'activated', 'output') else patches]
@@ -112,11 +119,13 @@ class _InplaceGELU(nn.Module):
         return torch.ops.aten.gelu.out(source, approximate="tanh", out=source)
 
 
-def _norm(weight, eps=None):
-    with torch.device('meta'):
-        module = nn.RMSNorm(weight.numel(), eps=eps)
-    module.weight = nn.Parameter(weight, requires_grad=False)
-    return module
+class _RMSNorm(nn.Module):
+    def __init__(self, weight, source, output, eps=None, *, session, name):
+        super().__init__()
+        self.operation = PreparedTorchRMSNorm(source, weight, output, eps=eps, session=session, name=name)
+
+    def forward(self, source):
+        return self.operation(source)
 
 
 def interpolate_positions(weight, indices, factors, output):
@@ -175,7 +184,11 @@ class PreparedVision:
             w = {key.removeprefix(prefix): value for key, value in tensors.items() if key.startswith(prefix)}
             with torch.device('meta'):
                 block = Kimi_K25VisionEncoderLayer(config)
-            block.norm1, block.norm2 = _norm(w['norm0.weight']), _norm(w['norm1.weight'])
+            # QKV consumes normalization output before query unpacking reuses it.
+            block.norm1 = _RMSNorm(w['norm0.weight'], s.hidden, s.normalized,
+                                  session=session, name=f'{name}.{layer}.norm1')
+            block.norm2 = _RMSNorm(w['norm1.weight'], s.hidden, s.normalized,
+                                  session=session, name=f'{name}.{layer}.norm2')
             block.attn = _Attention(w, s, self.cu, self.rotary_positions,
                 session=session, workspace=workspace, name=f'{name}.{layer}')
             block.mlp.fc1 = _Projection(w['mlp.fc0.weight'], s.hidden, s.mlp_up, session=session, name=f'{name}.{layer}.up')
@@ -184,12 +197,14 @@ class PreparedVision:
             block.mlp.fc2 = _Projection(w['mlp.fc1.weight'], s.mlp_up, s.mlp_down, session=session, name=f'{name}.{layer}.down')
             block.eval()
             self.blocks.append(block)
-        self.norm = _norm(tensors['vision_tower.encoder.final_layernorm.weight'])
+        self.norm = _RMSNorm(tensors['vision_tower.encoder.final_layernorm.weight'], s.hidden, s.normalized,
+                             session=session, name=name + '.norm')
         self.up = _Projection(tensors['mm_projector.proj.0.weight'], s.merged, s.activated,
                              session=session, name=name + '.merge_up')
         self.down = _Projection(tensors['mm_projector.proj.2.weight'], s.activated, s.output,
                                session=session, name=name + '.merge_down')
-        self.post_norm = _norm(tensors['mm_projector.post_norm.weight'], 1e-5)
+        self.post_norm = _RMSNorm(tensors['mm_projector.post_norm.weight'], s.output, s.output, 1e-5,
+                                  session=session, name=name + '.post_norm')
 
     def rotary_embeddings(self):
         rotary = self.rotary[self.positions.flip((1,))].transpose(1, 2).flatten(1, 2)

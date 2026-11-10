@@ -724,7 +724,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
         create_all_reduce_runtime, create_head_exchange)
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import ModelConfig
     from ignition.recipes.kimi3.dspark import PreparedMarkov
@@ -832,11 +832,16 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                 arena = ScratchArena(device)
                 session.register_scratch(arena)
                 buffers = {}
+                context_pool = GraphBufferPool(device, chunk_bytes=2 << 20)
+                context_cursor = context_pool.cursor()
+                retained = context_cursor.full((256,), 7, torch.bfloat16)
                 common = dict(session=session, workspace=arena, runtime=context_runtime,
-                              coordinator=coordinator, buffers=buffers, context=context)
+                              coordinator=coordinator, buffers=buffers, context=context,
+                              allocator=context_cursor.fork())
                 initial_context = PreparedContext(weights, auxiliary, initial, pool, name="initial", **common)
                 commit_context = PreparedContext(weights, feedback, commit, pool, name="commit", **common)
                 single_context = PreparedContext(weights, one_feedback, single, pool, name="single", **common)
+                assert bool((retained == 7).all())
                 assert initial_context.projected.data_ptr() == commit_context.projected.data_ptr()
                 assert commit_context.kv.data_ptr() == single_context.kv.data_ptr()
                 scratch = DraftScratch.allocate(config, shard, 14, BLOCK, device)

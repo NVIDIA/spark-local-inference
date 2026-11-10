@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from ignition.components.parallel import TensorParallelShard
 
 if TYPE_CHECKING:
+    from ignition.recipes.kimi31.dflash_config import DFlash2Config
     from ignition.recipes.kimi31.dspark_config import DSparkConfig as MLADSparkConfig
 
 PAGE_TOKENS = 128
@@ -39,6 +40,9 @@ class DSparkConfig:
 
     @classmethod
     def from_dict(cls, raw, target):
+        if raw.get("architectures") == ["DFlash2DraftModel"]:
+            from ignition.recipes.kimi31.dflash_config import DFlash2Config
+            return DFlash2Config.from_dict(raw, target)
         layer = raw.get("transformer_layer_config", {})
         aux = raw.get("aux_hidden_state_layer_ids", ())
         rope = layer.get("rope_parameters", {})
@@ -139,7 +143,7 @@ class DSAConfig:
 class ModelConfig:
     text: dict
     vision: dict
-    draft: "DSparkConfig | MLADSparkConfig | None" = None
+    draft: "DSparkConfig | MLADSparkConfig | DFlash2Config | None" = None
     dsa: DSAConfig | None = None
 
     @classmethod

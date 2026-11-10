@@ -271,6 +271,8 @@ def test_dspark_draft_geometry(config):
     plain, widened = continuation_layout(speculative, 16), continuation_layout(speculative, 16, speculative_tokens=7)
     assert widened.region("layer1.convolution").shape == (2304, 10)
     assert widened.region("draft4.value").shape == (2048, 1, 64) and widened.region("draft4.value").dtype == torch.bfloat16
+    assert plain.region("draft4.value").shape == widened.region("draft4.value").shape
+    assert plain.region("draft4.value").dtype == torch.bfloat16
     assert widened.row_bytes > plain.row_bytes
     for name, value in (("aux_hidden_state_layer_ids", [0, 93]), ("sample_from_anchor", False),
                         ("sliding_window_non_causal", True)):

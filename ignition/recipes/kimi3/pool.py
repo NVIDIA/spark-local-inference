@@ -12,6 +12,7 @@ from ignition.components.state import StateLayout
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES
+from ignition.recipes.kimi31.dflash_config import DFlash2Config
 
 
 def page_specs(config):
@@ -34,8 +35,8 @@ def page_bytes(config):
 def continuation_layout(config, world_size, *, speculative_tokens=0):
     """One continuation row preserves KDA history and each cache region's partial page.
 
-    Speculation widens KDA convolution history by the verified drafts. Sliding-window drafts also
-    retain every layer's key/value ring here; full-context drafts retain their history in pages.
+    Speculation widens KDA convolution history by the verified drafts. Sliding-window drafts
+    retain every layer's accepted history here; full-context drafts retain their history in pages.
     """
     heads = config.text["linear_attn_config"]["num_heads"] // world_size
     regions = []
@@ -44,7 +45,10 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
             regions.extend(((f"layer{index}.convolution", (3 * heads * 128, 3 + speculative_tokens), torch.bfloat16),
                             (f"layer{index}.recurrent", (heads, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config))
-    if speculative_tokens and config.draft is not None and config.draft.window is not None:
+    if isinstance(config.draft, DFlash2Config):
+        for layer in range(config.draft.layers):
+            regions.append((f"draft{layer}.latent", (config.draft.window, RECORD_BYTES), torch.float8_e4m3fn))
+    elif config.draft is not None and config.draft.window is not None:
         d = config.draft
         for layer in range(d.layers):
             for kind in ("key", "value"):

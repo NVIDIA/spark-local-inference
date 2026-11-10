@@ -118,7 +118,7 @@ class PreparedContext:
     """Project accepted target output taps into each draft layer's paged latent history."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
-                 buffers, context):
+                 buffers, context, allocator=None):
         self.metadata, self.shards = metadata, context.shards
         config, draft = weights.config, weights.draft
         tokens, device = auxiliary.shape[0], auxiliary.device
@@ -126,7 +126,8 @@ class PreparedContext:
 
         def buffer(key, *shape, dtype=torch.bfloat16):
             if key not in buffers:
-                buffers[key] = torch.zeros((tokens, *shape), dtype=dtype, device=device)
+                buffers[key] = (torch.zeros((tokens, *shape), dtype=dtype, device=device) if allocator is None
+                                else allocator.zeros((tokens, *shape), dtype))
             if buffers[key].shape[0] < tokens:
                 raise ValueError("draft context storage must be allocated for the largest capacity first")
             return buffer_rows(buffers, key, tokens)
