@@ -86,7 +86,15 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
         attention = PreparedAttention(0, weights, config, shard, source, scratch, metadata, pool,
             mode='prefill', runtime=None, coordinator=None, session=session, name='prefill', workspace=arena)
         session.tune()
-        compiled = compile_forward(lambda: attention(source))
+        def forward():
+            query, key, value, gate = attention.project(source, metadata)
+            scratch.query.copy_(query)
+            scratch.key.copy_(key)
+            scratch.value.copy_(value)
+            scratch.projected[:, -gate.shape[-1]:].copy_(gate)
+            output, _ = attention.attend(query, key, value, gate, metadata, source.shape)
+            scratch.output.copy_(output)
+        compiled = compile_forward(forward)
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -193,7 +201,15 @@ def test_decode_wrap_and_inactive_lanes(window):
         attention = PreparedAttention(0, weights, config, shard, source, scratch, metadata, pool,
             mode='decode', runtime=None, coordinator=None, session=session, name='decode', workspace=arena)
         session.tune()
-        compiled = compile_forward(lambda: attention(source))
+        def forward():
+            query, key, value, gate = attention.project(source, metadata)
+            scratch.query.copy_(query)
+            scratch.key.copy_(key)
+            scratch.value.copy_(value)
+            scratch.projected[:, -gate.shape[-1]:].copy_(gate)
+            output, _ = attention.attend(query, key, value, gate, metadata, source.shape)
+            scratch.output.copy_(output)
+        compiled = compile_forward(forward)
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):

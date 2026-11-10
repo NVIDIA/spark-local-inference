@@ -668,3 +668,52 @@ def test_misc_preserves_stable_and_tuned_storage_classes():
     misc = {view['name']: view['storage'] for view in declaration['views'] if view['group'] == 'misc'}
     assert misc == {'weights.embedding': STABLE, 'weights.head': STABLE,
                     "weights.vision['patch']": STABLE, 'weights.draft': TUNED}
+
+
+@pytest.mark.parametrize('recipe', ['deepseek4', 'deepseek41'])
+@pytest.mark.parametrize('with_draft', [False, True])
+def test_deepseek_weight_catalog_preserves_recipe_fields(recipe, with_draft):
+    from importlib import import_module
+    from ignition.components.weights import MLPWeights
+
+    module = import_module(f'ignition.recipes.{recipe}.weights')
+
+    def tensor():
+        return torch.arange(4, dtype=torch.float32)
+
+    expert_args = dict(router=tensor(), correction=tensor(), experts={'packed': tensor()},
+                       shared=MLPWeights(tensor(), tensor()), vision_correction=tensor())
+    layer_args = dict(attention={'query': tensor()}, residual={'score': tensor()})
+    draft_args = dict(main_projection=tensor(), context_kv=tensor(), main_norm=tensor(),
+                      norm=tensor(), markov_embedding=tensor(), markov_head=tensor(),
+                      draft_head=tensor())
+    model_args = dict(config=None, shard=None, embedding=tensor(), norm=tensor(), head=tensor(),
+                      allocated_bytes=0, vision={'patch': tensor()})
+    if recipe == 'deepseek4':
+        expert_args['token_experts'] = tensor()
+        draft_args['head_mix'] = {'score': tensor()}
+        model_args['head_mix'] = {'score': tensor()}
+        components = ('embedding', 'norm', 'head', 'head_mix', 'draft', 'vision')
+    else:
+        layer_args['engram'] = {'embedding': tensor()}
+        draft_args['confidence_head'] = tensor()
+        components = ('embedding', 'norm', 'head', 'draft', 'vision')
+    layer = module.LayerWeights(experts=module.ExpertWeights(**expert_args), **layer_args)
+    draft = module.DSparkWeights(layers=(layer,), **draft_args) if with_draft else None
+    model = module.ModelWeights(layers=(layer,), draft=draft, **model_args)
+    catalog = rebuild_weights_metadata(declare_weights(model, components=components))
+    entries = {entry['name']: entry for entry in catalog['tensors']}
+    assert not catalog['unavailable']
+    assert entries["weights.layers[0].attention['query']"]['address'] == layer.attention['query'].data_ptr()
+    assert entries['weights.layers[0].experts.shared.gate_up']['address'] == layer.experts.shared.gate_up.data_ptr()
+    if recipe == 'deepseek4':
+        assert entries["weights.head_mix['score']"]['address'] == model.head_mix['score'].data_ptr()
+        if with_draft:
+            assert entries["weights.draft.head_mix['score']"]['address'] == draft.head_mix['score'].data_ptr()
+    else:
+        assert entries["weights.layers[0].engram['embedding']"]['address'] == layer.engram['embedding'].data_ptr()
+        if with_draft:
+            assert entries['weights.draft.confidence_head']['address'] == draft.confidence_head.data_ptr()
+    if with_draft:
+        assert entries['weights.draft.draft_head']['address'] == draft.draft_head.data_ptr()
+        assert entries["weights.draft.layers[0].attention['query']"]['address'] == layer.attention['query'].data_ptr()

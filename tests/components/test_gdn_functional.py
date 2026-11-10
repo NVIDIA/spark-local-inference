@@ -95,6 +95,7 @@ def test_functional_recovery_preserves_record_and_convolution_operands(monkeypat
 def test_functional_gdn_routes_projection_slices_without_bound_scratch(kind):
     owner = object.__new__(gated_delta.PreparedGDN)
     owner._functional_requested = owner._functional_ready = True
+    owner._has_partitions = False
     owner.world_size = 1
     owner.fused_qkvzba, owner.fused_qkvz = kind == "combined", kind == "parallel"
     owner.tokens = 2
@@ -129,6 +130,30 @@ def test_functional_gdn_routes_projection_slices_without_bound_scratch(kind):
     owner._functional_sequence = sequence
     assert torch.equal(owner(source), torch.ones_like(source))
     assert order == {"combined": ["combined"], "parallel": [], "separate": ["qkv", "z", "ba"]}[kind]
+
+
+def test_functional_gdn_uses_runtime_partition_metadata_and_records():
+    owner = object.__new__(gated_delta.PreparedGDN)
+    owner._functional_requested = owner._functional_ready = owner._has_partitions = True
+    owner.world_size, owner.fused_qkvzba, owner.fused_qkvz = 1, True, True
+    owner.partitions = None
+    owner.projections = {"in_proj_qkvzba": lambda source: torch.zeros((2, 16480), dtype=torch.bfloat16),
+                         "out_proj": lambda value: value}
+    seen = []
+
+    def sequence(projected, z, a, b, *, records, metadata):
+        seen.append((metadata, records))
+        return torch.full((1, 2), float(len(seen))), None
+
+    owner.sequences_by_role = (SimpleNamespace(_functional_sequence=sequence),
+                               SimpleNamespace(_functional_sequence=sequence))
+    prompt_metadata, decode_metadata, records = object(), object(), object()
+    parts = (SimpleNamespace(mode="prefill", metadata=prompt_metadata, gather=lambda value: value[:1]),
+             SimpleNamespace(mode="decode", metadata=decode_metadata, gather=lambda value: value[1:]))
+    partitions = SimpleNamespace(parts=parts, combine=lambda outputs: torch.cat(outputs))
+    result = owner(torch.zeros((2, 2560), dtype=torch.bfloat16), records=records, partitions=partitions)
+    assert seen == [(prompt_metadata, None), (decode_metadata, records)]
+    assert result.tolist() == [[1.0, 1.0], [2.0, 2.0]]
 
 
 def test_gdn_finalization_drops_template_scratch_and_bindings():

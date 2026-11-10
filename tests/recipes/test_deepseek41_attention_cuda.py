@@ -19,12 +19,13 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 @pytest.mark.parametrize("window_size", [128, 136])
 @pytest.mark.parametrize("rows", [4, 24])
 @torch.no_grad()
-def test_mixed_cache_writers_and_captured_attention(ratio, mode, window_size, rows):
+def test_mixed_cache_writers_and_captured_attention(ratio, mode, window_size, rows, functional):
     device = torch.device("cuda:0")
     torch.manual_seed(4101)
     window_values = torch.randn((window_size, 512), device=device, dtype=torch.bfloat16) * .2
@@ -64,10 +65,21 @@ def test_mixed_cache_writers_and_captured_attention(ratio, mode, window_size, ro
         for value, saved in zip(metadata, saved_metadata, strict=True):
             assert value.eq(2 ** 30).all()
             value.copy_(saved)
+        if functional:
+            write_window.functional(session=session, cache=None)
+            write_compressed.functional(session=session)
+            attention.functional(session=session, window=None)
+
         def forward():
-            write_window(window_values)
-            write_compressed(compressed_values)
-            attention()
+            if functional:
+                write_window(window_values, window_slots, cache=window)
+                write_compressed(compressed_values, compressed_slots)
+                output.copy_(attention(query, window_indices, lengths, indexed_indices=compressed_indices,
+                    indexed_lengths=indexed_lengths, page_table=table, window=window))
+            else:
+                write_window(window_values)
+                write_compressed(compressed_values)
+                attention()
         compiled = torch.compile(forward, fullgraph=True)
         compiled()
         torch.cuda.synchronize()

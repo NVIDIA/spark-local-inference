@@ -17,6 +17,7 @@ from ignition.components.linear import prepare_projection
 from ignition.components.mlp import PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.examples import declaration_tensor
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.window_staging import PreparedWindowStaging
 
@@ -43,24 +44,14 @@ def _rotary(values, positions, inverse):
     return values * cos[:, None] + rotate_half(values) * sin[:, None]
 
 
-class _FunctionalContextCapture:
+class PreparedContextCapture:
     """Capture target features that can survive in a draft context ring.
 
     Compact prefill accepts every live input row. Verification retains all rows
     until its accepted prefix is known.
     """
 
-    @staticmethod
-    def allocate_buffers(rows, columns, compact, device, *, buffers=None):
-        def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=device)
-                    if buffers is None else buffers.zeros(shape, dtype))
-        indices = zeros((rows,), torch.int64) if compact else None
-        live = zeros((rows,), torch.bool) if compact else None
-        return indices, live, zeros((rows, columns), torch.bfloat16)
-
-    def __init__(self, metadata, columns, window, *, compact_prefill=False, buffers=None):
-        self.metadata = metadata
+    def __init__(self, metadata, columns, window, *, compact_prefill=False):
         rows = metadata.positions.numel()
         compact = compact_prefill and metadata.starts.numel() == 1 and rows > window
         if compact:
@@ -69,9 +60,12 @@ class _FunctionalContextCapture:
         self.device = metadata.positions.device
         self.compact = compact
 
+    def functional(self):
+        return self
+
     def _indices(self, metadata=None):
         if self.compact:
-            m = self.metadata if metadata is None else metadata
+            m = metadata
             if m is None:
                 raise ValueError("functional context capture requires runtime metadata")
             offsets = torch.arange(self.shape[0], device=m.positions.device)
@@ -93,29 +87,6 @@ class _FunctionalContextCapture:
         return state
 
 
-class PreparedContextCapture(_FunctionalContextCapture):
-    """Capture selected decoder layers into caller-owned feature storage."""
-
-    def __init__(self, metadata, columns, window, *, compact_prefill=False, buffers=None):
-        super().__init__(metadata, columns, window, compact_prefill=compact_prefill)
-        self.indices, self.live, self.output = self.allocate_buffers(
-            *self.shape, self.compact, self.device, buffers=buffers)
-
-    def functional(self):
-        operation = _FunctionalContextCapture.__new__(_FunctionalContextCapture)
-        for name in ("shape", "device", "compact"):
-            setattr(operation, name, getattr(self, name))
-        operation.metadata = None
-        return operation
-
-    def begin(self):
-        if self.compact:
-            indices, live = self._indices()
-            self.indices.copy_(indices)
-            self.live.copy_(live)
-
-    def __call__(self, hidden, column):
-        super().__call__((self.output, self.indices, self.live), hidden, column)
 
 
 class PreparedContext:
@@ -127,8 +98,8 @@ class PreparedContext:
     """
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 runtime, coordinator, buffers=None, compact_prefill=False):
-        self.weights, self.metadata = weights, metadata
+                 runtime, coordinator, compact_prefill=False, examples=None):
+        self.weights = weights
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         tokens, hidden = auxiliary.shape[0], c.text["hidden_size"]
@@ -139,9 +110,9 @@ class PreparedContext:
         self.compact = compact
         _, kv_heads = a.local(weights.shard)
         self.inverse = _inverse(a, auxiliary.device)
-        local = torch.empty((tokens, hidden // weights.shard.world_size), dtype=torch.bfloat16,
-                            device=auxiliary.device)
-        projected = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=auxiliary.device)
+        local = declaration_tensor(examples, "dflash.context.local",
+            (tokens, hidden // weights.shard.world_size), torch.bfloat16, auxiliary.device)
+        projected = declaration_tensor(examples, "dflash.context.projected", (tokens, hidden), torch.bfloat16, auxiliary.device)
         self.project = prepare_projection(auxiliary, weights.draft.projection, local,
             session=session, name=name + ".project", workspace=workspace).functional(session=session)
         self.gather = PreparedChunkedAllGather(local, projected, runtime=runtime,
@@ -149,14 +120,14 @@ class PreparedContext:
         self.gather.functional(session=session)
         self.norm = _norm(weights.draft.hidden_norm, c.text["rms_norm_eps"])
         kv_shape = (tokens, c.layers * kv_heads * (a.key_dim + a.value_dim))
-        kv = torch.empty(kv_shape, dtype=torch.bfloat16, device=auxiliary.device)
+        kv = declaration_tensor(examples, "dflash.context.kv", kv_shape, torch.bfloat16, auxiliary.device)
         self.project_kv = prepare_projection(projected, weights.draft.context_kv, kv,
             session=session, name=name + ".kv", workspace=workspace).functional(session=session)
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             norm = _norm(layer.key_norm, c.text["rms_norm_eps"])
-            key = torch.empty((tokens, kv_heads, a.key_dim), dtype=torch.bfloat16, device=auxiliary.device)
-            value = torch.empty((tokens, kv_heads, a.value_dim), dtype=torch.bfloat16, device=auxiliary.device)
+            key = declaration_tensor(examples, "dflash.context.key", (tokens, kv_heads, a.key_dim), torch.bfloat16, auxiliary.device)
+            value = declaration_tensor(examples, "dflash.context.value", (tokens, kv_heads, a.value_dim), torch.bfloat16, auxiliary.device)
             slots = torch.full((tokens,), -1, dtype=torch.int64, device=auxiliary.device)
             writer = PreparedPagedKVWriter(key, value,
                 pool.reserved_region(f"draft{index}.key"), pool.reserved_region(f"draft{index}.value"),
@@ -165,14 +136,10 @@ class PreparedContext:
             self.layers.append((norm, writer))
 
     def functional(self):
-        """Drop preparation metadata and require it as an invocation operand."""
-        self.metadata = None
         return self
 
-    def __call__(self, auxiliary, counts, metadata=None):
-        m = self.metadata if metadata is None else metadata
-        if m is None:
-            raise ValueError("functional DFlash context requires runtime metadata")
+    def __call__(self, auxiliary, counts, metadata):
+        m = metadata
         if not self.compact:
             positions = m.positions
             offset = positions - m.starts[m.requests]
@@ -199,7 +166,7 @@ class PreparedContext:
         chunks = kv.view(auxiliary.shape[0], len(self.layers), width + kv_heads * a.value_dim)
         for index, (norm, writer) in enumerate(self.layers):
             key = _rotary(norm(chunks[:, index, :width].view(key_shape)), positions, self.inverse)
-            value = chunks[:, index, width:].view(auxiliary.shape[0], kv_heads, a.value_dim)
+            value = chunks[:, index, width:].view(auxiliary.shape[0], kv_heads, a.value_dim).contiguous()
             writer(key, value, slots)
 
     def scratch_tensors(self):
@@ -217,7 +184,7 @@ class DraftScratch:
     window: int
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device=None, *, buffers=None, block_size=None):
+    def allocate(cls, config, shard, tokens, device=None, *, block_size=None):
         block_size = config.block_size if block_size is None else block_size
         if tokens <= 0 or tokens % block_size:
             raise ValueError("DFlash2 scratch requires complete proposal blocks")
@@ -240,42 +207,42 @@ class DraftScratch:
         return ()
 
 
-def _draft_templates(config, shard, scratch, device):
+def _draft_templates(config, shard, scratch, device, *, examples=None):
     attention, text = config.attention, config.text
     tokens, hidden, block = scratch.tokens, scratch.hidden_size, scratch.block_size
     heads, kv_heads = attention.local(shard)
     rows = tokens // block
     pages = rows * ((attention.window + block + PAGE_TOKENS - 1) // PAGE_TOKENS)
 
-    def empty(shape, dtype=torch.bfloat16):
-        return torch.empty(shape, dtype=dtype, device=device)
+    def empty(role, shape, dtype=torch.bfloat16):
+        return declaration_tensor(examples, "dflash.draft." + role, shape, dtype, device)
 
     return SimpleNamespace(
         block_size=block,
-        local_embedding=empty((tokens, scratch.local_hidden_size)),
-        embedding=empty((tokens, hidden)),
-        normalized=empty((tokens, hidden)),
-        qkv=empty((tokens, heads * attention.key_dim + kv_heads * (attention.key_dim + attention.value_dim))),
-        query=empty((tokens, heads, attention.key_dim)),
-        key=empty((tokens, kv_heads, attention.key_dim)),
-        value=empty((tokens, kv_heads, attention.value_dim)),
-        attended=empty((tokens, heads, attention.value_dim)),
-        partial=empty((tokens, hidden)),
-        output=empty((tokens, hidden)),
-        window_key=empty((pages, PAGE_TOKENS, kv_heads, attention.key_dim), torch.float8_e4m3fn),
-        window_value=empty((pages, PAGE_TOKENS, kv_heads, attention.value_dim), torch.float8_e4m3fn),
+        local_embedding=empty("local_embedding", (tokens, scratch.local_hidden_size)),
+        embedding=empty("embedding", (tokens, hidden)),
+        normalized=empty("normalized", (tokens, hidden)),
+        qkv=empty("qkv", (tokens, heads * attention.key_dim + kv_heads * (attention.key_dim + attention.value_dim))),
+        query=empty("query", (tokens, heads, attention.key_dim)),
+        key=empty("key", (tokens, kv_heads, attention.key_dim)),
+        value=empty("value", (tokens, kv_heads, attention.value_dim)),
+        attended=empty("attended", (tokens, heads, attention.value_dim)),
+        partial=empty("partial", (tokens, hidden)),
+        output=empty("output", (tokens, hidden)),
+        window_key=empty("window_key", (pages, PAGE_TOKENS, kv_heads, attention.key_dim), torch.float8_e4m3fn),
+        window_value=empty("window_value", (pages, PAGE_TOKENS, kv_heads, attention.value_dim), torch.float8_e4m3fn),
         mlp=SimpleNamespace(
-            gate_up=empty((tokens, 2 * text["intermediate_size"] // shard.world_size)),
-            intermediate=empty((tokens, text["intermediate_size"] // shard.world_size)),
-            output=empty((tokens, hidden)),
+            gate_up=empty("mlp.gate_up", (tokens, 2 * text["intermediate_size"] // shard.world_size)),
+            intermediate=empty("mlp.intermediate", (tokens, text["intermediate_size"] // shard.world_size)),
+            output=empty("mlp.output", (tokens, hidden)),
         ),
-        hidden=empty((tokens, hidden)),
-        local_logits=empty((tokens, scratch.local_vocabulary_size)),
-        gathered_logits=empty((tokens, scratch.local_vocabulary_size * shard.world_size)),
+        hidden=empty("hidden", (tokens, hidden)),
+        local_logits=empty("local_logits", (tokens, scratch.local_vocabulary_size)),
+        gathered_logits=empty("gathered_logits", (tokens, scratch.local_vocabulary_size * shard.world_size)),
         convolution={
-            "coefficients": empty((tokens, 2 * 2 * hidden // 16)),
-            "before": empty((tokens, hidden)),
-            "after": empty((tokens, hidden)),
+            "coefficients": empty("convolution.coefficients", (tokens, 2 * 2 * hidden // 16)),
+            "before": empty("convolution.before", (tokens, hidden)),
+            "after": empty("convolution.after", (tokens, hidden)),
         },
     )
 
@@ -284,8 +251,7 @@ class DraftAttention:
     """Noncausal GQA over accepted context followed by a parallel proposal block."""
 
     def __init__(self, index, weights, source, config, shard, scratch, metadata, pool, *,
-                 runtime, coordinator, session, name, workspace, buffers):
-        self.metadata = metadata
+                 runtime, coordinator, session, name, workspace):
         a, self.window = config.attention, config.attention.window
         self.block_size = scratch.block_size
         self.qkv = prepare_projection(source, weights.qkv, scratch.qkv,
@@ -320,38 +286,44 @@ class DraftAttention:
         self.value_shape = tuple(scratch.value.shape)
 
     def functional(self):
-        """Drop preparation metadata and require it as an invocation operand."""
-        self.metadata = None
         return self
 
-    def __call__(self, source, metadata=None):
-        m = self.metadata if metadata is None else metadata
-        if m is None:
-            raise ValueError("functional DFlash attention requires runtime metadata")
+    def project(self, source, metadata):
+        m = metadata
         q_width = self.query_shape[1] * self.query_shape[2]
         kv_width = self.key_shape[1] * self.key_shape[2]
-        q, k, v = self.qkv(source).split((q_width, kv_width, self.value_shape[1] * self.value_shape[2]), -1)
+        projected = self.qkv(source)
+        q, k, v = projected.split((q_width, kv_width, self.value_shape[1] * self.value_shape[2]), -1)
         query = _rotary(self.q_norm(q.view(self.query_shape)), m.positions, self.inverse)
         key = _rotary(self.k_norm(k.view(self.key_shape)), m.positions, self.inverse)
-        value = v.view(self.value_shape)
+        value = v.view(self.value_shape).contiguous()
+        return projected, query, key, value
+
+    def attend(self, query, key, value, metadata):
+        m = metadata
         staged_key, staged_value = self.staging(key, value, metadata=m)
         lengths = torch.where(m.lengths > 0, m.starts.clamp(max=self.window) + m.lengths, 0).int()
-        attended = self.attention(query, k_cache=staged_key, v_cache=staged_value,
-                                  cache_seqlens=lengths, cu_seqlens_q=m.query_start_loc)
+        return self.attention(query, k_cache=staged_key, v_cache=staged_value,
+                              cache_seqlens=lengths, cu_seqlens_q=m.query_start_loc)
+
+    def __call__(self, source, metadata):
+        _, query, key, value = self.project(source, metadata)
+        attended = self.attend(query, key, value, metadata)
         return self.reduce(self.output(attended.flatten(1)))
 
 
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, embedding, head,
-                 output_multiplier, final_logit_softcapping, buffers=None):
-        self.metadata, self.scratch = metadata, scratch
-        self.session = session
+                 output_multiplier, final_logit_softcapping, examples=None):
+        self.logit_shape = scratch.logit_shape
+        self.logit_dtype, self.local_logit_dtype = torch.float32, torch.bfloat16
+        self.local_logit_shape = (scratch.tokens, scratch.local_vocabulary_size)
         c = weights.config.draft
-        s = _draft_templates(weights.config.draft, weights.shard, scratch, pool.backing.device)
+        s = _draft_templates(weights.config.draft, weights.shard, scratch, embedding.device, examples=examples)
         self.embedding = PreparedShardedEmbedding(embedding, metadata.token_ids, s.local_embedding, s.embedding,
             runtime=embedding_runtime, coordinator=coordinator, session=session, name=name + ".embedding",
-            num_rows=metadata.live_counts[:1]).functional(session=session)
+            num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             prefix = f"{name}.layer{index}"
@@ -363,7 +335,7 @@ class PreparedDraft:
                 operation.functional(session=session)
             attention = DraftAttention(index, layer, attention_source, c, weights.shard, s, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=prefix + ".attention",
-                workspace=workspace, buffers=None)
+                workspace=workspace)
             mlp = PreparedMLP(mlp_source, layer.mlp, s.mlp.gate_up, s.mlp.intermediate, s.mlp.output,
                 session=session, name=prefix + ".mlp", workspace=workspace).functional(session=session)
             reduction = PreparedAllReduce(s.mlp.output, s.output, runtime=runtime, coordinator=coordinator,
@@ -380,23 +352,14 @@ class PreparedDraft:
         self.block_size = scratch.block_size
         self.hidden_size = scratch.hidden_size
         self.vocabulary_size = scratch.vocabulary_size
-        self.sample_indices = metadata.sample_indices
         self.multiplier = output_multiplier
         self.softcap = final_logit_softcapping
 
-    def functional(self):
-        """Drop metadata and template references before graph capture."""
-        self.metadata = None
-        self.sample_indices = None
-        self.embedding.functional(session=self.session, dynamic_inputs=True)
-        for _, _, attention, _, _, _, _ in self.layers:
-            attention.functional()
+    def release_outputs(self):
         return self
 
-    def __call__(self, metadata=None):
-        m = self.metadata if metadata is None else metadata
-        if m is None:
-            raise ValueError("functional DFlash draft requires runtime metadata")
+    def forward(self, metadata):
+        m = metadata
         embedding = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1])
         for norm, conv, attention, post_norm, mlp_conv, mlp, reduce in self.layers:
             normalized = norm(embedding)
@@ -412,6 +375,10 @@ class PreparedDraft:
         unary = logits[:, :self.vocabulary_size].float() * self.multiplier
         logits = unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap
         selector_features = self.selector.prepare_features(hidden.view(-1, self.block_size, self.hidden_size))
+        return hidden, logits, selector_features
+
+    def __call__(self, metadata):
+        _, logits, selector_features = self.forward(metadata)
         return logits, selector_features
 
     def scratch_tensors(self):

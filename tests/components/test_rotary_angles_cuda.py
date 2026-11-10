@@ -12,7 +12,7 @@ import torch
 from ignition.components.rotary import CompressedRotary, PreparedRotaryAngles
 from ignition.preparation.compile_pool import CompilePool
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool
+from tests.tensor_examples import TensorExamples
 from ignition.recipes.deepseek4.attention import normalize_rotate
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -51,8 +51,8 @@ def test_shared_angles_are_exact_through_metadata_compilation_and_native_replay(
         "rope_scaling":{"original_max_position_embeddings":4096, "beta_fast":32.,
                         "beta_slow":1., "factor":16.}})
     rotary = CompressedRotary(config, device)
-    buffers = GraphBufferPool(device)
-    angles = PreparedRotaryAngles(positions, rotary.frequencies[True], buffers=buffers.cursor())
+    buffers = TensorExamples(device)
+    angles = PreparedRotaryAngles(positions, rotary.frequencies[True], buffers=buffers)
     forward = RotaryForward(seed, rotated, normalized, angles, inverse)
     path = tmp_path / "rotary.bin"
     with CompilePool(device) as compiler:

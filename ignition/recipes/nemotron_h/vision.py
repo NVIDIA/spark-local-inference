@@ -13,8 +13,8 @@ from transformers.models.radio.modeling_radio import RadioLayer
 
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.preparation.examples import declaration_tensor
 from ignition.components.weights import DirectWeightLoader
-from ignition.preparation.scratch import GraphBufferPool
 
 PATCH_CAPACITIES = (1024, 4096, 13312)
 FEATURES = 13312
@@ -118,23 +118,20 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, device, *, buffers=None):
-        buffers = GraphBufferPool(device).cursor() if buffers is None else buffers
-        def zeros(cursor, *shape):
-            return cursor.zeros(shape, torch.bfloat16)
+    def allocate(cls, patches, device, *, examples=None):
+        def zeros(role, shape):
+            return declaration_tensor(examples, "nemotron.vision." + role, shape, torch.bfloat16, device)
         rows = patches + REGISTER_TOKENS
-        pixels = zeros(buffers, patches, PIXEL_WIDTH)
-        patch_hidden = zeros(buffers, patches, VISION_HIDDEN)
-        hidden, projected = (zeros(buffers, rows, VISION_HIDDEN) for _ in range(2))
-        attention, feedforward, merger = (buffers.fork() for _ in range(3))
-        mlp_up = zeros(feedforward, rows, 4 * VISION_HIDDEN)
-        qkv = zeros(attention, rows, 3 * VISION_HIDDEN)
-        query, key, value = (zeros(attention, rows, 16, 80) for _ in range(3))
-        attended = zeros(attention, rows, VISION_HIDDEN)
-        merged = zeros(merger, patches // 4, 4 * VISION_HIDDEN)
-        activated = zeros(merger, patches // 4, 20480)
-        output = zeros(merger, patches // 4, HIDDEN)
-        buffers.join(attention, feedforward, merger)
+        pixels = zeros("pixels", (patches, PIXEL_WIDTH))
+        patch_hidden = zeros("patch_hidden", (patches, VISION_HIDDEN))
+        hidden, projected = (zeros(role, (rows, VISION_HIDDEN)) for role in ("hidden", "projected"))
+        mlp_up = zeros("mlp_up", (rows, 4 * VISION_HIDDEN))
+        qkv = zeros("qkv", (rows, 3 * VISION_HIDDEN))
+        query, key, value = (zeros(role, (rows, 16, 80)) for role in ("query", "key", "value"))
+        attended = zeros("attended", (rows, VISION_HIDDEN))
+        merged = zeros("merged", (patches // 4, 4 * VISION_HIDDEN))
+        activated = zeros("activated", (patches // 4, 20480))
+        output = zeros("output", (patches // 4, HIDDEN))
         return cls(pixels, patch_hidden, hidden, qkv, query, key, value, attended, projected,
                    mlp_up, merged, activated, output)
 
@@ -147,11 +144,15 @@ class _Projection(nn.Module):
     def forward(self, source):
         return self.operation(source)
 
+    def functional(self, *, session):
+        self.operation.functional(session=session)
+        return self
+
 
 class _Attention(nn.Module):
     def __init__(self, weights, scratch, cu, *, session, workspace, name):
         super().__init__()
-        self.scratch = s = scratch
+        s = scratch
         self.qkv = _Projection(weights["attn.qkv.weight"], s.hidden, s.qkv, session=session,
                                name=name + ".qkv", bias=weights["attn.qkv.bias"])
         self.output = _Projection(weights["attn.proj.weight"], s.attended, s.projected, session=session,
@@ -159,14 +160,17 @@ class _Attention(nn.Module):
         self.attend = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended.view_as(s.query),
                                              session=session, workspace=workspace, name=name + ".attention")
 
+    def functional(self, *, session):
+        self.qkv.functional(session=session)
+        self.output.functional(session=session)
+        self.attend.functional(session=session)
+        self.cu = None
+        return self
+
     def forward(self, source, attention_mask=None, **kwargs):
-        s = self.scratch
-        q, k, v = self.qkv(source).view(-1, 3, 16, 80).unbind(1)
-        s.query.copy_(q)
-        s.key.copy_(k)
-        s.value.copy_(v)
-        self.attend()
-        return self.output(s.attended), None
+        q, k, v = (value.contiguous() for value in self.qkv(source).view(-1, 3, 16, 80).unbind(1))
+        attended = self.attend(q, k, v, attention_mask)
+        return self.output(attended.reshape(source.shape[0], VISION_HIDDEN)), None
 
 
 def _norm(weight, bias, eps):
@@ -178,19 +182,16 @@ def _norm(weight, bias, eps):
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name, buffers=None):
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name):
+        self.session = session
         self.scratch, self.inputs = scratch, inputs
         s = scratch
         tensors = weights.tensors
         n, device = s.patches.shape[0], s.patches.device
+        self.patch_capacity = n
         def zeros(shape, dtype=torch.int32):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.interpolation_indices = zeros((n, 4), torch.int64)
-        self.interpolation_weights = zeros((n, 4), torch.float32)
-        self.merge_indices = zeros((n // 4, 4), torch.int64)
-        self.cu = zeros((2,))
-        self.num_features = zeros((1,))
+            return torch.zeros(shape, dtype=dtype, device=device)
+        cu = zeros((2,))
         self.position_weight = tensors[PREFIX + "patch_generator.pos_embed"].reshape(-1, VISION_HIDDEN)
         self.registers = tensors[PREFIX + "patch_generator.cls_token.token"]
         self.patch = UnquantizedProjection(s.patches, weights.patch, s.patch_hidden,
@@ -205,7 +206,7 @@ class PreparedVision:
             block.norm1 = _norm(w["norm1.weight"], w["norm1.bias"], config.layer_norm_eps)
             block.norm2 = _norm(w["norm2.weight"], w["norm2.bias"], config.layer_norm_eps)
             block.layer_scale1 = block.layer_scale2 = nn.Identity()
-            block.attention = _Attention(w, s, self.cu, session=session, workspace=workspace, name=f"{name}.{layer}")
+            block.attention = _Attention(w, s, cu, session=session, workspace=workspace, name=f"{name}.{layer}")
             block.mlp.fc1 = _Projection(w["mlp.fc1.weight"], s.hidden, s.mlp_up,
                 session=session, name=f"{name}.{layer}.up", bias=w["mlp.fc1.bias"])
             block.mlp.fc2 = _Projection(w["mlp.fc2.weight"], s.mlp_up, s.projected,
@@ -217,19 +218,29 @@ class PreparedVision:
                                        session=session, name=name + ".projector_up")
         self.down = UnquantizedProjection(s.activated, tensors["mlp1.3.weight"], s.output,
                                          session=session, name=name + ".projector_down")
+        self.release_outputs()
 
-    def __call__(self):
-        s = self.scratch
-        positions = (self.position_weight[self.interpolation_indices].float()
-                     * self.interpolation_weights[:, :, None]).sum(1).to(s.patch_hidden.dtype)
-        s.hidden[:REGISTER_TOKENS].copy_(self.registers)
-        s.hidden[REGISTER_TOKENS:].copy_(self.patch(s.patches) + positions)
-        hidden = s.hidden
+    def release_outputs(self):
+        self.patch.functional(session=self.session)
         for block in self.blocks:
-            hidden = block(hidden)
-        merged = hidden[REGISTER_TOKENS:][self.merge_indices].flatten(1).float()
+            block.attention.functional(session=self.session)
+            block.mlp.fc1.functional(session=self.session)
+            block.mlp.fc2.functional(session=self.session)
+        self.up.functional(session=self.session)
+        self.down.functional(session=self.session)
+        self.scratch = None
+        return self
+
+    def __call__(self, patches, interpolation_indices, interpolation_weights, merge_indices, cu):
+        patches = patches.to(self.registers.dtype)
+        positions = (self.position_weight[interpolation_indices].float()
+                     * interpolation_weights[:, :, None]).sum(1).to(patches.dtype)
+        hidden = torch.cat((self.registers, self.patch(patches) + positions), dim=0)
+        for block in self.blocks:
+            hidden = block(hidden, attention_mask=cu)
+        merged = hidden[REGISTER_TOKENS:][merge_indices].flatten(1).float()
         merged = merged * torch.rsqrt(merged.square().mean(-1, keepdim=True) + 1e-5)
-        s.merged.copy_((merged * self.projector_norm.float()).to(s.merged.dtype))
-        activated = torch.relu(self.up(s.merged))
-        s.activated.copy_(activated * activated)
-        return self.down(s.activated)
+        merged = (merged * self.projector_norm.float()).to(torch.bfloat16)
+        activated = torch.relu(self.up(merged))
+        activated = activated * activated
+        return self.down(activated)

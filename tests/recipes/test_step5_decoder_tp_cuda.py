@@ -80,19 +80,21 @@ def _rank(rank, world, rendezvous, snapshot):
                                 coordinator=coordinator, next_norm=weights.input_norm if fused else None)
                             norm = None if fused else PreparedRMSNorm(scratch.residual, weights.input_norm,
                                 scratch.normalized, eps=config.text["rms_norm_eps"], session=session,
-                                name=name + ".following_norm", zero_centered=True)
-                            paths.append((scratch, layer, norm))
+                                name=name + ".following_norm", zero_centered=True).functional()
+                            paths.append((scratch, layer, norm, metadata))
                         pairs.append(paths)
                     session.tune(show_progress=False)
+                    arena.release_preparation()
 
                     def forward():
                         for paths in pairs:
-                            for scratch, layer, norm in paths:
-                                update = layer(scratch.residual)
+                            for scratch, layer, norm, metadata in paths:
+                                update, _ = layer(scratch.residual, metadata=metadata)
                                 if norm is not None:
                                     scratch.residual.add_(update.float())
-                                    norm(scratch.residual)
-                        arena.tensor.fill_(255)
+                                    scratch.normalized.copy_(norm(scratch.residual))
+                                else:
+                                    scratch.normalized.copy_(update)
 
                     compiled = compile_forward(forward)
                     compiled()
@@ -109,7 +111,7 @@ def _rank(rank, world, rendezvous, snapshot):
                             pool.backing.zero_()
                         for paths in pairs:
                             initial = torch.randn(paths[0][0].residual.shape, generator=generator) * .3
-                            for scratch, _, _ in paths:
+                            for scratch, _, _, _ in paths:
                                 scratch.residual.copy_(initial)
                         allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
                         graph.replay()

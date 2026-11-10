@@ -5,7 +5,7 @@
 """Sliding windows, overlapping C4 retrieval, and dense C128 history."""
 
 from dataclasses import dataclass
-from types import SimpleNamespace
+from typing import NamedTuple
 
 import torch
 import triton
@@ -24,6 +24,8 @@ from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.rotary import PreparedRotaryAngles
 from ignition.components.window_indices import PreparedWindowIndices
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import register_finalizer
 
 from .config import Compressor
 from .pool import PAGE_TOKENS, latent_page_bytes
@@ -152,10 +154,9 @@ class AttentionScratch:
     index_weights: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, world, device, *, blocks=8192, buffers=None):
+    def allocate(cls, tokens, world, device, *, blocks=8192):
         def zeros(shape, dtype=torch.bfloat16):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
+            return torch.zeros(shape, dtype=dtype, device=device)
 
         return cls(
             zeros((tokens, 1536)),
@@ -171,74 +172,88 @@ class AttentionScratch:
         )
 
 
+class CompressionGeometry(NamedTuple):
+    slots: torch.Tensor
+    lengths: torch.Tensor
+    index_lengths: torch.Tensor
+    active_width: torch.Tensor
+    position: torch.Tensor
+    emitted: torch.Tensor
+    emitted_slots: torch.Tensor
+
+
+class AttentionGeometry(NamedTuple):
+    window_slots: torch.Tensor
+    window_indices: torch.Tensor
+    window_lengths: torch.Tensor
+    ratios: dict[int, CompressionGeometry]
+    dense: torch.Tensor | None
+    angles: dict[tuple[bool, int], torch.Tensor]
+
+
 class AttentionIndices(PreparedWindowIndices):
-    """Window and compression indices that every attention layer of one forward shares.
+    """Window, compression, and rotary inputs shared by layers of one invocation."""
 
-    They depend only on the batch metadata, so the forward computes them once before its first layer
-    instead of once per layer.
-    """
-
-    def __init__(self, metadata, *, mode, tokens, visible, buffers):
+    def __init__(self, metadata, *, mode, tokens, visible=None):
         page_size = 128 if mode == "decode" else 128 + metadata.max_query_tokens
         width = page_size if mode == "draft" else 128 + (384 if visible is not None else 0)
-        super().__init__(metadata, mode=mode, tokens=tokens, page_size=page_size,
-            width=width, visible=visible, buffers=buffers)
-        self.buffers = buffers
-        self.ratios, self.dense = {}, None
-        self.angles = {}
+        super().__init__(metadata, mode=mode, tokens=tokens, page_size=page_size, width=width, visible=visible)
+        self.ratios, self.dense, self.angles = {}, None, {}
 
     def rotary_angles(self, rotary, *, compressed, ratio=0):
         key = compressed, ratio
         if key not in self.angles:
             positions = self.metadata.positions if ratio == 0 else self.compressed(ratio).position
-            self.angles[key] = PreparedRotaryAngles(positions, rotary.frequencies[compressed], buffers=self.buffers)
+            self.angles[key] = PreparedRotaryAngles(positions, rotary.frequencies[compressed])
         return self.angles[key]
 
     def compressed(self, ratio):
-        """Slots, lengths and emission flags shared by the layers compressing at `ratio`."""
         if ratio not in self.ratios:
-            tokens, buffers = self.window_slots.shape[0], self.buffers
-            self.ratios[ratio] = SimpleNamespace(
-                slots=buffers.full((tokens,), -1, torch.int64),
-                lengths=buffers.zeros((tokens,), torch.int32),
-                index_lengths=buffers.zeros((tokens,), torch.int32),
-                active_width=buffers.zeros((1,), torch.int32),
-                position=buffers.zeros((tokens,), torch.int64),
-                emitted=buffers.zeros((tokens,), torch.bool),
-                emitted_slots=buffers.full((tokens,), -1, torch.int64),
-            )
+            device, tokens = self.window_slots.device, self.window_slots.shape[0]
+            def zeros(dtype):
+                return torch.zeros((tokens,), dtype=dtype, device=device)
+            self.ratios[ratio] = CompressionGeometry(slots=zeros(torch.int64), lengths=zeros(torch.int32),
+                index_lengths=zeros(torch.int32), active_width=torch.zeros(1, dtype=torch.int32, device=device),
+                position=zeros(torch.int64), emitted=zeros(torch.bool), emitted_slots=zeros(torch.int64))
         return self.ratios[ratio]
 
     def dense_pages(self, target):
-        """Dense C128 layers read one copy of the token page table."""
         if self.dense is None:
             self.dense = target
-        elif self.dense.data_ptr() != target.data_ptr() or self.dense.shape != target.shape:
-            raise ValueError("dense C128 layers of one forward share their page indices")
         return self.dense
 
-    def __call__(self):
-        super().__call__()
-        m = self.metadata
+    def functional(self):
+        self.compression_ratios = tuple(self.ratios)
+        self.has_dense = self.dense is not None
+        self.ratios = self.dense = None
+        for operation in self.angles.values():
+            operation.functional()
+        super().functional()
+        return self
+
+    def __call__(self, metadata, visible=None):
+        base = super().__call__(metadata, visible=visible)
+        m = metadata
         live, position = m.positions >= 0, m.positions.clamp_min(0)
-        for ratio, shared in self.ratios.items():
-            shared.lengths.copy_(torch.where(live, (position + 1) // ratio, 0))
-            shared.index_lengths.copy_(shared.lengths.clamp(max=512) if ratio == 4 else shared.lengths)
-            shared.active_width.copy_(shared.lengths.amax().view(1))
+        ratios = {}
+        for ratio in self.compression_ratios:
+            lengths = torch.where(live, (position + 1) // ratio, 0).to(torch.int32)
             pages = m.page_table[m.requests, (position // PAGE_TOKENS).clamp(max=m.page_table.shape[1] - 1)]
-            shared.slots.copy_(
-                torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1)
-            )
-            shared.position.copy_(((position + 1) // ratio * ratio - ratio).clamp_min(0))
-            shared.emitted.copy_(live & ((m.positions + 1) % ratio == 0))
-            shared.emitted_slots.copy_(torch.where(shared.emitted, shared.slots, -1))
-        if self.dense is not None:
-            records = PAGE_TOKENS // 128
-            offsets = torch.arange(records, device=m.page_table.device)
+            slots = torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1)
+            emitted = live & ((m.positions + 1) % ratio == 0)
+            ratios[ratio] = CompressionGeometry(slots=slots, lengths=lengths,
+                index_lengths=lengths.clamp(max=512) if ratio == 4 else lengths,
+                active_width=lengths.amax().view(1), position=((position + 1) // ratio * ratio - ratio).clamp_min(0),
+                emitted=emitted, emitted_slots=torch.where(emitted, slots, -1))
+        dense = None
+        if self.has_dense:
             pages = m.token_page_table[:, :, None]
-            self.dense.copy_(torch.where(pages >= 0, pages * records + offsets, -1).flatten(1))
-        for angles in self.angles.values():
-            angles()
+            records = PAGE_TOKENS // 128
+            dense = torch.where(pages >= 0, pages * records + torch.arange(records, device=pages.device), -1).flatten(1).to(torch.int32)
+        angles = {key: operation(m.positions if key[1] == 0 else ratios[key[1]].position)
+                  for key, operation in self.angles.items()}
+        return AttentionGeometry(window_slots=base.window_slots, window_indices=base.window_indices,
+            window_lengths=base.window_lengths, ratios=ratios, dense=dense, angles=angles)
 
 
 class PreparedAttention:
@@ -257,12 +272,13 @@ class PreparedAttention:
         session,
         name,
         workspace,
-        buffers,
         visible=None,
         indices=None,
+        examples=None,
     ):
-        self.scratch, self.metadata, self.pool = scratch, metadata, pool
-        self.rotary, self.mode, self.visible = rotary, mode, visible
+        self.pool = pool
+        self.heads = scratch.query.shape[1]
+        self.rotary, self.mode = rotary, mode
         self.ratio = 0 if mode == "draft" else pool.config.text["compress_ratios"][layer]
         self.eps = pool.config.text["rms_norm_eps"]
         tokens, rows, device = source.shape[0], metadata.starts.numel(), source.device
@@ -270,15 +286,16 @@ class PreparedAttention:
         # Layers of one forward share their window and compression indices; a standalone layer owns them.
         self.owns_indices = indices is None
         if indices is None:
-            indices = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visible, buffers=buffers)
+            indices = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visible)
         self.indices = indices
         self.window_page_size = indices.window_page_size
-        # Every launch stages its window and rewrites it before reading it, so it lives in the graph's
-        # private buffers, which graphs that never run concurrently share.
+        self.window_shape = (rows, latent_page_bytes(self.window_page_size))
+        # Staged windows belong to one invocation; only decode writes the persistent window directly.
         self.window_cache = (
             self.window
             if mode == "decode"
-            else buffers.zeros((rows, latent_page_bytes(self.window_page_size)), torch.uint8)
+            else declaration_tensor(examples, "attention.window",
+                                    (rows, latent_page_bytes(self.window_page_size)), torch.uint8, device)
         )
         self.window_slots, self.window_indices = indices.window_slots, indices.window_indices
         self.window_lengths = indices.window_lengths
@@ -303,6 +320,7 @@ class PreparedAttention:
             name=name + ".qkv_a",
             workspace=workspace,
             activation_mode=activation_mode,
+            examples=examples, example_role="attention.qkv",
         )
         self.qb = QuantizedProjection(
             scratch.query_low,
@@ -312,6 +330,7 @@ class PreparedAttention:
             name=name + ".q_b",
             workspace=workspace,
             activation_mode=activation_mode,
+            examples=examples, example_role="attention.query",
         )
         self.qnorm = PreparedRMSNorm(
             scratch.projected[:, :1024],
@@ -368,7 +387,8 @@ class PreparedAttention:
             if self.ratio == 4:
                 specs.append(Compressor(layer, 4, 128, index=True))
             widths = [spec.state_shape[1] for spec in specs]
-            self.compressed = buffers.zeros((tokens, 2 * sum(widths)), torch.float32)
+            self.compressed = declaration_tensor(examples, "attention.compression",
+                                                 (tokens, 2 * sum(widths)), torch.float32, device)
             self.compression = UnquantizedProjection(
                 source, weights["compression"], self.compressed, session=session, name=name + ".compression"
             )
@@ -387,7 +407,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".compress",
                 deferred=mode == "verify",
-                buffers=buffers,
+                examples=examples, example_role="attention.compressor",
                 emitted=shared.emitted,
                 emitted_slots=shared.emitted_slots,
                 projected=projected[0],
@@ -411,7 +431,7 @@ class PreparedAttention:
                     session=session,
                     name=name + ".index_compress",
                     deferred=mode == "verify",
-                    buffers=buffers,
+                    examples=examples, example_role="attention.index_compressor",
                     emitted=shared.emitted,
                     emitted_slots=shared.emitted_slots,
                     projected=projected[1],
@@ -424,6 +444,7 @@ class PreparedAttention:
                     name=name + ".index_query",
                     workspace=workspace,
                     activation_mode=activation_mode,
+                    examples=examples, example_role="attention.index_query",
                 )
                 self.index_weight = UnquantizedProjection(
                     source,
@@ -447,7 +468,7 @@ class PreparedAttention:
                             session=session,
                             name=f"{name}.index{first}",
                             workspace=workspace,
-                            buffers=buffers,
+                            examples=examples, example_role="attention.indexer",
                             prefill_records_per_call=131072,
                         )
                     )
@@ -499,72 +520,129 @@ class PreparedAttention:
             **indexed,
         )
 
-    def rotate(self, tensor, *, compression=False, inverse=False):
-        angles = self.compressed_angles if compression else self.angles
-        if angles is not None:
-            angles.apply(tensor, inverse=inverse)
+        if self.concurrent_index is not None:
+            self.concurrent_index.functional(session=session)
+            self.concurrent_compression.functional(session=session)
         else:
-            position = (self.indices.compressed(self.ratio).position if compression
-                        else self.metadata.positions.clamp_min(0))
+            if self.ratio == 4:
+                self.index_query.functional(session=session)
+                self.index_weight.functional(session=session)
+            if self.compression is not None:
+                self.compression.functional(session=session)
+        self.qkv.functional(session=session)
+        self.qb.functional(session=session)
+        self.qnorm.functional()
+        self.kvnorm.functional()
+        self.output_projection.functional(session=session)
+        self.window_writer.functional(session=session, cache=None if mode != "decode" else self.window)
+        self.attention.functional(session=session, window=None if mode != "decode" else self.window)
+        if self.compressor is not None:
+            self.compressor.functional(session=session)
+            self.compressed_writer.functional(session=session)
+        if self.index_compressor is not None:
+            self.index_compressor.functional(session=session)
+        for selector in self.selectors:
+            selector.functional(session=session)
+        register_finalizer(session, self._release_examples)
+        if self.owns_indices:
+            self.indices.functional()
+
+    def _release_examples(self):
+        self.window_cache = self.window_slots = self.window_indices = self.window_lengths = None
+        self.compressed_slots = self.lengths = self.active_width = self.index_lengths = None
+        self.compressed = self.indexed_indices = None
+        if self.concurrent_index is not None:
+            self.index_query = self.index_weight = self.compression = None
+
+    def rotate(self, tensor, metadata, indices, *, compression=False, inverse=False):
+        operation = self.compressed_angles if compression else self.angles
+        if operation is not None:
+            key = (True, self.ratio) if compression else (bool(self.ratio), 0)
+            operation.apply(tensor, indices.angles[key], inverse=inverse)
+        else:
+            position = indices.ratios[self.ratio].position if compression else metadata.positions.clamp_min(0)
             self.rotary.apply(tensor, position, compressed=compression or bool(self.ratio), inverse=inverse)
 
-    def __call__(self, source):
-        m, s = self.metadata, self.scratch
-        position = m.positions if self.angles is not None else m.positions.clamp_min(0)
+    def __call__(self, source, metadata, indices=None):
+        m = metadata
         if self.owns_indices:
-            self.indices()
+            indices = self.indices(m)
+        window = self.window if self.mode == "decode" else torch.empty(self.window_shape, dtype=torch.uint8, device=source.device)
         if self.mode != "decode":
-            transfer_window(self.window, self.window_cache, m, self.window_page_size)
+            transfer_window(self.window, window, m, self.window_page_size)
+        shared = indices.ratios[self.ratio] if self.ratio else None
+        compressed_pending = None
         if self.concurrent_compression is not None:
-            self.concurrent_compression.start(source)
-        self.qkv(source)
-        self.qnorm(s.projected[:, :1024])
-        if self.concurrent_index is not None:
-            self.concurrent_index.start(s.query_low)
-        self.kvnorm(s.projected[:, 1024:])
-        self.qb(s.query_low)
-        normalize_rotate(s.query, position, self.rotary.frequencies[bool(self.ratio)], self.eps,
-                         angles=None if self.angles is None else self.angles.values)
-        self.rotate(s.window_values)
-        self.window_writer(s.window_values)
-        if self.concurrent_compression is not None:
-            self.concurrent_index.finish(s.query_low, s.query)
-            self.rotate(s.index_query)
-            self.concurrent_compression.finish(source, [s.query, self.window_cache, s.index_query])
+            compressed_pending = self.concurrent_compression.start(source, m, shared.position, shared.emitted_slots,
+                angles=indices.angles[(True, self.ratio)])
+        projected = self.qkv(source)
+        query_low = self.qnorm(projected[:, :1024])
+        index_pending = self.concurrent_index.start(query_low) if self.concurrent_index is not None else None
+        window_values = self.kvnorm(projected[:, 1024:])
+        query = self.qb(query_low).view(source.shape[0], self.heads, 512)
+        angles = None if self.angles is None else indices.angles[(bool(self.ratio), 0)]
+        normalize_rotate(query, m.positions if angles is not None else m.positions.clamp_min(0),
+            self.rotary.frequencies[bool(self.ratio)], self.eps, angles=angles)
+        self.rotate(window_values, m, indices)
+        self.window_writer(window_values, indices.window_slots, cache=window)
+        compressed_records = index_records = None
+        index_query = index_weights = None
+        if compressed_pending is not None:
+            index_query = self.concurrent_index.finish(index_pending, query).view(source.shape[0], 64, 128)
+            self.rotate(index_query, m, indices)
+            outputs = self.concurrent_compression.finish(compressed_pending, [query, window, index_query])
+            projected = outputs[0]
+            width = self.compressor.spec.state_shape[1]
+            index_width = self.index_compressor.spec.state_shape[1]
+            compressed_records = (projected[:, :width], projected[:, width:2*width])
+            index_records = (projected[:, 2*width:2*width+index_width], projected[:, 2*width+index_width:])
+            index_weights = outputs[-1]
+        selected = indices.dense if self.ratio else None
         if self.ratio:
-            if self.concurrent_compression is None:
-                self.compression(source)
-                latent = self.compressor(source)
-                self.rotate(latent, compression=True)
-                self.compressed_writer(latent)
+            if compressed_pending is None:
+                projected = self.compression(source)
+                width = self.compressor.spec.state_shape[1]
+                latent, values, scores, _, slots = self.compressor(source, m, shared.slots,
+                    projected=(projected[:, :width], projected[:, width:2*width]),
+                    emitted=shared.emitted, emitted_slots=shared.emitted_slots)
+                compressed_records = values, scores
+                self.rotate(latent, m, indices, compression=True)
+                self.compressed_writer(latent, slots)
             if self.index_compressor is not None:
-                if self.concurrent_compression is None:
-                    keys = self.index_compressor(source)
-                    self.rotate(keys, compression=True)
-                    self.selectors[0].write_keys(keys, self.index_compressor.slots)
-                if self.concurrent_compression is None:
-                    self.index_query(s.query_low)
-                    self.rotate(s.index_query)
-                    self.index_weight(source)
-                for selector in self.selectors:
-                    selector()
-                logical = s.selected.long()
-                records = PAGE_TOKENS // 4
-                physical = m.token_page_table.gather(1, (logical // records).clamp(0, m.page_table.shape[1] - 1))
-                s.selected.copy_(
-                    torch.where((logical >= 0) & (physical >= 0), physical * records + logical % records, -1)
-                )
-        self.attention()
-        self.rotate(s.attended, inverse=True)
-        self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
+                if compressed_pending is None:
+                    offset = 2 * self.compressor.spec.state_shape[1]
+                    width = self.index_compressor.spec.state_shape[1]
+                    keys, values, scores, _, slots = self.index_compressor(source, m, shared.slots,
+                        projected=(projected[:, offset:offset+width], projected[:, offset+width:offset+2*width]),
+                        emitted=shared.emitted, emitted_slots=shared.emitted_slots)
+                    index_records = values, scores
+                    self.rotate(keys, m, indices, compression=True)
+                    self.selectors[0].write_keys(keys, slots)
+                    index_query = self.index_query(query_low).view(source.shape[0], 64, 128)
+                    self.rotate(index_query, m, indices)
+                    index_weights = self.index_weight(source)
+                selected = torch.cat([selector(index_query[first:first+INDEX_ROWS], index_weights[first:first+INDEX_ROWS],
+                    m.token_page_table[first:first+INDEX_ROWS], shared.lengths[first:first+INDEX_ROWS], shared.active_width)
+                    for first, selector in zip(range(0, source.shape[0], INDEX_ROWS), self.selectors)], dim=0)
+                logical = selected.long()
+                records_per_page = PAGE_TOKENS // 4
+                physical = m.token_page_table.gather(1, (logical // records_per_page).clamp(0, m.page_table.shape[1] - 1))
+                selected = torch.where((logical >= 0) & (physical >= 0),
+                    physical * records_per_page + logical % records_per_page, -1).to(selected.dtype)
+        attended = self.attention(query, indices.window_indices, indices.window_lengths,
+            indexed_indices=selected, indexed_lengths=None if shared is None else shared.index_lengths, window=window)
+        self.rotate(attended, m, indices, inverse=True)
+        output = self.output_projection(attended.view(source.shape[0], -1, 4096))
+        records = window, compressed_records, index_records
         if self.mode == "prefill":
-            self.commit(m.lengths)
-        return s.output
+            self.commit(m.lengths, records, m)
+        return output, records
 
-    def commit(self, counts):
-        transfer_window(self.window_cache, self.window, self.metadata, self.window_page_size, counts=counts)
+    def commit(self, counts, records, metadata):
+        window, compressed, index = records
+        transfer_window(window, self.window, metadata, self.window_page_size, counts=counts)
         if self.mode == "verify":
             if self.compressor is not None:
-                self.compressor.commit(counts)
+                self.compressor.commit(counts, compressed, metadata)
             if self.index_compressor is not None:
-                self.index_compressor.commit(counts)
+                self.index_compressor.commit(counts, index, metadata)

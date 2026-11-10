@@ -5,19 +5,20 @@
 """Checkpoint GLM latent attention composes into allocation-stable native graphs."""
 
 import os
+from dataclasses import fields
 import time
 from pathlib import Path
 
 import pytest
 import torch
-from b12x.attention import sparse_mla
+from b12x.attention import dsa_indexer, sparse_mla
 from cuda.bindings import driver as cuda
 
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
-from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.scratch import ScratchArena, planned_scratch
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.glm53.indexer import IndexMetadata
 from ignition.recipes.glm53.mla import MLAScratch, MLAState, PreparedGlmMLA
@@ -55,21 +56,31 @@ def runs_concurrently(graph):
     return bool(ready)
 
 
-def assert_selection(actual, expected, indexer):
+def assert_selection(actual, expected, indexer, scratch):
     differing = (actual.sort().values != expected.sort().values).any(1)
     if not differing.any():
         return
     assert indexer.mode == "prefill"
     # Prefill selects in row slices; recompute each slice's tile logits for its differing rows.
     logits = []
+    start = 0
     for selector in indexer.selectors:
-        selector()
-        runtime = selector.binding.runtime
+        rows = selector.output_layout[0][0]
+        end = start + rows
+        binding = dsa_indexer.bind(selector.plan, scratch=planned_scratch(selector.plan.scratch_specs()),
+            q_fp8=scratch.query_fp8[start:end].view(rows, 32, 128),
+            query_weights=scratch.weights[start:end], index_k_cache=indexer.cache.view(indexer.cache.shape[0], -1),
+            page_table=scratch.page_table.expand(actual.shape[0], -1)[start:end],
+            cache_lengths=scratch.pool_lengths[start:end],
+            output_indices=torch.empty((rows, 512), dtype=torch.int32, device=actual.device))
+        dsa_indexer.run(binding)
+        runtime = binding.runtime
         block_k = runtime.prefill_block_k
         tiles = runtime.supertile_k // block_k
         logits.extend((runtime.scratch.get_indexer_contiguous_tile_logits()
                        .reshape(-1, tiles, 32, block_k).permute(0, 2, 1, 3)
-                       .reshape(-1, tiles * block_k)[:selector.output.shape[0]]).clone())
+                       .reshape(-1, tiles * block_k)[:rows]).clone())
+        start = end
     assert len(logits) == actual.shape[0]
     for row in differing.nonzero().flatten().tolist():
         observed, reference = actual[row].tolist(), expected[row].tolist()
@@ -77,7 +88,7 @@ def assert_selection(actual, expected, indexer):
         expected_live = [index for index in reference if index >= 0]
         assert len(live) == len(expected_live) == len(set(live))
         assert observed.count(-1) == reference.count(-1)
-        length = int(indexer.scratch.pool_lengths[row])
+        length = int(scratch.pool_lengths[row])
         assert all(0 <= index < length for index in live)
         changed = sorted(set(live) ^ set(expected_live))
         cutoff = logits[row][expected_live].min()
@@ -120,18 +131,17 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                 mode=mode, session=session, name="mla", workspace=arena)
             # Decode projects and absorbs queries on an auxiliary stream unless overlap is disabled.
             assert (attention.query_chain is not None) is (overlap and mode == "decode")
+            attention.functional(session=session)
             session.tune()
-
-            value_expansion = attention.value_expansion
-            def record_attended(values):
-                # Observe the attention output before serial scratch reuse overwrites it.
-                scratch.attended.copy_(values.transpose(0, 1))
-                return value_expansion(values)
-            attention.value_expansion = record_attended
+            arena.release_preparation()
 
             def forward():
-                attention(source)
-                arena.tensor.fill_(255)
+                _, local = attention.forward(source, metadata)
+                for name in ("query_input", "query_residual", "latent_input", "latent", "query",
+                             "absorbed_query", "attended", "expanded", "output", "visible"):
+                    getattr(scratch, name).copy_(getattr(local, name))
+                for field in fields(scratch.index):
+                    getattr(scratch.index, field.name).copy_(getattr(local.index, field.name))
 
             compiled = compile_forward(forward)
             compiled()
@@ -207,12 +217,19 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                 actual = {key: value.clone() for key, value in stages.items()}
                 actual_pools, actual_physical = scratch.index.pools.clone(), scratch.index.physical.clone()
                 # Attention reduction must use the native selector's candidate order.
-                attention.attention()
-                attention.value_expansion(scratch.attended.transpose(0, 1))
-                attention.projections["o_proj"](scratch.expanded.view(capacity, -1))
+                if attention.sm103_prefill:
+                    attended = attention.attention(scratch.absorbed_query, metadata.positions,
+                        scratch.index.selected_lengths, scratch.index.page_table[0],
+                        metadata.positions.max().reshape(1) + 1, cache=state.cache)
+                else:
+                    attended = attention.attention(scratch.absorbed_query, scratch.index.physical,
+                        scratch.visible, scratch.index.selected_lengths, cache=state.cache)
+                scratch.attended.copy_(attended)
+                scratch.expanded.copy_(attention.value_expansion(attended.transpose(0, 1)).transpose(0, 1))
+                scratch.output.copy_(attention.projections["o_proj"](scratch.expanded.view(capacity, -1)))
                 for key in ("attended", "expanded", "output"):
                     expected[key] = stages[key].clone()
-                assert_selection(actual_pools, expected_pools, attention.indexer)
+                assert_selection(actual_pools, expected_pools, attention.indexer, scratch.index)
                 scratch.index.pools.copy_(actual_pools)
                 if attention.indexer.logical:
                     from ignition.recipes.glm53.dcp import expand_tokens
@@ -220,7 +237,8 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                     expand_tokens(scratch.index.pools, metadata.positions,
                                   scratch.index.physical, scratch.index.selected_lengths)
                 else:
-                    sparse_mla.expand_pooled_topk_to_physical_slots(*attention.indexer.expand_arguments,
+                    sparse_mla.expand_pooled_topk_to_physical_slots(scratch.index.pools, metadata.positions,
+                        metadata.requests, metadata.block_table, scratch.index.physical, scratch.index.selected_lengths,
                         **attention.indexer.expand_options, plan=attention.indexer.expand_plan)
                 torch.testing.assert_close(scratch.index.physical, actual_physical, rtol=0, atol=0)
                 for key, value in actual.items():

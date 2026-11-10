@@ -20,7 +20,7 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
     from ignition.components.recurrent import DeltaMetadata, _commit_convolution
     from ignition.components.state import StateLayout, StateStorage
     from ignition.preparation.triton import prepare_triton
-    from ignition.preparation.scratch import GraphBufferPool
+    from tests.tensor_examples import TensorExamples
 
     device = torch.device("cuda:0")
     torch.manual_seed(241)
@@ -50,7 +50,7 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
     initial = stores[0].backing.clone()
     conv_offset = torch.tensor([layout.region("convolution").offset // 2], device=device, dtype=torch.int64)
     paths = []
-    recovery_buffers = GraphBufferPool(device)
+    recovery_buffers = TensorExamples(device)
     for storage in stores:
         mixed = torch.empty((tokens, channels), device=device, dtype=torch.bfloat16)
         output = torch.empty((tokens, value_channels), device=device, dtype=torch.bfloat16)
@@ -64,7 +64,7 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
         verify = PreparedRecoveredRecurrence(mixed_qkv=mixed, a=projected[:, gate_offset + value_heads:], b=projected[:, gate_offset:gate_offset + value_heads],
             A_log=a_log, dt_bias=bias, state=storage.region("recurrent"), metadata=metadata, output=output,
             records=records[0], key_heads=key_heads, value_heads=value_heads,
-            convolution=None if not paths else operands, buffers=recovery_buffers.cursor())
+            convolution=None if not paths else operands, buffers=recovery_buffers)
         norm = PreparedGatedRMSNorm(output.view(tokens, value_heads, 128), projected[:, channels:gate_offset].view(tokens, value_heads, 128),
             norm_weight, gated.view(tokens, value_heads, 128), metadata.num_tokens, eps=1e-6, round_normalized=True)
         commit = PreparedGDNCommit(storage.backing, {0: storage.region("recurrent")}, records, metadata, counts,

@@ -14,6 +14,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.rotary import apply_cached_rotary, prepare_cached_rotary
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_copy
 
 PATCH_CAPACITIES = (256, 1024, 4096, 16384, 65536)
 FEATURES = 16384
@@ -76,22 +77,13 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, device, *, work=None, buffers=None):
+    def allocate(cls, patches, device):
         def zeros(*shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if buffers is None
-                    else buffers.zeros(shape, torch.bfloat16))
-        work = zeros(patches * 4608) if work is None else work
-        if (work.ndim != 1 or work.numel() < patches * 4608 or not work.is_contiguous()
-                or work.dtype != torch.bfloat16 or work.device != torch.device(device)):
-            raise ValueError("vision workspace requires contiguous BF16 storage for fused QKV")
-        projected = zeros(patches, 1024)
-        q, k, v = zeros(3, patches, 12, 128).unbind(0)
-        def view(rows, width):
-            return work[:rows * width].view(rows, width)
-        # Patch projection, attention output, MLP activation, and spatial merging execute serially.
-        return cls(view(patches, 588), projected, view(patches, 4608), q, k, v, view(patches, 1536), projected,
-            view(patches, 4096), projected, view(patches // 4, 4096), projected.view(patches // 4, 4096),
-            view(patches // 4, HIDDEN))
+            return torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        return cls(zeros(patches, 588), zeros(patches, 1024), zeros(patches, 4608),
+            *(zeros(patches, 12, 128) for _ in range(3)), zeros(patches, 1536), zeros(patches, 1024),
+            zeros(patches, 4096), zeros(patches, 1024), zeros(patches // 4, 4096),
+            zeros(patches // 4, 4096), zeros(patches // 4, HIDDEN))
 
     def rows(self, patches):
         return type(self)(*(getattr(self, name)[:patches // 4 if name in ('merged', 'activated', 'output') else patches]
@@ -101,7 +93,7 @@ class VisionScratch:
 class _Projection(nn.Module):
     def __init__(self, weight, source, output, *, session, name):
         super().__init__()
-        self.operation = UnquantizedProjection(source, weight, output, session=session, name=name)
+        self.operation = UnquantizedProjection(source, weight, output, session=session, name=name).functional(session=session)
 
     def forward(self, source):
         return self.operation(source)
@@ -120,47 +112,37 @@ def _norm(weight, eps=None):
 
 
 class _Attention(nn.Module):
-    def __init__(self, weights, scratch, cu, positions, *, session, workspace, name):
+    def __init__(self, weights, scratch, cu, *, session, workspace, name):
         super().__init__()
         s = scratch
-        self.scratch = scratch
-        self.positions = positions
         self.qkv = _Projection(weights['wqkv.weight'], s.hidden, s.qkv, session=session, name=name + '.qkv')
         self.output = _Projection(weights['wo.weight'], s.attended, s.projected, session=session, name=name + '.output')
         self.attend = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended.view_as(s.query),
-            session=session, workspace=workspace, name=name + '.attention')
+            session=session, workspace=workspace, name=name + '.attention').functional(session=session)
 
     def forward(self, source, *, cu_seqlens, position_embeddings):
-        s = self.scratch
         q, k, v = self.qkv(source).view(-1, 3, 12, 128).unbind(1)
-        apply_cached_rotary(q, k, position_embeddings, self.positions, s.query, s.key, True)
-        s.value.copy_(v)
-        self.attend()
-        return self.output(s.attended)
+        query, key = torch.empty_like(q), torch.empty_like(k)
+        positions = torch.arange(source.shape[0], dtype=torch.int32, device=source.device)
+        apply_cached_rotary(q, k, position_embeddings, positions, query, key, True)
+        attended = self.attend(query, key, v.contiguous(), cu_seqlens)
+        return self.output(attended.flatten(1))
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name, buffers=None):
-        self.scratch, self.inputs = scratch, inputs
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name):
+        self.inputs = inputs
+        self.capacity = scratch.patches.shape[0]
         s, tensors = scratch, weights.tensors
-        n, device = s.patches.shape[0], s.patches.device
-        def zeros(shape, dtype=torch.int32):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.positions = zeros((n, 2), torch.int64)
-        self.interpolation_indices = zeros((n, 4), torch.int64)
-        self.interpolation_weights = zeros((n, 4), torch.float32)
-        self.merge_indices = zeros((n // 4, 4), torch.int64)
-        self.cu = zeros((2,))
-        self.num_patches, self.num_features = zeros((1,)), zeros((1,))
-        self.frequencies = 1. / (10000 ** (torch.arange(0, 128, 4, dtype=torch.float32, device=device) / 128))
-        angles = torch.arange(512, dtype=torch.float32, device=device)[:, None] * self.frequencies
-        self.rotary = torch.view_as_real(torch.polar(torch.ones_like(angles), angles))
-        self.rotary_positions = torch.arange(n, dtype=torch.int32, device=device)
+        device = s.patches.device
+        cu = torch.zeros(2, dtype=torch.int32, device=device)
+        frequencies = 1. / (10000 ** (torch.arange(0, 128, 4, dtype=torch.float32, device=device) / 128))
+        angles = torch.arange(512, dtype=torch.float32, device=device)[:, None] * frequencies
+        self.rotary = persistent_copy(torch.view_as_real(torch.polar(torch.ones_like(angles), angles)))
         prepare_cached_rotary(session)
         self.position_weight = tensors['vision_tower.patch_embed.pos_emb.weight'].reshape(-1, 1024)
         self.patch = UnquantizedProjection(s.patches, tensors['vision_tower.patch_embed.proj.weight'].flatten(1),
-            s.hidden, session=session, name=name + '.patch')
+            s.hidden, session=session, name=name + '.patch').functional(session=session)
         self.blocks = []
         config = SimpleNamespace(hidden_size=1024, num_attention_heads=12, intermediate_size=4096, hidden_act='gelu_pytorch_tanh')
         for layer in range(27):
@@ -169,7 +151,7 @@ class PreparedVision:
             with torch.device('meta'):
                 block = Kimi_K25VisionEncoderLayer(config)
             block.norm1, block.norm2 = _norm(w['norm0.weight']), _norm(w['norm1.weight'])
-            block.attn = _Attention(w, s, self.cu, self.rotary_positions,
+            block.attn = _Attention(w, s, cu,
                 session=session, workspace=workspace, name=f'{name}.{layer}')
             block.mlp.fc1 = _Projection(w['mlp.fc0.weight'], s.hidden, s.mlp_up, session=session, name=f'{name}.{layer}.up')
             # The activation is the only consumer of the up projection's output.
@@ -184,18 +166,17 @@ class PreparedVision:
                                session=session, name=name + '.merge_down')
         self.post_norm = _norm(tensors['mm_projector.post_norm.weight'], 1e-5)
 
-    def rotary_embeddings(self):
-        rotary = self.rotary[self.positions.flip((1,))].transpose(1, 2).flatten(1, 2)
+    def rotary_embeddings(self, positions):
+        rotary = self.rotary[positions.flip((1,))].transpose(1, 2).flatten(1, 2)
         return torch.cat((rotary[..., 0], rotary[..., 1]), dim=-1)
 
-    def __call__(self):
-        s = self.scratch
-        positions = (self.position_weight[self.interpolation_indices].float()
-                     * self.interpolation_weights[:, :, None]).sum(1).to(s.hidden.dtype)
-        hidden = self.patch(s.patches) + positions
-        embeddings = self.rotary_embeddings()
+    def __call__(self, pixels, positions, interpolation_indices, interpolation_weights, merge_indices, cu):
+        learned = (self.position_weight[interpolation_indices].float()
+                   * interpolation_weights[:, :, None]).sum(1).to(pixels.dtype)
+        hidden = self.patch(pixels) + learned
+        embeddings = self.rotary_embeddings(positions)
         for block in self.blocks:
-            hidden = block(hidden, self.cu, position_embeddings=embeddings)
+            hidden = block(hidden, cu, position_embeddings=embeddings)
         hidden = self.norm(hidden)
-        s.merged.copy_(hidden[self.merge_indices].flatten(1))
-        return self.post_norm(self.down(torch.nn.functional.gelu(self.up(s.merged))))
+        merged = hidden[merge_indices].flatten(1)
+        return self.post_norm(self.down(torch.nn.functional.gelu(self.up(merged))))

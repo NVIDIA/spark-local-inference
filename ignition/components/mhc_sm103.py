@@ -29,9 +29,8 @@ SPLITS = 4
 _BLOCK_T = 128
 _BLOCK_K = 64
 _CONFIG = triton.Config({}, num_warps=8, num_stages=3)
-# Calls with more rows than this (prefill) compose FlashInfer's kernels; decode keeps b12x's fused launches.
+# Calls above this row count compose FlashInfer's kernels; decode keeps b12x's fused launches.
 MIN_ROWS = 256
-_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _SPLIT_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
@@ -41,12 +40,13 @@ _HANDLES = itertools.count()
 # that reads its inputs and writes the residual, mixes and normalized input.
 @torch.library.custom_op("flare::sm103_composed_mhc", mutates_args=("residual", "post", "comb", "normalized"))
 def _composed(inputs: list[torch.Tensor], residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
-              normalized: torch.Tensor, handle: int) -> None:
-    _OWNERS[handle].run(*inputs)
+              normalized: torch.Tensor, dot: torch.Tensor, squares: torch.Tensor,
+              collapsed: torch.Tensor, handle: int) -> None:
+    _OWNERS[handle].run(inputs, residual, post, comb, normalized, dot, squares, collapsed)
 
 
 @_composed.register_fake
-def _fake_composed(inputs, residual, post, comb, normalized, handle) -> None:
+def _fake_composed(inputs, residual, post, comb, normalized, dot, squares, collapsed, handle) -> None:
     pass
 
 
@@ -85,11 +85,7 @@ def _split_weights(fn):
 
 
 class ComposedMHC:
-    """Post/pre or pre into ``scratch`` (residual, post, comb, normalized) for one prefill capacity.
-
-    Layers run serially, so every call of one capacity on a device shares its logits, square sums
-    and collapsed input.
-    """
+    """Post/pre or pre with invocation-local outputs and work tensors."""
 
     def __init__(self, operation, weights, scratch, *, rms_eps, hc_eps, sinkhorn_iters, norm_eps):
         from flashinfer.mhc import _mhc_post_impl, _mhc_pre_big_fuse_impl
@@ -100,30 +96,28 @@ class ComposedMHC:
         rows, _, hidden = scratch.residual.shape
         if operation not in ("pre", "post_pre") or weights.fn.shape != (24, 4 * hidden):
             raise ValueError("composed mHC serves pre and post/pre with 24 mixes")
-        self.operation, self.weights, self.scratch = operation, weights, scratch
+        self.operation, self.weights = operation, weights
+        self.rows, self.hidden = rows, hidden
         self.eps = (float(rms_eps), float(hc_eps), int(sinkhorn_iters), float(norm_eps))
         self.high, self.low = _split_weights(weights.fn)
-        key = (scratch.residual.device, rows, hidden)
-        if key not in _SCRATCH:
-            device = scratch.residual.device
-            _SCRATCH[key] = (torch.empty((SPLITS, rows, 24), dtype=torch.float32, device=device),
-                             torch.empty((SPLITS, rows), dtype=torch.float32, device=device),
-                             torch.empty((rows, hidden), dtype=torch.bfloat16, device=device))
-        self.dot, self.squares, self.collapsed = _SCRATCH[key]
-        self.fp32_norm = None
+        device = scratch.residual.device
+        self.norm_program = None
         if weights.norm.dtype == torch.float32:
             from flashinfer.triton.kernels.norm import rms_norm_kernel
             from ignition.preparation.triton import prepare_triton
 
             # FlashInfer's CUDA RMSNorm binds weight pointers with the activation dtype.
-            self.fp32_norm = prepare_triton(rms_norm_kernel,
-                (hidden, rows, self.collapsed, hidden, None, None, 0, weights.norm,
-                 scratch.normalized, hidden, None), (rows, 1, 1),
+            self.norm_program = prepare_triton(rms_norm_kernel,
+                (hidden, rows, torch.empty((rows, hidden), dtype=torch.bfloat16, device=device),
+                 hidden, None, None, 0, weights.norm,
+                 torch.empty((rows, hidden), dtype=torch.bfloat16, device=device), hidden, None), (rows, 1, 1),
                 EPS=norm_eps, BLOCK_SIZE=triton.next_power_of_2(hidden), HAS_IN_SCALE=False,
                 HAS_OUT_SCALE=False, HAS_OUTPUT=True, HAS_RESIDUAL=False, ROUND_BEFORE_WEIGHT=False,
                 num_warps=max(8, min(32, triton.next_power_of_2(hidden) // 256)))
         flat = scratch.residual.view(rows, -1)
-        self.args = (flat, self.high, self.low, self.dot, self.squares, rows)
+        dot = torch.empty((SPLITS, rows, 24), dtype=torch.float32, device=device)
+        squares = torch.empty((SPLITS, rows), dtype=torch.float32, device=device)
+        self.args = (flat, self.high, self.low, dot, squares, rows)
         self.options = {"K": 4 * hidden, "SPLITS": SPLITS, "BLOCK_T": _BLOCK_T, "BLOCK_K": _BLOCK_K}
         self.grid = (triton.cdiv(rows, _BLOCK_T), SPLITS, 1)
         self.compiled = _project.fn.warmup(*self.args, grid=self.grid, num_warps=_CONFIG.num_warps,
@@ -132,23 +126,42 @@ class ComposedMHC:
         _OWNERS[self.handle] = self
 
     def __call__(self, *inputs):
-        s = self.scratch
-        _composed(list(inputs), s.residual, s.post, s.comb, s.normalized, self.handle)
-        return s.normalized
+        residual = inputs[0] if self.operation == "pre" else inputs[1]
+        outputs = (torch.empty_like(residual),
+                   torch.empty((residual.shape[0], 4), dtype=torch.float32, device=residual.device),
+                   torch.empty((residual.shape[0], 4, 4), dtype=torch.float32, device=residual.device),
+                   torch.empty((residual.shape[0], self.hidden), dtype=residual.dtype, device=residual.device))
+        dot = torch.empty((SPLITS, self.rows, 24), dtype=torch.float32, device=residual.device)
+        squares = torch.empty((SPLITS, self.rows), dtype=torch.float32, device=residual.device)
+        collapsed = torch.empty((self.rows, self.hidden), dtype=torch.bfloat16, device=residual.device)
+        _composed(list(inputs), *outputs, dot, squares, collapsed, self.handle)
+        return outputs
 
-    def run(self, *inputs):
-        s, w = self.scratch, self.weights
+    def functional(self):
+        self.args = None
+        if self.norm_program is not None:
+            self.norm_program.args = None
+        return self
+
+    def run(self, inputs, residual, post, comb, normalized, dot, squares, collapsed):
+        w = self.weights
         rms_eps, hc_eps, iterations, norm_eps = self.eps
         if self.operation == "post_pre":
-            source, residual, post, comb = inputs
-            self.mix(s.residual, source, residual, post, comb)
+            source, source_residual, source_post, source_comb = inputs
+            self.mix(residual, source, source_residual, source_post, source_comb)
         else:
-            s.residual.copy_(inputs[0])
-        self.compiled[self.grid](*self.args)
-        self.fuse(s.post, s.comb, self.collapsed, self.dot, self.squares, s.residual, w.scale, w.base,
-                               s.residual.shape[1] * s.residual.shape[2], rms_eps, hc_eps, hc_eps, 2.0, iterations,
+            residual.copy_(inputs[0])
+        flat = residual.view(self.rows, -1)
+        self.compiled[self.grid](flat, self.high, self.low, dot, squares, self.rows)
+        self.fuse(post, comb, collapsed, dot, squares, residual, w.scale, w.base,
+                               residual.shape[1] * residual.shape[2], rms_eps, hc_eps, hc_eps, 2.0, iterations,
                                SPLITS, 0)
-        if self.fp32_norm is None:
-            self.norm(self.collapsed, w.norm, norm_eps, out=s.normalized)
+        if self.norm_program is None:
+            self.norm(collapsed, w.norm, norm_eps, out=normalized)
         else:
-            self.fp32_norm()
+            from ignition.preparation.triton import launch_triton
+
+            args = (self.hidden, self.rows, collapsed, self.hidden, None, None, 0,
+                    w.norm, normalized, self.hidden, None)
+            launch_triton(self.norm_program.kernel, self.norm_program.compiled, args,
+                          self.norm_program.grid, **self.norm_program.options)

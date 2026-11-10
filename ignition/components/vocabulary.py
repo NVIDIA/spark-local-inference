@@ -67,8 +67,10 @@ class PreparedVocabularyProjection:
         self.output = output
         self.padded = columns != output.shape[1]
 
-    def functional(self, *, session):
+    def functional(self, *, session, dynamic_indices=False):
         """Return local or gathered logits without retaining projection destinations."""
+        if dynamic_indices:
+            self.row_indices = None
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.projection.functional(session=session)
@@ -78,27 +80,28 @@ class PreparedVocabularyProjection:
                 self.gathered = None
         return self
 
-    def __call__(self, source):
+    def __call__(self, source, *, row_indices=None):
+        row_indices = self.row_indices if row_indices is None else row_indices
         if self.output is None:
             projected = self.projection(source)
             if self.local_only:
-                return projected if self.row_indices is None else projected[self.row_indices]
+                return projected if row_indices is None else projected[row_indices]
             gathered = self.gather(projected)
-            if self.row_indices is None and not self.padded:
+            if row_indices is None and not self.padded:
                 return gathered
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-            selected = gathered[:, :shape[1]] if self.row_indices is None else gathered[self.row_indices, :shape[1]]
+            selected = gathered[:, :shape[1]] if row_indices is None else gathered[row_indices, :shape[1]]
             return output.copy_(selected)
         if self.local_only:
             projected = self.projection(source)
-            if self.row_indices is not None:
-                self.output.copy_(projected[self.row_indices])
+            if row_indices is not None:
+                self.output.copy_(projected[row_indices])
             return self.output
         gathered = self.gather(self.projection(source))
-        if self.row_indices is not None:
+        if row_indices is not None:
             # Indexed reads materialize before the overlapping destination write.
-            self.output.copy_(gathered[self.row_indices, :self.output.shape[1]])
+            self.output.copy_(gathered[row_indices, :self.output.shape[1]])
         elif self.padded:
             self.output.copy_(gathered[:, :self.output.shape[1]])
         return self.output

@@ -47,13 +47,13 @@ def _source(cls):
 def owner_claims(prepared):
     """Walk retained fields and function closures, never properties or module globals.
 
-    Tensor claims cover elements rather than entire backing storages. Pool claims
-    cover their full allocations, including unused chunk capacity. Object identity
+    Tensor claims cover elements rather than entire backing storages. Arena claims
+    cover their full allocations, including unused capacity. Object identity
     bounds traversal; overlapping tensor elements use their first owning field.
     """
     import torch
     from .aot import BoundForward
-    from .scratch import GraphBufferPool, ScratchArena
+    from .scratch import ScratchArena
 
     seen, covered, result = set(), [], []
     pending = deque()
@@ -92,14 +92,11 @@ def owner_claims(prepared):
                                   for left, right in subtract_ranges([(start, end)], overlaps))
                     covered[first:stop] = merge_ranges([*overlaps, (start, end)])
             continue
-        if isinstance(value, (ScratchArena, GraphBufferPool)):
-            category = "Operator scratch" if isinstance(value, ScratchArena) else "Graph scratch pools"
-            tensors = [value.tensor] if isinstance(value, ScratchArena) else [
-                chunk for chunks in value.chunks.values() for chunk in chunks]
-            result.extend(Claim(t.data_ptr(), t.data_ptr() + t.nbytes, category,
-                                f"{path}<{type(value).__name__}>", _source(type(value)), 80)
-                          for t in tensors if t.nbytes)
-            # Chunk tensors would hide the fields using their individual views.
+        if isinstance(value, ScratchArena):
+            tensor = value.tensor
+            if tensor.nbytes:
+                result.append(Claim(tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes,
+                    "Operator scratch", f"{path}<ScratchArena>", _source(type(value)), 80))
             continue
         if isinstance(value, Mapping):
             enqueue((child, f"{path}[{key!r}]", source) for key, child in value.items())
@@ -316,8 +313,8 @@ def format_inventory(reports):
         lines.append("Shared system usage includes host allocations and other processes; it is not process VRAM usage.")
     lines.append("Graph executable overhead, resident kernel code, untracked driver/library allocations, and other "
                  "processes are included in device usage but cannot be separated by this snapshot.")
-    lines.append("Shared scratch lists representative tensor owners; source lines identify owning classes or closures.")
-    lines.append("Scratch totals count reserved storage, including chunk padding; they do not measure a peak of live values.")
+    lines.append("Shared storage lists representative tensor owners; source lines identify owning classes or closures.")
+    lines.append("Temporary storage totals include allocator alignment and reservation; they do not measure the exact live-memory peak.")
     return "\n".join(lines)
 
 

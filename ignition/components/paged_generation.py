@@ -24,11 +24,8 @@ class PreparedGeneration:
         name,
         workspace,
         context_factory=None,
-        buffers=None,
-        local_metadata=False,
     ):
         self.decoder, self.batch = decoder, batch
-        self.local_metadata = local_metadata
         self.validation = PreparedAllReduce(
             batch.validation_input,
             batch.validation_sum,
@@ -66,53 +63,34 @@ class PreparedGeneration:
                 name=name + ".context",
                 workspace=workspace,
             )
-        release_outputs = getattr(decoder, "release_outputs", None)
-        if release_outputs is not None:
-            release_outputs()
-        if local_metadata:
-            self.validation.functional(session=session)
-            if self.context is not None:
-                self.context.functional()
-            self.batch.functional()
+        decoder.release_outputs()
+        self.validation.functional(session=session)
+        if self.context is not None:
+            self.context.functional()
+        self.batch.functional()
 
     def __call__(self):
         self._run()
 
     def observe(self):
-        """Execute the forward and return its packed metadata for untimed checks."""
-        if not self.local_metadata:
-            raise RuntimeError("forward observations require call-local metadata")
+        """Return forward-local outputs and packed metadata for diagnostic consumers."""
         return self._run(observe=True)
 
     def _run(self, *, observe=False):
-        if self.local_metadata:
-            validation, present = self.batch.validate()
-            metadata = self.batch.begin(self.validation(validation), present=present)
-            result = self.decoder(metadata)
-        else:
-            self.batch.begin(self.validation(self.batch.validate()))
-            metadata = self.batch.metadata
-            result = self.decoder()
-        if result is None:
-            hidden, logits, auxiliary = self.decoder.scratch.hidden, self.decoder.scratch.logits, self.decoder.auxiliary
-        else:
-            hidden, logits, auxiliary = result[:3]
+        validation, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation), present=present)
+        hidden, logits, auxiliary, _ = self.decoder(metadata)
         save_hidden(
             hidden,
             self.decoder.pool.last_hidden,
             metadata.state_rows,
-            metadata.lengths > 0 if self.local_metadata else self.batch.token_state.active,
+            metadata.lengths > 0,
         )
-        if self.local_metadata:
-            self.batch.finish(metadata)
-        else:
-            self.batch.finish()
+        self.batch.finish(metadata)
         self.completion.run(logits)
         if self.context is not None:
-            if self.local_metadata:
-                self.context(auxiliary, metadata.lengths, metadata)
-            else:
-                self.context(auxiliary, metadata.lengths)
+            self.context(auxiliary, metadata.lengths, metadata)
         if observe:
-            return {"target." + name: getattr(metadata, name) for name in
-                    ("live_counts", "starts", "lengths", "query_start_loc")}
+            return {"target.hidden": hidden, "target.logits": logits,
+                    **{"target." + name: getattr(metadata, name) for name in
+                       ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}}

@@ -15,6 +15,7 @@ from transformers.models.step3p7.modeling_step3p7 import Step3p7VisionEncoderLay
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.preparation.persistent import persistent_copy
 
 PATCH_CAPACITIES = (4096, 8192, 16384, 32768, 65536)
 FEATURES = PATCH_CAPACITIES[-1] // 16
@@ -71,26 +72,21 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, shard, device, *, buffers=None):
-        def zeros(cursor, *shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if cursor is None
-                    else cursor.zeros(shape, torch.bfloat16))
+    def allocate(cls, patches, shard, device):
+        def zeros(*shape):
+            return torch.zeros(shape, dtype=torch.bfloat16, device=device)
         world = shard.world_size
         heads = 16 // world
-        pixels = zeros(buffers, patches, 588)
-        hidden, normalized, projected, reduced = (zeros(buffers, patches, 1536) for _ in range(4))
-        stages = [buffers.fork() for _ in range(3)] if buffers is not None else [None] * 3
-        attention, feedforward, merger = stages
-        mlp_up, activated = (zeros(feedforward, patches, 8960 // world) for _ in range(2))
-        qkv = zeros(attention, patches, 3 * heads * 96)
-        query, key, value, attended = (zeros(attention, patches, heads, 96) for _ in range(4))
-        first_input = zeros(merger, patches // 4, 1536 * 9)
-        first_output = zeros(merger, patches // 4, 3072 // world)
-        second_input = zeros(merger, patches // 16, 3072 // world * 9)
-        second_output, second_reduced = (zeros(merger, patches // 16, 6144) for _ in range(2))
-        output = zeros(merger, patches // 16, 4096 // world)
-        if buffers is not None:
-            buffers.join(*stages)
+        pixels = zeros(patches, 588)
+        hidden, normalized, projected, reduced = (zeros(patches, 1536) for _ in range(4))
+        mlp_up, activated = (zeros(patches, 8960 // world) for _ in range(2))
+        qkv = zeros(patches, 3 * heads * 96)
+        query, key, value, attended = (zeros(patches, heads, 96) for _ in range(4))
+        first_input = zeros(patches // 4, 1536 * 9)
+        first_output = zeros(patches // 4, 3072 // world)
+        second_input = zeros(patches // 16, 3072 // world * 9)
+        second_output, second_reduced = (zeros(patches // 16, 6144) for _ in range(2))
+        output = zeros(patches // 16, 4096 // world)
         return cls(pixels, hidden, normalized, qkv, query, key, value, attended, projected,
                    reduced, mlp_up, activated, first_input, first_output, second_input,
                    second_output, second_reduced, output)
@@ -118,26 +114,25 @@ class VisionAttention(nn.Module):
     def __init__(self, weights, scratch, cu, *, runtime, coordinator, session, workspace, name):
         super().__init__()
         s = self.scratch = scratch
+        self.query_shape = tuple(s.query.shape)
         self.qkv = UnquantizedProjection(s.normalized, weights["qkv"][0], s.qkv, bias=weights["qkv"][1],
-                                         session=session, name=name + ".qkv")
+                                         session=session, name=name + ".qkv").functional(session=session)
         self.attention = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended, max_seqlen=2704,
-                                                 session=session, workspace=workspace, name=name + ".attention")
+                                                 session=session, workspace=workspace, name=name + ".attention").functional(session=session)
         self.output = UnquantizedProjection(s.attended.flatten(1), weights["output"][0], s.projected,
-                                            session=session, name=name + ".output")
+                                            session=session, name=name + ".output").functional(session=session)
         self.reduction = PreparedAllReduce(s.projected, s.reduced, runtime=runtime, coordinator=coordinator,
-                                           session=session, name=name + ".reduce")
+                                           session=session, name=name + ".reduce").functional(session=session)
         self.bias = weights["output"][1]
 
-    def forward(self, hidden_states, *, position_embeddings, **kwargs):
-        s = self.scratch
-        s.normalized.copy_(hidden_states)
-        q, k, v = self.qkv(s.normalized).chunk(3, -1)
+    def forward(self, hidden_states, *, position_embeddings, cu, **kwargs):
+        q, k, v = self.qkv(hidden_states).chunk(3, -1)
         cosine, sine = position_embeddings
-        s.query.copy_(rotate(q.view_as(s.query), cosine, sine))
-        s.key.copy_(rotate(k.view_as(s.key), cosine, sine))
-        s.value.copy_(v.view_as(s.value))
-        self.attention()
-        return self.reduction(self.output(s.attended.flatten(1))) + self.bias, None
+        query = rotate(q.view(self.query_shape), cosine, sine).contiguous()
+        key = rotate(k.view(self.query_shape), cosine, sine).contiguous()
+        value = v.view(self.query_shape).contiguous()
+        attended = self.attention(query, key, value, cu)
+        return self.reduction(self.output(attended.flatten(1))) + self.bias, None
 
 
 class VisionMLP(nn.Module):
@@ -145,17 +140,15 @@ class VisionMLP(nn.Module):
         super().__init__()
         s = self.scratch = scratch
         self.up = UnquantizedProjection(s.normalized, weights["up"][0], s.mlp_up, bias=weights["up"][1],
-                                        session=session, name=name + ".up")
-        self.down = UnquantizedProjection(s.activated, weights["down"][0], s.projected, session=session, name=name + ".down")
+                                        session=session, name=name + ".up").functional(session=session)
+        self.down = UnquantizedProjection(s.activated, weights["down"][0], s.projected, session=session, name=name + ".down").functional(session=session)
         self.reduction = PreparedAllReduce(s.projected, s.reduced, runtime=runtime, coordinator=coordinator,
-                                           session=session, name=name + ".reduce")
+                                           session=session, name=name + ".reduce").functional(session=session)
         self.bias, self.activation = weights["down"][1], ACT2FN["quick_gelu"]
 
     def forward(self, hidden_states):
-        s = self.scratch
-        s.normalized.copy_(hidden_states)
-        s.activated.copy_(self.activation(self.up(s.normalized)))
-        return self.reduction(self.down(s.activated)) + self.bias
+        activated = self.activation(self.up(hidden_states))
+        return self.reduction(self.down(activated)) + self.bias
 
 
 @triton.jit
@@ -174,12 +167,12 @@ def neighborhood(source, indices, output):
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, runtime, coordinator, session, workspace, name, buffers=None):
+    def __init__(self, weights, scratch, inputs, *, runtime, coordinator, session, workspace, name):
         self.weights, self.scratch, self.inputs = weights, scratch, inputs
         s = scratch
         n, device = s.patches.shape[0], s.patches.device
         def zeros(shape, dtype=torch.int32):
-            return torch.zeros(shape, dtype=dtype, device=device) if buffers is None else buffers.zeros(shape, dtype)
+            return torch.zeros(shape, dtype=dtype, device=device)
         self.positions = zeros((n, 2), torch.int64)
         self.interpolation_indices = zeros((n, 4), torch.int64)
         self.interpolation_weights = zeros((n, 4), torch.float32)
@@ -187,8 +180,8 @@ class PreparedVision:
         self.second_indices = zeros((n // 16, 9))
         self.cu = zeros((MAX_VIEWS + 1,))
         self.num_patches, self.num_features = zeros((1,)), zeros((1,))
-        self.inverse = 10000 ** (-torch.arange(0, 48, 2, dtype=torch.float32, device=device) / 48)
-        self.patch = UnquantizedProjection(s.patches, weights.patch, s.hidden, session=session, name=name + ".patch")
+        self.inverse = persistent_copy(10000 ** (-torch.arange(0, 48, 2, dtype=torch.float32, device=device) / 48))
+        self.patch = UnquantizedProjection(s.patches, weights.patch, s.hidden, session=session, name=name + ".patch").functional(session=session)
         self.norm = layer_norm(weights.norm)
         self.blocks = []
         common = {"runtime": runtime, "coordinator": coordinator, "session": session}
@@ -201,29 +194,50 @@ class PreparedVision:
             block.mlp = VisionMLP(w, s, name=f"{name}.{i}.mlp", **common)
             self.blocks.append(block)
         self.first = UnquantizedProjection(s.first_input, weights.first[0], s.first_output, bias=weights.first[1],
-                                           session=session, name=name + ".downsample1")
+                                           session=session, name=name + ".downsample1").functional(session=session)
         self.second = UnquantizedProjection(s.second_input, weights.second[0], s.second_output,
-                                            session=session, name=name + ".downsample2")
-        self.reduce_second = PreparedAllReduce(s.second_output, s.second_reduced, name=name + ".downsample_reduce", **common)
+                                            session=session, name=name + ".downsample2").functional(session=session)
+        self.reduce_second = PreparedAllReduce(s.second_output, s.second_reduced, name=name + ".downsample_reduce", **common).functional(session=session)
         self.projector = UnquantizedProjection(s.second_reduced, weights.projector, s.output,
-                                               session=session, name=name + ".projector")
+                                               session=session, name=name + ".projector").functional(session=session)
 
-    def __call__(self):
-        s, w = self.scratch, self.weights
-        self.patch(s.patches)
-        position = (w.position[self.interpolation_indices].float() * self.interpolation_weights[..., None]).sum(1).bfloat16()
-        hidden = self.norm(s.hidden + position)
-        angles = (self.positions.flip(-1).float()[..., None] * self.inverse).repeat_interleave(2, -1).flatten(1).bfloat16()[:, None]
+        self.input_layout = {field: (tuple(value.shape), value.dtype) for field in (
+            "positions", "interpolation_indices", "interpolation_weights", "first_indices", "second_indices",
+            "cu", "num_patches", "num_features") if (value := getattr(self, field)) is not None}
+        self.input_layout["patches"] = (tuple(s.patches.shape), s.patches.dtype)
+
+    def allocate_inputs(self):
+        return {name: torch.empty(shape, dtype=dtype, device=self.inputs.vision_slot.device)
+                for name, (shape, dtype) in self.input_layout.items()}
+
+    def __call__(self, inputs):
+        w = self.weights
+        projected = self.patch(inputs["patches"])
+        position = (w.position[inputs["interpolation_indices"]].float()
+                    * inputs["interpolation_weights"][..., None]).sum(1).bfloat16()
+        hidden = self.norm(projected + position)
+        angles = (inputs["positions"].flip(-1).float()[..., None]
+                  * self.inverse).repeat_interleave(2, -1).flatten(1).bfloat16()[:, None]
         embeddings = angles.cos(), angles.sin()
         for block in self.blocks:
-            hidden = block(hidden, position_embeddings=embeddings)
-        s.hidden.copy_(hidden)
-        neighborhood(s.hidden, self.first_indices, s.first_input)
-        self.first(s.first_input)
-        neighborhood(s.first_output, self.second_indices, s.second_input)
-        self.reduce_second(self.second(s.second_input)).add_(w.second[1])
-        return self.projector(s.second_reduced)
+            hidden = block(hidden, position_embeddings=embeddings, cu=inputs["cu"])
+        first_input = torch.empty((inputs["first_indices"].shape[0], hidden.shape[1] * 9),
+                                  dtype=hidden.dtype, device=hidden.device)
+        neighborhood(hidden, inputs["first_indices"], first_input)
+        first = self.first(first_input)
+        second_input = torch.empty((inputs["second_indices"].shape[0], first.shape[1] * 9),
+                                   dtype=first.dtype, device=first.device)
+        neighborhood(first, inputs["second_indices"], second_input)
+        second = self.reduce_second(self.second(second_input)).add_(w.second[1])
+        return self.projector(second)
+
+    def release_outputs(self):
+        self.scratch = None
+        for name in self.input_layout:
+            if name != "patches":
+                setattr(self, name, None)
+        for block in self.blocks:
+            block.self_attn.scratch = block.mlp.scratch = None
 
     def scratch_tensors(self):
-        return (self.positions, self.interpolation_indices, self.interpolation_weights, self.first_indices,
-                self.second_indices, self.cu, self.num_patches, self.num_features)
+        return ()

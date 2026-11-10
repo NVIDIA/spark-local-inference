@@ -9,13 +9,12 @@ import pytest
 import torch
 
 from ignition.components import collectives, paged_resume, vocabulary
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize("quantized", [False, True])
-def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, pooled, quantized):
+def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, quantized):
     from b12x.comm import pcie
 
     observed = {}
@@ -33,9 +32,9 @@ def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, pool
             return self
 
         def validate(self):
-            return self.validation_input
+            return self.validation_input, torch.ones(1, dtype=torch.bool)
 
-        def gather(self):
+        def gather(self, totals, *, present):
             return self.source.clone()
 
     class Projection:
@@ -134,7 +133,6 @@ def test_resume_projection_matches_gather_byte_geometry(monkeypatch, dtype, pool
         coordinator=None,
         session=None,
         name="resume",
-        buffers=GraphBufferPool("cpu").cursor() if pooled else None,
         workspace=arena,
         **options,
     )

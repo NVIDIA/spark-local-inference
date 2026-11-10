@@ -65,6 +65,14 @@ class GraphSignature:
                 raise ValueError("mixed graphs require a prompt capacity, at least two rows, and an explicit decode mode")
             if "prefill_row" not in self.inputs:
                 raise ValueError("mixed graphs require the prefill_row input")
+            if self.speculation_enabled:
+                depth = self.token_capacity - 1 if self.draft_tokens is None else self.draft_tokens
+                if (type(depth) is not int or not 0 <= depth < (1 << 31) - 1
+                        or (self.token_capacity == 1 and depth != 0)):
+                    raise ValueError("speculative mixed graphs require nonnegative Int32 draft depth and width-one graphs require zero")
+                object.__setattr__(self, "draft_tokens", depth)
+            elif self.draft_tokens is not None:
+                raise ValueError("draft depth requires a speculation-enabled graph")
         elif self.prefill_capacity:
             raise ValueError("only mixed graphs declare a separate prefill capacity")
         if (type(self.packed_token_capacity) is not int or self.packed_token_capacity < 0
@@ -83,8 +91,9 @@ class GraphSignature:
             object.__setattr__(self, "packed_token_capacity", packed)
             if "query_lengths" in self.inputs and "speculative_prefix_limits" in self.inputs:
                 raise ValueError("speculative rounds cannot bind both query lengths and prefix limits")
-        elif self.draft_tokens is not None:
-            raise ValueError("explicit draft depth belongs to speculative rounds")
+        elif self.draft_tokens is not None and not (
+                self.kind == "mixed" and self.speculation_enabled is True):
+            raise ValueError("draft depth requires a speculative graph")
         if (type(self.confidence_width) is not int or self.confidence_width < 0
                 or (self.confidence_width and (self.kind != "speculative"
                     or self.confidence_width != self.draft_tokens))):
@@ -214,7 +223,9 @@ class PreparedExecution(PreparedGraphBundle):
                 offsets[name] = (cursor, nbytes)
                 cursor += nbytes
         graphs = []
-        speculative = any(signature.kind == "speculative" for signature in self.signatures.values())
+        speculative = any(signature.kind == "speculative"
+                          or signature.kind == "mixed" and signature.speculation_enabled is True
+                          for signature in self.signatures.values())
         graph_handles = dict(zip(self.graphs, handles, strict=True))
         for name in self.serving_graphs:
             handle = graph_handles[name]

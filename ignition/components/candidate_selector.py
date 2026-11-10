@@ -36,7 +36,7 @@ class PreparedCandidateSelector:
     def prepare(self, hidden):
         self.projection(hidden.flatten(0, -2))
 
-    def prepare_shortlists(self, logits):
+    def prepare_shortlists(self, logits, *, features=None):
         if self.functional_mode:
             return logits.topk(self.top_k, dim=-1, sorted=False)
         unary, ids = logits.topk(self.top_k, dim=-1, sorted=False)

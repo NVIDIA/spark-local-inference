@@ -14,6 +14,7 @@ from b12x.gemm import bf16_gemv, blockscaled
 from b12x.preparation import PreparationSession, PreparedCall
 
 from ignition.components import sm103_projection
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.fixtures import bf16_gemv as bf16_fixtures
 from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
 from ignition.preparation.fixtures.projection import input_factory
@@ -98,9 +99,29 @@ class BatchedUnquantizedProjection:
         record_numeric_tensor(weight)
         self.output = output
 
-    def __call__(self, source):
-        _bmm_out(source, self.weight, self.output)
-        return self.output
+    def functional(self, *, session):
+        """Allocate each batched result with the prepared output layout."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("batched output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        _bmm_out(source, self.weight, output)
+        return output
 
 
 @torch.library.custom_op("flare::bmm_out", mutates_args=("out",))
@@ -174,7 +195,7 @@ class UnquantizedProjection:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.dense:
-            torch.ops.flare.sm103_dense_out(source, self.weight, output, self.plan.handle)
+            sm103_projection.bf16_out(source, self.weight, output, self.plan.handle)
             return output
         return bf16_gemv.mm(source, self.weight, out=output, plan=self.plan, bias=self.bias)
 
@@ -197,9 +218,14 @@ class QuantizedProjection:
         rhs_prefetch_ready: bool = False,
         allow_bf16_atomic_reduction: bool | None = None,
         buffers=None,
+        examples=None,
+        example_role=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight, _validate_bias
+
+        if examples is not None and (not isinstance(example_role, str) or not example_role):
+            raise ValueError("shared projection declarations require an explicit operand role")
 
         # Address-dependent bias checks run before metadata-only forward compilation.
         _validate_bias(bias, out_features=weight.out_features, out_dtype=output.dtype, device=source.device)
@@ -224,6 +250,7 @@ class QuantizedProjection:
         self.activation_mode = activation_mode
         self.bias = bias
         self.workspace = workspace
+        self.preparation_arena = workspace if isinstance(workspace, ScratchArena) else None
         self.encoded = self.quantizer_plan = None
         self.encoded_layout = None
         self.sm103 = sm103_projection.is_sm103(source.device)
@@ -244,14 +271,17 @@ class QuantizedProjection:
                                  " BF16 output, and caller-owned scratch")
             self.activation_mode = "quantized"
             rows, columns = source.shape
-            def allocate(shape, dtype):
+            def allocate(role, shape, dtype):
+                if examples is not None:
+                    return declaration_tensor(examples, example_role + "." + role, shape, dtype, source.device)
                 return (torch.zeros(shape, dtype=dtype, device=source.device) if buffers is None
                         else buffers.zeros(shape, dtype))
 
             values_shape, row_shape, mma_shape = mxfp8.dense_rows_storage_shapes(rows, columns)
             if encoded is None:
-                self.encoded_bases = (allocate(values_shape, torch.float8_e4m3fn),
-                                      allocate(row_shape, torch.uint8), allocate(mma_shape, torch.uint8))
+                self.encoded_bases = (allocate("values", values_shape, torch.float8_e4m3fn),
+                                      allocate("scale_rows", row_shape, torch.uint8),
+                                      allocate("scale_mma", mma_shape, torch.uint8))
                 self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
                 self.quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
                     source, self.encoded.values, self.encoded.scale_rows, self.encoded.scale_mma,
@@ -401,12 +431,13 @@ class QuantizedProjection:
             if self.encoded is not None:
                 self.encoded_layout = tuple((tuple(base.shape), base.dtype) for base in self.encoded_bases)
                 self.encoded = self.encoded_bases = None
-            register_finalizer(session, self._finalize_functional)
+            register_finalizer(session, self._finalize_functional, workspace=self.preparation_arena)
         return self
 
     def _finalize_functional(self):
         self.workspace_nbytes = self.plan.memory_requirements().scratch_nbytes
         self.workspace = None
+        self.preparation_arena = None
 
     def __call__(self, source: torch.Tensor, *, encoded_bases=None) -> torch.Tensor:
         output, workspace = self.output, self.workspace
@@ -512,17 +543,37 @@ class BatchedQuantizedProjection:
                     run=lambda: state.run(rows_in, weight, rows_out, b_major=major, sf_axis=major))),))
             self.plans.append(plan)
 
-    def __call__(self, source):
+    def functional(self, *, session):
+        """Allocate each batched result with the prepared output layout."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
         from b12x import gemm
 
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("batched output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.expanded is not None:
-            torch.ops.flare.sm103_bmm_out(source, self.expanded, self.output)
-            return self.output
+            torch.ops.flare.sm103_bmm_out(source, self.expanded, output)
+            return output
         for (start, end), plan in zip(self.slices, self.plans, strict=True):
-            gemm.bmm(source[:, start:end], self.weight, self.output[:, start:end], plan=plan,
+            gemm.bmm(source[:, start:end], self.weight, output[:, start:end], plan=plan,
                 a_dtype="bfloat16", b_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu",
                 c_dtype="bfloat16", sf_vec_size=32, b_major=self.major, sf_axis=self.major)
-        return self.output
+        return output
 
 
 # cuBLAS writes strided-batched results straight into the caller's per-head views; traced copies would

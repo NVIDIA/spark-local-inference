@@ -6,28 +6,30 @@
 
 import torch
 from b12x.sequence import gdn_decode, kda_prefill, short_conv
+from b12x.sequence.gdn_decode._kernels import _gdn_decode_op as kda_decode_out
+from b12x.sequence.kda_prefill._ops import _run as kda_prefill_out
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
-from ignition.components.recurrent import prepare_sequence_binding
+from ignition.components.recurrent import prepare_sequence_binding, run_short_conv
 from ignition.components.kda_speculation import _record, register_recording
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import register_finalizer
 
 from .projections import prepare_projection
 
 
 class PreparedKDA:
-    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
-                 allocator=None):
+    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, records=None, examples=None):
         mode = "decode" if mode == "verify" else mode
-        self.records, self.state, self.metadata = records, state, metadata
+        self.state, self.weights = state, weights
+        self.recording = records is not None
+        self.tokens, self.hidden, self.eps = source.shape[0], source.shape[1], eps
         tokens, hidden = source.shape
         heads, width = state.recurrent.shape[1], state.recurrent.shape[1] * 128
         device = source.device
 
         def buffer(key, channels):
-            if key not in buffers or buffers[key].shape[0] < tokens:
-                buffers[key] = (torch.zeros((tokens, channels), dtype=torch.bfloat16, device=device) if allocator is None
-                                else allocator.zeros((tokens, channels), torch.bfloat16))
-            return buffers[key][:tokens]
+            return declaration_tensor(examples, "kda." + key, (tokens, channels), torch.bfloat16, device)
 
         self.forget = buffer("forget_input", 128)
         raw_g = buffer("raw_g", width)
@@ -50,6 +52,7 @@ class PreparedKDA:
             max_tokens=tokens, max_seqs=sequences, max_state_slots=state.convolution.shape[0],
             max_speculative_tokens=state.convolution.shape[-1] - 3)
         plan = short_conv.plan(caps, invocation=short_conv.invocation_from_tensors(**conv_args))
+        self.conv_plan = plan
         prepare_sequence_binding(plan, conv_args, session=session, name=name + ".conv", mode=mode,
             public_bind=short_conv.bind, bind_plan=True, workspace=workspace,
             set_binding=lambda binding: setattr(self, "convolution", binding))
@@ -70,9 +73,6 @@ class PreparedKDA:
                 state_indices=metadata.state_indices)
             if records is not None:
                 args.update(correction_cache=records[0], kg_cache=records[1])
-                self.handle = register_recording(self)
-                self.reads = [mixed, raw_g, beta, gate, recurrent, metadata.query_start_loc,
-                              metadata.state_indices, metadata.num_seqs, metadata.num_tokens]
             plan = gdn_decode.plan(caps, invocation=gdn_decode.invocation_from_tensors(caps, **args))
             bind, method = gdn_decode.bind_kda, "bind_kda"
         else:
@@ -90,19 +90,63 @@ class PreparedKDA:
         prepare_sequence_binding(plan, args, session=session, name=name + ".recurrence", mode=mode,
             public_bind=bind, bind_method=method, workspace=workspace, run_options=self.options,
             set_binding=lambda binding: setattr(self, "recurrence", binding))
-        self.gated = gated
+        self.recurrent_shape = tuple(recurrent.shape)
+        self.width, self.heads, self.columns = width, heads, columns
+        self.norm.functional(dynamic_live=True) if mode != "decode" else None
+        for projection in self.projections.values():
+            projection.functional(session=session)
+        self.handle = register_recording(self) if self.recording else None
 
-    def __call__(self, source):
-        p = self.projections
-        p["input"](source)
-        self.forget.copy_(self.forget_source)
-        p["forget"](self.forget)
-        short_conv.run(self.convolution)
-        if self.records is not None:
-            _record(self.reads, self.gated, *self.records, self.handle)
-        elif self.mode == "decode":
-            gdn_decode.run_kda(self.recurrence, **self.options)
+        def release():
+            self.scratch_bytes = sum(spec.nbytes for spec in self.plan.scratch_specs())
+            self.convolution = self.recurrence = None
+            self.forget = self.forget_source = self.input = None
+        register_finalizer(session, release, workspace=workspace)
+
+    def __call__(self, source, metadata, *, records=None):
+        m, w = metadata, self.weights
+        tokens, heads, width = source.shape[0], self.heads, self.width
+        projected = self.projections["input"](source)
+        qkv, forget_source, gate, beta, _ = projected.split(
+            (3 * width, 128, width, heads, self.columns - 4 * width - 128 - heads), dim=-1)
+        raw_g = self.projections["forget"](forget_source.contiguous())
+        mixed = torch.empty((tokens, 3 * width), dtype=source.dtype, device=source.device)
+        conv_scratch = torch.empty(sum(spec.nbytes for spec in self.conv_plan.scratch_specs()), dtype=torch.uint8, device=source.device)
+        run_short_conv(self.conv_plan, scratch=conv_scratch, x=qkv, conv_weight=w["convolution"],
+            query_start_loc=m.query_start_loc, state_slot_ids=m.convolution_slots, state_is_fresh=m.fresh,
+            num_accepted_tokens=m.accepted_tokens, num_seqs=m.num_seqs, num_tokens=m.num_tokens,
+            conv_state=self.state.convolution, out=mixed)
+        recurrent = self.state.recurrent[:self.recurrent_shape[0]]
+        output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+        raw_g = raw_g.view(tokens, heads, 128)
+        if self.mode == "decode":
+            z = gate.view(tokens, heads, 128)
+            reads = [mixed, raw_g, beta, z, w["A_log"], w["dt_bias"].view(heads, 128), w["norm"],
+                     m.query_start_loc, m.accepted_tokens, m.state_indices, m.num_seqs, m.num_tokens]
+            if self.recording:
+                scratch = torch.empty(self.scratch_bytes, dtype=torch.uint8, device=source.device)
+                _record(reads, recurrent, output, *records, scratch, self.handle)
+            else:
+                kda_decode_out(*reads[:7], recurrent, *reads[7:], output,
+                               self.eps, 128 ** -.5, -5.0, self.plan.handle)
+            gated = output
         else:
-            kda_prefill.run(self.recurrence, **self.options)
-            self.norm()
-        return p["output"](self.gated)
+            q, k, v = (x.view(tokens, heads, 128) for x in mixed.split(width, dim=-1))
+            scratch = torch.empty(self.scratch_bytes, dtype=torch.uint8, device=source.device)
+            kda_prefill_out([q, k, v, raw_g, beta, w["A_log"], w["dt_bias"].view(heads, 128),
+                m.query_start_loc, m.initial_state_indices, m.final_state_indices,
+                m.checkpoint_state_indices, m.checkpoint_offsets, m.num_seqs, m.num_tokens],
+                scratch, recurrent, output, self.plan.handle, -5.0, None, 1e-6, None, None)
+            gated = self.norm(output, gate.view(tokens, heads, 128), live=m.num_tokens)
+        return self.projections["output"](gated.view(tokens, width))
+
+    def run_recorded(self, reads, recurrent_state, output, corrections, keys_gates, scratch):
+        (mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, query_start_loc,
+         num_accepted_tokens, state_indices, num_seqs, num_tokens) = reads
+        binding = gdn_decode.bind_kda(self.plan, scratch=scratch, mixed_qkv=mixed_qkv,
+            raw_g=raw_g, raw_beta=raw_beta, z=z, A_log=A_log, dt_bias=dt_bias,
+            norm_weight=norm_weight, recurrent_state=recurrent_state, query_start_loc=query_start_loc,
+            num_accepted_tokens=num_accepted_tokens, state_indices=state_indices,
+            num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+            correction_cache=corrections, kg_cache=keys_gates)
+        gdn_decode.run_kda(binding, lower_bound=-5.0, eps=self.eps)

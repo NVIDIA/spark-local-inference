@@ -18,6 +18,7 @@ from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.preparation.examples import declaration_tensor
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES, ContextShards, pull_context, write_records
@@ -28,136 +29,107 @@ FP8 = torch.float8_e4m3fn
 
 
 class PreparedMLA:
-    def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, allocator=None):
+    def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, latents=None,
+                 coordinator=None, context=None, peers=None, examples=None):
         tokens, hidden = source.shape
-        heads = weights["key"].shape[0]
-        device = source.device
-
-        def buffer(key, *shape, dtype=None, rows=None):
-            # Graphs share each buffer at its declared capacity, else their own rows; a larger graph replaces
-            # it and earlier graphs keep their bindings.
-            if key not in buffers or buffers[key].shape[0] < tokens:
-                shape = (max(rows or tokens, tokens), *shape)
-                dtype = source.dtype if dtype is None else dtype
-                buffers[key] = (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
-                                else allocator.zeros(shape, dtype))
-            return buffers[key][:tokens]
-
+        heads, device = weights["key"].shape[0], source.device
+        def buffer(role, *shape, dtype=None):
+            return declaration_tensor(examples, "mla." + role, shape,
+                                      source.dtype if dtype is None else dtype, device)
         latent_width = weights["query_norm"].shape[0] + RECORD_BYTES
-        self.query_norm = buffer("query_norm", latent_width - RECORD_BYTES)
-        self.query = buffer("query", heads * 192).view(tokens, heads, 192)
-        self.latent = buffer("latent", RECORD_BYTES)
-        self.absorbed = buffer("absorbed", heads, RECORD_BYTES)
-        self.attended = buffer("attended", heads, 512)
-        self.expanded = buffer("expanded", heads * 128)
-        self.weights, self.metadata, self.mode, self.cache = weights, metadata, mode, cache
-        # Each rank projects only its query and KV latent rows beside its output gate, and the ranks gather the
-        # latents, as vLLM's VLLM_KIMI_SHARD_QKV_A does: every rank keeps and reads a sixteenth of the latent
-        # projection. A single rank (``latents`` None) projects every latent row itself.
-        self.latent_gather = None
         local_width = (weights["latent_gate"].shape[0] if isinstance(weights["latent_gate"], torch.Tensor)
                        else weights["latent_gate"].out_features)
-        if latents is None:
-            self.local = buffer("local", local_width)
-            self.input = self.local[:, :latent_width]
-            self.gate = self.local[:, latent_width:]
-        else:
-            rows, width = latents.max_batch_size, latents.query_head_dim
-            self.input = buffer("input", latent_width)
-            self.local = buffer("local", local_width, rows=rows)
-            self.gate = self.local[:, width:]
-            # The exchange reads contiguous rows, which a single row's latent columns already are.
-            self.staged = tokens > 1
-            self.send = buffer("send", width, rows=rows) if self.staged else self.local[:, :width]
-            self.gathered_latents = buffer("gathered_latents", latents.world_size * width, rows=rows)
-            self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
-                session=session, coordinator=coordinator, name=name + ".gather_latents")
+        local, query_norm = buffer("local", tokens, local_width), buffer("query_norm", tokens, latent_width - RECORD_BYTES)
+        query = buffer("query", tokens, heads, 192)
+        absorbed, attended = buffer("absorbed", tokens, heads, RECORD_BYTES), buffer("attended", tokens, heads, 512)
+        expanded = buffer("expanded", tokens, heads * 128)
+        self.weights, self.mode, self.cache = weights, mode, cache
+        self.heads, self.latent_width = heads, latent_width
+        self.latent_gather = None
+        self.gather_width = None if latents is None else latents.query_head_dim
+        if latents is not None:
+            send = buffer("latent_send", tokens, self.gather_width)
+            gathered = buffer("latent_gathered", tokens, latents.world_size * self.gather_width)
+            self.latent_gather = PreparedChunkedAllGather(send, gathered, runtime=latents,
+                session=session, coordinator=coordinator, name=name + ".gather_latents").functional(session=session)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
-            name=name + "." + key, workspace=workspace)
-            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
-                             ("output", self.expanded, buffer("output", hidden)))}
+            name=name + "." + key, workspace=workspace).functional(session=session)
+            for key, x, y in (("latent_gate", source, local), ("q_b", query_norm, query.view(tokens, -1)),
+                             ("output", expanded, buffer("output", tokens, hidden)))}
         self.shards = ContextShards() if context is None else context.shards
-        self.peers = peers
-        self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
         world, width = self.shards.world, metadata.page_table.shape[1]
         common = dict(device=device, kv_dtype=FP8, page_size=PAGE_TOKENS, use_cuda_graph=True,
                       partial_dtype=torch.float32)
         scale = 192 ** -.5
         if world == 1:
-            # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
-            self.lengths = torch.zeros_like(metadata.lengths)
             caps = dense_mla.Caps(mode=mode if mode in ("decode", "verify") else "extend", q_dtype=torch.bfloat16,
                 num_q_heads=heads, max_total_q=tokens, max_batch=metadata.lengths.numel(),
                 max_cache_tokens=width * PAGE_TOKENS, max_page_table_width=width, num_cache_pages=cache.shape[0],
                 **common)
-            self.attention = PreparedDenseMLA(self.absorbed, cache, self.attended, metadata.page_table, self.lengths,
-                metadata.query_start_loc, caps=caps, scale=scale, session=session, name=name + ".attention",
-                workspace=workspace)
+            self.attention = PreparedDenseMLA(absorbed, cache, attended, metadata.page_table,
+                torch.zeros_like(metadata.lengths), metadata.query_start_loc, caps=caps, scale=scale,
+                session=session, name=name + ".attention", workspace=workspace).functional(session=session)
         elif mode == "prefill":
-            self.prefill = PreparedContextPrefill(self.absorbed, self.attended, metadata, context, peers,
-                session=session, name=name, workspace=workspace, buffer=buffer, scale=scale, common=common)
+            self.prefill = PreparedContextPrefill(absorbed, attended, metadata, context, peers,
+                session=session, name=name, workspace=workspace, scale=scale, common=common, examples=examples)
         else:
-            # Each query row attends to the records this rank owns at or before its position, as its own sequence.
-            total, rows = heads * world, context.heads.max_batch_size
-            self.quantized = buffer("quantized", heads, RECORD_BYTES, dtype=FP8, rows=rows)
-            self.gathered = buffer("gathered", total, RECORD_BYTES, dtype=FP8, rows=rows)
-            self.partial = buffer("partial", total, 512, rows=rows)
-            self.lse = buffer("lse", total, dtype=torch.float32, rows=rows)
-            self.token_pages = buffer("token_pages", width, dtype=torch.int32, rows=rows)
-            self.token_lengths = buffer("token_lengths", dtype=torch.int32, rows=rows)
-            self.token_starts = torch.arange(tokens + 1, dtype=torch.int32, device=device)
-            self.gather = PreparedAllGather(self.quantized.view(tokens, -1), self.gathered.view(tokens, -1),
-                runtime=context.heads, session=session, coordinator=context.coordinator, name=name + ".gather_heads")
+            total = heads * world
+            quantized, gathered = buffer("quantized", tokens, heads, RECORD_BYTES, dtype=FP8), buffer("gathered_heads", tokens, total, RECORD_BYTES, dtype=FP8)
+            partial, lse = buffer("partial", tokens, total, 512), buffer("lse", tokens, total, dtype=torch.float32)
+            self.gather = PreparedAllGather(quantized.view(tokens, -1), gathered.view(tokens, -1),
+                runtime=context.heads, session=session, coordinator=context.coordinator,
+                name=name + ".gather_heads").functional(session=session)
             caps = dense_mla.Caps(mode="decode", q_dtype=FP8, num_q_heads=total, max_total_q=tokens,
                 max_batch=tokens, max_cache_tokens=width * PAGE_TOKENS, max_page_table_width=width,
                 num_cache_pages=cache.shape[0], **common)
-            self.attention = PreparedDenseMLA(self.gathered, cache, self.partial, self.token_pages,
-                self.token_lengths, self.token_starts, caps=caps, scale=scale, session=session,
-                name=name + ".attention", workspace=workspace, lse=self.lse)
-            self.combine = PreparedLseReduceScatter(self.partial, self.lse, self.attended, runtime=context.heads,
-                session=session, coordinator=context.coordinator, name=name + ".combine")
+            self.attention = PreparedDenseMLA(gathered, cache, partial, metadata.token_page_table,
+                torch.zeros(tokens, dtype=torch.int32, device=device), torch.arange(tokens + 1, dtype=torch.int32, device=device),
+                caps=caps, scale=scale, session=session, name=name + ".attention", workspace=workspace,
+                lse=lse).functional(session=session)
+            self.combine = PreparedLseReduceScatter(partial, lse, attended, runtime=context.heads,
+                session=session, coordinator=context.coordinator, name=name + ".combine").functional(session=session)
 
-    def __call__(self, source):
-        p, m, shards = self.projections, self.metadata, self.shards
-        p["latent_gate"](source)
-        if self.latent_gather is not None:
-            tokens, width = self.send.shape
-            if self.staged:
-                self.send.copy_(self.local[:, :width])
-            self.latent_gather(self.send)
-            # Rank-major latent shards back into the query and KV latents they partition.
-            world = self.gathered_latents.shape[1] // width
-            gathered = self.gathered_latents.view(tokens, world, width)
-            query = self.input.shape[1] - RECORD_BYTES
-            q, kv = query // world, RECORD_BYTES // world
-            self.input[:, :query].view(tokens, world, q).copy_(gathered[:, :, :q])
-            self.input[:, query:].view(tokens, world, kv).copy_(gathered[:, :, q:q + kv])
-        rms_norm_columns(self.input[:, :-RECORD_BYTES], self.weights["query_norm"], self.query_norm, 1e-6)
-        rms_norm_columns(self.input[:, -RECORD_BYTES:-64], self.weights["kv_norm"], self.latent[:, :512], 1e-6)
-        self.latent[:, 512:].copy_(self.input[:, -64:])
-        p["q_b"](self.query_norm)
-        self.absorbed[:, :, :512].copy_(torch.bmm(self.query[:, :, :128].transpose(0, 1), self.weights["key"]).transpose(0, 1))
-        self.absorbed[:, :, 512:].copy_(self.query[:, :, 128:])
-        # Each rank stores the positions it owns; every position is owned when no ranks share the context.
-        self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
-        write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
-        if shards.world == 1:
-            self.lengths.copy_(torch.where(m.lengths > 0, m.starts + m.lengths, 0))
-            self.attention()
-        elif self.mode == "prefill":
-            self.prefill(self.latent)
+    def __call__(self, source, metadata):
+        p, m, shards = self.projections, metadata, self.shards
+        tokens, heads = source.shape[0], self.heads
+        local = p["latent_gate"](source)
+        if self.latent_gather is None:
+            inputs, gate = local[:, :self.latent_width], local[:, self.latent_width:]
         else:
-            tokens = self.absorbed.shape[0]
-            self.quantized.copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
-            self.gather(self.quantized.view(tokens, -1))
-            self.token_pages.copy_(m.token_page_table)
-            self.token_lengths.copy_(shards.local_tokens(m.positions + 1).to(torch.int32))
-            self.attention()
-            self.combine(self.partial, self.lse)
-        self.expanded.copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1))
-        sigmoid_gate(self.expanded, self.gate)
-        return p["output"](self.expanded)
+            width = self.gather_width
+            gathered = self.latent_gather(local[:, :width].contiguous()).view(tokens, -1, width)
+            world = gathered.shape[1]
+            query = self.latent_width - RECORD_BYTES
+            q, kv = query // world, RECORD_BYTES // world
+            inputs = torch.cat((gathered[:, :, :q].reshape(tokens, query),
+                                gathered[:, :, q:q + kv].reshape(tokens, RECORD_BYTES)), -1)
+            gate = local[:, width:]
+        query_norm = torch.empty((tokens, self.latent_width - RECORD_BYTES), dtype=source.dtype, device=source.device)
+        rms_norm_columns(inputs[:, :-RECORD_BYTES], self.weights["query_norm"], query_norm, 1e-6)
+        latent = torch.empty((tokens, RECORD_BYTES), dtype=source.dtype, device=source.device)
+        rms_norm_columns(inputs[:, -RECORD_BYTES:-64], self.weights["kv_norm"], latent[:, :512], 1e-6)
+        latent[:, 512:].copy_(inputs[:, -64:])
+        query = p["q_b"](query_norm).view(tokens, heads, 192)
+        absorbed = torch.empty((tokens, heads, RECORD_BYTES), dtype=source.dtype, device=source.device)
+        absorbed[:, :, :512].copy_(torch.bmm(query[:, :, :128].transpose(0, 1), self.weights["key"]).transpose(0, 1))
+        absorbed[:, :, 512:].copy_(query[:, :, 128:])
+        slots = shards.token_slots(m.positions, m.token_page_table)
+        write_records(latent, slots, self.cache.view(-1, RECORD_BYTES))
+        if shards.world == 1:
+            lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).to(torch.int32)
+            attended = self.attention(absorbed, m.page_table, lengths, m.query_start_loc)
+        elif self.mode == "prefill":
+            attended = self.prefill(absorbed, latent, m)
+        else:
+            quantized = absorbed.float().clamp(-448., 448.).to(FP8)
+            gathered = self.gather(quantized.view(tokens, -1)).view(tokens, -1, RECORD_BYTES)
+            lengths = shards.local_tokens(m.positions + 1).to(torch.int32)
+            starts = torch.arange(tokens + 1, dtype=torch.int32, device=source.device)
+            partial, lse = self.attention(gathered, m.token_page_table, lengths, starts)
+            attended = self.combine(partial, lse)
+        expanded = torch.bmm(attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1).contiguous()
+        sigmoid_gate(expanded, gate)
+        return p["output"](expanded)
 
 
 class PreparedContextPrefill:
@@ -170,8 +142,7 @@ class PreparedContextPrefill:
     written before this forward's collectives ordered the ranks.
     """
 
-    def __init__(self, absorbed, attended, metadata, context, peers, *, session, name, workspace, buffer, scale,
-                 common):
+    def __init__(self, absorbed, attended, metadata, context, peers, *, session, name, workspace, scale, common, examples=None):
         tokens, heads = absorbed.shape[:2]
         device, world, width = absorbed.device, context.shards.world, metadata.page_table.shape[1]
         slab, window = context.slab, context.window
@@ -179,65 +150,63 @@ class PreparedContextPrefill:
         if (peers is None or peers.shape != (world,) or slab.shape[0] % PAGE_TOKENS or window % PAGE_TOKENS
                 or slab.shape[0] < window + tokens):
             raise ValueError("context-parallel prefill requires every rank's cache address and a context slab")
-        self.metadata, self.peers, self.shards, self.attended = metadata, peers, context.shards, attended
-        self.slab, self.window = slab, window
-        self.words = slab.view(torch.uint8).view(torch.int32).view(slab.shape[0], RECORD_BYTES // 4)[:window]
+        self.peers, self.shards = peers, context.shards
+        self.slab_shape, self.slab_dtype, self.window = tuple(slab.shape), slab.dtype, window
         self.windows = -(-width * PAGE_TOKENS * world // window)
-        self.offsets = torch.arange(self.windows, dtype=torch.int64, device=device) * window
-        self.bounds = torch.zeros((self.windows, 2), dtype=torch.int64, device=device)
-        self.records = torch.full((tokens,), -1, dtype=torch.int64, device=device)
-        self.lengths = torch.zeros_like(metadata.lengths)
-        self.lse = buffer("prefill_lse", heads, dtype=torch.float32)
         cache = slab.view(pages, PAGE_TOKENS, RECORD_BYTES)
         caps = dense_mla.Caps(mode="extend", q_dtype=torch.bfloat16, num_q_heads=heads, max_total_q=tokens,
             max_batch=1, max_cache_tokens=pages * PAGE_TOKENS, max_page_table_width=pages, num_cache_pages=pages,
             **common)
-        self.table = torch.arange(pages, dtype=torch.int32, device=device)[None]
-        self.attention = PreparedDenseMLA(absorbed, cache, attended, self.table, self.lengths,
+        table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+        lengths = torch.zeros_like(metadata.lengths)
+        lse = declaration_tensor(examples, "mla.prefill.lse", (tokens, heads), torch.float32, device)
+        self.attention = PreparedDenseMLA(absorbed, cache, attended, table, lengths,
             metadata.query_start_loc, caps=caps, scale=scale, session=session, name=name + ".attention",
-            workspace=workspace, lse=self.lse)
+            workspace=workspace, lse=lse).functional(session=session, cache=None)
         self.context_attention = None
         if self.windows > 1:
             columns = window // PAGE_TOKENS
-            self.merged = buffer("merged", heads, 512, dtype=torch.float32)
-            self.window_lengths = torch.zeros_like(metadata.lengths)
-            self.window_lse = buffer("window_lse", heads, dtype=torch.float32)
-            self.window_attended = buffer("window_attended", heads, 512)
-            self.window_table = torch.arange(columns, dtype=torch.int32, device=device)[None]
+            window_table = torch.arange(columns, dtype=torch.int32, device=device)[None]
             caps = dense_mla.Caps(mode="extend", causal=False, q_dtype=torch.bfloat16, num_q_heads=heads,
                 max_total_q=tokens, max_batch=1, max_cache_tokens=window, max_page_table_width=columns,
                 num_cache_pages=pages, **common)
-            self.context_attention = PreparedDenseMLA(absorbed, cache, self.window_attended, self.window_table,
-                self.window_lengths, metadata.query_start_loc, caps=caps, scale=scale, session=session,
-                name=name + ".context_attention", workspace=workspace, lse=self.window_lse)
+            self.context_attention = PreparedDenseMLA(absorbed, cache, attended, window_table,
+                lengths, metadata.query_start_loc, caps=caps, scale=scale, session=session,
+                name=name + ".context_attention", workspace=workspace, lse=lse).functional(session=session, cache=None)
 
-    def __call__(self, latent):
-        m, table = self.metadata, self.metadata.page_table[0]
-        ends = m.starts[:1].to(torch.int64) - self.offsets
-        self.bounds.copy_(torch.stack(((ends - self.window).clamp(min=0), ends.clamp(min=0)), -1))
-        pull_context(self.peers, table, self.bounds[0], self.words, self.shards)
-        # The chunk's records follow the latest window in the slab.
-        latest = self.bounds[0, 0]
-        self.records.copy_(torch.where(m.positions >= 0, m.positions - latest, -1))
-        write_records(latent, self.records, self.slab)
-        self.lengths.copy_(torch.where(m.lengths > 0, m.starts - latest + m.lengths, 0))
-        self.attention()
+    def __call__(self, absorbed, latent, metadata):
+        m, table = metadata, metadata.page_table[0]
+        slab = torch.empty(self.slab_shape, dtype=self.slab_dtype, device=latent.device)
+        words = slab.view(torch.uint8).view(torch.int32).view(slab.shape[0], RECORD_BYTES // 4)[:self.window]
+        offsets = torch.arange(self.windows, dtype=torch.int64, device=latent.device) * self.window
+        ends = m.starts[:1].to(torch.int64) - offsets
+        bounds = torch.stack(((ends - self.window).clamp(min=0), ends.clamp(min=0)), -1)
+        pull_context(self.peers, table, bounds[0], words, self.shards)
+        latest = bounds[0, 0]
+        records = torch.where(m.positions >= 0, m.positions - latest, -1)
+        write_records(latent, records, slab)
+        lengths = torch.where(m.lengths > 0, m.starts - latest + m.lengths, 0).to(torch.int32)
+        pages = slab.shape[0] // PAGE_TOKENS
+        cache = slab.view(pages, PAGE_TOKENS, RECORD_BYTES)
+        page_table = torch.arange(pages, dtype=torch.int32, device=latent.device)[None]
+        attended, lse = self.attention(absorbed, page_table, lengths, m.query_start_loc, cache=cache)
         if self.context_attention is None:
-            return self.attended
-        self.merged.copy_(self.attended.float())
+            return attended
+        merged = attended.float()
+        window_table = torch.arange(self.window // PAGE_TOKENS, dtype=torch.int32, device=latent.device)[None]
         for index in range(1, self.windows):
-            bounds = self.bounds[index]
-            pull_context(self.peers, table, bounds, self.words, self.shards)
-            present = bounds[1] > bounds[0]
-            self.window_lengths.copy_((bounds[1] - bounds[0]).to(self.window_lengths.dtype).expand_as(
-                self.window_lengths))
-            self.context_attention()
-            # An empty window contributes nothing; a query row without positions keeps a zero output.
-            peak = torch.maximum(self.lse, torch.where(present, self.window_lse, -torch.inf)).clamp(min=-1e30)
-            kept = torch.exp(self.lse - peak)
-            added = torch.where(present, torch.exp(self.window_lse - peak), 0.)
+            current = bounds[index]
+            pull_context(self.peers, table, current, words, self.shards)
+            present = current[1] > current[0]
+            window_lengths = (current[1] - current[0]).to(torch.int32).expand_as(m.lengths).clone(
+                memory_format=torch.contiguous_format)
+            window_attended, window_lse = self.context_attention(absorbed, window_table, window_lengths,
+                                                                m.query_start_loc, cache=cache)
+            peak = torch.maximum(lse, torch.where(present, window_lse, -torch.inf)).clamp(min=-1e30)
+            kept = torch.exp(lse - peak)
+            added = torch.where(present, torch.exp(window_lse - peak), 0.)
             total = (kept + added).clamp(min=1e-30)
-            self.merged.copy_((self.merged * kept[..., None] + torch.where(present, self.window_attended.float(),
-                                                                           0.) * added[..., None]) / total[..., None])
-            self.lse.copy_(peak + torch.log(total))
-        return self.attended.copy_(self.merged)
+            merged = (merged * kept[..., None] + torch.where(present, window_attended.float(),
+                                                            0.) * added[..., None]) / total[..., None]
+            lse = peak + torch.log(total)
+        return merged.to(attended.dtype)

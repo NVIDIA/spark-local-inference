@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pooled MiMo image scratch preserves compiled encoder and publication results."""
+"""MiMo image encoding and native publication ignore declaration tensors."""
 
 import json
 import math
@@ -21,7 +21,7 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.mimo_v2.vision import FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch
 from ignition.recipes.mimo_v2.vision_state import PreparedVisionGeneration
 from ignition.recipes.mimo_v2.vision_weights import VisionWeights
@@ -43,13 +43,13 @@ def weights():
 
 @pytest.mark.parametrize("capacity", [256, 16384])
 @torch.no_grad()
-def test_pooled_encoder_publication_matches_unpooled_after_poisoning(weights, capacity):
+def test_encoder_publication_ignores_poisoned_preparation_templates(weights, capacity):
     from b12x.preparation import PreparationSession
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     weights, config = weights
     device = torch.device("cuda:0")
-    pool, arena = GraphBufferPool(device, chunk_bytes=2 << 20), ScratchArena(device)
+    arena = ScratchArena(device)
     inputs = VisionInputs.allocate(device)
     side = math.isqrt(capacity)
     positions = torch.stack(torch.meshgrid(torch.arange(side, device=device),
@@ -70,17 +70,19 @@ def test_pooled_encoder_publication_matches_unpooled_after_poisoning(weights, ca
     records = torch.zeros((2, 2, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
-    graphs, owners, states = {}, [], []
+    graphs, owners, states, templates = {}, [], [], []
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
-        for pooled in (False, True):
-            buffers = pool.cursor() if pooled else None
-            scratch = VisionScratch.allocate(capacity, weights.shard, device, buffers=buffers)
+        for poison in (False, True):
+            scratch = VisionScratch.allocate(capacity, weights.shard, device)
+            if poison:
+                templates.extend(value for value in vars(scratch).values() if isinstance(value, torch.Tensor))
+                templates.extend(value for value in vars(scratch.mlp).values() if isinstance(value, torch.Tensor))
             encoder = PreparedVision(weights, scratch, inputs, runtime=None, coordinator=None,
-                session=session, workspace=arena, name=f"vision-{pooled}", buffers=buffers)
+                session=session, workspace=arena, name=f"vision-{poison}")
             state = VisionState(batch, PrefillVisionInputs.allocate(capacity, device), requests,
                 image_token=config["image_token_id"], features=FEATURES, hidden=HIDDEN)
             state.feature_slot.fill_(0)
-            operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, buffers=buffers)
+            operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence)
             states.append(state)
             owners.append(operation)
         arena.finalize()
@@ -94,15 +96,14 @@ def test_pooled_encoder_publication_matches_unpooled_after_poisoning(weights, ca
                 call()
             graphs[str(index)] = graph
         bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={},
-            resources=(owners, calls, states, weights, inputs, requests, pool, arena, session))
+            resources=(owners, calls, states, weights, inputs, requests, arena, session))
         worker = bundle.start_worker()
         try:
             for seed in (31, 72):
                 torch.manual_seed(seed)
                 inputs.vision_pixel_values[:capacity].normal_()
-                for chunks in pool.chunks.values():
-                    for tensor in chunks:
-                        tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
+                for tensor in templates:
+                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
                 for state in states:
                     state.arena.fill_(float("nan"))
                 torch.cuda.synchronize()

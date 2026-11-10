@@ -52,6 +52,7 @@ class PackageStorage:
         self.integrated = properties.is_integrated
         self._persistent_total_bytes = properties.total_memory
         self._retention_scope = False
+        self._retention_pool = None
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
         from flare_heliopause import flare_heliopause as native
@@ -191,45 +192,82 @@ class PackageStorage:
         if self._retention_scope:
             raise RuntimeError("nested transient physical retention scope")
         self._retention_scope = True
+        retired_pool = False
         try:
             if self.library.flare_package_retention_begin():
                 raise self.error or RuntimeError("cannot begin transient physical retention")
             try:
                 yield
+                if self._retention_pool is not None:
+                    import torch
+
+                    torch.cuda.synchronize(self.device)
+                    retired_pool = True
+                self._retire_retention_pool()
                 if self.error is not None:
                     raise self.error
                 if self.library.flare_package_retention_finish():
                     raise self.error or RuntimeError("cannot release transient physical backing")
-            except BaseException:
+            except BaseException as error:
+                try:
+                    if self._retention_pool is not None:
+                        import torch
+
+                        torch.cuda.synchronize(self.device)
+                except BaseException as cleanup_error:
+                    error.add_note(f"transient pool synchronization failed: {cleanup_error!r}")
+                else:
+                    try:
+                        self._retire_retention_pool()
+                    except BaseException as cleanup_error:
+                        error.add_note(f"transient pool cleanup failed: {cleanup_error!r}")
                 self.library.flare_package_retention_abort()
                 raise
+            else:
+                if retired_pool:
+                    self.seal_low_window()
         finally:
             self._retention_scope = False
 
+    def _retire_retention_pool(self):
+        pool, self._retention_pool = self._retention_pool, None
+        if pool is None:
+            return
+        import torch
+
+        del pool
+        torch.cuda.empty_cache()
+
     @contextmanager
     def transient(self):
-        """Route allocations to a package-backed pool whose free segments return to the device on exit.
+        """Route allocations through a package-backed transient pool.
 
-        A live pool never releases cached segments, so work that frees most of
-        what it allocates, such as kernel tuning, would otherwise strand that
-        memory for the rest of preparation. Allocations still live on exit
-        stay valid, package-backed, and exported.
+        Outside physical retention, the pool is destroyed on exit so its cached
+        segments return to the device. Inside physical retention, contexts share
+        one pool that is retired before retained backing is released.
         """
         import torch
 
-        allocator = (self._transient_allocator if self._retention_scope
-                     else self._allocator)
-        pool = torch.cuda.MemPool(allocator.allocator())
-        self._preparation_pools.add(pool.id)
+        shared = self._retention_scope
+        if shared:
+            pool = self._retention_pool
+            if pool is None:
+                pool = torch.cuda.MemPool(self._transient_allocator.allocator())
+                self._retention_pool = pool
+                self._preparation_pools.add(pool.id)
+        else:
+            pool = torch.cuda.MemPool(self._allocator.allocator())
+            self._preparation_pools.add(pool.id)
         try:
             with torch.cuda.use_mem_pool(pool, device=self.device):
                 yield
         finally:
             torch.cuda.synchronize(self.device)
-            del pool
-            torch.cuda.empty_cache()
-            # Returned segments may reopen low addresses that later library allocations would take.
-            self.seal_low_window()
+            if not shared:
+                del pool
+                torch.cuda.empty_cache()
+                # Returned segments may reopen low addresses that later library allocations would take.
+                self.seal_low_window()
 
     def scratch_pool(self):
         """Own zero-initialized scratch whose physical backing can be released during compilation."""

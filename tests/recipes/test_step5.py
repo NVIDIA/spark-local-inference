@@ -98,20 +98,18 @@ def test_generation_stops_at_chat_and_base_eos(tmp_path):
         prepare_frontend(tmp_path, eos_token_ids=[0, 1])
 
 
-def test_vision_text_and_draft_scratch_share_storage(checkpoint_config):
+def test_execution_declarations_use_independent_tensor_storage(checkpoint_config):
     from dataclasses import fields, is_dataclass
     import torch
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.step5.decoder import Scratch
     from ignition.recipes.step5.vision import VisionScratch
 
     config = ModelConfig.from_dict(checkpoint_config)
     shard = TensorParallelShard(0, 4)
-    pool = GraphBufferPool('meta', chunk_bytes=2 << 20)
-    vision = VisionScratch.allocate(65536, shard, 'meta', buffers=pool.cursor())
-    text = Scratch.allocate(config, shard, 4096, 1, 1048576, 'meta', buffers=pool.cursor())
-    decode = Scratch.allocate(config, shard, 16, 16, 1048576, 'meta', buffers=pool.cursor())
-    draft = Scratch.allocate(config, shard, 64, 64, 1048576, 'meta', buffers=pool.cursor())
+    vision = VisionScratch.allocate(65536, shard, 'meta')
+    text = Scratch.allocate(config, shard, 4096, 1, 1048576, 'meta')
+    decode = Scratch.allocate(config, shard, 16, 16, 1048576, 'meta')
+    draft = Scratch.allocate(config, shard, 64, 64, 1048576, 'meta')
 
     def tensors(value):
         if isinstance(value, torch.Tensor):
@@ -120,37 +118,13 @@ def test_vision_text_and_draft_scratch_share_storage(checkpoint_config):
             for field in fields(value):
                 yield from tensors(getattr(value, field.name))
 
-    owners = {t.untyped_storage()._cdata for chunks in pool.chunks.values() for t in chunks}
-    footprints = []
-    for execution in (vision, text, decode, draft):
-        values = list(tensors(execution))
-        footprints.append(sum(t.nbytes for t in values))
-        assert all(t.untyped_storage()._cdata in owners for t in values)
-        if execution is vision:
-            persistent = [vision.patches, vision.hidden, vision.normalized,
-                          vision.projected, vision.reduced]
-            stages = [persistent + [vision.qkv, vision.query, vision.key, vision.value, vision.attended],
-                      persistent + [vision.mlp_up, vision.activated],
-                      persistent + [vision.first_input, vision.first_output, vision.second_input,
-                                    vision.second_output, vision.second_reduced, vision.output]]
-        else:
-            private = {"attention", "dense", "shared", "router_logits", "router", "experts", "partial"}
-            persistent = [t for field in fields(execution) if field.name not in private
-                          for t in tensors(getattr(execution, field.name))]
-            stages = [persistent + list(tensors(execution.attention)),
-                      persistent + list(tensors(execution.dense)),
-                      persistent + [t for field in private - {"attention", "dense"}
-                                    for t in tensors(getattr(execution, field))]]
-        for stage in stages:
-            intervals = {}
-            for tensor in stage:
-                start = tensor.storage_offset() * tensor.element_size()
-                intervals.setdefault(tensor.untyped_storage()._cdata, []).append((start, start + tensor.nbytes))
-            for ranges in intervals.values():
-                ordered = sorted(ranges)
-                assert all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:]))
-    assert vision.patches.untyped_storage()._cdata == text.embedding.untyped_storage()._cdata
-    assert (text.embedding.untyped_storage()._cdata == decode.embedding.untyped_storage()._cdata
-            == draft.embedding.untyped_storage()._cdata)
-    assert sum(footprints) - pool.nbytes > 400 << 20
-    assert text.attention.key.dtype == text.attention.value.dtype == torch.bfloat16
+    values = [tensor for execution in (vision, text, decode, draft) for tensor in tensors(execution)]
+    assert len({tensor.untyped_storage()._cdata for tensor in values}) == len(values)
+    assert vision.query.shape == (65536, 4, 96)
+    assert text.embedding.shape == (4096, config.hidden)
+    assert decode.logits.shape == (16, config.vocabulary)
+    assert draft.attention.key.dtype == draft.attention.value.dtype == torch.bfloat16
+    selected = text.rows(128, 1)
+    assert selected.embedding.shape == (128, config.hidden)
+    assert selected.embedding.untyped_storage()._cdata == text.embedding.untyped_storage()._cdata
+    assert selected.attention.query.untyped_storage()._cdata == text.attention.query.untyped_storage()._cdata

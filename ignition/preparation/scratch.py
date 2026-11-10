@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Caller-owned byte storage for serialized planned operators."""
+"""Preparation workspace and typed invocation-local scratch views."""
 
 from __future__ import annotations
 
@@ -37,10 +37,10 @@ def scratch_views(backing, shapes):
 
 
 class ScratchArena:
-    """Grow during preparation, then retain one address for graph capture.
+    """Share tuning workspace and retire declaration storage before compilation.
 
-    With ``overlap`` false, recipes compose every branch on the main stream:
-    the arena then creates no auxiliary stream and accepts no concurrent plans.
+    With ``overlap`` false, preparation creates no auxiliary stream and accepts
+    no concurrent plans. Serving forwards allocate their own temporary tensors.
     """
 
     def __init__(self, device, *, overlap=True, allocation_pool=None):
@@ -52,6 +52,7 @@ class ScratchArena:
         self.frozen = False
         self._released = False
         self._finalizers = []
+        self._preparation_releases = []
         self._parallel_plans = []
         self._auxiliary_stream = None
         self._recorded_views = None
@@ -84,7 +85,7 @@ class ScratchArena:
         return self._auxiliary_stream
 
     def register_parallel(self, *plans):
-        """Declare plans whose workspaces must coexist within a captured fork."""
+        """Declare plans that need disjoint workspace during preparation."""
         if not self.overlap:
             raise RuntimeError("stream overlap is disabled; serial plans share scratch")
         if self.frozen:
@@ -138,9 +139,19 @@ class ScratchArena:
             return
         if not self.frozen or self._finalizers:
             raise RuntimeError("scratch preparation release requires completed binding finalization")
+        for callback in self._preparation_releases:
+            callback()
+        self._preparation_releases.clear()
         self.tensor = torch.empty(0, dtype=torch.uint8, device=self.device)
         self._parallel_plans.clear()
         self._released = True
+
+    def register_preparation_release(self, callback):
+        """Release shared declaration owners after every binding has finalized."""
+        self._require_active()
+        if not callable(callback):
+            raise TypeError("preparation release must be callable")
+        self._preparation_releases.append(callback)
 
     def _require_active(self):
         if self._released:
@@ -262,10 +273,6 @@ def scratch_storage(workspace, *, nbytes, device):
 
 def bind_scratch(layout, *, device, workspace=None):
     """Bind contiguous operand prefixes from caller-owned, typed capacity buffers."""
-    if isinstance(workspace, GraphBuffers):
-        if workspace.pool.device != torch.device(device):
-            raise ValueError("graph scratch and operands must share a device")
-        return {name: workspace.zeros(shape, dtype) for name, (shape, dtype) in layout.items()}
     if workspace is None:
         return {name: torch.empty(shape, dtype=dtype, device=device)
                 for name, (shape, dtype) in layout.items()}
@@ -294,149 +301,9 @@ def planned_scratch(specs, workspace=None):
 
 
 def prime_owners(workspace, *owners):
-    """Keep the arena in prepared plans without pinning pre-finalization views.
+    """Keep preparation storage without retaining disposable declaration views.
 
-    b12x retains priming owners until a plan is released. Serving components
-    own their finalized bindings; benchmark calls retain concrete trial views.
+    b12x retains priming owners until a plan is released. Functional execution
+    supplies invocation tensors; standalone calls retain their concrete owners.
     """
     return (workspace,) if isinstance(workspace, ScratchArena) else owners
-
-
-def overlay(objects, *, keep=()):
-    """Place each scratch dataclass's tensors at the start of one shared byte buffer.
-
-    The objects overlap one another, so they must never be live at the same time.
-    Views within an object keep their relationships. Nested dataclasses of a `keep`
-    type retain their own storage, for example buffers holding prepared constants.
-    """
-    import dataclasses
-
-    def tensors(value, found):
-        if isinstance(value, keep):
-            return
-        if isinstance(value, torch.Tensor):
-            if value.numel():
-                found.append(value)
-        elif dataclasses.is_dataclass(value):
-            for field in dataclasses.fields(value):
-                tensors(getattr(value, field.name), found)
-
-    layouts, device = [], None
-    for value in objects:
-        found, offsets, size = [], {}, 0
-        tensors(value, found)
-        for tensor in found:
-            storage = tensor.untyped_storage()
-            if storage.data_ptr() not in offsets:
-                offsets[storage.data_ptr()] = size
-                size += (storage.nbytes() + 255) // 256 * 256
-            device = tensor.device
-        layouts.append((offsets, size))
-    if device is None:
-        return tuple(objects)
-    shared = torch.zeros(max(size for _, size in layouts), dtype=torch.uint8, device=device)
-    if shared.numel() % 8:
-        raise ValueError("overlaid scratch must keep 8-byte storage alignment")
-
-    def rebase(value, offsets):
-        if isinstance(value, keep):
-            return value
-        if isinstance(value, torch.Tensor):
-            if not value.numel():
-                return value
-            # as_strided offsets count elements from the start of the shared storage.
-            start = offsets[value.untyped_storage().data_ptr()] // value.element_size()
-            return shared.view(value.dtype).as_strided(value.shape, value.stride(), start + value.storage_offset())
-        if dataclasses.is_dataclass(value):
-            return dataclasses.replace(value, **{field.name: rebase(getattr(value, field.name), offsets)
-                                                 for field in dataclasses.fields(value) if field.init})
-        return value
-
-    return tuple(rebase(value, offsets) for value, (offsets, _) in zip(objects, layouts, strict=True))
-
-
-
-class GraphBufferPool:
-    """Chunks shared by private execution buffers with disjoint lifetimes.
-
-    A rank replays one captured graph at a time, so a buffer that each launch writes
-    before reading it need not outlive the launch. Every graph allocates through its
-    own `cursor()`: cursors fill available space in the same chunks, so different graphs
-    share memory while one graph's buffers stay disjoint. Graphs constructed largest
-    first leave later cursors within the chunks the first one created. Each dtype has
-    its own chunks because compiled graphs cannot reinterpret aliased inputs across
-    element sizes.
-
-    Sequential layers can take separate cursors from a dedicated pool when every
-    layer consumes and commits its intermediates before the following layer starts.
-    Values retained across layers or until speculative acceptance need separate storage.
-    """
-
-    def __init__(self, device, *, chunk_bytes=2 << 20, allocation_pool=None):
-        if type(chunk_bytes) is not int or chunk_bytes <= 0 or chunk_bytes % 256:
-            raise ValueError("graph buffer chunks must be a positive multiple of 256 bytes")
-        self.device, self.chunk_bytes = torch.device(device), chunk_bytes
-        self.allocation_pool = allocation_pool
-        self.chunks = {}
-
-    @property
-    def nbytes(self):
-        return sum(chunk.nbytes for chunks in self.chunks.values() for chunk in chunks)
-
-    def cursor(self):
-        return GraphBuffers(self)
-
-
-class GraphBuffers:
-    """One graph's disjoint views into a `GraphBufferPool`."""
-
-    def __init__(self, pool):
-        self.pool, self.positions = pool, {}
-
-    def fork(self):
-        """Allocate a sequential stage after the caller's live buffers.
-
-        Sibling cursors reuse storage. Each stage must consume its outputs before
-        another sibling starts; concurrent branches belong to the same cursor.
-        Join all siblings before allocating values that must coexist with them.
-        """
-        cursor = GraphBuffers(self.pool)
-        cursor.positions = {dtype: dict(offsets) for dtype, offsets in self.positions.items()}
-        return cursor
-
-    def join(self, *cursors):
-        """Reserve the union of stage extents without summing sequential lifetimes."""
-        if any(cursor.pool is not self.pool for cursor in cursors):
-            raise ValueError("graph buffer cursors must share a pool")
-        for cursor in cursors:
-            for dtype, offsets in cursor.positions.items():
-                target = self.positions.setdefault(dtype, {})
-                for index, offset in offsets.items():
-                    target[index] = max(target.get(index, 0), offset)
-
-    def zeros(self, shape, dtype):
-        return self._take(shape, dtype).zero_()
-
-    def full(self, shape, value, dtype):
-        return self._take(shape, dtype).fill_(value)
-
-    def _take(self, shape, dtype):
-        shape = (shape,) if isinstance(shape, int) else tuple(shape)
-        if any(type(dim) is not int or dim < 0 for dim in shape):
-            raise ValueError("graph buffer dimensions must be nonnegative integers")
-        count = prod(shape)
-        aligned = (count * dtype.itemsize + 255) // 256 * 256
-        chunks = self.pool.chunks.setdefault(dtype, [])
-        offsets = self.positions.setdefault(dtype, {})
-        for index, chunk in enumerate(chunks):
-            offset = offsets.get(index, 0)
-            if offset + aligned <= chunk.nbytes:
-                break
-        else:
-            index, offset = len(chunks), 0
-            with (nullcontext() if self.pool.allocation_pool is None else
-                  torch.cuda.use_mem_pool(self.pool.allocation_pool, device=self.pool.device.index)):
-                chunks.append(torch.empty(max(aligned, self.pool.chunk_bytes) // dtype.itemsize, dtype=dtype,
-                                          device=self.pool.device))
-        offsets[index] = offset + aligned
-        return chunks[index].narrow(0, offset // dtype.itemsize, count).view(shape)

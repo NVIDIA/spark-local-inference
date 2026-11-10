@@ -11,7 +11,7 @@ from b12x.attention.dsa_indexer.reference import unpack_index_k_cache_reference
 
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -34,7 +34,7 @@ def test_rotated_fp8_selection_preserves_cache_and_replay_storage(mode, rows):
     lengths[0] = 0
     width = torch.tensor([records], device=device, dtype=torch.int32)
     output = torch.empty((rows, 512), device=device, dtype=torch.int32)
-    arena, buffers = ScratchArena(device), GraphBufferPool(device)
+    arena, examples = ScratchArena(device), {}
     matrix = torch.ones((1, 1), device=device)
     for _ in range(7):
         matrix = torch.cat((torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1)), 0)
@@ -49,14 +49,28 @@ def test_rotated_fp8_selection_preserves_cache_and_replay_storage(mode, rows):
             workload_schema="fp8-rotated-index-v1", numerical_policy="power-of-two") as session:
         session.register_scratch(arena)
         indexer = PreparedFP8Indexer(query, weights, cache, table, lengths, width, output,
-            mode=mode, session=session, name="index", workspace=arena, buffers=buffers.cursor(),
-            prefill_records_per_call=131072)
+            mode=mode, session=session, name="index", workspace=arena,
+            examples=examples, example_role="attention.indexer", prefill_records_per_call=131072)
+        repeated = PreparedFP8Indexer(query, weights, cache, table, lengths, width, output,
+            mode=mode, session=session, name="repeated", workspace=arena,
+            examples=examples, example_role="attention.indexer", prefill_records_per_call=131072)
+        for name in ("quantized", "scales", "scaled_weights", "packed_pages"):
+            assert getattr(indexer, name) is getattr(repeated, name)
+        assert indexer.scales is not indexer.scaled_weights
+        quantized = torch.empty_like(indexer.quantized)
+        scaled_weights = torch.empty_like(indexer.scaled_weights)
+        indexer.functional(session=session)
+        repeated.functional(session=session)
         session.tune()
+        examples.clear()
+        arena.release_preparation()
 
         def forward():
             indexer.write_keys(keys, slots)
-            indexer()
-            arena.tensor.fill_(255)
+            selected, local_quantized, local_scaled = indexer._run(query, weights, table, lengths, width)
+            output.copy_(selected)
+            quantized.copy_(local_quantized)
+            scaled_weights.copy_(local_scaled)
 
         compiled = compile_forward(forward)
         compiled()
@@ -76,12 +90,12 @@ def test_rotated_fp8_selection_preserves_cache_and_replay_storage(mode, rows):
         actual_k = unpack_index_k_cache_reference(cache, num_tokens=records)
         torch.testing.assert_close(actual_k.float(), expected_k * key_scale[:, None], rtol=0, atol=0)
         expected_q, query_scale = rotated_quantized(query)
-        torch.testing.assert_close(indexer.quantized.float(), expected_q, rtol=0, atol=0)
-        torch.testing.assert_close(indexer.scaled_weights,
+        torch.testing.assert_close(quantized.float(), expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(scaled_weights,
             weights.float() * query_scale * (128 * heads)**-0.5, rtol=2e-6, atol=1e-7)
         permuted = actual_k.view(-1, 64, 128).flip(0).flatten(0, 1).float()
         scores = torch.einsum("rhd,kd->rhk", expected_q[1:4], permuted).relu()
-        scores = (scores * indexer.scaled_weights[1:4, :, None]).sum(1)
+        scores = (scores * scaled_weights[1:4, :, None]).sum(1)
         selected = scores.gather(1, output[1:4].long())
         cutoff = scores.topk(512, dim=1).values[:, -1]
         assert (selected.amin(1) >= cutoff - 0.001).all()

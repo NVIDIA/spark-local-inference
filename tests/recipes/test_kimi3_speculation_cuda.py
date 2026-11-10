@@ -49,14 +49,14 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             workload_schema="kimi-kda-rollback", numerical_policy="default") as session:
         arena = ScratchArena(device)
         session.register_scratch(arena)
-        buffers = {}
         decode = PreparedKDA(w, source[:1], state, decode_meta, mode="decode", eps=1e-5,
-            session=session, name="decode", workspace=arena, buffers=buffers)
+            session=session, name="decode", workspace=arena)
         verify = PreparedKDA(w, source, state, verify_meta, mode="verify", eps=1e-5,
-            session=session, name="verify", workspace=arena, buffers=buffers, records=records.layer(0))
+            session=session, name="verify", workspace=arena, records=records.layer(0))
         replay = PreparedKDAReplay(pool.backing, [state.recurrent], records, verify.plan,
-            verify_meta.state_indices[:, 0], session=session, workspace=arena)
+            session=session).functional()
         session.tune(show_progress=False)
+        arena.release_preparation()
         for meta, tokens in ((verify_meta, 8), (decode_meta, 1)):
             meta.query_start_loc[1] = tokens
             meta.convolution_slots.fill_(1)
@@ -64,8 +64,10 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             meta.num_seqs.fill_(1)
             meta.num_tokens.fill_(tokens)
         def verify_commit():
-            verify(source)
-            replay(counts)
+            local_records = KDARecords(records.layers, torch.zeros_like(records.corrections),
+                torch.zeros_like(records.keys_and_gates), records.A_log, records.dt_bias)
+            verify(source, verify_meta, records=local_records.layer(0))
+            replay(counts, local_records, verify_meta)
             torch.library.wrap_triton(_commit_convolution)[(1, 1, 18)](
                 pool.backing.view(torch.bfloat16), offsets, verify_meta.state_indices[:, 0], counts,
                 pool.layout.row_bytes // 2, 2304, 10, 128)
@@ -77,16 +79,16 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             compiled()
         pool.backing.zero_()
         for i in range(3):
-            decode(source[i:i+1])
+            decode(source[i:i+1], decode_meta)
         initial = pool.backing.clone()
         initial_recurrent = state.recurrent.clone()
         expected, outputs = [], []
         for i in range(8):
-            outputs.append(decode(source[i:i+1]).clone())
+            outputs.append(decode(source[i:i+1], decode_meta).clone())
             expected.append((state.convolution[1, :, :3].clone(), state.recurrent[1].clone()))
         for count in range(1, 9):
             pool.backing.copy_(initial)
-            actual = verify(source).clone()
+            actual = verify(source, verify_meta, records=records.layer(0)).clone()
             torch.testing.assert_close(state.recurrent, initial_recurrent, rtol=0, atol=0)
             counts.fill_(count)
             pool.backing.copy_(initial)

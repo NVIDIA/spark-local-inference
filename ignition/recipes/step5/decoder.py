@@ -40,27 +40,21 @@ class Scratch:
     logits: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, samples, context, device, *, buffers=None):
-        from ignition.preparation.scratch import GraphBufferPool
-
+    def allocate(cls, config, shard, tokens, samples, context, device):
         c = config.text
-        if buffers is None:
-            buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
-        def zeros(rows, columns, dtype=torch.bfloat16, *, cursor=buffers):
-            return cursor.zeros((rows, columns), dtype)
+        def zeros(rows, columns, dtype=torch.bfloat16):
+            return torch.zeros((rows, columns), dtype=dtype, device=device)
         width = config.vocabulary_partition(shard)[2]
         embedding, local_embedding = zeros(tokens, config.hidden), zeros(tokens, config.hidden // shard.world_size)
         normalized, residual = zeros(tokens, config.hidden), zeros(tokens, config.hidden, torch.float32)
         reduced = zeros(tokens, config.hidden, torch.float32)
-        attn, dense_stage, routed_stage = (buffers.fork() for _ in range(3))
-        attention = AttentionScratch.allocate(config, shard, tokens, context, device, requests=samples, buffers=attn)
-        dense = MLPScratch.allocate(tokens, config.hidden, c["intermediate_size"] // shard.world_size, device, buffers=dense_stage)
-        shared = MLPScratch.allocate(tokens, config.hidden, c["share_expert_dim"] // shard.world_size, device, buffers=routed_stage)
-        router_logits = zeros(tokens, c["moe_num_experts"], torch.float32, cursor=routed_stage)
-        router = RouterScratch.allocate(tokens, device, experts=c["moe_num_experts"], top_k=c["moe_top_k"], buffers=routed_stage)
-        experts = zeros(tokens, config.hidden, cursor=routed_stage)
-        partial = zeros(tokens, config.hidden, torch.float32, cursor=routed_stage)
-        buffers.join(attn, dense_stage, routed_stage)
+        attention = AttentionScratch.allocate(config, shard, tokens, context, device, requests=samples)
+        dense = MLPScratch.allocate(tokens, config.hidden, c["intermediate_size"] // shard.world_size, device)
+        shared = MLPScratch.allocate(tokens, config.hidden, c["share_expert_dim"] // shard.world_size, device)
+        router_logits = zeros(tokens, c["moe_num_experts"], torch.float32)
+        router = RouterScratch.allocate(tokens, device, experts=c["moe_num_experts"], top_k=c["moe_top_k"])
+        experts = zeros(tokens, config.hidden)
+        partial = zeros(tokens, config.hidden, torch.float32)
         return cls(embedding, local_embedding, normalized, residual, attention, dense, shared,
             router_logits, router, experts, partial, reduced, zeros(samples, config.hidden),
             zeros(samples, width), zeros(samples, config.vocabulary))
@@ -87,7 +81,7 @@ class PreparedFeedForward(torch.nn.Module):
         if routed:
             c = config.text
             self.router_projection = UnquantizedProjection(source, weights.router, scratch.router_logits,
-                                                           session=session, name=name + ".router")
+                                                           session=session, name=name + ".router").functional(session=session)
             self.router = PreparedRouter(scratch.router_logits, scratch.router, session=session, name=name + ".route",
                 score_func="sigmoid", renormalize=True, routed_scaling_factor=c["moe_router_scaling_factor"],
                 correction_bias=weights.correction)
@@ -103,27 +97,27 @@ class PreparedFeedForward(torch.nn.Module):
                         source.shape[0] <= 2 and binding is not None and binding.implementation == "micro")
                 register_finalizer(session, finalize_overlap, workspace=workspace)
         self.reduction = PreparedAllReduce(scratch.partial, scratch.reduced, runtime=runtime, coordinator=coordinator,
-                                           session=session, name=name + ".reduce") if reduce_output else None
+                                           session=session, name=name + ".reduce").functional(session=session) if reduce_output else None
+        if self.concurrent is not None:
+            self.concurrent.functional(session=session)
+        if self.experts is not None:
+            self.experts.functional(session=session)
+            self.router.functional(session=session)
+        self.mlp.functional(session=session)
 
-    def forward(self, hidden):
-        s = self.scratch
-        s.normalized.copy_(hidden)
+    def forward(self, hidden, *, metadata=None):
         if self.experts is None:
-            projected = self.mlp(s.normalized)
+            projected = self.mlp(hidden)
             if self.reduction is None:
                 return projected
-            s.partial.copy_(projected)
-        else:
-            if self.concurrent is not None:
-                self.concurrent.start(s.normalized)
-            self.router(self.router_projection(s.normalized))
-            routed = self.experts()
-            shared = self.mlp(s.normalized) if self.concurrent is None else self.concurrent.finish(s.normalized, routed)
-            s.partial.copy_(shared.float() + routed.float())
-        if self.reduction is None:
-            return s.partial
-        reduced = self.reduction(s.partial)
-        return reduced.bfloat16() if self.experts is None else reduced
+            return self.reduction(projected.float()).bfloat16()
+        pending = None if self.concurrent is None else self.concurrent.start(hidden)
+        logits = self.router_projection(hidden)
+        routes = self.router(logits)
+        routed = self.experts(hidden, routes.ids, routes.weights, router_logits=logits)
+        shared = self.mlp(hidden) if self.concurrent is None else self.concurrent.finish(pending, routed)
+        partial = shared.float() + routed.float()
+        return partial if self.reduction is None else self.reduction(partial)
 
 
 class PreparedDecoderLayer(torch.nn.Module):
@@ -133,96 +127,100 @@ class PreparedDecoderLayer(torch.nn.Module):
         self.attention, self.feed_forward = attention, feed_forward
         self.input_norm = None if input_normalized else PreparedRMSNorm(scratch.residual, weights.input_norm, scratch.normalized,
             eps=epsilon, session=session, name=name + ".input_norm", zero_centered=True,
-            residual=scratch.reduced if accumulate else None)
+            residual=scratch.reduced if accumulate else None).functional()
         self.fused_attention = attention.reduction is None
         if self.fused_attention:
             self.post_attention_norm = PreparedAllReduceRMSNorm(scratch.attention.projected_output, scratch.residual,
                 weights.post_attention_norm, scratch.normalized, eps=epsilon, runtime=runtime, coordinator=coordinator,
-                session=session, name=name + ".attention_reduce_norm", zero_centered=True, reduction_dtype=torch.bfloat16)
+                session=session, name=name + ".attention_reduce_norm", zero_centered=True, reduction_dtype=torch.bfloat16).functional(session=session)
         else:
             self.post_attention_norm = PreparedRMSNorm(scratch.residual, weights.post_attention_norm, scratch.normalized,
                 eps=epsilon, session=session, name=name + ".post_attention_norm", zero_centered=True,
-                residual=scratch.attention.projected_output)
+                residual=scratch.attention.projected_output).functional()
         mlp_output = scratch.dense.output if weights.experts is None else scratch.partial
         self.output_norm = None if next_norm is None else PreparedAllReduceRMSNorm(mlp_output, scratch.residual,
             next_norm, scratch.normalized, eps=epsilon, runtime=runtime, coordinator=coordinator, session=session,
             name=name + ".mlp_reduce_norm", zero_centered=True,
-            reduction_dtype=torch.bfloat16 if weights.experts is None else None)
+            reduction_dtype=torch.bfloat16 if weights.experts is None else None).functional(session=session)
 
-    def forward(self, residual, update=None):
+    def forward(self, residual, update=None, *, metadata, proposal=None):
         hidden = update if self.input_norm is None else self.input_norm(residual, update)
-        attended = self.attention(hidden)
+        attended, records = self.attention(hidden, metadata=metadata, proposal=proposal)
         normalized = (self.post_attention_norm(attended, residual) if self.fused_attention
                       else self.post_attention_norm(residual, attended))
-        update = self.feed_forward(normalized)
-        return update if self.output_norm is None else self.output_norm(update, residual)
+        update = self.feed_forward(normalized, metadata=metadata)
+        return (update if self.output_norm is None else self.output_norm(update, residual)), records
 
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, embedding_runtime, vocabulary_runtime,
-                 coordinator, session, name, workspace, overlap=True, vision=None, buffers=None, scoring=None):
+                 coordinator, session, name, workspace, overlap=True, vision=None, scoring=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
+        self.mode = mode
         self.vision = vision if mode == "prefill" else None
-        self.auxiliary = ((torch.zeros_like(scratch.embedding) if buffers is None
-                           else buffers.zeros(scratch.embedding.shape, scratch.embedding.dtype))
+        self.auxiliary = ((torch.zeros_like(scratch.embedding))
                           if weights.draft is not None else None)
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, scratch.local_embedding,
             scratch.embedding, runtime=embedding_runtime, coordinator=coordinator, session=session,
-            name=name + ".embedding", num_rows=metadata.live_counts[:1])
+            name=name + ".embedding", num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
         self.layers = []
         fused = PreparedAllReduceRMSNorm.fits(runtime, scratch.partial)
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             common = {"runtime": runtime, "coordinator": coordinator, "session": session, "workspace": workspace}
             attention = PreparedAttention(index, w, weights.config, weights.shard, scratch.normalized,
-                scratch.attention, metadata, pool, mode=mode, name=prefix + ".attention", reduce_output=not fused, buffers=buffers, **common)
+                scratch.attention, metadata, pool, mode=mode, name=prefix + ".attention", reduce_output=not fused,  **common)
             next_norm = weights.layers[index + 1].input_norm if fused and index + 1 < len(weights.layers) else None
             feed_forward = PreparedFeedForward(index, w, weights.config, scratch, name=prefix + ".mlp",
                                                overlap=overlap, reduce_output=next_norm is None, **common)
             self.layers.append(PreparedDecoderLayer(w, attention, feed_forward, scratch,
                 weights.config.text["rms_norm_eps"], session=session, name=prefix, accumulate=index > 0,
                 runtime=runtime, coordinator=coordinator, input_normalized=fused and index > 0, next_norm=next_norm))
-        self.sampled_hidden = (torch.empty_like(scratch.hidden) if buffers is None
-                               else buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype))
+        self.sampled_hidden = (torch.empty_like(scratch.hidden))
         self.norm = PreparedRMSNorm(self.sampled_hidden, weights.norm, scratch.hidden,
-            eps=weights.config.text["rms_norm_eps"], session=session, name=name + ".norm", zero_centered=True)
+            eps=weights.config.text["rms_norm_eps"], session=session, name=name + ".norm", zero_centered=True).functional()
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator,
-            name=name + ".prompt", copy_source=True)
-        self.score_norm = None if self.scoring is None else PreparedRMSNorm(self.scoring.source, weights.norm,
-            self.scoring.source, eps=weights.config.text["rms_norm_eps"], session=session,
-            name=name + ".prompt_norm", zero_centered=True)
+            name=name + ".prompt")
+        self.score_norm = None if self.scoring is None else PreparedRMSNorm(scratch.embedding, weights.norm,
+            scratch.embedding, eps=weights.config.text["rms_norm_eps"], session=session,
+            name=name + ".prompt_norm", zero_centered=True).functional()
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", buffers=buffers, workspace=workspace)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",  workspace=workspace).functional(session=session)
 
-    def __call__(self):
-        local = self.embedding.lookup()
+    def __call__(self, metadata):
+        local = self.embedding.lookup(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
         if self.vision is not None:
-            self.vision.inject(self.metadata, local)
-        residual = self.scratch.residual
-        residual.copy_(self.embedding.gather(local))
-        update = None
+            self.vision.inject(metadata, local)
+        embedded = self.embedding.gather(local)
+        residual = embedded.float()
+        update, records = None, []
         for layer in self.layers:
-            update = layer(residual, update)
+            update, retained = layer(residual, update, metadata=metadata)
+            records.append(retained)
             if layer.output_norm is None:
-                # Dense blocks narrow their reduced output before residual addition.
                 update = update.float()
         residual.add_(update)
-        if self.auxiliary is not None:
-            self.auxiliary.copy_(residual)
-        # The checkpoint narrows the residual before its final normalization.
-        self.sampled_hidden.copy_(residual[self.metadata.sample_indices])
-        self.norm(self.sampled_hidden)
+        auxiliary = None if self.weights.draft is None else (residual.bfloat16(), embedded)
+        hidden = self.norm(residual[metadata.sample_indices].bfloat16())
         if self.scoring is not None:
-            self.scoring.source.copy_(residual)
-            self.score_norm(self.scoring.source)
-            self.scoring()
-        self.head(self.scratch.hidden)
+            self.scoring(self.score_norm(residual.bfloat16()))
+        return hidden, self.head(hidden), auxiliary, tuple(records) if self.mode == "verify" else None
 
-    def commit(self, counts):
+    def commit(self, counts, records, metadata):
+        if records is None:
+            return
+        for layer, retained in zip(self.layers, records, strict=True):
+            layer.attention.commit(counts, retained, metadata)
+
+    def release_examples(self):
+        self.scratch = self.metadata = self.auxiliary = self.sampled_hidden = None
         for layer in self.layers:
-            layer.attention.commit(counts)
+            layer.feed_forward.scratch = None
+            layer.attention.release_examples()
+
+    def release_outputs(self):
+        self.release_examples()
 
     def scratch_tensors(self):
-        return (self.auxiliary, self.sampled_hidden, self.head.gathered,
-                *(layer.attention.scratch_tensors() for layer in self.layers))
+        return ()

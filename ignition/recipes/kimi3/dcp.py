@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 from .config import PAGE_TOKENS
+from ignition.preparation.persistent import persistent_copy
 
 # One E4M3 latent record: 512 normalized latent values and 64 unrotated key values.
 RECORD_BYTES = 576
@@ -42,7 +43,7 @@ class ContextShards:
 
     @classmethod
     def on(cls, rank, world, device):
-        return cls(rank, world, torch.tensor([rank], dtype=torch.int64, device=device))
+        return cls(rank, world, persistent_copy(torch.tensor([rank], dtype=torch.int64, device=device)))
 
     @property
     def owner(self):
@@ -137,14 +138,15 @@ def write_records(latent, indices, table):
 
 @dataclass(frozen=True)
 class ContextParallel:
-    """Decode context parallel resources shared by every MLA layer of a rank: its shards, the b12x head
-    exchange (DcpAllToAll), the collective coordinator, every rank's address of each layer's page pool
-    ({layer: [world] int64}) and the prefill slab [window + chunk, 576] E4M3 that serial prefill layers reuse:
-    one window of earlier context, then the chunk's own records."""
+    """Shard geometry, head exchange, coordinator, and per-layer peer cache addresses.
+
+    ``slab`` is a preparation example with shape [window + chunk, 576] and E4M3 dtype.
+    Each compiled prefill invocation allocates its context slab locally.
+    """
 
     shards: ContextShards
     heads: object
     coordinator: object
     peers: dict
-    slab: torch.Tensor
+    slab: torch.Tensor | None
     window: int = CONTEXT_WINDOW

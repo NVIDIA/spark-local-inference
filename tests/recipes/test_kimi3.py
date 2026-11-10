@@ -88,7 +88,8 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
     from ignition.recipes.kimi3.weights import KimiWeightLoader
     from ignition.recipes.kimi3.kda import PreparedKDA
     from ignition.components.recurrent import DeltaState, DeltaMetadata
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
 
     device = torch.device("cuda:0")
@@ -106,9 +107,8 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         metadata = DeltaMetadata.allocate(1, device)
         torch.manual_seed(41)
         source = torch.randn((tokens, 7168), device=device, dtype=torch.bfloat16)
-        graph_buffers = GraphBufferPool(device)
         op = PreparedKDA(weights["attention"], source, state, metadata, mode=mode, eps=1e-5,
-                        session=session, name="kda", workspace=arena, buffers={}, allocator=graph_buffers.cursor())
+                        session=session, name="kda", workspace=arena)
         session.tune(show_progress=False)
         metadata.query_start_loc[1] = tokens
         metadata.convolution_slots[0] = 1
@@ -119,7 +119,17 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         metadata.fresh.fill_(True)
         state.convolution.zero_()
         state.recurrent.zero_()
-        output = op(source).clone()
+        arena.release_preparation()
+        replayed = torch.empty_like(source)
+
+        def forward():
+            replayed.copy_(op(source, metadata))
+
+        compiled = compile_forward(forward)
+        state.convolution.zero_()
+        state.recurrent.zero_()
+        compiled()
+        output = replayed.clone()
         assert torch.isfinite(output).all() and output.abs().max() > 0
         expected_state = state.recurrent[1].clone()
         from b12x.sequence.kda_prefill.reference import recurrent_kda
@@ -144,15 +154,18 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         state.convolution.zero_()
         state.recurrent.zero_()
         stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
         graph = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.graph(graph, stream=stream):
-            replayed = op(source)
-        for chunks in graph_buffers.chunks.values():
-            for chunk in chunks:
-                chunk.fill_(float("nan"))
+            compiled()
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)
         graph.replay()
         torch.cuda.synchronize(device)
+        after = torch.cuda.memory_stats(device)
+        for key in ("allocation.all.allocated", "allocation.all.freed",
+                    "segment.all.allocated", "segment.all.freed"):
+            assert before[key] == after[key]
         torch.testing.assert_close(replayed, output, rtol=0, atol=0)
         torch.testing.assert_close(state.recurrent[1], expected_state, rtol=0, atol=0)
         assert not state.recurrent[0].count_nonzero()
@@ -169,7 +182,8 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
     from ignition.components.paged_batch import Metadata
     from ignition.recipes.kimi3.weights import KimiWeightLoader
     from ignition.recipes.kimi3.attention import PreparedMLA
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
 
     device = torch.device("cuda:0")
@@ -188,16 +202,23 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
         cache = torch.zeros((pages, 128, 576), dtype=torch.float8_e4m3fn, device=device)
         torch.manual_seed(41)
         source = torch.randn((tokens, 7168), device=device, dtype=torch.bfloat16)
-        graph_buffers = GraphBufferPool(device)
         op = PreparedMLA(weights, source, metadata, cache, mode=mode, session=session,
-                         name="mla", workspace=arena, buffers={}, allocator=graph_buffers.cursor())
+                         name="mla", workspace=arena)
         session.tune(show_progress=False)
         metadata.query_start_loc[1] = tokens
         metadata.lengths.fill_(tokens)
         metadata.page_table.copy_(torch.arange(pages, device=device)[None])
         metadata.positions.copy_(torch.arange(tokens, device=device))
         metadata.token_page_table.copy_(metadata.page_table.expand(tokens, -1))
-        output = op(source).clone()
+        arena.release_preparation()
+        replayed = torch.empty_like(source)
+
+        def forward():
+            replayed.copy_(op(source, metadata))
+
+        compiled = compile_forward(forward)
+        compiled()
+        output = replayed.clone()
         w = _reference_attention(weights)
         projected = F.linear(source, w["latent_gate"][:2112])
         def norm(x, weight):
@@ -226,15 +247,18 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
         error = (output.float() - quantized_reference.float()).norm() / quantized_reference.float().norm()
         assert error.item() < .02
         stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
         graph = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.graph(graph, stream=stream):
-            replayed = op(source)
-        for chunks in graph_buffers.chunks.values():
-            for chunk in chunks:
-                chunk.fill_(float("nan") if chunk.is_floating_point() else -1)
+            compiled()
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)
         graph.replay()
         torch.cuda.synchronize(device)
+        after = torch.cuda.memory_stats(device)
+        for key in ("allocation.all.allocated", "allocation.all.freed",
+                    "segment.all.allocated", "segment.all.freed"):
+            assert before[key] == after[key]
         torch.testing.assert_close(replayed, output, rtol=0, atol=0)
 
 

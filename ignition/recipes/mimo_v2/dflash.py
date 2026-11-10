@@ -17,66 +17,69 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.speculation import SpeculativeRngState
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.preparation.persistent import persistent_copy
+from ignition.components.dflash2_preparation import DFlash2Preparation
 
 from .attention import partial_rotary, stage_windows
 from .decoder import PreparedDecoder, canonical_norm
 
 
 def inverse_frequencies(geometry, device):
-    return 1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
-        dtype=torch.float32, device=device) / geometry.rotary_dim))
+    return persistent_copy(1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
+        dtype=torch.float32, device=device) / geometry.rotary_dim)))
 
 
 class PreparedContext:
     """Project accepted target features once into all draft layers' context K/V."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator):
-        self.metadata, self.pool = metadata, pool
+        self.weights = weights
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         self.value_scale = c.text["dflash_config"].get("attention_value_scale", 1.)
         tokens, device = auxiliary.shape[0], auxiliary.device
         heads, kv_heads = a.local(weights.shard)
         hidden = c.text["hidden_size"]
-        self.local = torch.zeros((tokens, hidden // weights.shard.world_size), dtype=auxiliary.dtype, device=device)
-        self.projected = torch.zeros((tokens, hidden), dtype=auxiliary.dtype, device=device)
-        self.project = UnquantizedProjection(auxiliary, weights.draft.projection, self.local,
-                                             session=session, name=name + ".project")
-        self.gather = PreparedAllGather(self.local, self.projected, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".gather")
+        local = torch.zeros((tokens, hidden // weights.shard.world_size), dtype=auxiliary.dtype, device=device)
+        projected = torch.zeros((tokens, hidden), dtype=auxiliary.dtype, device=device)
+        self.project = UnquantizedProjection(auxiliary, weights.draft.projection, local,
+                                             session=session, name=name + ".project").functional(session=session)
+        self.gather = PreparedAllGather(local, projected, runtime=runtime, coordinator=coordinator,
+                                       session=session, name=name + ".gather").functional(session=session)
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.hidden_norm, c.text["rms_norm_eps"])
-        self.kv = torch.zeros((tokens, weights.draft.context_kv.shape[0]), dtype=auxiliary.dtype, device=device)
-        self.project_kv = UnquantizedProjection(self.projected, weights.draft.context_kv, self.kv,
-                                               session=session, name=name + ".kv")
-        self.key = torch.zeros((tokens, kv_heads, a.key_dim), dtype=auxiliary.dtype, device=device)
-        self.value = torch.zeros((tokens, kv_heads, a.value_dim), dtype=auxiliary.dtype, device=device)
-        self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
+        kv = torch.zeros((tokens, weights.draft.context_kv.shape[0]), dtype=auxiliary.dtype, device=device)
+        self.project_kv = UnquantizedProjection(projected, weights.draft.context_kv, kv,
+                                               session=session, name=name + ".kv").functional(session=session)
+        key = torch.zeros((tokens, kv_heads, a.key_dim), dtype=auxiliary.dtype, device=device)
+        value = torch.zeros((tokens, kv_heads, a.value_dim), dtype=auxiliary.dtype, device=device)
+        slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
         self.inverse = inverse_frequencies(a, device)
         self.stages = []
         for index, layer in enumerate(weights.draft.layers):
             norm = canonical_norm(Qwen3RMSNorm, layer.key_norm, c.text["rms_norm_eps"])
-            writer = PreparedPagedKVWriter(self.key, self.value, pool.reserved_region(f"draft{index}.key"),
-                pool.reserved_region(f"draft{index}.value"), self.slots, session=session, name=f"{name}.{index}.write")
+            writer = PreparedPagedKVWriter(key, value, pool.reserved_region(f"draft{index}.key"),
+                pool.reserved_region(f"draft{index}.value"), slots, session=session, name=f"{name}.{index}.write", caller_owned_placeholders=True).functional()
             self.stages.append((norm, writer))
 
-    def __call__(self, auxiliary, counts):
-        m = self.metadata
+        self.key_shape, self.value_shape = tuple(key.shape), tuple(value.shape)
+
+    def functional(self):
+        return self
+
+    def __call__(self, auxiliary, counts, metadata):
+        m = metadata
         offset = m.positions - m.starts[m.requests]
         count = counts[m.requests]
         live = (m.positions >= 0) & (offset < count) & (offset >= (count - self.window).clamp_min(0))
-        self.slots.copy_(torch.where(live, m.state_rows[m.requests] * self.window + m.positions % self.window, -1))
-        self.projected.copy_(self.norm(self.gather(self.project(auxiliary))))
-        self.project_kv(self.projected)
-        width = self.key.shape[1] * self.key.shape[2]
-        chunks = self.kv.view(self.kv.shape[0], len(self.stages), -1)
+        slots = torch.where(live, m.state_rows[m.requests] * self.window + m.positions % self.window, -1)
+        projected = self.norm(self.gather(self.project(auxiliary)))
+        kv = self.project_kv(projected)
+        width = self.key_shape[1] * self.key_shape[2]
+        chunks = kv.view(kv.shape[0], len(self.stages), -1)
         for index, (norm, writer) in enumerate(self.stages):
-            key = norm(chunks[:, index, :width].view_as(self.key))
-            self.key.copy_(partial_rotary(key, m.positions, self.inverse))
-            self.value.copy_(chunks[:, index, width:].view_as(self.value) * self.value_scale)
-            writer()
-
-    def scratch_tensors(self):
-        return (self.local, self.projected, self.kv, self.key, self.value, self.slots)
+            key = partial_rotary(norm(chunks[:, index, :width].view(self.key_shape)), m.positions, self.inverse)
+            value = (chunks[:, index, width:].view(self.value_shape) * self.value_scale).contiguous()
+            writer(key, value, slots)
 
 
 @dataclass(frozen=True)
@@ -124,39 +127,46 @@ class DraftScratch:
 class DraftAttention(torch.nn.Module):
     def __init__(self, index, weights, config, scratch, metadata, pool, *, runtime, coordinator, session, name, workspace):
         super().__init__()
-        self.scratch, self.metadata = scratch, metadata
+        self.query_shape, self.key_shape, self.value_shape = (tuple(value.shape) for value in (scratch.query, scratch.key, scratch.value))
         a = config.attention
         self.value_scale = config.text["dflash_config"].get("attention_value_scale", 1.)
-        self.qkv = UnquantizedProjection(scratch.embedding, weights.qkv, scratch.qkv, session=session, name=name + ".qkv")
+        self.qkv = UnquantizedProjection(scratch.embedding, weights.qkv, scratch.qkv, session=session, name=name + ".qkv").functional(session=session)
         self.q_norm = canonical_norm(Qwen3RMSNorm, weights.query_norm, config.text["rms_norm_eps"])
         self.k_norm = canonical_norm(Qwen3RMSNorm, weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = inverse_frequencies(a, scratch.embedding.device)
         self.key_cache, self.value_cache = (pool.reserved_region(f"draft{index}.{kind}") for kind in ("key", "value"))
         rows = metadata.lengths.numel()
         count = (a.window + config.block_size + 127) // 128
-        self.key, self.value = scratch.window_key[:rows * count], scratch.window_value[:rows * count]
-        self.pages = torch.arange(rows * count, device=scratch.embedding.device, dtype=torch.int32).view(rows, count)
-        self.lengths = torch.zeros_like(metadata.lengths)
+        key, value = scratch.window_key[:rows * count], scratch.window_value[:rows * count]
+        self.staged_key_shape, self.staged_value_shape = tuple(key.shape), tuple(value.shape)
+        pages = torch.arange(rows * count, device=scratch.embedding.device, dtype=torch.int32).view(rows, count)
+        lengths = torch.zeros_like(metadata.lengths)
         self.window = a.window
-        self.attention = PreparedPagedAttention(scratch.query, self.key, self.value, self.pages, self.lengths,
+        self.attention = PreparedPagedAttention(scratch.query, key, value, pages, lengths,
             metadata.query_start_loc, scratch.attended, sink=weights.sink, mode="verify", width=config.block_size,
-            window=a.window - 1, causal=False, session=session, workspace=workspace, name=name + ".attention")
+            window=a.window - 1, causal=False, session=session, workspace=workspace, name=name + ".attention", caller_owned_placeholders=True).functional(session=session,
+                k_cache=None, v_cache=None, page_table=None, cache_seqlens=None, cu_seqlens_q=None)
         self.output = UnquantizedProjection(scratch.attended.flatten(1), weights.output, scratch.partial,
-                                            session=session, name=name + ".output")
+                                            session=session, name=name + ".output").functional(session=session)
         self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".reduce")
+                                       session=session, name=name + ".reduce").functional(session=session)
 
-    def forward(self, hidden_states, **kwargs):
-        s, m = self.scratch, self.metadata
-        q, k, v = self.qkv(hidden_states).split((s.query[0].numel(), s.key[0].numel(), s.value[0].numel()), -1)
-        s.query.copy_(partial_rotary(self.q_norm(q.view_as(s.query)), m.positions, self.inverse))
-        s.key.copy_(partial_rotary(self.k_norm(k.view_as(s.key)), m.positions, self.inverse))
-        s.value.copy_(v.view_as(s.value) * self.value_scale)
-        stage_windows(self.key_cache, s.key, self.key, m)
-        stage_windows(self.value_cache, s.value, self.value, m)
-        self.lengths.copy_(m.starts.clamp(max=self.window).int() + m.lengths)
-        self.attention()
-        return self.reduce(self.output(s.attended.flatten(1))), None
+    def forward(self, hidden_states, *, metadata):
+        m = metadata
+        widths = tuple(shape[1] * shape[2] for shape in (self.query_shape, self.key_shape, self.value_shape))
+        q, k, v = self.qkv(hidden_states).split(widths, -1)
+        query = partial_rotary(self.q_norm(q.view(self.query_shape)), m.positions, self.inverse)
+        key = partial_rotary(self.k_norm(k.view(self.key_shape)), m.positions, self.inverse)
+        value = (v.view(self.value_shape) * self.value_scale).contiguous()
+        staged_key = torch.empty(self.staged_key_shape, dtype=self.key_cache.dtype, device=key.device)
+        staged_value = torch.empty(self.staged_value_shape, dtype=self.value_cache.dtype, device=value.device)
+        stage_windows(self.key_cache, key, staged_key, m)
+        stage_windows(self.value_cache, value, staged_value, m)
+        pages = torch.arange(staged_key.shape[0], dtype=torch.int32, device=key.device).view(m.lengths.numel(), -1)
+        lengths = m.starts.clamp(max=self.window).int() + m.lengths
+        attended = self.attention(query, k_cache=staged_key, v_cache=staged_value,
+            page_table=pages, cache_seqlens=lengths, cu_seqlens_q=m.query_start_loc)
+        return self.reduce(self.output(attended.flatten(1))), None
 
 
 class DraftMLP(torch.nn.Module):
@@ -164,9 +174,9 @@ class DraftMLP(torch.nn.Module):
         super().__init__()
         s = scratch.mlp
         self.mlp = PreparedMLP(scratch.embedding, weights, s.gate_up, s.intermediate, s.output,
-                              session=session, workspace=workspace, name=name)
+                              session=session, workspace=workspace, name=name).functional(session=session)
         self.reduce = PreparedAllReduce(s.output, scratch.output, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".reduce")
+                                       session=session, name=name + ".reduce").functional(session=session)
 
     def forward(self, hidden_states):
         return self.reduce(self.mlp(hidden_states))
@@ -175,10 +185,12 @@ class DraftMLP(torch.nn.Module):
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, coordinator,
                  session, name, workspace):
-        self.weights, self.scratch, self.metadata = weights, scratch, metadata
+        self.weights = weights
+        self.logit_shape, self.local_logit_shape = tuple(scratch.logits.shape), tuple(scratch.local_logits.shape)
+        self.logit_dtype, self.local_logit_dtype = scratch.logits.dtype, scratch.local_logits.dtype
         c = weights.config.draft
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
-            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
+            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
         self.layers = []
         for index, layer_weights in enumerate(weights.draft.layers):
             layer = Qwen3DecoderLayer.__new__(Qwen3DecoderLayer)
@@ -194,15 +206,21 @@ class PreparedDraft:
             self.layers.append(layer.eval())
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.norm, c.text["rms_norm_eps"])
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace).functional(session=session)
 
-    def __call__(self):
-        hidden = torch.where((self.metadata.token_ids == self.weights.config.draft.noise_token)[:, None],
-                             self.weights.draft.mask_embedding, self.embedding())
+    def release_outputs(self):
+        return self
+
+    def __call__(self, metadata):
+        hidden = torch.where((metadata.token_ids == self.weights.config.draft.noise_token)[:, None],
+            self.weights.draft.mask_embedding,
+            self.embedding(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1]))
         for layer in self.layers:
-            hidden = layer(hidden)
-        self.scratch.hidden.copy_(self.norm(hidden[self.metadata.sample_indices]))
-        self.head(self.scratch.hidden)
+            attended, _ = layer.self_attn(layer.input_layernorm(hidden), metadata=metadata)
+            hidden = hidden + attended
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        hidden = self.norm(hidden[metadata.sample_indices])
+        return self.head(hidden), None
 
 
 @dataclass(frozen=True)
@@ -214,10 +232,15 @@ class DraftForwards:
 
 
 class SpeculativePreparation:
+    round = DFlash2Preparation.round
+    def release_examples(self):
+        self.scratch = self.draft_scratch = None
+
     def __init__(self, weights, canonical, pool, requests, inputs, scratch, *, completion, frame, sequence,
                  session, workspace, runtime, vocabulary_runtime, context_runtime, coordinator):
         from .pool import PAGE_TOKENS
 
+        self.owners = []
         self.page_tokens = PAGE_TOKENS
         self.weights, self.tables, self.pool = weights, canonical, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch

@@ -115,7 +115,7 @@ class PreparedTokenState:
         self._consume = _compile(_consume, self._consume_args, (self.state.capacity, 1, 1))
         self._prepared = True
 
-    def functional(self):
+    def functional(self, *, dynamic_inputs=False):
         """Keep prepared kernels while supplying packed storage at each invocation."""
         if not self._prepared:
             raise RuntimeError("token state prepare() must complete before functional execution")
@@ -125,9 +125,26 @@ class PreparedTokenState:
             self._gather_args = self._consume_args = None
             self._gather.args = self._consume.args = None
             self.pending_tokens = self.positions = self.history = self.active = None
+        if dynamic_inputs:
+            self._gather_inputs = (None, None, None, *self._gather_inputs[3:])
+            self._consume_inputs = (None, None, None, *self._consume_inputs[3:])
         return self
 
-    def gather(self):
+    def _runtime_rows(self, defaults, row_slot_ids, row_generations, live_rows):
+        inputs = list(defaults)
+        for index, value in enumerate((row_slot_ids, row_generations, live_rows)):
+            if value is not None:
+                inputs[index] = value
+        if any(value is None for value in inputs[:3]):
+            raise ValueError("functional token state requires runtime row operands")
+        device = self.state.generation.device
+        for tensor, shape, dtype, name in ((inputs[0], (self._rows,), torch.int32, "row_slot_ids"),
+                (inputs[1], (self._rows,), torch.int64, "row_generations"),
+                (inputs[2], (1,), torch.int32, "live_rows")):
+            _check_tensor(tensor, shape, dtype, device, name)
+        return inputs
+
+    def gather(self, row_slot_ids=None, row_generations=None, live_rows=None):
         if not self._prepared:
             raise RuntimeError("token state prepare() must complete before capture")
         if self._gather_args is None:
@@ -139,13 +156,17 @@ class PreparedTokenState:
             history = (torch.empty((self._rows, 2), dtype=torch.int64, device=device)
                        if self._gather_constants[3] else None)
             active = torch.empty((self._rows,), dtype=torch.int32, device=device)
-            args = (*self._gather_inputs, pending, positions, history, active, *self._gather_constants)
+            inputs = self._runtime_rows(self._gather_inputs, row_slot_ids, row_generations, live_rows)
+            args = (*inputs, pending, positions, history, active, *self._gather_constants)
             launch_triton(self._gather.kernel, self._gather.compiled, args, self._gather.grid,
                           **self._gather.options)
             return pending, positions, history, active
+        if any(value is not None for value in (row_slot_ids, row_generations, live_rows)):
+            raise ValueError("runtime row operands require functional token state")
         self._gather()
 
-    def consume(self, token_ids=None, cu_seqlens=None) -> None:
+    def consume(self, token_ids=None, cu_seqlens=None, *, row_slot_ids=None,
+                row_generations=None, live_rows=None) -> None:
         if not self._prepared:
             raise RuntimeError("token state prepare() must complete before capture")
         if self._consume_args is None:
@@ -156,10 +177,11 @@ class PreparedTokenState:
             device = self.state.generation.device
             _check_tensor(token_ids, (self._token_capacity,), torch.int64, device, "token_ids")
             _check_tensor(cu_seqlens, (self._rows + 1,), torch.int32, device, "cu_seqlens")
-            args = (token_ids, cu_seqlens, *self._consume_inputs)
+            inputs = self._runtime_rows(self._consume_inputs, row_slot_ids, row_generations, live_rows)
+            args = (token_ids, cu_seqlens, *inputs)
             launch_triton(self._consume.kernel, self._consume.compiled, args, self._consume.grid,
                           **self._consume.options)
             return
-        if token_ids is not None or cu_seqlens is not None:
+        if any(value is not None for value in (token_ids, cu_seqlens, row_slot_ids, row_generations, live_rows)):
             raise ValueError("runtime token operands require functional token state")
         self._consume()

@@ -10,6 +10,8 @@ import triton.language as tl
 
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.rms_norm import PreparedRMSNorm
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import register_finalizer
 
 
 @triton.jit
@@ -143,14 +145,10 @@ def commit_gated(values, scores, state_values, state_scores, metadata, counts):
 
 
 class PreparedGatedCompressor:
-    """Gate and pool C4/C128 compression windows.
-
-    `buffers`, when given, supplies the per-launch intermediates (a graph's
-    `GraphBuffers`); every call rewrites them before reading them.
-    """
+    """Gate and pool C4/C128 compression windows with explicit runtime intermediates."""
 
     def __init__(self, spec, weights, source, metadata, pool, slots, *, session, name, deferred=False,
-                 buffers=None, emitted=None, emitted_slots=None, projected=None):
+                 buffers=None, emitted=None, emitted_slots=None, projected=None, examples=None, example_role=None):
         if spec.ratio not in (4, 128) or spec.head_dim not in (128, 512):
             raise ValueError("gated compression requires C4/C128 and a 128/512-dimensional head")
         self.spec, self.metadata, self.deferred = spec, metadata, deferred
@@ -159,7 +157,12 @@ class PreparedGatedCompressor:
         self.ape = weights["ape"]
         tokens, device = source.shape[0], source.device
 
-        def zeros(shape, dtype):
+        if examples is not None and (not isinstance(example_role, str) or not example_role):
+            raise ValueError("shared compressor declarations require an explicit operand role")
+
+        def zeros(role, shape, dtype):
+            if examples is not None:
+                return declaration_tensor(examples, example_role + "." + role, shape, dtype, device)
             return torch.zeros(shape, dtype=dtype, device=device) if buffers is None else buffers.zeros(shape, dtype)
 
         # A caller projecting several compressors' values and gates in one GEMM passes their outputs.
@@ -172,10 +175,10 @@ class PreparedGatedCompressor:
             if self.values.stride() != self.scores.stride():
                 raise ValueError("projected compressor values and scores require matching strides")
         else:
-            self.values = zeros((tokens, spec.state_shape[1]), torch.float32)
-            self.scores = zeros((tokens, spec.state_shape[1]), torch.float32)
-        self.pooled = zeros((tokens, spec.head_dim), torch.bfloat16)
-        self.output = zeros((tokens, spec.head_dim), torch.bfloat16)
+            self.values = zeros("values", (tokens, spec.state_shape[1]), torch.float32)
+            self.scores = zeros("scores", (tokens, spec.state_shape[1]), torch.float32)
+        self.pooled = zeros("pooled", (tokens, spec.head_dim), torch.bfloat16)
+        self.output = zeros("output", (tokens, spec.head_dim), torch.bfloat16)
         # A caller computing emission flags and slots once for several compressors passes them in.
         self.shared_slots = emitted is not None
         if self.shared_slots:
@@ -183,8 +186,9 @@ class PreparedGatedCompressor:
                 raise ValueError("shared emission flags and slots must cover every source row")
             self.emitted, self.slots = emitted, emitted_slots
         else:
-            self.emitted = zeros((tokens,), torch.bool)
-            self.slots = (torch.full_like(slots, -1) if buffers is None
+            self.emitted = zeros("emitted", (tokens,), torch.bool)
+            self.slots = (zeros("slots", slots.shape, slots.dtype).fill_(-1) if examples is not None
+                          else torch.full_like(slots, -1) if buffers is None
                           else buffers.full(slots.shape, -1, slots.dtype))
         self.destinations = slots
         self.project_values = self.project_scores = None
@@ -204,7 +208,34 @@ class PreparedGatedCompressor:
             name=name + ".norm",
         )
 
-    def __call__(self, source):
+    def functional(self, *, session):
+        self.output_shape = tuple(self.output.shape)
+        if not self.projected:
+            self.project_values.functional(session=session)
+            self.project_scores.functional(session=session)
+        self.normalize = self.normalize.functional()
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.metadata = self.values = self.scores = self.pooled = self.output = None
+        self.emitted = self.slots = self.destinations = None
+
+    def __call__(self, source, metadata=None, slots=None, *, projected=None, emitted=None, emitted_slots=None):
+        if self.metadata is None:
+            values, scores = (projected if self.projected else
+                              (self.project_values(source), self.project_scores(source)))
+            pooled = torch.zeros(self.output_shape, dtype=torch.bfloat16, device=source.device)
+            pool_gated(values, scores, self.ape, self.state_values, self.state_scores,
+                       metadata, pooled, ratio=self.spec.ratio)
+            output = self.normalize(pooled)
+            if emitted is None:
+                positions = metadata.positions
+                emitted = (positions >= 0) & ((positions + 1) % self.spec.ratio == 0)
+                emitted_slots = torch.where(emitted, slots, -1)
+            if not self.deferred:
+                self.commit(metadata.lengths, (values, scores), metadata)
+            return output, values, scores, emitted, emitted_slots
         if not self.projected:
             self.project_values(source)
             self.project_scores(source)
@@ -227,5 +258,7 @@ class PreparedGatedCompressor:
             self.commit(self.metadata.lengths)
         return self.output
 
-    def commit(self, counts):
-        commit_gated(self.values, self.scores, self.state_values, self.state_scores, self.metadata, counts)
+    def commit(self, counts, records=None, metadata=None):
+        values, scores = (self.values, self.scores) if records is None else records
+        commit_gated(values, scores, self.state_values, self.state_scores,
+                     self.metadata if metadata is None else metadata, counts)

@@ -34,10 +34,18 @@ class _Plan:
         return SimpleNamespace(scratch_nbytes=self.nbytes)
 
 
+@pytest.mark.parametrize("role", [None, "", 42])
+def test_shared_projection_examples_require_an_explicit_role(role):
+    with pytest.raises(ValueError, match="explicit operand role"):
+        linear.QuantizedProjection(None, None, None, session=None, name="projection",
+                                    examples={}, example_role=role)
+
+
 def _quantized(monkeypatch, *, encoded=False, quantizer=False, stride=(11, 1)):
     projection = object.__new__(linear.QuantizedProjection)
     projection.output = torch.empty_strided((2, 3), stride)
     projection.workspace = torch.empty(64, dtype=torch.uint8)
+    projection.preparation_arena = None
     projection.weight = torch.arange(12, dtype=torch.float32).view(3, 4)
     projection.plan = _Plan()
     projection.bias = torch.arange(3, dtype=torch.float32)
@@ -76,7 +84,7 @@ def test_functional_projection_releases_bound_storage_and_preserves_strides(monk
 def test_functional_projection_uses_final_selected_workspace(monkeypatch):
     projection = _quantized(monkeypatch)
     finalizers = []
-    monkeypatch.setattr(linear, "register_finalizer", lambda session, callback: finalizers.append(callback))
+    monkeypatch.setattr(linear, "register_finalizer", lambda session, callback, **kwargs: finalizers.append(callback))
     projection.functional(session=None)
     with pytest.raises(RuntimeError, match="preparation before execution"):
         projection(torch.zeros(2, 4))
@@ -86,6 +94,106 @@ def test_functional_projection_uses_final_selected_workspace(monkeypatch):
     assert projection.workspace_nbytes == 128
     projection(torch.ones(2, 4))
     assert projection.workspace is None
+
+
+def test_standalone_projection_releases_refreshed_arena_binding(monkeypatch):
+    from ignition.preparation.scratch import ScratchArena
+
+    arena = ScratchArena("cpu")
+    arena.reserve(256)
+    projection = _quantized(monkeypatch)
+    projection.preparation_arena = arena
+    arena.register_finalizer(lambda: setattr(projection, "workspace", arena.tensor[:64]))
+    projection.functional(session=None)
+    arena.finalize()
+    arena.freeze()
+    arena.release_preparation()
+    assert projection.workspace is projection.preparation_arena is None
+    assert arena.nbytes == 0
+    torch.testing.assert_close(projection(torch.ones(2, 4)),
+        torch.ones(2, 4) @ projection.weight.T + projection.bias, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("major", ["n", "k"])
+def test_batched_bf16_projection_returns_independent_strided_outputs(major):
+    source = torch.ones((2, 3, 4), dtype=torch.bfloat16)
+    weight = torch.arange(40, dtype=torch.bfloat16).view(2, 4, 5)
+    output = torch.empty_strided((2, 3, 5), (64, 12, 1), dtype=torch.bfloat16)
+    output_ref = weakref.ref(output)
+    projection = linear.BatchedUnquantizedProjection(source,
+        weight if major == "n" else weight.transpose(1, 2), output,
+        major=major, session=None, name="batched").functional(session=None)
+    del output
+    assert output_ref() is None
+    first, second = projection(source), projection(source + 1)
+    assert first.stride() == second.stride() == (64, 12, 1)
+    assert first.untyped_storage() is not second.untyped_storage()
+    torch.testing.assert_close(first, torch.bmm(source, weight), atol=0, rtol=0)
+    torch.testing.assert_close(second, torch.bmm(source + 1, weight), atol=0, rtol=0)
+    destination = torch.empty_strided(first.shape, first.stride(), dtype=first.dtype)
+    assert projection(source + 2, destination) is destination
+    torch.testing.assert_close(destination, torch.bmm(source + 2, weight), atol=0, rtol=0)
+    with pytest.raises(ValueError, match="preserve the prepared"):
+        projection(source, torch.empty_like(first))
+
+
+@pytest.mark.parametrize("major", ["n", "k"])
+@pytest.mark.parametrize("rows", [4, 4101])
+def test_batched_quantized_projection_releases_examples_and_preserves_slices(monkeypatch, major, rows):
+    from b12x import gemm
+
+    declarations, calls = [], []
+    source = torch.ones((2, rows, 32), dtype=torch.bfloat16)
+    values = torch.ones((2, 32, 32), dtype=torch.float8_e4m3fn)
+    scales = torch.full((2, 32, 1), 127, dtype=torch.uint8)
+    stride = (rows * 40 + 64, 40, 1)
+    output = torch.empty_strided((2, rows, 32), stride, dtype=torch.bfloat16)
+    output_ref = weakref.ref(output)
+    session = SimpleNamespace(prepare=lambda requests: declarations.extend(requests))
+    projection = linear.BatchedQuantizedProjection(source, (values, scales), output,
+        major=major, session=session, name="batched").functional(session=session)
+    declarations.clear()
+    del output
+    assert output_ref() is None
+    def bmm(source, weight, output, *, plan, b_major, **kwargs):
+        calls.append((tuple(source.shape), output.stride(), plan))
+        dense = weight[0].to(torch.bfloat16)
+        output.copy_(torch.bmm(source, dense if b_major == "n" else dense.transpose(1, 2)))
+    monkeypatch.setattr(gemm, "bmm", bmm)
+    first, second = projection(source), projection(source + 1)
+    assert first.stride() == second.stride() == stride
+    assert first.untyped_storage() is not second.untyped_storage()
+    assert len(calls) == 2 * len(projection.slices)
+    assert [call[0][1] for call in calls[:len(projection.slices)]] == [
+        end - start for start, end in projection.slices]
+    torch.testing.assert_close(first, torch.full_like(first, 32), atol=0, rtol=0)
+    torch.testing.assert_close(second, torch.full_like(second, 64), atol=0, rtol=0)
+    destination = torch.empty_strided(first.shape, first.stride(), dtype=first.dtype)
+    assert projection(source + 2, destination) is destination
+    torch.testing.assert_close(destination, torch.full_like(destination, 96), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("major", ["n", "k"])
+def test_expanded_batched_projection_returns_local_strided_outputs(monkeypatch, major):
+    monkeypatch.setattr(linear.sm103_projection, "is_sm103", lambda device: True)
+    monkeypatch.setattr(linear, "_EXPANDED_BMM_WEIGHTS", {})
+    source = torch.ones((2, 3, 32), dtype=torch.bfloat16)
+    weight = (torch.ones((2, 32, 32), dtype=torch.float8_e4m3fn),
+              torch.full((2, 32, 1), 127, dtype=torch.uint8))
+    output = torch.empty_strided((2, 3, 32), (160, 40, 1), dtype=torch.bfloat16)
+    output_ref = weakref.ref(output)
+    projection = linear.BatchedQuantizedProjection(source, weight, output,
+        major=major, session=None, name="batched").functional(session=None)
+    del output
+    assert output_ref() is None
+    first, second = projection(source), projection(source + 1)
+    assert first.stride() == second.stride() == (160, 40, 1)
+    assert first.untyped_storage() is not second.untyped_storage()
+    torch.testing.assert_close(first, torch.full_like(first, 32), atol=0, rtol=0)
+    torch.testing.assert_close(second, torch.full_like(second, 64), atol=0, rtol=0)
+    destination = torch.empty_strided(first.shape, first.stride(), dtype=first.dtype)
+    assert projection(source + 2, destination) is destination
+    torch.testing.assert_close(destination, torch.full_like(destination, 96), atol=0, rtol=0)
 
 
 def test_forward_local_projection_allocations_survive_storage_lowering(monkeypatch):

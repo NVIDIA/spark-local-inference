@@ -8,7 +8,7 @@ import copy
 import pytest
 import torch
 
-from qualify.muse_spark_logits import compare_readbacks
+from qualify.muse_spark_logits import TextReadback, compare_readbacks
 
 
 def readback():
@@ -39,3 +39,26 @@ def test_fp8_readback_rejects_nonfinite_cache(side):
     values[side]['cache_outputs'][0]['endpoint1'].view(torch.uint8)[0, 0, 0, 0, 0] = 127
     with pytest.raises(ValueError, match='cache contains nonfinite'):
         compare_readbacks(values['compiled'], values['raw'])
+
+
+def test_text_readback_consumes_returned_values_without_decoder_scratch():
+    tokens = torch.tensor([3, 5, 8])
+
+    class Forward:
+        def observe(self):
+            return {'target.token_ids': tokens + 1, 'target.positions': tokens - 1,
+                    'target.hidden': tokens[:, None].to(torch.bfloat16),
+                    'target.logits': (tokens[:, None] * 2).to(torch.bfloat16)}
+
+    outputs = dict(token_ids=torch.empty_like(tokens), positions=torch.empty_like(tokens),
+        hidden=torch.empty((3, 1), dtype=torch.bfloat16), logits=torch.empty((3, 1), dtype=torch.bfloat16))
+    operation = TextReadback(Forward(), outputs)
+    for _ in range(2):
+        for value in outputs.values():
+            value.fill_(-99)
+        operation()
+        assert torch.equal(outputs['token_ids'], tokens + 1)
+        assert torch.equal(outputs['positions'], tokens - 1)
+        assert torch.equal(outputs['hidden'], tokens[:, None].bfloat16())
+        assert torch.equal(outputs['logits'], (tokens[:, None] * 2).bfloat16())
+        tokens.add_(7)

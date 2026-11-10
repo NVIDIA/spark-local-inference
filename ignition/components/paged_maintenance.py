@@ -31,10 +31,8 @@ class PreparedMaintenance:
         admission_buffers,
         draft_state=True,
         page_tokens=PAGE_TOKENS,
-        buffers=None,
         trailing_pages=(),
         trailing_tables=None,
-        local_metadata=False,
     ):
         self.pool, self.commands, self.inputs, self.requests = pool, commands, inputs, requests
         self.page_tokens = page_tokens
@@ -63,7 +61,6 @@ class PreparedMaintenance:
             world_size=1 if runtime is None else runtime.world_size,
             capacity=capacity,
             admission_buffers=admission_buffers,
-            buffers=buffers,
         )
         self.state.prepare()
         self.validation = PreparedAllReduce(
@@ -74,10 +71,8 @@ class PreparedMaintenance:
             session=session,
             name=name + ".validation",
         )
-        self.local_metadata = local_metadata
-        if local_metadata:
-            self.validation.functional(session=session)
-            self.state.functional()
+        self.validation.functional(session=session)
+        self.state.functional()
 
     def _transfer(self):
         return PreparedStateTransfer(
@@ -94,10 +89,6 @@ class PreparedMaintenance:
         )
 
     def __call__(self):
-        if self.local_metadata:
-            validation, admission_errors = self.state.validate()
-            totals = self.validation(validation)
-            self.state.apply(totals, admission_errors=admission_errors)
-        else:
-            self.validation(self.state.validate())
-            self.state.apply()
+        validation, admission_errors = self.state.validate()
+        totals = self.validation(validation)
+        self.state.apply(totals, admission_errors=admission_errors)

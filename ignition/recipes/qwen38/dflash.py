@@ -3,12 +3,13 @@
 
 """Qwen hyperconnection features and target state for shared DFlash2 rounds."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
 
 from ignition.components.dflash2 import PreparedContext
-from ignition.components.dflash2_preparation import DFlash2Preparation, PreparedContextAbsorption
+from ignition.components.dflash2_preparation import DFlash2Preparation
 from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
 from ignition.components.recurrent import DeltaMetadata
 from ignition.components.token_state import PreparedTokenState
@@ -16,6 +17,25 @@ from ignition.components.token_state import PreparedTokenState
 from .attention import QSAMetadata
 from .decoder import PreparedDecoder
 from .ple import PLEMetadata
+
+
+@dataclass
+class TargetRuntime:
+    gdn: object
+    qsa: object
+    ple: object
+    capture_metadata: object
+    metadata: object
+
+
+@dataclass(frozen=True)
+class CaptureMetadata:
+    positions: torch.Tensor
+    starts: torch.Tensor
+    lengths: torch.Tensor
+    requests: torch.Tensor
+    state_rows: torch.Tensor
+    query_start_loc: torch.Tensor
 
 
 class PreparedTargetState:
@@ -49,56 +69,67 @@ class PreparedTargetState:
     def prepare_residual(self, residual):
         pass
 
-    def begin(self):
-        m, g, q, o = self.metadata, self.gdn, self.qsa, self.owner
-        self.token_state.gather()
+    def functional(self):
+        if self.metadata is None:
+            return self
+        self.token_state.functional()
+        self.gdn = self.qsa = self.ple = self.metadata = self.hidden = self.sample = None
+        self.slot_ids = None
+        return self
+
+    def _delta(self, m):
+        o = self.owner
         active = m.lengths > 0
         slots = o.inputs.row_slot_ids[:self.rows].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
-        g.query_start_loc.copy_(m.query_start_loc)
-        g.convolution_slots.copy_(torch.where(active, m.state_rows, -1))
-        g.fresh.zero_()
-        g.accepted_tokens.copy_(torch.where(active, o.previous_accepted[safe], 1))
-        g.state_indices.zero_()
-        g.state_indices[:, 0].copy_(m.state_rows)
-        g.initial_state_indices.copy_(m.state_rows)
-        g.final_state_indices.copy_(m.state_rows)
-        g.num_seqs.copy_(m.live_counts[1:])
-        g.num_tokens.copy_(m.live_counts[:1])
-        q.query_start_loc.copy_(m.query_start_loc)
-        q.raw_state_slot_ids.copy_(torch.where(active, slots + 1, -1))
-        q.num_accepted_tokens.copy_(g.accepted_tokens)
-        q.is_prefilling.zero_()
-        q.sequence_lengths.copy_(torch.where(active, m.starts + m.lengths, 0))
-        q.main_block_table.copy_(m.page_table)
-        q.compressed_block_table.copy_(m.page_table)
+        state_indices = torch.zeros((self.rows, m.max_query_tokens), dtype=torch.int64, device=slots.device)
+        state_indices[:, 0].copy_(m.state_rows)
+        return DeltaMetadata(m.query_start_loc, torch.where(active, m.state_rows, -1),
+            torch.zeros_like(active), torch.where(active, o.previous_accepted[safe], 1), state_indices,
+            m.state_rows, m.state_rows, torch.zeros_like(m.state_rows), torch.zeros_like(m.lengths),
+            m.live_counts[1:], m.live_counts[:1])
+
+    def begin_runtime(self, m):
+        _, _, history, _ = self.token_state.gather()
+        g = self._delta(m)
+        slots = self.owner.inputs.row_slot_ids[:self.rows].long()
+        active = m.lengths > 0
         valid = m.positions >= 0
-        q.request_ids.copy_(torch.where(valid, m.requests, -1))
-        q.query_positions.copy_(m.positions)
-        delta = o.pool.rope_delta[m.state_rows[m.requests], 0]
+        delta = self.owner.pool.rope_delta[m.state_rows[m.requests], 0]
         rope = torch.where(valid, m.positions + delta, -1)
-        q.rope_positions.copy_(rope[:, None].expand(-1, 3))
         page = m.page_table[m.requests, (m.positions // 64).clamp(0, m.page_table.shape[1] - 1)]
-        q.slot_mapping.copy_(torch.where(valid, page.long() * 64 + m.positions.remainder(64), -1))
+        q = QSAMetadata(m.page_table, m.page_table, torch.where(active, slots + 1, -1),
+            torch.where(valid, m.requests, -1), m.positions, rope[:, None].expand(-1, 3).contiguous(),
+            torch.where(active, m.starts + m.lengths, 0).to(torch.int32), m.query_start_loc,
+            g.accepted_tokens, torch.zeros_like(active),
+            torch.where(valid, page.long() * 64 + m.positions.remainder(64), -1))
+        ple = PLEMetadata(m.token_ids, g.query_start_loc, history, g.convolution_slots, g.fresh,
+                          g.accepted_tokens, g.num_seqs, g.num_tokens)
+        return TargetRuntime(g, q, ple, m, m)
+
+    def finish_runtime(self, runtime, hidden, residual):
+        m = runtime.metadata
+        sample = hidden[m.sample_indices]
+        if m.max_query_tokens == 1:
+            self.retain_accepted(m.lengths)
+        return sample
 
     def retain_accepted(self, counts):
         slots = self.inputs.row_slot_ids[:self.rows]
-        match = (self.slot_ids[:, None] == slots[None, :]) & (counts[None, :] > 0)
+        slot_ids = self.slot_ids if self.slot_ids is not None else torch.arange(self.requests.capacity, device=slots.device)
+        match = (slot_ids[:, None] == slots[None, :]) & (counts[None, :] > 0)
         accepted = torch.where(match, counts[None, :], 0).sum(1).to(torch.int32)
         self.owner.previous_accepted.copy_(torch.where(match.any(1), accepted,
             self.owner.previous_accepted))
 
-    def finish(self):
-        self.sample.copy_(self.hidden[self.metadata.sample_indices])
-        if self.metadata.max_query_tokens == 1:
-            self.retain_accepted(self.metadata.lengths)
 
 
 class PreparedTarget:
     """Expose Qwen's target forward to the shared speculative round."""
 
     def __init__(self, owner, scratch, metadata, *, session, name, workspace, mode,
-                 capture_buffers, **collectives):
+                 **collectives):
+        self.session = session
         self.state = PreparedTargetState(owner, metadata)
         wide = metadata.max_query_tokens > 1
         self.forward = PreparedDecoder(owner.target_weights, scratch, self.state,
@@ -106,9 +137,8 @@ class PreparedTarget:
             owner.completion, owner.frame, owner.sequence, session=session, name=name,
             max_cache_pages=owner.max_cache_pages, verification=True,
             gdn_records=owner.records if wide else None, gdn_in_place=not wide,
-            gdn_buffers=owner.gdn_buffers, **collectives)
-        self.forward.capture_context(metadata, owner.weights.config.draft,
-            buffers=capture_buffers)
+            **collectives)
+        self.forward.capture_context(metadata, owner.weights.config.draft)
         self.auxiliary = self.forward.auxiliary
         self.scratch = SimpleNamespace(logits=self.forward.scratch.logits,
             hidden=self.forward.scratch.sample_hidden)
@@ -122,14 +152,43 @@ class PreparedTarget:
                 key_heads=heads // 3, value_heads=heads)
         owner.decoders.append(self.forward)
 
-    def __call__(self):
-        self.forward()
-
-    def commit(self, counts):
-        self.commit_counts.copy_(counts)
+    def release_outputs(self):
+        self.forward.functional(session=self.session)
+        self.forward.release_outputs()
         if self.replay is not None:
-            self.replay()
+            self.replay.functional(session=self.session, dynamic_metadata=True)
+        self.scratch = self.auxiliary = self.commit_counts = None
+
+    def __call__(self, metadata):
+        runtime = self.state.begin_runtime(metadata)
+        hidden, logits, auxiliary, records = self.forward(runtime)
+        return hidden, logits, auxiliary.draft_features, records
+
+    def commit(self, counts, records=None, metadata=None):
+        if self.replay is not None:
+            self.replay(counts, records=records, metadata=self.state._delta(metadata))
         self.state.retain_accepted(counts)
+
+
+class PreparedQwenContextAbsorption:
+    def __init__(self, decoder, context, *, session):
+        self.decoder, self.context = decoder, context.functional()
+        decoder.functional(session=session)
+        decoder.release_outputs()
+
+    def __call__(self):
+        decoder = self.decoder
+        errors = None if decoder.embedding_injection is None else decoder.embedding_injection.validate()
+        runtime = decoder.state.begin_runtime()
+        runtime.injection_errors = errors
+        state = decoder.state
+        metadata = CaptureMetadata(positions=runtime.qsa.query_positions,
+            starts=runtime.values["positions"], lengths=state.inputs.query_lengths[:state.rows],
+            requests=runtime.qsa.request_ids, state_rows=runtime.gdn.convolution_slots,
+            query_start_loc=runtime.gdn.query_start_loc)
+        runtime.capture_metadata = metadata
+        _, _, auxiliary, _ = decoder(runtime)
+        self.context(auxiliary.draft_features, metadata.lengths, metadata)
 
 
 class SpeculativePreparation(DFlash2Preparation):
@@ -137,11 +196,9 @@ class SpeculativePreparation(DFlash2Preparation):
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages, draft_head=None,
                  runtime=None, vocabulary_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None, graph_buffers=None, gather_runtime=None, buffer_layout=None,
-                 gdn_buffers=None):
+                 sampling_workspace=None, gather_runtime=None):
         self.target_weights, self.cache, self.rotary, self.table = weights, cache, rotary, table
         self.context, self.max_cache_pages = context, max_cache_pages
-        self.gdn_buffers = gdn_buffers
         device = pool.backing.device
         self.decoders, self.owners = [], []
         self.previous_accepted = torch.ones(requests.capacity, dtype=torch.int32, device=device)
@@ -163,7 +220,7 @@ class SpeculativePreparation(DFlash2Preparation):
             page_tokens=64, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspaces, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
-            block_size=draft_config.block_size, gather_runtime=gather_runtime, buffer_layout=buffer_layout)
+            block_size=draft_config.block_size, gather_runtime=gather_runtime)
 
     def buffers(self):
         return {}
@@ -175,12 +232,12 @@ class SpeculativePreparation(DFlash2Preparation):
             requests=s.qsa.request_ids, state_rows=s.gdn.convolution_slots,
             query_start_loc=s.gdn.query_start_loc)
         decoder.capture_context(metadata, self.weights.config.draft,
-            buffers=self.buffer_layout.capture.fork(), compact_prefill=True)
+            compact_prefill=True)
         context = PreparedContext(self.weights, decoder.auxiliary, metadata, self.pool,
             session=self.session, name=name + ".context", workspace=self.workspace,
             runtime=self.gather_runtime, coordinator=self.collectives["coordinator"],
-            buffers=self.buffer_layout.stage.fork(), compact_prefill=True)
-        operation = PreparedContextAbsorption(decoder, context, metadata)
+            compact_prefill=True)
+        operation = PreparedQwenContextAbsorption(decoder, context, session=self.session)
         self.owners.append(operation)
         return operation
 
@@ -190,13 +247,6 @@ class SpeculativePreparation(DFlash2Preparation):
     def rebind_pages_for_preparation(self, cache):
         self.cache = cache
 
-    def scratch_tensors(self):
-        values = [super().scratch_tensors(), self.records, self.buffer_layout.pool]
-        for operation in self.owners:
-            if isinstance(operation, PreparedContextAbsorption):
-                continue
-            state = operation.decoder.state
-            values.extend((state.gdn, state.qsa, operation.decoder.commit_counts,
-                state.token_state.pending_tokens, state.token_state.positions,
-                state.token_state.history, state.token_state.active))
-        return tuple(values)
+    def release_examples(self):
+        super().release_examples()
+        self.records = None

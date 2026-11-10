@@ -16,14 +16,52 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
                               reason="requires explicitly assigned tensor-parallel GPUs")
 
 
+def scratch_tensors(layout, device):
+    return {name: torch.empty(shape, dtype=dtype, device=device)
+            for name, (shape, dtype) in layout.items()}
+
+
 class SamplingRound:
-    def __init__(self, proposals, verify, ids, probabilities, valid, sampled, offset, seed):
+    def __init__(self, proposals, verify, logits, target, ids, probabilities, valid, sampled, offset, seed,
+                 *, source_logits=None):
         self.proposals, self.verify = proposals, verify
+        self.logits, self.target, self.seed = logits, target, seed
+        self.source_logits = source_logits
         self.ids, self.probabilities, self.valid = ids, probabilities, valid
         self.sampled, self.offset = sampled, offset
-        self.seed = seed
+        self.seed_bits = torch.empty_like(verify.seed_bits)
+        self.verify_offset = torch.empty_like(verify.offset)
+        self.acceptance = {name: torch.empty_like(value) for name, value in vars(verify.output).items()}
+        self.safe = {name: torch.empty_like(getattr(verify, name))
+                     for name in ("safe_ids", "safe_draft_probs", "safe_target_probs")}
 
     def __call__(self):
+        ids = torch.zeros_like(self.ids)
+        probabilities = torch.empty_like(self.probabilities)
+        valid = torch.empty_like(self.valid)
+        sampled, offset = torch.zeros_like(self.seed), torch.zeros_like(self.seed)
+        for index, proposal in enumerate(self.proposals):
+            offset.fill_(index * 4)
+            scratch = scratch_tensors(proposal.layout, ids.device)
+            q = proposal.run(scratch, self.logits, source_logits=self.source_logits, candidates=ids,
+                             seed=self.seed, offset=offset, sampled=sampled)
+            ids[:, index].copy_(sampled)
+            probabilities[:, index].copy_(q[:, 0])
+            valid[:, index].copy_(scratch["valid"][:, 0])
+        scratch = scratch_tensors(self.verify.layout, ids.device)
+        acceptance = self.verify.run(scratch, probabilities, self.target,
+            torch.ones(self.target.shape[:2], dtype=torch.bool, device=ids.device),
+            drafts=ids, draft_valid=valid, disjoint=True)
+        for destination, value in ((self.ids, ids), (self.probabilities, probabilities),
+                                   (self.valid, valid), (self.sampled, sampled), (self.offset, offset),
+                                   (self.seed_bits, scratch["seed_bits"]), (self.verify_offset, scratch["offset"])):
+            destination.copy_(value)
+        for name, destination in self.acceptance.items():
+            destination.copy_(getattr(acceptance, name))
+        for name, destination in self.safe.items():
+            destination.copy_(scratch[name])
+
+    def bound_reference(self):
         for index, proposal in enumerate(self.proposals):
             self.offset.fill_(index * 4)
             proposal()
@@ -31,25 +69,27 @@ class SamplingRound:
             self.probabilities[:, index].copy_(proposal.probabilities[:, 0])
             self.valid[:, index].copy_(proposal.valid[:, 0])
         self.verify()
+        self.seed_bits.copy_(self.verify.seed_bits)
+        self.verify_offset.copy_(self.verify.offset)
+        for name, destination in self.acceptance.items():
+            destination.copy_(getattr(self.verify.output, name))
 
     def results(self):
         return (self.ids, self.probabilities, self.valid, self.sampled, self.offset, self.seed,
-                self.verify.seed_bits, self.verify.offset,
-                *vars(self.verify.output).values(),
+                self.seed_bits, self.verify_offset, *self.acceptance.values(),
                 self.verify.rng.generation, self.verify.rng.target_offset,
                 self.verify.state.seed.view(torch.int64), self.verify.state.rng_counter.view(torch.int64))
 
 
 def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False):
     from ignition.components.draft_sampling import PreparedDraftDistribution
-    from ignition.components.parallel_draft import prepare_sampling_broadcasts, prepare_sampling_scratch
+    from ignition.components.parallel_draft import prepare_sampling_broadcasts
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
     from ignition.components.speculation import PreparedStochasticVerification, SpeculativeAcceptance, SpeculativeRngState
     from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                                 create_result_broadcast_runtime)
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -80,7 +120,6 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
         slots = torch.tensor([3, 0, 2, 1, *range(4, batch_capacity)], dtype=torch.int32, device=device)
         epochs = torch.full((batch_capacity,), 7, dtype=torch.int64, device=device)
         epochs[3] = 99
-        buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
         with RecordedPreparationSession(device=device, checkpoint="sampling-broadcast",
                 workload_schema="rank-sampling-v1", numerical_policy="default", coordinator=coordinator) as session:
             shapes = ([(batch, width, batch) for batch in (1, 2, 4, 8) for width in range(1, 7)]
@@ -88,17 +127,14 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                       [(4, 3, 4), (1, 1, 1), (4, 8, 3), (4, 3, 0)])
             for batch, width, active in shapes:
                 live = torch.tensor([active], dtype=torch.int32, device=device)
-                cursor = buffers.cursor()
-                workspace = prepare_sampling_scratch(batch, width, 257, device, buffers=cursor)
                 ids = torch.zeros((batch, width - 1), dtype=torch.int64, device=device)
-                probabilities = cursor.zeros((batch, width - 1, 257), torch.float32)
+                probabilities = torch.zeros((batch, width - 1, 257), dtype=torch.float32, device=device)
                 valid = torch.zeros((batch, width - 1), dtype=torch.bool, device=device)
                 seed = torch.arange(batch, dtype=torch.int64, device=device) + 51
                 offset, sampled = torch.zeros_like(seed), torch.zeros_like(seed)
                 logits = torch.randn((batch, 1, 257), generator=torch.Generator().manual_seed(17 + rank)).to(device)
                 proposals = tuple(PreparedDraftDistribution(logits, state, slots[:batch], epochs[:batch], live, ids,
-                    prefix_offset=index, seed=seed, offset=offset, sampled=sampled,
-                    workspace=workspace["proposal"]) for index in range(width - 1))
+                    prefix_offset=index, seed=seed, offset=offset, sampled=sampled) for index in range(width - 1))
                 if divergent_invalid:
                     if rank == 0:
                         logits[0].fill_(float("nan"))
@@ -125,19 +161,22 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                 rng.target_offset.copy_(torch.arange(capacity, device=device) * 16)
                 verify = PreparedStochasticVerification(probabilities, ids, target, state,
                     slots[:batch], epochs[:batch], live, rng=rng,
-                    draft_valid=valid, workspace=workspace["verify"])
+                    draft_valid=valid)
                 verify.prepare()
-                operation = SamplingRound(proposals, verify, ids, probabilities, valid, sampled, offset, seed)
-                operation()
+                operation = SamplingRound(proposals, verify, logits, target, ids, probabilities, valid, sampled, offset, seed,
+                    source_logits=logits[:, 0] if divergent_invalid else None)
+                operation.bound_reference()
                 reference = [tensor.cpu().clone() for tensor in operation.results()]
                 dist.broadcast_object_list(reference, src=0)
                 references.append(reference)
                 prepare_sampling_broadcasts(proposals, verify,
                     collectives=dict(vocabulary_runtime=runtime, coordinator=coordinator), session=session,
-                    name=f"sampling{batch}x{width}-active{active}", buffers=cursor, result_runtime=result_runtime)
+                    name=f"sampling{batch}x{width}-active{active}", result_runtime=result_runtime)
                 assert verify.broadcast.gather.runtime is (result_runtime if result_channel else runtime)
                 for proposal in proposals:
                     assert proposal.broadcast.gather.runtime is (result_runtime if result_channel else runtime)
+                for sampler in (*proposals, verify):
+                    sampler.functional(session=session)
                 owners.append(operation)
             session.tune(show_progress=False)
             for index, operation in enumerate(owners):
@@ -151,15 +190,13 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                 calls.append(call)
             session.freeze()
             bundle = PreparedGraphBundle(device=rank, graphs=graphs, buffers={},
-                resources=(owners, calls, session, runtime, result_runtime, state, buffers))
+                resources=(owners, calls, session, runtime, result_runtime, state))
             worker = bundle.start_worker()
             order = ((*range(len(owners)), *reversed(range(len(owners)))) if result_channel
                      else (0, 1, 2, 3, 0, 2, 1, 3))
             for index in order:
-                # Poison shared scratch before switching shape; every replay must initialize it.
-                for chunks in buffers.chunks.values():
-                    for tensor in chunks:
-                        tensor.fill_(float("nan") if tensor.is_floating_point() else 255)
+                for tensor in (*owners[index].acceptance.values(), *owners[index].safe.values()):
+                    tensor.fill_(float("nan") if tensor.is_floating_point() else 255)
                 torch.cuda.synchronize()
                 dist.barrier()
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -169,7 +206,7 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                 assert allocations == torch.cuda.memory_stats()["allocation.all.allocated"]
                 for field, (actual, expected) in enumerate(zip(owners[index].results(), references[index], strict=True)):
                     actual_host = actual.cpu()
-                    if actual is owners[index].verify.output.survival:
+                    if actual is owners[index].acceptance["survival"]:
                         root_survival = [actual_host if rank == 0 else None]
                         dist.broadcast_object_list(root_survival, src=0)
                         assert torch.equal(actual_host, root_survival[0]), (
@@ -181,17 +218,17 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                             f"rank {rank}, graph {index}, result field {field}: "
                             f"{int((actual_host != expected).sum())} differing entries"
                         )
-                verify = owners[index].verify
-                if verify.drafts.shape[1]:
-                    indices = verify.safe_ids.long().unsqueeze(-1)
-                    draft = verify.safe_draft_probs.gather(-1, indices).squeeze(-1)
-                    target = verify.safe_target_probs[:, :-1].gather(-1, indices).squeeze(-1)
+                observed_round = owners[index]
+                if observed_round.ids.shape[1]:
+                    indices = observed_round.safe["safe_ids"].long().unsqueeze(-1)
+                    draft = observed_round.safe["safe_draft_probs"].gather(-1, indices).squeeze(-1)
+                    target = observed_round.safe["safe_target_probs"][:, :-1].gather(-1, indices).squeeze(-1)
                     expected = torch.where(draft > 0, (target / draft).clamp(max=1.), (target > 0).float()).cumprod(-1)
                     # The broadcast commits rank zero's survival law, even when
                     # the peers deliberately supply different local distributions.
                     root_expected = [expected.cpu() if rank == 0 else None]
                     dist.broadcast_object_list(root_expected, src=0)
-                    actual = verify.output.survival[:, :verify.drafts.shape[1]].cpu()
+                    actual = observed_round.acceptance["survival"][:, :observed_round.ids.shape[1]].cpu()
                     observed = actual >= 0
                     torch.testing.assert_close(actual[observed], root_expected[0][observed], rtol=1e-6, atol=0)
             worker.close()
@@ -285,11 +322,12 @@ def _byte_rank(rank, world, rendezvous):
                 operation = PreparedBroadcast(tensors, runtime=runtime, session=session,
                     coordinator=coordinator, name=f"bytes{index}")
                 assert len(operation._unpack_groups) == (1, 3, 2)[index]
-                owners.append(operation)
+                operation.functional(session=session)
+                owners.append((operation, tensors))
                 cases.append((backings, inputs, expected))
             session.tune(show_progress=False)
-            for index, operation in enumerate(owners):
-                call = compile_forward(operation)
+            for index, (operation, tensors) in enumerate(owners):
+                call = compile_forward(lambda operation=operation, tensors=tensors: operation(tensors))
                 call()
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
@@ -304,8 +342,6 @@ def _byte_rank(rank, world, rendezvous):
             for index in (0, 1, 2, 0, 2, 1):
                 for backing, initial in zip(cases[index][0], cases[index][1], strict=True):
                     backing.copy_(initial)
-                owners[index].send.fill_(173)
-                owners[index].received.fill_(173)
                 torch.cuda.synchronize()
                 dist.barrier()
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]

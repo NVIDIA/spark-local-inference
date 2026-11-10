@@ -396,7 +396,7 @@ class PreparedDecoder:
             torch.arange(0, dim, 2, device=source.device, dtype=torch.float32) / dim)))
         self.scoring = None if scoring is None else scoring.prepare(scratch.activations, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator,
-            name=name + ".prompt", functional=True)
+            name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto", workspace=workspace).functional(session=session)
         self.context_capture = (PreparedContextCapture(metadata,

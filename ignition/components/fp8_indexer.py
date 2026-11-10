@@ -12,7 +12,8 @@ from b12x.attention.dsa_indexer._glm_pool_kernels import _write_pool
 from b12x.preparation import PreparedCall
 
 from ignition.components.indexer import PreparedSparseIndexer
-from ignition.preparation.tuning import declare
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import declare, register_finalizer
 
 
 @triton.jit
@@ -36,7 +37,8 @@ class PreparedFP8Indexer:
     """
 
     def __init__(self, query, weights, cache, pages, lengths, active, output, *,
-                 mode, session, name, workspace, buffers, prefill_records_per_call=None):
+                 mode, session, name, workspace, buffers=None, prefill_records_per_call=None,
+                 examples=None, example_role=None):
         if prefill_records_per_call is not None and (type(prefill_records_per_call) is not int
                                                      or prefill_records_per_call <= 0):
             raise ValueError("FP8 prefill record capacity per call must be a positive integer")
@@ -44,17 +46,26 @@ class PreparedFP8Indexer:
         if width != 128 or query.dtype != torch.bfloat16 or cache.shape[1] != 64 * 132:
             raise ValueError("FP8 indexing requires BF16 128-channel queries and 64-record pages")
         self.query, self.weights, self.cache = query, weights, cache
-        self.quantized = buffers.zeros(query.shape, torch.float8_e4m3fn)
-        self.scales = buffers.zeros((rows, heads), torch.float32)
-        self.scaled_weights = buffers.zeros((rows, heads), torch.float32)
+        if examples is not None and (not isinstance(example_role, str) or not example_role):
+            raise ValueError("shared indexer declarations require an explicit operand role")
+
+        def zeros(role, shape, dtype):
+            if examples is not None:
+                return declaration_tensor(examples, example_role + "." + role, shape, dtype, query.device)
+            return (torch.zeros(shape, dtype=dtype, device=query.device) if buffers is None
+                    else buffers.zeros(shape, dtype))
+        self.quantized = zeros("quantized", query.shape, torch.float8_e4m3fn)
+        self.scales = zeros("scales", (rows, heads), torch.float32)
+        self.scaled_weights = zeros("scaled_weights", (rows, heads), torch.float32)
         self.weight_normalization = (32 / heads) ** 0.5
         self.query_arguments = (query.view(-1, 128), self.quantized.view(-1, 128),
                                 self.scales.view(-1), self.scaled_weights.view(-1))
         self.query_plan = glm_pool.plan_queries(*self.query_arguments)
+        query_arguments = self.query_arguments
         declare(session, (self.query_plan.request(name=name + ".query",
-            prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*self.query_arguments))),))
+            prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*query_arguments))),))
         self.pages = pages
-        self.packed_pages = pages if mode == "prefill" else buffers.zeros(pages.shape, torch.int32)
+        self.packed_pages = pages if mode == "prefill" else zeros("packed_pages", pages.shape, torch.int32)
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
             max_page_table_width=pages.shape[1], topk=512, mode=mode,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)
@@ -69,10 +80,37 @@ class PreparedFP8Indexer:
             keys, self.cache.view(torch.float8_e4m3fn), self.cache.view(torch.float32),
             slots, self.cache.stride(0), num_warps=4)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.query_layout = tuple(self.query.shape)
+        self.copy_pages = self.packed_pages is not self.pages
+        self.selection.functional(session=session)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.query = self.weights = self.quantized = self.scales = self.scaled_weights = None
+        self.query_arguments = self.pages = self.packed_pages = None
+
+    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None):
+        output, _, _ = self._run(query, weights, pages, lengths, active)
+        return output
+
+    def _run(self, query=None, weights=None, pages=None, lengths=None, active=None):
+        if self.query is None:
+            rows, heads, _ = self.query_layout
+            quantized = torch.zeros(self.query_layout, dtype=torch.float8_e4m3fn, device=query.device)
+            scales = torch.zeros((rows, heads), dtype=torch.float32, device=query.device)
+            scaled_weights = torch.empty((rows, heads), dtype=torch.float32, device=query.device)
+            scaled_weights.copy_(weights)
+            scaled_weights.mul_(self.weight_normalization)
+            glm_pool.quantize_queries(query.view(-1, 128), quantized.view(-1, 128), scales.view(-1),
+                                      scaled_weights.view(-1), plan=self.query_plan)
+            output = self.selection(quantized, scaled_weights, pages.clone() if self.copy_pages else pages,
+                                    lengths, active)
+            return output, quantized, scaled_weights
         self.scaled_weights.copy_(self.weights)
         self.scaled_weights.mul_(self.weight_normalization)
         glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)
-        return self.selection()
+        return self.selection(), self.quantized, self.scaled_weights

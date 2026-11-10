@@ -6,7 +6,8 @@
 
 import itertools
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 from b12x.attention import sparse_mla
@@ -16,6 +17,7 @@ from ignition.components.linear import (
     BatchedQuantizedProjection, BatchedUnquantizedProjection, QuantizedProjection, prepare_projection,
 )
 from ignition.components import sm103
+from ignition.components.block_fp8 import BlockFP8Projection, _workspace_bytes
 from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.components.sparse_mla_sm103 import Sm103PrefillSparseMLA, Sm103SparseMLA
 from ignition.preparation.tuning import register_finalizer
@@ -113,29 +115,40 @@ _CHAINS = weakref.WeakValueDictionary()
 _CHAIN_HANDLES = itertools.count()
 
 
-@torch.library.custom_op("flare::start_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace"))
+@torch.library.custom_op("flare::start_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace", "encoded"))
 def _start_query_chain(source: torch.Tensor, query: torch.Tensor, absorbed: torch.Tensor, gathered: torch.Tensor,
-                       workspace: torch.Tensor, handle: int, stream: int) -> None:
+                       workspace: torch.Tensor, encoded: list[torch.Tensor], handle: int, stream: int) -> None:
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
     auxiliary.wait_stream(torch.cuda.current_stream(source.device))
     with torch.cuda.stream(auxiliary):
-        _CHAINS[handle].run(source, workspace)
+        _CHAINS[handle].run(source, query, absorbed, gathered, workspace, encoded)
 
 
 @_start_query_chain.register_fake
-def _fake_start_query_chain(source, query, absorbed, gathered, workspace, handle, stream):
+def _fake_start_query_chain(source, query, absorbed, gathered, workspace, encoded, handle, stream):
     pass
 
 
-@torch.library.custom_op("flare::join_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace"))
-def _join_query_chain(query: torch.Tensor, absorbed: torch.Tensor, gathered: torch.Tensor,
-                      workspace: torch.Tensor, stream: int) -> None:
+@torch.library.custom_op("flare::join_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace", "encoded"))
+def _join_query_chain(source: torch.Tensor, dependency: torch.Tensor, query: torch.Tensor,
+                      absorbed: torch.Tensor, gathered: torch.Tensor, workspace: torch.Tensor,
+                      encoded: list[torch.Tensor], stream: int) -> None:
     torch.cuda.current_stream(query.device).wait_stream(torch.cuda.ExternalStream(stream, device=query.device))
 
 
 @_join_query_chain.register_fake
-def _fake_join_query_chain(query, absorbed, gathered, workspace, stream):
+def _fake_join_query_chain(source, dependency, query, absorbed, gathered, workspace, encoded, stream):
     pass
+
+
+@dataclass(frozen=True)
+class PendingQueryChain:
+    source: torch.Tensor
+    query: torch.Tensor
+    absorbed: torch.Tensor
+    gathered: torch.Tensor
+    workspace: torch.Tensor
+    encoded: list[torch.Tensor]
 
 
 class QueryChain:
@@ -163,40 +176,96 @@ class QueryChain:
             self.values, self.scales = values, scales.view(torch.uint8)
         self.source, self.query, self.absorbed = source, query, absorbed
         self.gathered = gathered if gathered is not None else absorbed
+        self.query_layout = (tuple(query.shape), tuple(query.stride()), query.dtype)
+        self.absorbed_layout = (tuple(absorbed.shape), tuple(absorbed.stride()), absorbed.dtype)
+        self.gathered_layout = (tuple(self.gathered.shape), tuple(self.gathered.stride()), self.gathered.dtype)
         self.arena, self.parallel_plans = workspace, tuple(parallel_plans)
         for main in self.parallel_plans:
             workspace.register_parallel(main, projection.plan)
         self.stream_handle = workspace.auxiliary_stream.cuda_stream
         self.handle = next(_CHAIN_HANDLES)
         _CHAINS[self.handle] = self
-        register_finalizer(session, self.refresh, workspace=workspace)
+        register_finalizer(session, partial(self.refresh, self.parallel_plans, workspace), workspace=workspace)
 
-    def refresh(self):
-        main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in self.parallel_plans)
+    def refresh(self, parallel_plans, arena):
+        main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in parallel_plans)
         side_bytes = self.projection.plan.memory_requirements().scratch_nbytes
-        _, self.workspace = self.arena.views(((main_bytes,), torch.uint8), ((side_bytes,), torch.uint8))
+        _, self.workspace = arena.views(((main_bytes,), torch.uint8), ((side_bytes,), torch.uint8))
 
-    def run(self, source, workspace):
-        from ignition.components.sm103_projection import packed_out_workspace
+    def functional(self, *, session):
+        self.projection.functional(session=session)
+        self.absorb.functional(session=session)
+        if self.gather is not None:
+            self.gather.functional(session=session)
+        register_finalizer(session, self._finalize_functional, workspace=self.arena)
+        return self
 
-        if isinstance(self.projection, QuantizedProjection):
-            packed_out_workspace(source, self.values, self.scales, None, None, self.projection.output, workspace, "none",
+    def _finalize_functional(self):
+        plans = [self.projection.plan]
+        if getattr(self.projection, "quantizer_plan", None) is not None:
+            plans.append(self.projection.quantizer_plan)
+        self.workspace_nbytes = max(plan.memory_requirements().scratch_nbytes for plan in plans)
+        self.encoded_layouts = ()
+        if isinstance(self.projection, BlockFP8Projection):
+            rows, columns = self.query_layout[0][0], self.projection.weight.in_features
+            self.encoded_layouts = (((rows, columns), torch.float8_e4m3fn),
+                                   ((rows, columns // 128), torch.float32))
+            if self.projection.sm103 and rows <= 32:
+                self.encoded_layouts += (((columns // 128, rows), torch.float32),
+                                        (tuple(self.projection.weight.scales.T.shape), torch.float32))
+            self.workspace_nbytes = _workspace_bytes(self.projection.plan)
+        elif getattr(self.projection, "dense", False):
+            from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+
+            self.workspace_nbytes = DEFAULT_WORKSPACE_SIZE
+        self.source = self.query = self.absorbed = self.gathered = None
+        self.arena = self.workspace = self.parallel_plans = None
+
+    def run(self, source, query, absorbed, gathered, workspace, encoded):
+        from ignition.components.sm103_projection import packed_out_workspace, _dense_out_workspace
+
+        output = query.view(source.shape[0], -1)
+        if isinstance(self.projection, BlockFP8Projection):
+            from ignition.components.block_fp8 import _project_out, _quantize_out
+
+            _quantize_out(source, encoded[0], encoded[1])
+            activation_scales, weight_scales = encoded[1], self.projection.weight.scales
+            if len(encoded) == 4:
+                encoded[2].copy_(activation_scales.T)
+                encoded[3].copy_(weight_scales.T)
+                activation_scales, weight_scales = encoded[2:]
+            _project_out(encoded[0], activation_scales, self.projection.weight.values, weight_scales,
+                         output, workspace, self.projection.plan.handle)
+        elif isinstance(self.projection, QuantizedProjection):
+            packed_out_workspace(source, self.values, self.scales, None, None, output, workspace, "none",
                                  None, self.projection.plan.handle, "any")
+        elif self.projection.dense:
+            _dense_out_workspace(source, self.projection.weight, output, workspace, self.projection.plan.handle)
         else:
-            self.projection(source)
-        rows = self.absorbed.shape[0]
-        self.absorb(self.query[:rows].transpose(0, 1))
+            from b12x.gemm import bf16_gemv
+
+            bf16_gemv.mm(source, self.projection.weight, out=output, plan=self.projection.plan,
+                         bias=self.projection.bias)
+        self.absorb(query.transpose(0, 1), output=absorbed.transpose(0, 1))
         if self.gather is not None and not self.gather_on_main:
-            self.gather.run_eager(self.absorbed.view(rows, -1))
+            self.gather(absorbed.view(absorbed.shape[0], -1), output=gathered.view(gathered.shape[0], -1))
 
-    def start(self):
-        _start_query_chain(self.source, self.query, self.absorbed, self.gathered, self.workspace, self.handle,
-                           self.stream_handle)
+    def start(self, source, query, absorbed, gathered):
+        if self.source is None:
+            workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+        else:
+            workspace = self.workspace
+        encoded = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
+        _start_query_chain(source, query, absorbed, gathered, workspace, encoded, self.handle, self.stream_handle)
+        return PendingQueryChain(source, query, absorbed, gathered, workspace, encoded)
 
-    def finish(self):
-        _join_query_chain(self.query, self.absorbed, self.gathered, self.workspace, self.stream_handle)
+    def finish(self, pending, dependency):
+        source, query, absorbed, gathered, workspace, encoded = (
+            pending.source, pending.query, pending.absorbed, pending.gathered, pending.workspace, pending.encoded)
+        _join_query_chain(source, dependency, query, absorbed, gathered, workspace, encoded, self.stream_handle)
         if self.gather_on_main:
-            self.gather(self.absorbed.view(self.absorbed.shape[0], -1))
+            self.gather(absorbed.view(absorbed.shape[0], -1), output=gathered.view(gathered.shape[0], -1))
+        return gathered if self.gather is not None else absorbed
 
 
 class PreparedGlmMLA:
@@ -225,7 +294,7 @@ class PreparedGlmMLA:
                 or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
                     else weights["kv_b_proj"].out_features) != heads * 512):
             raise ValueError("GLM MLA cache or head partition geometry mismatch")
-        self.module, self.scratch, self.state, self.metadata = module, scratch, state, metadata
+        self.module, self.scratch, self.state, self.cache, self.metadata = module, scratch, state, state.cache, metadata
         # Decode projects and absorbs queries while records are selected; shared RoCE gathers follow the join.
         self.query_chain = None
         for key in ("q_a_layernorm", "kv_a_layernorm"):
@@ -248,6 +317,10 @@ class PreparedGlmMLA:
             self.absorb_weights, self.expand_weights = (values[:, :256], scales[:, :256]), (values[:, 256:], scales[:, 256:])
             batched_projection = BatchedQuantizedProjection
         self.mode = mode
+        self.heads, self.device, self.blocks = heads, source.device, metadata.block_table.shape[1]
+        self.context_ranks = 1 if context is None else context.shards.world
+        self.remote = context is not None and context.remote
+        self.sm103_prefill = context is None and mode == "prefill" and sm103.is_sm103(source.device)
         if context is None:
             self.query_absorption = batched_projection(scratch.query.transpose(0, 1),
                 self.absorb_weights, scratch.absorbed_query.transpose(0, 1), major="n",
@@ -359,11 +432,10 @@ class PreparedGlmMLA:
                 scratch.query, scratch.absorbed_query[:end - start], gather, scratch.gathered[:end - start],
                 session=session, workspace=workspace, parallel_plans=self.indexer.scratch_plans)
 
-    def attend_gathered_context(self):
+    def attend_gathered_context(self, s, m, query, physical, selected_lengths):
         """Attend one prefill request over its context gathered from every rank, one query slice at a time."""
         from .dcp import pull_context
 
-        s, m = self.scratch, self.metadata
         end = (m.positions.max() + 1).reshape(1)
         shards = self.context.shards
         if self.windows:
@@ -374,7 +446,7 @@ class PreparedGlmMLA:
             for first, gather in self.windows:
                 pack_records(cache, m.block_table[0], end, s.records, shards, first)
                 s.record_counts.copy_(window_counts(end, shards.world, first, window))
-                gather()
+                gather(output=s.records, counts=s.record_counts)
                 scatter_records(s.records, end, s.slab.view(torch.int32), shards, first)
         else:
             # The indexer's candidate gather orders this layer's peer cache writes before these reads.
@@ -382,12 +454,15 @@ class PreparedGlmMLA:
         # Selected indices are global positions, which index the slab directly.
         s.visible.copy_(m.positions + 1)
         for start, end, absorb, attention, expand in self.slices:
-            absorb(s.query[start:end].transpose(0, 1))
-            attention()
-            expand(s.attended[:end - start].transpose(0, 1))
+            absorbed = absorb(query[start:end].transpose(0, 1)).transpose(0, 1)
+            attended = attention(absorbed, physical[start:end], s.visible[start:end],
+                selected_lengths[start:end], cache=s.slab.view(-1, 64, 528))
+            expanded = expand(attended.transpose(0, 1)).transpose(0, 1)
+            s.expanded[start:end].copy_(expanded)
 
     def rebind_pages(self):
         """Write and attend through the state's current page pools after they were replaced."""
+        self.cache = self.state.cache
         self.writer.cache = self.state.cache
         self.indexer.rebind_pages()
         if self.context is None:
@@ -396,43 +471,82 @@ class PreparedGlmMLA:
             for slice in self.slices:
                 slice[4].rebind_cache(self.state.cache)
 
-    def __call__(self, source):
-        s, p = self.scratch, self.projections
-        p["qkv_a_proj"](source)
+    def functional(self, *, session):
+        if self.query_chain is not None:
+            self.query_chain.functional(session=session)
+        for projection in self.projections.values():
+            projection.functional(session=session)
+        if hasattr(self, "query_absorption"):
+            self.query_absorption.functional(session=session)
+            self.value_expansion.functional(session=session)
+        self.indexer.functional(session=session)
+        self.writer.functional(session=session)
+        if hasattr(self, "attention"):
+            self.attention.functional(session=session)
+        for item in getattr(self, "slices", ()):
+            for operator in item[2:]:
+                if hasattr(operator, "functional"):
+                    operator.functional(session=session)
+        for _, gather in getattr(self, "windows", ()):
+            gather.functional(session=session)
+        self.scratch = self.metadata = self.end = None
+        return self
+
+    def __call__(self, source, metadata):
+        output, _ = self.forward(source, metadata)
+        return output
+
+    def forward(self, source, metadata):
+        s = MLAScratch.allocate(source.shape[0], self.heads, self.blocks, self.mode, self.device,
+            context_ranks=self.context_ranks, remote=self.remote)
+        p = self.projections
+        projected = p["qkv_a_proj"](source)
+        s.projected_input.copy_(projected)
         rms_norm(s.query_input, self.module.q_a_layernorm.weight, s.query_residual,
             self.module.q_a_layernorm.variance_epsilon, round_before_weight=True)
         chain = self.query_chain
+        chain_pending = None
         if chain is not None:
-            chain.start()
+            chain_pending = chain.start(s.query_residual, s.query, s.absorbed_query, s.gathered)
+            query = s.query
         else:
-            p["q_b_proj"](s.query_residual)
+            query = p["q_b_proj"](s.query_residual).view(source.shape[0], self.heads, 256)
             if self.context is None:
-                self.query_absorption(s.query.transpose(0, 1))
+                absorbed_query = self.query_absorption(query.transpose(0, 1)).transpose(0, 1)
+                s.absorbed_query.copy_(absorbed_query)
         rms_norm(s.latent_input, self.module.kv_a_layernorm.weight, s.latent,
             self.module.kv_a_layernorm.variance_epsilon, round_before_weight=True)
-        self.writer()
-        self.indexer()
+        self.writer(s.latent, metadata.token_slots)
+        selection, index_scratch = self.indexer.forward(source, s.query_residual,
+            s.projected_input[:, 2048:2176], s.projected_input[:, 2176:2208], metadata, s.index)
+        physical, selected_lengths, page_table = selection
+        s = replace(s, index=index_scratch, query=query)
+        chain_result = chain.finish(chain_pending, physical) if chain is not None else None
         if self.context is None:
-            s.visible.copy_(self.metadata.positions + 1)
-            if self.end is not None:
-                self.end.copy_(self.metadata.positions.max().reshape(1) + 1)
-            if chain is not None:
-                chain.finish()
-            # The expansion BMM uses no arena scratch, so it reads the attention output in place.
-            attended, _ = self.attention.attend_in_scratch()
-            self.value_expansion(attended.transpose(0, 1))
+            s.visible.copy_(metadata.positions + 1)
+            if self.sm103_prefill:
+                end = metadata.positions.max().reshape(1) + 1
+                attended = self.attention(chain_result if chain_result is not None else s.absorbed_query,
+                    metadata.positions, selected_lengths, page_table[0], end, cache=self.cache)
+            else:
+                attended = self.attention(chain_result if chain_result is not None else s.absorbed_query,
+                    physical, s.visible, selected_lengths, cache=self.cache)
+            expanded = self.value_expansion(attended.transpose(0, 1)).transpose(0, 1)
+            s.expanded.copy_(expanded)
         elif self.mode == "prefill":
-            self.attend_gathered_context()
+            self.attend_gathered_context(s, metadata, query, physical, selected_lengths)
         else:
-            s.visible.copy_(self.context.shards.local_tokens(self.metadata.positions + 1))
+            s.visible.copy_(self.context.shards.local_tokens(metadata.positions + 1))
             for start, end, absorb, gather, attention, combine, expand in self.slices:
                 count = end - start
-                if chain is not None:
-                    chain.finish()
-                else:
-                    absorb(s.query[start:end].transpose(0, 1))
-                    gather(s.absorbed_query[:count].view(count, -1))
+                absorbed = s.absorbed_query[start:end] if chain is not None else absorb(query[start:end].transpose(0, 1)).transpose(0, 1)
+                gathered = (chain_result[start:end] if chain is not None else
+                            gather(absorbed.view(count, -1)).view(count, self.heads * self.context_ranks, 512))
                 # The head exchange uses its own channel, so it reads the partial output and LSE in place.
-                partial, lse = attention.attend_in_scratch()
-                expand(combine(partial, lse).transpose(0, 1))
-        return p["o_proj"](s.expanded.view(s.output.shape[0], -1))
+                partial, lse = attention(gathered, physical[start:end], s.visible[start:end],
+                    selected_lengths[start:end], cache=self.cache)
+                attended = combine(partial, lse)
+                expanded = expand(attended.transpose(0, 1)).transpose(0, 1)
+                s.expanded[start:end].copy_(expanded)
+        output = p["o_proj"](s.expanded.view(source.shape[0], -1))
+        return output, replace(s, output=output)

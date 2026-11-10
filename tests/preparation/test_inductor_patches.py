@@ -29,7 +29,7 @@ from ignition.patches.__main__ import main
 def installation(monkeypatch, tmp_path):
     """Install distribution metadata and exact source contexts from bundled diffs."""
     for name in ("torch._inductor.runtime.triton_heuristics", "torch._inductor.runtime.static_triton_launcher",
-                 "triton.runtime.build"):
+                 "torch._inductor.codegen.memory_planning", "triton.runtime.build"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     sources, expected, diffs = {}, {}, []
     for name in patches._PATCHES:
@@ -76,7 +76,7 @@ def test_preparation_startup_applies_patches_without_importing_torch(installatio
 
 
 def test_repeated_startup_keeps_files_and_reinstall_reapplies_patches(installation):
-    assert len(patches.apply()) == 3
+    assert len(patches.apply()) == len(installation.sources)
     installed = {relative: (installation.root / relative).stat() for relative in installation.sources}
     assert patches.apply() == ()
     for relative, before in installed.items():
@@ -84,11 +84,11 @@ def test_repeated_startup_keeps_files_and_reinstall_reapplies_patches(installati
         assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
     for relative, source in installation.sources.items():
         (installation.root / relative).write_bytes(source)
-    assert len(patches.apply()) == 3
+    assert len(patches.apply()) == len(installation.sources)
     assert_patched(installation)
 
 
-@pytest.mark.parametrize("patch_index", [0, 1, 2])
+@pytest.mark.parametrize("patch_index", range(len(patches._PATCHES)))
 @pytest.mark.parametrize("partial", [False, True])
 def test_existing_manual_patch_is_accepted(installation, patch_index, partial):
     for relative, before, after in patches._hunks(installation.diffs[patch_index]):
@@ -138,7 +138,7 @@ def test_missing_dependency_is_allowed_only_for_triton_on_windows(installation, 
     # Restrict distribution discovery to this installation, excluding the test runner's dependencies.
     monkeypatch.setattr(sys, "path", [str(installation.root)])
     if name == "triton" and target_platform == "win32":
-        assert len(patches.apply()) == 2
+        assert len(patches.apply()) == len(installation.sources) - 1
         assert patches.apply() == ()
         for relative, expected in installation.expected.items():
             if relative.startswith("torch/"):
@@ -195,7 +195,7 @@ def test_already_patched_imported_triton_module_is_accepted(installation, monkey
     target = installation.root / "triton/runtime/build.py"
     target.write_text(installation.expected["triton/runtime/build.py"])
     monkeypatch.setitem(sys.modules, "triton.runtime.build", SimpleNamespace())
-    assert len(patches.apply()) == 2
+    assert len(patches.apply()) == len(installation.sources) - 1
     assert_patched(installation)
 
 
@@ -234,7 +234,7 @@ def test_simultaneous_startup_produces_the_same_patched_files(installation):
 
 def test_explicit_entry_point_reports_errors_and_repeated_application(installation, capsys):
     assert main() == 0
-    assert capsys.readouterr().out.count("Patched ") == 3
+    assert capsys.readouterr().out.count("Patched ") == len(installation.sources)
     assert main() == 0
     assert capsys.readouterr().out == ""
     next(installation.root.glob("triton-*.dist-info/METADATA")).write_text("Name: triton\nVersion: 3.7.0\n")

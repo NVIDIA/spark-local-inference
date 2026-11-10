@@ -378,10 +378,20 @@ class PreparedAllReduceRMSNorm:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_rmsnorm(source, residual, self.weight, self.output, self.handle, self.input_addend,
-                           self.group_weights, self.group_ids)
-        return self.output
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = self.residual = self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=source.device)
+        else:
+            input_addend, group_weights, group_ids = self.input_addend, self.group_weights, self.group_ids
+        _all_reduce_rmsnorm(source, residual, self.weight, output, self.handle, input_addend,
+                           group_weights, group_ids)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_all_reduce_add", mutates_args=("residual",))
@@ -431,8 +441,16 @@ class PreparedAllReduceAdd:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_add(source, residual, self.handle, self.input_addend, self.group_weights, self.group_ids)
+    def functional(self, *, session):
+        self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        _all_reduce_add(source, residual, self.handle,
+                        self.input_addend if input_addend is None else input_addend,
+                        self.group_weights if group_weights is None else group_weights,
+                        self.group_ids if group_ids is None else group_ids)
+        return residual
 
 
 def _gather_transport_view(tensor):
@@ -737,13 +755,13 @@ class PreparedAllGather:
 
 
 @torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
-def _all_gather_varlen(counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+def _all_gather_varlen(source: torch.Tensor, counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    owner.runtime.all_gather_varlen(owner.source, counts, out=output, plan=owner.plan)
+    owner.runtime.all_gather_varlen(source, counts, out=output, plan=owner.plan)
 
 
 @_all_gather_varlen.register_fake
-def _fake_all_gather_varlen(counts, output, handle):
+def _fake_all_gather_varlen(source, counts, output, handle):
     pass
 
 
@@ -767,7 +785,8 @@ class PreparedVarlenGather:
             raise ValueError("variable-length gathers require one contiguous 16-byte-multiple row per rank")
         self.runtime, self.output, self.counts = runtime, output, counts
         # A rank's own row is its source, so the gather leaves it in place.
-        self.source = output[ranks.index(dist.get_rank())]
+        self.local_rank = ranks.index(dist.get_rank())
+        self.source = output[self.local_rank]
         self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather_varlen")
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(
@@ -777,9 +796,18 @@ class PreparedVarlenGather:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self):
-        _all_gather_varlen(self.counts, self.output, self.handle)
-        return self.output
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.source = self.counts = self.output = None
+
+    def __call__(self, output=None, counts=None):
+        output = self.output if output is None else output
+        counts = self.counts if counts is None else counts
+        _all_gather_varlen(output[self.local_rank], counts, output, self.handle)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_lse_reduce_scatter", mutates_args=("output",))
@@ -846,13 +874,28 @@ class PreparedLseReduceScatter:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = None
+        if self.roce:
+            self.send_layout = tuple(self.send.shape), self.send.dtype
+            self.send = self.received = None
+            self.gather.functional(session=session)
+        return self
+
     def __call__(self, partial, lse):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=partial.device).zero_()
         if self.roce:
             from .head_exchange import merge, pack
 
-            pack(partial, lse, self.send, self.rank, self.world)
-            self.gather(self.send)
-            merge(self.received, partial, lse, self.output, self.rank, self.world)
-            return self.output
-        _lse_reduce_scatter(partial, lse, self.output, self.handle)
-        return self.output
+            send = self.send
+            if send is None:
+                send = torch.zeros(self.send_layout[0], dtype=self.send_layout[1], device=partial.device)
+            pack(partial, lse, send, self.rank, self.world)
+            received = self.gather(send)
+            merge(received, partial, lse, output, self.rank, self.world)
+            return output
+        _lse_reduce_scatter(partial, lse, output, self.handle)
+        return output

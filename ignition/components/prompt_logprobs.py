@@ -4,10 +4,11 @@
 """Blocked vocabulary-shard projection and raw prompt-token statistics."""
 
 import torch
+
+from ignition.preparation.persistent import persistent_copy
 import triton
 import triton.language as tl
 
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.preparation.triton import launch_triton, prepare_triton
 
 from .collectives import PreparedAllGather
@@ -127,7 +128,6 @@ class PromptOutputs:
     def __init__(self, capacity, device):
         self.targets = torch.full((capacity,), -1, dtype=torch.int32, device=device)
         self.values = torch.zeros((2, capacity, PROMPT_FIELDS), dtype=torch.int32, device=device)
-        self.scratch = GraphBufferPool(device, chunk_bytes=2 << 20)
 
     def buffers(self):
         return dict(prompt_target_tokens=self.targets, prompt_logprobs=self.values)
@@ -137,15 +137,14 @@ class PreparedPromptReduction:
     """Reduce one bounded row block; partial exchanges never contain vocabulary rows."""
 
     def __init__(self, logits, targets, output, frame, *, start, vocabulary, offset,
-                 runtime, session, coordinator, name, buffers):
+                 runtime, session, coordinator, name):
         rows, local = logits.shape
         if isinstance(offset, int):
-            offset = torch.tensor([offset], dtype=torch.int32, device=logits.device)
+            offset = persistent_copy(torch.tensor([offset], dtype=torch.int32, device=logits.device))
         world = 1 if runtime is None else runtime.world_size
         tiles = triton.cdiv(local, _TILE)
         def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=logits.device) if buffers is None
-                    else buffers.zeros(shape, dtype))
+            return torch.zeros(shape, dtype=dtype, device=logits.device)
         stats = zeros((rows, tiles, 2), torch.float32)
         norm = zeros((rows, 2), torch.float32)
         keys = zeros((rows, tiles, _CANDIDATES), torch.uint64)
@@ -174,16 +173,6 @@ class PreparedPromptReduction:
     def functional(self, *, session):
         return _FunctionalPromptReduction(self, session=session)
 
-    def __call__(self):
-        statistics, local_stats, global_stats, candidates, local_candidates, finish = self.operations
-        statistics()
-        local_stats()
-        self.gather(self.partial.view(torch.bfloat16))
-        global_stats()
-        candidates()
-        local_candidates()
-        self.gather(self.partial.view(torch.bfloat16))
-        finish()
 
 
 class _FunctionalPromptReduction:
@@ -219,20 +208,14 @@ class _FunctionalPromptReduction:
 
 class PreparedPromptScoring:
     def __init__(self, source, weight, outputs, frame, *, vocabulary, rank=0,
-                 runtime=None, session, coordinator=None, name, copy_source=False, logits_dtype=torch.bfloat16,
-                 local_outputs=False):
+                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16):
         local = weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
-        buffers = None if local_outputs else outputs.scratch.cursor()
         def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=source.device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        if copy_source:
-            source = zeros(source.shape, source.dtype)
+            return torch.zeros(shape, dtype=dtype, device=source.device)
         self.source = source
         rows = min(BLOCK_ROWS, source.shape[0])
         logits = zeros((rows, local), logits_dtype)
-        stage = None if buffers is None else buffers.fork()
-        self.offset = torch.tensor([rank * local], dtype=torch.int32, device=source.device)
+        self.offset = persistent_copy(torch.tensor([rank * local], dtype=torch.int32, device=source.device))
         self.parts = []
         projection_type = UnquantizedProjection if isinstance(weight, torch.Tensor) else QuantizedProjection
         options = {} if isinstance(weight, torch.Tensor) else dict(activation_mode="auto")
@@ -243,20 +226,15 @@ class PreparedPromptScoring:
                 name=f"{name}.head{start}", **options)
             reduction = PreparedPromptReduction(logits[:count], outputs.targets, outputs.values, frame,
                 start=start, vocabulary=vocabulary, offset=self.offset, runtime=runtime,
-                session=session, coordinator=coordinator, name=f'{name}.reduce{start}',
-                buffers=None if stage is None else stage.fork())
+                session=session, coordinator=coordinator, name=f'{name}.reduce{start}')
             self.parts.append((view, projection, reduction))
 
     def functional(self, *, session):
         parts = tuple((start, view.shape[0], projection.functional(session=session), reduction.functional(session=session))
                       for start, (view, projection, reduction) in zip(
                           range(0, self.source.shape[0], BLOCK_ROWS), self.parts, strict=True))
+        self.source, self.parts = None, ()
         return _FunctionalPromptScoring(parts)
-
-    def __call__(self):
-        for source, projection, reduction in self.parts:
-            projection(source)
-            reduction()
 
 
 class _FunctionalPromptScoring:
@@ -269,7 +247,7 @@ class _FunctionalPromptScoring:
 
 
 class PromptScoring:
-    """One package's optional outputs, communication channel, and serial scratch pool."""
+    """Prompt-logprob outputs and their prepared communication channel."""
 
     def __init__(self, capacity, device, *, frame, group=None, ipc=None, remote_runtime=None):
         self.outputs = PromptOutputs(capacity, device)
@@ -301,20 +279,19 @@ class PromptScoring:
         return scoring
 
     def memory_report(self):
-        return dict(prompt_scoring_scratch_bytes=self.outputs.scratch.nbytes,
-                    prompt_output_bytes=sum(t.nbytes for t in self.outputs.buffers().values()))
+        return dict(prompt_output_bytes=sum(t.nbytes for t in self.outputs.buffers().values()))
 
     def zero_ranges(self):
         from ignition.preparation.disposable import storage_ranges
 
-        return storage_ranges((self.outputs.buffers(), self.outputs.scratch.chunks))
+        return storage_ranges(self.outputs.buffers())
 
-    def prepare(self, source, weight, *, vocabulary, session, coordinator, name, copy_source=False,
-                logits_dtype=torch.bfloat16, functional=False):
+    def prepare(self, source, weight, *, vocabulary, session, coordinator, name,
+                logits_dtype=torch.bfloat16):
         operation = PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
             rank=self.rank, runtime=self.runtime, session=session, coordinator=coordinator,
-            name=name, copy_source=copy_source, logits_dtype=logits_dtype, local_outputs=functional)
-        return operation.functional(session=session) if functional else operation
+            name=name, logits_dtype=logits_dtype)
+        return operation.functional(session=session)
 
 
 def scored_prefill_capacities(chunk):

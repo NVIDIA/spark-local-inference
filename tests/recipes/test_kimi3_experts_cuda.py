@@ -87,6 +87,7 @@ def _assert_matches_arithmetic(checkpoint, experts, scales, packed, expanded):
     from ignition.components.moe import PreparedRoutedExperts
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.preparation.compilation import compile_forward
 
     device = torch.device("cuda:0")
     w13, w2 = (torch.stack(x).to(device) for x in zip(*packed))
@@ -102,16 +103,23 @@ def _assert_matches_arithmetic(checkpoint, experts, scales, packed, expanded):
         arena = ScratchArena(device)
         session.register_scratch(arena)
         op = PreparedRoutedExperts(source, experts, ids, probabilities, output,
-                                   session=session, name="experts", workspace=arena)
+            session=session, name="experts", workspace=arena).functional(session=session)
         session.tune(show_progress=False)
+        arena.release_preparation()
+
+        def forward():
+            output.copy_(op(source, ids, probabilities))
+
+        compiled = compile_forward(forward)
         expected = moe_reference_w4a8_mx(source, w13, s13, None, torch.ones(4, device=device),
             w2, s2, None, torch.ones(4, device=device), ids, probabilities, 4, 3584, 192, activation="situ")
-        actual = op().clone()
+        compiled()
+        actual = output.clone()
         error = (actual.float() - expected).square().mean().sqrt() / expected.square().mean().sqrt()
         assert error.item() < .02
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            op()
+            compiled()
         for scale in scales:
             scale.fill_(255)
         allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]

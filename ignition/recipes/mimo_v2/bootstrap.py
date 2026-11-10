@@ -42,13 +42,12 @@ from ignition.preparation.collectives import (
     create_all_reduce_runtime,
     create_dma_all_reduce_runtime,
 )
-from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
@@ -242,11 +241,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         # The recipe declares no stream overlap: every branch runs on the main stream.
         arena = ScratchArena(device, overlap=False)
         session.register_scratch(arena)
-        graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-        prefill_storage = Scratch.allocate(weights.config, shard, config.prefill_chunk_size, 1, device,
-                                           buffers=graph_buffers.cursor())
+        prefill_storage = Scratch.allocate(weights.config, shard, config.prefill_chunk_size, 1, device)
         decoder_storage = Scratch.allocate(
-            weights.config, shard, config.decode_tokens, config.decode_samples, device, buffers=graph_buffers.cursor()
+            weights.config, shard, config.decode_tokens, config.decode_samples, device
         )
         vision_inputs = VisionInputs.allocate(device)
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -276,8 +273,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 pool,
                 requests,
                 inputs,
-                decoder_storage,
-                completion=completion,
+                    completion=completion,
                 frame=frame,
                 sequence=sequence,
                 session=session,
@@ -373,17 +369,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         if speculation is not None:
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
-            speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
             for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda shape: (shape[2], shape[0]), reverse=True):
                 name = f"speculative{batch}x{width}-tokens{packed}"
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                                                     buffers=speculation.sampling_buffers.cursor(), target_token_capacity=packed)
+                                                     target_token_capacity=packed)
                 forward.prepare()
                 add(name, forward, "speculative", batch, width, forward_inputs, enabled=True, packed_tokens=packed)
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
-            cursor = graph_buffers.cursor()
-            vision_storage[capacity] = VisionScratch.allocate(capacity, shard, device, buffers=cursor)
+            vision_storage[capacity] = VisionScratch.allocate(capacity, shard, device)
             encoder = PreparedVision(
                 weights.vision,
                 vision_storage[capacity],
@@ -393,9 +387,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 session=session,
                 workspace=arena,
                 name=name,
-                buffers=cursor,
             )
-            forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
+            forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
@@ -468,6 +461,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+    if speculation is not None:
+        speculation.release_examples()
+    metadata.clear()
+    scratch.clear()
+    vision_storage.clear()
+    prefill_storage = decoder_storage = storage = None
+    arena.release_preparation()
     stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
     pages = initial_pages
 
@@ -563,27 +563,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
         memory.update(speculative_round_shapes=config.speculative_round_shapes,
                       speculative_graph_budget=config.speculative_graph_budget)
-    disposable = [
-        prefill_storage,
-        decoder_storage,
-        arena.tensor,
-        metadata,
-        vision_storage,
-        vision_state.arena,
-        graph_buffers.chunks,
-    ]
-    if speculation is not None:
-        disposable.append(speculation.draft_scratch)
-        disposable.append(speculation.sampling_buffers.chunks)
-    for forward in forwards.values():
-        if isinstance(forward, PreparedScoredPrefill):
-            forward = forward.forward
-        if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
-            disposable.append(forward.completion.scratch_tensors)
-        if hasattr(forward, "decoder"):
-            disposable.append(forward.decoder.scratch_tensors())
-        if getattr(forward, "context", None) is not None:
-            disposable.append(forward.context.scratch_tensors())
     return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'draft', 'vision')),
         device=config.devices[rank],
         graphs=graphs,
@@ -594,14 +573,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         server_config=server_config,
         memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                           *storage_ranges(disposable), *completion.zero_ranges()),
+                           *completion.zero_ranges()),
         resources=(scoring,
             weights,
             vision_state,
             vision_inputs,
             vision_prefill,
-            vision_storage,
-            graph_buffers,
             pool,
             requests,
             inputs,
@@ -609,10 +586,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             commands,
             arena,
             forwards,
-            prefill_storage,
-            decoder_storage,
-            scratch,
-            metadata,
             compiled,
             stream,
             graph_pool,

@@ -14,6 +14,8 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.glm53.model import create_model_tree
 from ignition.recipes.glm53.stack import DecoderScratch
 from ignition.recipes.glm53.state import DecoderMetadata, DecoderState
+from ignition.recipes.glm53.mla import MLAState, PreparedGlmMLA
+from ignition.recipes.glm53.indexer import PreparedGlmIndexer
 
 
 def scratch_tensors(scratch, prefix=""):
@@ -24,6 +26,31 @@ def scratch_tensors(scratch, prefix=""):
             yield name, value
         elif value is not None:
             yield from scratch_tensors(value, f"{name}.")
+
+
+def test_sparse_attention_rebind_uses_replacement_cache_at_execution():
+    from types import SimpleNamespace
+
+    state = MLAState.allocate(1, 2, "cpu")
+    previous = torch.empty_like(state.cache)
+    indexer = object.__new__(PreparedGlmIndexer)
+    indexer.state, indexer.cache = state.index, previous
+    indexer.selectors, indexer.logical, indexer.expand_options = (), False, {}
+
+    class Attention:
+        def rebind_cache(self, cache):
+            self.cache = cache
+
+    prepared = object.__new__(PreparedGlmMLA)
+    prepared.state, prepared.cache = state, previous
+    prepared.writer, prepared.indexer = SimpleNamespace(cache=previous), indexer
+    prepared.attention, prepared.context = Attention(), None
+    prepared.rebind_pages()
+    assert prepared.cache is state.cache
+    assert prepared.writer.cache is state.cache
+    assert prepared.attention.cache is state.cache
+    assert prepared.indexer.cache is state.index.cache
+    assert prepared.indexer.expand_options["num_cache_blocks"] == state.index.cache.shape[0]
 
 
 @pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])

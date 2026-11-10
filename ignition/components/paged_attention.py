@@ -8,7 +8,7 @@ import triton
 from b12x.attention import paged, paged_decode, paged_kv_write
 from b12x.preparation import PreparedCall, plan_from_handle
 
-from ignition.preparation.persistent import persistent_empty
+from ignition.preparation.persistent import persistent_copy, persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
@@ -24,13 +24,15 @@ def _scratch(specs, workspace):
     return list(values) if isinstance(values, tuple) else [values]
 
 
-@torch.library.custom_op("flare::paged_attention", mutates_args=("output", "scratch"))
+@torch.library.custom_op("flare::paged_attention", mutates_args=("output", "scratch", "live_metadata"))
 def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torch.Tensor,
             lengths: torch.Tensor, cu: torch.Tensor, sink: torch.Tensor | None,
             output: torch.Tensor, scratch: list[torch.Tensor], k_descale: torch.Tensor | None,
             v_descale: torch.Tensor | None, selected_blocks: torch.Tensor | None,
             handle: int, decode: bool, window: int,
-            schedule_storage: torch.Tensor | None, schedule_slot: int, output_gate: torch.Tensor | None) -> None:
+            schedule_storage: torch.Tensor | None, schedule_slot: int, output_gate: torch.Tensor | None,
+            metadata_seeds: list[torch.Tensor], live_metadata: list[torch.Tensor],
+            chunk_pages_lut: torch.Tensor | None) -> None:
     plan = plan_from_handle(handle)
     if plan.component_id == "flare.paged_tma":
         from b12x.preparation.types import require_prepared
@@ -40,6 +42,9 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
     arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages, cache_seqlens=lengths,
                      cu_seqlens_q=cu, attention_sink_bias=sink, output=output, scratch=scratch,
                      k_descale=k_descale, v_descale=v_descale)
+    if metadata_seeds:
+        arguments["replay_metadata"] = paged.ReplayMetadata(
+            tuple(live_metadata if live_metadata else metadata_seeds), chunk_pages_lut)
     if selected_blocks is not None:
         arguments["q2k_indices"] = selected_blocks
     if schedule_slot >= 0:
@@ -53,7 +58,7 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
 
 
 @_attend.register_fake
-def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot, output_gate):
+def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot, output_gate, metadata_seeds, live_metadata, chunk_pages_lut):
     pass
 
 
@@ -219,7 +224,8 @@ class PreparedPagedAttention:
             paged.bind(self.plan, scratch=self.scratch, **self.arguments, window_left=self.window)
 
     def functional(self, *, session, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND,
-                   cache_seqlens=_BOUND_OPERAND, page_table=_BOUND_OPERAND, cu_seqlens_q=_BOUND_OPERAND):
+                   cache_seqlens=_BOUND_OPERAND, page_table=_BOUND_OPERAND, cu_seqlens_q=_BOUND_OPERAND,
+                   selected_blocks=_BOUND_OPERAND, schedule_storage=_BOUND_OPERAND):
         """Return attention with local output and selected-plan scratch.
 
         Omitted operands retain their prepared bindings. Bind an operand to None
@@ -232,20 +238,29 @@ class PreparedPagedAttention:
                 operation.arguments[name] = value
         if cu_seqlens_q is None and operation.compact_decode is not None:
             operation.compact_decode = (None, operation.compact_decode[1])
+        if selected_blocks is not _BOUND_OPERAND:
+            operation.selected_blocks = selected_blocks
+            if operation.compact_decode is not None:
+                operation.compact_decode = (operation.compact_decode[0], selected_blocks)
+        if schedule_storage is not _BOUND_OPERAND:
+            operation.schedule_storage = schedule_storage
         if self.schedules is not None:
-            if (any(component is self for component in self.schedules.components)
+            if (schedule_storage is _BOUND_OPERAND
+                    and any(component is self for component in self.schedules.components)
                     and operation.arguments["cache_seqlens"] is not self.schedules.lengths):
                 raise ValueError("shared attention schedules require their bound cache lengths")
             self.schedules.components[:] = [operation if component is self else component
                                            for component in self.schedules.components]
         register_finalizer(session, operation.bind)
+        if not operation.tma and not operation.decode:
+            self.workspace.register_preparation_release(operation.release_metadata)
         return operation
 
     def __call__(self):
         if self.tma is not None:
             q, key, value, pages, lengths, cu, output = self.tma.arguments
             _attend(q, key, value, pages, lengths, cu, None, output, [self.tma.scratch],
-                None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate)
+                None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate, [], [], None)
             return output
         a = self.arguments
         if self.compact_decode is not None:
@@ -258,7 +273,7 @@ class PreparedPagedAttention:
         _attend(a["q"], a["k_cache"], a["v_cache"], a["page_table"], a["cache_seqlens"],
                 a["cu_seqlens_q"], a["attention_sink_bias"], a["output"], self.scratch,
                 a["k_descale"], a["v_descale"], self.selected_blocks,
-                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot, None)
+                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot, None, [], [], None)
         if self.compact_decode is not None:
             positions = torch.arange(destination.shape[0], device=destination.device)
             requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)
@@ -293,17 +308,32 @@ class _FunctionalPagedAttention:
                 self.compact_decode = cu, selected
                 self.selected_blocks = None
             self.schedule_storage, self.schedule_slot = prepared.schedule_storage, prepared.schedule_slot
+        selected = None if self.tma else prepared.selected_blocks
+        self.selected_shape = None if selected is None else tuple(selected.shape)
         self.query_shape, self.query_dtype = tuple(q.shape), q.dtype
         self.output_shape, self.output_dtype = tuple(output.shape), output.dtype
         self.kernel_output_shape = tuple(kernel_output.shape)
         self.gated = prepared.output_gate is not None
         self.scratch_layout = None
+        self.metadata_seeds, self.chunk_pages_lut = (), None
+        self.live_metadata = False
 
     def bind(self):
         self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        if not self.tma and not self.decode:
+            metadata = paged.replay_metadata(self.plan)
+            self.metadata_seeds = metadata.tensors
+            self.chunk_pages_lut = metadata.chunk_pages_lut
+            self.live_metadata = metadata.live
+
+    def release_metadata(self):
+        self.metadata_seeds = tuple(persistent_copy(value) for value in self.metadata_seeds)
+        if self.chunk_pages_lut is not None:
+            self.chunk_pages_lut = persistent_copy(self.chunk_pages_lut)
+        paged.release_replay_metadata(self.plan)
 
     def __call__(self, q, *, output_gate=None, k_cache=None, v_cache=None, cache_seqlens=None,
-                 page_table=None, cu_seqlens_q=None):
+                 page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None):
         if self.scratch_layout is None:
             raise RuntimeError("functional paged attention requires finalized preparation")
         if tuple(q.shape) != self.query_shape or q.dtype != self.query_dtype:
@@ -311,7 +341,7 @@ class _FunctionalPagedAttention:
         if (output_gate is not None) != self.gated:
             raise ValueError("functional paged attention gate differs from prepared geometry")
         a = self.arguments
-        if (self.schedule_slot >= 0 and cache_seqlens is not None
+        if (self.schedule_slot >= 0 and schedule_storage is None and cache_seqlens is not None
                 and cache_seqlens is not a["cache_seqlens"]):
             raise ValueError("shared attention schedules require their bound cache lengths")
         key = a["k_cache"] if k_cache is None else k_cache
@@ -324,19 +354,31 @@ class _FunctionalPagedAttention:
         output = (torch.empty(self.kernel_output_shape, dtype=self.output_dtype, device=q.device) if self.tma
                   else torch.zeros(self.kernel_output_shape, dtype=self.output_dtype, device=q.device))
         scratch = [torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in self.scratch_layout]
-        selected = self.selected_blocks
+        selected = self.selected_blocks if selected_blocks is None else selected_blocks
         if self.compact_decode is not None:
-            bound_cu, selected = self.compact_decode
+            selected = self.compact_decode[1] if selected_blocks is None else selected_blocks
+        if ((selected is None) != (self.selected_shape is None)
+                or selected is not None and (tuple(selected.shape) != self.selected_shape
+                    or selected.dtype != torch.int32 or not selected.is_contiguous())):
+            raise ValueError("functional selected blocks differ from prepared geometry")
+        schedules = self.schedule_storage if schedule_storage is None else schedule_storage
+        if self.schedule_slot >= 0 and schedules is None:
+            raise ValueError("functional paged attention requires shared scheduling storage")
+        if self.compact_decode is not None:
+            bound_cu, bound_selected = self.compact_decode
+            selected = bound_selected if selected_blocks is None else selected_blocks
             cu = cu if bound_cu is None else bound_cu
             indices = cu[:-1].long().clamp(0, q.shape[0] - 1)
             active = cu[1:] > cu[:-1]
             q = torch.where(active[:, None, None], q[indices], 0)
             if selected is not None:
                 selected = torch.where(active[None, :, None], selected[:, indices], -1)
+        live_metadata = [value.clone() for value in self.metadata_seeds] if self.live_metadata else []
         _attend(q, key, value, pages, lengths,
             cu, a["attention_sink_bias"], output, scratch,
             a["k_descale"], a["v_descale"], selected, self.plan.handle, self.decode,
-            self.window, self.schedule_storage, self.schedule_slot, output_gate)
+            self.window, schedules,
+            self.schedule_slot, output_gate, list(self.metadata_seeds), live_metadata, self.chunk_pages_lut)
         if self.compact_decode is not None:
             positions = torch.arange(self.output_shape[0], device=output.device)
             requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)
@@ -365,9 +407,13 @@ class PreparedPagedKVWriter:
     def __call__(self):
         paged_kv_write.run(self.plan, **self.arguments)
 
-    def functional(self):
-        """Bind cache storage while accepting projected rows and slots at each call."""
-        return _FunctionalPagedKVWriter(self)
+    def functional(self, *, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND):
+        """Accept projected rows, slots, and explicitly unbound caches at invocation."""
+        operation = _FunctionalPagedKVWriter(self)
+        for name, value in (("k_cache", k_cache), ("v_cache", v_cache)):
+            if value is not _BOUND_OPERAND:
+                operation.arguments[name] = value
+        return operation
 
 
 class _FunctionalPagedKVWriter:
@@ -377,11 +423,18 @@ class _FunctionalPagedKVWriter:
                           if name not in ("key", "value", "slot_mapping", "dummy_scale")}
         self.caller_owned_placeholders = "dummy_scale" in prepared.arguments
 
-    def __call__(self, key, value, slots):
+    def __call__(self, key, value, slots, *, k_cache=None, v_cache=None):
+        arguments = dict(self.arguments)
+        if k_cache is not None:
+            arguments["k_cache"] = k_cache
+        if v_cache is not None:
+            arguments["v_cache"] = v_cache
+        if arguments["k_cache"] is None or arguments["v_cache"] is None:
+            raise ValueError("functional cache writing requires cache tensors at invocation")
         dummy_scale = (torch.empty((1,), dtype=torch.float32, device=key.device)
                        if self.caller_owned_placeholders else None)
         paged_kv_write.run(self.plan, key=key, value=value,
-            slot_mapping=slots, dummy_scale=dummy_scale, **self.arguments)
+            slot_mapping=slots, dummy_scale=dummy_scale, **arguments)
 
 
 class PagedAttentionMetadata:

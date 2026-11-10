@@ -563,7 +563,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         self.logits = None
         self.source_logits = None
 
-    def functional(self, *, session=None):
+    def functional(self, *, session=None, dynamic_inputs=False):
         if getattr(self, "_functional", False):
             return self
         if not self._prepared:
@@ -581,7 +581,18 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         runtime_slots(self._score_kernels[0], {2: "candidates"})
         runtime_slots(self._score_kernels[1], {1: "candidates", 10: "valid"})
         if self._candidate_kernels is not None:
-            runtime_slots(self._candidate_kernels[0], {3: "candidates"})
+            runtime_slots(self._candidate_kernels[0], {
+                1: "source_bias" if self.source_bias is not None else "source_logits",
+                3: "candidates",
+            })
+        if dynamic_inputs:
+            runtime_slots(self._score_kernels[0], {3: "slots"})
+            runtime_slots(self._score_kernels[1], {2: "slots", 3: "generations", 4: "live_rows"})
+            runtime_slots(self.proposal._kernels[-1], {7: "slots"})
+            if self._candidate_kernels is not None:
+                runtime_slots(self._candidate_kernels[0], {4: "slots"})
+            self.slots = self.generations = self.live_rows = None
+        self.source_bias = None
         runtime_slots(self.proposal._kernels[-1], {3: "valid", 8: "seed", 9: "offset", 10: "sampled"})
         if has_support:
             runtime_slots(self.proposal._kernels[-1], {16: "support_ids", 17: "support_probabilities"})
@@ -598,21 +609,28 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         self._functional = True
         return self
 
-    def run(self, scratch, logits, *, source_logits=None, shortlist_ids=None, candidates=None,
-            seed=None, offset=None, sampled=None):
+    def run(self, scratch, logits, *, source_logits=None, source_bias=None, shortlist_ids=None, candidates=None,
+            seed=None, offset=None, sampled=None, slots=None, generations=None, live_rows=None):
         from ignition.preparation.triton import launch_triton
 
         if not self._prepared:
             raise RuntimeError("draft proposal requires prepare() before capture")
 
         functional = getattr(self, "_functional", False)
-        runtime = dict(logits=logits, source_logits=source_logits, shortlist_ids=shortlist_ids,
-                       candidates=candidates, seed=seed, offset=offset, sampled=sampled)
+        source_bias = self.source_bias if source_bias is None else source_bias
+        slots = self.slots if slots is None else slots
+        generations = self.generations if generations is None else generations
+        live_rows = self.live_rows if live_rows is None else live_rows
+        runtime = dict(logits=logits, source_logits=source_logits, source_bias=source_bias, shortlist_ids=shortlist_ids,
+                       candidates=candidates, seed=seed, offset=offset, sampled=sampled,
+                       slots=slots, generations=generations, live_rows=live_rows)
         if functional and self._has_support:
             scratch = dict(scratch)
             batch = logits.shape[0]
-            scratch["support_ids"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.int64, device=logits.device)
-            scratch["support_probabilities"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.float32, device=logits.device)
+            if "support_ids" not in scratch:
+                scratch["support_ids"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.int64, device=logits.device)
+            if "support_probabilities" not in scratch:
+                scratch["support_probabilities"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.float32, device=logits.device)
 
         def launch(kernel):
             args = list(kernel.args)
@@ -626,7 +644,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                 elif self._candidate_kernels is not None and kernel is self._candidate_kernels[0]:
                     args[14] = candidates.stride(0)
                     args[15] = source_logits.stride(0)
-                    args[16] = (source_logits if self.source_bias is None else self.source_bias).stride(0)
+                    args[16] = (source_logits if source_bias is None else source_bias).stride(0)
                 elif self._runtime_shortlist and kernel is self.proposal._kernels[0]:
                     args[3] = shortlist_ids.stride(0)
             launch_triton(kernel.kernel, kernel.compiled, tuple(args), kernel.grid, **kernel.options)
@@ -634,8 +652,8 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         if self._candidate_kernels is None:
             if source_logits is not None:
                 logits[:, 0].copy_(source_logits.float())
-                if self.source_bias is not None:
-                    logits[:, 0].add_(self.source_bias)
+                if source_bias is not None:
+                    logits[:, 0].add_(source_bias)
             for kernel in self._score_kernels:
                 launch(kernel)
         else:
@@ -684,7 +702,7 @@ class PreparedDraftBlockBroadcast:
                     sampled=((depth, batch), torch.int64), valid=((depth, batch), torch.bool))
 
     def __init__(self, proposals, drafts, probabilities, valid, sampled, *, runtime,
-                 session, coordinator, name, buffers=None):
+                 session, coordinator, name):
         from .collectives import PreparedBroadcast
 
         batch, depth = drafts.shape
@@ -693,35 +711,30 @@ class PreparedDraftBlockBroadcast:
         if (probabilities.shape[:2] != (batch, depth) or valid.shape != drafts.shape
                 or sampled.shape != (batch,)):
             raise ValueError("block proposal outputs must cover every request and draft position")
-        layout = self.broadcast_layout(batch, depth)
-        def allocate(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=drafts.device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.support_ids, self.support_probabilities, self.sampled, self.valid = (
-            allocate(*field) for field in layout.values())
-        self.drafts, self.probabilities, self.output_valid = drafts, probabilities, valid
-        self.output_sampled = sampled
-        self.positions = torch.arange(depth, device=drafts.device)
+        self.layout = self.broadcast_layout(batch, depth)
+        examples = {key: torch.empty(shape, dtype=dtype, device=drafts.device)
+                    for key, (shape, dtype) in self.layout.items()}
         for index, proposal in enumerate(proposals):
-            proposal.proposal.bind_support(self.support_ids[index], self.support_probabilities[index])
-        self.broadcast = PreparedBroadcast(
-            (self.support_ids, self.support_probabilities, self.sampled, self.valid),
-            runtime=runtime, session=session, coordinator=coordinator, name=name, buffers=buffers)
+            proposal.proposal.bind_support(examples["support_ids"][index], examples["support_probabilities"][index])
+        self.broadcast = PreparedBroadcast(tuple(examples.values()), runtime=runtime, session=session,
+            coordinator=coordinator, name=name).functional(session=session)
 
-    def retain(self, position, proposal):
-        self.sampled[position].copy_(proposal.sampled)
-        self.valid[position].copy_(proposal.valid[:, 0])
+    def begin(self, device):
+        return {key: torch.empty(shape, dtype=dtype, device=device)
+                for key, (shape, dtype) in self.layout.items()}
 
-    def finish(self, active, limits, probabilities=None):
-        if probabilities is None:
-            probabilities = self.probabilities
-        self.broadcast()
-        self.drafts.copy_(self.sampled.T)
-        self.output_sampled.copy_(self.sampled[-1])
-        self.output_valid.copy_(self.valid.T & active[:, None]
-                                & (self.positions[None, :] < limits[:, None] - 1))
-        # Local supports can differ at every position. Clear the complete retained
-        # rows before restoring root q; padding repeats token zero with identical bits.
+    def retain(self, state, position, scratch, sampled):
+        state["support_ids"][position].copy_(scratch["support_ids"])
+        state["support_probabilities"][position].copy_(scratch["support_probabilities"])
+        state["sampled"][position].copy_(sampled)
+        state["valid"][position].copy_(scratch["valid"][:, 0])
+
+    def finish(self, state, drafts, probabilities, valid, sampled, active, limits):
+        self.broadcast(tuple(state.values()))
+        drafts.copy_(state["sampled"].T)
+        sampled.copy_(state["sampled"][-1])
+        positions = torch.arange(drafts.shape[1], device=drafts.device)
+        valid.copy_(state["valid"].T & active[:, None] & (positions[None, :] < limits[:, None] - 1))
         probabilities.zero_()
-        probabilities.scatter_(2, self.support_ids.permute(1, 0, 2),
-                                   self.support_probabilities.permute(1, 0, 2))
+        probabilities.scatter_(2, state["support_ids"].permute(1, 0, 2),
+                               state["support_probabilities"].permute(1, 0, 2))

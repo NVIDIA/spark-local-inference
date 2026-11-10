@@ -15,10 +15,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 def test_strided_attention_gate_preserves_rounding_and_captured_storage(tokens, packed):
     from b12x.preparation import PreparationSession
     from ignition.components.head_gate import PreparedHeadGate
-    from ignition.preparation.scratch import GraphBufferPool
+    from tests.tensor_examples import TensorExamples
 
-    pool = GraphBufferPool("cuda", chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples("cuda")
+    buffers = pool
     before = buffers.zeros((1024,), torch.bfloat16)
     qg = buffers.zeros((tokens, 14336) if packed else (tokens, 24, 512), torch.bfloat16)
     values = buffers.zeros((tokens, 24, 256), torch.bfloat16)

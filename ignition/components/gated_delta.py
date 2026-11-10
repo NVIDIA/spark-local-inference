@@ -493,6 +493,7 @@ class PreparedGDN:
             return self
         self._functional_requested = True
         self._dynamic_metadata = dynamic_metadata
+        self._has_partitions = self.partitions is not None
         self._functional_ready = False
         self.encoding_layout = ()
         if self.output_encoding is not None:
@@ -507,9 +508,10 @@ class PreparedGDN:
             if self.parallel_projections is not None:
                 self.parallel_projections.functional(session=session)
         if self.partitions is not None:
-            self.partitions = self.partitions.functional()
+            if not dynamic_metadata:
+                self.partitions = self.partitions.functional()
             for sequence in self.sequences_by_role:
-                sequence.functional(session=session)
+                sequence.functional(session=session, dynamic_metadata=dynamic_metadata)
         elif self.recovered is not None:
             self.recovered.functional(dynamic_metadata=dynamic_metadata)
         elif self.chunked is not None:
@@ -536,6 +538,8 @@ class PreparedGDN:
         self._binding_workspace = None
         if getattr(self, "_dynamic_metadata", False):
             self.metadata = None
+            if self._has_partitions:
+                self.partitions = None
         self._functional_ready = True
 
     def _functional_sequence(self, projected, z, a, b, *, records=None, metadata=None):
@@ -588,7 +592,7 @@ class PreparedGDN:
                                  live=metadata.num_tokens)
         return (recurrence if gated is None else gated).view(self.tokens, -1), encoded
 
-    def _functional(self, source, *, records=None, metadata=None):
+    def _functional(self, source, *, records=None, metadata=None, partitions=None):
         if not self._functional_ready:
             raise RuntimeError("functional GDN requires completed sequence binding finalization")
         if self.fused_qkvzba:
@@ -605,30 +609,33 @@ class PreparedGDN:
         if qkvz is not None:
             projected, z = qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
         b, a = ba.chunk(2, dim=-1)
-        if self.partitions is None:
+        if not self._has_partitions:
             if metadata is None:
                 gated, encoded = self._functional_sequence(projected, z, a, b, records=records)
             else:
                 gated, encoded = self._functional_sequence(projected, z, a, b, records=records, metadata=metadata)
         else:
+            partitions = self.partitions if partitions is None else partitions
+            if partitions is None:
+                raise ValueError("functional partitioned GDN requires runtime partitions")
             qkvz = torch.cat((projected, z), dim=-1) if qkvz is None else qkvz
             outputs = []
-            for part, sequence in zip(self.partitions.parts, self.sequences_by_role, strict=True):
+            for part, sequence in zip(partitions.parts, self.sequences_by_role, strict=True):
                 packed_qkvz, packed_ba = part.gather(qkvz), part.gather(ba)
                 part_projected, part_z = packed_qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
                 part_b, part_a = packed_ba.chunk(2, dim=-1)
                 values, _ = sequence._functional_sequence(part_projected, part_z, part_a, part_b,
-                    records=records if part.mode == "decode" else None)
+                    records=records if part.mode == "decode" else None, metadata=part.metadata)
                 outputs.append(values)
-            gated, encoded = self.partitions.combine(outputs), None
+            gated, encoded = partitions.combine(outputs), None
         if encoded is None:
             return self.projections["out_proj"](gated)
         return self.projections["out_proj"](gated, encoded_bases=encoded)
 
-    def __call__(self, source: torch.Tensor, *, records=None, metadata=None) -> torch.Tensor:
+    def __call__(self, source: torch.Tensor, *, records=None, metadata=None, partitions=None) -> torch.Tensor:
         if getattr(self, "_functional_requested", False):
-            return self._functional(source, records=records, metadata=metadata)
-        if records is not None or metadata is not None:
+            return self._functional(source, records=records, metadata=metadata, partitions=partitions)
+        if records is not None or metadata is not None or partitions is not None:
             raise ValueError("runtime GDN operands require functional execution")
         scratch = self.scratch
         if self.fused_qkvzba:

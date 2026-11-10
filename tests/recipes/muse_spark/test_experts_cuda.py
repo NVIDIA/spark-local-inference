@@ -37,16 +37,19 @@ def test_route_finalizer_canonical_rounding(tokens, valid):
     for slot in range(8):
         index = order[:, slot, None, None].expand(-1, 1, 4096)
         expected.add_(values.gather(1, index).squeeze(1))
-    prepared()
+    prepared.functional()
+    def forward():
+        output.copy_(prepared.run(routes, weights, ids, count))
+    forward()
     # Approximate reciprocal square root can differ at a BF16 midpoint.
     error = (output.float() - expected.float()).abs()
     assert error.max().item() <= .015625
     assert error.norm().item() / expected.float().norm().item() < .001
     assert torch.count_nonzero(output[valid:]) == 0
-    run = prepared
+    run = forward
     if tokens == 17:
         from ignition.preparation.compilation import compile_forward
-        run = compile_forward(prepared)
+        run = compile_forward(forward)
         run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -58,7 +61,6 @@ def test_route_finalizer_canonical_rounding(tokens, valid):
 
 def test_bf16_experts_raw_silu():
     from ignition.components.bf16_experts import PreparedBF16Experts
-    from ignition.preparation.scratch import GraphBufferPool
 
     torch.manual_seed(171)
     source = torch.randn((17, 128), device="cuda", dtype=torch.bfloat16)
@@ -69,19 +71,21 @@ def test_bf16_experts_raw_silu():
     ids[13:] = -1
     valid = torch.tensor([13], device="cuda", dtype=torch.int32)
     output = torch.empty((17, 2, 128), device="cuda", dtype=torch.bfloat16)
-    prepared = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid,
-                                  buffers=GraphBufferPool("cuda").cursor())
+    prepared = PreparedBF16Experts(source, gate_up, down, ids, weights, output, valid)
     expected = torch.zeros_like(output)
     for token in range(13):
         for route in range(2):
             expert = ids[token, route].item()
             gate, up = torch.nn.functional.linear(source[token], gate_up[expert]).chunk(2)
             expected[token, route] = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, down[expert])
-    prepared()
+    prepared.functional(session=None)
+    def forward():
+        output.copy_(prepared.run(source, ids, weights, valid))
+    forward()
     torch.testing.assert_close(output, expected, rtol=.025, atol=.002)
     assert torch.count_nonzero(output[13:]) == 0
     from ignition.preparation.compilation import compile_forward
-    run = compile_forward(prepared)
+    run = compile_forward(forward)
     run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

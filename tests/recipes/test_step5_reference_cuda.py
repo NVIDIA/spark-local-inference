@@ -17,7 +17,7 @@ from safetensors import safe_open
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.step5.weights import Step5WeightLoader
 
@@ -127,7 +127,8 @@ def test_dense_decoder_layer(checkpoint, index, monkeypatch, record_property):
         attention = PreparedAttention(index, weights, config, shard, scratch.normalized, scratch.attention,
             metadata, pool, mode="prefill", name="attention", **common)
         feed_forward = PreparedFeedForward(index, weights, config, scratch, name="mlp", overlap=False, **common)
-        layer = DecoderLayer(weights, attention, feed_forward, config.text["rms_norm_eps"])
+        layer = DecoderLayer(weights, lambda source: attention(source, metadata=metadata)[0],
+            feed_forward, config.text["rms_norm_eps"])
         session.tune()
         load_mxfp8_reference_mlp(ref.mlp, weights.mlp.gate_up)
         if ref.self_attn.is_sparse:
@@ -146,7 +147,7 @@ def test_dense_decoder_layer(checkpoint, index, monkeypatch, record_property):
         torch.testing.assert_close(layer.input_norm(residual).bfloat16(), hidden, rtol=0, atol=0)
         reference_attention = ref.self_attn(hidden, metadata.positions, cache, metadata.lengths,
                                             metadata.starts, is_decode=False)
-        attended = attention(hidden).clone()
+        attended = attention(hidden, metadata=metadata)[0].clone()
         tolerance = .008 if index == 91 else .006
         assert relative_error(attended, reference_attention) < tolerance
         normalized = ref.post_attention_layernorm(residual + attended.float()).bfloat16()
@@ -208,13 +209,13 @@ def test_mtp_feedback_and_proposals(checkpoint, monkeypatch, record_property):
         session.register_scratch(arena)
         common = {"runtime": None, "embedding_runtime": None, "vocabulary_runtime": None,
                       "coordinator": None, "session": session, "workspace": arena}
-        buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-        feedback = PreparedFeedback(weights, auxiliary, metadata, pool, scratch=scratch, name="feedback",
-                                    buffers=buffers.cursor(), **common)
-        draft = PreparedProposals(weights, pool, scratch.rows(1, 1), 1, 3, name="draft",
-                                  buffers=buffers.cursor(), **common)
+        feedback = PreparedFeedback(weights, auxiliary, metadata, pool, scratch=scratch, name="feedback", **common)
+        draft = PreparedProposals(weights, pool, scratch.rows(1, 1), 1, 3, name="draft", **common)
+        feedback.functional()
+        draft.release_outputs()
         session.tune()
-        compiled = compile_forward(lambda: feedback(auxiliary, counts))
+        arena.release_preparation()
+        compiled = compile_forward(lambda: feedback((auxiliary, None), counts, metadata))
         start = 0
         batches = []
         for offered, accepted in ((1, 1), (2, 2), (128, 128), (128, 128), (128, 128), (128, 128), (5, 5), (4, 2)):
@@ -241,7 +242,7 @@ def test_mtp_feedback_and_proposals(checkpoint, monkeypatch, record_property):
             auxiliary.zero_()
             auxiliary[:offered].copy_(hidden[begin:begin + offered])
             counts.fill_(accepted)
-            feedback(auxiliary, counts)
+            feedback((auxiliary, None), counts, metadata)
         torch.testing.assert_close(pool.backing, compiled_state, atol=0, rtol=0)
         pool.backing.zero_()
         for begin in range(start):
@@ -305,9 +306,9 @@ def test_mtp_feedback_and_proposals(checkpoint, monkeypatch, record_property):
                 errors[f"draft{i}.{kind}"] = relative_error(actual, expected)
 
         state_before = pool.backing.clone()
-        draft.begin(torch.ones(1, dtype=torch.int64, device=device))
+        state = draft.begin(torch.ones(1, dtype=torch.int64, device=device))
         for i in range(3):
-            logits = draft.step(i, tokens[start + i:start + i + 1], torch.tensor([start], device=device),
+            logits, state = draft.step(state, i, tokens[start + i:start + i + 1], torch.tensor([start], device=device),
                                 torch.ones(1, dtype=torch.int64, device=device), torch.ones(1, dtype=torch.bool, device=device))
             errors[f"draft{i}.logits"] = relative_error(logits[0], expected_logits[i])
         torch.testing.assert_close(pool.backing, state_before, atol=0, rtol=0)
@@ -326,10 +327,11 @@ def test_mtp_feedback_and_proposals(checkpoint, monkeypatch, record_property):
         actual_logits = torch.empty(3, config.vocabulary, device=device, dtype=torch.bfloat16)
 
         def deferred_round():
-            record(auxiliary, embedded, counts)
-            draft.begin(states)
+            record((auxiliary, embedded), counts, metadata)
+            state = draft.begin(states)
             for i in range(3):
-                actual_logits[i].copy_(draft.step(i, next_tokens[i:i + 1], before, states, active)[0])
+                logits, state = draft.step(state, i, next_tokens[i:i + 1], before, states, active)
+                actual_logits[i].copy_(logits[0])
 
         execute = compile_forward(deferred_round)
         graph = None
@@ -345,11 +347,13 @@ def test_mtp_feedback_and_proposals(checkpoint, monkeypatch, record_property):
             before.fill_(start + accepted)
             next_tokens.copy_(tokens[start + accepted:start + accepted + 3])
             pool.backing.copy_(state_before)
-            feedback(auxiliary, counts)
+            feedback((auxiliary, None), counts, metadata)
             expected_state = pool.backing.clone()
-            draft.begin(states)
-            expected_logits = [draft.step(i, next_tokens[i:i + 1], before, states, active).clone()
-                               for i in range(3)]
+            state = draft.begin(states)
+            expected_logits = []
+            for i in range(3):
+                logits, state = draft.step(state, i, next_tokens[i:i + 1], before, states, active)
+                expected_logits.append(logits.clone())
             pool.backing.copy_(state_before)
             if graph is None:
                 execute()
@@ -395,8 +399,7 @@ def test_vision_encoder(checkpoint):
     with torch.device("meta"):
         ref = reference.Step5VisionEncoder(reference.Step5VisionConfig(**weights.config))
     ref = load_reference(ref, "vision_model.", manifest)
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
-    scratch = VisionScratch.allocate(4096, shard, device, buffers=buffers)
+    scratch = VisionScratch.allocate(4096, shard, device)
     arena = ScratchArena(device)
     torch.manual_seed(912)
     images = [torch.randn(1, 3, side, side, dtype=torch.bfloat16, device=device) for side in (504, 728)]
@@ -411,20 +414,26 @@ def test_vision_encoder(checkpoint):
                                     numerical_policy="default") as session:
         session.register_scratch(arena)
         encoder = PreparedVision(weights, scratch, VisionInputs.allocate(device), runtime=None, coordinator=None,
-                                 session=session, workspace=arena, name="vision", buffers=buffers)
+                                 session=session, workspace=arena, name="vision")
         session.tune()
+        work = encoder.allocate_inputs()
+        for value in work.values():
+            value.zero_()
+        output = torch.empty_like(scratch.output)
+        encoder.release_outputs()
+        arena.release_preparation()
         base = first_base = second_base = 0
         cu = [0]
-        encoder.first_indices.fill_(-1)
-        encoder.second_indices.fill_(-1)
+        work["first_indices"].fill_(-1)
+        work["second_indices"].fill_(-1)
         for image in images:
             side = image.shape[-1] // 14
             patches = side * side
-            scratch.patches[base:base + patches].copy_(image[0].reshape(3, side, 14, side, 14)
+            work["patches"][base:base + patches].copy_(image[0].reshape(3, side, 14, side, 14)
                 .permute(1, 3, 0, 2, 4).reshape(patches, 588))
             y, x = torch.meshgrid(torch.arange(side, device=device), torch.arange(side, device=device), indexing="ij")
             positions = torch.stack((y.flatten(), x.flatten()), -1)
-            encoder.positions[base:base + patches].copy_(positions)
+            work["positions"][base:base + patches].copy_(positions)
             coordinate = ((52 / side) * (positions.float() + .5) - .5).clamp_min(0)
             lo, hi = coordinate.long(), (coordinate.long() + 1).clamp_max(51)
             fraction = coordinate - lo
@@ -432,11 +441,11 @@ def test_vision_encoder(checkpoint):
             for i, j in ((0, 0), (0, 1), (1, 0), (1, 1)):
                 indices.append((hi if i else lo)[:, 0] * 52 + (hi if j else lo)[:, 1])
                 probabilities.append((fraction if i else 1 - fraction)[:, 0] * (fraction if j else 1 - fraction)[:, 1])
-            encoder.interpolation_indices[base:base + patches].copy_(torch.stack(indices, -1))
-            encoder.interpolation_weights[base:base + patches].copy_(torch.stack(probabilities, -1))
+            work["interpolation_indices"][base:base + patches].copy_(torch.stack(indices, -1))
+            work["interpolation_weights"][base:base + patches].copy_(torch.stack(probabilities, -1))
             for extent, source_base, output_base, buffer in (
-                (side, base, first_base, encoder.first_indices),
-                (side // 2, first_base, second_base, encoder.second_indices),
+                (side, base, first_base, work["first_indices"]),
+                (side // 2, first_base, second_base, work["second_indices"]),
             ):
                 neighbors = []
                 for row in range(extent // 2):
@@ -449,17 +458,18 @@ def test_vision_encoder(checkpoint):
             first_base += patches // 4
             second_base += patches // 16
             cu.append(base)
-        encoder.cu.fill_(base)
-        encoder.cu[:len(cu)].copy_(torch.tensor(cu, device=device))
-        actual = encoder()[:expected.shape[0]].clone()
+        work["cu"].fill_(base)
+        work["cu"][:len(cu)].copy_(torch.tensor(cu, device=device))
+        actual = encoder(work)[:expected.shape[0]].clone()
         assert relative_error(actual, expected) < .03
-        compiled = compile_forward(encoder)
-        actual = compiled()[:expected.shape[0]].clone()
+        compiled = compile_forward(lambda: output.copy_(encoder(work)))
+        compiled()
+        actual = output[:expected.shape[0]].clone()
         assert relative_error(actual, expected) < .03
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             compiled()
-        baseline = scratch.output.clone()
+        baseline = output.clone()
         graph.replay()
-        torch.testing.assert_close(scratch.output, baseline, atol=0, rtol=0)
+        torch.testing.assert_close(output, baseline, atol=0, rtol=0)
         graph.reset()

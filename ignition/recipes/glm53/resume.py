@@ -31,10 +31,19 @@ class PreparedResume:
         self.completion.prepare()
         self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
+        self.state.functional()
+        self.validation.functional(session=session)
+        self.projection.functional(session=session)
+        self.completion.functional(session=session)
+        self.local_logits = self.logits = None
         self.compilation_variant = "sample"
 
     def __call__(self):
-        self.validation(self.state.validate())
-        hidden = self.state.gather()
-        self.projection(hidden)
-        self.completion()
+        self.forward()
+
+    def forward(self):
+        validation, present = self.state.validate()
+        hidden = self.state.gather(self.validation(validation), present=present)
+        logits = self.projection(hidden)
+        self.completion.run(logits)
+        return hidden, logits

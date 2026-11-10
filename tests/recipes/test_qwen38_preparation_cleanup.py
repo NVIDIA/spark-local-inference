@@ -40,6 +40,10 @@ class Routing:
         storage.device = 0
         storage._allocator = self.pool()
         storage._preparation_pools = set()
+        storage._retention_scope = False
+        storage._context_tokens = []
+        storage._persistent_arena = None
+        storage._persistent_model_owned = False
         storage.numeric_storage = contextlib.nullcontext()
         storage._scope = torch.cuda.use_mem_pool(self.pool(), device=0)
         storage.seal_low_window = lambda: self.events.append(("seal", 0))
@@ -63,6 +67,7 @@ def routing(monkeypatch):
     hooks = Routing()
     monkeypatch.setattr(torch.cuda, "_lazy_init", lambda: pytest.fail("CPU test initialized CUDA"))
     monkeypatch.setattr(torch.cuda, "MemPool", hooks.pool)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: hooks.events.append(("synchronize", 0)))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: hooks.events.append(("empty-cache", 0)))

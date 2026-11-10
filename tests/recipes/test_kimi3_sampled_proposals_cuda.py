@@ -41,11 +41,27 @@ def test_markov_bias_and_sampled_distribution_replay():
                                 session=session, name="kimi.markov")
         proposal = PreparedDraftDistribution(torch.zeros(batch, 1, vocab, device=device), state,
             slots, epochs, live, prefix, seed=seeds, offset=offsets, sampled=torch.zeros_like(seeds))
-        proposal.bind_logits(head, markov.logits)
+        proposal.bind_logits(head, torch.empty(batch, vocab, dtype=torch.float32, device=device))
         proposal.prepare()
+        proposal.functional(session=session, dynamic_inputs=True)
+        observed_logits = torch.empty(batch, vocab, dtype=torch.float32, device=device)
+        observed_probabilities = torch.empty(batch, 1, vocab, device=device)
+        observed_valid = torch.empty(batch, 1, dtype=torch.bool, device=device)
+        observed_sampled = torch.empty_like(seeds)
+
         def forward():
-            markov()
-            proposal()
+            transition = markov(pending)
+            scratch = {name: torch.empty(shape, dtype=dtype, device=device)
+                       for name, (shape, dtype) in proposal.layout.items()}
+            logits = torch.empty(batch, 1, vocab, device=device)
+            sampled = torch.empty_like(seeds)
+            probabilities = proposal.run(scratch, logits, source_logits=head, source_bias=transition,
+                candidates=prefix, seed=seeds, offset=offsets, sampled=sampled,
+                slots=slots, generations=epochs, live_rows=live)
+            observed_logits.copy_(transition)
+            observed_probabilities.copy_(probabilities)
+            observed_valid.copy_(scratch["valid"])
+            observed_sampled.copy_(sampled)
         compiled = compile_forward(forward)
         compiled()
         graph = torch.cuda.CUDAGraph()
@@ -58,11 +74,11 @@ def test_markov_bias_and_sampled_distribution_replay():
                 offsets.fill_(4 * iteration)
                 graph.replay()
                 expected = weights.draft.markov_embedding[pending].float() @ weights.draft.markov_head.float().T
-                torch.testing.assert_close(markov.logits, expected, rtol=1e-5, atol=1e-6)
-                assert proposal.valid.all()
-                assert (proposal.probabilities[:, 0].count_nonzero(-1) > 1).all()
-                torch.testing.assert_close(proposal.probabilities.sum(-1), torch.ones(batch, 1, device=device))
-                observed.append(proposal.sampled.clone())
+                torch.testing.assert_close(observed_logits, expected, rtol=1e-5, atol=1e-6)
+                assert observed_valid.all()
+                assert (observed_probabilities[:, 0].count_nonzero(-1) > 1).all()
+                torch.testing.assert_close(observed_probabilities.sum(-1), torch.ones(batch, 1, device=device))
+                observed.append(observed_sampled.clone())
             assert torch.stack(observed).unique().numel() > batch
         finally:
             graph.reset()

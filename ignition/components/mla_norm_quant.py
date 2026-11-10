@@ -8,15 +8,16 @@ from b12x.preparation import PreparedCall
 from b12x.quantization import mla_norm_mxfp8, mxfp8
 
 from ignition.preparation.fixtures.projection import input_factory
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_context_plan
+from ignition.preparation.tuning import declare, register_context_plan, register_finalizer
 
 
 class PreparedMLANormQuant:
     """Normalize query and KV slices, then encode the rounded BF16 query."""
 
     def __init__(self, projected, weights, query, kv, *, eps, session, name, buffers=None,
-                 release_dependents=False):
+                 release_dependents=False, examples=None):
         rows = projected.shape[0]
         if (projected.shape != (rows, 1792) or projected.dtype != torch.bfloat16
                 or not projected.is_contiguous() or query.shape != (rows, 1280)
@@ -30,13 +31,16 @@ class PreparedMLANormQuant:
                     or weight.device != projected.device or not weight.is_contiguous()):
                 raise ValueError("MLA normalization affine weights must match their output slices")
             record_numeric_tensor(weight)
-        def allocate(shape, dtype):
+        def allocate(role, shape, dtype):
+            if examples is not None:
+                return declaration_tensor(examples, "mla.query." + role, shape, dtype, projected.device)
             return (torch.zeros(shape, dtype=dtype, device=projected.device) if buffers is None
                     else buffers.zeros(shape, dtype))
 
         values_shape, rows_shape, mma_shape = mxfp8.dense_rows_storage_shapes(rows, 1280)
-        self.encoded_bases = (allocate(values_shape, torch.float8_e4m3fn),
-                              allocate(rows_shape, torch.uint8), allocate(mma_shape, torch.uint8))
+        self.encoded_bases = (allocate("values", values_shape, torch.float8_e4m3fn),
+                              allocate("scale_rows", rows_shape, torch.uint8),
+                              allocate("scale_mma", mma_shape, torch.uint8))
         self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
         self.plan = mla_norm_mxfp8.plan(mla_norm_mxfp8.Query(
             rows=rows, query_weight_dtype=str(weights[0].dtype).removeprefix("torch."),
@@ -46,18 +50,33 @@ class PreparedMLANormQuant:
         representative = input_factory(projected, projected,
             storage=getattr(session, "benchmark_storage", None))
 
+        encoded_bases, encoded = self.encoded_bases, self.encoded
+
         def prepare(state, fixture=None):
             source = projected if fixture is None else fixture.source
             return PreparedCall(run=lambda: state.run(source, *self.weights, query, kv,
-                *self.encoded_bases), produce=None if fixture is None else fixture.produce,
-                output=(query, kv, *self.encoded_bases), owners=(fixture, self.encoded))
+                *encoded_bases), produce=None if fixture is None else fixture.produce,
+                output=(query, kv, *encoded_bases), owners=(fixture, encoded))
 
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: prepare(state),
             benchmark_call=lambda state: prepare(state, representative())),))
         register_context_plan(session, name, self)
 
+    def functional(self, *, session):
+        self.layouts = tuple((tuple(t.shape), t.dtype) for t in (self.query, self.kv, *self.encoded_bases))
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.query = self.kv = self.encoded_bases = self.encoded = None
+
     def __call__(self, projected):
+        if self.query is None:
+            query, kv, *bases = (torch.zeros(shape, dtype=dtype, device=projected.device)
+                                 for shape, dtype in self.layouts)
+            mla_norm_mxfp8.run(projected, *self.weights, query, kv, *bases, plan=self.plan)
+            return query, kv, tuple(bases)
         mla_norm_mxfp8.run(projected, *self.weights, self.query, self.kv,
                             *self.encoded_bases, plan=self.plan)
         return self.query, self.kv

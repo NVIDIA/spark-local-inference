@@ -88,20 +88,19 @@ def metadata(batch, width=8):
 def test_context_accepted_fp8_capture(width):
     from b12x.preparation import PreparationSession
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.muse_spark.dflash import PreparedContext
     weights, pool = fixture(), Pool()
     m, set_values = metadata(4, width)
     tokens = 4 * width
     aux = torch.randn((tokens, 1280), device='cuda', dtype=torch.bfloat16)
     counts = torch.tensor([width, 3, 0, 5], device='cuda')
-    buffers = GraphBufferPool('cuda')
     with PreparationSession(device='cuda:0', autotune=False) as session:
         arena = ScratchArena('cuda')
         context = PreparedContext(weights, aux, m, pool, session=session, name='ctx', workspace=arena,
-                                  runtime=None, coordinator=None, buffers=buffers.cursor())
+                                  runtime=None, coordinator=None)
         arena.finalize()
-        fn = compile_forward(lambda: context(aux, counts))
+        fn = compile_forward(lambda: context(aux, counts, m))
         fn()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -136,31 +135,34 @@ def test_context_accepted_fp8_capture(width):
 @torch.no_grad()
 def test_private_attention_alternating_capacities():
     from b12x.preparation import PreparationSession
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.muse_spark.dflash import DraftScratch, DraftAttention
+    from ignition.components.dflash2 import _draft_templates
     weights, pool = fixture(), Pool()
     for value in pool.values.values():
         value.copy_(fp8(torch.randn(value.shape, device='cuda') * .2))
     original = {name: value.clone() for name, value in pool.values.items()}
-    buffers = GraphBufferPool('cuda')
-    scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 32, 'cuda', buffers=buffers.cursor())
+    scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 32, 'cuda')
     with PreparationSession(device='cuda:0', autotune=False) as session:
         arena = ScratchArena('cuda')
         prepared = []
         for batch in (1, 4):
             m, setter = metadata(batch)
-            s = scratch.rows(batch*8, batch*8)
+            s = _draft_templates(weights.config.draft, weights.shard, scratch.rows(batch*8, batch*8), "cuda")
             attention = DraftAttention(0, weights.draft.layers[0], s.normalized, weights.config.draft,
                 weights.shard, s, m, pool, runtime=None, coordinator=None, session=session,
-                name=f'attn{batch}', workspace=arena, buffers=buffers.cursor())
+                name=f'attn{batch}', workspace=arena)
             prepared.append((s, m, setter, attention))
         arena.finalize()
         graphs = []
         for s, m, setter, op in prepared:
-            op(s.normalized)
+            op.functional()
+            def call(op=op, s=s, m=m):
+                s.output.copy_(op(s.normalized, m))
+            call()
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
-                op(s.normalized)
+                call()
             graphs.append(graph)
         for turn in range(4):
             index = turn % 2
@@ -207,11 +209,10 @@ def test_private_attention_alternating_capacities():
 def test_five_layer_draft_compiled_replay(tmp_path):
     from b12x.preparation import PreparationSession
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.muse_spark.dflash import DraftScratch, PreparedDraft
     weights, pool = fixture(), Pool()
-    buffers = GraphBufferPool('cuda')
-    scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 32, 'cuda', buffers=buffers.cursor())
+    scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 32, 'cuda')
     before_pool = {name: value.clone() for name, value in pool.values.items()}
     with PreparationSession(device='cuda:0', autotune=False) as session:
         arena = ScratchArena('cuda')
@@ -220,12 +221,21 @@ def test_five_layer_draft_compiled_replay(tmp_path):
             m, setter = metadata(batch)
             op = PreparedDraft(weights, scratch.rows(batch*8, batch*8), m, pool,
                 runtime=None, vocabulary_runtime=None, embedding_runtime=None, coordinator=None,
-                session=session, name=f'draft{batch}', workspace=arena, buffers=buffers.cursor())
-            prepared.append((m, setter, op))
+                session=session, name=f'draft{batch}', workspace=arena)
+            op.release_outputs()
+            hidden = torch.empty((batch * 8, 256), device="cuda", dtype=torch.bfloat16)
+            logits = torch.empty((batch * 8, 128), device="cuda", dtype=torch.float32)
+            features = torch.empty((batch, 8, 256), device="cuda", dtype=torch.bfloat16)
+            prepared.append((m, setter, op, hidden, logits, features))
         arena.finalize()
         graphs = []
-        for m, setter, op in prepared:
-            fn = compile_forward(op)
+        for m, setter, op, hidden, logits, features in prepared:
+            def forward(m=m, op=op, hidden=hidden, logits=logits, features=features):
+                values = op.forward(m)
+                hidden.copy_(values[0])
+                logits.copy_(values[1])
+                features.copy_(values[2])
+            fn = compile_forward(forward)
             fn()
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
@@ -233,16 +243,15 @@ def test_five_layer_draft_compiled_replay(tmp_path):
             graphs.append(graph)
         for turn in range(4):
             index = turn % 2
-            m, setter, op = prepared[index]
+            m, setter, op, hidden, logits, features = prepared[index]
             batch = len(m.lengths)
             starts = [18+turn] * batch
             setter(starts, [8] * batch)
             ids = torch.randint(0, 128, (batch, 8), device='cuda')
             m.token_ids.copy_(ids.flatten())
-            op()
-            expected_hidden = op.scratch.hidden.clone()
-            expected_logits = op.scratch.logits.clone()
-            expected_selector = op.selector.projected.clone()
+            expected_hidden, expected_logits, expected_selector = op.forward(m)
+            expected_hidden, expected_logits, expected_selector = (value.clone() for value in
+                (expected_hidden, expected_logits, expected_selector))
             head = F.linear(expected_hidden, weights.head).float()
             transformed = 20 * torch.tanh(head * .17677669529663687 / 20)
             torch.testing.assert_close(expected_logits, transformed, rtol=0, atol=0)
@@ -252,27 +261,22 @@ def test_five_layer_draft_compiled_replay(tmp_path):
             graphs[index].replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == before
-            torch.testing.assert_close(op.scratch.hidden, expected_hidden, rtol=0, atol=0)
-            torch.testing.assert_close(op.scratch.logits, expected_logits, rtol=2e-6, atol=2e-6)
-            torch.testing.assert_close(op.selector.projected, expected_selector, rtol=0, atol=0)
-            unary = op.scratch.logits.view(batch, 8, -1)[:, 3].clone()
+            torch.testing.assert_close(hidden, expected_hidden, rtol=0, atol=0)
+            torch.testing.assert_close(logits, expected_logits, rtol=2e-6, atol=2e-6)
+            torch.testing.assert_close(features, expected_selector, rtol=0, atol=0)
+            unary = logits.view(batch, 8, -1)[:, 3].clone()
             predecessor = ids[:, 2]
             shortlist, candidates = unary.topk(16, sorted=False)
             coded = weights.draft.selector['predecessor'][predecessor] * expected_selector[:, 3]
             correction = torch.bmm(weights.draft.selector['successor'][candidates], coded[:, :, None]).squeeze(-1)
             selected = torch.full_like(unary, -torch.inf)
             selected.scatter_(1, candidates, shortlist + correction.float())
-            op.selector(unary, predecessor, 3)
+            unary = op.selector(unary, predecessor, 3, features)
             torch.testing.assert_close(unary, selected, rtol=0, atol=0)
             for name, value in pool.values.items():
                 assert torch.equal(value.view(torch.uint8), before_pool[name].view(torch.uint8))
-        assert len(scratch.selectors) == 2
-        from ignition.preparation.disposable import storage_ranges
-
-        disposable = dict(storage_ranges(scratch.scratch_tensors()))
-        for _, _, op in prepared:
-            assert op.selector.projected.untyped_storage().data_ptr() in disposable
-            assert dict(storage_ranges(op.scratch_tensors())) == disposable
-        assert weights.head.untyped_storage().data_ptr() not in disposable
+        for _, _, op, _, _, _ in prepared:
+            assert "metadata" not in vars(op) and op.selector.projected is None
+            assert op.selector.unary is None and op.selector.ids is None
         for graph in graphs:
             graph.reset()

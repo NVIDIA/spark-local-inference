@@ -114,52 +114,65 @@ Preparation failures before that ownership transfer drain and release their
 mappings; a failed drain retains them. Tensor-allocation accounting includes the
 arena's used bytes, and physical memory accounting includes its mapped backing.
 
-## Scratch storage and concurrent lifetimes
+## Serving temporaries and concurrent lifetimes
 
-Compiler-local intermediates use Inductor's static memory planner with a combined
-pool. Captured graph variants share a CUDA graph pool when their executions are
-serialized and their outputs live in explicit caller-owned buffers. Functional
-components allocate their intermediates inside the compiled forward so the
-compiler can track their lifetimes. Bound operator interfaces still require the
-explicit scratch ownership described below.
+Allocate intermediate tensors inside prepared forwards and pass them explicitly
+between components. Activations, packed batch metadata, sampling intermediates,
+CSF expansion planes, and operator workspaces follow this rule. Prepared
+components retain selected plans, weights, geometry, and workspace requirements.
+Their functional calls accept invocation tensors and return tensors or structured
+tensor records.
 
-Dense Qwen target and draft forwards pass packed batch metadata, proposal
-state, recurrent correction records, and sampling intermediates as local tensor
-values. Their prepared operators retain kernel plans, weights, geometry, native
-inputs and outputs, and persistent cache state. Declaration examples are released
-after tuning, and the operator arena is retired before compilation. These forwards
-do not use `GraphBufferPool`. The shared CUDA graph pool backs Inductor's planned
-temporaries across serialized graph variants.
+Expose every temporary input, output, workspace, and alias to compilation.
+Custom operators receive their destination and workspace tensors as arguments
+and declare their reads and mutations. Allocate those tensors with ordinary
+Torch operations in the forward. Inductor's static memory planner uses their
+dependencies to reuse storage within a combined pool. A temporary allocated
+inside an opaque operator cannot participate in that planning.
+Tensors retained by constructors appear as external storage inputs to compilation.
+Their owners keep those allocations alive across graph variants.
 
-Retained rotary frequencies, fixed page indices, and scalar quantization constants
-use persistent tensor storage. Attention placeholder operands belong to the
-forward's declared scratch rather than hidden plan allocations. Constructors may
-use temporary examples to select kernels, but those examples must not become
-serving storage through closures, argument tuples, or module fields.
+Constructors use example tensors to declare layouts and prepare kernels.
+The [declaration tensor helper](../ignition/preparation/examples.py) shares examples
+by semantic role, shape, dtype, and device. Give simultaneously live operands
+distinct roles. Clear the example dictionary after binding finalizers complete
+and CUDA work drains.
+`ScratchArena` supplies preparation workspace for candidate tuning and binding
+finalizers. After tuning and finalization, synchronize CUDA work and call
+`arena.release_preparation()` before compiling forwards. Drop example tensors
+from component fields, prepared argument tuples, closures, and retained priming
+owners. Release callbacks discard library declaration buffers, including expanded
+CSF scale examples. Keep immutable layout metadata needed to bind invocation
+tensors.
 
-CUDA libraries can retain workspace without a Python tensor owner. Captured GEMMs
-may embed cuBLAS workspace pointers inside packed kernel arguments. Those
-allocations remain required for replay and must not be released as preparation
-caches. Account for them separately from inactive allocator blocks and alignment.
+Weights, rotary frequencies, fixed page indices, and scalar quantization
+constants use [persistent tensor storage](#persistent-model-tensor-storage).
+Native batch inputs, completion frames, request state, cache history, snapshots,
+saved hidden vectors, image features, and registered transport buffers retain
+explicit storage. Their lifetimes extend beyond one forward or include native
+consumers outside its dependency graph. Write escaping results into that storage
+before the graph completes.
 
-- Supply caller-owned scratch through the kernel planning interfaces. Reuse
-  storage across sequential work; preserve separate storage for overlapping
-  operations and persistent state. Aliasing must follow actual lifetimes and
-  stream dependencies, including overlap captured inside a single graph.
-- **Share scratch across the complete graph catalog.** Vision, prefill, decode,
-  speculative, and resume graphs execute serially and should reuse caller-owned
-  activation and private buffer pools. Allocate per-variant views with
-  `GraphBufferPool` cursors; keep simultaneously live values disjoint within a
-  graph, including retained verification state and overlapping expert branches.
-  Use the shared operator arena for kernel workspaces and one CUDA graph pool for
-  compiler-created temporaries. Inspect constructor allocations as well as captured
-  allocations; sharing the CUDA graph pool alone does not share recipe scratch.
-  Constants and request-owned state must retain independent storage.
-  Prime indexed operators with private valid metadata: aliased serving scratch
-  is initialized by the complete graph, not by each operator's constructor.
-  Keep shared buffer-pool layouts identical across TP ranks, including storage
-  reserved for designated-rank sampling, so shared compiled forwards retain the
-  same storage aliases on every rank.
+For auxiliary-stream work, pass every live source, output, encoded plane, and
+workspace through an explicit pending record. The fork waits for input
+production. The join receives the pending operands and the main-stream result
+that must precede it, then waits for the auxiliary stream. Custom operators
+declare these dependencies so Inductor keeps storage live through the join.
+`ScratchArena.register_parallel` sizes simultaneous preparation workspaces.
+Serving overlap uses invocation-local tensors.
+
+Capture serialized graph variants with the same CUDA graph pool through
+`capture_forwards`. Prefill, decode, speculative, maintenance, and vision graphs
+reuse that pool after all work from the preceding graph has joined. Every value
+that survives a graph boundary belongs to explicit external storage. Retain the
+pool, compiled kernels, graph executables, and native resources until replay
+drains. CUDA libraries can retain allocations referenced by captured kernel
+arguments without Python tensor owners. Preserve those resources through drain.
+
+The diagnostic `--no-compile` path executes the same prepared functional calls
+during warmup and capture. CUDA graph capture retains their local allocations
+without Inductor's lifetime planning. Native replay executes the captured work
+without Python calls or steady-state allocations.
 
 ## Physical cache backing and preparation memory
 
@@ -175,7 +188,7 @@ caches. Account for them separately from inactive allocator blocks and alignment
   set after compiler workers exit and before warmup and capture. Validate compiled
   guards against those tensors. Helios sizes the serving cache independently;
   temporary compiler contexts must not reduce its budget.
-- **Release preparation temporaries at phase boundaries.** Retire loading,
+- **Release preparation temporaries after their consumers finish.** Retire loading,
   conversion, tuning, and warmup pools when their temporary owners are gone;
   retain graph pools and captured addresses through export and replay. A live
   tensor can pin otherwise unused space in a shared allocator segment; retiring
@@ -189,6 +202,11 @@ caches. Account for them separately from inactive allocator blocks and alignment
   available system RAM. Recipes pass byte headroom, not hardware flags. Forward
   compilation uses memory-bounded parallel workers on both integrated and discrete
   GPUs; artifact binding starts no additional compiler pool.
+
+Compiled-forward warmup reuses one transient Torch pool across the graph catalog.
+Torch can split and recycle its free blocks between synchronized forwards. The
+pool is retired before native physical-retention references are released;
+allocations with surviving owners keep their complete mapped segments.
 
 ## Tensor-parallel compilation
 
@@ -244,7 +262,7 @@ draft row, inactive lanes, and replay transitions between physical capacities.
 
 - **Prepare the whole serving shape range.** Include batch-one decode, packed
   decode, partial/inactive rows, and configurable chunked prefill through at
-  least 4096 tokens. Test alternating graph variants with shared scratch and
+  least 4096 tokens. Test alternating graph variants in a shared CUDA graph pool and
   changing cache/recurrent state. Small-batch success does not establish stride,
   alias, or workspace correctness for prefill.
 

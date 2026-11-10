@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from functools import partial
 
 import torch
-from b12x.norm import hyperconnection as hc
+from b12x.norm.hyperconnection import api as hc
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 
 from ignition.components.hyperconnection_gate import PreparedHyperconnectionGate, PreparedShardedHyperconnectionGate
@@ -76,15 +76,14 @@ class HyperconnectionScratch:
     gate_logits: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens: int, device: torch.device, *, buffers=None, projected=None,
+    def allocate(cls, tokens: int, device: torch.device, *, projected=None,
                  block_input=None, lowrank: int = 320) -> HyperconnectionScratch:
         if tokens <= 0:
             raise ValueError("hyperconnection token capacity must be positive")
         if lowrank not in (80, 160, 320):
             raise ValueError("Qwen hyperconnection lowrank must be 320, 160 or 80")
         def zeros(width):
-            return (torch.zeros((tokens, width), device=device, dtype=torch.bfloat16) if buffers is None
-                    else buffers.zeros((tokens, width), torch.bfloat16))
+            return torch.zeros((tokens, width), device=device, dtype=torch.bfloat16)
         normalized = zeros(10240)
         projected = zeros((lowrank + 4 + 15) // 16 * 16) if projected is None else projected
         bottleneck, gate_workspace = zeros(lowrank), zeros(10240)
@@ -221,32 +220,35 @@ class PreparedHyperconnection:
                                    arguments=arguments, kwargs=kwargs)),))
         self.plans["combine_norm"] = plan
 
-    def mix(self, residual: torch.Tensor, *, pre_normalized: bool = False) -> torch.Tensor:
-        normalized = self.scratch.normalized if pre_normalized else hc.run_grouped_rmsnorm(
-            residual, self.norm_gain, eps=self.eps, zero_centered=False,
-            binding=self.bindings["grouped_rmsnorm"])
-        self.down(normalized)
-        bottleneck = hc.run_scaled_silu(self.scratch.projected_down, binding=self.bindings["scaled_silu"])
-        return self.gate(bottleneck, normalized)
+    def functional(self, *, session):
+        self.has_injection = self.injection is not None
+        self.down.functional(session=session)
+        self.gate.functional(session=session)
+        register_finalizer(session, self._finalize_functional)
+        return self
 
-    def trace_intermediates(self) -> dict[str, torch.Tensor]:
-        """Expose activations produced by every eligible gate implementation."""
-        values = {name: getattr(self.scratch, name)
-                  for name in ("normalized", "projected_down", "bottleneck")}
-        if self.injection is not None:
-            values["injection_logits"] = self.injection
-        return values
+    def _finalize_functional(self):
+        self.bindings.clear()
+        self.scratch = self.injection = None
 
-    def combine(self, residual: torch.Tensor, block_output: torch.Tensor) -> torch.Tensor:
-        """Inject in FP32 and update the BF16 residual in place."""
-        if self.injection is None:
-            raise ValueError("the final hyperconnection mixer has no residual injection")
-        return hc.run_combine(residual, block_output, self.scratch.injection_logits,
-                              plan=self.plans["combine"], out=residual)
+    def mix_runtime(self, residual, normalized=None):
+        if normalized is None:
+            normalized = torch.empty((self.tokens, 10240), dtype=torch.bfloat16, device=residual.device)
+            torch.ops.b12x.hyperconnection_grouped_rmsnorm(
+                residual, self.norm_gain, normalized, float(self.eps),
+                self.plans["grouped_rmsnorm"].handle, False)
+        projected = self.down(normalized)
+        injection = projected[:, self.lowrank:self.lowrank + 4] if self.has_injection else None
+        bottleneck = torch.empty((self.tokens, self.lowrank), dtype=torch.bfloat16, device=residual.device)
+        torch.ops.b12x.hyperconnection_scaled_silu(projected[:, :self.lowrank], bottleneck,
+                                                  self.plans["scaled_silu"].handle)
+        return self.gate(bottleneck, normalized), injection
 
-    def combine_norm(self, residual: torch.Tensor, block_output: torch.Tensor) -> torch.Tensor:
-        """Update the residual in place and prepare the following mixer's input."""
-        combined, _ = hc.run_combine_norm(residual, block_output, self.scratch.injection_logits,
-            self.following.norm_gain, eps=self.following.eps, zero_centered=False,
-            plan=self.plans["combine_norm"], out=(residual, self.following.scratch.normalized))
-        return combined
+    def combine_runtime(self, residual, block_output, injection):
+        return hc.run_combine(residual, block_output, injection, plan=self.plans["combine"], out=residual)
+
+    def combine_norm_runtime(self, residual, block_output, injection):
+        normalized = torch.empty_like(residual)
+        return hc.run_combine_norm(residual, block_output, injection, self.following.norm_gain,
+            eps=self.following.eps, zero_centered=False, plan=self.plans["combine_norm"],
+            out=(residual, normalized))

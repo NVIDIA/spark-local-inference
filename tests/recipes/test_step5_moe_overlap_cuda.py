@@ -50,11 +50,31 @@ def test_shared_routed_graph_order_and_scratch_reuse(weights, rows):
         moe = PreparedFeedForward(3, layer, config, scratch, runtime=None, coordinator=None,
             session=session, name=f"moe:{rows}", workspace=arena, overlap=True, reduce_output=False)
         session.tune(show_progress=False)
+        arena.release_preparation()
+        router, experts, finish = moe.router, moe.experts, moe.concurrent.finish
+        observed_ids, observed_weights = torch.empty_like(scratch.router.ids), torch.empty_like(scratch.router.weights)
+        observed_routed = torch.empty_like(scratch.experts)
+
+        def observe_router(logits):
+            routes = router(logits)
+            observed_ids.copy_(routes.ids)
+            observed_weights.copy_(routes.weights)
+            return routes
+
+        def observe_experts(source, ids, weights, **kwargs):
+            routed = experts(source, ids, weights, **kwargs)
+            observed_routed.copy_(routed)
+            return routed
+
+        def observe_shared(pending, routed):
+            value = finish(pending, routed)
+            shared.copy_(value)
+            return value
+
+        moe.router, moe.experts, moe.concurrent.finish = observe_router, observe_experts, observe_shared
 
         def forward():
             output.copy_(moe(source))
-            shared.copy_(scratch.shared.output)
-            arena.tensor.fill_(255)
             scratch.normalized.zero_()
 
         try:
@@ -72,12 +92,12 @@ def test_shared_routed_graph_order_and_scratch_reuse(weights, rows):
                 source.normal_(generator=torch.Generator(device="cuda").manual_seed(5011 + iteration))
                 scratch.normalized.copy_(source)
                 expected_shared = moe.mlp(scratch.normalized).clone()
-                moe.router(moe.router_projection(scratch.normalized))
-                expected_ids = scratch.router.ids.clone()
-                expected_weights = scratch.router.weights.clone()
-                expected_routed = moe.experts().clone()
+                logits = moe.router_projection(scratch.normalized)
+                routes = router(logits)
+                expected_ids, expected_weights = routes.ids.clone(), routes.weights.clone()
+                expected_routed = experts(scratch.normalized, routes.ids, routes.weights, router_logits=logits).clone()
                 # Dynamic MoE uses BF16 atomic scatter; bound comparisons by serial repeatability.
-                repeats = torch.stack([moe.experts().float().clone() for _ in range(8)])
+                repeats = torch.stack([experts(scratch.normalized, routes.ids, routes.weights, router_logits=logits).float().clone() for _ in range(8)])
                 repeat_errors = repeats - expected_routed.float()
                 repeat_max = repeat_errors.abs().max().item()
                 repeat_norm = repeat_errors.flatten(1).norm(dim=1).max().item()
@@ -91,12 +111,12 @@ def test_shared_routed_graph_order_and_scratch_reuse(weights, rows):
                     torch.cuda.synchronize()
                     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
                     torch.testing.assert_close(shared, expected_shared, rtol=0, atol=0)
-                    torch.testing.assert_close(scratch.router.ids, expected_ids, rtol=0, atol=0)
-                    torch.testing.assert_close(scratch.router.weights, expected_weights, rtol=0, atol=0)
-                    torch.testing.assert_close(output, shared.float() + scratch.experts.float(), rtol=0, atol=0)
-                    error = scratch.experts.float() - expected_routed.float()
+                    torch.testing.assert_close(observed_ids, expected_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(observed_weights, expected_weights, rtol=0, atol=0)
+                    torch.testing.assert_close(output, shared.float() + observed_routed.float(), rtol=0, atol=0)
+                    error = observed_routed.float() - expected_routed.float()
                     assert error.norm().item() <= min(.01 * reference_norm, 2 * repeat_norm)
-                    torch.testing.assert_close(scratch.experts, expected_routed, rtol=0, atol=2 * repeat_max)
+                    torch.testing.assert_close(observed_routed, expected_routed, rtol=0, atol=2 * repeat_max)
         finally:
             for graph in graphs:
                 graph.reset()

@@ -25,8 +25,8 @@ class SpeculativePreparation(DFlash2Preparation):
             head=weights.head if weights.draft_head is None else weights.draft_head,
             page_tokens=PAGE_TOKENS, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspace,
-            verification_width=verification_width, study_width=study_width, buffer_layout=None,
-            local_metadata=True)
+            verification_width=verification_width, study_width=study_width,
+        )
 
     def release_examples(self):
         super().release_examples()

@@ -119,7 +119,7 @@ def test_actual_context_and_five_layer_draft(compiled):
     from ignition.components.weights import DirectWeightLoader
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.muse_spark.config import ModelConfig
     from ignition.recipes.muse_spark.draft_weights import DraftWeights
     from ignition.recipes.muse_spark.dflash import PreparedContext, PreparedDraft, DraftScratch
@@ -149,19 +149,24 @@ def test_actual_context_and_five_layer_draft(compiled):
     metadata.set(torch.tensor([152], device='cuda'), torch.tensor([8], device='cuda', dtype=torch.int32),
         torch.tensor([1], device='cuda'), torch.zeros((1, 2), device='cuda', dtype=torch.int32),
         ids.view(1, 8), torch.tensor([1], device='cuda', dtype=torch.int32))
-    buffers, context_buffers, private = (GraphBufferPool('cuda') for _ in range(3))
     with PreparationSession(device='cuda:0', autotune=False) as session:
         arena = ScratchArena('cuda')
-        scratch = DraftScratch.allocate(config.draft, shard, 8, 'cuda', buffers=buffers.cursor())
+        scratch = DraftScratch.allocate(config.draft, shard, 8, 'cuda')
         context = PreparedContext(weights, auxiliary, context_metadata, pool, session=session, name='actual.context',
-            workspace=arena, runtime=None, coordinator=None, buffers=context_buffers.cursor())
+            workspace=arena, runtime=None, coordinator=None)
         prepared = PreparedDraft(weights, scratch, metadata, pool, runtime=None, vocabulary_runtime=None,
-            embedding_runtime=None, coordinator=None, session=session, name='actual.draft', workspace=arena,
-            buffers=private.cursor())
+            embedding_runtime=None, coordinator=None, session=session, name='actual.draft', workspace=arena)
+        prepared.release_outputs()
+        captured_hidden = torch.empty((8, 8192), dtype=torch.bfloat16, device="cuda")
+        captured_logits = torch.empty((8, config.vocabulary), dtype=torch.float32, device="cuda")
+        captured_features = torch.empty((1, 8, 256), dtype=torch.bfloat16, device="cuda")
         arena.finalize()
         def forward():
-            context(auxiliary, context_metadata.lengths)
-            prepared()
+            context(auxiliary, context_metadata.lengths, context_metadata)
+            hidden, logits, features = prepared.forward(metadata)
+            captured_hidden.copy_(hidden)
+            captured_logits.copy_(logits)
+            captured_features.copy_(features)
         run = compile_forward(forward) if compiled else forward
         run()
         graph = torch.cuda.CUDAGraph()
@@ -171,7 +176,7 @@ def test_actual_context_and_five_layer_draft(compiled):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == before
-        actual_hidden, actual_logits = scratch.hidden.clone(), scratch.logits.clone()
+        actual_hidden, actual_logits = captured_hidden.clone(), captured_logits.clone()
         hidden, logits, history, layers = reference(weights, auxiliary, ids)
         context_errors = []
         for i, (key, value) in enumerate(history):
@@ -186,28 +191,28 @@ def test_actual_context_and_five_layer_draft(compiled):
         positions = torch.arange(152, 160, device=x.device)
         for index, (layer, stages) in enumerate(zip(draft.layers, prepared.layers, strict=True)):
             norm, conv, attn, post_norm, mlp_conv, mlp, reduction = stages
-            scratch.normalized.copy_(norm(x))
-            expected, delta = conv_prepare(scratch.normalized, layer.attention_conv)
-            before = conv.prepare(scratch.normalized)
+            normalized = norm(x)
+            expected, delta = conv_prepare(normalized, layer.attention_conv)
+            before, coefficients = conv.prepare(normalized)
             convolution_error = relative_error(before, expected)
             cached = tuple(pool.values[f'draft{index}.{kind}'][1, :152] for kind in ('key', 'value'))
             expected_attended = attention(before, layer, cached, positions)
-            attended = attn(before)
+            attended = attn(before, metadata)
             attention_error = relative_error(attended, expected_attended)
             expected_finished = convolve(attended, delta, layer.attention_conv['base'][1])
-            finished = conv.finish(attended)
+            finished = conv.finish(attended, coefficients)
             finish_error = relative_error(finished, expected_finished)
             x = x + finished
-            scratch.normalized.copy_(post_norm(x))
-            expected, delta = conv_prepare(scratch.normalized, layer.mlp_conv)
-            before = mlp_conv.prepare(scratch.normalized)
+            normalized = post_norm(x)
+            expected, delta = conv_prepare(normalized, layer.mlp_conv)
+            before, coefficients = mlp_conv.prepare(normalized)
             mlp_convolution_error = relative_error(before, expected)
             gate, up = F.linear(before, layer.mlp.gate_up).chunk(2, -1)
             expected_mlp = F.linear(F.silu(gate) * up, layer.mlp.down)
             actual_mlp = reduction(mlp(before))
             mlp_error = relative_error(actual_mlp, expected_mlp)
             expected_finished = convolve(actual_mlp, delta, layer.mlp_conv['base'][1])
-            finished = mlp_conv.finish(actual_mlp)
+            finished = mlp_conv.finish(actual_mlp, coefficients)
             mlp_finish_error = relative_error(finished, expected_finished)
             x = x + finished
             errors = (convolution_error, attention_error, finish_error, mlp_convolution_error,
@@ -216,15 +221,15 @@ def test_actual_context_and_five_layer_draft(compiled):
             assert max(errors) < .008, (index, errors)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(scratch.hidden, actual_hidden)
-        assert torch.equal(scratch.logits, actual_logits)
+        assert torch.equal(captured_hidden, actual_hidden)
+        assert torch.equal(captured_logits, actual_logits)
         assert torch.isfinite(actual_hidden).all() and torch.isfinite(actual_logits).all()
         print(dict(compiled=compiled, component_relative_l2=component_errors, context_relative_l2=context_errors, hidden_relative_l2=relative_error(actual_hidden, hidden),
             logits_rmse=float((actual_logits - logits).square().mean().sqrt()),
             top1_agreement=float((actual_logits.argmax(-1) == logits.argmax(-1)).float().mean())))
         # Selector arithmetic is checked on the same prepared hidden rows.
         projected = F.linear(actual_hidden, draft.selector['projection']).view(1, 8, 256)
-        assert relative_error(prepared.selector.projected, projected) < .008
+        assert relative_error(captured_features, projected) < .008
         predecessor = ids[:1]
         for position in range(1, 8):
             unary = actual_logits[position:position+1].clone()
@@ -232,7 +237,7 @@ def test_actual_context_and_five_layer_draft(compiled):
             coded = draft.selector['predecessor'][predecessor] * projected[:, position]
             correction = torch.bmm(draft.selector['successor'][indices], coded.unsqueeze(-1)).squeeze(-1)
             expected = torch.full_like(unary, -torch.inf).scatter_(1, indices, top + correction.float())
-            prepared.selector(unary, predecessor, position)
+            unary = prepared.selector(unary, predecessor, position, captured_features)
             torch.testing.assert_close(unary, expected, rtol=.008, atol=.008)
             assert torch.equal(unary.argmax(-1), expected.argmax(-1))
             predecessor = unary.argmax(-1)

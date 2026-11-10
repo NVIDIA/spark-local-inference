@@ -58,10 +58,10 @@ for _container, _fields in (
     ('ignition.recipes.deepseek4.weights.ExpertWeights',
      ('router', 'correction', 'vision_correction', 'token_experts', 'experts', 'shared')),
     ('ignition.recipes.deepseek4.weights.LayerWeights',
-     ('attention', 'experts', 'residual', 'engram')),
+     ('attention', 'experts', 'residual')),
     ('ignition.recipes.deepseek4.weights.DSparkWeights',
-     ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm',
-      'markov_embedding', 'markov_head', 'confidence_head', 'draft_head')),
+     ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm', 'head_mix',
+      'markov_embedding', 'markov_head', 'draft_head')),
     ('ignition.recipes.glm53.weights.LayerWeights', ('attention', 'mlp', 'residual')),
     ('ignition.recipes.glm53.weights.MoEWeights', ('router', 'correction', 'experts', 'shared')),
     ('ignition.recipes.glm53.weights.MTPWeights', ('attention', 'mlp', 'tensors', 'draft_head')),
@@ -1547,7 +1547,16 @@ class DirectWeightLoader:
             raise ValueError("MXFP4 expert scale compression must be None or 'csf'")
         prefixes = tuple(prefixes)
         compressed = getattr(self.manifest, "compressed_scales", frozenset())
-        encoded = [f"{prefix}.{projection}.{scale_name}" in compressed
+        def encoded_scale(name):
+            for suffixes in (("csf32_bases", "csf32_codes", "csf32_page_bases", "csf32_offsets", "csf32_exceptions"),
+                             ("mxfp4_csf_fixed", "mxfp4_csf_exceptions")):
+                present = [f"{name}.{suffix}" in self._sources for suffix in suffixes]
+                if any(present):
+                    if not all(present):
+                        raise ValueError(f"MXFP4 scale encoding requires complete planes: {name}")
+                    return True
+            return name in compressed
+        encoded = [encoded_scale(f"{prefix}.{projection}.{scale_name}")
                    for prefix in prefixes for projection in projection_names]
         geometry = dict(hidden_size=hidden_size, intermediate_size=intermediate_size,
                         intermediate_range=intermediate_range, swiglu_limit=swiglu_limit,

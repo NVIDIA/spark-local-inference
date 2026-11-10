@@ -129,26 +129,34 @@ def test_latent_projections(weights, online, rows):
             reference = expanded(selected[key])
             source = torch.randn(rows, reference.shape[1], device="cuda:0", dtype=torch.bfloat16) * .1
             output = torch.empty(rows, reference.shape[0], device="cuda:0", dtype=torch.bfloat16)
-            op = prepare_projection(source, selected[key], output, session=session, name=key, workspace=arena)
-            projections.append((op, source, reference))
+            op = prepare_projection(source, selected[key], output, session=session, name=key,
+                                    workspace=arena).functional(session=session)
+            projections.append((op, source, reference, torch.empty_like(output)))
         session.tune(show_progress=False)
+        arena.release_preparation()
+
+        def forward():
+            for op, source, _, observed in projections:
+                observed.copy_(op(source))
+
+        compiled = compile_forward(forward)
+        compiled()
         expected = []
-        for op, source, reference in projections:
-            output = op(source).clone()
-            assert relative_error(output, torch.nn.functional.linear(source, reference)) < .01
-            expected.append(output)
+        for _, source, reference, observed in projections:
+            assert relative_error(observed, torch.nn.functional.linear(source, reference)) < .01
+            expected.append(observed.clone())
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for op, source, _ in projections:
-                op(source)
+            compiled()
         allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
         for _ in range(4):
-            arena.tensor.fill_(255)
+            for _, _, _, observed in projections:
+                observed.fill_(float("nan"))
             graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-        for (op, _, _), reference in zip(projections, expected, strict=True):
-            torch.testing.assert_close(op.output, reference, rtol=0, atol=0)
+        for (_, _, _, observed), reference in zip(projections, expected, strict=True):
+            torch.testing.assert_close(observed, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("online", [False, True])
@@ -173,24 +181,24 @@ def test_shared_expert(weights, online, rows, compiled, overlap):
         session.register_scratch(arena)
         routed = (PreparedRoutedExperts(latent, w["experts"], ids, scores, routed_output,
             session=session, name="routed", workspace=arena) if overlap else None)
-        mlp = PreparedMLP(w["shared"], input_copy, session=session, name="shared", buffers={}, workspace=arena,
+        mlp = PreparedMLP(w["shared"], input_copy, session=session, name="shared", workspace=arena,
                           parallel_plans=(routed.plan,) if overlap else ())
+        if routed is not None:
+            routed.functional(session=session)
         session.tune(show_progress=False)
-        if overlap and mlp.workspace.numel():
-            size = routed.plan.memory_requirements().scratch_nbytes
-            assert mlp.workspace.data_ptr() >= arena.tensor.data_ptr() + size
+        arena.release_preparation()
         reference_weights = {key: expanded(value) for key, value in w["shared"].items()}
 
         def forward():
             input_copy.copy_(source)
             if overlap:
-                mlp.start(input_copy)
-                routed()
-                mlp.finish(input_copy, routed_output)
+                pending = mlp.start(input_copy)
+                routed_result = routed(latent, ids, scores)
+                output = mlp.finish(pending, routed_result)
+                routed_output.copy_(routed_result)
             else:
-                mlp(input_copy)
-            result.copy_(mlp.down.output)
-            arena.tensor.fill_(255)
+                output = mlp(input_copy)
+            result.copy_(output)
             input_copy.zero_()
 
         call = compile_forward(forward) if compiled else forward
@@ -206,7 +214,7 @@ def test_shared_expert(weights, online, rows, compiled, overlap):
                 source, reference_weights["gate_up"])), reference_weights["down"])
             input_copy.copy_(source)
             serial = mlp(input_copy).clone()
-            routed_expected = routed().clone() if overlap else None
+            routed_expected = routed(latent, ids, scores).clone() if overlap else None
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()

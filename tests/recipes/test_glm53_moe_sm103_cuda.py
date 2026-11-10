@@ -51,13 +51,19 @@ def _run(experts, tokens, reference):
         routing = PreparedRouter(logits, route, session=session, name=f"glm_sm103_route:{tokens}")
         prepared = PreparedRoutedExperts(source, experts, route.ids, route.weights, output,
                                          session=session, name=f"glm_sm103_experts:{tokens}", workspace=workspace)
-        session.freeze()
+        routing.functional(session=session)
+        prepared.functional(session=session)
         workspace.finalize()
         workspace.freeze()
+        workspace.release_preparation()
+        session.freeze()
 
         def forward():
-            routing(logits)
-            return prepared()
+            selected = routing(logits)
+            route.ids.copy_(selected.ids)
+            route.weights.copy_(selected.weights)
+            output.copy_(prepared(source, selected.ids, selected.weights))
+            return output
 
         forward()
         graph = torch.cuda.CUDAGraph()

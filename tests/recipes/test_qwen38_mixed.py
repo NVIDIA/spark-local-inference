@@ -65,24 +65,39 @@ def test_mixed_capture_defaults_off_without_changing_speculation():
 def test_prompt_sampling_precedes_draft_scratch_reuse():
     from ignition.recipes.qwen38.mixed_model import DecodeTarget
 
-    logits = torch.empty((3, 4))
-    scratch = SimpleNamespace(logits=logits[:2])
+    logits = torch.zeros((5, 4))
+    logits[-1, 2] = 1
     sampled = []
+    role = SimpleNamespace(row_slot_ids=torch.tensor([0]), row_generations=torch.tensor([1]),
+                           live_rows=torch.tensor([1]), sample_enabled=torch.tensor([1]))
+    packing = SimpleNamespace(batch=2, width=2, prompt=role)
+    runtime = SimpleNamespace(gdn_partitions=SimpleNamespace(parts=(None, SimpleNamespace(gather=lambda x: x))))
+    state = SimpleNamespace(prompt=SimpleNamespace(begin_runtime=lambda _: None),
+                            combine_runtime=lambda *_: runtime)
+    forward = SimpleNamespace(state=state, embedding_injection=SimpleNamespace(validate_runtime=lambda _: None))
+    class Forward:
+        def __init__(self):
+            self.state = forward.state
+            self.embedding_injection = forward.embedding_injection
 
-    def target():
-        logits.fill_(0)
-        logits[-1, 2] = 1
+        def __call__(self, _):
+            return logits[:4], logits, SimpleNamespace(residual=logits), None
 
-    decoder = DecodeTarget(scratch, target, lambda: sampled.append(int(logits[-1].argmax())))
-    decoder()
+    class Sampler:
+        def run(self, values, **_):
+            sampled.append(int(values[0].argmax()))
+
+    decoder = DecodeTarget(SimpleNamespace(logits=logits[:4]), Forward(), Sampler())
+    _, target_logits, _, _ = decoder(None, packing)
+    assert target_logits.shape == (4, 4)
     logits.fill_(float("nan"))
     assert sampled == [2]
-    assert decoder.scratch.logits.shape == (2, 4)
 
 
 @pytest.mark.parametrize("prompt_row", [-1, 0, 1, 2, 3])
 @pytest.mark.parametrize("width", [1, 3, 6])
-def test_packing_preserves_native_row_order_and_physical_slots(prompt_row, width):
+@pytest.mark.parametrize("functional", [False, True])
+def test_packing_preserves_native_row_order_and_physical_slots(prompt_row, width, functional):
     batch, prefill, length = 4, 128, 65
     tokens = prefill + (batch - 1) * width
     inputs = DecoderInputs.allocate("cpu", context=256, tokens=tokens, capacity=batch)
@@ -96,7 +111,14 @@ def test_packing_preserves_native_row_order_and_physical_slots(prompt_row, width
     if prompt_row >= 0:
         inputs.query_lengths[prompt_row] = length
     inputs.token_ids.copy_(torch.arange(tokens) + 1000)
-    packing.upload_roles()
+    if functional:
+        packing.functional()
+        packing = packing.runtime()
+        assert packing.prompt.row_slot_ids is not p.row_slot_ids
+        assert packing.decode.row_slot_ids is not d.row_slot_ids
+        p, d = packing.prompt, packing.decode
+    else:
+        packing.upload_roles()
     assert d.row_slot_ids.tolist() == [(-1 if r == prompt_row else s) for r, s in enumerate([2, 0, 3, 1])]
     prompt_ids = torch.full((prefill,), -1)
     if prompt_row >= 0:
@@ -116,3 +138,54 @@ def test_packing_preserves_native_row_order_and_physical_slots(prompt_row, width
     live = int(inputs.query_lengths.sum())
     assert packed[:live].tolist() == inputs.token_ids[:live].tolist()
     assert not packing.prompt_valid.any() if prompt_row == -1 else packing.prompt_valid.sum() == length
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_image_validation_precedes_prompt_state_gather(speculative):
+    from ignition.recipes.qwen38.mixed_model import DecodeTarget, PreparedMixedRound
+
+    class ForwardComplete(Exception):
+        pass
+
+    status = torch.tensor([0])
+    errors = torch.tensor([1])
+    packing = SimpleNamespace(prompt=object(), decode=object())
+    observed = []
+
+    def validate(value):
+        assert value is packing
+        status.fill_(1)
+        return errors
+
+    def begin(value):
+        assert value is packing.prompt
+        observed.append(status.item())
+        return "prompt-state"
+
+    def combine(value, prompt, decode):
+        assert value is packing and prompt == "prompt-state"
+        return SimpleNamespace()
+
+    class Forward:
+        embedding_injection = SimpleNamespace(validate_runtime=validate)
+        state = SimpleNamespace(prompt=SimpleNamespace(begin_runtime=begin),
+                                decode=SimpleNamespace(begin_runtime=lambda _: "decode-state"),
+                                combine_runtime=combine)
+
+        def __call__(self, runtime):
+            assert runtime.injection_errors == (errors, packing)
+            raise ForwardComplete
+
+    forward = Forward()
+    with pytest.raises(ForwardComplete):
+        if speculative:
+            DecodeTarget(None, forward, None)("decode-state", packing)
+        else:
+            round_ = PreparedMixedRound.__new__(PreparedMixedRound)
+            round_.owner = SimpleNamespace()
+            round_.packing = SimpleNamespace(runtime=lambda: packing)
+            round_.absorb = None
+            round_.enabled = False
+            round_.prompt_state = forward.state.prompt
+            round_.decoder = forward
+            round_()
+    assert observed == [1]

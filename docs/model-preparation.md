@@ -74,7 +74,7 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-Ignition applies three bundled preparation patches to the pinned PyTorch 2.14.1 and
+Ignition applies four bundled preparation patches to the pinned PyTorch 2.14.1 and
 Triton 3.8 preparation environment before importing preparation libraries in
 `export`, `debug-serve`, `bench`, and `join`, including commands launched through `uv run`.
 `ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
@@ -82,6 +82,9 @@ Triton's 150-character physical cache filenames while retaining full CUDA symbol
 names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
 cooperative vision reductions in portable static kernels through Triton's CUDA
 launcher, including their cooperative launch attributes and frozen selections.
+`ignition/patches/torch-inductor-workspace-lifetimes.patch` keeps graph-wide
+semaphores live through the final planned operation, preventing their reuse as
+shorter-lived kernel workspace.
 `ignition/patches/triton-platform-key-pointer-width.patch` derives Triton's helper
 cache key from the interpreter's pointer width without launching `file`.
 Nsight Systems injection can conflict with `file`'s seccomp sandbox and hang
@@ -872,16 +875,15 @@ adaptive verification:
 
 `--expert-scale-compression csf` compresses all Step-5 routed-expert block
 scales losslessly during loading. Both checkpoint W4A4 experts and converted
-W4A16 experts use CSF, retaining their activation modes. Serialized layers share
-one pair of expansion buffers, whose contents are zero-initialized on export.
-One transient loading pool reuses conversion scratch across layers and retires
-after weight loading, retaining live weights for graph export. The separate
-graph-capture pool remains alive. Vision, prefill, decode, and draft activations
-reuse typed graph buffers. MTP feedback, sampling, metadata, and resume scratch
-reuse a separate buffer pool across graph variants, with disjoint buffers within
-each graph. Sequential predictors share their norm-concatenation output. Kernel
-workspaces use the shared operator arena, with separate slices for overlapping
-expert branches. Compiler-created intermediates use one shared CUDA graph pool.
+W4A16 experts use CSF, retaining their activation modes. Expansion planes,
+activations, metadata, sampling intermediates, and kernel workspaces are local
+values in the compiled forward. Inductor plans their reuse from data dependencies,
+including the joins of overlapping expert branches. Serialized vision, prefill,
+decode, draft, and resume graphs use one CUDA graph pool. Request history,
+completion frames, and image features retain explicit storage across graph
+boundaries. Loading conversions and tuning examples are released after their
+consumers finish; selected plans and captured resources remain alive through
+native replay. See [serving temporary lifetimes](preparation-development.md#serving-temporaries-and-concurrent-lifetimes).
 The memory plan estimates 6% lower resident weight storage; actual memory depends
 on encoded exceptions and is reported after loading. Larger concurrency requires
 separate preparation and memory validation.
@@ -1119,10 +1121,10 @@ independently by `--speculative-graph-budget`.
 Every model export prints a VRAM inventory for each rank after final publication,
 including exports without `--verbose`. Heliopause measures device usage and package
 allocator mappings; Ignition attributes retained ranges to checkpoint tensors,
-scratch pools, graph temporaries, I/O and persistent state, communication buffers,
+graph temporaries, I/O and persistent state, communication buffers,
 kernel globals, and allocator slack. Owner fields and defining source locations
 identify the largest consumers in each category. Aliased ranges count once;
-shared scratch displays representative tensor owners.
+shared storage displays representative tensor owners.
 
 Preparation-only storage is separate from fixed package storage. Cache figures
 count physically backed pages, not their virtual serving capacity. Mapped host

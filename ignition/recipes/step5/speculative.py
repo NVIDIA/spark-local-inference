@@ -11,10 +11,9 @@ from .mtp import PreparedAcceptedContext, PreparedProposals
 
 
 class PreparedRound(PreparedCausalDraftRound):
-    def __init__(self, owner, batch, width, name, *, buffers=None):
+    def __init__(self, owner, batch, width, name):
         def context(weights, metadata, pool, **kwargs):
-            record = PreparedAcceptedContext(weights, metadata, pool)
-            return lambda hidden, counts: record(hidden, self.decoder.scratch.embedding, counts)
+            return PreparedAcceptedContext(weights, metadata, pool)
 
         super().__init__(owner, batch, width, name, decoder_factory=PreparedDecoder,
-            context_factory=context, proposal_factory=PreparedProposals, buffers=buffers)
+            context_factory=context, proposal_factory=PreparedProposals)

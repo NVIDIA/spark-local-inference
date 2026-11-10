@@ -145,6 +145,7 @@ class PreparedLogprobs:
             raise ValueError("raw logprob width exceeds completion token capacity")
         tiles = triton.cdiv(vocab, _VOCAB_TILE)
         self.logits = logits
+        self.row_inputs = (slots, epochs, live)
         self.layout = {
             "stats": ((batch, width, tiles, 2), torch.float32),
             "lse": ((batch, width), torch.float32),
@@ -189,26 +190,39 @@ class PreparedLogprobs:
     def __call__(self):
         return self.run(self.logits)
 
-    def functional(self):
+    def functional(self, *, session=None, dynamic_inputs=False):
         self.release_logits()
+        if dynamic_inputs:
+            self.row_inputs = (None, None, None)
+            for operation in (self.statistics, self.normalization, self.candidates, self.finish):
+                start = 3 if operation is self.normalization else 4
+                args = list(operation.args)
+                args[start:start + 3] = (None, None, None)
+                operation.args = tuple(args)
         return self
 
     def release_logits(self):
         self.logits = None
 
-    def run(self, logits):
+    def run(self, logits, *, slots=None, generations=None, live_rows=None):
         from ignition.preparation.triton import launch_triton
 
         if self.statistics is None:
             raise RuntimeError("logprob reduction prepare() must finish before capture")
         if logits.ndim == 2:
             logits = logits[:, None, :]
+        row_inputs = tuple(default if value is None else value for default, value in
+                           zip(self.row_inputs, (slots, generations, live_rows), strict=True))
+        if any(value is None for value in row_inputs):
+            raise ValueError("functional logprobs require runtime row operands")
         scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                    for name, (shape, dtype) in self.layout.items()}
         for operation in (self.statistics, self.normalization, self.candidates, self.finish):
             args = list(operation.args)
             if operation is not self.normalization:
                 args[0] = logits
+            start = 3 if operation is self.normalization else 4
+            args[start:start + 3] = row_inputs
             for index, name in operation.scratch_slots:
                 args[index] = scratch[name]
             launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)

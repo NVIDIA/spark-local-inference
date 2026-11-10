@@ -15,6 +15,7 @@ def test_windowed_context_matches_attention_over_every_position(start, tokens):
     import torch
     from ignition.components.paged_batch import Metadata
     from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.attention import PreparedContextPrefill
     from ignition.recipes.kimi3.config import PAGE_TOKENS
@@ -37,9 +38,6 @@ def test_windowed_context_matches_attention_over_every_position(start, tokens):
     latent = (torch.randn((capacity, RECORD_BYTES), device=device) * .5).bfloat16()
     attended = torch.zeros((capacity, heads, 512), dtype=torch.bfloat16, device=device)
 
-    def buffer(key, *shape, dtype=torch.bfloat16, rows=None):
-        return torch.zeros((capacity, *shape), dtype=dtype, device=device)
-
     common = dict(device=device, kv_dtype=fp8, page_size=PAGE_TOKENS, use_cuda_graph=True,
                   partial_dtype=torch.float32)
     with RecordedPreparationSession(device=device, checkpoint="kimi3-context-prefill-test",
@@ -47,7 +45,7 @@ def test_windowed_context_matches_attention_over_every_position(start, tokens):
         arena = ScratchArena(device)
         session.register_scratch(arena)
         op = PreparedContextPrefill(absorbed, attended, metadata, context, peers, session=session, name="mla",
-                                    workspace=arena, buffer=buffer, scale=192 ** -.5, common=common)
+                                    workspace=arena, scale=192 ** -.5, common=common)
         assert op.windows == width * PAGE_TOKENS * world // window
         session.tune(show_progress=False)
         metadata.starts.fill_(start)
@@ -55,7 +53,29 @@ def test_windowed_context_matches_attention_over_every_position(start, tokens):
         metadata.query_start_loc[1] = tokens
         metadata.positions.fill_(-1)
         metadata.positions[:tokens].copy_(torch.arange(start, start + tokens, device=device))
-        output = op(latent).clone()
+        arena.release_preparation()
+        observed = torch.empty_like(attended)
+
+        def forward():
+            observed.copy_(op(absorbed, latent, metadata))
+
+        compiled = compile_forward(forward)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compiled()
+        try:
+            observed.fill_(float("nan"))
+            torch.cuda.synchronize(device)
+            before = torch.cuda.memory_stats(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            after = torch.cuda.memory_stats(device)
+            for key in ("allocation.all.allocated", "allocation.all.freed",
+                        "segment.all.allocated", "segment.all.freed"):
+                assert before[key] == after[key]
+            output = observed.clone()
+        finally:
+            graph.reset()
 
     # Every position's record: earlier ones from their owners' caches, the chunk's from its E4M3 latents.
     positions = torch.arange(start, device=device)

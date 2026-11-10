@@ -128,39 +128,60 @@ def _make_batch(mode):
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
 @pytest.mark.parametrize("fault", [None, "pending", "duplicate", "stale", "missing_rank", "pages"])
-def test_functional_batch_matches_bound_validation_and_packing(cpu_token_kernels, mode, fault):
-    bound, functional = _make_batch(mode), _make_batch(mode)
-    for batch in (bound, functional):
-        if fault == "pending":
-            batch.requests.pending_token[1] = 99
-        elif fault == "duplicate" and mode == "decode":
-            batch.inputs.row_slot_ids[1] = 1
-        elif fault == "stale":
-            batch.inputs.row_generations[0] = 6
-        elif fault == "pages":
-            batch.inputs.page_tables[1, 0] = -1
-    template = weakref.ref(functional.metadata)
-    packed = weakref.ref(functional.token_state.pending_tokens)
-    functional.functional()
-    assert template() is None and packed() is None
-    assert functional.validation_input is functional.validation_sum is functional.present is None
-    assert functional.token_state._gather.args is functional.token_state._consume.args is None
-    validation, present = functional.validate()
-    torch.testing.assert_close(validation, bound.validate(), rtol=0, atol=0)
-    torch.testing.assert_close(present, bound.present)
+def test_batch_validation_and_packing_preserve_slot_contract(cpu_token_kernels, mode, fault):
+    batch = _make_batch(mode)
+    if fault == "pending":
+        batch.requests.pending_token[1] = 99
+    elif fault == "duplicate" and mode == "decode":
+        batch.inputs.row_slot_ids[1] = 1
+    elif fault == "stale":
+        batch.inputs.row_generations[0] = 6
+    elif fault == "pages":
+        batch.inputs.page_tables[1, 0] = -1
+    template = weakref.ref(batch.metadata)
+    batch.functional()
+    assert template() is None
+    assert batch.validation_input is batch.validation_sum is None
+    assert batch.token_state.pending_tokens is batch.token_state.positions is None
+    assert batch.token_state._gather.args is batch.token_state._consume.args is None
+
+    slots = [1, 3, 0, 2] if mode == "decode" else [1]
+    if fault == "duplicate" and mode == "decode":
+        slots[1] = 1
+    resident = [fault != "stale" or index != 0 for index in range(len(slots))]
+    invalid = fault in ("pending", "pages") or (fault == "duplicate" and mode == "decode")
+    expected_present = torch.tensor([any(live and slot == index for slot, live in zip(slots, resident))
+                                     for index in range(4)])
+    expected_bad = torch.tensor([False, invalid, False, False])
+    expected_validation = torch.cat((expected_bad, expected_present)).to(torch.bfloat16).view(1, 8)
+    validation, present = batch.validate()
+    torch.testing.assert_close(validation, expected_validation, rtol=0, atol=0)
+    torch.testing.assert_close(present, expected_present, rtol=0, atol=0)
     totals = validation * 2
     if fault == "missing_rank":
-        totals[0, functional.requests.capacity + 1] = 1
-    bound.begin(totals)
-    actual = functional.begin(totals, present=present)
-    _assert_metadata_equal(actual, bound.metadata)
-    torch.testing.assert_close(functional.requests.status, bound.requests.status)
-    torch.testing.assert_close(functional.requests.error_code, bound.requests.error_code)
-    assert actual.sample_indices.tolist() == (actual.query_start_loc[1:] - 1).clamp(min=0).tolist()
-    if fault == "missing_rank":
-        assert functional.requests.status[1] == ERROR
-        assert functional.requests.error_code[1] == 32
-    functional.finish(actual)
+        totals[0, batch.requests.capacity + 1] = 1
+    actual = batch.begin(totals, present=present)
+    failed = invalid or fault == "missing_rank"
+    expected_status = torch.full((4,), RUNNING, dtype=batch.requests.status.dtype)
+    expected_errors = torch.zeros(4, dtype=batch.requests.error_code.dtype)
+    if failed:
+        expected_status[1], expected_errors[1] = ERROR, 32
+    torch.testing.assert_close(batch.requests.status, expected_status, rtol=0, atol=0)
+    torch.testing.assert_close(batch.requests.error_code, expected_errors, rtol=0, atol=0)
+
+    active = torch.tensor([live and not (failed and slot == 1) for slot, live in zip(slots, resident)])
+    slot_ids = torch.tensor(slots)
+    starts = torch.tensor([0, 127, 255, 3])[slot_ids].masked_fill(~active, 0)
+    lengths = active.to(torch.int32) * (3 if mode == "prefill" else 1)
+    states = (slot_ids + 1).masked_fill(~active, 0)
+    pages = batch.inputs.page_tables[slot_ids].masked_fill(~active[:, None], -1)
+    tokens = (batch.inputs.token_ids.view(1, -1) if mode == "prefill"
+              else batch.requests.pending_token[slot_ids].view(-1, 1))
+    expected = Metadata.allocate(batch.tokens, batch.rows, 4, "cpu")
+    expected.set(starts, lengths, states, pages, tokens, batch.inputs.live_rows)
+    expected.sample_indices.copy_((lengths.cumsum(0) - 1).clamp_min(0))
+    _assert_metadata_equal(actual, expected)
+    batch.finish(actual)
     kernel, args = cpu_token_kernels[1][-1]
     assert kernel is token_state._consume
     assert args[0] is actual.token_ids and args[1] is actual.query_start_loc

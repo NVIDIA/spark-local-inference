@@ -183,15 +183,10 @@ class PreparedBatch:
         self.input_vocabulary = requests.vocab_size if input_vocabulary is None else input_vocabulary
         self.validate_prefill = validate_prefill
         device, capacity = metadata.token_ids.device, requests.capacity
-        self.row_ids = torch.arange(self.rows, device=device)
-        self.slot_ids = torch.arange(capacity, device=device)
-        self.token_offsets = torch.arange(self.tokens, device=device)
-        self.block_ids = torch.arange(inputs.page_tables.shape[1], device=device)
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device) if buffers is None else buffers.zeros(shape, dtype)
         self.validation_input = zeros((1, max(8, 2 * capacity)), torch.bfloat16)
         self.validation_sum = zeros(self.validation_input.shape, torch.bfloat16)
-        self.present = zeros((capacity,), torch.bool)
         self.token_state = PreparedTokenState(
             requests,
             metadata.token_ids,
@@ -202,22 +197,20 @@ class PreparedBatch:
             buffers=buffers,
         )
         self.token_state.prepare()
+        self.token_state.functional()
 
     def functional(self):
         """Return validation and packed metadata as local forward values."""
         if self.metadata is not None:
-            self.token_state.functional()
-            self.metadata = self.validation_input = self.validation_sum = self.present = None
-            self.row_ids = self.slot_ids = self.token_offsets = self.block_ids = None
+            self.metadata = self.validation_input = self.validation_sum = None
         return self
 
     def validate(self):
         b, r = self.inputs, self.requests
         device = r.generation.device
-        row_ids = self.row_ids if self.metadata is not None else torch.arange(self.rows, device=device)
-        slot_ids = self.slot_ids if self.metadata is not None else torch.arange(r.capacity, device=device)
-        block_ids = (self.block_ids if self.metadata is not None
-                     else torch.arange(b.page_tables.shape[1], device=device))
+        row_ids = torch.arange(self.rows, device=device)
+        slot_ids = torch.arange(r.capacity, device=device)
+        block_ids = torch.arange(b.page_tables.shape[1], device=device)
         slots = b.row_slot_ids[: self.rows].long()
         safe = slots.clamp(0, r.capacity - 1)
         resident = (row_ids < b.live_rows) & (slots >= 0) & (slots < r.capacity)
@@ -245,7 +238,7 @@ class PreparedBatch:
         valid &= (state > 0) & (state < self.pool.memory_capacity[0])
         pending, tokens = r.pending_token[safe], b.token_ids[: self.tokens]
         if self.mode == "prefill":
-            offsets = self.token_offsets if self.metadata is not None else torch.arange(self.tokens, device=device)
+            offsets = torch.arange(self.tokens, device=device)
             invalid = ((tokens < 0) | (tokens >= self.input_vocabulary)) & (offsets < lengths[0])
             valid &= (pending < 0) & ~invalid.any()
             if self.validate_prefill is not None:
@@ -256,84 +249,46 @@ class PreparedBatch:
         bad = present & ~valid
         bad_slots = ((slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
         present_slots = ((slot_ids[:, None] == slots[None, :]) & present[None, :]).any(1)
-        if self.metadata is None:
-            validation = torch.zeros((1, max(8, 2 * r.capacity)), dtype=torch.bfloat16, device=device)
-            validation[0, :r.capacity].copy_(bad_slots)
-            validation[0, r.capacity:2 * r.capacity].copy_(present_slots)
-            return validation, present_slots
-        self.present.copy_(present_slots)
-        self.validation_input[0, : r.capacity].copy_(bad_slots)
-        self.validation_input[0, r.capacity : 2 * r.capacity].copy_(self.present)
-        return self.validation_input
+        validation = torch.zeros((1, max(8, 2 * r.capacity)), dtype=torch.bfloat16, device=device)
+        validation[0, :r.capacity].copy_(bad_slots)
+        validation[0, r.capacity:2 * r.capacity].copy_(present_slots)
+        return validation, present_slots
 
-    def begin(self, totals, *, present=None):
-        b, r, m, t = self.inputs, self.requests, self.metadata, self.token_state
-        present = self.present if present is None else present
-        if present is None:
-            raise ValueError("functional batch begin requires validation presence")
+    def begin(self, totals, *, present):
+        b, r, t = self.inputs, self.requests, self.token_state
         participants = totals[0, r.capacity : 2 * r.capacity]
         bad = present & (
             (totals[0, : r.capacity] > 0) | ((participants > 0) & (participants < self.shard.world_size))
         )
         r.status.copy_(torch.where(bad, ERROR, r.status))
         r.error_code.copy_(torch.where(bad, 32, r.error_code))
-        if m is None:
-            pending_tokens, positions, _, active = t.gather()
-            active = active.bool()
-        else:
-            t.gather()
-            pending_tokens, positions, active = t.pending_tokens, t.positions, t.active.bool()
+        pending_tokens, positions, _, active = t.gather()
+        active = active.bool()
         slots = b.row_slot_ids[: self.rows].long().clamp(0, r.capacity - 1)
         lengths = (b.query_lengths[: self.rows] if self.mode == "prefill"
                    else torch.ones((self.rows,), dtype=torch.int32, device=r.generation.device))
         lengths = torch.where(active, lengths, 0)
         ends = lengths.cumsum(0, dtype=torch.int32)
         starts = ends - lengths
-        if m is None:
-            offsets = torch.arange(self.tokens, device=r.generation.device)
-            request = (offsets[:, None] >= ends[None, :]).sum(1).clamp(max=self.rows - 1)
-            live = offsets < ends[-1]
-            pages = torch.where(active[:, None], b.page_tables[slots], -1)
-            tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else pending_tokens[request]
-            return Metadata(
-                torch.where(live, tokens, 0),
-                (ends - 1).clamp(min=0).to(torch.int64).expand(self.sample_count),
-                torch.cat((torch.zeros(1, dtype=torch.int32, device=ends.device), ends)),
-                torch.where(active, b.request_state_rows[slots, 0], 0),
-                positions,
-                lengths,
-                request,
-                torch.where(live, positions[request] + offsets - starts[request], -1),
-                pages,
-                pages.expand(self.tokens, -1) if self.rows == 1 else pages[request],
-                torch.cat((ends[-1:], b.live_rows.clamp(0, self.rows))),
-                self.max_query_tokens,
-            )
-        m.query_start_loc[0].zero_()
-        m.query_start_loc[1:].copy_(ends)
-        m.lengths.copy_(lengths)
-        m.starts.copy_(positions)
-        m.state_rows.copy_(torch.where(active, b.request_state_rows[slots, 0], 0))
-        m.page_table.copy_(torch.where(active[:, None], b.page_tables[slots], -1))
-        m.live_counts[0:1].copy_(ends[-1:])
-        m.live_counts[1:2].copy_(b.live_rows.clamp(0, self.rows))
-        m.sample_indices.copy_((ends - 1).clamp(min=0))
-        request = (self.token_offsets[:, None] >= ends[None, :]).sum(1).clamp(max=self.rows - 1)
-        live = self.token_offsets < ends[-1]
-        m.requests.copy_(request)
-        if self.rows > 1:
-            m.token_page_table.copy_(m.page_table[request])
-        m.positions.copy_(torch.where(live, positions[request] + self.token_offsets - starts[request], -1))
-        if self.mode == "prefill":
-            tokens = b.token_ids[:self.tokens]
-        else:
-            tokens = pending_tokens[request]
-        m.token_ids.copy_(torch.where(live, tokens, 0))
+        offsets = torch.arange(self.tokens, device=r.generation.device)
+        request = (offsets[:, None] >= ends[None, :]).sum(1).clamp(max=self.rows - 1)
+        live = offsets < ends[-1]
+        pages = torch.where(active[:, None], b.page_tables[slots], -1)
+        tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else pending_tokens[request]
+        return Metadata(
+            torch.where(live, tokens, 0),
+            (ends - 1).clamp(min=0).to(torch.int64).expand(self.sample_count),
+            torch.cat((torch.zeros(1, dtype=torch.int32, device=ends.device), ends)),
+            torch.where(active, b.request_state_rows[slots, 0], 0),
+            positions,
+            lengths,
+            request,
+            torch.where(live, positions[request] + offsets - starts[request], -1),
+            pages,
+            pages.expand(self.tokens, -1) if self.rows == 1 else pages[request],
+            torch.cat((ends[-1:], b.live_rows.clamp(0, self.rows))),
+            self.max_query_tokens,
+        )
 
-    def finish(self, metadata=None):
-        if self.metadata is None:
-            if metadata is None:
-                raise ValueError("functional batch finish requires packed metadata")
-            self.token_state.consume(metadata.token_ids, metadata.query_start_loc)
-        else:
-            self.token_state.consume()
+    def finish(self, metadata):
+        self.token_state.consume(metadata.token_ids, metadata.query_start_loc)

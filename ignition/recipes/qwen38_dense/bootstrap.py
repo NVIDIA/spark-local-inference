@@ -294,7 +294,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                         compact_prefill=mode == "prefill") if enabled else None)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=None,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=context, local_metadata=True)
+                        context_factory=context)
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled)
         if speculation is not None:
             for batch, width, packed in sorted(config.speculative_round_shapes,
@@ -311,14 +311,13 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                     name = f"resume{capacity}" + suffix
                     forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                         rows=capacity, runtime=None, vocabulary_runtime=None, coordinator=coordinator,
-                        session=session, name=name, activation_mode="auto", workspace=arena,
-                        local_metadata=True)
+                        session=session, name=name, activation_mode="auto", workspace=arena)
                     add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled)
                 for mode in (("init",) if prefill_only else ("init", "restore", "snapshot")):
                     name = f"{mode}{capacity}" + suffix
                     forward = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
                         runtime=None, coordinator=coordinator, session=session, name=name, capacity=capacity,
-                        admission_buffers=admission, draft_state=enabled, local_metadata=True)
+                        admission_buffers=admission, draft_state=enabled)
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1,
                         (*fields, "page_tables", *commands.buffers()), enabled)

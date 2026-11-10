@@ -46,7 +46,6 @@ class ModelWeights:
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
-    scale_scratch: tuple[torch.Tensor, ...] = ()
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=True,
@@ -57,7 +56,6 @@ class ModelWeights:
         with loading(), Step5WeightLoader(manifest, device, shard=shard, progress=progress, mtp=mtp,
                                          expert_scale_compression=expert_scale_compression) as loader:
             config = loader.config
-            scale_scratch = loader.scale_scratch
             first, last = shard.partition(config.hidden)
             embedding = loader.load_tensor("model.embed_tokens.weight", extent=(slice(None), slice(first, last)))
             norm = loader.norm("model.norm.weight", config.hidden)
@@ -67,7 +65,7 @@ class ModelWeights:
             from .vision_weights import VisionWeights
             vision = VisionWeights.load(loader)
         return cls(config, shard, embedding, norm, head, layers, allocated_tensor_bytes(device) - before,
-                   draft, vision, scale_scratch)
+                   draft, vision)
 
 
 class Step5WeightLoader(DirectWeightLoader):

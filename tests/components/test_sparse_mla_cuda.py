@@ -19,9 +19,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
     reason="explicit CUDA assignment required")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("mode,rows,heads", [("decode", 2, 32), ("extend", 4096, 16)])
 @torch.no_grad()
-def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads):
+def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads, functional):
     device = torch.device("cuda:0")
     records = ((rows + 192 + 63) // 64) * 64
     source = torch.zeros((rows, 512), dtype=torch.bfloat16, device=device)
@@ -50,16 +51,28 @@ def test_native_sparse_attention_rebinds_selected_arena(mode, rows, heads):
                 caps=caps, session=session, name="attention", workspace=arena)
             previous = arena.tensor
             arena.reserve(arena.nbytes + 1024)
+            if functional:
+                writer.functional(session=session)
+                attention.functional(session=session)
             session.tune()
-            assert attention.binding.runtime.scratch.shared_scratch.data_ptr() == arena.tensor.data_ptr()
+            if functional:
+                assert attention.binding is attention.output is None
+            else:
+                assert attention.binding.runtime.scratch.shared_scratch.data_ptr() == arena.tensor.data_ptr()
             assert arena.tensor.data_ptr() != previous.data_ptr()
             del previous
+            if functional:
+                arena.release_preparation()
 
             def forward():
-                writer()
-                attention()
+                if functional:
+                    writer(source, slots)
+                    result = attention(query, selected, lengths, lengths)
+                else:
+                    writer()
+                    result = attention()
                 arena.tensor.fill_(255)
-                observed.copy_(output)
+                observed.copy_(result)
 
             compiled = compile_forward(forward)
             compiled()

@@ -13,6 +13,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.preparation.persistent import persistent_copy
 
 PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 FEATURES = 16384
@@ -63,25 +64,20 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, shard, device, *, buffers=None):
+    def allocate(cls, patches, shard, device):
         heads, kv_heads = 32 // shard.world_size, 8 // shard.world_size
-        def zeros(cursor, *shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if cursor is None
-                    else cursor.zeros(shape, torch.bfloat16))
-        pixels = zeros(buffers, patches, 1536)
-        residual, normalized, projected, reduced = (zeros(buffers, patches, 1280) for _ in range(4))
-        stages = [buffers.fork() for _ in range(3)] if buffers is not None else [None] * 3
-        attention, feedforward, merger = stages
-        mlp = MLPScratch.allocate(patches, 1280, 4608 // shard.world_size, device, buffers=feedforward)
-        qkv = zeros(attention, patches, (heads + 2 * kv_heads) * 64)
-        query = zeros(attention, patches, heads, 64)
-        key, value = (zeros(attention, patches, kv_heads, 64) for _ in range(2))
-        attended = zeros(attention, patches, heads * 64)
-        merged = zeros(merger, patches // 4, 5120)
-        activated = zeros(merger, patches // 4, 5120 // shard.world_size)
-        partial, output = (zeros(merger, patches // 4, HIDDEN) for _ in range(2))
-        if buffers is not None:
-            buffers.join(*stages)
+        def zeros(*shape):
+            return torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        pixels = zeros(patches, 1536)
+        residual, normalized, projected, reduced = (zeros(patches, 1280) for _ in range(4))
+        mlp = MLPScratch.allocate(patches, 1280, 4608 // shard.world_size, device)
+        qkv = zeros(patches, (heads + 2 * kv_heads) * 64)
+        query = zeros(patches, heads, 64)
+        key, value = (zeros(patches, kv_heads, 64) for _ in range(2))
+        attended = zeros(patches, heads * 64)
+        merged = zeros(patches // 4, 5120)
+        activated = zeros(patches // 4, 5120 // shard.world_size)
+        partial, output = (zeros(patches // 4, HIDDEN) for _ in range(2))
         return cls(pixels, residual, normalized, qkv, query, key, value, attended, projected,
                    reduced, mlp, merged, activated, partial, output)
 
@@ -92,70 +88,62 @@ class VisionScratch:
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, runtime, coordinator, session, workspace, name, buffers=None):
-        self.scratch, self.inputs, self.config = scratch, inputs, weights.config
+    def __init__(self, weights, scratch, inputs, *, runtime, coordinator, session, workspace, name):
+        self.inputs, self.config = inputs, weights.config
+        self.capacity = scratch.patches.shape[0]
+        self.query_shape, self.key_shape, self.value_shape = (tuple(value.shape) for value in (scratch.query, scratch.key, scratch.value))
         c, s = weights.config, scratch
-        tokens, device = s.patches.shape[0], s.patches.device
-        self.frequencies = 10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32)
-        def zeros(shape, dtype=torch.int32):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.positions = zeros((tokens, 2), torch.int64)
-        self.columns, self.rows = zeros((tokens // 4,)), zeros((tokens // 4,))
-        self.columns.copy_(torch.arange(tokens // 4, dtype=torch.int32, device=device))
-        self.rows.copy_(self.columns)
-        self.cu = zeros((2,))
-        self.num_patches, self.num_features = zeros((1,)), zeros((1,))
-        self.patch = UnquantizedProjection(s.patches, weights.patch, s.residual, session=session, name=name + ".patch")
+        device = s.patches.device
+        self.frequencies = persistent_copy(10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32))
+        cu = torch.zeros((2,), dtype=torch.int32, device=device)
+        self.patch = UnquantizedProjection(s.patches, weights.patch, s.residual, session=session, name=name + ".patch").functional(session=session)
         self.blocks = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.{index}"
-            norm1 = PreparedRMSNorm(s.residual, w.norm1, s.normalized, eps=1e-6, session=session, name=prefix + ".norm1")
-            qkv = UnquantizedProjection(s.normalized, w.qkv, s.qkv, bias=w.qkv_bias, session=session, name=prefix + ".qkv")
-            output = UnquantizedProjection(s.attended, w.output, s.projected, session=session, name=prefix + ".output")
-            norm2 = PreparedRMSNorm(s.residual, w.norm2, s.normalized, eps=1e-6, session=session, name=prefix + ".norm2")
+            norm1 = PreparedRMSNorm(s.residual, w.norm1, s.normalized, eps=1e-6, session=session, name=prefix + ".norm1").functional()
+            qkv = UnquantizedProjection(s.normalized, w.qkv, s.qkv, bias=w.qkv_bias, session=session, name=prefix + ".qkv").functional(session=session)
+            output = UnquantizedProjection(s.attended, w.output, s.projected, session=session, name=prefix + ".output").functional(session=session)
+            norm2 = PreparedRMSNorm(s.residual, w.norm2, s.normalized, eps=1e-6, session=session, name=prefix + ".norm2").functional()
             mlp = PreparedMLP(s.normalized, w.mlp, s.mlp.gate_up, s.mlp.intermediate, s.mlp.output,
-                gate_up_bias=w.gate_up_bias, session=session, workspace=workspace, name=prefix + ".mlp")
+                gate_up_bias=w.gate_up_bias, session=session, workspace=workspace, name=prefix + ".mlp").functional(session=session)
             window = None if index in c["fullatt_block_indexes"] else (c["visual_token_window_size"],) * 2
-            attention = PreparedVarlenAttention(s.query, s.key, s.value, self.cu, s.attended.view_as(s.query),
-                window=window, sink=w.sink, session=session, workspace=workspace, name=prefix + ".attention")
+            attention = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended.view_as(s.query),
+                window=window, sink=w.sink, session=session, workspace=workspace, name=prefix + ".attention").functional(session=session)
             self.blocks.append((norm1, qkv, attention, output, w.output_bias, norm2, mlp, w.down_bias))
         self.reduce = PreparedAllReduce(s.projected, s.reduced, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".reduce")
-        self.norm = PreparedRMSNorm(s.residual, weights.norm, s.normalized, eps=1e-6, session=session, name=name + ".norm")
-        self.merge_up = UnquantizedProjection(s.merged, weights.merge_up, s.activated, session=session, name=name + ".merge_up")
-        self.merge_down = UnquantizedProjection(s.activated, weights.merge_down, s.partial, session=session, name=name + ".merge_down")
+                                       session=session, name=name + ".reduce").functional(session=session)
+        self.norm = PreparedRMSNorm(s.residual, weights.norm, s.normalized, eps=1e-6, session=session, name=name + ".norm").functional()
+        self.merge_up = UnquantizedProjection(s.merged, weights.merge_up, s.activated, session=session, name=name + ".merge_up").functional(session=session)
+        self.merge_down = UnquantizedProjection(s.activated, weights.merge_down, s.partial, session=session, name=name + ".merge_down").functional(session=session)
         self.merge_reduce = PreparedAllReduce(s.partial, s.output, runtime=runtime, coordinator=coordinator,
-                                             session=session, name=name + ".merge_reduce")
+                                             session=session, name=name + ".merge_reduce").functional(session=session)
 
-    def __call__(self):
-        s, c = self.scratch, self.config
-        self.patch(s.patches)
-        angles = (self.positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None]
-        col_angles = angles.unflatten(0, (-1, 4))[self.columns.long()].flatten(0, 1)
-        def rotate(source, destination, angles):
+    def __call__(self, patches, positions, columns, rows, cu):
+        hidden = self.patch(patches)
+        angles = (positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None]
+        col_angles = angles.unflatten(0, (-1, 4))[columns.long()].flatten(0, 1)
+        def rotate(source, angles):
             left, right = source.float().chunk(2, -1)
             cos, sin = angles.cos(), angles.sin()
-            destination.copy_(torch.cat((left * cos - right * sin, right * cos + left * sin), -1))
+            return torch.cat((left * cos - right * sin, right * cos + left * sin), -1).to(source.dtype)
 
         previous = -1
         for index, (norm1, project, attention, output, output_bias, norm2, mlp, down_bias) in enumerate(self.blocks):
-            kind = c["vit_window_attn_types"][index]
+            kind = self.config["vit_window_attn_types"][index]
             if (kind == 1) != (previous == 1):
-                order = self.columns if kind == 1 else self.rows
-                s.residual.copy_(s.residual.unflatten(0, (-1, 4))[order.long()].flatten(0, 1))
+                order = columns if kind == 1 else rows
+                hidden = hidden.unflatten(0, (-1, 4))[order.long()].flatten(0, 1)
             previous = kind
-            q, k, v = project(norm1(s.residual)).split((s.query[0].numel(), s.key[0].numel(), s.value[0].numel()), -1)
+            widths = tuple(shape[1] * shape[2] for shape in (self.query_shape, self.key_shape, self.value_shape))
+            q, k, v = project(norm1(hidden)).split(widths, -1)
             selected = col_angles if kind == 1 else angles
-            rotate(q.view_as(s.query), s.query, selected)
-            rotate(k.view_as(s.key), s.key, selected)
-            s.value.copy_(v.view_as(s.value))
-            attention()
-            s.residual.add_(self.reduce(output(s.attended)) + output_bias)
-            s.residual.add_(self.reduce(mlp(norm2(s.residual))) + down_bias)
+            query = rotate(q.view(self.query_shape), selected)
+            key = rotate(k.view(self.key_shape), selected)
+            attended = attention(query, key, v.view(self.value_shape).contiguous(), cu)
+            hidden = hidden + (self.reduce(output(attended.flatten(1))) + output_bias)
+            hidden = hidden + (self.reduce(mlp(norm2(hidden))) + down_bias)
         if previous == 1:
-            s.residual.copy_(s.residual.unflatten(0, (-1, 4))[self.rows.long()].flatten(0, 1))
-        self.norm(s.residual)
-        s.merged.copy_(s.normalized.view_as(s.merged))
-        s.activated.copy_(F.gelu(self.merge_up(s.merged)))
-        return self.merge_reduce(self.merge_down(s.activated))
+            hidden = hidden.unflatten(0, (-1, 4))[rows.long()].flatten(0, 1)
+        merged = self.norm(hidden).view(self.capacity // 4, -1)
+        activated = F.gelu(self.merge_up(merged))
+        return self.merge_reduce(self.merge_down(activated))

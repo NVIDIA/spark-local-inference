@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from ignition.components.sampling import DeviceRequestState, RequestAdmission, RUNNING
+from ignition.components.sampling import DeviceRequestState, RequestAdmission
 from ignition.components.speculation import (
     PreparedSpeculativeDistributions, PreparedSpeculativeStateCommit,
     PreparedStochasticVerification, SpeculativeAcceptance, SpeculativeRngState,
@@ -62,13 +62,13 @@ class NoLogprobs:
     def prepare(self):
         pass
 
-    def functional(self):
+    def functional(self, *, session=None, dynamic_inputs=False):
         return self
 
     def __call__(self):
         pass
 
-    def run(self, logits):
+    def run(self, logits, *, slots=None, generations=None, live_rows=None):
         self.inputs.append(logits)
 
 

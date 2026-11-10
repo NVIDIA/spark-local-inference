@@ -1,0 +1,21 @@
+diff --git a/torch/_inductor/codegen/memory_planning.py b/torch/_inductor/codegen/memory_planning.py
+--- a/torch/_inductor/codegen/memory_planning.py
++++ b/torch/_inductor/codegen/memory_planning.py
+@@ -15,6 +15,7 @@
+ from .. import config
+ from ..utils import _align, align, cache_on_self, CachedMethod, IndentedBuffer
+ from ..virtualized import V
++from .common import WorkspaceArg, WorkspaceZeroMode
+ from .wrapper import (
+     AllocateLine,
+     BufferLike,
+@@ -771,5 +772,8 @@
+         if self.buffer_groups is None:
+             raise AssertionError("buffer_groups not computed")
+         for group in self.buffer_groups:
+-            if group.is_output:
++            if group.is_output or (
++                isinstance(group.node, WorkspaceArg)
++                and group.node.zero_mode == WorkspaceZeroMode.ZERO_PER_GRAPH
++            ):
+                 group.update_usage(timestep)

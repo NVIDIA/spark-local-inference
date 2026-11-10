@@ -17,8 +17,6 @@ from ignition.recipes.glm53.batch import BatchInputs
 from ignition.recipes.glm53.dcp import ContextShards
 from ignition.recipes.glm53.speculative import PreparedRound
 from ignition.recipes.glm53.mtp import DraftMetadata
-from ignition.recipes.glm53.state import DecoderMetadata
-from ignition.components.recurrent import DeltaMetadata
 
 
 def test_shared_commit_without_previous_token_embeddings():
@@ -60,20 +58,18 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     inputs.live_rows.fill_(2)
     inputs.request_state_rows.copy_(torch.tensor([[1, 8, 9, 10, 11, 12, 13, 14], [2, 15, 16, 17, 18, 19, 20, 21]]))
     op.owner = SimpleNamespace(inputs=inputs, requests=SimpleNamespace(capacity=2), shards=ContextShards())
-    m = DecoderMetadata.allocate(2 * width, 2, 2, "cpu")
-    op.metadata = DecoderMetadata(m.token_ids, torch.zeros(2 * width, dtype=torch.int64),
-        DeltaMetadata.allocate(2, "cpu", verification_columns=8), m.indexed)
-    op.active = torch.tensor([True, True])
-    op.before = torch.tensor([255, 510])
-    op.offsets, op.columns, op.state_columns = torch.arange(2 * width), torch.arange(width), torch.arange(8)
-    op.candidates = torch.arange(2 * width).view(2, width)
-    op.target_metadata(torch.tensor([0, 1]), torch.tensor(limits, dtype=torch.int32))
-    assert op.metadata.recurrent.query_start_loc.tolist() == [0, limits[0], sum(limits)]
-    assert op.metadata.recurrent.num_tokens.item() == sum(limits)
-    assert op.metadata.indexed.positions.tolist() == positions
-    assert op.metadata.indexed.token_slots.tolist()[:sum(limits)] == token_slots
+    args = (torch.tensor([0, 1]), torch.tensor(limits, dtype=torch.int32), torch.tensor([True, True]),
+            torch.tensor([255, 510]), torch.arange(2 * width).view(2, width))
+    metadata = op.target_metadata(*args)
+    assert metadata.recurrent.query_start_loc.tolist() == [0, limits[0], sum(limits)]
+    assert metadata.recurrent.num_tokens.item() == sum(limits)
+    assert metadata.indexed.positions.tolist() == positions
+    assert metadata.indexed.token_slots.tolist()[:sum(limits)] == token_slots
     # Columns past the round's width stay on the null row instead of reaching the next slot's rows.
-    assert op.metadata.recurrent.state_indices.tolist() == state_indices
+    assert metadata.recurrent.state_indices.tolist() == state_indices
+    repeated = op.target_metadata(*args)
+    assert metadata.token_ids.data_ptr() != repeated.token_ids.data_ptr()
+    torch.testing.assert_close(metadata.token_ids, repeated.token_ids)
 
 
 def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
@@ -94,6 +90,36 @@ def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
     assert metadata.num_tokens.item() == 0
     assert metadata.indexed.positions.tolist() == [-1, -1, -1]
     assert metadata.indexed.token_slots.tolist() == [-1, -1, -1]
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_draft_metadata_is_local_and_traces_with_runtime_lengths(compiled):
+    slots = torch.tensor([2, 0, 1])
+    state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
+    tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    tokens = torch.tensor([[7, 8], [9, 10], [11, 12]])
+    hidden = torch.arange(6, dtype=torch.bfloat16)[:, None].expand(6, 4096).reshape(3, 2, 4096)
+
+    def pack(lengths):
+        metadata = DraftMetadata.pack(slots, lengths, torch.tensor([254, 510, 0]), tokens, hidden,
+            tables, capacity=2, state_rows=state_rows)
+        return (metadata.token_ids, metadata.hidden, metadata.output_indices, metadata.num_tokens,
+                metadata.indexed.positions, metadata.indexed.token_slots)
+
+    run = torch.compile(pack, backend="eager", fullgraph=True) if compiled else pack
+    lengths = torch.tensor([2, 1, 0])
+    actual = run(lengths)
+    assert actual[0][:3].tolist() == [7, 8, 9]
+    assert actual[1][:3, 0].tolist() == [0, 1, 2]
+    assert actual[2].tolist() == [1, 2, 2]
+    assert actual[3].item() == 3
+    assert actual[4].tolist() == [254, 255, 510, -1, -1, -1]
+    for result, reference in zip(actual, pack(lengths), strict=True):
+        torch.testing.assert_close(result, reference)
+    empty = run(torch.zeros_like(lengths))
+    assert empty[3].item() == 0
+    assert empty[4].tolist() == [-1] * 6
+    assert actual[0].data_ptr() != empty[0].data_ptr()
 
 
 @pytest.fixture(autouse=True)

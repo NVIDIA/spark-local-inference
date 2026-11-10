@@ -15,7 +15,7 @@ from ignition.components.rotary import CompressedRotary
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.deepseek4.attention import AttentionIndices, AttentionScratch, PreparedAttention
 from ignition.recipes.deepseek4.config import REVISION
@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 class OrderedSelection:
-    """Give both storage layouts the same reduction order for an unordered selected set."""
+    """Order equal selected sets before comparing independently compiled forwards."""
 
     def __init__(self, operation):
         self.operation = operation
@@ -35,8 +35,8 @@ class OrderedSelection:
     def write_keys(self, keys, slots):
         self.operation.write_keys(keys, slots)
 
-    def __call__(self):
-        selected = self.operation()
+    def __call__(self, *args):
+        selected = self.operation(*args)
         ordered = torch.where(selected >= 0, selected, 2147483647).sort(-1).values
         selected.copy_(torch.where(ordered == 2147483647, -1, ordered))
         return selected
@@ -67,39 +67,28 @@ def test_prefill_layers_reuse_storage_after_committing_state(capacity):
     with RecordedPreparationSession(device=device, checkpoint=REVISION,
             workload_schema="deepseek4.prefill-storage.v1", numerical_policy="checkpoint") as session:
         session.register_scratch(arena)
-        forwards, allocations = [], []
-        for reuse in (False, True):
-            shared = GraphBufferPool(device, chunk_bytes=1 << 20)
-            private = GraphBufferPool(device, chunk_bytes=1 << 20)
-            indices = AttentionIndices(metadata, mode="prefill", tokens=capacity,
-                                       visible=None, buffers=shared.cursor())
-            cursor, operations = private.cursor(), []
+        forwards = []
+        for variant in range(2):
+            indices = AttentionIndices(metadata, mode="prefill", tokens=capacity)
+            operations = []
             for i, weight in zip(layers, weights, strict=True):
-                operations.append(PreparedAttention(i, weight, source, scratch, metadata, pool, rotary,
-                    mode="prefill", world=2, session=session, name=f"reuse{int(reuse)}.layer{i}",
-                    workspace=arena, buffers=private.cursor() if reuse else cursor, indices=indices))
-                # Sparse selection can return the same set in different orders on repeated replay.
-                # Canonicalize both fixtures so exact output equality isolates storage reuse.
-                operations[-1].selectors = [OrderedSelection(s) for s in operations[-1].selectors]
+                operation = PreparedAttention(i, weight, source, scratch, metadata, pool, rotary,
+                    mode="prefill", world=2, session=session, name=f"variant{variant}.layer{i}",
+                    workspace=arena, indices=indices)
+                operation.selectors = [OrderedSelection(s) for s in operation.selectors]
+                operations.append(operation)
+            indices.functional()
 
-            def forward(indices=indices, operations=operations, private=private):
-                indices()
+            def forward(indices=indices, operations=operations):
+                packet = indices(metadata)
                 for index, operation in enumerate(operations):
-                    output[index].copy_(operation(source))
-                    # No layer may retain an intermediate after committing its prefill state.
-                    for chunks in private.chunks.values():
-                        for chunk in chunks:
-                            chunk.view(torch.uint8).fill_(0x7F)
+                    value, _ = operation(source, metadata, packet)
+                    output[index].copy_(value)
 
             forwards.append(forward)
-            allocations.append(private.nbytes)
-            owners.extend((shared, private, indices, operations))
-            assert (operations[0].compressed.data_ptr() == operations[1].compressed.data_ptr()) == reuse
-        assert allocations[1] <= allocations[0]
-        if capacity == 4096:
-            assert allocations[1] < allocations[0]
+            owners.extend((indices, operations))
         session.tune()
-        for name, forward in zip(("separate", "shared"), forwards, strict=True):
+        for name, forward in zip(("first", "second"), forwards, strict=True):
             compiled = compile_forward(forward)
             compiled()
             graph = torch.cuda.CUDAGraph()
@@ -125,7 +114,6 @@ def test_prefill_layers_reuse_storage_after_committing_state(capacity):
                     metadata.positions[:count].copy_(torch.arange(start, start + count, device=device))
                     metadata.page_table.copy_(torch.arange(blocks - 1, -1, -1, device=device)[None, :])
                     metadata.live_counts.copy_(torch.tensor([count, int(count > 0)], device=device))
-                    arena.tensor.fill_(0x5A)
                     torch.cuda.synchronize()
                     before = torch.cuda.memory_stats()
                     ticket = worker.submit(graph_index)

@@ -204,7 +204,7 @@ import torch
 from ignition.preparation.aot import aot_forward
 from ignition.preparation.forward_metadata import dumps, loads
 from ignition.preparation.package_storage import PackageStorage
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 
 class Forward:
     def __init__(self, source, scratch):
@@ -219,21 +219,21 @@ torch.cuda.set_device(0)
 with PackageStorage(device=0) as storage:
     source = torch.randn(256, 256, device='cuda')
     pool = storage.scratch_pool()
-    buffers = GraphBufferPool('cuda', chunk_bytes=64 << 20, allocation_pool=pool.pool)
-    cursor = buffers.cursor()
-    scratch = cursor.zeros(source.shape, torch.float32)
+    with torch.cuda.use_mem_pool(pool.pool):
+        scratch = torch.zeros_like(source)
     arena = ScratchArena('cuda', allocation_pool=pool.pool)
     arena.reserve(128 << 20)
-    late = cursor.full((128 << 20,), 7, torch.uint8)
+    with torch.cuda.use_mem_pool(pool.pool):
+        late = torch.full((128 << 20,), 7, dtype=torch.uint8, device='cuda')
     arena.reserve(256 << 20)
     arena.trim(128 << 20)
     arena.tensor.fill_(1)
     tensors = (scratch, late, arena.tensor)
     forward = Forward(source, scratch)
-    forward.buffers, forward.arena = buffers, arena
+    forward.late, forward.arena = late, arena
     metadata = loads(dumps(forward))
     assert metadata.scratch.shape == scratch.shape
-    buffers.allocation_pool = arena.allocation_pool = None
+    arena.allocation_pool = None
     torch.cuda.synchronize()
     cached = torch.cuda.mem_get_info()[0]
     pool.retire()
@@ -242,7 +242,7 @@ with PackageStorage(device=0) as storage:
     torch.cuda.synchronize()
     before = torch.cuda.mem_get_info()[0]
     pool.release_backing()
-    assert torch.cuda.mem_get_info()[0] >= before + buffers.nbytes + arena.nbytes
+    assert torch.cuda.mem_get_info()[0] >= before + scratch.nbytes + late.nbytes + arena.nbytes
     try:
         compiled = aot_forward(forward)
     finally:
@@ -352,22 +352,27 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
 
     @contextmanager
     def warmup():
-        previous = storage._preparation_pools.copy()
         with storage.transient():
             temporary = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
             temporary.zero_()
             del temporary
             yield
-        pools = storage._preparation_pools - previous
-        assert pools
-        assert not [segment for segment in torch.cuda.memory_snapshot()
-                    if tuple(segment["segment_pool_id"]) in pools]
-        assert storage._snapshot()["retained_handles"] > 0
-        warmed.append(pools)
+        pool = storage._retention_pool
+        assert pool is not None
+        segments = [segment for segment in torch.cuda.memory_snapshot()
+                    if tuple(segment["segment_pool_id"]) == tuple(pool.id)]
+        assert segments
+        assert storage._snapshot()["retained_handles"] == 0
+        warmed.append((pool.id, sum(segment["total_size"] for segment in segments)))
 
     cache = ForwardCache(namespace={"model": "warmup-storage"}, device="cuda:0", root=tmp_path)
     with storage.retain_transient_backing():
         compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
+    assert storage._retention_pool is None
+    assert len({tuple(pool_id) for pool_id, _ in warmed}) == 1
+    assert max(size for _, size in warmed) == warmed[-1][1]
+    assert not [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == tuple(warmed[0][0])]
     assert storage._snapshot()["retained_handles"] == 0
     assert storage._snapshot()["retained_reference_bytes"] == 0
     assert len(warmed) == 2 * len(functions)
@@ -387,7 +392,7 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                     reason="requires an explicitly assigned CUDA device")
-def test_transient_retention_reuses_retained_physical_backing(mailbox_storage):
+def test_transient_retention_reuses_one_torch_pool(mailbox_storage):
     import torch
 
     storage = mailbox_storage
@@ -396,27 +401,75 @@ def test_transient_retention_reuses_retained_physical_backing(mailbox_storage):
     sizes = [segment_size] * 12
     reusable_address = None
     with storage.retain_transient_backing():
-        for index, size in enumerate(sizes):
+        for size in sizes:
             with storage.transient():
                 temporary = torch.empty(size, dtype=torch.uint8, device="cuda")
-                mapping_extent = storage.mappings[temporary.data_ptr()].nbytes
+                address = temporary.data_ptr()
+                mapping_extent = storage.mappings[address].nbytes
                 assert mapping_extent >= size
                 if reusable_address is None:
-                    reusable_address = temporary.data_ptr()
+                    reusable_address = address
                     reusable_extent = mapping_extent
                 else:
-                    assert temporary.data_ptr() == reusable_address
+                    assert address == reusable_address
                     assert mapping_extent == reusable_extent
                 del temporary
 
             snapshot = storage._snapshot()
-            assert snapshot["retained_handles"] == index + 1
-            assert snapshot.get("retained_reusable_handles", 0) == 1
-            assert snapshot.get("retained_reusable_bytes", 0) == reusable_extent
+            assert snapshot["retained_handles"] == 0
+            assert storage._retention_pool is not None
+            pool_segments = [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == tuple(storage._retention_pool.id)]
+            assert sum(segment["total_size"] for segment in pool_segments) == reusable_extent
+            assert storage.mappings[reusable_address].nbytes == reusable_extent
     snapshot = storage._snapshot()
     assert snapshot["retained_handles"] == 0
     assert snapshot["retained_reference_bytes"] == 0
+    assert storage._retention_pool is None
     assert reusable_address not in storage.mappings
+    assert storage.error is None
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
+def test_transient_pool_bounds_ascending_and_descending_sizes(mailbox_storage):
+    import torch
+
+    storage = mailbox_storage
+    sizes = tuple((1 << power) << 20 for power in range(1, 8))
+    catalog = (*sizes, *reversed(sizes), *sizes)
+    largest = max(catalog)
+    peak = 0
+    pool_id = None
+    pool_addresses = set()
+    with storage.retain_transient_backing():
+        for size in catalog:
+            with storage.transient():
+                value = torch.empty(size, dtype=torch.uint8, device="cuda")
+                value.fill_(size // (1 << 20))
+                del value
+            pool = storage._retention_pool
+            assert pool is not None
+            if pool_id is None:
+                pool_id = pool.id
+            assert tuple(pool.id) == tuple(pool_id)
+            segments = [segment for segment in torch.cuda.memory_snapshot()
+                        if tuple(segment["segment_pool_id"]) == tuple(pool_id)]
+            pool_addresses.update(segment["address"] for segment in segments)
+            total = sum(segment["total_size"] for segment in segments)
+            mapped = sum(storage.mappings[segment["address"]].nbytes for segment in segments)
+            assert mapped == total
+            peak = max(peak, total)
+            assert total <= 2 * largest + storage.granularity, (size, total, largest)
+            assert storage._snapshot()["retained_handles"] == 0
+            del pool
+    assert peak <= 2 * largest + storage.granularity
+    assert storage._retention_pool is None
+    assert storage._snapshot()["retained_handles"] == 0
+    assert storage._snapshot()["retained_reference_bytes"] == 0
+    assert not pool_addresses.intersection(storage.mappings)
+    assert not [segment for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == tuple(pool_id)]
     assert storage.error is None
 
 
@@ -428,43 +481,39 @@ def test_transient_retention_preserves_live_segment_extents(mailbox_storage):
 
     storage = mailbox_storage
     larger_size = 32 << 20
-    smaller_size = (16 << 20) - 1
+    block_size = 8 << 20
+    smaller_size = block_size - 1
+    segment_address = None
+    segment_extent = None
     with storage.retain_transient_backing():
         with storage.transient():
             temporary = torch.empty(larger_size, dtype=torch.uint8, device="cuda")
-            larger_address = temporary.data_ptr()
-            larger_segment, = (segment for segment in torch.cuda.memory_snapshot()
-                               if segment["address"] == larger_address)
-            larger_extent = larger_segment["total_size"]
-            assert storage.mappings[larger_address].nbytes == larger_extent
+            segment_address = temporary.data_ptr()
+            segment, = (item for item in torch.cuda.memory_snapshot()
+                        if item["address"] == segment_address)
+            segment_extent = segment["total_size"]
+            assert storage.mappings[segment_address].nbytes == segment_extent
             del temporary
         with storage.transient():
+            prefix = torch.empty(block_size, dtype=torch.uint8, device="cuda")
             live = torch.full((smaller_size,), 19, dtype=torch.uint8, device="cuda")
             live_address = live.data_ptr()
-            live_segment, = (segment for segment in torch.cuda.memory_snapshot()
-                             if segment["address"] == live_address)
-            live_extent = live_segment["total_size"]
-            assert live_extent < larger_extent
-            assert live_address != larger_address
-            assert storage.mappings[live_address].nbytes == live_extent
+            live_segment, = (item for item in torch.cuda.memory_snapshot()
+                             if item["address"] <= live_address < item["address"] + item["total_size"]
+                             and tuple(item["segment_pool_id"]) == tuple(storage._retention_pool.id))
+            assert live_segment["address"] == segment_address
+            assert live_address > segment_address
+            assert storage.mappings[segment_address].nbytes == segment_extent
+            del prefix
         snapshot = storage._snapshot()
-        assert snapshot["retained_handles"] == 1
-        assert snapshot["retained_reusable_handles"] == 1
-        assert snapshot["retained_reusable_bytes"] == larger_extent
-        with storage.transient():
-            temporary = torch.empty(larger_size, dtype=torch.uint8, device="cuda")
-            assert temporary.data_ptr() == larger_address
-            assert storage.mappings[larger_address].nbytes == larger_extent
-            del temporary
-        snapshot = storage._snapshot()
-        assert snapshot["retained_handles"] == 2
-        assert snapshot["retained_reusable_handles"] == 1
-        assert snapshot["retained_reusable_bytes"] == larger_extent
+        assert snapshot["retained_handles"] == 0
+        assert snapshot["mappings"][str(segment_address)] == segment_extent
     snapshot = storage._snapshot()
     assert snapshot["retained_handles"] == 0
     assert snapshot["retained_reference_bytes"] == 0
-    assert larger_address not in storage.mappings
-    assert storage.mappings[live_address].nbytes == live_extent
+    assert storage._retention_pool is None
+    assert storage.mappings[segment_address].nbytes == segment_extent
+    assert segment_address <= live_address < segment_address + segment_extent
     block, = (block for block in live_segment["blocks"] if block["address"] == live_address)
     assert block["requested_size"] == live.nbytes < block["size"]
     padding = (live_address + live.nbytes, live_address + block["size"])
@@ -485,7 +534,7 @@ def test_transient_retention_preserves_live_segment_extents(mailbox_storage):
     del live, output
     gc.collect()
     torch.cuda.empty_cache()
-    assert live_address not in storage.mappings
+    assert segment_address not in storage.mappings
     assert storage.error is None
 
 

@@ -58,9 +58,28 @@ def test_verify_accepted_prefix_then_decode(window):
         decode = PreparedAttention(0, weights, config, shard, source[:4], decode_scratch, decode_metadata, pool,
             mode='decode', runtime=None, coordinator=None, session=session, name='decode', workspace=arena)
         session.tune()
-        forwards = [compile_forward(lambda: attention(source)),
-                    compile_forward(lambda: attention.commit(accepted)),
-                    compile_forward(lambda: decode(source[:4]))]
+        retained_key, retained_value = torch.empty_like(scratch.key), torch.empty_like(scratch.value)
+        def verify_forward():
+            query, key, value, gate = attention.project(source, metadata)
+            scratch.query.copy_(query)
+            scratch.key.copy_(key)
+            scratch.value.copy_(value)
+            scratch.projected[:, -gate.shape[-1]:].copy_(gate)
+            output, records = attention.attend(query, key, value, gate, metadata, source.shape)
+            scratch.output.copy_(output)
+            if records is not None:
+                retained_key.copy_(records[0])
+                retained_value.copy_(records[1])
+        def decode_forward():
+            query, key, value, gate = decode.project(source[:4], decode_metadata)
+            decode_scratch.query.copy_(query)
+            decode_scratch.projected[:, -gate.shape[-1]:].copy_(gate)
+            output, _ = decode.attend(query, key, value, gate, decode_metadata, source[:4].shape)
+            decode_scratch.output.copy_(output)
+        forwards = [compile_forward(verify_forward),
+                    compile_forward(lambda: attention.commit(accepted,
+                        (retained_key, retained_value) if window > 0 else None, metadata)),
+                    compile_forward(decode_forward)]
         graphs = []
         for index, forward in enumerate(forwards):
             forward()

@@ -11,16 +11,14 @@ from .vision import FEATURES, REGISTER_TOKENS
 
 
 class PreparedVisionGeneration:
-    def __init__(self, encoder, state, completion, frame, sequence, *, buffers=None):
+    def __init__(self, encoder, state, completion, frame, sequence):
         self.encoder, self.state = encoder, state
-        self.errors = (torch.zeros(1, dtype=torch.int32, device=completion.records.device) if buffers is None
-                       else buffers.zeros((1,), torch.int32))
         self.publish = PreparedFeaturePublication(state, encoder.inputs, completion, frame, sequence)
 
     def __call__(self):
         e, s = self.encoder, self.state
         i, r = e.inputs, s.requests
-        capacity = e.scratch.patches.shape[0]
+        capacity = e.patch_capacity
         slot = i.vision_slot.long().clamp(0, r.capacity - 1)
         count, features, offset = i.vision_num_patches, i.vision_num_features, i.vision_feature_offset
         valid = (i.vision_slot >= 0) & (i.vision_slot < r.capacity)
@@ -40,14 +38,13 @@ class PreparedVisionGeneration:
         valid &= (~live | ((weights.sum(-1) - 1).abs() < 1e-5)).all()
         valid &= (~feature_live[:, None] | ((merge >= 0) & (merge < count))).all()
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
-        self.errors.copy_(~valid)
-        e.scratch.patches.copy_(torch.where(valid & live[:, None], i.vision_pixel_values[:capacity], 0))
-        e.interpolation_indices.copy_(torch.where(valid & live[:, None], indices, 0))
-        e.interpolation_weights.copy_(torch.where(valid & live[:, None], weights, 0))
-        e.merge_indices.copy_(torch.where(valid & feature_live[:, None], merge, 0))
-        e.cu[0].zero_()
-        e.cu[1:].copy_(torch.where(valid, count + REGISTER_TOKENS, 0))
-        e.num_features.copy_(torch.where(valid, features, 0))
-        output = e()
-        self.errors.copy_(self.errors | (~((~feature_live[:, None]) | torch.isfinite(output)).all()).int() * 64)
-        self.publish(output, e.num_features, self.errors)
+        errors = (~valid).int()
+        patches = torch.where(valid & live[:, None], i.vision_pixel_values[:capacity], 0)
+        indices = torch.where(valid & live[:, None], indices, 0)
+        weights = torch.where(valid & live[:, None], weights, 0)
+        merge = torch.where(valid & feature_live[:, None], merge, 0)
+        cu = torch.cat((torch.zeros_like(count), torch.where(valid, count + REGISTER_TOKENS, 0)))
+        num_features = torch.where(valid, features, 0)
+        output = e(patches, indices, weights, merge, cu)
+        errors = errors | (~((~feature_live[:, None]) | torch.isfinite(output)).all()).int() * 64
+        self.publish(output, num_features, errors)

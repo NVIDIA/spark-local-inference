@@ -31,9 +31,7 @@ class PreparedResume:
         name,
         activation_mode="a16",
         logits_dtype=torch.bfloat16,
-        buffers=None,
         workspace=None,
-        local_metadata=False,
     ):
         if logits_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("resume logits require BF16 or FP32 storage")
@@ -85,22 +83,14 @@ class PreparedResume:
         self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
         self.completion.functional(session=session)
-        self.local_metadata = local_metadata
-        if local_metadata:
-            self.validation.functional(session=session)
-            self.state.functional(local_metadata=True)
-        else:
-            self.state.functional()
+        self.validation.functional(session=session)
+        self.state.functional()
         self.local_logits = self.logits = None
         self.compilation_variant = "sample"
 
     def __call__(self):
-        if self.local_metadata:
-            validation, present = self.state.validate()
-            totals = self.validation(validation)
-            hidden = self.state.gather(totals, present=present)
-        else:
-            self.validation(self.state.validate())
-            hidden = self.state.gather()
+        validation, present = self.state.validate()
+        totals = self.validation(validation)
+        hidden = self.state.gather(totals, present=present)
         logits = self.projection(hidden)
         self.completion.run(logits)

@@ -192,7 +192,7 @@ import flare_heliopause
 from ignition.preparation.memory_inventory import collect_inventory, owner_claims
 from ignition.preparation.package_storage import PackageStorage
 from ignition.preparation.runtime_package import Allocation
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 # A dataclass retained through a closure exercises owners outside Ignition modules.
@@ -204,9 +204,9 @@ torch.cuda.set_device(0)
 with PackageStorage() as storage:
     weight = torch.ones(1024, device='cuda')
     record_numeric_tensor(weight)
-    pool = GraphBufferPool('cuda:0', chunk_bytes=4096)
-    prefill = Forward(pool.cursor().zeros(1024, torch.float32))
-    decode = Forward(pool.cursor().zeros(8, torch.float32))
+    backing = torch.zeros(1024, device='cuda:0')
+    prefill = Forward(backing)
+    decode = Forward(backing[:8])
     def forward(owner=prefill):
         return owner.hidden
     arena = ScratchArena('cuda:0')
@@ -214,7 +214,7 @@ with PackageStorage() as storage:
     cache = storage.device_allocate('KV', (1 << 20, 256), torch.uint8,
                                     group='kv_pages', maximum=1 << 20, units=4)
     region, = storage.dynamic_regions
-    prepared = SimpleNamespace(resources=(weight, pool, forward, decode, arena),
+    prepared = SimpleNamespace(resources=(weight, forward, decode, arena),
         buffers={'cache': cache}, device=0, export_zero_ranges=(), graphs={'prefill': None, 'decode': None})
     allocations = [Allocation(str(i), a.address, a.nbytes) for i, a in enumerate(storage.mappings.values())]
     allocations.append(Allocation('KV', region.address, region.extent, sizing={'capacity': 'kv_pages'}))
@@ -224,7 +224,7 @@ with PackageStorage() as storage:
     def size(category, field='entries'):
         return sum(row['nbytes'] for row in report[field] if row['category'] == category)
     assert size('Weights / numeric constants') == weight.nbytes
-    assert size('Graph scratch pools') == pool.nbytes == 4096
+    assert size('Other owned tensors') == backing.nbytes == 4096
     assert size('Operator scratch') == arena.nbytes == 512
     assert size('Preparation cache backing', 'preparation_entries') == region.nbytes < region.extent
     assert report['tracked_physical_bytes'] == sum(size for _, size in flare_heliopause.memory_inventory()['mappings']) + region.nbytes

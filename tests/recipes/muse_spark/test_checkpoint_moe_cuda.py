@@ -73,7 +73,7 @@ def test_checkpoint_moe_e256_tp8_arithmetic(layer, tokens, valid):
     from ignition.components.route_finalizer import PreparedRouteFinalizer
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.muse_spark.model import norm
     from ignition.recipes.muse_spark.weights import BF16Experts, MuseSparkWeightLoader
 
@@ -107,8 +107,10 @@ def test_checkpoint_moe_e256_tp8_arithmetic(layer, tokens, valid):
             output = torch.empty_like(raw_reference)
             with ExitStack() as resources:
                 if isinstance(experts, BF16Experts):
-                    op = PreparedBF16Experts(source, experts.gate_up, experts.down, ids, weights, output, count,
-                        buffers=GraphBufferPool("cuda").cursor())
+                    op = PreparedBF16Experts(source, experts.gate_up, experts.down, ids, weights, output, count)
+                    op.functional(session=None)
+                    def forward(prepared=op, destination=output):
+                        destination.copy_(prepared.run(source, ids, weights, count))
                 else:
                     session = resources.enter_context(PreparationSession(device="cuda:0", autotune=False, compile_workers=0))
                     arena = ScratchArena("cuda")
@@ -116,8 +118,11 @@ def test_checkpoint_moe_e256_tp8_arithmetic(layer, tokens, valid):
                         name="routes", workspace=arena)
                     arena.finalize()
                     scale_math = "dynamic_fast" if op.binding.fast_math else "dynamic_precise"
-                op()
-                run = compile_forward(op) if rank == 0 else op
+                    op.functional(session=session)
+                    def forward(prepared=op, destination=output):
+                        destination.copy_(prepared(source, ids, weights, num_valid_tokens=count))
+                forward()
+                run = compile_forward(forward) if rank == 0 else forward
                 run()
                 if quantized:
                     session.freeze()

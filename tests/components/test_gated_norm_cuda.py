@@ -140,10 +140,14 @@ def test_gated_norm_mxfp8_prefill_graph_live_rows_and_storage(encoded_only):
 def test_gdn_mxfp8_encodings_reuse_storage_across_captured_prefill_shapes():
     from ignition.components.gated_delta import GDNScratch
     from ignition.components.gated_norm import PreparedGatedRMSNorm
-    from ignition.preparation.scratch import GraphBufferPool
+    from b12x.quantization import mxfp8
 
     scratch = GDNScratch.allocate(4096, torch.device("cuda:0"))
-    pool = GraphBufferPool("cuda:0")
+    shared_bases = tuple(torch.zeros(shape, dtype=dtype, device="cuda:0")
+                         for shape, dtype in zip(mxfp8.dense_rows_storage_shapes(4096, 48 * 128),
+                             (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    shared_bases[1].fill_(127)
+    shared_bases[2].fill_(127)
     weight = torch.ones(128, dtype=torch.float32, device="cuda:0")
     live = torch.zeros(1, dtype=torch.int32, device="cuda:0")
     graphs, outputs = [], []
@@ -151,7 +155,9 @@ def test_gdn_mxfp8_encodings_reuse_storage_across_captured_prefill_shapes():
         view = scratch.rows(rows)
         hidden, gate = view.recurrence.view(rows, 48, 128), view.z.view(rows, 48, 128)
         independent = view.mxfp8_output
-        shared = view.allocate_mxfp8_output(buffers=pool.cursor())
+        shapes = mxfp8.dense_rows_storage_shapes(rows, 48 * 128)
+        shared = mxfp8.dense_rows_from_bases(*(base.reshape(-1)[:torch.Size(shape).numel()].view(shape)
+            for base, shape in zip(shared_bases, shapes, strict=True)))
         norms = [PreparedGatedRMSNorm(hidden, gate, weight, None, live, eps=1e-6,
             round_normalized=True, activation="silu", encoded=encoded)
             for encoded in (independent, shared)]
@@ -163,9 +169,8 @@ def test_gdn_mxfp8_encodings_reuse_storage_across_captured_prefill_shapes():
         outputs.append((independent, shared))
     assert len({shared.values.data_ptr() for _, shared in outputs}) == 1
     for index in (0, 2, 1, 0, 1, 2):
-        for chunks in pool.chunks.values():
-            for tensor in chunks:
-                tensor.fill_(255 if tensor.dtype == torch.uint8 else 0)
+        for tensor in shared_bases:
+            tensor.fill_(255 if tensor.dtype == torch.uint8 else 0)
         rows = outputs[index][0].values.shape[0]
         live.fill_(max(0, rows - 1))
         scratch.recurrence.normal_()

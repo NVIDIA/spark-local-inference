@@ -20,21 +20,36 @@ def draft_config():
     )
 
 
+def test_draft_declaration_reuse_keeps_writable_roles_disjoint():
+    from ignition.components.dflash2 import _draft_templates
+
+    config, shard, examples = draft_config(), TensorParallelShard(0, 1), {}
+    scratch = DraftScratch.allocate(config, shard, 8, "cpu")
+    first = _draft_templates(config, shard, scratch, "cpu", examples=examples)
+    second = _draft_templates(config, shard, scratch, "cpu", examples=examples)
+    assert first.normalized is second.normalized
+    assert first.output is second.output
+    assert first.mlp.output is second.mlp.output
+    assert first.convolution["before"] is second.convolution["before"]
+    planes = (first.embedding, first.normalized, first.partial, first.output, first.hidden,
+              first.mlp.output, first.convolution["before"], first.convolution["after"])
+    assert len({tensor.untyped_storage()._cdata for tensor in planes}) == len(planes)
+    first.output.fill_(4)
+    assert torch.all(second.output == 4)
+    assert torch.count_nonzero(first.mlp.output) == 0
+    assert torch.count_nonzero(first.convolution["after"]) == 0
+
+
 def capture_pair(metadata, hidden, *, columns, window, compact):
-    bound = PreparedContextCapture(metadata, columns, window, compact_prefill=compact)
-    bound.begin()
-    functional = bound.functional()
+    functional = PreparedContextCapture(metadata, columns, window, compact_prefill=compact)
     state = functional.begin(metadata)
     width = hidden[0].shape[-1]
     for index, values in enumerate(hidden):
-        column = index * width
-        bound(values, column)
-        state = functional(state, values, column)
-    torch.testing.assert_close(state[0], bound.output, rtol=0, atol=0)
+        state = functional(state, values, index * width)
     return functional, state
 
 
-def test_functional_context_capture_matches_bound_compact_suffix_selection():
+def test_functional_context_capture_selects_compact_suffix():
     metadata = SimpleNamespace(
         positions=torch.tensor([0, 1, 2, 3, 4, -1, -1, -1], dtype=torch.int64),
         starts=torch.tensor([0], dtype=torch.int64),
@@ -52,7 +67,7 @@ def test_functional_context_capture_matches_bound_compact_suffix_selection():
     torch.testing.assert_close(live, torch.tensor([True, True, True]), rtol=0, atol=0)
 
 
-def test_functional_context_capture_matches_bound_full_rows():
+def test_functional_context_capture_retains_full_rows():
     metadata = SimpleNamespace(
         positions=torch.tensor([4, 5, 0, 1], dtype=torch.int64),
         starts=torch.tensor([4, 0], dtype=torch.int64),
@@ -76,7 +91,7 @@ def test_functional_context_capture_keeps_invocation_outputs_independent():
         query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
     )
     functional = PreparedContextCapture(metadata, 4, 3, compact_prefill=True).functional()
-    assert functional.metadata is None
+    assert not any(isinstance(value, torch.Tensor) for value in vars(functional).values())
     first, second = functional.begin(metadata), functional.begin(metadata)
     assert first[0].data_ptr() != second[0].data_ptr()
     hidden = torch.arange(32, dtype=torch.bfloat16).view(8, 4)

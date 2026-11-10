@@ -17,6 +17,7 @@ _VERSIONS = {"torch": "2.14.1+cu132", "triton": "3.8.0"}
 _PATCHES = (
     "torch-inductor-triton-cache-filenames.patch",
     "torch-inductor-cooperative-static-launch.patch",
+    "torch-inductor-workspace-lifetimes.patch",
     "triton-platform-key-pointer-width.patch",
 )
 

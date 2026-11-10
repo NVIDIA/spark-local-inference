@@ -22,7 +22,8 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, ch
     from ignition.components.weights import DirectWeightLoader
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
+    from tests.tensor_examples import TensorExamples
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes import resolve
     from ignition.recipes.qwen38_dense.config import ModelConfig, TEXT_PREFIX
@@ -42,8 +43,8 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, ch
     with torch.device("meta"):
         canonical = Qwen3_5MLP(Qwen3_5TextConfig.from_dict(config.text), config.text["intermediate_size"])
     device, width, intermediate = torch.device("cuda:0"), config.hidden, config.text["intermediate_size"]
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     guard_before = buffers.zeros((1024,), torch.bfloat16)
     source = buffers.zeros((rows, width), torch.bfloat16)
     packed = buffers.zeros((rows, 2 * intermediate), torch.bfloat16)
@@ -134,7 +135,8 @@ def test_bf16_down_projection_uses_intermediate_through_pooled_replay(rows):
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
+    from tests.tensor_examples import TensorExamples
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.qwen38_dense.decoder import GroupedMLP
 
@@ -142,8 +144,8 @@ def test_bf16_down_projection_uses_intermediate_through_pooled_replay(rows):
     canonical = Qwen3_5MLP(Qwen3_5TextConfig(hidden_size=width, hidden_act="silu"), intermediate).to(
         device=device, dtype=torch.bfloat16).eval()
     combined = torch.cat((canonical.gate_proj.weight, canonical.up_proj.weight))
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     guard_before = buffers.zeros((1024,), torch.bfloat16)
     source = buffers.zeros((rows, width), torch.bfloat16)
     packed = buffers.zeros((rows, 2 * intermediate), torch.bfloat16)

@@ -11,6 +11,7 @@ from b12x.norm.hyperconnection import api as hyperconnection
 from b12x.preparation import PreparedCall
 
 from ignition.preparation.fixtures.hyperconnection import HyperconnectionBenchmarkInputs
+from ignition.preparation.persistent import persistent_cat
 from ignition.preparation.tuning import benchmark_resource, declare
 
 
@@ -145,10 +146,26 @@ class PreparedIndexedRMSNorm:
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalIndexedRMSNorm(self.weight, self.plan, self.eps)
+
     def __call__(self, source, indices):
         torch.ops.b12x.hyperconnection_indexed_rmsnorm(
             source, self.weight, indices, self.output, self.eps, self.plan.handle)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalIndexedRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+
+    def __call__(self, source, indices):
+        output = torch.empty((indices.numel(), source.shape[1]), dtype=torch.bfloat16, device=source.device)
+        torch.ops.b12x.hyperconnection_indexed_rmsnorm(
+            source, self.weight, indices, output, self.eps, self.plan.handle)
+        return output
 
 
 class PreparedPairedRMSNorm:
@@ -160,7 +177,7 @@ class PreparedPairedRMSNorm:
                 or len(weights) != 2 or any(w.shape != left.shape[1:] for w in weights)
                 or weights[0].dtype != weights[1].dtype):
             raise ValueError("paired normalization requires two BF16 matrices and matching gains")
-        self.weight, self.output, self.eps = torch.cat(weights), output, float(eps)
+        self.weight, self.output, self.eps = persistent_cat(weights), output, float(eps)
         self.plan = hyperconnection.plan(hyperconnection.Caps(device=left.device,
             max_tokens=left.shape[0], hidden_size=left.shape[1], streams=2, lowrank=1),
             invocation={"operation": "grouped_rmsnorm", "zero_centered": zero_centered, "eps": self.eps,
@@ -176,6 +193,21 @@ class PreparedPairedRMSNorm:
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(
                 left, self.weight, output, eps=self.eps, paired=right)), benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalPairedRMSNorm(self.weight, self.plan, self.eps)
+
     def __call__(self, left, right):
         torch.ops.b12x.hyperconnection_paired_rmsnorm(left, right, self.weight, self.output, self.eps, self.plan.handle)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalPairedRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+
+    def __call__(self, left, right):
+        output = torch.empty((left.shape[0], 2 * left.shape[1]), dtype=torch.bfloat16, device=left.device)
+        torch.ops.b12x.hyperconnection_paired_rmsnorm(left, right, self.weight, output, self.eps, self.plan.handle)
+        return output
