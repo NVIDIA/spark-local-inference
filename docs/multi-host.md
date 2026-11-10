@@ -100,14 +100,17 @@ the switch, for example DGX Sparks whose second port is cabled to one partner:
 each rank then reaches a cabled peer over the cable's devices and every other
 peer over the switch. The planner identifies a cable as an IPv4 subnet that only
 the two cabled ranks hold, so every cable needs subnets of its own, distinct from
-the switch's and from every other cable's. IPv4 link-local addresses
-(169.254.0.0/16) never identify a cable. The two ranks of a group on one cabled
-pair hold every subnet in common, so the planner also identifies a cable by
-LLDP: each rank records its devices' MAC addresses and, when lldpd runs on the
+the switch's and from every other cable's. The two ranks of a group on one
+cabled pair hold every subnet in common, so the planner also identifies a cable
+by LLDP: each rank records its devices' MAC addresses and, when lldpd runs on the
 host, the port MAC addresses that `lldpctl` reports for their neighbors. LLDP
-frames do not cross a switch, so devices of two ranks that list each other share
-a cable. Without lldpd on both hosts, a two-rank group on a cabled pair uses the
-switch. Among equally verified links, a
+frames do not cross a switch, so devices of two ranks share a cable when either
+lists the other; lldpd on one host of the pair is enough. Without LLDP data, a
+two-rank group on a cabled pair has no evidence of its cable: its rails take one
+device behind each PCIe link and then the lowest-numbered network, which is the
+switch only when the switch's subnets sort below the cable's. IPv4 link-local
+addresses (169.254.0.0/16) never identify a cable, and two link-local addresses
+form a link only between LLDP neighbors. Among equally verified links, a
 peer's two rails use devices behind different PCIe links: a DGX Spark's two
 ConnectX-7 functions behind one PCIe x4 link share its bandwidth, so a two-rank
 group on a cabled pair uses one function behind each link. Core distribution
@@ -125,7 +128,9 @@ startup phase lists each peer's local devices in rail order and marks a peer
 reached over a direct cable, for example
 `2 rails per peer: rank 0 roceP2p1s0f0,rocep1s0f0; rank 2 direct roceP2p1s0f1,rocep1s0f1; rank 3 roceP2p1s0f0,rocep1s0f0`,
 so a cable that is down or unaddressed appears as its partner routed without
-`direct`. For direct cabling and neighbor forwarding, see
+`direct`. The marker reports the topology inferred from subnets and LLDP, not
+verified reachability; only a connected transport shows that the devices reach
+each other. For direct cabling and neighbor forwarding, see
 [experimental rings](#experimental-rings).
 
 ## Manual serving
