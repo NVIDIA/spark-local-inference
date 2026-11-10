@@ -14,7 +14,7 @@ from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
 from ignition.components.dense_mla import PreparedDenseMLA
-from ignition.components.dflash2 import PreparedDraft as BlockDraft
+from ignition.components.dflash2 import PooledPreparedDraft as BlockDraft
 from ignition.components.kda_speculation import KDARecords
 from ignition.components.linear import BatchedUnquantizedProjection, prepare_projection
 from ignition.components.mlp import MLPScratch

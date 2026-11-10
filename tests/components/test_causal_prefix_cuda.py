@@ -37,11 +37,11 @@ def test_eager_captured_prefix_oracle_and_allocation_stability(batch, depth):
     submitted.fill_(True)
     source_valid.fill_(True)
     limits.fill_(depth + 1)
-    operation()
+    valid.copy_(operation.functional()(confidence, slots, submitted, source_valid, limits, lengths))
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        operation()
+        valid.copy_(operation(confidence, slots, submitted, source_valid, limits, lengths))
     values = [0., -0., 1., .5, 2. ** -149, 2. ** -126, 1. - 2. ** -24]
     for iteration in range(40):
         probabilities = [[rng.choice(values + [rng.random()]) for _ in range(depth)] for _ in range(batch)]
@@ -86,7 +86,7 @@ def test_signed_zero_frontier_order_and_fp64_underflow_survival():
     for budget in range(3, 25):
         operation = PreparedCausalPrefixAllocation(confidence, slots, submitted, submitted, limits,
             lengths, valid, token_capacity=budget, request_capacity=3)
-        operation()
+        valid.copy_(operation.functional()(confidence, slots, submitted, submitted, limits, lengths))
         assert (lengths.tolist(), valid.tolist()) == allocate(confidence.tolist(), slots.tolist(),
             submitted.tolist(), submitted.tolist(), limits.tolist(), budget, 3)
 

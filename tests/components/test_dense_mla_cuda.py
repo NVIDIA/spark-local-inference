@@ -10,6 +10,7 @@ import torch
 from b12x.attention import dense_mla
 
 from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.preparation.compilation import compile_forward
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 
@@ -18,8 +19,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires FLARE_RUN_CUDA_TESTS=1 and an assigned GPU")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("tokens,batch", [(5, 2), (9, 4)])
-def test_ragged_tuning_partition_covers_physical_queries(monkeypatch, tokens, batch):
+def test_ragged_tuning_partition_covers_physical_queries(monkeypatch, tokens, batch, functional):
     import ignition.components.dense_mla as module
 
     device = torch.device("cuda", 0)
@@ -54,7 +56,13 @@ def test_ragged_tuning_partition_covers_physical_queries(monkeypatch, tokens, ba
         session.register_scratch(arena)
         attention = PreparedDenseMLA(query, cache, output, table, lengths, starts,
             caps=caps, scale=576 ** -.5, session=session, name="attention", workspace=arena)
+        if functional:
+            attention.functional(session=session)
         session.tune()
+        if functional:
+            arena.release_preparation()
+            operation = attention
+            attention = compile_forward(lambda: output.copy_(operation(query, table, lengths, starts)))
         assert observed
         cache.fill_(.125)
         attention(query, output)

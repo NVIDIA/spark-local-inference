@@ -89,11 +89,19 @@
     Windows text/image/speculative replay. SM103 execution and CSF repacking
     need GPU validation beyond metadata tests. See windows.md#serve-a-prepared-core.
 
-[ ] Review scratch-memory lifetimes and sharing across every supported recipe
-    and shared component, including Qwen, GLM, DeepSeek, MiMo, Kimi, Step, and
-    Nemotron. Review contiguous-buffer placement within typed pools and weight
-    allocation padding; nonoverlapping lifetimes alone do not eliminate gaps.
-    See performance-work.md#cross-model-scratch-planning for scope and checks.
+[ ] Validate compiler-owned temporaries in a complete GLM export. Migrate Kimi,
+    Step, Muse, and MiMo from graph-buffer pools, then validate complete exports.
+    Exercise native text/image transitions, speculative rollback, and full graph
+    catalogs with tensor parallelism. Measure fixed memory and KV capacity. See
+    performance-work.md#cross-model-scratch-planning.
+
+[ ] Fix Int32 partial-output address overflow in FlashInfer dense MLA split
+    stores for Kimi prefill4096; use element offsets that cover the allocated
+    tensor. Validate with Compute Sanitizer and the unchanged attention reference.
+
+[ ] Resolve Step TP8 package publication exceeding the 128 MiB envelope limit
+    after all 111 graphs capture. Preserve bounded package loading and validate
+    the complete package through native serving.
 
 [ ] Size DeepSeek V4 and MiMo one-shot all-reduce channels from their actual
     callers; prefills of at least 1024 rows use separate DMA channels. Preserve
@@ -121,13 +129,20 @@
 [ ] Validate cooperative Inductor reductions in full vision-enabled exports of
     kimi-k3-mxfp4-csf, step5-preview-nvfp4, mimo-v2.6-pro-mopd, glm-5.3-flash,
     and nemotron-bolt-24gb. Exercise every vision capacity, TP kernel agreement,
-    frozen preparation-cache reload, and native image replay. RADIO validation
-    passes single-rank and TP2 tests; full Qwen3.8 export passes. The five listed
-    full-model vision paths remain untested. See model-preparation.md#environment-setup.
+    frozen preparation-cache reload, and native image replay. Nemotron compiles
+    its complete catalog and replays RADIO at 1024 patches; other vision
+    capacities need native checks. Full Qwen3.8 export passes.
+    See model-preparation.md#environment-setup.
 
-[ ] Investigate Qwen vision's canonical-reference accuracy failure in
-    test_actual_vision_encoder_native_replay: relative L2 0.078 exceeds 0.03
-    with standalone scratch. Pooled and standalone native replay are exact.
+[ ] Investigate Qwen Flash Next vision's canonical-reference accuracy failure
+    with Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD: relative L2 0.09977 exceeds
+    0.03 with both bound and invocation-local temporaries. Native image requests
+    pass but do not establish the encoder's numerical reference.
+
+[ ] Resolve checkpoint reference failures before claiming full numerical
+    validation: GLM KDA prefix relative L2 0.02715 exceeds 0.01, Nemotron B8
+    context 0.010005 exceeds 0.01, and Step sparse attention layer 91 error
+    0.008425 exceeds 0.008. Each failure also reproduces with bound temporary storage.
 
 [ ] Check DeepSeek V4/V4.1 continuation-row requirements during speculation.
     parallel_draft.py consumes request_state_rows[:, 0], while their graph

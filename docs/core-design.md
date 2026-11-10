@@ -514,7 +514,7 @@ mechanisms:
 
 | Mechanism | Component and contract |
 |---|---|
-| Dense projections | [linear.py](../ignition/components/linear.py): BF16, FP32, and block-scaled plans, declared tuning, caller-owned outputs, and scratch |
+| Dense projections | [linear.py](../ignition/components/linear.py): BF16, FP32, and block-scaled plans, declared tuning, and outputs and workspaces passed as tensor operands |
 | Vocabulary projection | [vocabulary.py](../ignition/components/vocabulary.py): contiguous TP weight shards, rank-local projection, and gathered logits |
 | Embeddings | [embedding.py](../ignition/components/embedding.py): counted lookup with inactive-row zeroing |
 | Routed experts | [moe.py](../ignition/components/moe.py): FP32 route weights, model-selected scoring, and tuned expert execution |
@@ -617,19 +617,21 @@ GDN combines QKV/Z and B/A weights into two MXFP8 projections. Sparse attention
 combines Q/K/V into one projection and keeps the indexer independent. MTP uses
 the same Q/K/V grouping with BF16 weights. Loading concatenates serialized
 values and scale rows before b12x packs the scales; it does not requantize
-weights. Output slices share persistent packed scratch. The b12x convolution,
-recurrence, and KV writer consume row-strided views without unpacking copies.
+weights. Each forward allocates the grouped projection output. The b12x
+convolution, recurrence, and KV writer consume row-strided views without
+unpacking copies.
 GDN and sparse-attention projection plans let b12x select BF16 or quantized
-activations for each prepared capacity. Concurrent projections retain separate
-workspaces sized from their selected plans.
+activations for each prepared capacity. Concurrent projections receive separate
+invocation-local workspaces sized from their selected plans.
 
-Operators that allocate their outputs per call, including standalone
-hyperconnection combine, are acceptable inside capture
-because the allocation resolves into the graph memory pool. Graph variants share
-one pool only for intermediates whose lifetime ends within their graph. Values
-that survive a graph boundary live in caller-owned persistent storage outside
-the graph-private pool: request and cache state, snapshots, saved hidden
-vectors, vision embeddings, and completion frames. Each graph copies escaping
+Recipes with compiler-planned temporary storage allocate activations, metadata,
+outputs, and workspaces as local tensor values. Custom operators expose those
+tensors and their mutations to Inductor's static memory planner. Capture places
+the planned storage in a CUDA graph memory pool. Graph variants share one pool only for intermediates whose
+lifetime ends within their graph. Values that survive a graph boundary live in
+caller-owned persistent storage outside the graph-private pool: request and cache
+state, snapshots, saved hidden vectors, vision embeddings, and completion frames.
+Each graph writes escaping
 results into that storage before completing. Graphs execute serially on the
 model stream, including any captured side-stream joins; serialization alone
 does not establish safe pooled-output lifetimes. Qualification alternates
@@ -645,7 +647,8 @@ The loader must:
 - Preserve packed NVFP4 values, global/input scales, MXFP8 scale interpretation,
   and PLE hashing constants.
 - Feed compressed expert scales into b12x's CSF preparation path.
-- Share CSF expansion scratch across serialized layer execution.
+- Keep CSF records persistent and expose expansion planes as invocation-local
+  expert operands.
 - Convert normalization weights only where the selected b12x contract requires
   it, and qualify the numerical effect.
 - Exclude MTP tensors explicitly while MTP is disabled.
@@ -794,39 +797,34 @@ preparation synchronizes, restores every hybrid state region and PLE history to
 its admission value, and synchronizes again before capture. A restoration failure
 prevents capture and freeze.
 
-Hyperconnection priming borrows the decoder's zero-initialized residual
-storage through capacity views. Priming only reads that source; normalized and
-projected outputs occupy separate scratch. Autotuning retains private seeded
-fixtures.
+Hyperconnection priming reads declaration residual examples and writes separate
+normalization and projection examples. Autotuning uses private seeded fixtures.
 
-One `ignition.preparation.scratch.ScratchArena` supplies byte storage to quantized
-projections, GDN, QSA, routed MoE, PLE, and vision attention across serialized
-layers and graph executions. `arena.views(*shapes_and_dtypes)` returns contiguous
-typed views with 256-byte-aligned, nonoverlapping regions for buffers needed by
-simultaneous work. Serial invocations reuse the arena from offset zero.
-`register_parallel(*plans)` declares operations whose scratch must coexist;
-their aligned requirements are added within each group. Separate groups reuse
-storage, so the reserved extent is the maximum across serial operations and
-concurrent groups.
-`reserve(nbytes)` grows the backing tensor during preparation. Candidate
-measurement uses the maximum scratch requirement of the complete legal
-candidate envelope, including alignment, rather than a sum of per-family,
-per-layer, or per-candidate allocations. After selection and CUDA synchronization,
-`trim(nbytes)` replaces that storage with the peak requirement of the selected
-plans and concurrent groups. `freeze()` then rejects growth beyond the retained extent.
+`ignition.preparation.scratch.ScratchArena` supplies byte storage for kernel
+preparation and candidate measurement. `arena.views(*shapes_and_dtypes)` returns
+contiguous typed views with 256-byte-aligned, nonoverlapping regions.
+`register_parallel(*plans)` declares preparation workspaces that must coexist.
+The arena reserves the maximum requirement across sequential operations and
+concurrent groups in the complete candidate envelope. After selection and CUDA
+synchronization, `trim(nbytes)` sizes that storage from the selected plans, and
+`freeze()` rejects growth beyond that extent.
 
 `RecordedPreparationSession.register_scratch(arena)` associates that storage
 with the batched declarations. The session reserves the complete candidate
 budget before measurement and keeps that extent stable throughout the trials.
 It obtains the selected requirement from each plan's public
 `memory_requirements()`, synchronizes before replacing storage, trims the
-arena, and freezes the retained extent. `arena.finalize()` then refreshes
-every binding and shared alias against that final allocation, including
-singleton operations whose equivalent declarations share a prepared payload.
+arena, and freezes the extent used for binding finalization. `arena.finalize()`
+refreshes every declaration binding and shared alias against that allocation.
+Equivalent singleton declarations can share a prepared payload.
 Standalone component tests using a plain b12x session prepare and bind eagerly;
-model startup always uses the batched, tuned lifecycle.
-Bound addresses must not change after capture.
-The arena remains owned until all referencing graphs and native CUDA work drain.
+model startup uses the batched, tuned lifecycle. Finalizers retain selected
+geometry and workspace requirements while dropping concrete example bindings.
+After finalizers complete and CUDA work drains, `arena.release_preparation()`
+releases declaration buffers and retires the backing before forward compilation.
+Serving calls allocate their outputs and workspaces inside the forward.
+Inductor tracks their lifetimes, including aliased views and retained proposal
+values, and plans reuse from explicit dataflow.
 
 Serving graphs may declare persistent bindings produced by named startup tuning
 graphs. Preparation compiles and captures those producers with their candidate
@@ -838,14 +836,16 @@ recapture, or configuration search occurs during request execution.
 
 One preparation-owned auxiliary stream overlaps independent GDN projections,
 shared and routed experts, and QSA selection with its main QKV producer.
-Concurrent branches use disjoint scratch views. Opaque operations preserve
-forks, joins, input lifetimes, and tensor mutations through forward compilation.
-Every branch rejoins before dependent outputs or reused scratch are consumed.
+Each branch carries its sources, outputs, encoded planes, and workspaces in an
+explicit pending record through the join. The join receives the main-stream
+dependency and waits for auxiliary work. Opaque operators expose these operands
+and their mutations to compilation, so storage remains live until the join.
+Every branch rejoins before dependent outputs or storage reuse.
 Python captures these dependencies inside one CUDA graph; Rust submits that
 graph without calling Python or managing the internal streams.
 Preparation with `--no-stream-overlap` creates no auxiliary stream: recipes
-compose each branch on the main stream with the same kernels and register no
-concurrent scratch, to test whether a fault depends on overlap.
+compose each branch on the main stream with the same kernels, to test whether
+a fault depends on overlap.
 
 Startup compiles complete text forwards with Inductor before capture, including
 prefill absorption, ordinary decode, resume sampling, and speculative rounds.
@@ -864,32 +864,31 @@ the bound buffers before capture and serialization. Tests can set
 Serving never executes either Python forward after native handoff.
 
 b12x retains priming `PreparedCall.owners` with prepared plans. Priming calls use
-`prime_owners(arena, ...)` to retain the arena object without retaining obsolete
-views or bindings from a larger allocation. Serving components own their
-refreshed final bindings. Benchmark calls retain concrete trial views and
-bindings through measurement and teardown. Explicit raw-tensor callers retain
-their supplied storage owners. Replacing `arena.tensor` is insufficient to
-release memory if another owner still references its previous storage; ownership
-qualification checks those references as well as the reported arena extent.
+`prime_owners(arena, ...)` to retain the preparation arena without retaining
+obsolete views or bindings from a larger allocation. Benchmark calls retain
+concrete trial views and bindings through measurement and teardown. Component
+finalizers and preparation-release callbacks remove declaration tensors from
+fields, prepared argument tuples, closures, and library plan state before
+compilation. Persistent weights, native inputs and outputs, cache history,
+snapshots, and registered transport storage keep explicit owners through native
+drain.
 
 Operator benchmark operands and trial-state arenas live in
 [`preparation/fixtures`](../ignition/preparation/fixtures/). GDN, fused MoE,
 hyperconnection, variable-length attention, blockscaled GEMM, and MTP feedback
 each provide a concrete fixture factory. Recipes retain plan declarations,
-priming, selected bindings, and finalizers. Fixture factories preserve checkpoint
+selected plans, geometry, and finalizers. Fixture factories preserve checkpoint
 weight identity, tensor layouts and aliases, producer order, candidate scratch
 requirements, and cleanup before capture; they do not own serving execution.
 
-Scratch contents are volatile across operator calls. Kernels may not depend on
-bytes left by a previous call. Model state, cache pages, request metadata,
-weights, CSF expansion storage, and outputs that remain live while another
-operator runs have separate storage. Decoder and vision activation buffers
-therefore retain their existing lifetime boundaries. Graph variants share the
-operator arena only under the native model stream's serialization and captured
-side-stream joins. The preparation report records the initial allocation,
-candidate requirement and reservation, selected requirement, final reservation,
-and pending persistent bytes under `scratch_arena`. The model memory report records the retained
-allocation as `operator_scratch_bytes`.
+Compiler-planned temporary contents are volatile after their last consumer.
+Each forward initializes metadata, expanded scales, and workspaces before any
+dependent read. Inductor keeps simultaneously live values disjoint and can reuse their storage
+afterward. Captured variants reuse one CUDA graph pool under the native model
+stream's serialization, including captured side-stream joins. Values that escape
+a graph are written into explicit external storage before completion. The
+preparation report records candidate and selected workspace requirements under
+`scratch_arena`. Those requirements describe preparation workspace sizes.
 
 Selection caches are separate from compiled executable caches. The serving
 namespace includes checkpoint revision, configuration and tensor-header hashes,
@@ -915,15 +914,17 @@ Preparation proceeds in this order:
 1. Validate checkpoint architecture, quantization, tensor mappings, and hardware.
 2. Construct the canonical model and required replacements. Load packed weights
    through `DirectWeightLoader`; declare immutable table payloads.
-3. Describe persistent state, activation/output buffers, and the serving shape
+3. Describe persistent state, example tensor layouts, and the serving shape
    catalog. Use bounded cache storage for sizing and kernel preparation.
    Constructors declare requests without compiling or priming them.
 4. Reserve the complete candidate scratch envelope and tune all declared
    operations in one batch. Synchronize, trim to the selected peak, refresh
-   bindings, release trial owners, and restore borrowed state.
+   bindings, release trial owners, and restore borrowed state. Retire declaration
+   buffers and the preparation arena after CUDA work drains.
 5. Measure graph memory with sizing captures and determine cache geometry.
-   Compile complete forwards from tensor and selected-plan metadata on rank
-   zero. Peers load the resulting variants without tracing or compilation.
+   Divide missing forward compilations across preparation ranks using tensor
+   and selected-plan metadata. Every rank binds all compiled variants to its
+   own tensors before warmup and capture.
 6. After compiler workers exit, materialize final KV storage through
    `capture_forwards`' materialization callback. Bind live tensors and native
    handles, validate guards, and refresh cache-maintenance pointers.
@@ -1217,8 +1218,8 @@ advancement do not call Python.
 Device completion flags suppress further mutation for finished requests. Slot
 retirement waits for every submitted operation that can reference the slot.
 
-Prefill and vision execute on the same model stream as decode. This
-allows b12x scratch and CSF buffers to remain shared safely. QSA's optional
+Prefill and vision execute on the same model stream as decode. Their local
+temporaries reuse the CUDA graph pool after prior work completes. QSA's optional
 selection stream and its readiness event are bound before capture; the captured
 fork and join execute on replay.
 

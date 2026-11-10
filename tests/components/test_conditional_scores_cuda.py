@@ -170,7 +170,7 @@ def test_conditional_score_empty_and_slot_boundaries(mode):
 
 def test_native_filtered_target_probabilities_match_with_reusable_scratch():
     from ignition.preparation.graphs import PreparedGraphBundle
-    from ignition.preparation.scratch import GraphBufferPool, bind_scratch
+    from ignition.preparation.scratch import bind_scratch
     from ignition.components.speculation import PreparedStochasticVerification, SpeculativeRngState
 
     reference, candidate = _fixture(4, 6, torch.float32, prefix_masks=True)
@@ -179,8 +179,7 @@ def test_native_filtered_target_probabilities_match_with_reusable_scratch():
     candidate.state.seed.copy_(torch.tensor([131, 271, 419, 587], dtype=torch.uint64, device="cuda:0"))
     # Independent filter storage feeds the same request-owned verification policy.
     reference.prepare()
-    pool = GraphBufferPool("cuda:0", chunk_bytes=2 << 20)
-    work = bind_scratch(candidate.scratch_layout(4, 6, 10000), device="cuda:0", workspace=pool.cursor())
+    work = bind_scratch(candidate.scratch_layout(4, 6, 10000), device="cuda:0", workspace=None)
     for name, tensor in work.items():
         setattr(candidate, name, tensor)
     from ignition.components.probability_normalization import PreparedProbabilityNormalization
@@ -209,7 +208,7 @@ def test_native_filtered_target_probabilities_match_with_reusable_scratch():
         owners.append((distribution, call))
         verifiers.append(verify)
         graphs[name] = graph
-    bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={}, resources=(owners, pool))
+    bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={}, resources=(owners, work, verifiers))
     worker = bundle.start_worker()
     try:
         for live in (4, 3, 4, 1, 0, 4):
@@ -241,7 +240,7 @@ def test_native_c32_full_vocabulary_filter_and_verification():
     from ignition.components.probability_normalization import PreparedProbabilityNormalization
     from ignition.components.speculation import PreparedStochasticVerification, SpeculativeRngState
     from ignition.preparation.graphs import PreparedGraphBundle
-    from ignition.preparation.scratch import GraphBufferPool, bind_scratch
+    from ignition.preparation.scratch import bind_scratch
 
     batch, width, vocabulary = 32, 6, 129280
     reference, candidate = _fixture(batch, width, torch.float32,
@@ -258,9 +257,8 @@ def test_native_c32_full_vocabulary_filter_and_verification():
     state.top_k.fill_(-1)
     state.grammar_enabled.zero_()
     reference.prepare()
-    pool = GraphBufferPool('cuda:0', chunk_bytes=2 << 20)
     work = bind_scratch(candidate.scratch_layout(batch, width, vocabulary),
-                        device='cuda:0', workspace=pool.cursor())
+                        device='cuda:0', workspace=None)
     for name, tensor in work.items():
         setattr(candidate, name, tensor)
     candidate.normalization = PreparedProbabilityNormalization(candidate.probabilities, candidate.valid)
@@ -289,7 +287,7 @@ def test_native_c32_full_vocabulary_filter_and_verification():
         owners.append((distribution, verify, call))
         verifiers.append(verify)
         graphs[name] = graph
-    bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={}, resources=(owners, pool))
+    bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={}, resources=(owners, work, verifiers))
     worker = bundle.start_worker()
     try:
         request_counter = state.rng_counter.clone()

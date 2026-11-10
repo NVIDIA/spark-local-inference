@@ -36,6 +36,16 @@ class PreparedHeadGate:
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(values, gates, values)),
             benchmark_call=benchmark),))
 
-    def __call__(self):
-        torch.ops.b12x.hyperconnection_head_gate(self.values, self.gates, self.plan.handle)
-        return self.values
+    def functional(self, *, session):
+        """Consume forward-local values and gates with the prepared row strides."""
+        del session
+        self.values = self.gates = None
+        return self
+
+    def __call__(self, values=None, gates=None):
+        values = self.values if values is None else values
+        gates = self.gates if gates is None else gates
+        if values is None or gates is None:
+            raise ValueError("head gate requires values and gates")
+        torch.ops.b12x.hyperconnection_head_gate(values, gates, self.plan.handle)
+        return values

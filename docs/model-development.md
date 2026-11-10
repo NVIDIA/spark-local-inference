@@ -268,11 +268,17 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   DeepSeek V4 and V4.1 pack all draft layers' context KV projections into one
   projection of the normalized target feedback. Per-layer normalization, rotary
   embedding, and accepted-token cache writes consume slices of the packed output.
+- **Allocate temporary values in the forward.** Pass local activations, metadata,
+  outputs, and workspaces explicitly between prepared components. Expose custom
+  operator reads, writes, and aliases so Inductor can plan reuse. Keep weights,
+  native inputs and outputs, cache history, and transport storage under explicit
+  ownership. Release declaration examples and tuning workspace before compilation.
+  Follow [serving temporary lifetimes](preparation-development.md#serving-temporaries-and-concurrent-lifetimes).
 - **Respect layouts after fusion.** A column slice of a fused output can be
   contiguous for batch one and strided for multiple rows. Check downstream b12x
   input, output, stride, and alignment contracts for every graph capacity.
-  Allocate reusable staging storage where needed; do not introduce runtime
-  allocation through an implicit `.contiguous()`.
+  Allocate required staging tensors in the forward and pass them to the operator.
+  Keep layout conversions visible to compilation.
 - **Overlap independent branches.** Shared experts should be considered for
   overlap with routing and routed experts; recurrent output-gate projections
   can overlap independent input projections. Use
@@ -288,13 +294,13 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   and draft capacities. Other recipes retain their shape- and kernel-dependent
   ordering; a crossover measured for one expert geometry does not establish
   another geometry's crossover.
-- **Make overlap safe through compilation.** Declare every concurrently live
-  plan with [ScratchArena.register_parallel](../ignition/preparation/scratch.py).
-  Sequential work reuses storage; concurrent work gets disjoint storage sized
-  from the tuned plans. Refresh bindings after arena resizing. The fork must
-  follow input production, and the join must precede output consumption or
-  input/scratch reuse. Custom ops must expose reads, writes, aliases, and join
-  dependencies so compilation preserves those lifetimes.
+- **Make overlap safe through compilation.** Carry each branch's source, outputs,
+  encoded planes, and workspaces in an explicit pending record through its join.
+  The fork waits for input production, and the join precedes output consumption
+  or storage reuse. Pass the main-stream dependency to the join and expose every
+  operand's reads, writes, and aliases to Inductor. Use
+  [ScratchArena.register_parallel](../ignition/preparation/scratch.py) to size
+  concurrent preparation workspaces. Allocate serving temporaries in the forward.
 - **Shard the vocabulary projection under TP.** Use
   [PreparedVocabularyProjection](../ignition/components/vocabulary.py) to project
   contiguous vocabulary partitions and gather logits before designated-rank

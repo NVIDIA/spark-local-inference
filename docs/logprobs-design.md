@@ -93,12 +93,14 @@ Triton kernels are prepared before complete-forward compilation and capture.
 Opaque launch inputs and outputs expose the record, scratch, and logit ordering
 to the compiler.
 
-A bundle's `GraphBufferPool` shares reduction scratch across every serial graph
-variant and writer. Mixed role outputs use a second shared pool; roles within one
-graph remain disjoint until merging. Persistent two-frame outputs never alias
-scratch. Owners retain tensors and kernel handles through export and drained
-native replay. Export zero ranges include these pools and outputs. Memory reports
-include their physical bytes separately from allocated/reserved device totals.
+Reduction workspaces are local tensor values in the compiled forward. Inductor
+plans their lifetimes, and serialized graph variants share one CUDA graph pool.
+Mixed generation keeps prompt and decode completion frames in separate explicit
+storage until their merge. Serial variants reuse each role's frames. Native
+two-frame outputs never alias temporary storage. Owners retain completion frames,
+graph storage, and kernel handles through export and drained native replay.
+Export zero ranges include completion frames. Memory reports account for their
+physical bytes separately from allocated and reserved device totals.
 
 A zero request flag bypasses vocabulary reads, sorting, and payload writes.
 Requests without logprobs incur only the gated launches. Performance claims must

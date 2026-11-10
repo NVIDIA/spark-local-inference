@@ -316,13 +316,17 @@ publication boundaries.
 
 JSON identifies study timing as `cuda_graph_speculation_study_latency_ms`, with
 `native_completion_publication=false` and per-case `effective_draft_block`. Each seeded
-sample contains one `acceptance` observation: offered and accepted draft counts,
-committed draft and emitted token counts after clipping, emitted token IDs, and
-cumulative acceptance probabilities along the sampled proposal chain. Restored
-timing repetitions reuse the same RNG draw and are not independent acceptance
-observations. `useful_tokens_per_gpu_second` divides that input's emitted count
-by its median graph time; it does not measure serving throughput. Three default
-seeds provide an initial screen, not a robust acceptance estimate.
+sample contains one `acceptance` observation from a separate untimed diagnostic
+graph: offered and accepted draft counts, committed draft and emitted token counts
+after clipping, emitted token IDs, and cumulative acceptance probabilities along
+the sampled proposal chain. `acceptance.observation_source` identifies whether that
+diagnostic graph was compiled. The timed graph contains no diagnostic output copies.
+Restored timing repetitions reuse the same RNG draw and are not independent
+acceptance observations. Each timed replay records its actual committed emitted
+token count in `emitted_counts`. `useful_tokens_per_gpu_second` divides the median
+of those counts by the median graph time and converts milliseconds to seconds;
+it does not measure serving throughput. Three default seeds provide an initial
+screen, not a robust acceptance estimate.
 
 With `--prefill`, each request has `context + chunk` prompt tokens. Admission
 and the preceding context run outside timing; each measured replay processes

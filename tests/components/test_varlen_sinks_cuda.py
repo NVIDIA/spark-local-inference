@@ -17,8 +17,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires FLARE_RUN_CUDA_TESTS=1 and an assigned GPU")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("window", [None, (64, 64)])
-def test_vision_gqa_sinks_under_compiled_replay(window):
+def test_vision_gqa_sinks_under_compiled_replay(window, functional):
     device = torch.device("cuda", 0)
     generator = torch.Generator(device=device).manual_seed(21)
     q = torch.randn((256, 4, 64), device=device, generator=generator).bfloat16()
@@ -33,7 +34,14 @@ def test_vision_gqa_sinks_under_compiled_replay(window):
         session.register_scratch(arena)
         op = PreparedVarlenAttention(q, k, v, cu, out, sink=sink, window=window,
                                      session=session, workspace=arena, name="attention")
+        if functional:
+            op.functional(session=session)
         session.tune()
+        if functional:
+            arena.release_preparation()
+            attention = op
+            def op():
+                return out.copy_(attention(q, k, v, cu))
         compiled = compile_forward(op)
         compiled()
         graph = torch.cuda.CUDAGraph()

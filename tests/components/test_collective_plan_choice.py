@@ -47,8 +47,7 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
     if selected:
         assert prepared is selected[0]
     else:
-        assert all(actual is expected for actual, expected in zip(
-            prepared.owners, (runtime, source, output), strict=True))
+        assert prepared.owners == (runtime,)
     assert prepared.capture_safe is (surface != "PCIeTwoShotBF16.all_reduce")
     prepared.run()
     assert torch.equal(source, output)

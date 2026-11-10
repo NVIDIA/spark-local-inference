@@ -18,8 +18,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned GPU")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @torch.no_grad()
-def test_fused_mla_norm_default_tune_compiles_and_replays():
+def test_fused_mla_norm_default_tune_compiles_and_replays(functional):
     device = torch.device("cuda:0")
     projected = torch.empty((8, 1792), dtype=torch.bfloat16, device=device)
     query = torch.empty((8, 1280), dtype=torch.bfloat16, device=device)
@@ -30,8 +31,22 @@ def test_fused_mla_norm_default_tune_compiles_and_replays():
             workload_schema="query-kv", numerical_policy="bf16-floor1e-4", compile_workers=2) as session:
         prepared = PreparedMLANormQuant(projected, (qw, kw), query, kv, eps=1e-20,
             session=session, name="norm", release_dependents=True)
+        encoded_bases, encoded = prepared.encoded_bases, prepared.encoded
+        if functional:
+            prepared.functional(session=session)
         session.tune()
-        forward = compile_forward(lambda: prepared(projected))
+
+        def run():
+            if functional:
+                q, k, bases = prepared(projected)
+                query.copy_(q)
+                kv.copy_(k)
+                for observed, value in zip(encoded_bases, bases, strict=True):
+                    observed.copy_(value)
+            else:
+                prepared(projected)
+
+        forward = compile_forward(run)
         projected.normal_(std=.125)
         forward()
         graph = torch.cuda.CUDAGraph()
@@ -46,7 +61,7 @@ def test_fused_mla_norm_default_tune_compiles_and_replays():
                 projected.normal_(std=scale)
                 query.fill_(float("nan"))
                 kv.fill_(float("nan"))
-                for base in prepared.encoded_bases:
+                for base in encoded_bases:
                     base.zero_()
                 torch.cuda.synchronize()
                 before = torch.cuda.memory_stats()
@@ -61,7 +76,7 @@ def test_fused_mla_norm_default_tune_compiles_and_replays():
                     value = source.float()
                     expected = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-20)).bfloat16()
                     assert torch.equal(output, expected)
-                assert prepared.encoded.values.view(torch.uint8).count_nonzero() > 0
+                assert encoded.values.view(torch.uint8).count_nonzero() > 0
         finally:
             worker.close()
             graph.reset()

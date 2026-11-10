@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Share preparation operands while functional forwards allocate their own values."""
+
+import torch
+
+
+def declaration_tensor(examples, role, shape, dtype, device):
+    device = torch.device(device)
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    if examples is None:
+        return torch.zeros(shape, dtype=dtype, device=device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = role, shape, dtype, device
+    if key not in examples:
+        examples[key] = torch.zeros(shape, dtype=dtype, device=device)
+    return examples[key]

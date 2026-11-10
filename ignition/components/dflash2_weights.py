@@ -13,6 +13,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights, quantize_bf16_linear_as_mxfp8
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_cat
 
 
 if TYPE_CHECKING:
@@ -57,15 +58,17 @@ class DraftWeights:
             return quantize_bf16_linear_as_mxfp8(weight) if online_mxfp8 else weight
 
         with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
-            def matrix(prefix, rows=None, columns=None):
+            def matrix(prefix, rows=None, columns=None, *, temporary=None):
                 return loader.load_tensor(prefix + ".weight", extent=(
-                    slice(*(rows or (None, None))), slice(*(columns or (None, None)))))
+                    slice(*(rows or (None, None))), slice(*(columns or (None, None)))),
+                    temporary=online_mxfp8 if temporary is None else temporary)
 
             projection = pack(matrix("fc", rows=shard.partition(c["hidden_size"], alignment=64)))
             hidden_norm, norm = loader.load_tensors(("hidden_norm.weight", "norm.weight"))
             for i in range(config.layers):
                 p = f"layers.{i}"
-                qkv = torch.cat([matrix(p + ".self_attn." + n + "_proj", rows=r)
+                concatenate = torch.cat if online_mxfp8 else persistent_cat
+                qkv = concatenate([matrix(p + ".self_attn." + n + "_proj", rows=r, temporary=True)
                     for n, r in zip(("q", "k", "v"), (q_range, kv_range, kv_range), strict=True)])
                 context_kv = qkv[q_range[1] - q_range[0]:]
                 context_parts.append(context_kv.clone() if online_mxfp8 else context_kv)
@@ -74,7 +77,7 @@ class DraftWeights:
                 output = pack(matrix(p + ".self_attn.o_proj", columns=q_range))
                 qn, kn, inn, post = loader.load_tensors(tuple(p + n + ".weight" for n in
                     (".self_attn.q_norm", ".self_attn.k_norm", ".input_layernorm", ".post_attention_layernorm")))
-                mlp = MLPWeights(pack(torch.cat([matrix(p + ".mlp." + n + "_proj", rows=intermediate)
+                mlp = MLPWeights(pack(concatenate([matrix(p + ".mlp." + n + "_proj", rows=intermediate, temporary=True)
                     for n in ("gate", "up")])), pack(matrix(p + ".mlp.down_proj", columns=intermediate)))
                 def conv(name):
                     base, projection = loader.load_tensors((p + "." + name + ".base_kernel",
@@ -84,7 +87,7 @@ class DraftWeights:
                                                 conv("attention_conv"), conv("mlp_conv")))
             values = loader.load_tensors(("candidate_selector.hidden_projection.weight",
                 "candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook"))
-        context = pack(torch.cat(context_parts))
+        context = pack((torch.cat if online_mxfp8 else persistent_cat)(context_parts))
         return cls(projection, hidden_norm, context, norm, tuple(layers),
                    dict(zip(("projection", "predecessor", "successor"), values, strict=True)))
 

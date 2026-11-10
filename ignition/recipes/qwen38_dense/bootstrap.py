@@ -18,7 +18,6 @@ from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_modes,
 )
 
-from ignition.components.parallel_draft import PreparedParallelDraftRound
 from ignition.components.dflash2 import PreparedContext
 from ignition.components.capacity import (
     parallel_speculative_shapes, batch_capacities, prefill_capacities,
@@ -39,7 +38,7 @@ from ignition.preparation.frontend import annotated_template_asset, prepare_fron
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.selection import BenchmarkSelection
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
@@ -250,10 +249,8 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                                  restore=pool.clear_for_preparation)
         arena = ScratchArena(device)
         session.register_scratch(arena)
-        graph_buffers, private_buffers = GraphBufferPool(device), GraphBufferPool(device)
-        target_buffers, context_buffers, draft_buffers = (GraphBufferPool(device) for _ in range(3))
-        prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, weights.config, device, buffers=graph_buffers.cursor())
-        decode_storage = Scratch.allocate(decode_tokens, config.decode_samples, weights.config, device, buffers=graph_buffers.cursor())
+        prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, weights.config, device)
+        decode_storage = Scratch.allocate(decode_tokens, config.decode_samples, weights.config, device)
         buffers = dict(inputs.buffers(), **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -264,16 +261,14 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         if config.mtp and config.speculative_round_shapes:
             speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
                 completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
-                buffers=draft_buffers.cursor(), decoder_buffers=target_buffers, context_buffers=context_buffers,
                 verification_width=config.verification_width)
         study_owners = {}
         for study_width in study_widths:
             study_owners[study_width] = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
                 completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
-                buffers=draft_buffers.cursor(), decoder_buffers=target_buffers, context_buffers=context_buffers,
                 study_width=study_width)
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame)
-    forwards, signatures, metadata = {}, {}, {}
+    forwards, signatures = {}, {}
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
@@ -297,26 +292,23 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                 for capacity in sizes:
                     rows = 1 if mode == "prefill" else capacity
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    private = private_buffers.cursor()
-                    m = metadata[name] = Metadata.allocate(capacity, rows, blocks, device, buffers=private)
+                    m = Metadata.allocate(capacity, rows, blocks, device)
                     scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
-                        scoring=scoring if kind == "scored_prefill" else None, buffers=private,
+                        scoring=scoring if kind == "scored_prefill" else None,
                         vocabulary_runtime=None, coordinator=coordinator, session=session, name=name, workspace=arena)
-                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool, buffers=private)
+                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool)
                     context = (partial(PreparedContext, runtime=None, coordinator=None,
-                        buffers=context_buffers.cursor(), compact_prefill=mode == "prefill") if enabled else None)
+                        compact_prefill=mode == "prefill") if enabled else None)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=None,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=context, buffers=private)
+                        context_factory=context)
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled)
         if speculation is not None:
             for batch, width, packed in sorted(config.speculative_round_shapes,
                     key=lambda shape: (shape[2], shape[0]), reverse=True):
                 name = f"speculative{batch}x{width}p{packed}"
-                forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                    target_token_capacity=packed, buffers=private_buffers.cursor())
-                forward.prepare()
+                forward = speculation.round(batch, width, name, target_token_capacity=packed)
                 add(name, forward, "speculative", batch, width, forward_inputs, True, packed)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
@@ -327,13 +319,13 @@ def prepare(snapshot, config, *, progress=None, core_storage):
                     name = f"resume{capacity}" + suffix
                     forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                         rows=capacity, runtime=None, vocabulary_runtime=None, coordinator=coordinator,
-                        session=session, name=name, activation_mode="auto", buffers=private_buffers.cursor())
+                        session=session, name=name, activation_mode="auto", workspace=arena)
                     add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled)
                 for mode in (("init",) if prefill_only else ("init", "restore", "snapshot")):
                     name = f"{mode}{capacity}" + suffix
                     forward = PreparedMaintenance(mode, requests, pool, commands, inputs, completion, frame, sequence,
                         runtime=None, coordinator=coordinator, session=session, name=name, capacity=capacity,
-                        admission_buffers=admission, draft_state=enabled, buffers=private_buffers.cursor())
+                        admission_buffers=admission, draft_state=enabled)
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1,
                         (*fields, "page_tables", *commands.buffers()), enabled)
@@ -341,20 +333,34 @@ def prepare(snapshot, config, *, progress=None, core_storage):
     if study_owners:
         from ignition.bench.study import SpeculationStudy
 
-        studies = {width: SpeculationStudy(owner, width, buffers=private_buffers.cursor())
+        studies = {width: SpeculationStudy(owner, width)
                    for width, owner in study_owners.items()}
+    for owner in (() if speculation is None else (speculation,)) + tuple(study_owners.values()):
+        owner.release_examples()
+    del prefill_storage, decode_storage, m, scratch
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None, console=stage.console)
+    arena.release_preparation()
     stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
         stream=stream, pool=graph_pool, collective=None, coordinator=coordinator,
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs, materialize=pool.clear_for_preparation, warmup_storage=core_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative"))
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot"))
     for study in studies.values():
         study.capture(session=session, device=device, stream=stream, pool=graph_pool,
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
             retain_graphs=config.retain_graphs, materialize=pool.clear_for_preparation, warmup_storage=core_storage)
+    observers = None
+    if config.benchmark_selection is not None:
+        from ignition.bench.observations import capture_observers
+
+        selected = {name: forward for name, forward in forwards.items()
+                    if signatures[name].kind in ("prefill", "speculative")}
+        observers = capture_observers(selected, signatures, session=session, device=device,
+            stream=stream, pool=graph_pool, compile_decoder=config.compile_decoder,
+            progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
+            materialize=pool.clear_for_preparation, warmup_storage=core_storage)
     session.freeze()
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
@@ -398,8 +404,8 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         prefill_capacities=prefill_sizes, free_device_bytes=free, total_device_bytes=total,
         headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder,
         speculative_shapes=shapes, speculative_round_shapes=config.speculative_round_shapes,
-        speculative_graph_budget=config.speculative_graph_budget, draft_buffer_bytes=draft_buffers.nbytes,
-        target_buffer_bytes=target_buffers.nbytes, context_buffer_bytes=context_buffers.nbytes, graph_buffer_bytes=graph_buffers.nbytes, private_buffer_bytes=private_buffers.nbytes)
+        speculative_graph_budget=config.speculative_graph_budget,
+        graph_buffer_bytes=0, private_buffer_bytes=0)
     if scoring is not None:
         memory.update(scoring.memory_report())
     state = None
@@ -421,19 +427,16 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         benchmark_state=state, benchmark_pool=pool if state is not None else None,
         benchmark_requests=requests if state is not None else None,
-        benchmark_prefills=None if state is None else {name: value for name, value in metadata.items()
-            if signatures[name].kind == "prefill"},
+        benchmark_observers=None if observers is None else observers.observers,
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)),
+        graph_resources=(() if observers is None else (observers,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                           *storage_ranges([prefill_storage, decode_storage, arena.tensor, metadata,
-                                            graph_buffers.chunks, private_buffers.chunks, target_buffers.chunks, context_buffers.chunks, draft_buffers.chunks,
-                                            () if speculation is None else (speculation.draft_scratch.scratch_tensors(), speculation.records),
+                           *storage_ranges([arena.tensor,
                                             [f.scratch_tensors() for f in forwards.values() if hasattr(f, "scratch_tensors")]]), *completion.zero_ranges()),
-        resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage,
-                   decode_storage, metadata, compiled, stream, graph_pool, session, coordinator,
-                   graph_buffers, private_buffers, target_buffers, context_buffers, draft_buffers, speculation, studies))
+        resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, compiled, stream, graph_pool, session, coordinator,
+                   speculation, studies, observers))
 
     if studies:
         from ignition.bench.study import StudyModel

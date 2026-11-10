@@ -15,7 +15,7 @@ from ignition.recipes.deepseek41.decoder_prefill import PreparedDecoderSuffix
 @pytest.mark.parametrize("start", [0, 127, 4095])
 def test_decoder_suffix_alternates_full_partial_and_inactive_chunks(capacity, start):
     source = Metadata.allocate(capacity, 1, 40, "cpu")
-    packing = PreparedDecoderSuffix(source)
+    packing = PreparedDecoderSuffix(source).functional()
     values = torch.arange(capacity * 12).reshape(capacity, 3, 4)
     output = torch.empty((128, 3, 4), dtype=values.dtype)
     pages = torch.arange(40).flip(0).view(1, -1)
@@ -32,9 +32,9 @@ def test_decoder_suffix_alternates_full_partial_and_inactive_chunks(capacity, st
         source.positions.fill_(-1)
         source.positions[:count] = torch.arange(start, start + count)
         output.fill_(-999)
-        packing.begin()
-        packing.gather(values, output)
-        target = packing.metadata
+        packed = packing.begin(source)
+        output.copy_(packed.gather(values))
+        target = packed.metadata
         retained = list(range(max(0, count - 128), count))
         kept = len(retained)
         assert target.positions.tolist() == [start + index for index in retained] + [-1] * (128 - kept)
@@ -52,7 +52,7 @@ def test_decoder_suffix_alternates_full_partial_and_inactive_chunks(capacity, st
         if retained:
             expected[:kept] = values[retained]
         assert torch.equal(output, expected)
-        assert packing.replay_start.item() == (start + retained[0] if count > 128 else 0)
+        assert packed.replay_start.item() == (start + retained[0] if count > 128 else 0)
 
 
 @pytest.mark.parametrize("rows,tokens", [(2, 256), (1, 128)])
@@ -72,7 +72,8 @@ def test_decoder_feedback_at_replay_boundary_is_rejected_before_component_constr
         sources=(SimpleNamespace(layer=20),), draft=SimpleNamespace(target_layers=(20,))),
         draft=object(), layers=tuple(SimpleNamespace(engram=None) for _ in range(40)),
         shard=SimpleNamespace(world_size=4), embedding=None)
-    scratch = SimpleNamespace(embedding=torch.zeros(1), hidden=torch.zeros((1, 5120)))
+    scratch = SimpleNamespace(embedding=torch.zeros(1), hidden=torch.zeros((1, 5120)),
+        local_logits=torch.zeros((1, 1)), logits=torch.zeros((1, 1)))
     with pytest.raises(ValueError, match="draft target layers after"):
         decoder.PreparedDecoder(weights, None, scratch, Metadata.allocate(256, 1, 2, "cpu"), None,
             mode="prefill", runtime=None, vocabulary_runtime=None, coordinator=None,

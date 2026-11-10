@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, verify_chain
+from ignition.components.flashinfer_sampling import filter_probabilities_out, probability_filter_workspace_size, verify_chain
 
 from ignition.components.capacity import BATCH_CAPACITIES
 from ignition.components.completion import VECTOR_TOKENS_FIELD, validate_completion_buffers
@@ -70,6 +70,16 @@ def _live(state, slots, generations, live_rows, rows):
     selected &= (slots >= 0) & (slots < state.capacity) & (state.generation[safe] == generations)
     duplicates = ((slots[:, None] == slots[None, :]) & selected[None, :]).sum(-1) > 1
     return safe, selected & ~duplicates & (state.status[safe] == RUNNING)
+
+
+def _idle_completion_record(fields, *, device, draft_context_lag):
+    record = torch.zeros(fields, dtype=torch.int64, device=device)
+    record[4:5].fill_(-1)
+    record[12:13].fill_(-1)
+    record[VECTOR_TOKENS_FIELD:].fill_(-1)
+    if draft_context_lag is None:
+        record[13:14].fill_(-1)
+    return record
 
 
 @dataclass
@@ -130,7 +140,8 @@ class PreparedSpeculativeDistributions:
         return dict(scores=((batch, width, vocab), torch.float32),
             probabilities=((batch, width, vocab), torch.float32),
             maximum=((batch, width), torch.float32), valid=((batch, width), torch.bool),
-            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32))
+            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32),
+            top_p_workspace=((probability_filter_workspace_size(batch * width, vocab),), torch.uint8))
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                  *, prefix_offset=0, grammar_masks=None, grammar_mask_count=None, workspace=None):
@@ -159,10 +170,11 @@ class PreparedSpeculativeDistributions:
         self.grammar_masks, self.grammar_mask_count = grammar_masks, grammar_mask_count
         self.rows = torch.arange(batch, device=device)
         self.columns = torch.arange(width, device=device)
-        self.vocab_ids = torch.arange(vocab, device=device)
+        self.vocab_ids = requests.vocab_ids
         for tensor in (self.rows, self.columns, self.vocab_ids):
             record_numeric_tensor(tensor)
-        for name, tensor in bind_scratch(self.scratch_layout(batch, width, vocab),
+        self.layout = self.scratch_layout(batch, width, vocab)
+        for name, tensor in bind_scratch(self.layout,
                                         device=device, workspace=workspace).items():
             setattr(self, name, tensor)
         from ignition.components.probability_normalization import PreparedProbabilityNormalization
@@ -170,13 +182,21 @@ class PreparedSpeculativeDistributions:
         self._prepared = False
 
     def prepare_scores(self):
-        state, columns = self.state, self.columns
-        safe, live = _live(state, self.slots, self.generations, self.live_rows, self.rows)
+        return self._prepare_scores({name: getattr(self, name) for name in self.layout}, self.logits)
+
+    def _prepare_scores(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None):
+        state = self.state
+        rows = self.rows if self.rows is not None else torch.arange(logits.shape[0], device=logits.device)
+        columns = self.columns if self.columns is not None else torch.arange(logits.shape[1], device=logits.device)
+        candidates = self.candidates if candidates is None else candidates
+        safe, live = _live(state, self.slots if slots is None else slots,
+                           self.generations if generations is None else generations,
+                           self.live_rows if live_rows is None else live_rows, rows)
         counts = state.histogram[safe, None, :]
         prefix = columns + self.prefix_offset
-        prefix_valid = torch.ones_like(self.valid)
+        prefix_valid = torch.ones_like(scratch["valid"])
         for index in range(columns.numel() - 1 + self.prefix_offset):
-            ids = self.candidates[:, index]
+            ids = candidates[:, index]
             used = index < prefix
             valid = (ids >= 0) & (ids < state.vocab_size)
             prefix_valid &= valid[:, None] | ~used[None, :]
@@ -184,7 +204,7 @@ class PreparedSpeculativeDistributions:
             additions = matches & valid[:, None, None] & used[None, :, None]
             counts = counts + additions.to(torch.int32)
         params = state.parameters[safe]
-        scores = self.logits.float()
+        scores = logits.float()
         penalty = params[:, None, 3:4]
         adjusted = torch.where(scores > 0, scores / penalty, scores * penalty)
         scores = torch.where(counts > 0, adjusted, scores)
@@ -196,17 +216,17 @@ class PreparedSpeculativeDistributions:
         else:
             words = self.grammar_masks[safe][:, prefix][:, :, self.vocab_ids // 32]
         allowed = ((words >> (self.vocab_ids % 32)) & 1).bool() | ~state.grammar_enabled[safe, None, None].bool()
-        self.scores.copy_(torch.where(allowed, scores, -torch.inf))
-        self.maximum.copy_(_sliced(self.scores).amax(-1).amax(-1))
-        self.valid.copy_(live[:, None] & prefix_valid & torch.isfinite(self.maximum))
+        scratch["scores"].copy_(torch.where(allowed, scores, -torch.inf))
+        scratch["maximum"].copy_(_sliced(scratch["scores"]).amax(-1).amax(-1))
+        scratch["valid"].copy_(live[:, None] & prefix_valid & torch.isfinite(scratch["maximum"]))
         if self.grammar_masks is not None:
             count = self.grammar_mask_count[safe, None]
-            self.valid.logical_and_(~state.grammar_enabled[safe, None].bool()
+            scratch["valid"].logical_and_(~state.grammar_enabled[safe, None].bool()
                                     | ((prefix[None, :] < count) & (count <= self.grammar_masks.shape[1])))
         elif columns.numel() > 1:
-            self.valid.logical_and_(~state.grammar_enabled[safe, None].bool() | (prefix[None, :] == 0))
-        self.packed_top_k.copy_(torch.where(state.top_k[safe] > 0, state.top_k[safe], state.vocab_size)[:, None].expand_as(self.valid).reshape(-1))
-        self.packed_top_p.copy_(params[:, 1:2].expand_as(self.valid).reshape(-1))
+            scratch["valid"].logical_and_(~state.grammar_enabled[safe, None].bool() | (prefix[None, :] == 0))
+        scratch["packed_top_k"].copy_(torch.where(state.top_k[safe] > 0, state.top_k[safe], state.vocab_size)[:, None].expand_as(scratch["valid"]).reshape(-1))
+        scratch["packed_top_p"].copy_(params[:, 1:2].expand_as(scratch["valid"]).reshape(-1))
         return safe, params
 
     def prepare(self):
@@ -215,32 +235,56 @@ class PreparedSpeculativeDistributions:
         from flashinfer import sampling
         self._flashinfer = sampling
         self.library_scratch = (
-            sampling._get_cache_buf(f"top_k_mask_logits_row_states_{self.logits.device}", 1024 * 1024, self.logits.device, zero_init=True),
-            sampling._get_cache_buf("softmax_workspace", 1024 * 1024, self.logits.device),
+            torch.zeros(1024 * 1024, dtype=torch.uint8, device=self.logits.device),
+            torch.empty(1024 * 1024, dtype=torch.uint8, device=self.logits.device),
         )
-        self.top_p_workspace = probability_filter_workspace(
-            self.packed_top_p.numel(), self.state.vocab_size, self.logits.device)
         self._prepared = True
         self()
 
     def __call__(self):
+        scratch = {name: getattr(self, name) for name in self.layout}
+        return self.run(scratch, self.logits)
+
+    def release_scratch(self):
+        for name in self.layout:
+            setattr(self, name, None)
+        self.normalization.output = None
+        self.normalization.valid = None
+        self.library_scratch = None
+        self.logits = None
+
+    def functional(self, *, session=None, dynamic_inputs=False):
+        self.release_scratch()
+        if dynamic_inputs:
+            self.slots = self.generations = self.live_rows = None
+        self.normalization.functional()
+        self.candidates = self.rows = self.columns = None
+        return self
+
+    def run(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None):
         if not self._prepared:
             raise RuntimeError("probability filtering requires prepare() before capture")
-        _, params = self.prepare_scores()
+        _, params = self._prepare_scores(scratch, logits, candidates=candidates, slots=slots, generations=generations, live_rows=live_rows)
+        scores, valid = scratch["scores"], scratch["valid"]
+        probabilities = scratch["probabilities"]
         dummy = torch.where(self.vocab_ids == 0, 0., -torch.inf)
-        self.scores.copy_(torch.where(self.valid[:, :, None], self.scores, dummy))
-        flat = self.scores.view(-1, self.state.vocab_size)
-        filter_probabilities_out(flat, self.packed_top_k, self.packed_top_p,
-            *self.library_scratch, self.probabilities.view_as(flat), self.top_p_workspace)
-        return self.normalization(self.probabilities, params)
+        scores.copy_(torch.where(valid[:, :, None], scores, dummy))
+        flat = scores.view(-1, self.state.vocab_size)
+        library_scratch = self.library_scratch
+        if library_scratch is None:
+            library_scratch = (torch.zeros(1024 * 1024, dtype=torch.uint8, device=logits.device),
+                               torch.empty(1024 * 1024, dtype=torch.uint8, device=logits.device))
+        filter_probabilities_out(flat, scratch["packed_top_k"], scratch["packed_top_p"],
+            *library_scratch, probabilities.view_as(flat), scratch["top_p_workspace"])
+        return self.normalization.run(probabilities, params, probabilities, valid)
 
 
 class PreparedStochasticVerification:
     """Fixed-width one-row FlashInfer calls with device-owned RNG offsets.
 
     K+2 bounds scalar Philox draws, including the independent-acceptance metric.
-    Reservations are rounded to four draws. Functional library outputs remain
-    graph-private and are copied into the persistent acceptance buffers.
+    Reservations are rounded to four draws. The bound interface retains its
+    acceptance buffers; functional execution returns invocation-local results.
     """
 
     @staticmethod
@@ -253,7 +297,7 @@ class PreparedStochasticVerification:
 
     def __init__(self, draft_probs, draft_token_ids, target_probs, requests, slots, generations,
                  live_rows, *, rng, draft_valid=None, target_valid=None, output=None, token_limits=None,
-                 workspace=None):
+                 workspace=None, dummy=None):
         batch, width, vocab = target_probs.shape
         _geometry(batch, width)
         device = target_probs.device
@@ -275,14 +319,17 @@ class PreparedStochasticVerification:
         self.output = SpeculativeAcceptance.allocate(batch, width, device) if output is None else output
         self.output.validate(batch, width, device)
         self.rows, self.columns = torch.arange(batch, device=device), torch.arange(width, device=device)
-        self.dummy = (torch.arange(vocab, device=device) == 0).float()
-        for name, tensor in bind_scratch(self.scratch_layout(batch, width, vocab),
+        self.dummy = (torch.arange(vocab, device=device) == 0).float() if dummy is None else dummy
+        _tensor(self.dummy, (vocab,), torch.float32, device, "dummy probability distribution")
+        self.layout = self.scratch_layout(batch, width, vocab)
+        for name, tensor in bind_scratch(self.layout,
                                         device=device, workspace=workspace).items():
             setattr(self, name, tensor)
         self.draw_reservation = 4 * ((width + 1 + 3) // 4)
         if token_limits is not None:
             _tensor(token_limits, (batch,), torch.int32, device, "token_limits")
         self.token_limits = token_limits
+        self._has_token_limits = token_limits is not None
         self._prepared = False
         self.broadcast = None
         from .probability_mask import PreparedProbabilityMask
@@ -311,70 +358,138 @@ class PreparedStochasticVerification:
         self()
 
     def __call__(self):
+        scratch = {name: getattr(self, name) for name in self.layout}
+        return self.run(scratch, self.draft_probs, self.target_probs, self.target_valid)
+
+    def release_scratch(self):
+        for name in self.layout:
+            setattr(self, name, None)
+        self.draft_probs = None
+        self.target_probs = None
+        self.target_valid = None
+        for mask in self.probability_masks:
+            mask.source = None
+            mask.destination = None
+            mask.snapshot = None
+            if mask.kernel is not None:
+                mask.kernel.args = ()
+
+    def functional(self, *, session=None, dynamic_inputs=False):
+        self.release_scratch()
+        if dynamic_inputs:
+            self.slots = self.generations = self.live_rows = self.token_limits = None
+        self.output = self.drafts = self.draft_valid = None
+        self.rows = self.columns = self.dummy = None
+        for mask in self.probability_masks:
+            mask.valid = mask.dummy = None
+            if dynamic_inputs:
+                mask.limits = None
+        self._functional = True
+        if self.broadcast is not None:
+            self.broadcast.functional(session=session)
+        return self
+
+    def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts=None, draft_valid=None, disjoint=False, slots=None, generations=None, live_rows=None, token_limits=None):
         if not self._prepared:
             raise RuntimeError("chain verification requires prepare() before capture")
-        out = self.output
-        safe, live = _live(self.state, self.slots, self.generations, self.live_rows, self.rows)
-        if self.token_limits is None:
-            valid = live & self.draft_valid.all(-1) & self.target_valid.all(-1)
-            valid &= ((self.drafts >= 0) & (self.drafts < self.state.vocab_size)).all(-1)
-            draft_probs, target_probs, ids = self.draft_probs, self.target_probs, self.drafts
+        functional = getattr(self, "_functional", False)
+        slots = self.slots if slots is None else slots
+        generations = self.generations if generations is None else generations
+        live_rows = self.live_rows if live_rows is None else live_rows
+        token_limits = self.token_limits if token_limits is None else token_limits
+        if (token_limits is not None) != self._has_token_limits:
+            raise ValueError("verification token limits must match the prepared mask contract")
+        out = (SpeculativeAcceptance.allocate(target_probs.shape[0], target_probs.shape[1], target_probs.device)
+               if functional else self.output)
+        drafts = self.drafts if drafts is None else drafts
+        draft_valid = self.draft_valid if draft_valid is None else draft_valid
+        rows = torch.arange(target_probs.shape[0], device=target_probs.device) if functional else self.rows
+        columns = torch.arange(target_probs.shape[1], device=target_probs.device) if functional else self.columns
+        dummy = (torch.arange(target_probs.shape[-1], device=target_probs.device) == 0).float() if functional else self.dummy
+        draft_source, target_source = draft_probs, target_probs
+        safe, live = _live(self.state, slots, generations, live_rows, rows)
+        if token_limits is None:
+            valid = live & draft_valid.all(-1) & target_valid.all(-1)
+            valid &= ((drafts >= 0) & (drafts < self.state.vocab_size)).all(-1)
+            ids = drafts
         else:
-            target_used = self.columns[None, :] < self.token_limits[:, None]
-            draft_used = self.columns[None, :-1] < self.token_limits[:, None] - 1
-            valid = live & (self.draft_valid | ~draft_used).all(-1) & (self.target_valid | ~target_used).all(-1)
-            valid &= (((self.drafts >= 0) & (self.drafts < self.state.vocab_size)) | ~draft_used).all(-1)
-            valid &= (self.token_limits >= 1) & (self.token_limits <= self.target_probs.shape[1])
-            draft_probs = torch.where(draft_used[:, :, None], self.draft_probs, self.dummy)
-            target_probs = torch.where(target_used[:, :, None], self.target_probs, self.dummy)
-            ids = torch.where(draft_used, self.drafts, 0)
+            target_used = columns[None, :] < token_limits[:, None]
+            draft_used = columns[None, :-1] < token_limits[:, None] - 1
+            valid = live & (draft_valid | ~draft_used).all(-1) & (target_valid | ~target_used).all(-1)
+            valid &= (((drafts >= 0) & (drafts < self.state.vocab_size)) | ~draft_used).all(-1)
+            valid &= (token_limits >= 1) & (token_limits <= target_probs.shape[1])
+            draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
+            target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
+            ids = torch.where(draft_used, drafts, 0)
         for probabilities in (draft_probs, target_probs):
             slices = _sliced(probabilities)
             entries = (torch.isfinite(slices) & (slices >= 0)).all(-1).all(-1)
             mass = slices.sum(-1).sum(-1)
             valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
         out.valid.copy_(valid)
-        if self.token_limits is not None:
+        if disjoint or functional:
+            self.probability_masks[0].run_disjoint(draft_source, scratch["safe_draft_probs"],
+                out.valid, token_limits, dummy)
+            self.probability_masks[1].run_disjoint(target_source, scratch["safe_target_probs"],
+                out.valid, token_limits, dummy)
+        else:
+            if token_limits is not None:
+                for mask in self.probability_masks:
+                    mask.stage()
             for mask in self.probability_masks:
-                mask.stage()
-        for mask in self.probability_masks:
-            if self.token_limits is None:
-                mask.stage()
-            mask()
-        self.safe_ids.copy_(torch.where(valid[:, None], ids, 0))
-        self.seed_bits.copy_(self.state.seed.view(torch.int64)[safe] ^ TARGET_RNG_DOMAIN)
-        self.offset.copy_(torch.where(self.rng.generation[safe] == self.generations, self.rng.target_offset[safe], 0))
-        self.independent_accepted.zero_()
-        self.emitted_drafts.zero_()
-        tokens, _, _ = verify_chain(self.safe_draft_probs, self.safe_ids, self.safe_target_probs,
-            self.independent_accepted, self.emitted_drafts, seed=self.seed_bits, offset=self.offset)
-        accepted = self.emitted_drafts
-        if self.token_limits is None:
-            out.offered_drafts.fill_(self.drafts.shape[1])
+                if token_limits is None:
+                    mask.stage()
+                mask()
+        scratch["safe_ids"].copy_(torch.where(valid[:, None], ids, 0))
+        scratch["seed_bits"].copy_(self.state.seed.view(torch.int64)[safe] ^ TARGET_RNG_DOMAIN)
+        scratch["offset"].copy_(torch.where(self.rng.generation[safe] == generations, self.rng.target_offset[safe], 0))
+        scratch["independent_accepted"].zero_()
+        scratch["emitted_drafts"].zero_()
+        tokens, _, _ = verify_chain(scratch["safe_draft_probs"], scratch["safe_ids"], scratch["safe_target_probs"],
+            scratch["independent_accepted"], scratch["emitted_drafts"], seed=scratch["seed_bits"], offset=scratch["offset"])
+        accepted = scratch["emitted_drafts"]
+        if token_limits is None:
+            out.offered_drafts.fill_(drafts.shape[1])
         else:
             # The fixed-width library may accept dummy columns beyond a short
             # tail. Only the real prefix belongs to the commit contract.
-            out.offered_drafts.copy_((self.token_limits - 1).clamp(0, self.drafts.shape[1]))
+            out.offered_drafts.copy_((token_limits - 1).clamp(0, drafts.shape[1]))
             accepted = torch.minimum(accepted, out.offered_drafts)
         out.token_ids.copy_(tokens)
         out.accepted_drafts.copy_(torch.where(valid, accepted, 0))
         out.proposed_count.copy_(torch.where(valid, accepted + 1, 0))
         out.rng_increment.copy_(torch.where(valid, self.draw_reservation, 0))
         out.token_ids.masked_fill_(~valid[:, None], -1)
-        if self.drafts.shape[1]:
-            indices = self.safe_ids.long().unsqueeze(-1)
-            draft = self.safe_draft_probs.gather(-1, indices).squeeze(-1)
-            target = self.safe_target_probs[:, :-1].gather(-1, indices).squeeze(-1)
+        if drafts.shape[1]:
+            indices = scratch["safe_ids"].long().unsqueeze(-1)
+            draft = scratch["safe_draft_probs"].gather(-1, indices).squeeze(-1)
+            target = scratch["safe_target_probs"][:, :-1].gather(-1, indices).squeeze(-1)
             ratio = torch.where(draft > 0, (target / draft).clamp(max=1.), (target > 0).float())
             # Serial products preserve monotonicity despite FP32 rounding at unit ratios.
             prefixes = [ratio[:, 0]]
-            for depth in range(1, self.drafts.shape[1]):
+            for depth in range(1, drafts.shape[1]):
                 prefixes.append(prefixes[-1] * ratio[:, depth])
             out.survival.fill_(-1.)
-            out.survival[:, :self.drafts.shape[1]].copy_(torch.where(valid[:, None], torch.stack(prefixes, -1), -1.))
+            out.survival[:, :drafts.shape[1]].copy_(torch.where(valid[:, None], torch.stack(prefixes, -1), -1.))
         if self.broadcast is not None:
-            self.broadcast()
+            if functional:
+                self.broadcast(tuple(vars(out).values()))
+            else:
+                self.broadcast()
         return out
+
+
+@dataclass
+class SpeculativeCommitOutput:
+    emitted_ids: torch.Tensor
+    committed_input_ids: torch.Tensor
+    emitted_count: torch.Tensor
+    accepted_count: torch.Tensor
+    accepted_drafts: torch.Tensor
+    commit_column: torch.Tensor
+    consumed_before: torch.Tensor
+    generated_before: torch.Tensor
+    history_before: torch.Tensor
 
 
 class PreparedSpeculativeStateCommit:
@@ -423,6 +538,7 @@ class PreparedSpeculativeStateCommit:
             _tensor(records, (2, requests.capacity, record_fields), torch.int64, device, "completion_records")
             _tensor(frame_index, (1,), torch.int32, device, "frame_index")
             _tensor(submission_sequence, (1,), torch.int64, device, "submission_sequence")
+        self._default_copy_offered_mask = copy_offered_mask is None
         self.copy_offered_mask = torch.zeros(batch, dtype=torch.int64, device=device) if copy_offered_mask is None else copy_offered_mask
         _tensor(self.copy_offered_mask, (batch,), torch.int64, device, "copy_offered_mask")
         if rng is not None:
@@ -456,35 +572,94 @@ class PreparedSpeculativeStateCommit:
         self.survival = None if completion is None else completion.speculative_survival
         self._survival = zeros((requests.capacity, tokens - 1), torch.float32) if self.survival is not None else None
         self.survival_columns = torch.arange(tokens - 1, device=device)
-        self.idle_record = torch.zeros(record_fields, dtype=torch.int64, device=device)
-        self.idle_record[[4, 12, *range(VECTOR_TOKENS_FIELD, record_fields)]] = -1
-        if draft_context_lag is None:
-            self.idle_record[13] = -1
+        self.idle_record = _idle_completion_record(
+            record_fields, device=device, draft_context_lag=draft_context_lag)
 
     def prepare(self):
         if self.logprobs is not None:
             self.logprobs.prepare()
 
-    def __call__(self):
-        state, acceptance, columns = self.state, self.acceptance, self.columns
+    _output_names = ("emitted_ids", "committed_input_ids", "emitted_count", "accepted_count",
+                     "accepted_drafts", "commit_column", "consumed_before", "generated_before", "history_before")
+    _temporary_names = ("owners", "consumed_after", "history_after", "_records", "_survival")
+
+    def functional(self, *, session=None, dynamic_inputs=False):
+        if getattr(self, "_functional", False):
+            return self
+        def layout(names):
+            return {name: (tuple(tensor.shape), tensor.stride(), tensor.dtype)
+                    for name in names if (tensor := getattr(self, name)) is not None}
+        self._output_layout = layout(self._output_names)
+        self._temporary_layout = layout(self._temporary_names)
+        self._record_fields = self.idle_record.numel()
+        for name in (*self._output_names, *self._temporary_names, "acceptance", "inputs",
+                     "rows", "columns", "eos_columns", "history_columns", "survival_columns", "idle_record"):
+            setattr(self, name, None)
+        self.copy_offered_mask = None
+        if dynamic_inputs:
+            self.slots = self.generations = self.live = self.token_limits = None
+        if self.logprobs is not None:
+            self.logprobs.functional(session=session, dynamic_inputs=dynamic_inputs)
+        self._functional = True
+        return self
+
+    def __call__(self, logits=None, *, acceptance=None, inputs=None, copy_offered_mask=None,
+                 slots=None, generations=None, live_rows=None, token_limits=None):
+        functional = getattr(self, "_functional", False)
+        state = self.state
+        slots = self.slots if slots is None else slots
+        generations = self.generations if generations is None else generations
+        live_rows = self.live if live_rows is None else live_rows
+        token_limits = self.token_limits if token_limits is None else token_limits
+        acceptance = self.acceptance if acceptance is None else acceptance
+        inputs = self.inputs if inputs is None else inputs
+        if functional:
+            output = {name: torch.empty_strided(shape, stride, dtype=dtype, device=inputs.device)
+                      for name, (shape, stride, dtype) in self._output_layout.items()}
+            out = SpeculativeCommitOutput(**output)
+            if self.history is None:
+                out.history_before.zero_()
+            scratch = {name: torch.empty_strided(shape, stride, dtype=dtype, device=inputs.device)
+                       for name, (shape, stride, dtype) in self._temporary_layout.items()}
+            rows = torch.arange(inputs.shape[0], device=inputs.device)
+            columns = torch.arange(inputs.shape[1], device=inputs.device)
+            eos_columns = torch.arange(state.eos_token_ids.shape[1], device=inputs.device)
+            history_columns = torch.arange(2, device=inputs.device)
+            survival_columns = torch.arange(self.token_capacity - 1, device=inputs.device)
+            idle_record = _idle_completion_record(
+                self._record_fields, device=inputs.device, draft_context_lag=self.draft_context_lag)
+        else:
+            out = self
+            scratch = {name: getattr(self, name) for name in self._temporary_names}
+            rows, columns = self.rows, self.columns
+            eos_columns, history_columns = self.eos_columns, self.history_columns
+            survival_columns, idle_record = self.survival_columns, self.idle_record
+        owners = scratch["owners"]
+        consumed_after, history_after = scratch["consumed_after"], scratch["history_after"]
+        record_output, survival_output = scratch.get("_records"), scratch.get("_survival")
+        if copy_offered_mask is None:
+            if functional and not self._default_copy_offered_mask:
+                raise ValueError("speculative commit requires its runtime offered-token mask")
+            copy_offered_mask = (torch.zeros(inputs.shape[0], dtype=torch.int64, device=inputs.device)
+                                 if self.copy_offered_mask is None else self.copy_offered_mask)
         width = columns.numel()
-        safe = self.slots.long().clamp(0, state.capacity - 1)
-        selected = ((self.rows < self.live[0]) & (self.live[0] >= 0) & (self.live[0] <= self.rows.numel())
-            & (self.slots >= 0) & (self.slots < state.capacity) & (state.generation[safe] == self.generations))
-        self.consumed_before.copy_(state.consumed_tokens[safe])
-        self.generated_before.copy_(state.generated_tokens[safe])
+        safe = slots.long().clamp(0, state.capacity - 1)
+        selected = ((rows < live_rows[0]) & (live_rows[0] >= 0) & (live_rows[0] <= rows.numel())
+            & (slots >= 0) & (slots < state.capacity) & (state.generation[safe] == generations))
+        out.consumed_before.copy_(state.consumed_tokens[safe])
+        out.generated_before.copy_(state.generated_tokens[safe])
         if self.history is not None:
-            self.history_before.copy_(self.history[safe])
+            out.history_before.copy_(self.history[safe])
 
         # Every row commits from its slot's last selected row, which alone writes the slot's state.
         # Rows are evaluated together from the state before the round; each slot then takes its
         # owner's values in one update, so no slot is written twice whatever the core capacity.
-        matches = selected[:, None] & selected[None, :] & (self.slots[:, None] == self.slots[None, :])
+        matches = selected[:, None] & selected[None, :] & (slots[:, None] == slots[None, :])
         count = matches.sum(1)
-        row = torch.where(matches, self.rows[None, :], 0).amax(1)
-        leader = selected & (row == self.rows)
+        row = torch.where(matches, rows[None, :], 0).amax(1)
+        leader = selected & (row == rows)
         ids = acceptance.token_ids[row]
-        inputs = self.inputs[row]
+        inputs = inputs[row]
         proposed = acceptance.proposed_count[row].long()
         accepted = acceptance.accepted_drafts[row].long()
         offered = acceptance.offered_drafts[row].long()
@@ -508,11 +683,11 @@ class PreparedSpeculativeStateCommit:
             shape_valid &= increment >= 0
         valid = valid & shape_valid
         eos = ((ids[:, :, None] == state.eos_token_ids[safe][:, None, :])
-            & (self.eos_columns[None, None, :] < state.eos_count[safe][:, None, None])).any(-1)
+            & (eos_columns[None, None, :] < state.eos_count[safe][:, None, None])).any(-1)
         eos_position = torch.where(eos & proposal, columns[None, :] + 1, width).amin(-1)
         emitted = torch.minimum(torch.minimum(proposed, remaining), eos_position)
-        if self.token_limits is not None:
-            emitted = torch.minimum(emitted, self.token_limits[row])
+        if token_limits is not None:
+            emitted = torch.minimum(emitted, token_limits[row])
         emitted = torch.where(enabled & valid, emitted, 0)
         emitted_drafts = torch.minimum(accepted.clamp_min(0), emitted)
         take = columns[None, :] < emitted[:, None]
@@ -531,7 +706,7 @@ class PreparedSpeculativeStateCommit:
         counters = counter[safe] + emitted.view(-1, *([1] * (counter.dim() - 1)))
         if self.history is not None:
             history = self.history[safe]
-            tail = torch.cat((history, inputs), 1).gather(1, emitted[:, None] + self.history_columns[None, :])
+            tail = torch.cat((history, inputs), 1).gather(1, emitted[:, None] + history_columns[None, :])
             history = torch.where((emitted > 0)[:, None], tail, history)
         if self.rng is not None:
             offset = self.rng.target_offset[safe]
@@ -543,7 +718,7 @@ class PreparedSpeculativeStateCommit:
         if self.records is not None:
             record = torch.cat((torch.stack((generation, self.sequence.expand_as(generation), consumed, generated,
                 torch.where(emitted > 0, pending, -1), status.long(), error.long(), torch.zeros_like(emitted), emitted,
-                torch.where(live, offered, 0), emitted_drafts, torch.where(live, self.copy_offered_mask[row], 0),
+                torch.where(live, offered, 0), emitted_drafts, torch.where(live, copy_offered_mask[row], 0),
                 torch.full_like(emitted, -1),
                 ((consumed - self.draft_context_lag).clamp_min(0) if self.draft_context_lag is not None
                  else torch.full_like(emitted, -1)),
@@ -552,26 +727,26 @@ class PreparedSpeculativeStateCommit:
 
         # Records and per-row outputs precede request-state mutation: compiled graphs must not
         # re-derive enabled/valid fields from the status and token counts this round rewrites.
-        self.emitted_ids.copy_(torch.where(selected[:, None] & take, ids, -1))
-        self.committed_input_ids.copy_(torch.where(selected[:, None] & take, inputs, -1))
-        self.emitted_count.copy_(torch.where(selected, emitted, 0))
-        self.accepted_count.copy_(torch.where(selected, emitted, 0))
-        self.accepted_drafts.copy_(torch.where(selected, emitted_drafts, 0))
-        self.commit_column.copy_(torch.where(selected, emitted - 1, -1))
-        self.owners.fill_(-1)
-        self.owners.scatter_(0, torch.where(leader, safe, state.capacity), self.rows)
-        owner = self.owners[:state.capacity]
+        out.emitted_ids.copy_(torch.where(selected[:, None] & take, ids, -1))
+        out.committed_input_ids.copy_(torch.where(selected[:, None] & take, inputs, -1))
+        out.emitted_count.copy_(torch.where(selected, emitted, 0))
+        out.accepted_count.copy_(torch.where(selected, emitted, 0))
+        out.accepted_drafts.copy_(torch.where(selected, emitted_drafts, 0))
+        out.commit_column.copy_(torch.where(selected, emitted - 1, -1))
+        owners.fill_(-1)
+        owners.scatter_(0, torch.where(leader, safe, state.capacity), rows)
+        owner = owners[:state.capacity]
         owned, source = owner >= 0, owner.clamp_min(0)
-        if self._survival is not None:
+        if survival_output is not None:
             logical = torch.minimum(offered, (remaining - 1).clamp_min(0))
-            if self.token_limits is not None:
-                logical = torch.minimum(logical, (self.token_limits[row] - 1).clamp_min(0))
+            if token_limits is not None:
+                logical = torch.minimum(logical, (token_limits[row] - 1).clamp_min(0))
             extent = torch.minimum(logical, torch.where(emitted > emitted_drafts, logical, emitted_drafts))
-            observed = owned[:, None] & live[source, None] & (self.survival_columns < extent[source, None])
+            observed = owned[:, None] & live[source, None] & (survival_columns < extent[source, None])
             values = torch.cat((acceptance.survival[row][source],
                 torch.full((state.capacity, self.token_capacity - width), -1., device=ids.device)), 1)
-            self._survival.copy_(torch.where(observed, values, -1.))
-            self.survival.index_copy_(0, self.frame.long(), self._survival.unsqueeze(0))
+            survival_output.copy_(torch.where(observed, values, -1.))
+            self.survival.index_copy_(0, self.frame.long(), survival_output.unsqueeze(0))
 
         def updated(tensor, values):
             mask = owned.view(-1, *([1] * (tensor.dim() - 1)))
@@ -582,11 +757,11 @@ class PreparedSpeculativeStateCommit:
 
         # Consumed tokens and history may be views of the state pool: both are read before
         # either is written, so compiled commits never materialize an updated pool.
-        self.consumed_after.copy_(updated(state.consumed_tokens, consumed))
+        consumed_after.copy_(updated(state.consumed_tokens, consumed))
         if self.history is not None:
-            self.history_after.copy_(updated(self.history, history))
+            history_after.copy_(updated(self.history, history))
         if self.records is not None:
-            self._records.copy_(torch.where(owned[:, None], record[source], self.idle_record))
+            record_output.copy_(torch.where(owned[:, None], record[source], idle_record))
         state.histogram.view(-1).scatter_add_(0, (safe[:, None] * state.vocab_size
             + ids.clamp(0, state.vocab_size - 1)).view(-1), (take & leader[:, None]).to(torch.int32).view(-1))
         commit(state.generated_tokens, generated)
@@ -597,13 +772,16 @@ class PreparedSpeculativeStateCommit:
         if self.rng is not None:
             commit(self.rng.target_offset, rng_offset)
             commit(self.rng.generation, rng_generation)
-        state.consumed_tokens.copy_(self.consumed_after)
+        state.consumed_tokens.copy_(consumed_after)
         if self.history is not None:
-            self.history.copy_(self.history_after)
+            self.history.copy_(history_after)
         if self.records is not None:
-            self.records.index_copy_(0, self.frame.long(), self._records.unsqueeze(0))
-            self.logprobs()
-        return self
+            self.records.index_copy_(0, self.frame.long(), record_output.unsqueeze(0))
+            if logits is None:
+                self.logprobs()
+            else:
+                self.logprobs.run(logits, slots=slots, generations=generations, live_rows=live_rows)
+        return out
 
 
 class PreparedSpeculativeCommit(PreparedSpeculativeStateCommit):

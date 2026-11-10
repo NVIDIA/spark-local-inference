@@ -46,9 +46,9 @@ def test_replicated_markov_head_on_a_tensor_parallel_rank(rows, quantization):
         operation = PreparedMarkov(weights, tokens, runtime=None, coordinator=None,
                                    session=session, name="markov")
         session.tune(show_progress=False)
-        assert operation.logits is operation.local
         assert operation.gather is None
-        compiled = torch.compile(operation, fullgraph=True)
+        output = torch.empty((rows, 129280), dtype=torch.float32, device=device)
+        compiled = torch.compile(lambda: output.copy_(operation(tokens)), fullgraph=True)
         compiled()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -59,14 +59,13 @@ def test_replicated_markov_head_on_a_tensor_parallel_rank(rows, quantization):
             expected = torch.nn.functional.linear(embedding[tokens].float(), head.float())
             if quantization:
                 expected = expected.bfloat16().float()
-                operation.projected.fill_(float("nan"))
-            operation.logits.fill_(float("nan"))
+            output.fill_(float("nan"))
             allocated = torch.cuda.memory_allocated()
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == allocated
-            assert operation.logits.dtype == torch.float32
-            torch.testing.assert_close(operation.logits, expected, atol=2e-5,
+            assert output.dtype == torch.float32
+            torch.testing.assert_close(output, expected, atol=2e-5,
                                        rtol=.008 if quantization else 2e-5)
         graph.reset()
 
@@ -85,15 +84,17 @@ def test_row_scaled_fp8_markov_projection_mutable_native_replay(rows):
     with RecordedPreparationSession(device=device, checkpoint="markov-fp8-projection",
             workload_schema="row-scaled-fp32", numerical_policy="quantized-reconstruction",
             compile_workers=2) as session:
-        embedding = PreparedEmbedding(embedding_weight, ids, source, session=session, name="markov.embed")
+        embedding = PreparedEmbedding(embedding_weight, ids, source, session=session, name="markov.embed").functional(session=session, dynamic_inputs=True)
         projection = PreparedRowScaledFP8MarkovProjection(source, weight, output,
-            session=session, name="markov")
+            session=session, name="markov").functional(session=session)
         session.tune(show_progress=False)
 
         class Forward:
             def __call__(self):
-                embedding()
-                return projection()
+                values = embedding(token_ids=ids)
+                source.copy_(values)
+                output.copy_(projection(values))
+                return output
 
         compiled = torch.compile(Forward(), fullgraph=True)
         compiled()
@@ -143,8 +144,8 @@ def test_replicated_row_scaled_fp8_markov_wiring_native_replay():
         operation = PreparedMarkov(weights, tokens, runtime=None, coordinator=None,
                                    session=session, name="markov")
         session.tune(show_progress=False)
-        assert operation.logits is operation.local and operation.logits.dtype == torch.float32
-        compiled = torch.compile(operation, fullgraph=True)
+        output = torch.empty((8, 129280), dtype=torch.float32, device=device)
+        compiled = torch.compile(lambda: output.copy_(operation(tokens)), fullgraph=True)
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -156,7 +157,7 @@ def test_replicated_row_scaled_fp8_markov_wiring_native_replay():
         gamma = 255 * u / (1 - 255 * u)
         for _ in range(3):
             tokens.add_(13).remainder_(64)
-            operation.logits.fill_(float("nan"))
+            output.fill_(float("nan"))
             torch.cuda.synchronize()
             before = torch.cuda.memory_stats()
             graph.replay()
@@ -170,6 +171,6 @@ def test_replicated_row_scaled_fp8_markov_wiring_native_replay():
             exact = dot * scales
             absolute = (source.abs() @ values.abs().T) * scales.abs()
             bound = gamma * absolute + u * exact.abs()
-            assert ((operation.logits[:, selected].double() - exact).abs() <= bound + 2.0**-149).all()
-            assert torch.isfinite(operation.logits).all()
+            assert ((output[:, selected].double() - exact).abs() <= bound + 2.0**-149).all()
+            assert torch.isfinite(output).all()
         graph.reset()

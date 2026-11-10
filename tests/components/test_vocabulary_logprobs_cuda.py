@@ -18,7 +18,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", r
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [1, 3, 8])
 @pytest.mark.parametrize("requested_ids", [False, True])
-def test_raw_scores_frames_ties_and_mutated_replay(dtype, width, requested_ids):
+@pytest.mark.parametrize("functional", [False, True])
+def test_raw_scores_frames_ties_and_mutated_replay(dtype, width, requested_ids, functional):
     vocabulary = 4097
     outputs = CompletionOutputs.allocate((2, 4, 32), device="cuda")
     logits = torch.randn((2, width, vocabulary), dtype=dtype, device="cuda")
@@ -39,14 +40,21 @@ def test_raw_scores_frames_ties_and_mutated_replay(dtype, width, requested_ids):
     operator = PreparedVocabularyParallelLogprobs(logits, outputs, slots, epochs, live, frame,
         vocabulary=vocabulary, offset=0, runtime=None, session=None, coordinator=None, name="logprobs")
     operator.prepare()
-    operator()
+    stats, keys = operator.stats, operator.keys
+    if functional:
+        operator.functional(session=None)
+        def call():
+            return operator.run(logits)
+    else:
+        call = operator
+    call()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        operator()
+        call()
     for _ in range(3):
         logits[0, :, 40:] += .5
-        operator.stats.fill_(float("nan"))
-        operator.keys.fill_(-1)
+        stats.fill_(float("nan"))
+        keys.fill_(-1)
         outputs.logprobs.fill_(-777)
         graph.replay()
         result = outputs.logprobs.cpu()

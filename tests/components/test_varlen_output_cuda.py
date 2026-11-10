@@ -12,7 +12,8 @@ from b12x.preparation import PreparationSession
 
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from tests.tensor_examples import TensorExamples
+from ignition.preparation.scratch import ScratchArena
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an assigned CUDA device")
@@ -71,8 +72,8 @@ def test_attention_tuning_reuses_output_without_mutating_serving_inputs(rows):
 @torch.no_grad()
 def test_provided_attention_outputs_survive_scratch_reuse(width, math_mode, compiler):
     device = torch.device("cuda", 0)
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     q, k, v, out = [buffers.zeros((32, 16, width), torch.bfloat16) for _ in range(4)]
     cu = torch.tensor([0, 16, 32], dtype=torch.int32, device=device)
     arena = ScratchArena(device)
