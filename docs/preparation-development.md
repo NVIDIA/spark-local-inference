@@ -176,8 +176,10 @@ Their owners keep those allocations alive across graph variants.
 
 Constructors use example tensors to declare layouts and prepare kernels.
 The [declaration tensor helper](../ignition/preparation/examples.py) shares examples
-by semantic role, shape, dtype, and device. Give simultaneously live operands
-distinct roles. Clear the example dictionary after binding finalizers complete
+by semantic role, dtype, and device. Declare capacities from largest to smallest
+so smaller layouts use contiguous views of the larger allocation. Repeated
+requests for the same shape retain tensor identity. Give simultaneously live
+operands distinct roles. Clear the example dictionary after binding finalizers complete
 and CUDA work drains.
 `ScratchArena` supplies preparation workspace for candidate tuning and binding
 finalizers. After tuning and finalization, synchronize CUDA work and call

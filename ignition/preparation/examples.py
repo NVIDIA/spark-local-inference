@@ -3,6 +3,8 @@
 
 """Share preparation operands while functional forwards allocate their own values."""
 
+from math import prod
+
 import torch
 
 
@@ -15,5 +17,10 @@ def declaration_tensor(examples, role, shape, dtype, device):
         device = torch.device("cuda", torch.cuda.current_device())
     key = role, shape, dtype, device
     if key not in examples:
-        examples[key] = torch.zeros(shape, dtype=dtype, device=device)
+        storage_key = role, dtype, device
+        storage = examples.get(storage_key)
+        elements = prod(shape)
+        if storage is None or storage.numel() < elements:
+            storage = examples[storage_key] = torch.zeros(shape, dtype=dtype, device=device)
+        examples[key] = storage.view(-1)[:elements].view(shape)
     return examples[key]
