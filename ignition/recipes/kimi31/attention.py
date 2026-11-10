@@ -3,6 +3,8 @@
 
 """Gated sparse MLA over globally selected interleaved FP8 latent records."""
 
+from typing import NamedTuple
+
 import torch
 from b12x.attention import dense_mla
 
@@ -10,12 +12,32 @@ from ignition.components.collectives import ConcurrentAllGather, PreparedAllGath
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.peer_record_gather import PreparedPeerRecordGather
 from ignition.components.interleaved_history import PreparedInterleavedHistory
-from ignition.recipes.kimi3.attention import FP8, PreparedMLAProjection
+from ignition.recipes.kimi3.attention import FP8, MLAProjectionOutput, PreparedMLAProjection
 from ignition.recipes.kimi3.dcp import ContextShards
 
 from .dcp import RECORD_BYTES, TOPK, selection_slots, write_records
 from .indexer import PreparedDSAIndexer, SharedBuffers
 from ignition.preparation.tuning import register_finalizer
+
+
+class _AttentionStage(NamedTuple):
+    quantized: torch.Tensor | None
+    gathered: torch.Tensor | None
+    partial: torch.Tensor | None
+    lse: torch.Tensor | None
+    selected: torch.Tensor
+    selected_scores: torch.Tensor | None
+    owners: torch.Tensor
+    slots: torch.Tensor
+    counts: torch.Tensor
+    index: tuple | None
+
+
+class _AttentionResult(NamedTuple):
+    output: torch.Tensor
+    projected: MLAProjectionOutput
+    attended: torch.Tensor
+    stages: tuple[_AttentionStage, ...]
 
 
 class PreparedDSA(PreparedMLAProjection):
@@ -143,6 +165,9 @@ class PreparedDSA(PreparedMLAProjection):
                 part["gather"].peers = None
 
     def __call__(self, source, metadata=None):
+        return self._run(source, metadata).output
+
+    def _run(self, source, metadata):
         if metadata is None:
             raise ValueError("sparse MLA execution requires invocation metadata")
         projected = self.project(source, metadata)
@@ -158,21 +183,25 @@ class PreparedDSA(PreparedMLAProjection):
         if self.history is not None:
             end = (metadata.starts + metadata.lengths) * (metadata.lengths > 0)
             history = self.history(metadata.page_table[0], end)
+        stages = []
         attended = torch.empty((source.shape[0], self.heads, 512), dtype=source.dtype, device=source.device)
         for start, end in self.indexer.bounds:
             rows = end - start
             part = self.parts[rows]
             positions, tables = metadata.positions[start:end], metadata.token_page_table[start:end]
-            gathered = None
+            gathered = partial = lse = index = selected_scores = None
+            if self.mode == "prefill":
+                quantized = None
             if selected_all is not None:
                 selected = selected_all[start:end]
-            elif pending is None:
-                selected = part["selector"](query[start:end], weights[start:end], positions, tables)
             else:
                 selector = part["selector"]
-                packed = selector.prepare_local(query[start:end], weights[start:end], positions, tables)
-                gathered = self.query_overlap.finish(pending, packed)
-                selected = selector.exchange(packed, positions, dependencies=(gathered,))
+                index = selector.prepare_local_result(query[start:end], weights[start:end], positions, tables)
+                packed = index[0]
+                if pending is not None:
+                    gathered = self.query_overlap.finish(pending, packed)
+                selected, selected_scores = selector.exchange_result(packed, positions,
+                    dependencies=() if gathered is None else (gathered,))
             owners = torch.empty((rows, TOPK), dtype=torch.int32, device=source.device)
             slots = torch.empty_like(owners)
             counts = torch.empty((rows,), dtype=torch.int32, device=source.device)
@@ -192,4 +221,6 @@ class PreparedDSA(PreparedMLAProjection):
                     page_table=slots, lengths=counts, starts=part["starts"])
                 output = part["combine"](partial, lse)
             attended[start:end].copy_(output)
-        return self.finish(attended, projected)
+            stages.append(_AttentionStage(quantized, gathered, partial, lse, selected,
+                selected_scores, owners, slots, counts, index))
+        return _AttentionResult(self.finish(attended, projected), projected, attended, tuple(stages))

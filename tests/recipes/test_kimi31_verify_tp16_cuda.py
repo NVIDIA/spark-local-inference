@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.recipes.kimi31_attention_observations import (
+    allocate_observations, copy_observations, poison_observations,
+)
+
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
                               reason="requires sixteen explicitly assigned CUDA devices")
 
@@ -101,14 +105,29 @@ def _write_reference(cache, index, table, rank, positions, features):
 
 
 class _TargetForward:
-    def __init__(self, variant, source):
-        for field in ("metadata", "starts", "lengths", "states", "tables", "tokens", "live", "operation"):
+    def __init__(self, variant, source, *, observations=None):
+        for field in ("starts", "lengths", "states", "tables", "tokens", "live", "operation", "width"):
             setattr(self, field, getattr(variant, field))
         self.source = source[:variant.capacity]
+        self.output = torch.empty_like(self.source)
+        self.observations = observations
+        self.positions = None if observations is None else torch.empty_like(variant.metadata.positions)
+        self.query_start_loc = None if observations is None else torch.empty_like(variant.metadata.query_start_loc)
 
     def __call__(self):
-        self.metadata.set(self.starts, self.lengths, self.states, self.tables, self.tokens, self.live)
-        return self.operation(self.source)
+        from ignition.components.paged_batch import Metadata
+
+        metadata = Metadata.pack(self.starts, self.lengths, self.states, self.tables, self.tokens, self.live,
+            token_capacity=self.source.shape[0], sample_count=self.tokens.numel(), max_query_tokens=self.width)
+        if self.observations is None:
+            self.output.copy_(self.operation(self.source, metadata))
+        else:
+            result = self.operation._run(self.source, metadata)
+            copy_observations(self.observations, result)
+            self.positions.copy_(metadata.positions)
+            self.query_start_loc.copy_(metadata.query_start_loc)
+            self.output.copy_(result.output)
+        return self.output
 
 
 @torch.no_grad()
@@ -191,23 +210,21 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         eps=EPS, mode="decode" if width == 1 else "verify", session=session, name=name,
                         workspace=arena, buffers=buffers, context=context)
                     variants[name] = variant
-                largest = variants["verify129"].operation
-                largest_part = largest.parts[largest.absorbed.shape[0]]
                 for variant in variants.values():
-                    operation = variant.operation
-                    part = operation.parts[variant.capacity]
-                    for field in ("absorbed", "attended", "latent", "query_norm"):
-                        assert getattr(operation, field).data_ptr() == getattr(largest, field).data_ptr()
-                    assert operation.indexer.query.data_ptr() == largest.indexer.query.data_ptr()
-                    assert part["selector"].selected.data_ptr() == largest_part["selector"].selected.data_ptr()
-                    for field in ("quantized", "gathered", "partial", "lse"):
-                        assert part[field].data_ptr() == largest_part[field].data_ptr()
-                    assert part["attention"].arguments["cu_seqlens_q"].numel() == variant.capacity + 1
+                    part = variant.operation.parts[variant.capacity]
+                    assert part["starts"].numel() == variant.capacity + 1
                 session.tune(show_progress=False)
+                buffers.clear()
                 for variant in variants.values():
+                    result = variant.operation._run(source[:variant.capacity], variant.metadata)
+                    variant.observations = allocate_observations(result)
                     variant.forward = _TargetForward(variant, source)
+                    variant.diagnostic = _TargetForward(variant, source, observations=variant.observations)
+                    variant.metadata = None
+                del result, metadata
+                functions = {name: variant.forward for name, variant in variants.items()}
+                functions.update({name + "-observed": variant.diagnostic for name, variant in variants.items()})
                 if compile_decoder:
-                    functions = {name: variant.forward for name, variant in variants.items()}
                     signatures = {name: GraphSignature(
                         kind="decode" if name == "decode" else "speculative",
                         batch_capacity=variant.batch, token_capacity=variant.width,
@@ -216,6 +233,7 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         packed_token_capacity=0 if name == "decode" else variant.capacity,
                         draft_tokens=None if name == "decode" else variant.width - 1)
                         for name, variant in variants.items()}
+                    signatures.update({name + "-observed": value for name, value in tuple(signatures.items())})
                     options = dict(_OPTIONS)
                     if force_external:
                         # Exercise mutation dependencies when a deferred GEMM selects an external kernel.
@@ -232,24 +250,28 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         assert compiled[name].owner is variant.forward
                         assert compiled[name].artifact is not None and compiled[name].pending is None
                         variant.graph = captured[name]
+                        variant.observed_graph = captured[name + "-observed"]
                 else:
-                    for variant in variants.values():
-                        variant.forward()
+                    captured = {}
+                    for name, forward in functions.items():
+                        forward()
                         torch.cuda.synchronize(device)
                         stream = torch.cuda.Stream(device=device)
                         stream.wait_stream(torch.cuda.current_stream(device))
                         graph = torch.cuda.CUDAGraph()
                         with session.capture(), torch.cuda.graph(graph, stream=stream):
-                            variant.forward()
-                        variant.graph = graph
+                            forward()
+                        captured[name] = graph
                         graphs.append(graph)
+                    for name, variant in variants.items():
+                        variant.graph = captured[name]
+                        variant.observed_graph = captured[name + "-observed"]
                 session.freeze()
                 cache.copy_(expected_cache)
                 index.copy_(expected_index)
 
                 def replay(name, starts, lengths, *, revision=1, future_revision=None):
                     variant = variants[name]
-                    operation = variant.operation
                     variant.starts.copy_(torch.tensor(starts, device=device))
                     variant.lengths.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
                     source.zero_()
@@ -269,13 +291,9 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         offset += length
                     assert offset <= variant.capacity
                     arena.tensor.fill_(255)
-                    operation.attended.fill_(17)
-                    operation.projections["output"].output.fill_(19)
-                    part = operation.parts[variant.capacity]
-                    part["partial"].fill_(torch.nan)
-                    part["lse"].fill_(torch.nan)
-                    selector = part["selector"]
-                    selector.selected.fill_(-2)
+                    poison_observations(variant.observations)
+                    variant.forward.output.fill_(19)
+                    observed, = variant.observations.stages
                     torch.cuda.synchronize(device)
                     dist.barrier()
                     before = torch.cuda.memory_stats(device)
@@ -285,30 +303,39 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                     for field in ("allocation.all.allocated", "allocation.all.freed",
                                   "segment.all.allocated", "segment.all.freed"):
                         assert before[field] == after[field], (name, field)
-                    selected = selector.selected.cpu()
+                    torch.testing.assert_close(cache.view(torch.uint8), expected_cache.view(torch.uint8), rtol=0, atol=0)
+                    torch.testing.assert_close(index, expected_index, rtol=0, atol=0)
+                    before = torch.cuda.memory_stats(device)
+                    variant.observed_graph.replay()
+                    torch.cuda.synchronize(device)
+                    after = torch.cuda.memory_stats(device)
+                    for field in ("allocation.all.allocated", "allocation.all.freed",
+                                  "segment.all.allocated", "segment.all.freed"):
+                        assert before[field] == after[field], (name + "-observed", field)
+                    selected = observed.selected.cpu()
                     root = [selected if rank == 0 else None]
                     dist.broadcast_object_list(root, src=0)
                     assert torch.equal(selected, root[0])
                     torch.testing.assert_close(cache.view(torch.uint8), expected_cache.view(torch.uint8), rtol=0, atol=0)
                     torch.testing.assert_close(index, expected_index, rtol=0, atol=0)
-                    torch.testing.assert_close(part["gathered"], query[None].expand(variant.capacity, -1, -1),
+                    torch.testing.assert_close(observed.gathered.view(variant.capacity, WORLD * HEADS, RECORD), query[None].expand(variant.capacity, -1, -1),
                                               rtol=0, atol=0)
-                    assert operation.metadata.positions.cpu().tolist() == [position for _, position in rows] + [-1] * (variant.capacity - offset)
+                    assert variant.diagnostic.positions.cpu().tolist() == [position for _, position in rows] + [-1] * (variant.capacity - offset)
                     ends, total = [0], 0
                     for length in lengths:
                         total += length
                         ends.append(total)
-                    assert variant.metadata.query_start_loc.cpu().tolist() == ends
+                    assert variant.diagnostic.query_start_loc.cpu().tolist() == ends
                     for row, (request, position) in enumerate(rows):
                         chosen = selected[row][selected[row] >= 0].long().to(device)
                         assert len(chosen) == len(set(chosen.cpu().tolist())) == min(position + 1, TOPK)
                         assert ((chosen >= 0) & (chosen <= position)).all(), (name, row)
                         records, keys, scales = _reference_records(history[request, :position + 1])
                         scores = torch.mv(keys.float() * scales[:, None], index_query).relu() * head_weight
-                        score_mask = selector.selected[row] >= 0
+                        score_mask = observed.selected[row] >= 0
                         # IDs follow rank zero; diagnostic scores retain each rank's local tie ordering.
                         if rank == 0:
-                            torch.testing.assert_close(selector.selected_scores[row][score_mask], scores[chosen],
+                            torch.testing.assert_close(observed.selected_scores[row][score_mask], scores[chosen],
                                                       rtol=3e-5, atol=3e-4)
                         cutoff = scores.topk(len(chosen)).values[-1]
                         assert (scores[chosen] >= cutoff - 3e-4).all(), (name, row)
@@ -316,35 +343,40 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         assert set(required.cpu().tolist()) <= set(chosen.cpu().tolist())
                         local = chosen[chosen.remainder(WORLD) == rank]
                         count = len(local)
-                        assert part["counts"][row].item() == count
+                        assert observed.counts[row].item() == count
                         physical = tables[request, local // (WORLD * PAGE)].long() * PAGE + (local // WORLD) % PAGE
-                        torch.testing.assert_close(part["slots"][row, :count].long(), physical, rtol=0, atol=0)
-                        assert (part["slots"][row, count:] == -1).all()
+                        torch.testing.assert_close(observed.slots[row, :count].long(), physical, rtol=0, atol=0)
+                        assert (observed.slots[row, count:] == -1).all()
                         selected_records = records[chosen].float()
                         logits = local_query @ selected_records.T * 192 ** -.5
                         attended = logits.softmax(-1) @ selected_records[:, :512]
-                        torch.testing.assert_close(operation.attended[row].float(), attended, rtol=.03, atol=.002)
+                        torch.testing.assert_close(variant.observations.attended[row].float(), attended, rtol=.03, atol=.002)
                         expected = (attended.bfloat16()[:, :128].float() * .5).bfloat16().reshape(-1)
-                        output = operation.projections["output"].output[row]
+                        output = variant.forward.output[row]
                         torch.testing.assert_close(output[:HEADS * 128].float(), expected.float(), rtol=.03, atol=.002)
+                        torch.testing.assert_close(variant.observations.output[row, :HEADS * 128].float(),
+                                                  expected.float(), rtol=.03, atol=.002)
+                        assert not variant.observations.output[row, HEADS * 128:].count_nonzero()
                         assert not output[HEADS * 128:].count_nonzero()
                         if not count:
-                            assert part["lse"][row].isneginf().all()
+                            assert observed.lse[row].isneginf().all()
                         elif row == 0 or request != rows[row - 1][0]:
                             local_records = records[local].float()
                             local_logits = query.float() @ local_records.T * 192 ** -.5
-                            torch.testing.assert_close(part["lse"][row], local_logits.logsumexp(-1),
+                            torch.testing.assert_close(observed.lse[row], local_logits.logsumexp(-1),
                                                       rtol=3e-5, atol=3e-4)
                             expected_partial = local_logits.softmax(-1) @ local_records[:, :512]
-                            torch.testing.assert_close(part["partial"][row].float(), expected_partial, rtol=.03, atol=.002)
+                            torch.testing.assert_close(observed.partial[row].float(), expected_partial, rtol=.03, atol=.002)
                     assert (selected[offset:] == -1).all()
-                    assert not part["counts"][offset:].count_nonzero()
-                    assert part["lse"][offset:].isneginf().all()
-                    assert not operation.attended[offset:].count_nonzero()
-                    assert not operation.projections["output"].output[offset:].count_nonzero()
-                    assert torch.isfinite(operation.projections["output"].output).all()
+                    assert not observed.counts[offset:].count_nonzero()
+                    assert observed.lse[offset:].isneginf().all()
+                    assert not variant.observations.attended[offset:].count_nonzero()
+                    assert not variant.forward.output[offset:].count_nonzero()
+                    assert torch.isfinite(variant.forward.output).all()
+                    assert not variant.observations.output[offset:].count_nonzero()
+                    assert torch.isfinite(variant.observations.output).all()
                     dist.barrier()
-                    return operation.attended.clone(), selected, rows
+                    return variant.observations.attended.clone(), selected, rows
 
                 limits = [8, 5, 1, 0, *([4] * 28)]
                 first, first_selection, rows = replay("verify129", initial, limits)
