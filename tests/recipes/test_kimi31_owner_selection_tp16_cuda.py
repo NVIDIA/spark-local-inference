@@ -1,4 +1,4 @@
-"""Compare replicated and row-owned exact DSA selection on sixteen GPUs.
+"""Compare replicated and counted row-owned exact DSA selection on sixteen GPUs.
 
 The inputs are candidate score/ID words, not model logits. Timings include
 packing, transport, selection and result replication; they are component
@@ -30,6 +30,7 @@ class OwnerPipeline:
         storage = SharedBuffers(buffers, owner.device)
         self.local_ids = storage.buffer("local_ids", (rows, 2048), torch.int32)
         self.local_scores = storage.buffer("local_scores", (rows, 2048), torch.float32)
+        self.local_counts = storage.buffer("local_counts", (rows,), torch.int32)
         self.active = storage.buffer("active", (rows,), torch.bool)
         self.output_ids = storage.buffer("output", (rows, 2048), torch.int32)
         self.planar = storage.buffer("planar", (2 * rows, 2048), torch.float32)
@@ -38,13 +39,20 @@ class OwnerPipeline:
         self.selection = PreparedOwnerTopK(self.ids, self.scores, self.active,
             self.shards.index, self.output_ids, owner_runtime=owner,
             reduction_runtime=reduction, session=session, coordinator=coordinator,
-            name=f"owner.{rows}", buffers=SharedBuffers(buffers, owner.device, prefix="selection."))
+            name=f"owner.{rows}", buffers=SharedBuffers(buffers, owner.device, prefix="selection."),
+            local_counts=self.local_counts)
 
     def __call__(self):
         live = self.local_ids >= 0
         self.ids.copy_(torch.where(live, self.local_ids * 16 + self.shards.owner, -1).to(torch.int32))
         self.scores.copy_(torch.where(live, self.local_scores, -torch.inf))
         return self.selection()
+
+
+def _poison_staging(transport):
+    transport.counts.fill_(2048)
+    transport.indices.fill_(1234567)
+    transport.scores.fill_(float("inf"))
 
 
 def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128, 32, 8, 6, 4, 3, 1), profile=False, tune=False):
@@ -125,12 +133,16 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                 if rank == 0:
                     print("capture completed", flush=True)
                 checks = 0
+                columns = torch.arange(2048, device=device)
                 for seed in (0, 1, 2):
                     for rows in reversed(rows_catalog):
                         observed = {}
                         for kind in ("replicated", "owner"):
                             operation = cases[rows, kind]
                             inputs(operation, rows, seed)
+                            if kind == "owner":
+                                operation.local_counts.fill_(-123)
+                                _poison_staging(operation.selection.transport)
                             operation.output_ids.fill_(-91)
                             torch.cuda.synchronize()
                             dist.barrier()
@@ -147,9 +159,14 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                         owned = max(0, last - first)
                         if owned:
                             expected = control.gathered[first:last]
-                            assert torch.equal(selected.transport.scores[:owned].view(torch.int32),
-                                               expected[:, :, 0].contiguous().view(torch.int32))
-                            assert torch.equal(selected.transport.indices[:owned], expected.view(torch.int32)[:, :, 1])
+                            expected_bits = expected.view(torch.int32)
+                            expected_ids = expected_bits[:, :, 1].reshape(owned, 16, 2048)
+                            counts = torch.where(expected_ids >= 0, columns + 1, 0).amax(dim=2)
+                            assert torch.equal(selected.transport.counts[:owned], counts.to(torch.int32))
+                            live = (columns < counts[..., None]).flatten(1)
+                            assert torch.equal(selected.transport.scores[:owned].view(torch.int32)[live],
+                                               expected_bits[:, :, 0][live])
+                            assert torch.equal(selected.transport.indices[:owned][live], expected_bits[:, :, 1][live])
                             expected = expected.clone()
                             inactive = ~control.active[first:last]
                             expected[inactive, :, 0] = -torch.inf
@@ -158,6 +175,7 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                             assert torch.equal(selected.selected_scores[:owned].view(torch.int32),
                                                control.output_values[first:last].view(torch.int32))
                         if owned < selected.owner_rows:
+                            assert torch.all(selected.transport.counts[owned:] == 0)
                             assert torch.all(selected.selected_ids[owned:] == -1)
                             assert torch.all(selected.selected_scores[owned:].view(torch.int32) == -8388608)
                         peers = [None] * 16
@@ -167,13 +185,23 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                 if rank == 0:
                     print(f"exact selection: {checks} cases on every rank", flush=True)
 
-                # Queue graph variants without host synchronization. Slow one owner before
-                # the sequence and poison reused outputs to expose channel lifetime defects.
+                # Queue counted graphs with changing capacities, then repeat a capacity
+                # with a shrinking prefix and exceptional entries beyond ordinary padding.
                 ordered_rows = sorted(rows_catalog)
-                sequence = tuple(ordered_rows[::2] + ordered_rows[1::2][::-1] + ordered_rows[:1])
+                row_order = ordered_rows[::2] + ordered_rows[1::2][::-1]
+                candidate_counts = (32768, 257, 0, None)
+                sequence = tuple((rows, candidate_counts[index % len(candidate_counts)])
+                                 for index, rows in enumerate(row_order))
+                sequence += tuple((ordered_rows[0], count) for count in candidate_counts)
                 patterns, snapshots, controls = [], [], []
-                for index, rows in enumerate(sequence):
-                    scores, ids, active = source_rows(rows, index + 70, count=32768)
+                for index, (rows, count) in enumerate(sequence):
+                    scores, ids, active = source_rows(rows, index + 70, count=257 if count is None else count)
+                    if count == 0:
+                        active.fill_(True)
+                    elif count is None:
+                        ids[:, 2047::2048] = 2047
+                        scores.view(torch.int32)[:, 2047::2048] = torch.tensor(
+                            [0x7FC01234, 0x7F800000, -8388608, -2147483648] * 4, dtype=torch.int32)
                     patterns.append((scores[:, rank * 2048:(rank + 1) * 2048].to(device),
                         ids[:, rank * 2048:(rank + 1) * 2048].to(device), active.to(device)))
                     operation = cases[rows, "replicated"]
@@ -184,18 +212,25 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
                     torch.cuda.synchronize()
                     controls.append(operation.output_ids.cpu())
                     snapshots.append(torch.empty_like(operation.output_ids))
+                _poison_staging(cases[ordered_rows[-1], "owner"].selection.transport)
                 torch.cuda.synchronize()
                 dist.barrier()
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
                 if rank == 0:
                     torch.cuda._sleep(2000000)
-                for index, rows in enumerate(sequence):
+                for (rows, _), pattern, snapshot in zip(sequence, patterns, snapshots, strict=True):
                     operation = cases[rows, "owner"]
-                    for target, source in zip((operation.local_scores, operation.local_ids, operation.active), patterns[index], strict=True):
+                    for target, source in zip((operation.local_scores, operation.local_ids, operation.active), pattern, strict=True):
                         target.copy_(source)
+                    operation.local_counts.fill_(-123)
                     operation.output_ids.fill_(-91)
                     captured[f"owner{rows}"].replay()
-                    snapshots[index].copy_(operation.output_ids)
+                    snapshot.copy_(operation.output_ids)
+                    operation.local_scores.fill_(float("inf"))
+                    operation.local_ids.fill_(1234567)
+                    operation.active.fill_(False)
                 torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
                 assert all(torch.equal(snapshot.cpu(), control) for snapshot, control in zip(snapshots, controls, strict=True))
 
                 choices = []

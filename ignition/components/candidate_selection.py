@@ -37,6 +37,11 @@ class PreparedCandidateSelection:
         if (local_counts is not None and (local_counts.shape != (rows,) or local_counts.dtype != torch.int32
                 or local_counts.device != indices.device or not local_counts.is_contiguous())):
             raise ValueError("candidate merging requires contiguous int32 counts per row")
+        if local_counts is not None:
+            start, end = local_counts.data_ptr(), local_counts.data_ptr() + local_counts.nbytes
+            if any(start < tensor.data_ptr() + tensor.nbytes and tensor.data_ptr() < end
+                   for tensor in (indices, scores, positions, rank, output) if tensor is not None):
+                raise ValueError("candidate count scratch must not overlap inputs or output")
         self.indices, self.scores, self.positions, self.output = indices, scores, positions, output
         self.rank = 0 if rank is None else rank
         self.rows, self.world, self.topk = rows, world, topk
