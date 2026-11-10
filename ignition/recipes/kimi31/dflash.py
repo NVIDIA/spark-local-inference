@@ -19,6 +19,7 @@ from ignition.components.kda_speculation import KDARecords
 from ignition.components.linear import BatchedUnquantizedProjection, prepare_projection
 from ignition.components.mlp import MLPScratch
 from ignition.components.speculation import SpeculativeRngState
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.recipes.kimi3.decoder import PreparedDecoder
 from ignition.recipes.kimi3.dcp import write_records
@@ -141,21 +142,21 @@ class PreparedContext:
     """Project only accepted target features and retain one 1024-token latent ring per draft layer."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 runtime, coordinator, latent_runtime):
+                 runtime, coordinator, latent_runtime, examples=None):
         self.metadata, self.weights = metadata, weights
         c, shard = weights.config.draft, weights.shard
         rows, h = auxiliary.shape[0], weights.config.hidden
         self.window, self.world, self.eps = c.window, shard.world_size, c.text["rms_norm_eps"]
-        def zeros(shape, dtype):
-            return torch.zeros(shape, dtype=dtype, device=auxiliary.device)
-        self.local = zeros((rows, h//shard.world_size), torch.bfloat16)
-        self.projected = zeros((rows, h), torch.bfloat16)
-        self.normalized = zeros((rows, h), torch.bfloat16)
+        def zeros(role, shape, dtype):
+            return declaration_tensor(examples, "mla_dflash.context." + role, shape, dtype, auxiliary.device)
+        self.local = zeros("local", (rows, h//shard.world_size), torch.bfloat16)
+        self.projected = zeros("projected", (rows, h), torch.bfloat16)
+        self.normalized = zeros("normalized", (rows, h), torch.bfloat16)
         local_width = (c.layers*576//shard.world_size + 7)//8*8
-        self.kv_local = zeros((rows, local_width), torch.bfloat16)
-        self.kv = zeros((rows, local_width*shard.world_size), torch.bfloat16)
-        self.latent = zeros((rows, 576), torch.bfloat16)
-        self.slots = torch.full((rows,), -1, dtype=torch.int64, device=auxiliary.device)
+        self.kv_local = zeros("kv_local", (rows, local_width), torch.bfloat16)
+        self.kv = zeros("kv", (rows, local_width*shard.world_size), torch.bfloat16)
+        self.latent = zeros("latent", (rows, 576), torch.bfloat16)
+        self.slots = zeros("slots", (rows,), torch.int64).fill_(-1)
         self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
             session=session, name=name+".project", workspace=workspace, activation_mode="a16")
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime,
@@ -199,29 +200,29 @@ class PreparedContext:
 
 class DraftAttention:
     def __init__(self, index, weights, source, config, shard, scratch, metadata, pool, *,
-                 runtime, coordinator, session, name, workspace, latent_runtime):
+                 runtime, coordinator, session, name, workspace, latent_runtime, examples=None):
         self.metadata, self.weights = metadata, weights.attention
         self.window, self.world, self.eps = config.window, shard.world_size, config.text["rms_norm_eps"]
         n, h = source.shape
         heads, width = config.heads//shard.world_size, (2112//shard.world_size + 7)//8*8
-        def storage(shape, dtype=torch.bfloat16):
-            return torch.zeros(shape, dtype=dtype, device=source.device)
-        self.local = storage((n, width))
-        self.gathered = storage((n, width*shard.world_size))
-        self.q_latent = storage((n, 1536))
-        self.q_norm = storage((n, 1536))
-        self.latent = storage((n, 576))
-        self.query = storage((n, heads, 192))
-        self.absorbed = storage((n, heads, 576))
-        self.attended = storage((n, heads, 512))
-        self.expanded = storage((n, heads*128))
-        self.partial = storage((n, h))
+        def storage(role, shape, dtype=torch.bfloat16):
+            return declaration_tensor(examples, "mla_dflash.attention." + role, shape, dtype, source.device)
+        self.local = storage("local", (n, width))
+        self.gathered = storage("gathered", (n, width*shard.world_size))
+        self.q_latent = storage("q_latent", (n, 1536))
+        self.q_norm = storage("q_norm", (n, 1536))
+        self.latent = storage("latent", (n, 576))
+        self.query = storage("query", (n, heads, 192))
+        self.absorbed = storage("absorbed", (n, heads, 576))
+        self.attended = storage("attended", (n, heads, 512))
+        self.expanded = storage("expanded", (n, heads*128))
+        self.partial = storage("partial", (n, h))
         pages = (config.window + scratch.block_size + 127)//128
         rows = metadata.lengths.numel()
-        self.staged = storage((rows*pages, 128, 576), torch.float8_e4m3fn)
+        self.staged = storage("staged", (rows*pages, 128, 576), torch.float8_e4m3fn)
         self.history = pool.reserved_region(f"draft{index}.latent")
         self.page_table = persistent_copy(torch.arange(rows*pages, dtype=torch.int32, device=source.device).view(rows, pages))
-        self.lengths = storage((rows,), torch.int32)
+        self.lengths = storage("lengths", (rows,), torch.int32)
         self.project = prepare_projection(source, self.weights["latent_gate"], self.local,
             session=session, name=name+".qkv", workspace=workspace, activation_mode="a16")
         self.gather = PreparedChunkedAllGather(self.local, self.gathered, runtime=latent_runtime,
@@ -289,7 +290,7 @@ class PreparedDraft(BlockDraft):
 
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence, session, workspace,
-                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens,
+                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens, examples,
                  latent_runtime, context_latent_runtime, convolution_runtime):
         self.page_tokens = page_tokens
         self.weights, self.tables, self.pool = weights, None, pool
@@ -304,17 +305,18 @@ class SpeculativePreparation:
         self.kda_records = KDARecords.allocate(layers, requests.capacity+1, heads, pool.backing.device)
         def decoder(weights, tables, scratch, metadata, pool, *, mode, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, mode=mode, buffers=decoder_buffers,
-                kda_records=self.kda_records if mode == "verify" else None, **{**collectives, **kwargs})
+                kda_records=self.kda_records if mode == "verify" else None, examples=examples,
+                **{**collectives, **kwargs})
         self.block_size, self.logit_offset = draft_tokens+1, 1
         self.draft_scratch = DraftScratch.allocate(weights.config, weights.shard,
             requests.capacity*self.block_size, self.block_size, pool.backing.device)
         self.forwards = SimpleNamespace(decoder=decoder,
             context=partial(PreparedContext, runtime=context_runtime, coordinator=coordinator,
-                latent_runtime=context_latent_runtime),
+                latent_runtime=context_latent_runtime, examples=examples),
             draft=partial(PreparedDraft, embedding=weights.embedding,
                 head=weights.head if weights.draft.head is None else weights.draft.head,
                 embedding_runtime=collectives["embedding_runtime"], output_multiplier=1., final_logit_softcapping=None,
-                attention_factory=partial(DraftAttention, latent_runtime=latent_runtime),
+                attention_factory=partial(DraftAttention, latent_runtime=latent_runtime, examples=examples),
                 convolution_runtime=convolution_runtime), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = (persistent_zeros(requests.generation.shape, requests.generation.dtype,

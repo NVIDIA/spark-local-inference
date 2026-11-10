@@ -21,6 +21,7 @@ from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.recipes.kimi3.attention import PreparedMLAProjection
 from ignition.recipes.kimi3.config import PAGE_TOKENS
@@ -118,21 +119,21 @@ class PreparedContext:
     """Project accepted target output taps into each draft layer's paged latent history."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
-                 context):
+                 context, examples=None):
         self.metadata, self.shards = metadata, context.shards
         config, draft = weights.config, weights.draft
         tokens, device = auxiliary.shape[0], auxiliary.device
         self.eps = config.draft.text["rms_norm_eps"]
 
-        def buffer(*shape, dtype=torch.bfloat16):
-            return torch.zeros((tokens, *shape), dtype=dtype, device=device)
+        def buffer(role, *shape, dtype=torch.bfloat16):
+            return declaration_tensor(examples, "mla_dspark.context." + role, (tokens, *shape), dtype, device)
 
-        self.local = buffer(config.hidden // weights.shard.world_size)
-        self.projected = buffer(config.hidden)
-        self.normalized = buffer(config.hidden)
-        self.kv = buffer(draft.context_kv.shape[0])
-        self.latent = buffer(RECORD_BYTES)
-        self.slots = buffer(dtype=torch.int64)
+        self.local = buffer("local", config.hidden // weights.shard.world_size)
+        self.projected = buffer("projected", config.hidden)
+        self.normalized = buffer("normalized", config.hidden)
+        self.kv = buffer("kv", draft.context_kv.shape[0])
+        self.latent = buffer("latent", RECORD_BYTES)
+        self.slots = buffer("slots", dtype=torch.int64)
         self.hidden_norm = draft.hidden_norm
         self.project = projection(auxiliary, draft.projection, self.local, session=session,
                                   name=name + ".project", workspace=workspace)

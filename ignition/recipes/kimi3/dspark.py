@@ -23,6 +23,7 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.speculation import SpeculativeRngState
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 
 from .pointwise import rms_norm_columns
@@ -86,7 +87,7 @@ PADDED_HEAD = 128
 class PreparedContext:
     """Project accepted target auxiliary states once into every draft layer's context keys and values."""
 
-    def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator):
+    def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator, examples=None):
         config, draft = weights.config, weights.draft
         d, eps = config.draft, config.draft.text["rms_norm_eps"]
         self.window, self.eps = d.window, eps
@@ -94,22 +95,22 @@ class PreparedContext:
         _, kv_heads = local_heads(config, weights.shard)
         hidden = config.hidden
 
-        def buffer(*shape, dtype=auxiliary.dtype):
-            return torch.zeros((tokens, *shape), dtype=dtype, device=device)
-        self.local = buffer(hidden // weights.shard.world_size)
-        self.projected = buffer(hidden)
-        self.normalized = buffer(hidden)
+        def buffer(role, *shape, dtype=auxiliary.dtype):
+            return declaration_tensor(examples, "dspark.context." + role, (tokens, *shape), dtype, device)
+        self.local = buffer("local", hidden // weights.shard.world_size)
+        self.projected = buffer("projected", hidden)
+        self.normalized = buffer("normalized", hidden)
         self.project = projection(auxiliary, draft.projection, self.local, session=session, name=name + ".project",
                                   workspace=workspace)
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime, coordinator=coordinator,
                                         session=session, name=name + ".gather")
         self.hidden_norm = draft.hidden_norm
-        self.kv = buffer(draft.context_kv.shape[0])
+        self.kv = buffer("kv", draft.context_kv.shape[0])
         self.project_kv = UnquantizedProjection(self.normalized, draft.context_kv, self.kv,
                                                 session=session, name=name + ".kv")
-        self.key = buffer(kv_heads, d.head_dim)
-        self.value = buffer(kv_heads, d.head_dim)
-        self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
+        self.key = buffer("key", kv_heads, d.head_dim)
+        self.value = buffer("value", kv_heads, d.head_dim)
+        self.slots = buffer("slots", dtype=torch.int64).fill_(-1)
         self.inverse = persistent_copy(inverse_frequencies(config, device))
         self.stages = []
         for index, layer in enumerate(draft.layers):
@@ -303,14 +304,16 @@ class PreparedDraft:
 class PreparedMarkov:
     """Gather the preceding token's FP32 transition bias across vocabulary shards."""
 
-    def __init__(self, weights, tokens, *, runtime, coordinator, session, name):
+    def __init__(self, weights, tokens, *, runtime, coordinator, session, name, examples=None):
         from ignition.components.embedding import PreparedEmbedding
 
         rows, device = tokens.numel(), tokens.device
         draft, vocabulary = weights.draft, weights.config.vocabulary
-        self.embedding = torch.zeros((rows, weights.config.draft.markov_rank), dtype=torch.bfloat16, device=device)
-        self.local = torch.zeros((rows, vocabulary // weights.shard.world_size), dtype=torch.float32, device=device)
-        self.logits = torch.zeros((rows, vocabulary), dtype=torch.float32, device=device)
+        self.embedding = declaration_tensor(examples, "dspark.markov.embedding",
+            (rows, weights.config.draft.markov_rank), torch.bfloat16, device)
+        self.local = declaration_tensor(examples, "dspark.markov.local",
+            (rows, vocabulary // weights.shard.world_size), torch.float32, device)
+        self.logits = declaration_tensor(examples, "dspark.markov.logits", (rows, vocabulary), torch.float32, device)
         self.embed = PreparedEmbedding(draft.markov_embedding, tokens, self.embedding, session=session,
                                        name=name + ".embed").functional(session=session, dynamic_inputs=True)
         self.projection = UnquantizedProjection(self.embedding, draft.markov_head, self.local, session=session,
@@ -345,7 +348,8 @@ class SpeculativePreparation:
     """
 
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence, session, workspace,
-                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens, markov_runtime):
+                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens, markov_runtime,
+                 examples):
         from ignition.components.kda_speculation import KDARecords
         from .decoder import PreparedDecoder
 
@@ -364,7 +368,8 @@ class SpeculativePreparation:
 
         def decoder(weights, tables, scratch, metadata, pool, *, mode, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, mode=mode, buffers=decoder_buffers,
-                kda_records=self.kda_records if mode == "verify" else None, **{**collectives, **kwargs})
+                kda_records=self.kda_records if mode == "verify" else None, examples=examples,
+                **{**collectives, **kwargs})
 
         # The anchor predicts the first draft, so a block holds one position per draft.
         self.block_size, self.logit_offset = max(1, draft_tokens), 0
@@ -378,9 +383,9 @@ class SpeculativePreparation:
             draft_type = partial(draft_type, context=collectives["context"],
                                  latents=collectives["latent_runtimes"][-1])
         self.forwards = DraftForwards(decoder,
-            partial(context_type, runtime=context_runtime, coordinator=coordinator),
+            partial(context_type, runtime=context_runtime, coordinator=coordinator, examples=examples),
             partial(draft_type, block=self.block_size, embedding_runtime=collectives["embedding_runtime"]),
-            PreparedMarkov)
+            partial(PreparedMarkov, examples=examples))
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = (persistent_zeros(requests.generation.shape, requests.generation.dtype,
             requests.generation.device) for _ in range(2))
