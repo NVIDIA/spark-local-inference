@@ -454,7 +454,8 @@ def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, s
                                 samples[-1]["acceptance"] = acceptance_observation(observations)
                             draft_inputs = getattr(forward, "draft_inputs", None)
                             samples[-1]["draft_forward_tokens_per_request"] = (
-                                draft_inputs.shape[1] if draft_inputs is not None and forward.draft is not None else 0)
+                                0 if forward.draft is None else
+                                draft_inputs.shape[1] if draft_inputs is not None else forward.owner.block_size)
                             samples[-1]["draft_context_updated"] = forward.context is not None
                             samples[-1]["proposal_tokens_per_request"] = step.draft_tokens
                             samples[-1]["target_tokens_per_request"] = case.packed_tokens // case.batch

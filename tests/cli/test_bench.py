@@ -162,7 +162,7 @@ def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text("")
     assert main(["bench", "qwen3.8-flash", "--config", str(config)]) == 2
-    assert "supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark" in capsys.readouterr().err
+    assert "supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr" in capsys.readouterr().err
 
 
 def test_report_keeps_case_latency_and_equal_weight_score_separate(tmp_path, capsys):

@@ -209,10 +209,10 @@ storage according to those selections and available GPU memory.
 `ignition bench` prepares the target and draft checkpoints, captures the selected
 graph catalog, and measures complete speculative GPU rounds with CUDA events.
 It opens no HTTP listener and exports no core. Supported recipes are
-Qwen3.8-27B DFlash2 on one local GPU and Kimi K3.1 Pro DSpark on sixteen local
-GPUs. Tensor-parallel samples report the slowest rank's graph duration. Every
-rank finishes restoring request, cache, recurrent, and sampling state before
-the timed graph starts.
+Qwen3.8-27B DFlash2 and Nemotron Bolt LiLiCorr on one local GPU, and
+Kimi K3.1 Pro DSpark on sixteen local GPUs. Tensor-parallel samples report the
+slowest rank's graph duration. Every rank finishes restoring request, cache,
+recurrent, and sampling state before the timed graph starts.
 
 ```sh
 .venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
@@ -224,6 +224,9 @@ the timed graph starts.
   --batches 8 --max-concurrency 8 --verify-width 8 --contexts 8192 \
   --speculative-token-capacity 64 --online-mxfp8 \
   --autotune-effort default --output /tmp/kimi31-rounds.json
+.venv/bin/ignition bench nemotron-bolt-24gb --gpus 0 \
+  --batches 1 --max-concurrency 1 --verify-width 8 --contexts 4096 \
+  --output /tmp/nemotron-bolt-rounds.json
 ```
 
 | Flag | Meaning | Default |
@@ -249,7 +252,8 @@ overrides it. Preparation accepts the normal GPU, memory, cache, compiler,
 autotuning, precision, and overlap settings. Omitted concurrency defaults to the
 largest selected batch; configured and explicit capacities must cover it.
 The prepared request capacity is the largest selected batch. JSON distinguishes
-that capacity from the concurrency requested through configuration or flags.
+that capacity from the concurrency requested through configuration or flags and
+includes the operator configurations selected during preparation.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
 
@@ -271,9 +275,9 @@ Prefix one uses the width-one serving graph: it omits proposal generation but
 updates draft context, so it is not a target-only model measurement. JSON records
 the executed draft-forward size and acceptance separately from replay latency.
 
-Kimi K3.1 Pro supports verification widths through eight. Its selected catalog contains
-the requested speculative rounds and the initialization and prefill graphs
-needed to establish their contexts. Vision weights retain their configured
+Kimi K3.1 Pro and Nemotron Bolt support verification widths through eight.
+Their selected catalogs contain the requested speculative rounds and the
+initialization and prefill graphs needed to establish their contexts. Vision weights retain their configured
 residency, while image graphs are omitted from this text benchmark.
 
 For fifteen drafts plus the pending token, select `--mtp-draft-tokens 15` or

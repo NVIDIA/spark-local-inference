@@ -331,7 +331,9 @@ def test_packed_metadata_retains_full_proposal_draw_reservation(prefix):
             _check_metadata(model, step, BenchmarkCase(1, 8, prefix, 512))
 
 
-def test_prefix_matrix_reuses_prefill_and_restores_each_replay(monkeypatch):
+@pytest.mark.parametrize("retain_examples", [False, True])
+@pytest.mark.parametrize("draft_block_size", [8, 16])
+def test_prefix_matrix_reuses_prefill_and_restores_each_replay(monkeypatch, retain_examples, draft_block_size):
     from types import SimpleNamespace as NS
     import torch
 
@@ -346,8 +348,9 @@ def test_prefix_matrix_reuses_prefill_and_restores_each_replay(monkeypatch):
         **{("speculative", case.batch, case.width, case.packed_tokens,
             case.width - 1): str(case.packed_tokens) for case in cases}})
     rounds = {str(case.packed_tokens): NS(owner=NS(generation=torch.tensor([0]),
-              offset=torch.tensor([0])), draft=object() if case.width > 1 else None,
-              draft_inputs=torch.empty((1, 7)), context=object()) for case in cases}
+              offset=torch.tensor([0]), block_size=draft_block_size), draft=object() if case.width > 1 else None,
+              draft_inputs=torch.empty((1, draft_block_size)) if retain_examples else None,
+              context=object()) for case in cases}
     model = NS(benchmark_state={"requests": object()},
                benchmark_requests=NS(generation=torch.tensor([0])), benchmark_rounds=rounds)
 
@@ -412,6 +415,9 @@ def test_prefix_matrix_reuses_prefill_and_restores_each_replay(monkeypatch):
     assert len({(frame, sequence) for _, _, frame, sequence in executor.seen}) == 1
     assert result["status"] == "complete"
     assert all(sample["times_ms"] == [1., 1.] for case in result["cases"] for sample in case["samples"])
+    for case in result["cases"]:
+        for sample in case["samples"]:
+            assert sample["draft_forward_tokens_per_request"] == (0 if case["width"] == 1 else draft_block_size)
 
 
 @pytest.mark.parametrize("field", ["live_counts", "starts", "lengths", "query_start_loc"])
