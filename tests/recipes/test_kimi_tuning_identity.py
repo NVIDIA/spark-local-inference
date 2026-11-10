@@ -46,3 +46,18 @@ def test_target_geometry_changes_selection_namespace(field):
     else:
         world = 8
     assert target_tuning_identity(config, headers, world) != before
+
+
+def test_projection_scopes_separate_tuning_namespaces():
+    config, headers = fixture()
+    default = target_tuning_identity(config, headers, 16)
+    assert target_tuning_identity(config, headers, 16, online_mxfp8_scope="all") == default
+    assert target_tuning_identity(config, headers, 16, online_mxfp8_scope="kda-input") != default
+
+
+@pytest.mark.parametrize("scope,online", [("unsupported", True), ("kda-input", False)])
+def test_preparation_rejects_inconsistent_conversion_scope(scope, online):
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    with pytest.raises(ValueError, match="scope"):
+        PreparationConfig(online_mxfp8=online, online_mxfp8_scope=scope)

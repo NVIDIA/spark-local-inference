@@ -308,9 +308,12 @@ impl Source {
                 || previous.checkpoint_revision != expected.checkpoint_revision
                 || previous.local_checkpoint != expected.local_checkpoint
                 || previous.tensor_parallel != expected.tensor_parallel
+                || previous.online_mxfp8 != expected.online_mxfp8
+                || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
+                    != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, and tensor-parallel size",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and online MXFP8 conversion settings",
                 ));
             }
             return Ok(protection::verify(

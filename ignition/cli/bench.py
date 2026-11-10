@@ -238,7 +238,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "language_model_only")}}
+            "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}
 
     if settings.speculation_study:
         details["configuration"]["speculation_study"] = dict(

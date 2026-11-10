@@ -61,17 +61,20 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
-def target_tuning_identity(config, headers, world_size):
+def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all"):
     """Scope kernel selections to target geometry, independently of attached drafts.
 
     The target-only descriptor retains its empty draft field. Each operator's
     encoded query, invocation and candidate programs distinguish additional
     draft shapes and arithmetic contracts inside the selection cache.
     """
-    return hashlib.sha256(json.dumps({
+    value = {
         "config": config.text, "headers": headers, "vision": config.vision,
         "draft": None, "world_size": world_size,
-        "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
+        "contract": "kimi3.graph-inputs.v1"}
+    if online_mxfp8_scope != "all":
+        value["online_mxfp8_scope"] = online_mxfp8_scope
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,7 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     # Store eligible attention, shared-expert, latent MoE, and DSpark projections as MXFP8.
     online_mxfp8: bool = False
+    online_mxfp8_scope: str = "all"
     # Shared experts overlap routing and routed experts on an auxiliary stream.
     stream_overlap: bool = True
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
@@ -116,6 +120,10 @@ class PreparationConfig:
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.online_mxfp8_scope not in ("all", "kda-input"):
+            raise ValueError("online MXFP8 scope must be all or kda-input")
+        if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
+            raise ValueError("online MXFP8 scope requires online conversion")
         if self.mtp_only and (not self.drafting
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -236,7 +244,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         headers = [shard.header_sha256 for shard in manifest.shards]
     with package_storage.transient():
         peers = None if group is None or package_storage.peer_storage is None else (group, package_storage.peer_storage)
-        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
+        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8, online_mxfp8_scope=config.online_mxfp8_scope,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision)
         del manifest
@@ -315,7 +323,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         latent_runtimes = tuple(create_head_exchange(group, device, max_rows=rows, heads=shard.world_size,
                                                      head_dim=-(-latent // 8) * 8, ipc=package_storage.peer_storage)
                                 for rows in sorted({min(8, max_tokens), channel_rows}))
-        identity = target_tuning_identity(weights.config, headers, shard.world_size)
+        identity = target_tuning_identity(weights.config, headers, shard.world_size,
+            online_mxfp8_scope=config.online_mxfp8_scope)
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
