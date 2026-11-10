@@ -23,25 +23,25 @@ use the configured bearer authentication.
 Model cards include the vLLM-compatible fields `id`, `object`, `created`,
 `owned_by`, `root`, `parent`, `max_model_len`, and `permission`. `max_model_len`
 is the effective serving context limit in tokens, including prompt and output.
-`root` is the loaded model's identifier, `parent` is null, and `owned_by` remains
+`root` is the loaded model's identifier, `parent` is null, and `owned_by` is
 `local`. `created` is the serving instance's discovery initialization time in
 Unix seconds; cards and permission IDs stay stable until the server restarts.
 Permissions advertise sampling and viewing. `allow_logprobs` reflects the loaded
 core’s generation logprob outputs; fine-tuning, engine creation, and search
-indices remain disabled.
+indices are disabled.
 
 The additional `flare` object reports prepared and selected serving metadata:
 
 | Field | Meaning |
 | --- | --- |
 | `vocab_size` | Prepared output vocabulary size |
-| `max_top_logprobs` | Prepared alternative-token capacity; 20 for new cores, zero for older cores |
+| `max_top_logprobs` | Prepared natural alternative-token capacity, at most 20; zero for a core without generation logprob outputs |
 | `max_concurrency` | Selected maximum active requests |
 | `prefill_chunk_size` | Maximum tokens in a prefill chunk, not the context limit |
-| `default_max_tokens` | Default output-token budget when a request omits it; remaining context still bounds output |
+| `default_max_tokens` | Default output-token budget when a request omits it; remaining context also bounds output |
 | `sampling_defaults` | Prepared seed, temperature, filters, and penalties used for omitted request fields |
 | `thinking_token_budget` | Operator default reasoning-token cap for conversational requests; null when unset |
-| `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its prepared default; seed remains request-controlled |
+| `sampling_ranges` | Inclusive `{min, max}` bounds for distribution parameters; null fixes a parameter at its prepared default; seed is request-controlled |
 | `max_images_per_prompt` | Context-derived upper bound on image count; image sizes, framing, text, output, and HTTP body size further constrain admission; zero for text-only cores |
 | `max_image_tokens_per_prompt` | Context-derived upper bound on image tokens across the entire conversation; text, framing, and output also occupy context; zero for text-only cores |
 | `image_feature_window_tokens` | Prepared feature storage per active image request; chunked prefill reuses this storage across windows, so it does not limit total conversation image tokens |
@@ -63,7 +63,7 @@ configured alias. An optional boolean `verbose` is accepted; both modes return
 the same metadata. Missing, empty, or incorrectly typed names return HTTP 400;
 unknown names return HTTP 404. Discovery errors use `{"error": "message"}`.
 Both routes require the configured bearer key, when enabled. `/api/show` accepts
-uncompressed JSON within the HTTP body-size limit. Authentication errors retain
+uncompressed JSON within the HTTP body-size limit. Authentication errors use
 the OpenAI error format.
 
 `/api/show` reports `completion`, plus `vision` when vision graphs are prepared,
@@ -95,7 +95,7 @@ OpenCode v2 can discover Flare through its built-in Ollama provider. Merge into
 Add `settings.apiKey` when authentication is enabled. OpenCode polls the discovery
 endpoints and uses `/v1/chat/completions` for generation; choose a discovered model
 with `/models`. Its Ollama integration reads context, tool, and vision metadata;
-reasoning controls may still require client configuration. Flare implements
+reasoning controls may require client configuration. Flare implements
 Ollama discovery only: `/api/chat`, `/api/generate`, and model-management routes
 are not supported.
 
@@ -108,10 +108,11 @@ uses the target model's distribution at each committed position. The chosen toke
 is always included, even when outside the alternatives. Natural alternatives are
 ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported core provides up to 20 natural alternatives and supports
-explicit token IDs. Older cores retain their natural request limit (1..20),
-or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
-no generation logprob outputs. Unsupported requests return HTTP 400.
+`ignition export` writes cores that provide up to 20 natural alternatives and
+support explicit token IDs. A core whose logprob output stores fewer alternatives
+keeps that limit (1..20) as `flare.max_top_logprobs`. A core without generation
+logprob outputs advertises `allow_logprobs: false` and `flare.max_top_logprobs: 0`.
+Requests beyond the loaded core's capacity return HTTP 400.
 
 For Chat Completions, set `logprobs: true` and optionally `top_logprobs: 0..20`.
 A positive `top_logprobs` requires `logprobs: true`; zero alone is accepted and
@@ -133,7 +134,7 @@ entry and full bytes; tokens entirely beyond the stop have no entries. `bytes`
 contains the token's exact bytes, including partial UTF-8; `token` uses UTF-8
 replacement characters where needed for JSON.
 
-Legacy Completions accepts integer `logprobs: 0..20`. Each choice's `logprobs` has
+Completions accepts integer `logprobs: 0..20`. Each choice's `logprobs` has
 parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset` arrays.
 `top_logprobs` contains one token-to-logprob object per generated token.
 `text_offset` counts Unicode characters from the start of the completion, including
@@ -149,30 +150,35 @@ reasoning, tool calls, and delimiters do not. A token spanning a delimiter and
 answer belongs to the delimiter, even if its suffix contributes answer text.
 A reasoning delimiter spelled out in ordinary answer text is output text and
 receives entries.
-Other `include` values retain their existing behavior.
+Other `include` values are ignored.
 
 On these three endpoints, `return_tokens_as_token_ids: true` changes chosen and
 alternative token strings to `token_id:<id>`; bytes remain exact. `/v1/messages`
-explicitly rejects logprob fields. Temperature zero remains rejected. Single-token
+rejects `logprobs`, `top_logprobs`, `return_tokens_as_token_ids`, and
+`logprob_token_ids` with HTTP 400. Requesting logprobs does not change sampling:
+`temperature: 0` is clamped as described under
+[Reasoning, sampling, and usage](#reasoning-sampling-and-usage). Single-token
 continuations work with `max_tokens: 1`, `continue_final_message: true`,
 `add_generation_prompt: false`, `logprobs: true`, and `top_logprobs: 20`, omitting
 temperature to use the model's prepared default.
 
 On Chat, Completions, and Responses, `logprob_token_ids: [id, ...]` replaces
-natural generation alternatives with those IDs in caller order. Existing generation
-logprob enablement is required. Supply at most 128 elements before deduplication;
+natural generation alternatives with those IDs in caller order. The request must
+also enable generation logprobs through that endpoint's fields above. Supply at
+most 128 elements before deduplication;
 IDs must be nonnegative integers within the model vocabulary. Duplicates are
 removed in first-occurrence order. Null and empty arrays behave as omission.
 The sampled token is appended only when absent, so explicit results contain at
-most 129 entries. Values retain full-vocabulary normalization. Numeric top-k
-options still accept only 0..20 and do not truncate explicit results.
+most 129 entries. Values use full-vocabulary normalization. Numeric top-k
+options accept only 0..20 and do not truncate explicit results.
 
-Prompt scores and echoed prompt entries remain natural. Completions accepts
-validated IDs with `echo: true, max_tokens: 0`, which returns no generation
-positions. Completions maps retain their existing decoded-string collision
-behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
-rejects `logprob_token_ids`. Older cores reject nonempty selections before
-admission with an explanation to re-export.
+Prompt scores and echoed prompt entries always use natural alternatives.
+Completions accepts validated IDs with `echo: true, max_tokens: 0`, which returns
+no generation positions. Completions `top_logprobs` maps are keyed by decoded
+token string and keep the first entry when several IDs decode to the same string;
+use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
+rejects `logprob_token_ids`. A core without explicit-ID inputs rejects nonempty
+selections before admission with HTTP 400 and a message to re-export.
 
 ### Prompt log probabilities
 
@@ -187,7 +193,7 @@ at the response's top-level `prompt_logprobs`. The result is a list aligned with
 prompt token positions (the rendered prompt for chat). Its first entry and image
 positions are `null`. Each other entry maps token IDs to the actual token and up
 to the requested number of alternatives. `decoded_token` remains decoded text
-when `return_tokens_as_token_ids` changes the legacy token strings:
+when `return_tokens_as_token_ids` changes the Completions token strings:
 
 ```json
 [null, {"42":{"logprob":-0.25,"rank":1,"decoded_token":" answer"},
@@ -201,13 +207,13 @@ decreasing logprob and increasing token ID to break ties. Non-finite logprobs ar
 as `-9999.0`. The actual token is always included, even outside the alternatives.
 
 For Completions, `echo: true` with integer `logprobs: 0..20` requests prompt scoring
-and prepends prompt entries to the legacy `logprobs` arrays. Position zero and
+and prepends prompt entries to the Completions `logprobs` arrays. Position zero and
 image positions have null `token_logprobs` and `top_logprobs`. Prompt `text_offset`
 counts characters in the preceding decoded token strings; generated offsets start
 after the echoed text. Streaming echo emits one logprob frame per completed
 prompt chunk, before generated entries. Buffered completions also include
 `choices[i].prompt_logprobs`. An explicit `prompt_logprobs` value overrides the
-inferred count for that field; `logprobs` controls the legacy arrays.
+inferred count for that field; `logprobs` controls the Completions arrays.
 
 For Completions, `max_tokens: 0` with prompt scoring submits the prompt and
 returns zero generated tokens with `finish_reason: "length"`. Chat Completions
@@ -225,7 +231,9 @@ execution, and hosted tools are unsupported. Anthropic requests require
 When a serving key is configured, OpenAI routes use `Authorization: Bearer KEY`.
 Anthropic routes also accept `x-api-key: KEY`; supplying both headers requires
 both to match. `/health` and `/metrics` are unauthenticated. Flare reads its
-serving key from `--api-key-file`, independently of client configuration.
+serving key from `[server] api_key` in its configuration file, or from
+`--api-key-file`, which overrides it; an empty key disables authentication.
+Client configuration does not affect it.
 
 Generation request bodies support `identity`, `gzip`, zlib `deflate`, `br`, and `zstd` content
 encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
@@ -233,9 +241,22 @@ encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
 frontend worker pool. Invalid requests receive protocol-specific JSON errors;
 failures after streaming begins produce protocol-specific terminal error events.
 
+Chat Completions, Completions, and Responses errors are
+`{"error": {"type", "message", "param": null, "code"}}`; Messages errors are
+`{"type": "error", "error": {"type", "message"}}`. Malformed, unsupported, and
+over-context requests return HTTP 400 (`invalid_request_error`); a missing or
+invalid key returns 401 (`authentication_error`); an encoded or decoded body
+over `max_body_bytes` returns 413 (`request_too_large`); an unknown
+`Content-Encoding` returns 415; exhausted HTTP admission slots return 429
+(`rate_limit_error`); and a full model request queue, paused admission, or an
+unavailable runtime return 503. Execution and output-validation failures
+return 500. 5xx errors use `server_error`, or `api_error` on Messages.
+Responses for requests that reach model submission carry an `x-request-id`
+header.
+
 Streaming requests return HTTP 200 and SSE headers after frontend validation and
 bounded enqueue, without waiting for GPU admission or prefill. Admission failures
-after enqueue are terminal SSE errors under HTTP 200; buffered requests retain
+after enqueue are terminal SSE errors under HTTP 200; buffered requests receive
 the corresponding HTTP error status. Chat Completions emits its initial
 `{"role":"assistant","content":""}` delta only after the first generated token
 is available, including tokens hidden by stop matching or text decoding. Chunked
@@ -252,8 +273,8 @@ drains before its resources are reclaimed. A connected reader can pause and
 resume without losing generated output. Each response buffers up to its allowed
 output length, including requested token observations and prompt scores. Storage
 grows with queued data; large paused responses can retain more CPU memory.
-Finished responses awaiting delivery still count toward the admission limit,
-but no longer occupy a model execution slot or its live KV cache.
+Finished responses awaiting delivery count toward the admission limit,
+but occupy no model execution slot or live KV cache.
 
 ## Health and metrics
 
@@ -264,7 +285,9 @@ requires the serving key: both report aggregate state without request content.
 `GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
 Counter and gauge names start with `flare_`, such as
 `flare_generated_tokens_total`, `flare_active_requests`, and
-`flare_free_kv_pages`; there are no histograms. Beyond the JSON fields below, the
+`flare_free_kv_pages`. The only histograms describe host prefix-store lookups:
+`flare_host_cache_missing_tokens`, `flare_host_cache_estimated_transfer_ns`, and
+`flare_host_cache_estimated_prefill_ns`. Beyond the JSON fields below, the
 text includes speculative and proposal counters by batch, width, or depth, graph
 launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
@@ -279,9 +302,14 @@ selects text regardless of `Accept`, and any other `format` value returns HTTP
 as zero, and `flare_helios::server::view` holds the rate history and plots of
 the serving terminal dashboard.
 
-JSON fields are integers except `learned_drafter`. Totals count from server
-start; `active`, `pending`, the page fields, and the host record fields are
-instantaneous gauges.
+The fields in the table are integers except `learned_drafter`. Totals count from
+server start; `active`, `pending`, the page fields, and the host record fields are
+instantaneous gauges. The object also contains `first_response`, an object with
+`median_seconds` (null without samples), `samples`, `window_seconds`, `capacity`,
+and `truncated` describing server-side time from HTTP admission to the first
+offered answer or reasoning text over a 60-second window, and one integer per
+image-preparation and prepared-input cache metric under its Prometheus name
+without the `flare_` prefix, such as `input_decoded_images_total`.
 
 | Field | Meaning | Prometheus metric |
 | --- | --- | --- |
@@ -319,12 +347,11 @@ Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
 `end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
-writes. `flare_host_cache_store_skipped_total` still includes duplicates and
+writes. `flare_host_cache_store_skipped_total` includes duplicates and
 retries; it is not a dropped-record counter. Local checkpoint pool capacity is
 reported by `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total`
 (including automatic intake), and `flare_host_cache_intake_slots`. Used slots
-include pages, row pieces, and staging allocations. These replace the row
-capacity gauges.
+include pages, row pieces, and staging allocations.
 
 Dashboard DEPTH is the change in `verification_drafts` divided by the change in
 `verification_rounds` over the sampling window. It averages each request's planned
@@ -355,7 +382,7 @@ native system role to models whose templates cannot represent one inline.
 Model output parsers emit neutral semantic events. The ordered accumulator in
 `server/output.rs` retains text, reasoning, and tool blocks. Protocol encoders use
 the same accumulated output for buffered responses and SSE. Tool arguments are
-JSON objects, bounded to 8 MiB. Existing model parsers buffer tool envelopes until
+JSON objects, bounded to 8 MiB. The model parsers buffer tool envelopes until
 they are complete, so argument events do not imply incremental generation of an
 unfinished call. Truncated tool envelopes are omitted and the response reports
 its output limit; recognized but incomplete calls at natural completion are errors.
@@ -411,8 +438,8 @@ call written in prose, inline or on its own lines, still parses as a call and
 ends reasoning. A tag still undecided when generation ends is parsed as an
 incomplete call. GLM's `<tool_call>` likewise starts a call only when followed
 by a function name and an `<arg_key>` or `</tool_call>` tag.
-Gemma 4 and MiniMax keep their current behavior: Gemma's `<|tool_call>` opener
-and MiniMax's namespace-prefixed opener do not take part in this check. DeepSeek
+Gemma 4's `<|tool_call>` opener and MiniMax's namespace-prefixed opener always
+start a call; they do not take part in this check. DeepSeek
 DSML and XTML are parsed by their own parsers rather than this path.
 A missing `</parameter>` is closed by the next parameter or function boundary.
 Parameter schemas guide
@@ -478,12 +505,13 @@ Missing, duplicate, or unknown IDs leave that group in its supplied order.
 Results never move across another
 assistant message.
 
-Named tool selection and strict function schemas are rejected. Hosted search,
+Strict function schemas (`strict: true`) are rejected. Hosted search,
 computer execution, file stores, audio, and remote image downloads are unsupported. Images must be
 base64 PNG, JPEG, or static WebP data. Images are encoded sequentially into
 bounded feature windows. Chunked prefill consumes each window before its storage
 is reused; the total image tokens across a conversation may exceed
-`image_feature_window_tokens`. There is no separate four-image limit. Each image
+`image_feature_window_tokens`. Image count is bounded only by
+`max_images_per_prompt` and the limits below. Each image
 must fit a prepared vision graph and one feature window. The whole request must
 fit the HTTP body limit and the context shared by images, text, and generated
 output. Animated images are unsupported.
@@ -512,8 +540,9 @@ complete vision computation.
 
 Window transitions use a private snapshot of complete model state and restore
 it under a fresh execution generation before reusing the feature arena. They
-work with existing cores and with both host cache tiers disabled. These
-internal transitions do not count as cached prompt tokens.
+use the scheduler's ordinary snapshot and restore operations, so they need no
+dedicated core metadata and no host cache tier. These internal transitions do
+not count as cached prompt tokens.
 
 Configured host memory and disk retention also cache source descriptions and
 CPU vision inputs. These records can avoid decoding and preprocessing even when
@@ -529,7 +558,12 @@ request. Empty system messages produce no prompt text. Assistant-prefill message
 use the prepared template's continuation support. `context_management` may
 request preservation of all thinking blocks
 (`clear_thinking_20251015` with `keep: "all"`); active context edits are rejected.
-Cache-control hints do not alter the native prefix-cache policy.
+`cache_control` on a user message's `text`, `image`, or `tool_result` block
+marks the end of that block as a candidate prefix-checkpoint boundary, for the
+first four such blocks in a request; `cache_control` elsewhere is ignored. The
+markers do not change the rendered prompt, and the scheduler chooses among
+candidate boundaries within its checkpoint budget as it does for message
+boundaries.
 
 ## Stateless Responses
 
@@ -559,7 +593,7 @@ core. A parameter without a range is fixed at its prepared default, including
 in cores exported without range metadata. Ranges must contain their defaults
 and valid sampler values; temperature bounds are positive. For example,
 `temperature: 0` becomes the declared minimum, or the default if no range exists.
-Malformed types still return HTTP 400; `top_k` must be an integer. `seed` remains
+Malformed types return HTTP 400; `top_k` must be an integer. `seed` is
 request-controlled and uses its prepared default when omitted. Sampling defaults
 and ranges come from the model author's recommendations declared in the recipe,
 except for DeepSeek V4.1's repetition-penalty range based on measured use.
@@ -581,21 +615,32 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
 | `nemotron_h` | 1 | 0.95 | Disabled | None | [Nemotron-3.5-Bolt text recommendations](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB#model-summary) |
+| `kimi31` | 1 | 0.95 | Disabled | None | [Kimi-K3.1-Pro evaluation settings](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results) |
+| `minimax_m3` | 1 | 0.95 | Disabled | None | [MiniMax-M3.1-Flash usage recommendations](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash#usage) |
+| `muse_spark` | 1 | 1 | Disabled | None | [Muse-Spark-Open-816B-A42B-NVFP4 model card](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4) |
+| `gemma4` | 1 | 0.95 | 64 | None | [Gemma 4 model card sampling recommendations](https://huggingface.co/google/gemma-4-26B-A4B-it) |
 
 All recipes default to `min_p=0`, `repetition_penalty=1`, and zero presence and
 frequency penalties. Unspecified filters are disabled and unspecified penalties
 are neutral. Disabled top-k is stored as `-1`; Step 5's recommended `0` has the
-same meaning. Cores exported without ranges continue to fix every distribution
+same meaning. Cores exported without ranges fix every distribution
 parameter at their stored defaults, including Qwen presence penalties.
 
 Native extensions such as `top_k`, `min_p`, repetition penalties, token stops,
-`grammar`, and `chat_template_kwargs` remain available. JSON output formats and
+`grammar`, and `chat_template_kwargs` are available. JSON output formats and
 Lark output grammars constrain the final answer while permitting the model's
 reasoning and tool-call envelopes. Tool arguments do not use the final-answer
-schema. Active tools and thinking remain available; assistant continuation and
+schema. Active tools and thinking stay available under an output constraint; assistant continuation and
 custom stops cannot be combined with output constraints.
 For conversational JSON output, the schema and a JSON-only formatting instruction
 are included in the system prompt as well as enforced by token masks.
+
+String stops (`stop`, or `stop_sequences` on Messages) accept at most four
+nonempty strings totaling at most 4096 UTF-8 bytes. Token stops
+(`stop_token_ids` and `stop_token_sequences`) accept at most sixteen nonempty
+sequences of at most 64 vocabulary IDs each. One request cannot combine string
+stops with token stops. `ignore_eos: true` cannot be combined with an output
+constraint. Violations return HTTP 400.
 
 `thinking_token_budget` is a positive 32-bit integer accepted by Chat Completions,
 Responses, and Messages. It caps generated reasoning tokens from the start of
@@ -623,10 +668,10 @@ it leaves requests without a budget uncapped. `/v1/models` advertises it in
 `flare.thinking_token_budget`.
 
 On Messages, enabled or adaptive `thinking.budget_tokens` also caps reasoning on
-supported formats and remains an advisory effort hint on models that cannot honour a hard cap.
-Explicit `thinking_token_budget` still returns HTTP 400 on unsupported reasoning formats.
+supported formats and is an advisory effort hint on models that cannot honour a hard cap.
+Explicit `thinking_token_budget` returns HTTP 400 on unsupported reasoning formats.
 If both budget fields are present, their values must match. Budgets
-retain their effort mapping: up to 5,000 map to low effort, up to 20,000 to high
+also select effort: up to 5,000 map to low effort, up to 20,000 to high
 effort, and larger budgets to maximum effort; explicit `output_config.effort` wins.
 Messages budgets above the 32-bit output limit are accepted and never trigger a cut.
 Responses and Anthropic named effort settings
@@ -653,7 +698,7 @@ For `POST /v1/chat/completions`, for example:
 Alternatively, replace `"reasoning_effort": 80` with
 `"chat_template_kwargs": {"reasoning_effort": 80}`. Values outside 1–100,
 floating-point numbers such as `80.0`, booleans, and numeric strings such as
-`"80"` are rejected. Omitted values retain prepared defaults; explicit `null`
+`"80"` are rejected. Omitted values use prepared defaults; explicit `null`
 selects the encoder's high default. Disabling thinking suppresses the effort
 prefix. The score is a prompt hint, not a token count or hard reasoning budget;
 Anthropic `thinking.budget_tokens` also sets `thinking_token_budget` as described above.
@@ -661,7 +706,7 @@ Anthropic `thinking.budget_tokens` also sets `thinking_token_budget` as describe
 Both native DeepSeek encoders reject `drop_thinking`, assistant continuation,
 and `add_generation_prompt=false`.
 Explicit values are validated by the selected encoder. Cores exported with
-Jinja templates retain their prepared template semantics.
+Jinja templates follow their prepared template semantics.
 Kimi K3 always uses thinking: its template ignores `enable_thinking=false` and
 `thinking=false` without an error, preserves assistant reasoning history, and
 accepts `low`, `high`, or `max` effort (default `max`).
@@ -676,7 +721,7 @@ Usage counts native prompt and generated tokens, including model control tokens.
 Chat and Completions always include `prompt_tokens_details.cached_tokens`,
 equivalent to enabling vLLM's `--enable-prompt-tokens-details`. This counts the
 prompt tokens actually reused at admission, including restored prefixes; it is
-zero when no prefix is reused. Cached tokens remain part of `prompt_tokens`
+zero when no prefix is reused. Cached tokens are part of `prompt_tokens`
 and `total_tokens`. Image requests also include
 `prompt_tokens_details.multimodal_tokens.image`, the image feature tokens already
 included in the prompt total. Chat adds `completion_tokens_details.reasoning_tokens`,
@@ -687,24 +732,24 @@ has no reasoning region and omits it. Responses reports reuse through
 
 Anthropic reports reused tokens in `cache_read_input_tokens` and the remaining
 prompt tokens in `input_tokens`; their sum is the token-count endpoint's result.
-`cache_creation_input_tokens` remains zero because Flare does not separately
+`cache_creation_input_tokens` is zero because Flare does not separately
 account for cache writes. These are native reuse counts, independent of
 Anthropic cache-control billing policies. In streams, `message_start` initially
 reports the full prompt with zero cache reads; `message_delta` supplies the final
 input, output, and cache counts. Chat and Completions include final usage when
 `stream_options.include_usage` is true. Chat token observation extensions
 (`return_token_ids` and `return_token_timestamps`) preserve usage details,
-including the legacy terminal usage when token IDs are requested without a
+including usage on the terminal chunk when token IDs are requested without a
 separate usage chunk. Stop sequences report the exact matched string through
 Anthropic `stop_sequence`.
 
 For cumulative usage during Chat and Completions streaming, set
 `"stream_options": {"include_usage": true, "continuous_usage_stats": true}`.
-The `continuous_usage_stats` option defaults to false and requires
+The `continuous_usage_stats` option defaults to false and is ignored without
 `include_usage: true`. Enable it when measuring streams that may be cancelled
 before the final usage chunk arrives. Each emitted chunk carries cumulative
 native token counts; text chunks can combine multiple tokens, so counting
-chunks does not measure generated tokens. Final usage is still emitted.
+chunks does not measure generated tokens. The final usage chunk is also emitted.
 
 ## Raw completions
 
@@ -721,15 +766,18 @@ optional echo without GPU submission. Prompt usage counts each input once;
 cached usage uses the first choice's admission count for each input, independent
 of completion order. Zero-token requests report zero cached tokens because they
 do not perform a cache lookup. Completion usage sums all generated choices.
-`best_of` must equal `n`; ranked
-sampling, suffix insertion, prompt scoring, and log probabilities are rejected.
+`best_of` must equal `n`; ranked sampling and suffix insertion (`suffix`) are
+rejected, as are `tools`, `tool_choice`, and `thinking_token_budget`. Log
+probabilities and prompt scoring follow
+[Generation log probabilities](#generation-log-probabilities).
 
 ## Clients and tests
 
 The OpenAI SDK uses `base_url="http://127.0.0.1:8000/v1"`. The Anthropic SDK uses
 `base_url="http://127.0.0.1:8000"`. Supply the configured serving key as `api_key`;
 an arbitrary nonempty key satisfies SDK construction when server authentication
-is disabled. The SDK tests use OpenAI 2.54.0 and Anthropic 0.125.0.
+is disabled. The SDK tests use the OpenAI and Anthropic SDK versions that
+`uv.lock` pins for the `api-test` extra.
 
 [Claude Code settings](clients/claude-code.json) configure its base URL, model,
 and API key. Client settings may use environment variables; Helios behavior is
@@ -740,9 +788,11 @@ configured through its CLI, configuration file, and prepared core.
 search, and describe local model capabilities. Set the catalog's context limit
 to the loaded core's capacity. The catalog uses Codex's freeform `apply_patch`
 tool with completed-input grammar validation.
-The coding-client tests exercise Codex 0.162.1 and Claude Code 2.1.296 in normal
-and bare modes with actual file inspection, editing, and test execution in
-temporary repositories.
+The Responses and Messages routes are qualified with Codex 0.162.1 and Claude
+Code 2.1.296; other client versions are not qualified. To qualify a client
+version, run `tests/server/test_coding_clients.py` as shown below: it runs
+Codex, and Claude Code in normal and bare modes, on a file inspection, editing,
+and test-execution task in a temporary repository.
 
 Install SDK test dependencies and run against an idle native service:
 
@@ -756,10 +806,12 @@ cargo test --manifest-path helios/Cargo.toml --features server,runtime-core --li
 ```
 
 `FLARE_API_TEST_KEY` supplies an authenticated test endpoint's key. Coding-client
-tests use temporary repositories and check a real read/edit/test task. Scheduler
-regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
-and adaptive speculative execution. These environment variables configure tests,
-not the native server.
+tests require the `codex` and `claude` executables on `PATH`. Run the scheduler
+regressions in `tests/server/test_scheduler.py` against services with ordinary,
+fixed-width, and adaptive speculative execution. They are skipped unless
+`FLARE_RUN_CUDA_TESTS=1` and `FLARE_SCHEDULER_TEST_URL` names an otherwise idle
+service with four request slots and a 4096-token prefill chunk. These
+environment variables configure tests, not the native server.
 
 ## System One decisions
 
@@ -788,7 +840,8 @@ questions. Instructions and descriptions preserve structured JSON. Choice has
 prepared context/output capacities may lower these limits. Schema failures return
 Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
 unsupported cores return 400; authentication and operational errors use the
-existing generation error format.
+Chat Completions error format described under
+[Transport and admission](#transport-and-admission).
 
 The native scorer compiles independent questions after a common state message,
 verifies distinct single-token synthetic labels after the complete rendered
@@ -801,8 +854,8 @@ request cancels its current child through the ordinary generation lifetime.
 The scorer uses the normal assistant generation prompt with thinking disabled
 where supported and an `Answer:` cue in the final user turn. Labels are verified
 as the first assistant token against the actual rendered prompt, including with
-the native DeepSeek encoders. Older cores without requested-ID outputs require
-re-export.
+the native DeepSeek encoders. A core without the explicit-ID logprob inputs that
+`logprob_token_ids` uses returns HTTP 400 and requires re-export.
 
 PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
 `TypeSafe-Danger-Zone-Images: true` and a vision core. Supply base64 assets or
@@ -811,7 +864,7 @@ followed by uniquely named image parts. An asset's `part` takes precedence over
 `data_base64`; every part must belong to exactly one asset. References replace
 string values, including nested state/instructions/criteria, with whole-value
 matches first and then nonoverlapping left-to-right matches. Keys remain text;
-legends retain original references. Unused assets are rejected. Existing body,
+legends retain original references. Unused assets are rejected. The server's body,
 context and image limits apply, including to expanded prompts. Multipart content
 encoding must be identity (or absent); compressed multipart returns HTTP 415.
 JSON supports the usual compressed encodings. Box,
@@ -847,12 +900,12 @@ answers contain `probability`; Choice answers preserve the selected typed
 `choice` and an array of `{value, probability}` entries. Score answers contain
 `score` and `{value: index, label, probability}` entries. Choice/Score confidence
 is the winning label's full-vocabulary probability: its normalized probability
-multiplied by total raw label mass. System One retains its distinct Jev confidence
+multiplied by total raw label mass. System One uses its own Jev confidence
 formulas. Neither route promises empirical calibration.
 
 Usage sums actual logical input and generated read tokens across questions,
 including `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens: 0`
 and `total_tokens`. Cache writes are not measured and are reported as zero.
 The route shares System One's prompt compilation, exact-ID reads, sequential
-child lifetime, template constraints and older-core rejection; it adds no
-second scoring path.
+child lifetime, template constraints and rejection of cores without explicit-ID
+logprob inputs; it adds no second scoring path.

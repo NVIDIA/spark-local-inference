@@ -41,8 +41,8 @@ timelines with operator and layer attribution, kernel counts, summed kernel
 durations, and graph elapsed time. Host graph-launch traces alone cannot
 attribute GPU work.
 
-Verify improvements through an exported `.safetensors` core loaded by
-`flare run --embedding-table-storage ram`, including Helios's asynchronous
+Verify improvements through an exported core loaded by
+`flare run CORE --embedding-table-storage ram`, including Helios's asynchronous
 row delivery. Measure disk delivery separately when it is the deployment
 configuration. For matching batch and verification width, graph rounds per
 second are the change in `flare_speculative_rounds_total` divided by the
@@ -55,7 +55,7 @@ and use kernel traces or component measurements to attribute gaps before checkin
 gains through the actual Helios service. Record raw measurements with their
 configuration, rerun noisy comparisons, and retain workload regressions. The
 single-token weight-traffic estimate is a bandwidth bound; the minimal replay
-harness supplies the measured floor.
+harness in `qualify/replay_floor.py` supplies the measured floor.
 
 Verify allocation stability and scratch/input lifetime under repeated
 native replay, including poisoning reusable storage after its last permitted use.
@@ -202,8 +202,9 @@ indexer batches reuse packed queries and scales. The bounded decoder suffix
 gathers into destinations disjoint from the full prefill. Candidate rows follow
 the suffix capacity when hierarchical selection starts after that boundary.
 Verification compressor values and gates remain separate through acceptance.
-GLM's mHC carry and Kimi's named private buffers still require a stage-lifetime
-review. Nemotron reuses a cursor across serialized heterogeneous blocks.
+GLM's mHC carry and Kimi's named private buffers use dedicated storage;
+establish their stage lifetimes before sharing them. Nemotron reuses a cursor
+across serialized heterogeneous blocks.
 DeepSeek V4.1, MiMo, and Kimi draft-context projections retain dedicated
 intermediate tensors;
 review their consumption and history updates before sharing decoder storage.

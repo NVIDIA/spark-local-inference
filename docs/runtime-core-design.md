@@ -6,8 +6,11 @@ interpreter. The [core format](core-format-design.md) defines a packed
 `.safetensors` file and a directory form with `model.safetensors` plus immutable
 payload companions. The Flare model cache stores the directory form. Engine upgrades preserve previously supported models without re-export.
 Execution ABI labels do not gate loading; declared operations and layouts are validated. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
-the core, the Rust `flare` executable, and its system library dependencies
-(including libturbojpeg). Python and preparation tools are not required.
+the core, the Rust `flare` executable, and its system library dependencies:
+the C and C++ runtime libraries, plus libibverbs on aarch64 Linux builds, which
+enable RoCE. libjpeg-turbo is compiled from source through the `turbojpeg`
+crate's `cmake` feature; the x86-64 Linux executable has no dynamic
+libturbojpeg dependency. Python and preparation tools are not required.
 The [core design](core-design.md) defines the model contracts, scheduling,
 and cache behavior that the served process implements; this document defines
 how the prepared state leaves the Python process and how it is reconstructed.
@@ -61,8 +64,8 @@ verification-profile section.
 
 ## 2. The preparation boundary
 
-Ignition records four things while preparing a model, and refuses to
-write a core when any of them is incomplete.
+Ignition records the inputs this section describes while preparing a model, and
+refuses to write a core when any of them is incomplete.
 
 Ignition supplies captured graph handles, allocation and cache declarations,
 tensor shapes, strides and numeric roles, compiler parameter signatures,
@@ -125,7 +128,7 @@ as addresses.
 
 Numeric-span discovery merges overlapping allocation coverage, excludes
 zero-initialized storage, and deduplicates identical live tensor views. Integer
-aliases crossing coverage boundaries still suppress floating-view inference in
+aliases crossing coverage boundaries suppress floating-view inference in
 their covered bytes. Strided layouts
 retain their holes; fragmented persistent views without bounded span metadata
 remain conservative rather than expanding an unbounded interval catalog.
@@ -165,15 +168,18 @@ do not gate loading. Engine upgrades must preserve previously supported models. 
 The canonical format uses signed content IDs, payload-relative initializers,
 and unsigned physical locations; see [payload cores](core-format-design.md).
 
-`ModelIndex.contract` is a typed `ServingContract`. It declares serving defaults
+`ModelIndex.contract`, stored as `DeploymentBody.contract` in a payload core, is
+a typed `ServingContract`. It declares serving defaults
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
-completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
+completion cursors, and frontend syntax. `ModelIndex` field 4 is reserved; arbitrary Protobuf
 `Struct` configuration is not accepted. Execution ABI 6, model contract 3, and
-payload format 2 are independent version domains.
+payload format 2 are the versions Ignition writes; they are independent version
+domains. Helios loads model contract versions 1 through 3 and rejects others.
 
 Two prepared-contract fields fail validation when absent or out of
-range. `vision` must decode to a well-formed `VisionCapabilities`: a
+range. `vision` (Protobuf message `VisionCapacity`, Rust type
+`VisionCapabilities`) must decode to a well-formed value: a
 text-only core encodes the explicit all-zero value (`feature_slots`,
 `features_per_request`, `max_images`, and `patches_per_feature` of 0
 with empty `patch_capacities`), and an absent or null `vision` fails
@@ -212,7 +218,7 @@ select sampling policy. Missing values reject loading rather than inheriting
 another model's settings. `DefaultSamplingParameters.ranges` contains optional
 inclusive `min` and `max` bounds for temperature, top-p, top-k, min-p, and the
 repetition, presence, and frequency penalties. Each supplied range must contain
-its existing default, and both endpoints must be valid sampler values. Numeric
+its declared default, and both endpoints must be valid sampler values. Numeric
 request values are clamped to these bounds; omitted ranges fix parameters at
 their defaults. Cores without range fields use this fixed-default policy. Seed
 remains request-controlled.
@@ -293,7 +299,7 @@ Cache publication checks up to eight payloads concurrently, retaining each
 verified object's file handle and cache lease until its staging link is created.
 Object installation, staging links, and location records remain serialized.
 Every duplicate source occurrence is verified; authorized cached-weight reuse
-retains its existing pinned-object checks.
+applies its own pinned-object checks.
 A cache miss installs an immutable object without replacing existing entries.
 `--no-weights` requires exact cached weight payloads, including tuned weights;
 missing or corrupt required payloads fail publication. Executable and initial-state
@@ -324,14 +330,17 @@ cores; converting logical-resource containers requires re-export with Ignition.
 Canonical payload cores do not use logical filenames, layout segments, or
 key-free conversion of signed logical ranges: they use signed content ids,
 payload-relative initializer slices, and unsigned `LocationSet` entries, with
-`flare sign` required only when payload partitioning or signed semantics change.
+a signing key required only when payload partitioning or signed semantics
+change: `ignition sign` and `ignition combine` sign with a publisher key, and
+`ignition edit` signs its output with the development key.
 See [payload cores](core-format-design.md) for the present-state rules on
 canonical forms, packing, publication, locations, and conversion.
 
 ### Preparation rebuild metadata
 
-Exports through `ignition export` record an optional
-`ModelIndex.rebuild` manifest in the signed metadata of the primary shard.
+Exports through `ignition export` record an optional `RebuildManifest`. Export
+staging carries it as `ModelIndex.rebuild`, and the published payload core
+signs it as `DeploymentBody.rebuild`.
 It identifies the recipe, preparation source identity, qualified checkpoint
 repository and revision, tensor-parallel size, concurrency, chunk size,
 speculation, and selected preparation settings. A local checkpoint override
@@ -351,8 +360,10 @@ Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
 owner paths, packing-owner types, dtypes, shapes, element strides, and
 allocation-relative byte offsets. The containing bundle identifies the rank.
-Allocation resource spans and the core layout locate those bytes in the
-payload shards; repacking and re-signing preserve the references. Aliased views
+Publication converts each rank's catalog into the `PreparedWeightCatalog` of
+its `RankBody`, whose views reference allocations by index; allocation
+initializers locate those bytes in payloads, and conversion between container
+forms preserves the references. Aliased views
 share storage. Ignition describes live tensor metadata; Heliopause resolves its
 addresses against retained allocations and creates no weight copy.
 Meta tensors, discarded storage, and disposable scratch are listed as
@@ -365,11 +376,12 @@ weight reuse comparisons are independent of that encoding.
 
 These catalogs describe prepared storage, whose names and packing can differ
 from the original checkpoint. They do not serialize Python objects or execute
-imports. A core-based graph rebuild still requires a compatible recipe
-importer that validates the catalog and supplies any unavailable inputs;
-Ignition does not yet provide that importer or a core rebuild command.
-`--no-weights` continues to prepare from the source checkpoint and reuse cached
-payloads. Offloaded embedding planes retain their existing typed table metadata.
+imports. A core-based graph rebuild requires a compatible recipe
+importer that validates the catalog and supplies any unavailable inputs.
+Designed, not implemented: that importer and a core rebuild command.
+`--no-weights` prepares from the source checkpoint and reuses cached
+payloads. Offloaded embedding planes are described by their typed table
+metadata.
 
 Speculative rebuild metadata records the resolved physical graph-count budget
 as `RebuildSpeculation.graph_budget`. Packed speculative preparation requires
@@ -380,15 +392,23 @@ rather than selecting a recipe default.
 execution graphs. Its absent value is false. Graph selection uses the captured
 execution catalog; this preparation setting adds no runtime policy.
 
-Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
-`--all` includes the tensor catalogs. Absent manifests are reported as null.
+`flare inspect --json` reports the manifest as `rebuild` and per-rank tensor
+counts as `rebuild_weights` for logical-resource cores; `--all` includes the
+tensor catalogs. Absent manifests are reported as null. For payload cores both
+fields are null even when `DeploymentBody.rebuild` and a rank catalog are
+present. Designed, not implemented: reporting them for payload cores.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
 catalog versions. Serving validates the execution layout and prepared model contract independently.
 Changing signed rebuild metadata requires signing the core again.
 
 ### Publisher authentication and executable access
 
-Every final core carries three ordered Ed25519 signature groups for what
+A payload core, the format `ignition export` publishes, signs its `CoreBody`,
+each `DeploymentBody`, and each `RankBody` with Ed25519, and parent bodies
+commit to their children by digest;
+[payload cores](core-format-design.md#semantic-records) specifies that envelope
+(`ProtectedCore`). A signed logical-resource container (`ProtectedIndex`,
+formats 4 and 6) carries three ordered Ed25519 signature groups for what
 every rank shares, and one signed `RankProtection` per rank for that rank's
 resources:
 
@@ -408,10 +428,12 @@ a copy holding only that rank's bytes verifies completely and other ranks'
 bytes or signatures do not affect it. Peer transfer sends ranges separately for
 each logical file for `format: flare` cores, including headers and signed
 padding. Snapshot transfer sends the complete metadata primary and only the whole
-blobs selected for a rank. Agent protocol 3 stores core files in a rank-specific
-directory. Content-addressed files are hash-verified on arrival and hardlinked
-from the agent blob cache, which survives core-directory eviction. A peer needing companions rejects older agents
-before sending any files; monolithic transfer retains protocol 1/2 compatibility.
+blobs selected for a rank. The agent stores core files in a directory per core
+and rank. Content-addressed files are hash-verified on arrival and hardlinked
+from the agent blob cache, which survives core-directory eviction. Agents and
+controllers must speak the same agent protocol version (`PROTOCOL_VERSION` in
+`flare-cli/src/orbit/mod.rs`, 6); the HELLO exchange rejects any other version
+before files are sent.
 Resource classification follows actual consumers in the signed index. Missing,
 overlapping, unclassified, or incorrectly classified spans fail loading. The
 128 MiB metadata limit applies to the complete signed envelope. The core
@@ -441,7 +463,10 @@ AES-256-GCM executable encoding. Each encrypted chunk contains up to 4 MiB of pl
 authentication tag. The reader validates the signed ciphertext hashes, derives the key
 from the publisher key, core ID, accepted namespace, and resource offset, and
 authenticates each chunk before exposing its plaintext. Loading these cores
-does not modify their signatures, weights, or captured graphs.
+does not modify their signatures, weights, or captured graphs. Signed format 6
+uses the domain `flare-package-signature-v6` and payload format 2 uses
+`flare-package-signature-v5`. These byte strings are fixed authentication
+domains; changing their spelling would invalidate existing signatures.
 
 `CoreClaim::read` returns what a core claims before verification: signer
 fingerprint, namespace, official source, and development marker, syntax-checked
@@ -500,17 +525,15 @@ the same account the model itself is published from.
 ## 3. Address rules
 
 Parameter bytes are replayed verbatim, so a rebuilt process must reproduce
-every recorded address. Three driver behaviors, measured on driver 610.57.04
-with the `cr-probe` experiments under `~/projects/flare-research`, fix how
-that is done.
+every recorded address. Three behaviors of the NVIDIA driver, characterized on
+driver 610.57.04, constrain how that is done.
 
 - The driver satisfies a `cuMemAddressReserve` request from its current
   64 MiB block whenever the request fits, ignoring the requested address, and
   maps a fresh block at the requested address only when the request does not
-  fit. Four 16 MiB fixed requests in a fresh process are all moved and the
-  fifth is honored; a first request of 64 MiB is moved and a first request of
-  128 MiB, 1 GiB, 64 GiB, or 1 TiB is honored anywhere from 8 TiB to 127 TiB.
-  A core therefore uses large enclosing reservations and maps allocations
+  fit. A fixed request of 64 MiB or less can therefore be moved, while a fixed
+  request of 128 MiB through 1 TiB is honored at addresses from 8 TiB to
+  127 TiB. A core uses large enclosing reservations and maps allocations
   at their recorded offsets inside them; it never relies on small fixed
   reservations. Preparation reserves a 1 TiB arena; runtime cores use
   GiB-aligned enclosing ranges for retained arena storage and external spans.
@@ -589,6 +612,9 @@ speculative programs preserve draft context in both catalogs. Selection removes
 unused variants before reading graph bodies; captured weights and storage remain
 shared. There are no standalone
 proposal or verification operations or separate packed-speculative operation.
+Helios rejects graph operation identifiers 10, 11, and 13 and the graph kinds
+`proposal`, `verification`, and `packed_speculative`. Designed, not
+implemented: loading and serving cores that recorded those operations.
 
 Unselected graph templates and executables are never reconstructed. Functions
 used only by omitted graphs are dropped, as are unused modules without globals.
@@ -670,7 +696,7 @@ attention architecture.
 The prepared context extent determines page-table shapes and captured workspace
 sizes. The runtime sequence limit is the smaller of that extent and loaded KV
 capacity after the model's per-request draft-page allowance. Runtime input packing
-preserves the prepared strides. Existing cores retain their prepared ceiling;
+preserves the prepared strides. A core's prepared ceiling is fixed;
 raising that ceiling requires export.
 
 The `flare_snapshot_backing_pages` metric counts page ids excluded by owned
@@ -729,8 +755,8 @@ progress, cycling bars for indeterminate work, results, and elapsed time.
 Helios validates the core before reconstruction:
 the core's GPU architecture matches the selected device, the recorded
 address range is free, free device memory covers the recorded footprint, and
-the core's execution contract version is one the Helios build
-understands. It does not pin a driver version or a Helios build, because sm_120
+the core's prepared model contract version is one the Helios build
+supports (versions 1 through 3). It does not pin a driver version or a Helios build, because sm_120
 SASS loads on any driver that supports the architecture and a core stays
 valid across Helios builds that keep the contract.
 
@@ -749,8 +775,10 @@ and status. A 120-second deadline bounds a stranded collective. Shutdown
 confirms drain on every rank before releasing any shared storage.
 
 Preparation uses one Python process per rank. Each process reserves every
-rank's 1 TiB arena; rank r owns device base `0x0200_0000_0000 + r * 2^40`
-and host base `0x0c00_0000_0000 + r * 2^40`. b12x collective allocations
+rank's 1 TiB arena; rank r owns device base `0x0800_0000_0000 + r * 2^40` on
+Linux (`0x0400_0000_0000 + r * 2^40` on Windows) and host base
+`0x0c00_0000_0000 + r * 2^40`, or `0x2000_0000_0000 + r * 2^40` when the Linux
+device ranges extend past `0x0c00_0000_0000`. b12x collective allocations
 use the native core allocator. POSIX descriptor passing shares VMM physical
 allocations, and importers map each allocation at its owner's recorded address.
 Collective signals and generation-tagged payloads are reset after all ranks
@@ -773,41 +801,36 @@ handling.
 ## 7. Process images
 
 A CRIU image taken with the driver's process checkpoint support restores a
-loaded Helios process bit-exactly: every state class a prepared model holds
-was verified, including tensor maps, module symbols, pinned and registered
-host memory, two devices with peer access in one process, and legacy IPC
-across a process tree launched inside a cuda-checkpoint job. Images are not
+loaded Helios process bit-exactly. The restore covers every state class a
+prepared model holds: tensor maps, module symbols, pinned and registered
+host memory, two devices with peer access in one process, and CUDA's legacy
+IPC interface across a process tree launched inside a cuda-checkpoint job. Images are not
 the production path. Restore moves the same bytes a core load moves, once
 into anonymous host pages and once to the device, so it is bandwidth-bound in
-the same way; measured at a 70 GB footprint, restore from an NVMe image took
-29 s and from RAM about 13 s. An image is valid only on the driver build that
+the same way: at a 70 GB footprint, restore takes about 29 s from an NVMe
+image and about 13 s from RAM. An image is valid only on the driver build that
 produced it, bakes in the Helios binary, needs root and CRIU on the host,
 holds the whole device footprint in host memory during dump and restore, and
 is corrupted if any thread touches GPU-side driver state during the
 checkpoint window, including a thread polling `cuEventQuery`.
 
-Images remain a validation tool: image a loaded Helios once, and after a
+Images are a validation tool: image a loaded Helios once, and after a
 kernel, driver, or loader change compare a fresh load's replay against the
-restored image. The probes, orchestration, and measurements live under
-`~/projects/flare-research`.
+restored image.
 
-## 8. Open items
+## 8. Limitations
 
 - Full-model relocation requires complete pointer and tensor-map bindings in
   parameters, persistent storage, and module globals. The loader accepts typed
-  relocations, but the model exporter preserves addresses for opaque resources.
+  relocations, but the model exporter preserves addresses for opaque resources,
+  so a core loads only at its recorded addresses.
 - The sm_120 TMA tile path links against driver-provided code and reserves
-  about 3.6 GiB of device memory per context when loaded; the memory plan
-  should account for it once b12x kernels that use the path are identified.
-- Legacy allocator-segment cores pack weights in address order, so changes
-  in allocation order or size rename later blobs of a rank. Each independently
-  exported tensor-parallel size stores a complete copy of its weights.
-  [Payload-based model cores and the Flare model cache](core-format-design.md)
-  specifies stable layer payloads, payload-based authentication, packed and
-  directory canonical forms, and one core containing multiple prepared TP
-  deployments. Download materializes selected layouts into a shared Rust-owned
-  cache whose entries use the directory form. Aligned W4A16, QMMA, and IQ2
-  producer mappings have focused GPU byte-comparison coverage. Unsupported
-  mappings retain independently exported bytes, including shard-dependent
-  quantization data. Derived TP materialization has byte-exact fixture coverage
-  but no full-model TP2 reshard qualification.
+  about 3.6 GiB of device memory per context when loaded. The memory plan does
+  not account for that reservation.
+- Logical-resource cores written from allocator segments pack weights in
+  address order, so a change in allocation order or size renames later blobs of
+  a rank, and each exported tensor-parallel size stores a complete copy of its
+  weights. Payload cores store stable layer payloads and can hold several
+  prepared TP deployments in one core;
+  [payload cores](core-format-design.md) specifies them and states the
+  qualification of derived TP materialization.

@@ -3,7 +3,7 @@
 The private model bucket is `s3://flare-models-555824081510-us-west-2/` in
 `us-west-2`. Public access is blocked, object ownership is bucket-owner enforced,
 and default encryption uses S3-managed AES-256 keys. Executable core storage uses
-one zstd level-3 frame per resource; S3-managed encryption remains separate
+one zstd level-3 frame per resource; S3-managed encryption is separate
 storage-at-rest protection. Incomplete multipart uploads
 expire after seven days; completed objects do not expire.
 
@@ -11,13 +11,17 @@ Run the threaded uploader from the repository root. `uv` supplies its Boto3 and
 Rich dependencies independently of the preparation environment:
 
 ```sh
-uv run scripts/s3_upload.py /path/to/model.flare
-uv run scripts/s3_upload.py /path/to/model.flare s3://flare-models-555824081510-us-west-2/cores/model.flare
-uv run scripts/s3_upload.py /path/to/model.flare --threads 32 --part-size-mib 128
+uv run scripts/s3_upload.py /path/to/model.safetensors
+uv run scripts/s3_upload.py /path/to/model.safetensors s3://flare-models-555824081510-us-west-2/cores/model.safetensors
+uv run scripts/s3_upload.py /path/to/model.safetensors --threads 32 --part-size-mib 128
 ```
 
-A destination ending in `/` is a prefix; otherwise it is the exact object key.
-The source must be one file. An existing object with a matching key is replaced.
+Without a destination, the object key is the source file name at the bucket
+root. A destination ending in `/` is a prefix; otherwise it is the exact object key.
+The source must be one file. To upload a core as one file, first create its
+packed form with `ignition convert CACHE_ENTRY --form packed --output FILE`;
+the uploader does not accept a directory-form cache entry.
+An existing object with a matching key is replaced.
 Keep the source file unchanged until upload completion.
 
 Use `--dry-run` to inspect the key and size without AWS calls. `--profile` and

@@ -3,8 +3,8 @@
 Generation logprobs are a captured-graph operation contract. Ignition
 prepares the reduction in shared sampling and commit components; Helios manages
 its declared buffers, transfers, and protocol presentation. Recipes allocate a
-completion bundle and supply target logits to the shared commit. Native
-scheduling, cache policy, and model computation retain their existing boundaries.
+completion bundle and supply target logits to the shared commit. The contract
+adds no native scheduling, cache-policy, or model-computation behavior.
 Wire formats are documented in [api.md](api.md#generation-log-probabilities).
 
 ## Numerical meaning
@@ -18,14 +18,18 @@ Draft probabilities never enter the reporting path.
 
 Forced tokens, such as the `thinking_token_budget` close, have no logprob entry.
 
-Exports provide K=20 alternatives. Requests select zero through K. Alternatives
-are ordered by decreasing logprob and increasing token ID for equal values. The
-chosen token is stored separately, so it need not belong to the alternatives.
-The reduction does not change sampling or Philox state.
+Exports provide K=20 natural alternatives. Requests select zero through K.
+Natural alternatives are ordered by decreasing logprob and increasing token ID
+for equal values. A request may instead supply up to 128 distinct token IDs
+(`logprob_token_ids`); every position of that request then reports those IDs in
+caller order with the same full-vocabulary normalization, and no natural
+alternatives. The chosen token is stored separately, so it need not belong to
+the alternatives. The reduction does not change sampling or Philox state.
 
 ## Persistent I/O
 
-`CompletionOutputs` owns records, one packed output, and request flags. `capacity`
+`CompletionOutputs` (`ignition/components/completion.py`) owns records, one
+packed output, request flags, and the explicit-ID inputs. `capacity`
 is the padded physical request capacity. T is the resolved core
 `completion_token_capacity`: zero or omission means eight, and positive values
 are literal. All tensors have contiguous row-major storage.
@@ -33,19 +37,26 @@ are literal. All tensors have contiguous row-major storage.
 | Buffer | dtype | Shape | Meaning |
 | --- | --- | --- | --- |
 | `completion_records` | int64 | `[2, capacity, 16+T]` | ABI6 completion vectors |
-| `completion_logprobs` | int32 | `[2, capacity, T, 2+2*K]` | Packed token statistics |
+| `completion_logprobs` | int32 | `[2, capacity, T, 258]` | Packed token statistics: the chosen pair and up to 128 alternative pairs |
 | `logprob_requested` | int32 | `[capacity]` | Nonzero for requesting lanes in this submission |
+| `logprob_token_ids` | int32 | `[capacity, 128]` | Caller-selected token IDs per slot |
+| `logprob_token_id_counts` | int32 | `[capacity]` | Number of selected IDs per slot; zero selects the K natural alternatives |
 
-Each packed position has chosen token ID, chosen FP32 logprob bits, then K pairs
-of alternative ID and FP32 logprob bits. Bit storage preserves FP32 values without
-requiring separate transfer allocations. If the vocabulary has fewer than K
-entries, unused alternative IDs are -1. The flags are ordinary graph inputs;
-the output buffer cannot be uploaded. Flags and output must both be declared.
+Each packed position has chosen token ID, chosen FP32 logprob bits, then pairs
+of alternative ID and FP32 logprob bits: the K natural alternatives when the
+slot's count is zero, otherwise that many selected IDs in their uploaded order.
+Bit storage preserves FP32 values without requiring separate transfer
+allocations. If the vocabulary has fewer than K entries, unused alternative IDs
+are -1. The flags, IDs, and counts are ordinary graph inputs; the output buffer
+cannot be uploaded. A core that declares the ID inputs must declare all five
+buffers with these shapes.
 
-The native worker uploads the full flag vector on each submission, clearing
-unused slots. Only lanes in that submission can set flags. Graphs without
-logprob outputs receive neither flags nor logprob transfers. The prepared
-semantic contract contains the requested output layout and its value bindings.
+The native worker uploads the full flag and count vectors on each submission,
+clearing unused slots, and uploads each selecting slot's ID prefix. Only lanes
+in that submission can set flags, and a nonzero count requires that slot's
+flag. Graphs without logprob outputs receive neither flags nor logprob
+transfers. The prepared semantic contract contains the requested output layout
+and its value bindings.
 
 ## Writers and committed positions
 
@@ -73,7 +84,7 @@ emission, never stale payload contents, to decide which positions are meaningful
 
 Mixed prompt/decode graphs retain disjoint private role outputs. The shared merge
 copies only the active frame and chooses each slot's role for both records and
-payload. The inactive frame may still belong to a native transfer and is never
+payload. The inactive frame may belong to a native transfer and is never
 rewritten by the merge.
 
 ## Preparation and scratch
@@ -84,7 +95,19 @@ position's normalization. Tiles retain their best 32 integer sort keys; a final
 merge stores K pairs and the chosen token. Keys rank the reported FP32 logprobs
 and inverse token ID, including ties introduced by subtraction. Equal values at
 the cutoff therefore select the smallest IDs. Signed zero is normalized for tie
-ordering. Padded vocabulary lanes cannot enter the result.
+ordering. Padded vocabulary lanes cannot enter the result. For a slot with
+selected IDs, the final launch instead reads each selected ID's raw logit and
+subtracts the same normalization.
+
+Vocabulary-sharded speculative verification (`ignition/components/parallel_draft.py`)
+keeps each rank's target logits as a vocabulary shard and uses
+`PreparedVocabularyParallelLogprobs` (`ignition/components/vocabulary_logprobs.py`):
+six prepared Triton launches per rank and two all-gather exchanges of 256 FP32
+words per position per rank. The first exchange carries each shard's maximum
+and exponential mass for the global normalization. The second carries the
+chosen token's raw logit from its owning rank and either each shard's best 32
+sort keys or the selected IDs' raw logits. The final launch merges the gathered
+candidates into the same packed output.
 
 FlashInfer's deterministic graph-safe selection requires more shared memory than
 SM120 provides for this contract. The shared tiled implementation needs no full
@@ -101,15 +124,17 @@ native replay. Export zero ranges include these pools and outputs. Memory report
 include their physical bytes separately from allocated/reserved device totals.
 
 A zero request flag bypasses vocabulary reads, sorting, and payload writes.
-Requests without logprobs incur only the gated launches. Performance claims must
-still be established with complete replay and service measurements.
+Requests without logprobs incur only the gated launches. Performance claims
+about the reduction require complete replay and service measurements.
 
 ## Transfer lifetime and TP
 
-The executor records the producing graph's event and uses its existing copy
+The executor records the producing graph's event and uses its frame copy
 stream and frame transfer event. A requesting frame copies only its half of the
 packed output into preallocated pinned storage, or reads the corresponding mapped
-host allocation. Frames without a requesting lane enqueue no payload copy.
+host allocation. The copy covers each position's chosen pair and its first W
+alternative pairs, where W is the larger of K and the frame's largest selected
+ID count. Frames without a requesting lane enqueue no payload copy.
 A pending frame retains a physical-slot request mask, so unrelated lanes' stale
 payload is never decoded.
 
@@ -118,14 +143,14 @@ token IDs; missing data fails the requesting request rather than silently droppi
 an entry. The scheduler's generated-token order selects each frame position.
 Errors and host stops suppress later tokens of that request in the same frame.
 Only the coordinating TP rank copies values. Peers retain identical I/O layouts,
-upload flags, and participate in the existing acceptance protocol; peer agreement
+upload flags, and participate in the acceptance protocol; peer agreement
 does not compare or transport logprob payloads.
 
 ## Text attribution and bounded retention
 
 Token byte lookup follows the tokenizer decoder while preserving byte-level and
 byte-fallback pieces before UTF-8 replacement and stream-boundary cleanup. Text
-presentation uses the existing incremental decoder. Buffered spans track provisional
+presentation uses the server's incremental decoder. Buffered spans track provisional
 starts and refine them with matching byte ranges, including literal replacement
 characters and split UTF-8, without retaining copies of decoder prefixes. Completion
 offsets count characters at those starts, not when a whole span is released.
@@ -146,13 +171,18 @@ content without a source span receives no token entries.
 
 ## Compatibility
 
-No Protobuf field or completion-record ABI changes. Absent buffers mean K=0:
-old cores load and serve unchanged, advertise `allow_logprobs: false`, and
-reject logprob requests with HTTP 400 before admission. Present declarations
-require both buffers, their exact dtypes and frame/slot geometry, and 1<=K<=20.
-Sampling graphs must bind the flag vector. Malformed declarations fail loading.
-All newly prepared recipes allocate the complete bundle; enabling the feature on
-an old core requires a new export.
+The contract uses named buffers only: it has no dedicated Protobuf field and
+adds no completion-record fields. A core without the buffers has K=0:
+it loads and serves, advertises `allow_logprobs: false`, and
+rejects logprob requests with HTTP 400 before admission. A core that declares
+`completion_logprobs` and `logprob_requested` without the ID inputs has a last
+output extent of `2+2*K` with 1<=K<=20; it serves natural alternatives and
+rejects `logprob_token_ids`. Declarations must have the exact dtypes and
+frame/slot geometry above. Sampling graphs must bind the flag vector and, when
+the ID inputs are declared, both of them. Malformed declarations fail loading.
+`CompletionOutputs.allocate` always allocates the complete bundle, so every
+recipe exports it; a core exported without it provides these features only
+after re-export.
 
 ## Prompt scoring
 
@@ -160,12 +190,13 @@ an old core requires a new export.
 `prompt_target_tokens: int32[C]`. Target row `j` is the prompt token at position
 `chunk_start+j+1`, or -1 at the prompt end and inside image spans. The operation
 advances exactly the same cache and continuation storage as prefill, preserves
-draft context, and may sample the final chunk's next token through the existing
+draft context, and may sample the final chunk's next token through the
 completion contract. A zero output budget performs prefill only.
 
 `--prompt-logprobs` defaults off, allocating no scoring storage or graphs.
-When enabled, scored capacities grow by four from 128 through the configured chunk
-limit. Ordinary graph catalogs and inputs retain their shapes and order.
+When enabled, scored capacities start at 128 and grow by factors of four below
+the configured chunk limit, which is always the largest capacity. The flag does
+not change the shapes or order of ordinary graph catalogs and inputs.
 
 One optional packed output, `prompt_logprobs: int32[2,C,43]`, uses the ordinary
 submission frame index. Each row contains actual token ID, raw FP32 logprob bits,
@@ -191,22 +222,25 @@ matrices. Reductions and collectives are prepared before capture.
 Every recipe uses this component with its own final normalization. DeepSeek V4.1
 ordinary prefill uses the [technical report's](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf)
 bounded SWA replay (§3.2.2) for chunks over 128 rows. Scoring runs all layers on all
-rows, with full-row candidate storage. A long prompt's last-row score can differ
-from the first generated token's logprob: measured mean +0.29 nats, up to about 1.1 nats.
-Uncached prefill also varies between runs: b12x routed-expert reduction order
-changes layer-0 results by one BF16 ULP, amplified by subsequent expert routing.
-Accuracy comparisons must use fresh-run spread, rather than exact repeatability.
+rows, with full-row candidate storage. A long DeepSeek V4.1 prompt's last-row
+score therefore differs from the first generated token's logprob, by +0.29 nats
+on average and by up to about 1.1 nats. Uncached prefill is also not
+bit-repeatable: b12x routed-expert reduction order changes layer-0 results by
+one BF16 ULP, which subsequent expert routing amplifies. Accuracy comparisons
+must use the spread across fresh runs, not exact repeatability.
 
-On four RTX PRO 6000 GPUs, TP4 at concurrency 32, flag-on/off ABBA serving
-measurements found ordinary prefill and unrequested decode unchanged within noise.
-KV capacity fell 5.4%, from 21,714,176 to 20,539,648 tokens (Qwen TP1: 0.9%).
-The cores add about 1.0 GB of fixed device allocations per rank, including
-about 408 MiB of graph scratch, 185 MiB of other tensors and additional capture
-storage; eight scored graphs add about 51,000 nodes. Scored-prefill service
-throughput was about 0.50× ordinary at K=0 and 0.37× at K=20 (Qwen estimate:
-0.77×). Both counts execute the same top-20 GPU reduction; the K-dependent cost
-includes CPU formatting and response bytes. These measurements include legacy
-echo formatting for non-echo requests.
+`--prompt-logprobs` costs KV capacity and fixed device memory, and scored prefill
+is slower than ordinary prefill. For DeepSeek V4.1 Flash at TP4 and concurrency
+32 on four RTX PRO 6000 GPUs, the flag adds about 1.0 GB of fixed device
+allocations per rank (about 408 MiB of graph scratch, 185 MiB of other tensors,
+and capture storage for eight scored graphs of about 51,000 nodes) and lowers
+KV capacity by 5.4%; for Qwen at TP1 it lowers KV capacity by 0.9%. Ordinary
+prefill and decode without requested logprobs cost the same with and without
+the flag. Scored-prefill service throughput is about 0.50× ordinary prefill at
+K=0 and 0.37× at K=20. Both run the same top-20 GPU reduction; the K-dependent
+cost is CPU formatting and response bytes. The ratios include formatting the
+Completions `logprobs` arrays, which the server performs only for `echo`
+requests, so scoring requests without `echo` are at least this fast.
 
 Helios selects the operation from the request and prepared catalog, independently
 of model identity. Scored requests bypass GPU and host prefix lookup, but use the
@@ -215,10 +249,12 @@ prompt role of a mixed graph. Readmission preserves the original prompt end and
 published score position, finishes any remaining scores, and suppresses duplicates.
 Requests without scoring never select this operation.
 
-Protobuf declares operation 12 and value source 39 without new message fields.
+Protobuf declares `SCORED_PREFILL` as operation 12 and `PROMPT_TARGET_TOKEN` as
+value source 39; scoring has no dedicated message fields.
 Absent prompt buffers and graphs mean no scoring; partial or malformed layouts
-fail validation. Old cores retain their operations, default values, loading
-and serving behavior.
+fail validation. Prompt scoring also requires K=20 generation logprob outputs.
+A core without scoring buffers and graphs loads and serves, and rejects prompt
+logprob requests with HTTP 400.
 
 Wire formats follow vLLM's [completion serving](https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/completion/serving.py),
 and [chat serving](https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/chat_completion/serving.py).

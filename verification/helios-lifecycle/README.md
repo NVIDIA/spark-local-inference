@@ -13,9 +13,10 @@ aliases, and multi-rank offload reply aggregation.
 
 Install Java 11 or later and download the
 [TLA+ tools 1.7.4 jar](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4).
-The check uses Python 3, Cargo, `protoc`, and Helios's `server` test dependencies.
-It requires no CUDA device or model checkpoint. Java 21.0.13 and Rust 1.94.1
-are tested tool versions.
+The check uses Python 3, Cargo, `protoc`, and the build dependencies of Helios's
+`server` feature, including CMake and a C compiler for the bundled libjpeg-turbo.
+It requires no CUDA device or model checkpoint. The `Helios lifecycle` workflow
+in `.github/workflows/helios-lifecycle.yml` pins Java 21.0.13.
 
 From the repository root, run:
 
@@ -265,7 +266,8 @@ implementation.
 The rank-helper checks cover the extracted bookkeeping predicates. They do not
 execute `poll_ranks`, `rank_loop`, poison handling, or `close` against CUDA, and
 do not establish all-rank drain or collective progress. The socket coordinator
-in `execution/parallel.rs` retains its separate implementation.
+in `execution/parallel.rs` is a separate implementation that these checks do not
+cover.
 
 The model permits any nonempty live cohort with a compatible feedback barrier.
 It does not prove scheduling-policy choices or fairness. It checks safety only;
@@ -290,7 +292,7 @@ failure distinct from an inaccurate abstraction or unsupported tooling.
 
 Use pstack's `statechart` skill to interpret TLA+ results and
 `maintain-formal-verification-skill` when covered code changes without updating
-the checks. A deliberate source mutation must fail the corresponding Rust test
+the checks. Neither skill is stored in this repository. A deliberate source mutation must fail the corresponding Rust test
 or observed-edge check before the verification is used to guard that property.
 
 ## Sequential Rust proofs
@@ -389,9 +391,11 @@ relative. `TMPDIR="$PWD"` places the temporary copied crate beside `selene/`,
 `selene-manager/`, and `eos/`, preserving those paths. The original source remains
 unchanged, and the tool removes its temporary build tree afterward.
 
-The selected helpers generate eight mutations. Seven are caught by protocol
-assertions; constructing `Some(Default::default())` is unviable because `Pending`
-has no `Default` implementation. Unviable mutations do not count as caught.
+The selection is expected to leave no surviving mutation; inspect any survivor
+as the [verification guidance](../../docs/verification.md#use-mutation-testing-to-check-sensitivity)
+describes. A mutation that does not compile is unviable and does not count as
+caught: constructing `Some(Default::default())` is unviable because `Pending`
+has no `Default` implementation.
 The tool does not generate every targeted fault, including changing `.all` to
 `.any` or ignoring a failed commit send. The optional `--mutations` runner checks
 those explicit faults separately.
@@ -407,7 +411,7 @@ TMPDIR="$PWD" cargo mutants --manifest-path helios/Cargo.toml --no-config \
   -- model::contract::tests::state_view_validation_resolves_buffers_and_preserves_storage_errors
 ```
 
-This selection generates eleven mutations, all caught by the test. It covers
-unconditional acceptance/rejection, weakened conjunctions, omitted shape checks,
-and incorrect comparisons. A targeted strict-boundary fault (`<=` to `<`) also
-fails the storage-fit Kani equivalence assertion.
+This selection mutates the predicate into unconditional acceptance and
+rejection, weakened conjunctions, omitted shape checks, and incorrect
+comparisons, and is expected to leave no surviving mutation. The storage-fit
+Kani equivalence assertion detects a strict-boundary fault (`<=` changed to `<`).

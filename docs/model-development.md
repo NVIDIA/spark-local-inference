@@ -2,7 +2,11 @@
 
 Recipes in `ignition/recipes/` own model composition, checkpoint mapping, state
 layouts, and graph preparation. Shared execution mechanisms belong in
-`ignition/components/`. Follow [repository guidance](../AGENTS.md),
+`ignition/components/`. Each recipe package's `recipe.py` defines `RECIPE`, a
+`Recipe` from [the declaration module](../ignition/recipes/declaration.py) that
+names its checkpoints, serving range, memory costs, speculation, and sampling
+defaults; `recipes()` in `ignition/recipes/__init__.py` lists the declarations
+the Ignition CLI offers. Follow [repository guidance](../AGENTS.md),
 [preparation development](preparation-development.md), and the relevant
 [model preparation and serving instructions](model-preparation.md).
 Performance changes also require [GPU performance work](performance-work.md).
@@ -34,29 +38,36 @@ Performance changes also require [GPU performance work](performance-work.md).
 
 - Agents adding or changing a recipe must read the model card and manually verify
   its recommended sampling parameters for the default serving mode. Declare the
-  complete defaults in the Ignition recipe and cite the recommendation at that
+  complete defaults as the recipe's `SamplingDefaults` (`Recipe.sampling_defaults`)
+  and cite the recommendation at that
   declaration. Never infer sampling policy from `generation_config.json`,
   `config.json`, Transformers defaults, or another model. Model-card recommendations
   take precedence over conflicting config files; unspecified filters are disabled
-  and penalties are neutral. Declare optional inclusive sampling ranges only from
+  and penalties are neutral. Declare optional inclusive sampling ranges
+  (`SamplingRange` entries in `SamplingDefaults.ranges`) only from
   the model author's recommendations. Clamp request distribution parameters to
   those ranges; an absent range fixes the parameter at its declared default.
   Seed remains request-controlled.
 - Ignition validates checkpoint configuration for structural data, including
   EOS and template tokens, image preprocessing, and vision position geometry.
   Export only the fields Helios consumes in first-class Protobuf messages.
-  Runtime assets are the tokenizer and chat template; do not core raw generation,
-  tokenizer, processor, or model configuration files. Helios consumes prepared
+  Runtime assets are the tokenizer and chat template; do not export raw generation,
+  tokenizer, processor, or model configuration files in a core. Helios consumes prepared
   settings without per-model sampling policy or config-file interpretation.
 
 Ignition obtains upstream chat templates from the user's downloaded Hugging Face
 checkpoint. Bundled `assets/*.patch.json` files contain only message-mark insertion
 offsets and exact source/result SHA-256 hashes, plus the pinned HF source location.
-They contain no upstream template text. Preparation rejects changed source bytes
+They contain no upstream template text. `annotated_template_asset` in
+`ignition/preparation/frontend.py` rejects changed source bytes
 and supplies the annotated text to native export without modifying the checkpoint.
-Step's existing inference transformation removes training-span tags before applying
-its insertion patch. Kimi's custom segmented XTML renderer remains project code;
-its upstream reference is a Python encoder, not a Jinja template.
+Step's inference transformation (`ignition/recipes/step5/frontend.py`) replaces
+the template's `generation`/`endgeneration` training-span tags before applying
+its insertion patch. Kimi K3 and K3.1 bundle their segmented XTML templates as
+project code in `ignition/recipes/kimi3/assets/chat_template.jinja` and
+`ignition/recipes/kimi31/assets/chat_template.jinja`;
+their upstream reference is a Python encoder, not a Jinja template. DeepSeek V4
+and V4.1 use programmatic Rust encoders and have no template asset.
 
 Gemma 4 fetches Google's canonical chat templates for every supported publisher
 and quantization using the configured hub cache.
@@ -85,7 +96,7 @@ cargo test --manifest-path helios/Cargo.toml --features server --test message_bo
 
 Use `--hub-cache PATH` for a different HF cache and `--recipe NAME` to prepare
 selected recipes. `FLARE_TEST_TEMPLATE_DIR` is read only by tests. Actual checkpoint
-tokenizer comparisons still require their documented checkpoint assets.
+tokenizer comparisons require their documented checkpoint assets.
 
 ## Prompt renderers and checkpoint boundaries
 
@@ -140,7 +151,7 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 
 ### Jinja integration
 
-- Core an annotated recipe template. Removing its mark annotations must
+- Export an annotated recipe template in the core. Removing its mark annotations must
   reproduce the authoritative template bytes, including any explicitly supported
   inference transformation. Preserve Jinja whitespace-control behavior and test
   actual rendered output; source equality alone does not validate placement.
@@ -285,7 +296,7 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   join dependencies; measure this ordering in the complete model graph.
   DeepSeek V4.1 records shared kernels first at capacities of one through four
   rows, and routed kernels first at larger overlapping decode, verification,
-  and draft capacities. Other recipes retain their shape- and kernel-dependent
+  and draft capacities. Other recipes use their own shape- and kernel-dependent
   ordering; a crossover measured for one expert geometry does not establish
   another geometry's crossover.
 - **Make overlap safe through compilation.** Declare every concurrently live
@@ -317,5 +328,5 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   context updates and recurrent metadata required to alternate with wider rounds.
   Compare the complete width-one graph against ordinary decode, attribute any
   extra cost, and test transitions in both directions with partial/inactive rows
-  and cache-boundary crossings. Apply this check in each recipe's existing
+  and cache-boundary crossings. Apply this check in each recipe's
   preparation and tests.

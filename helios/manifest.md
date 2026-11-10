@@ -13,8 +13,9 @@ The Python representation is a dictionary with these fields:
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
-    "completion_token_capacity": int, # Zero resolves to eight; positive values are literal.
+    "completion_token_capacity": int, # Optional; zero or omitted resolves to eight.
     "input_frame_bytes": int,       # Positive, multiple of 8.
+    "engram": EmbeddingBinding,     # Optional embedding-table binding; None or omitted without tables.
     "buffers": [
         {
             "name": str,
@@ -33,9 +34,11 @@ The Python representation is a dictionary with these fields:
             "handle": int,          # Instantiated CUgraphExec handle.
             "batch_capacity": int,
             "token_capacity": int,  # W, including the pending token.
-            "draft_tokens": int,    # Captured proposal depth D for speculative graphs.
-            "packed_token_capacity": int,  # P, explicit for speculative graphs.
+            "draft_tokens": int,    # Captured proposal depth D; read only for speculative graphs.
+            "packed_token_capacity": int,  # P, explicit for speculative graphs; otherwise zero or omitted.
+            "prefill_capacity": int,  # Prompt capacity of a mixed graph, otherwise zero.
             "confidence_width": int,  # Produced confidence prefixes, otherwise zero.
+            "estimated_duration_ns": int,  # Zero denotes an indeterminate duration.
             "input_bindings": [
                 {
                     "buffer_name": str,
@@ -82,7 +85,8 @@ retains referenced producers and their executable resources and removes unused
 producers. Tuning storage remains owned through execution drain.
 
 Execution ABI numbers are descriptive metadata and do not gate loading or rank
-agreement. Engine upgrades preserve previously supported core layouts. The
+agreement. Every engine version loads the core layouts that earlier versions
+supported. The
 runtime validates graph operations, buffer geometry, and storage dependencies.
 
 ## Serving graph transport
@@ -97,8 +101,8 @@ with T=1 omit these zero-depth outputs. Graph verification widths cannot exceed 
 and operator limits may be smaller. Continuation-state geometry is independent
 of completion token capacity.
 
-Supported dtypes are `bool`, `uint8`, `int32`, `int64`, `float32`, `float16`, and
-`bfloat16`. Shapes are nonempty and every extent is positive. `nbytes` equals
+Supported dtypes are `bool`, `uint8`, `float8_e4m3fn`, `int32`, `int64`,
+`float32`, `float16`, and `bfloat16`. Shapes are nonempty and every extent is positive. `nbytes` equals
 the contiguous element count times dtype size. Device addresses and host
 offsets are aligned to that size. Names are nonempty and unique within their
 lists. Graph executable handles are nonzero and unique. Registered device
@@ -113,17 +117,24 @@ verification, and commit work. It declares B/D/W/P explicitly: request capacity,
 captured proposal depth, per-request target capacity, and aggregate target rows.
 W is from 1 through T, the resolved completion token capacity; P is from B
 through B × W, including rectangular P = B × W.
-An omitted or zero packed token capacity resolves to B × W for speculative
-graphs, preserving cores exported before that field was added.
+Core decoding resolves an omitted or zero `ExecutionGraph.packed_token_capacity`
+to B × W for speculative graphs, so a core without that field loads as a
+rectangular catalog. `ExecutionManifest::validate` requires the resolved value.
 Width-one speculative graphs have D = 0 and maintain draft context. No standalone
 proposal, verification, or packed-speculative graph kind exists.
-Prefill has batch capacity 1. Token capacities are 1, 16, or a multiple of 64
-within 64..=262144. The model configuration separately requires the captured
+A mixed graph has a power-of-two batch capacity from 2 through the request
+storage capacity, W from 1 through T, and a `prefill_capacity` that is a positive
+multiple of 64. It binds the `int32[1]` `prefill_row` input. Every other kind
+sets `prefill_capacity` to zero.
+Prefill and scored prefill have batch capacity 1. Their token capacities are 1,
+16, or a positive multiple of 64. The model configuration separately requires the captured
 catalog for its `prefill_chunk_size`; transport validation does not infer a
 scheduling policy or substitute a missing graph.
 State operations
 and resume use power-of-two batch capacities through 64. Vision batch capacity is 1, and its
-token capacity is one of 256, 1024, 4096, or 16384 patches. Batch capacity can
+token capacity is a positive patch count. The model contract's
+`vision.patch_capacities` lists the captured vision capacities in increasing
+order, each a multiple of `patches_per_feature`. Batch capacity can
 exceed `max_active` for padding, but must not exceed its next power of two.
 Request storage capacity is `max_active.next_power_of_two()`. The manifest records
 capture capacity. Runtime admission may use a smaller `SchedulerLimits.max_active`,
@@ -175,21 +186,29 @@ mapped-host decoding uses core pitch. Frames without reporting copy no
 generation payload. Natural width-20 readback uses 168TC bytes; explicit
 width 128 uses 1,032TC.
 Prompt output geometry and readback are independent of generation width.
+A catalog with scored prefill graphs declares `prompt_target_tokens: int32[N]`
+and `prompt_logprobs: int32[2,N,43]`, where N covers every scored graph's token
+capacity, and requires generation logprob storage with at least 20 alternatives. Scored
+prefill graphs, and no other kind, bind `prompt_target_tokens`.
 
-Relative to width-20 cores, persistent generation output adds 1,728TC bytes
-per rank and inputs add 516C. Each private output adds another 1,728TC; two
-pinned generation frames add 1,728TC on discrete GPUs. Two input staging frames
-add 1,032C before alignment. Allocator rounding and resulting KV capacity must
-be measured for the complete core.
+With the 258-field layout, persistent `completion_logprobs` storage occupies
+2,064TC bytes per rank, each private output occupies another 2,064TC, and the
+two pinned generation frames occupy 2,064TC on discrete GPUs.
+`logprob_token_ids` and `logprob_token_id_counts` occupy 516C bytes per rank,
+and two input staging frames hold 1,032C bytes for them before alignment. A core
+whose `completion_logprobs` last extent is 42 (a chosen pair and 20
+alternatives, without explicit ID inputs) uses 336TC bytes for each of those
+three output figures and has neither ID input. Allocator rounding and the
+resulting KV capacity are properties of the complete core.
 
-Each submission adds 4C H2D count bytes per rank and one upload descriptor even
-without explicit IDs. Explicit prefixes add `4ΣN` H2D bytes. The existing remote
-TP wire format adds `4C+24` bytes per peer for counts, plus `4ΣN` payload bytes
-and 24 bytes per uploaded prefix per peer. Same-process rank threads share
-uploads instead of using that wire format. Natural finishing adds a count load
-and branch; candidate and normalization work remain unchanged. Wider output
-strides and width-masked mixed merges require measurement. Equal readback bytes
-do not imply equal total work or efficiency.
+Each submission uploads 4C count bytes per rank with one upload descriptor,
+whether or not it carries explicit IDs. Explicit prefixes upload a further
+`4ΣN` bytes. The remote TP wire format carries `4C+24` bytes per peer for
+counts, plus `4ΣN` payload bytes and 24 bytes per uploaded prefix per peer.
+Same-process rank threads share uploads instead of using that wire format.
+Natural finishing performs one count load and branch in addition to candidate
+selection and normalization. Equal readback bytes do not imply equal total work
+or efficiency.
 
 An optional `readiness_timestamps` output has dtype int64 and contiguous shape
 `[2,3*N]`, with `1 <= N <= 64`. Each frame holds one triple per embedding table:
@@ -197,8 +216,8 @@ GPU timestamps before its external readiness wait, after readiness, and after a
 prepared all-rank reduction. Table indices follow the embedding catalog. Every
 graph consuming embedding tables writes all triples for its selected frame.
 Other graphs leave them untouched. The executor retains each frame's readback
-through its transfer fence. Cores without this output retain raw replay-cost
-estimation.
+through its transfer fence. For a core without this output, cost estimation uses
+raw replay intervals.
 
 Across ranks, the estimator takes the minimum readiness-through-reduction span
 and the minimum reduction-only span separately for each table. Their difference
@@ -321,20 +340,38 @@ bindings before serving requests.
 ## Native runtime core
 
 `ignition export MODEL --gpus N[,N...]` prepares a native core in the shared
-cache and prints its entry path. `flare run CACHE_ENTRY` loads that core.
-Each TP rank has its own resource bundle. Helios serves ranks as threads in one Rust
-process. Ignition exits or replaces its Python process through `execv` before
-the native server starts. The CUDA driver creates context, module, function,
-graph, and executable handles from the core descriptions.
+cache and reports its entry path. `flare run CACHE_ENTRY` loads that core in a
+separate Rust process; the export process has closed the prepared model and
+takes no part in serving. Each TP rank has its own resource bundle. Ranks on one
+host run as threads in one `flare run` process (`RankPeers::Threads`). Ranks of
+a multi-host core run in separate processes on their hosts; rank zero drives
+them through the `RankPeers::Processes` streams joined at its rendezvous
+address. The CUDA driver creates context, module, function, graph, and
+executable handles from the core descriptions.
 
-The safetensors file contains two one-dimensional `U8` tensors:
+A core is one `.safetensors` file or a directory whose primary file is
+`model.safetensors`. `NativeResources::core_format` reads the header's
+`__metadata__.format` and selects one of two carriers:
+
+- The payload format declares `"flare-payload"`. Its signed `CoreBody`,
+  `DeploymentBody`, and `RankBody` records follow `proto/core.proto` and embed
+  the `Execution`, `ServingContract`, and frontend messages of
+  `proto/runtime_core.proto`. `ignition export` writes this format;
+  [the core format design](../docs/core-format-design.md) specifies it.
+- The logical-resource format, `CoreFormat::Legacy` in the loader, declares
+  `"flare"` or `"flare-snapshot"`. `ignition export` does not produce it; Helios
+  loads it.
+
+A logical-resource primary file contains two one-dimensional `U8` tensors:
 `flare.payload` holds all resource bytes and alignment padding;
-`flare.metadata` holds the Protobuf `ModelIndex` at the end of the file.
-The JSON header is limited to 64 KiB, padded to place the payload on a 4 KiB
-boundary, and declares `__metadata__: {"format": "flare"}`. Stored allocations
+`flare.metadata` follows it and holds the signed Protobuf `ProtectedIndex` from
+which the loader reconstructs the `ModelIndex`. A header may also declare a
+`flare.layout` tensor after `flare.metadata` that names companion files.
+The JSON header is limited to 64 KiB and padded to place the payload on a 4 KiB
+boundary. Stored allocations
 and embedding tables from all ranks precede execution resources. Resource
 spans are byte offsets relative to `flare.payload`, bounded by its size.
-The index is limited to 16 MiB. It includes:
+The index is limited to 128 MiB. The `ModelIndex` includes:
 
 - Ordered rank bundles and peer-memory ownership and access declarations.
 - Architecture, context flags, limits, cache settings, and address reservations.
@@ -363,7 +400,10 @@ ceiling `SpeculativePrefixLimit` binding determines allocation ownership.
 Selection uses concrete metadata before reading graph bodies or loading kernels.
 Tensor-parallel ranks must have identical selected physical catalogs.
 
-Executable resource spans are one zstd level-3 frame per cubin or graph; the
+Executable resource spans are one zstd level-3 frame per cubin or graph in the
+payload format and in logical-resource cores with `ProtectedIndex.version` 6;
+version 4 cores use the AES-GCM chunk reader described in the
+[model contract](model-contract.md#ownership-and-bootstrap). The
 manifest does not select a codec or carry executable keys. Graph bodies, module
 images, globals, tensor payloads, and frontend assets are separate indexed spans
 in the file. Each graph body contains its declared
@@ -373,9 +413,10 @@ at a time and drops CUDA graph templates after instantiation. Tensor loading
 uses 16 MiB of pinned staging memory across all ranks; module images are
 mapped from the core while loading.
 
-The schema is `proto/runtime_core.proto`. `prost-build` generates Rust
-bindings during builds with `runtime-core`; these builds require `protoc`.
-Regenerate checked-in Python bindings with:
+The schemas are `proto/runtime_core.proto` and, for payload-format records,
+`proto/core.proto`. `prost-build` generates Rust bindings for both during builds
+with `runtime-core`; these builds require `protoc`. Regenerate the checked-in
+Python bindings, `ignition/preparation/runtime_core_pb2.py`, with:
 
 ```sh
 protoc --proto_path=helios/proto --python_out=ignition/preparation helios/proto/runtime_core.proto
@@ -394,8 +435,9 @@ page counts. Serving performs no allocation or remapping.
 
 Supported graph nodes are kernels, empty nodes, memset operations, named
 external event waits, and contiguous device-to-device copies. Other node types and device-updatable
-kernels reject export. Qwen and GLM use the shared native loader and scheduler.
+kernels reject export. Every recipe's core uses the shared native loader and scheduler.
 Cores are trusted executable input. Listener configuration and API keys are
 supplied when launching. Resources remain owned until replay drains; a failed
 drain retains them until process termination. Incompatible files require
-re-export; there is no directory or JSON core loader.
+re-export. A core directory loads through its `model.safetensors` primary; there
+is no JSON core loader.

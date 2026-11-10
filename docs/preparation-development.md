@@ -19,11 +19,11 @@ Recipe and execution-component changes also require
   follow tuning.
 
 `RecordedPreparationSession` uses `PreparationSession(prime=False)`. Selected
-plans still materialize, construct prepare-call bindings, retain owners, and
+plans materialize, construct prepare-call bindings, retain owners, and
 run restore/close hooks, but skip the call's reset, activation production, and
 execution. Factories must construct required resources without depending on
-those execution hooks. Tuning candidates and retained benchmark calls still
-prime. Complete-forward warmup in `capture_forwards` runs every selected variant
+those execution hooks. Tuning candidates and retained benchmark calls prime.
+Complete-forward warmup in `capture_forwards` runs every selected variant
 before the session's capture guard forbids further kernel resolution.
 
 ## Startup progress
@@ -51,7 +51,9 @@ before the session's capture guard forbids further kernel resolution.
   bind process-local kernel handles and caller-owned tensors at startup. Complete
   b12x preparation, tuning, binding refresh, and compiled warmup before capturing
   each serving graph. Warm the complete selected catalog before retaining a serving graph.
-  Core-backed eager warmups release their transient pools before capture, so
+  When `capture_forwards` receives `warmup_storage`, the preparation's
+  `CoreStorage` (`ignition/preparation/core_storage.py`), eager warmups allocate
+  from its transient pools and release them before capture, so
   their workspaces do not coexist with retained graph intermediates. Ranks
   synchronize before each warmup and each capture. Retain compiled kernel owners
   until native replay has drained.
@@ -80,7 +82,7 @@ helper compilation derives host identity without launching a subprocess.
 
 The runtime patch implementation contributes to both Ignition forward cache
 keys and Torch's compiler cache tag. Changing it invalidates compiled forwards
-and Torch graph caches. Captured cores execute independently of these Python
+and Torch graph caches. Exported cores execute independently of these Python
 patches.
 
 ## Runtime core export
@@ -130,6 +132,16 @@ incompatible metadata is an error, with no live-weight fallback.
   storage across sequential work; preserve separate storage for overlapping
   operations and persistent state. Aliasing must follow actual lifetimes and
   stream dependencies, including overlap captured inside a single graph.
+- **Write every scratch value a graph reads inside that graph.** Export clears
+  the storage a recipe declares disposable and omits it from the core
+  ([runtime core design](runtime-core-design.md)), so a value written only
+  during preparation reads as zero when the exported core is served.
+  `ignition debug-serve` serves the prepared storage without export and does
+  not expose such a value. Derive constant bounds from tensor shape metadata or
+  rewrite them in each graph, and keep storage whose preparation-time contents
+  a graph reads out of the disposable declaration. Test a prepared operator by
+  zeroing its scratch before native replay, as
+  [the GLM indexer test](../tests/recipes/test_glm53_indexer_cuda.py) does.
 - **Share scratch across the complete graph catalog.** Vision, prefill, decode,
   speculative, and resume graphs execute serially and should reuse caller-owned
   activation and private buffer pools. Allocate per-variant views with
@@ -240,7 +252,8 @@ waits for their completion. See the [ladder format](../ignition/preparation/ladd
 ## Shape and graph-transition validation
 
 Packed verification catalogs declare physical row capacities independently of
-logical per-request widths. Use `packed_speculative_shapes` to distribute a
+logical per-request widths. Use `packed_speculative_shapes` in
+`ignition/components/capacity.py` to distribute a
 graph-count budget across the request buckets while preserving each bucket's
 physical endpoints. Size target workspaces from the largest physical capacity
 and sampling/state workspaces from their declared logical widths. Validate

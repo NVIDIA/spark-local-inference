@@ -10,13 +10,14 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
 - **One manager per pool.** A pool is the set of Flare instances that share records. Run one
   `selene` for it, on a host with local NVMe if you want records to outlive the instances.
   Instances do not talk to each other; they talk to the manager, which brokers every copy.
-- **The manager owns its NVMe directory exclusively.** `--root` is locked
-  (`<root>/.lock`): a second manager on the same directory refuses to start. Do not put the
+- **The manager owns its NVMe directory exclusively.** `--root` is locked with an exclusive
+  `flock` on the directory: a second manager on the same directory refuses to start. Do not put the
   directory on a network file system, share it between managers, or edit it while the manager runs.
 - **Instances configure only their private tiers plus the pool address.** Each Flare instance
   keeps its own DRAM and NVMe settings for its private tiers and adds
   `--prefix-cache-pool <address>`; see
-  [address forms](network-operations.md#addresses-and-startup-warnings). The manager's `--name` supplies the identity salt. Everything shared,
+  [address forms](network-operations.md#addresses-and-startup-warnings). The manager returns its `--name` in `Hello`, and the instance
+  derives its scope and instance ids from that name. Everything shared,
   the index, holds, windows, the manager's own store and the network, lives in the manager.
 - **Never put the manager behind a load balancer.** A session is stateful: the index entries an
   instance announced, the claims in flight and the windows granted to it all live in the one
@@ -26,7 +27,7 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
 - **Same host, same identity.** The manager and every instance that uses shared memory must
   run with the same effective uid and gid, share the socket directory and `/dev/shm/selene` at
   identical paths, and (in containers) share a PID namespace so peer credentials are real.
-  Instances that cannot meet this still work over `--listen`, without shared memory.
+  Instances that cannot meet this work over `--listen`, without shared memory.
 
 Record expiry is off by default. `--max-age DURATION|off`
 accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
@@ -35,7 +36,7 @@ Recovery uses file mtime from its last write. After a restart, a record reused
 from disk but never rewritten may expire up to one max age early. The cost is a
 recompute, never wrong output. With expiry off, hits do not refresh last use;
 enabling it later may expire old files at once.
-The existing tick sweeps every namespace, with each index limited to once a
+The store's 10 ms tick sweeps every namespace, with each index limited to once a
 minute. It walks from the oldest entry, skipping interior nodes, pinned records
 and active I/O. It stops at the first fresh leaf or 64 expired leaves, removing
 page-only ancestors with their last child. LRU order uses a store-wide counter,
@@ -63,28 +64,30 @@ nothing is pinned. Host-tier exports that do not fit stream with two windows at 
 staging for the largest export you expect to run concurrently times `export_slots` (default 2 per
 instance), plus the quarantined bytes below. The minimum is 8 MiB and the default 4 GiB.
 
-One export of a long context needs staging for all of its pages and its row: a Qwen prefix of
-about 33,000 tokens did not fit the former 256 MiB default and was refused `NO_WINDOWS` on every
-request, so the requester recomputed it. When the first session of a scope arrives the manager
-logs, once for that scope, how many tokens of context one export can hold in the configured
-staging and warns if that is under 262,144 tokens (Flare's usual per-request limit; the manager
-does not know a model's real maximum). The warning names the staging size that would hold it.
+One export of a long context needs staging for all of its pages and its row. When staging is
+smaller than one export, every claim for that export is refused `NO_WINDOWS` and the requester
+recomputes. When the first session of a scope arrives and one
+export in the configured staging would hold fewer than 262,144 tokens of context (Flare's usual
+per-request limit; the manager does not know a model's real maximum), the manager logs one
+warning for that scope. The warning states the token count one export can hold, the page and row
+bytes, and the staging size that would hold 262,144 tokens; a manager whose staging
+holds that much logs nothing.
 One export holds (`--staging` minus the row bytes) divided by the page bytes, rounded down,
 times the page tokens: about 143,000 tokens at 2 GiB and 294,000 at the 4 GiB default for a
-model with 905,216-byte pages of 64 tokens and a 122 MiB row. A longer context is refused
-`NO_WINDOWS` and recomputed, so size `--staging` from the figure the manager logs when a scope
-opens.
+model with 905,216-byte pages of 64 tokens and a 122 MiB row. Size `--staging` from that
+formula or from the figure in the warning.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
 largest record an instance can put, or the put is refused `OVERSIZE`. Keep it above `--memory`:
 DRAM eviction needs durability, so a full NVMe budget stops DRAM from making room.
 
-The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so the shared-memory mount
+The arena and staging are preallocated files in `/dev/shm/selene/<name>-<hash>`, where the hash is
+the 32-hex-digit BLAKE2b digest of the absolute `--socket` path, so the shared-memory mount
 must provide at least `--memory + --staging` for each manager. A container's default 64 MiB
 `/dev/shm` is far too small; use `--shm-size` or the host IPC namespace.
 
-The files are fixed (`arena`, `staging`, and a `generation` and `holders` file beside them) and
+The files are fixed (`arena`, `staging`, and a `generation`, `holders` and `lock` file beside them) and
 persist across restarts. A restarted manager with the same `--memory` and `--staging` reopens the
 same files at the same offsets, so instances that registered them with CUDA at startup keep
 working; a killed manager never blocks a restart, and debris from a crash is reclaimed. If a size
@@ -92,10 +95,10 @@ changed or a file is missing, the wrong size or has no valid generation, the man
 recreates them under a new generation and logs that running instances must restart to use the
 pool: until they do, they run on local tiers only. A file owned by another user stops the
 start, as does an unexpected I/O error while checking them
-(an interrupted call is retried) stops the manager's start with an error and deletes nothing. After
+(an interrupted call is retried); either stops the manager's start with an error and deletes nothing. After
 a crash the manager keeps the regions out of service until each process that had a session has
-reconnected or exited (PROTOCOL.md 8.6). The files outlive a stopped manager and keep their
-memory: remove `/dev/shm/selene/<name>` to give it back.
+reconnected or exited ([PROTOCOL.md 8.6](../PROTOCOL.md#86-persistent-shared-regions)). The files outlive a stopped manager and keep their
+memory: remove the `/dev/shm/selene/<name>-<hash>` directory to give it back.
 
 Protect these files from systemd-logind `RemoveIPC`, which can unlink a normal
 user's shared memory when their last login session ends, including files used
@@ -105,8 +108,8 @@ login uid is required, set `RemoveIPC=no` in `/etc/systemd/logind.conf` and
 apply the logind configuration according to the host's service procedures.
 The manager checks the region files once per second. If one disappears or is
 replaced, it drains and exits with an error naming `RemoveIPC`. Fix the host
-configuration, then restart the manager and instances so they map the new
-regions; it never recreates regions underneath live copies.
+configuration, then restart the manager and instances so they map the recreated
+regions; the manager never recreates regions underneath live copies.
 
 Pool names isolate key namespaces. Instances of one pool map its shared arena and
 staging files. Processes running under the same uid can read other pools' files.
@@ -129,12 +132,16 @@ reverse) runs on up to eight threads of the manager's host, overlapped with the 
 
 ### Instance DRAM rows
 
-A pooled instance keeps a retiring record's local rows pinned until its put
-finishes. A slow manager can therefore exhaust the instance's rows and skip
-new host publications. Rows take one quarter of the local DRAM budget while
-preserving minimum page windows. Flare warns at startup when this leaves fewer than
-`--max-concurrency` rows. Increase `--prefix-cache-memory`
-or reduce concurrency; this threshold is a sizing warning, not a guarantee
+A pooled instance keeps a retiring record's local slots pinned until its put
+finishes. A slow manager can therefore exhaust the instance's free slots and skip
+new host publications. With a local memory or disk tier, the instance's host pool
+is one set of page-sized slots: the warm checkpoint slots that
+`--prefix-cache-memory` buys plus an automatic intake of
+`2 × --max-concurrency × row slots + 128` slots, where a row occupies as many slots
+as its bytes need. Flare prints one startup warning, `host prefix intake shrunk
+to N slots to fit the host budget`, when the host memory budget cannot hold the
+full intake; the warning states the bytes the full intake needs. Free host memory
+or reduce concurrency; the intake size is a sizing rule, not a guarantee
 that an arbitrarily long persistence backlog will fit.
 
 ## Multi-process instances
@@ -161,7 +168,8 @@ See [network startup warnings and TLS rules](network-operations.md#addresses-and
 A build without the `rdma` feature refuses `--rdma`. Configuration and TLS
 validation run before the store or any listener opens.
 
-Startup order is the root lock, NVMe recovery, shared-memory reclaim, then the socket. A second
+Startup order is the pool-name lock (`/dev/shm/selene/<name>.lock`), the root lock, NVMe recovery,
+shared-memory reclaim, the data, metrics and network listeners, then the Unix socket. A second
 manager on the same root or the same `--name` exits at once; a stale socket is replaced only after
 confirming nothing is listening.
 
@@ -202,9 +210,12 @@ unchanged; changing either means restarting the instances too.
 
 ## Readiness and restarts
 
-The manager is `READY` when its own disk recovery completes. It serves lookups,
-claims and puts without waiting for previous instances to reconnect. Until recovery
-finishes, requests answer `NOT_READY`; sessions and announcements remain available.
+Disk recovery completes before the manager binds any listener, so a manager that
+accepts connections is `READY`. It serves lookups, claims and puts without waiting
+for previous instances to reconnect, with one exception: after a crash, claims are
+refused `REGIONS_HELD` until each process that held a session has reconnected or
+exited (see [Sizing](#sizing)).
+While the manager drains for shutdown, requests answer `NOT_READY`.
 Sources reconnect and resnapshot independently, so their hints may temporarily miss.
 
 - Records the manager held only in DRAM are lost with it; NVMe records are recovered and start in the
@@ -220,12 +231,13 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 
 | Reason | Meaning | Operator action |
 |---|---|---|
-| `NOT_READY` | The manager is recovering or draining. | None; check `selene_pool_state`. |
+| `NOT_READY` | The manager is draining for shutdown. | None; check `selene_pool_state`. |
+| `REGIONS_HELD` | After a crash, the shared regions are held for processes of the previous run. | None while those instances reconnect; a live process that never reconnects keeps the hold. Check `selene_pool_regions_held`. |
 | `CLAIM_LIMIT` | The requester already has its claim slots in flight (default 2). | None; limits do not scale with concurrency. |
 | `SOURCE_LIMIT` / `SOURCE_BUSY` | The source already serves its export slots (default 2). | None. |
 | `UNKNOWN_SOURCE` / `STALE_SOURCE` | The named source or entry is gone, or the source reconnected. | None; the index catches up. |
 | `NO_WINDOWS` | Staging cannot hold the export, or too much of it is quarantined. | Raise `--staging`; look at `selene_pool_quarantined_bytes`. |
-| `NOT_FOUND`, `CHAIN_GAP`, `NO_HEADROOM` | The source no longer has it, or has no room to pin it. | None. |
+| `NOT_FOUND`, `CHAIN_GAP`, `NO_HEADROOM` | The source does not hold it, or has no room to pin it. | None. |
 | `SOURCE_TIMEOUT` | The source did not answer within `pin_deadline_ms` (default 250). | Look at the source's load. |
 | `SOURCE_LOST` / `REQUESTER_LOST` | The other side's stream ended. | Look at the instance that went. |
 | `RANKS_DETACHED` / `RANK_LOST` | A rank of a multi-process instance is not attached, or its attachment ended during the transfer. | Look at that rank's process. |
@@ -244,7 +256,7 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 Memory is reused only when every process that could still touch it has said it stopped, or is
 confirmed gone. If a process cannot say so (it reports `QUARANTINED`, or its stream ended while the
 process lives and it has not reported on a new session), the windows it held stay out of service
-until it exits, or until the manager does. `selene_pool_quarantined_bytes` and `ReadinessInfo` show
+until it exits, or until the manager does. `selene_pool_quarantined_bytes` shows
 the total; a nonzero value that does not fall means an instance is hung, not a leak.
 
 ## Metrics
@@ -255,11 +267,12 @@ does not answer within 1 s the previous store text is served.
 
 | Series | Meaning | Alert on |
 |---|---|---|
-| `selene_pool_state`, `selene_pool_ready` | 1 recovering, 3 ready, 4 draining; and 1 when ready. | Recovery that does not finish. |
+| `selene_pool_state`, `selene_pool_ready` | 3 ready, 4 draining; and 1 when ready. The endpoint binds after disk recovery, so no value reports recovery. | Draining that does not finish. |
+| `selene_pool_regions_held` | 1 while the shared regions are held for processes of the previous run. | Staying at 1. |
 | `selene_pool_sessions` | Live instance sessions. | Dropping to zero while instances serve. |
 | `selene_pool_index_entries` | Entries announced to the index. | Unbounded growth. |
 | `selene_pool_claims_in_flight`, `selene_pool_claim_records`, `selene_pool_lookups_queued` | Work in flight and records kept for fences. | Records that never fall. |
-| `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. | `COPY_ERROR`, `CHECKSUM`, `NO_WINDOWS` rising. |
+| `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. Label values are the Rust variant names, such as `reason="CopyError"`. | `CopyError`, `Checksum`, `NoWindows` rising. |
 | `selene_pool_puts_open` | Puts in flight. | |
 | `selene_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |
 | `selene_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. | Any `error`; `budget` growing faster than `ok`. |
@@ -267,7 +280,7 @@ does not answer within 1 s the previous store text is served.
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
 | `selene_nvme_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
-| `selene_nvme_reserved_bytes`, `selene_nvme_reserved_peak_bytes` | What `--nvme` bounds, now and its high-water mark since start: every record's padded file or rounded arena extent, what each unfinished put will leave on disk, and the staging hold of each unfinished streamed put. Never above `--nvme`. Windows leased for claims and exports are not in it; `selene_staging_allocated_bytes` shows them with the holds, and `--staging` bounds them. | Near `--nvme`: puts are refused `BUDGET` and DRAM eviction stops. |
+| `selene_nvme_reserved_bytes`, `selene_nvme_reserved_peak_bytes` | What `--nvme` bounds, as its present value and its high-water mark since start: every record's padded file or rounded arena extent, what each unfinished put will leave on disk, and the staging hold of each unfinished streamed put. Never above `--nvme`. Windows leased for claims and exports are not in it; `selene_staging_allocated_bytes` shows them with the holds, and `--staging` bounds them. | Near `--nvme`: puts are refused `BUDGET` and DRAM eviction stops. |
 | `selene_evictions_total`, `selene_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
 | `selene_hits_total{namespace,tier}`, `selene_records{namespace,tier}`, `selene_bytes{namespace,tier}` | Hits and inventory of the manager's own records. | Hit rate collapse. |
 
@@ -289,10 +302,14 @@ their traffic. The protocol version must match the instances: a manager that doe
 instance's version answers `Hello` with `VERSION_MISMATCH` and the instance runs on its local tiers
 until restarted. `--name`, `--socket`, `--listen`, `--listen-data` and the TLS files are restart-only.
 
-The root holds one opaque 64-hex directory per scope plus `.lock`. Remove a scope
+The root holds one directory per model identity and layout fingerprint, named
+`<16 hex>-<32 hex>` from the first 8 bytes of the model identity and the 16-byte layout
+fingerprint. Remove one such
 directory to drop that model's durable records, or all of them to clear the pool, only while the
-manager is stopped. A changed model identity, layout fingerprint or pool name is a different scope, so
-the old directory is safe to delete and cannot be reused by accident.
+manager is stopped. A changed model identity or layout fingerprint selects a different directory, so
+the directory it leaves unused is safe to delete. The pool name is not part of the directory name or
+the record header: a manager started with a different `--name` on the same root recovers the records
+in that root under its own name.
 
 ## Troubleshooting
 
@@ -306,11 +323,11 @@ the old directory is safe to delete and cannot be reused by accident.
 ### Duplicate puts and stale lookup hints
 
 `Present` means the complete record is already committed. Duplicate put logs
-report cumulative totals at 1, 2, 4, 8, and subsequent doublings instead of
-printing once per duplicate; every put still receives its own reply.
+report cumulative totals at 1, 2, 4, 8, and subsequent doublings;
+every put receives its own reply.
 
-A restore warning ending in `UnknownSource` means that its lookup hint no
-longer names an indexed source record. A source disconnect, manager restart,
+A restore warning ending in `UnknownSource` means that its lookup hint names
+a source record absent from the index. A source disconnect, manager restart,
 resync, or eviction between lookup and claim can cause this race. Lookup does
 not pin records. The manager refuses the claim before granting windows or
 requesting an export, and the instance falls back to an equivalent local

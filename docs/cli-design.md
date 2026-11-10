@@ -3,8 +3,8 @@
 For environment setup and model-specific launch examples, see
 [model preparation and serving](model-preparation.md).
 
-Flare serves the model architectures its recipes support on NVIDIA SM120 and
-SM121 GPUs. Recipes declare default checkpoints and supported preparation
+Flare serves the model architectures its recipes support on NVIDIA SM103, SM120,
+and SM121 GPUs. Recipes declare default checkpoints and supported preparation
 capacities. The command line selects models, GPUs, concurrency, storage, and
 listeners. The engine derives memory and execution geometry from those choices;
 advanced preparation flags expose the explicit overrides listed below.
@@ -25,8 +25,8 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
   the recipe, host, and selected capacities. Advanced flags override the recipe's
   prefill chunk and speculation settings.
 - **Memory follows the model and the host.** Weights, graphs and
-  scratch, live state, and a prefix cache sized from `--max-concurrency` come
-  first. KV pages take everything else: the GPU's free memory at startup minus
+  scratch, and live state come first. KV pages take everything else: the GPU's
+  free memory at startup minus
   engine headroom. The page pool holds active requests and every cached prefix,
   so memory beyond what active requests need keeps more history resident.
   The configuration's GPU reserve leaves memory for processes started later.
@@ -62,8 +62,13 @@ for patch application in standalone Python tools.
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
 ignition bench [MODEL] [flags]                   measure prepared decode-round or prefill graph latency
+ignition join ADDR:PORT --rank R --ranks N [--gpu INDEX]  run a peer rank of a multi-host preparation
 ignition convert CORE [--output PATH] [flags]  convert a core to packed or directory form
 ignition edit CORE --output PATH [flags]      edit frontend metadata without preparing the model
+ignition keygen --directory DIR --name NAME --namespace NAMESPACE  create a production signing key
+ignition key-password --signing-key PATH        change a signing key's passphrase
+ignition sign CORE --output PATH [flags]        sign a development core for production
+ignition combine CORE... --output PATH [flags]  combine signed cores' deployments into one core
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
@@ -109,7 +114,7 @@ flare-cli/target/release/flare run CORE --gpus 0
 ```
 flare run [CORE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared core
-flare inspect CORE|MODEL[@VERSION] [--tensor-parallel N] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
+flare inspect CORE|MODEL[@VERSION] [--tensor-parallel N] [--rank N] [--unverified] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -125,8 +130,12 @@ flare orbit forget NODE                   remove a node from the orbit file
 flare orbit push CORE --to NODE,...    stage core data without starting ranks
 flare orbit cores [--cluster NAME]     what each node's cache holds
 flare orbit ls | dashboard [--cluster NAME]  groups on the cluster's nodes; their live metrics
-flare trust revoke FINGERPRINT
+flare trust revoke FINGERPRINT [--trust-store PATH]
+flare models list | inspect | download | downloads | select | remove | gc   manage the prepared-model cache
 ```
+
+[Local model management](#local-model-management) specifies the `flare models`
+subcommands.
 
 `flare run CORE --rank 0 --rendezvous HOST:PORT` serves rank zero of a
 multi-host core. Each peer can run `flare run --rank N --rendezvous HOST:PORT`
@@ -147,7 +156,7 @@ Serving core distribution uses 1..64 streams per peer, selected by rank
 zero's `--transfer-streams` (default 8). Direct and switched fabrics route to
 the peer; `--roce-ring` uses intermediate ranks. `--core-cache` selects the
 receiving rank's prepared-model cache. `--model-cache` and `--package-cache`
-remain accepted aliases. The default is `paths.core_cache`, otherwise
+are accepted aliases. The default is `paths.core_cache`, otherwise
 `~/.cache/flare/cores`; an existing `~/.cache/flare/packages` directory is used
 when the `cores` directory does not exist. Rank zero's
 `--stage-only` distributes and verifies cores without GPU loading, and exits
@@ -163,15 +172,17 @@ flags of `flare run` and applies them to every rank; `--host`, `--port`,
 not upload it. Core inputs are Hugging Face repositories
 `ORG/NAME[@REVISION]`, controller-local files, or `NODE:/absolute/path` on a
 paired node. Orbit downloads repository cores on a candidate node and
-verifies their publisher on the controller. Download flags apply to that
-node's cache; `--token-file` is read on the controller.
+verifies their publisher on the controller. `--revision`, `--filename`,
+`--tensor-parallel`, and `--offline` apply to that node's download into its own
+cache. `--cache-dir` and `--core-cache` name controller paths and are not sent
+to the node; `--token-file` is read on the controller.
 
 Ranks use each node's installed agent executable by default. An explicit
 `--executable PATH`, or a saved group's override, uploads the chosen build.
 `--persistent --name GROUP` saves a launch for manual reuse;
 `--detach` returns when processes start, before HTTP readiness is guaranteed.
-See [Orbit](orbit.md) and the [multi-host guide](multi-host.md). Orbit commands
-are implemented in Unix builds; Windows builds reject them.
+See [Orbit](orbit.md) and the [multi-host guide](multi-host.md). `flare orbit`
+and `flare agent` are implemented in Unix builds; Windows builds reject them.
 
 For MSVC cross-compilation, native Windows builds, and GPU compatibility
 requirements, see [Windows serving](windows.md).
@@ -185,7 +196,7 @@ graphs, and maximum virtual extents for cache storage. `--max-concurrency N`
 and `--mtp-draft-tokens N` select supported reductions at load time;
 `--mtp-adaptive-verification` and `--no-mtp-adaptive-verification` select the
 verification policy. `--history-drafts` enables host history tracking and feeds
-continuations into existing graph inputs; it does not change the captured graphs.
+continuations into the captured graphs' history inputs; it does not change the graphs.
 `--no-history-drafts` disables those proposals. Cores exported by Ignition
 record no history preference. Core defaults fill omitted settings; explicit
 startup settings win. Execution ABI labels do not gate loading; engine upgrades
@@ -223,7 +234,7 @@ the timed graph starts.
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
 | `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
 | `--verify-prefixes LIST` | Single-request packed prefixes measured from shared context, within `--verify-width`; proposal count remains fixed above prefix one. Cannot accompany `--prefill` or `--speculation-study` | unset |
-| `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
+| `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; requires `--speculation-study` and replaces `--verify-width` and `--mtp-draft-tokens` | unset |
 | `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
 | `--repetitions N` | Timed restored rounds per case and seed | `20` |
@@ -233,7 +244,7 @@ the timed graph starts.
 The default matrix contains twelve cases: each batch at each context, with
 verification width eight and aggregate target rows `P = B × 8`. Seven draft
 tokens plus one pending token form each request's verification block. The
-speculative token capacity remains 128 unless configuration or an explicit flag
+speculative token capacity is 128 unless configuration or an explicit flag
 overrides it. Preparation accepts the normal GPU, memory, cache, compiler,
 autotuning, precision, and overlap settings. Omitted concurrency defaults to the
 largest selected batch; configured and explicit capacities must cover it.
@@ -366,7 +377,7 @@ raw samples. Successful results have `status: complete`. A failed run preserves
 partial samples with `status: incomplete`, its failure, and per-case completion
 flags; it has no aggregate score. Scores from different GPU classes
 remain separate. These measurements support graph optimization; serving
-throughput and comparisons against other runtimes still require exported
+throughput and comparisons against other runtimes require exported
 cores running through `flare run`.
 
 ## 3. Parameters
@@ -388,10 +399,11 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--port N` | Listening port. `debug-serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
-| `--no-weights` | Export only when exact stored-data blobs are cached | Off |
-| `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts | Off |
-| `--publisher-key PATH` | Public publisher profile authenticating the cached weight source | Embedded profiles and the local development profile |
-| `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
+| `--image-concurrency N` | Maximum active image requests, 1 through the concurrency limit; vision recipes only | `image_concurrency` in `[models."MODEL"]`, then `[defaults]`, else the smaller of 4 and the concurrency limit |
+| `--no-weights` | Export only when exact stored-data blobs are cached. `export` only. | Off |
+| `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts. `export` only. | Off |
+| `--publisher-key PATH` | Public publisher profile authenticating the cached weight source; repeatable. `export` only. | Embedded profiles and the local development profile |
+| `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target printed with the exported entry path. Export validates the identifier; the value is not stored in the entry and does not change its cache location. `export` only. | Recipe `export_repository` when declared; otherwise no target is printed |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Normal export reuses matching cached weight payloads automatically after hashing
@@ -421,17 +433,21 @@ explicit flags take precedence.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, a multiple of 64. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
-| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing cores retain their captured catalog. | Disabled |
-| `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
-| `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
+| `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen3.8 Flash with concurrency of at least two, with MTP speculation or without speculation; `--speculative-method dflash2` rejects it. Command line only; a core's catalog is fixed at export, so changing this flag requires re-export. | Disabled |
+| `--prompt-logprobs` | Capture separate scored prefill graphs for raw prompt token logprobs. See [the logprob contract](logprobs-design.md#prompt-scoring). Command line only. | Disabled |
+| `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, Step-5 NVFP4 scales including BF16 experts converted to W4A16, or MiniMax M3.1 Flash NVFP4 scales. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; the MiniMax M3.1 Flash declaration estimates none. Actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
+| `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2; Kimi K3.1 Pro defaults to its DSpark draft and also supports DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--mtp-only` | Omit MTP-disabled prefill, decode, maintenance, and mixed graphs during preparation. Retain width-one speculative rounds and vision graphs. Requires positive draft depth; rejects `--no-mtp`. The core cannot load with native `--mtp-draft-tokens 0`. | Capture both execution modes |
-| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. This does not quantize the draft body. | Checkpoint precision |
+| `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. Kimi K3.1 Pro supports both with `--speculative-method dflash2` only. This does not quantize the draft body. | Checkpoint precision |
+| `--markov-head-quantization {nvfp4,fp8}` | Prepare the draft Markov transition projection as NVFP4 or row-scaled E4M3 FP8. DeepSeek V4 supports NVFP4; DeepSeek V4.1 supports both. Requires positive draft depth. | Checkpoint precision |
+| `--vocabulary-parallel-sampling` | Prepare vocabulary-sharded DSpark proposals and block rejection sampling. DeepSeek V4.1 on four GPUs only; three-GPU preparation rejects it. Requires positive draft depth and recipe sampling defaults without top-k, top-p, or min-p filtering, and rejects `--markov-head-quantization nvfp4`. | Full-vocabulary sampling |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
-| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
+| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | Recipe declaration: 32 for Muse Spark and 128 for the other recipes that declare one. Gemma 4 declares none and derives it from concurrency and draft depth (6 at its defaults) |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
+| `--no-context-parallel` | Keep each rank's attention context whole instead of sharding each page's context across tensor-parallel ranks, which caches fewer tokens. Applies to recipes that declare context-parallel page costs (GLM 5.3, Kimi K3, and Kimi K3.1 Pro); other recipes reject it. | Context sharding where the recipe declares it |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
 | `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
@@ -447,9 +463,9 @@ explicit flags take precedence.
 | `--online-mxfp8` | Store eligible BF16 projections as MXFP8 while loading. Kimi K3.1 converts only fused target KDA inputs; other target and draft projections retain checkpoint precision. Kimi K3 converts KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark context, outputs and MLPs; batched MLA key/value projections retain BF16. Qwen3.8 dense converts target attention/MLP projections and DFlash2 context, attention and MLP projections. Flash Next with `--speculative-method dflash2` converts only DFlash2 projections; target precision is retained. Existing packed weights, normalization, convolutions, selectors and target vocabulary weights retain their precision. Recipes that name no such projections reject it. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
-Speculative token capacity and packed graph budget also accept configuration-file
-defaults and model overrides. The remaining speculation settings are command-line
-only. `--no-mtp` excludes explicit speculation flags and model-specific packed
+Speculative method, token capacity, and packed graph budget also accept
+configuration-file defaults and model overrides. The remaining speculation
+settings are command-line only. `--no-mtp` excludes explicit speculation flags and model-specific packed
 graph budgets. The `Select GPUs.` startup line states the settings in effect: `up to
 N draft tokens` while verification adapts, `exactly N draft tokens` when it is
 fixed, and `branches serialized` under `--no-stream-overlap`. That flag is also
@@ -457,18 +473,20 @@ recorded in the plan and the exported graph catalog; it changes graph scheduling
 not kernel selection, so its cores share tuned kernels with overlapped ones.
 
 Gemma 4 defaults to four concurrent requests and six speculative target-token
-rows. Other recipes default to 32 concurrent requests and 128 target-token rows.
-Qwen3.8 Flash, Qwen3.8 27B, and GLM 5.3 use rectangular catalogs covering five
+rows, and Muse Spark to four concurrent requests and 32 target-token rows. Other
+recipes default to 32 concurrent requests and 128 target-token rows.
+Qwen3.8 Flash and GLM 5.3 use rectangular catalogs covering five
 drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
-covers its full three-draft depth at batch 32. DeepSeek V4/V4.1, MiMo V2.6 Pro,
-Kimi K3, Nemotron Bolt, and MiniMax M3.1 use packed catalogs with a default
+covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
+MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
+Spark use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects
 its proposal and prefix-allocation mode.
 DeepSeek V4.1 defaults to seven draft tokens, concurrency 32, a 4096-token
 prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
 Its catalog contains combined proposal/allocation/verification rounds and
-width-one graphs; ordinary graphs remain available for `--mtp-draft-tokens 0`.
+width-one graphs; ordinary graphs serve `--mtp-draft-tokens 0`.
 The [model preparation guide](model-preparation.md#deepseek-v41-flash) defines
 the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
@@ -547,14 +565,14 @@ replica. The resulting core still contains two ranks. Additional GPUs must
 match the corresponding serving GPU model and have enough free memory for a
 replica. Both GPU lists use `CUDA_VISIBLE_DEVICES` ordinals.
 
-Without these flags, preparation retains automatic worker sizing and its
-existing local or multi-host sharding. On integrated GPUs such as DGX Spark,
+Without these flags, preparation sizes workers automatically and tunes on
+the serving ranks, locally or across hosts. On integrated GPUs such as DGX Spark,
 CPU and GPU allocations share one memory budget. Multi-host preparation keeps
 its rank coordination, candidate sharing, and compiled-forward distribution;
 `--compile-workers` sets a separate budget on each host. Local tuning replicas
 are selected only by `--tuning-gpus`.
 
-Both Ignition commands accept `--config`.
+Every Ignition command accepts `--config`.
 
 Multi-host `ignition export` and `ignition debug-serve` transfer checkpoint tensor
 ranges and prepared export payloads over the discovered CX7 fabric interfaces.
@@ -563,8 +581,11 @@ connections. `--roce-ring` selects forwarding through rank neighbors for a
 physical ring. `--transfer-streams N` selects 1 through 64 concurrent payload
 streams per peer (default 8), split across the available rails in either topology.
 Each rank owns its transfer helper; preparation requires no Orbit agents,
-controller files, pairing, or route signatures. The existing shared preparation
-token authenticates checkpoint and export frames end to end without encryption.
+controller files, pairing, or route signatures. The shared preparation token,
+read from `[preparation] checkpoint_token_file` (default
+`~/.config/flare/agent.token`), authenticates checkpoint and export frames end
+to end without encryption. Peer ranks run `ignition join`. Multi-host export
+requires the checkpoint in rank zero's hub cache; it does not download it.
 Metadata, endpoint exchange, and coordination use the rank rendezvous.
 See [checkpoint preparation](multi-host.md#prepare-the-core) for credentials,
 buffer bounds, and rendezvous traffic.
@@ -584,6 +605,13 @@ tuning, compilation of missing forwards, and graph capture still run.
 Diagnostics retain the bounded cache backing allocated during preparation.
 Use an exported core for long-context capacity tests; native core loading
 sizes the serving cache from the memory available after loading the model.
+
+`ignition debug-serve --direct` schedules each step in Python and replays the
+captured graphs without Helios, so it needs no `qualification` build; `--eager`
+and `--graph-times PATH` apply only with `--direct`. See
+[direct execution](direct-execution.md). `--prefix-cache-states N` is a
+`debug-serve`-only advanced flag that fixes the number of cached request states
+kept resident for prefix reuse; by default the plan sizes it from free memory.
 
 Select idle serving GPUs explicitly. Tensor-parallel preparation distributes
 forward compilation across the ranks within their memory budgets. Compiler
@@ -644,14 +672,14 @@ shows how to rebuild a compatible core with `--reuse-weights`.
 throughput with output cadence. For throughput-oriented serving, use
 `flare run model.safetensors --gpus 0,1,2,3 --scheduler-policy throughput`.
 This preference retains token-service fairness and can produce longer gaps
-between larger output bursts. It uses the core's existing graphs.
+between larger output bursts. It uses the core's captured graphs.
 Both policies retain terminal-retirement value and urgency. The independent
 `--scheduler-terminal-value VALUE` (default 256 prompt-token units) and
 `--scheduler-terminal-age-price PRICE` (default 1 value/ms²) override those
 coefficients after policy selection. Values must be finite and nonnegative;
 zero disables that term. Terminal age starts when termination is observed and
 includes queued-work drainage. These are scheduling preferences, not deadlines.
-The controls use existing snapshot graphs and require no core re-export.
+The controls use the core's captured snapshot graphs and require no re-export.
 
 `flare run CORE` loads an exported file and reads host defaults from
 `~/.config/flare/config.toml` using its Rust configuration reader. `--config PATH`
@@ -693,17 +721,28 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
+| `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
+| `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
+| `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |
+| `--prefix-cache-drain-on-shutdown[=DURATION\|on\|off]` | Drain host-memory records to local disk at shutdown, optionally bounded by a duration such as `90s` or `2m`; the bare flag means `on`, and a value requires `=` | `[prefix_cache] drain_on_shutdown`, otherwise `off` |
+| `--prefix-cache-max-age DURATION\|off` | Expire host records by time since last use | `[prefix_cache] max_age`, otherwise `off` |
+
+The table omits flags specified elsewhere: `--config`, the scheduler flags above,
+the multi-host flags in [section 2](#2-commands), the
+[download options](#downloading-published-cores), `--embedding-table-workers`
+below, and the `--prefix-cache-pool` flags in
+[section 3.4](#34-configuration-boundaries).
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
 probability `p` as `sqrt(p)` when choosing complete speculative programs
 and packed budgets. `1.0` uses the probabilities directly; values above `1.0`
 favor shorter prefixes. Confidence observations and token acceptance remain
-unchanged. This serving option uses existing core graphs and does not enable
+unchanged. This serving option uses the core's captured graphs and does not enable
 adaptive verification when fixed-width selection is configured.
 
 `--embedding-table-workers 1|2|4|8` controls Windows disk-reader workers.
 Workers share 128 I/O slots and 8 MiB of direct-read staging per embedding table.
-Windows defaults to four workers; other platforms retain one. Explicit worker
+Windows defaults to four workers; other platforms default to one. Explicit worker
 counts override the default. Large gathers use scoped helper threads, whose startup
 cost is included in gather latency. Small gathers stay on the delivery thread.
 Worker phase counters sum overlapping worker intervals and must not be subtracted
@@ -717,7 +756,7 @@ by default. An explicit nonzero cache requires disk storage and an embedding
 table catalog. Each host shares its budget across embedding tables and local
 tensor-parallel ranks. The loader commits cache memory before
 sizing KV and continuation pools, so the cache uses part of the integrated GPU's
-existing memory budget. The cache remains fixed in size while serving and warms
+memory budget. The cache remains fixed in size while serving and warms
 from requests each time the server starts.
 
 `--embedding-table-resident-scales` loads the original scale plane into immutable
@@ -730,16 +769,16 @@ weight and scale row sizes; it does not select behavior by model identity.
 Weight rows remain on disk, and a row-cache miss reads
 only the weight plane. The resident scale allocation is additional to
 `--embedding-table-cache-size` and is included in the integrated GPU memory
-budget. This option works with existing cores and requires disk table storage;
-RAM table storage already retains both planes. The metric
+budget. This option needs no re-export and requires disk table storage;
+RAM table storage holds both planes in host memory. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
 
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as
 `deepseek-v4.1-flash` select preparation inputs and configuration sections;
-they do not set the advertised API name. Existing cores retain their
-embedded aliases.
+they do not set the advertised API name. A core serves the aliases embedded
+when it was exported or edited.
 
 `--served-model-name` changes the name advertised by `/v1/models` and accepted
 for requests. It replaces the core aliases; the canonical model ID remains
@@ -758,7 +797,7 @@ extents. Reducing execution state can leave more memory for KV pages.
 
 ### Runtime memory limits
 
-`--kv-cache-limit memory` uses the remaining memory budget for KV, as before.
+`--kv-cache-limit memory` uses the remaining memory budget for KV.
 `context` caps useful KV history at one prepared context; `concurrency` caps it
 at one prepared context per selected active request. Concurrency three uses
 three contexts even though its graphs use a batch-four bucket. Context means
@@ -770,10 +809,10 @@ graphs' required private draft-page storage. They use the prepared context
 ceiling before fitting the served context to physical memory. All modes remain
 bounded by available memory and prepared virtual extents. The capped modes may
 start with a smaller pool than their ceiling; their minimum is one history page
-plus required draft storage per active request. The default memory mode retains
-its 8,192-token-per-request startup floor. A pool below its minimum fails startup.
-Prefix checkpoints continue borrowing the shared KV backing and are evicted
-under the existing shared policy.
+plus required draft storage per active request. The default memory mode has an
+8,192-token-per-request startup floor. A pool below its minimum fails startup.
+Prefix checkpoints borrow the shared KV backing and are evicted
+under the shared policy in every mode.
 
 `--memory-limit 30g` budgets at most 30 GiB for Flare on each selected GPU,
 including loaded weights, graph and kernel setup, scratch, execution state,
@@ -791,9 +830,9 @@ An explicit memory flag replaces the core's serving reserve; the two are
 never subtracted together. Without a flag, an explicitly configured `[memory] reserve`
 replaces the exported reserve; an absent setting preserves the core value.
 Integrated GPUs also count resident host tables, embedding row caches, and
-future prefix-cache host pools in the same physical budget. Shared host memory
-is charged once per host. The existing driver margin, host allowance, and
-system headroom remain in force. An occupied cap smaller than known fixed
+prefix-cache host pools in the same physical budget. Shared host memory
+is charged once per host. The driver margin, host allowance, and
+system headroom apply under every limit. An occupied cap smaller than known fixed
 resources fails before loading those resources. The loader reconciles observed
 startup consumption after graph upload and before allocating cache backing.
 Discrete occupied/fraction limits use NVIDIA NVML to observe memory before
@@ -844,7 +883,7 @@ capacities; the native loader validates its contract.
 
 `flare download` prints only the cached core path on stdout; resolution and
 terminal download progress go to stderr. It does not load or execute the core,
-or grant publisher trust. `flare run` applies the existing signature checks and
+or grant publisher trust. `flare run` applies signature checks and the
 publisher-approval flow after resolution. An existing path, an absolute path, a
 path starting with `./` or `../`, or a `.safetensors` path selects local serving.
 Download options are rejected for local core paths.
@@ -858,6 +897,7 @@ Both commands accept these download options:
 | `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
 | `--offline` | Resolve prepared cores only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local core path | Off |
+| `--tensor-parallel N[,N...]` | Tensor-parallel deployments of the repository's core to install | The selected GPU count |
 | `--core-cache PATH` | Flare prepared-model cache directory | `paths.core_cache`, otherwise `~/.cache/flare/cores` |
 
 Online acquisition uses the shared Hugging Face transport tree described under
@@ -904,7 +944,7 @@ filesystem whose free space cannot be queried prints `unknown`, which is distinc
 from zero. Estimates never reject an acquisition.
 A cached blob with an unexpected size or file type reports an error. Reuse
 operates on complete files, without Xet chunk reconstruction. Core signature
-verification still occurs when serving.
+verification occurs when serving.
 
 A complete core file already present in the user Hugging Face cache is reused
 without a transfer. The cache is `[paths].hub_cache` when configured and
@@ -946,8 +986,8 @@ Successful downloads record repository, requested revision, resolved commit,
 filename, TP selection, and the SHA-256 of the exact signed envelope authenticated
 during acquisition in the Flare cache. Offline resolution uses those references
 and verifies the selected entry's signatures and stored payloads. It never reads
-or imports HF snapshots. Source records written before envelope binding remain
-readable but are unbound; offline resolution rejects them with instructions to
+or imports HF snapshots. A source record without an envelope digest is
+readable but unbound; offline resolution rejects it with instructions to
 refresh the source online or load a cached entry by explicit path. A bound record
 whose entry envelope differs is rejected before the default changes. Automatic
 filename resolution requires a preceding download that selected its filename
@@ -962,8 +1002,11 @@ authentication are configured explicitly; native commands do not interpret
 ### Core snapshots
 
 `ignition export MODEL` publishes a prepared directory entry in the shared model
-cache and prints its path. A recipe's `export_repository` supplies its Hugging
-Face target; `--repo-id NAMESPACE/REPOSITORY` overrides it. For Qwen Flash:
+cache and prints its path. `--repo-id NAMESPACE/REPOSITORY`, or a recipe's
+`export_repository` when the recipe declares one, names the Hugging Face target
+that export validates and prints after the entry path; the target does not
+change the entry. No recipe in `ignition/recipes/` declares `export_repository`.
+For Qwen Flash:
 
 ```sh
 ignition export qwen3.8-flash
@@ -981,6 +1024,7 @@ The cache holds the directory canonical form of each entry:
     weights/layer-000.safetensors         # hardlink to a payload object
     deployments/<deployment>/rank-<n>/graphs.safetensors
   refs/<model-key>                        # selected default entry
+  sources/<selector-sha256>               # download selectors to entries
   staging/                                # unpublished work
   locks/                                  # stable lock inodes
 ```
@@ -1017,7 +1061,7 @@ allocation payload objects, so it needs no captured-allocation cache. Initial-st
 payloads (residual state, module globals) and executable resources are not
 weights: a graph or capacity change may produce new state and compressed executable
 frames, which such an export writes normally.
-The flag avoids temporary allocation files and duplicate weight writes. It still
+The flag avoids temporary allocation files and duplicate weight writes. It
 loads and prepares the checkpoint and reads captured storage to establish exact
 content identity. Changed graph captures and compressed executable resources may
 produce additional blobs. Regular exports also reuse matching cached payloads.
@@ -1038,15 +1082,18 @@ ignition convert /models/existing.safetensors \
 Conversion accepts payload-format cores and preserves their exact signed
 bodies and payload bytes. Supply the public publisher profile for a production
 core; the local development profile is loaded automatically. `--output`
-selects a destination and `--form` selects packed or directory form. Conversion
+selects a destination and `--form` selects packed or directory form. Without
+`--output`, directory-form conversion installs the core as an entry in the shared
+model cache and prints the entry path; `--form packed` requires `--output`.
+Conversion
 leaves its source intact. Conversion rejects logical-resource containers;
 export them again with Ignition to obtain a payload core. Serving accepts
-payload format 2 and signed format-6 logical-resource containers, with structural
-contract validation in both carriers. Execution ABI labels do not gate loading,
+payload format 2 and signed format-4 and format-6 logical-resource containers,
+with structural contract validation in both carriers. Execution ABI labels do not gate loading,
 and engine upgrades preserve previously supported models.
 
-The printed cache entry is self-contained and can be uploaded to the recipe's
-repository with the Hugging Face upload client as either canonical form. Export
+The printed cache entry is self-contained and can be uploaded to its Hugging
+Face repository with the Hugging Face upload client as either canonical form. Export
 and conversion do not upload or change publisher trust. Removing an entry removes
 its hard links; shared payload objects remain available for other entries, and
 `flare models gc` reclaims objects nothing references.
@@ -1107,6 +1154,18 @@ See [core snapshots](#core-snapshots).
 model preparation or GPU access. See [production signing](signing.md) for key
 custody, commands, and core promotion.
 
+`ignition combine CORE... --output DIR` writes one signed directory-form core
+that keeps every deployment of the listed payload-format cores, such as the
+tensor-parallel sizes of one model. It signs with `--signing-key`,
+`--namespace`, and `--official-source`, each defaulting to its `[publishing]`
+value; all three are required, and the local development key is not used. The
+sources must already be signed under that namespace, so development cores are
+promoted with `ignition sign` first. `--publisher-keys PATH` adds public profiles
+that authenticate the sources and is repeatable. Sources must agree on model,
+hardware, and publisher identity, frontend settings, sampling defaults, and
+preparation inputs other than tensor-parallel size and capacities. Combining
+needs no model preparation or GPU access, and `--output` must not exist.
+
 With no publishing identity configured, Ignition creates and reuses
 `development-signing-key.pem` beside its configuration file, with owner-only
 permissions. It also writes `development-publisher.json` containing the public
@@ -1124,7 +1183,7 @@ Publisher identity, key, source, license, and verification disclosures appear
 only on first acceptance of a signing-key fingerprint and publisher namespace.
 On a terminal, the banner animation finishes before those disclosures and the
 acceptance prompt. Remembered acceptance suppresses the disclosures, while
-every load still verifies signatures and executable resources.
+every load verifies signatures and executable resources.
 
 Every signing key is verified the same way. On every load that is not
 `--offline`, Flare fetches `publisher.json` from the root of the core's
@@ -1188,7 +1247,7 @@ Configured concurrency must fit the core's prepared capacities.
 
 `[publishing]`, `[preparation]`, `defaults.model`, image concurrency, speculative
 graph preparation settings, and the checkpoint, kernel, staging, and toolkit paths
-remain preparation settings. `flare run` requires a core; it does not interpret
+are preparation settings that native serving does not read. `flare run` requires a core; it does not interpret
 an Ignition recipe alias as a prepared core. `paths.hub_cache` selects only
 the user Hugging Face cache that acquisition reads read-only; it does not select
 prepared-core transport staging or the model cache.
@@ -1208,6 +1267,7 @@ api_key = ""                      # Empty: no authentication.
 [defaults]
 model = "qwen3.8-flash"
 max_concurrency = 4
+# image_concurrency = 4           # Active image requests; at most max_concurrency.
 # speculative_method = "mtp"      # Flash Next also supports dflash2.
 
 [preparation]
@@ -1215,6 +1275,7 @@ max_concurrency = 4
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
 # collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
+# checkpoint_token_file = "~/.config/flare/agent.token"  # Shared token for multi-host preparation.
 
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
@@ -1223,7 +1284,7 @@ reserve = "0"                     # GPU memory left for processes started later.
 memory = ""                      # Warm checkpoints and CPU inputs; empty or 0: no warm tier. Intake is additional.
 drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
 disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
-disk_transport = ""              # Empty: staged; also accepts direct.
+max_age = "off"                  # Expire host records by time since last use: off or a duration.
 
 [models."qwen3.8-flash"]          # Per-model overrides of [defaults].
 max_concurrency = 2
@@ -1237,10 +1298,15 @@ export_staging = ""               # Rank files an export assembles from; empty: 
 cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
 
+Ignition rejects any section or key outside its schema. Native Flare ignores
+keys it does not use, except in `[prefix_cache]`, where it accepts only `memory`,
+`disk_limit`, `drain_on_shutdown`, and `max_age`.
+
 `[models.<alias>]` overrides `[defaults]`; flags override both.
 Both sections accept `speculative_token_capacity`, overridden during preparation
 by `--speculative-token-capacity`. Omitting it uses the recipe declaration when
-supplied: all speculative recipes except Gemma 4 declare 128 target rows.
+supplied: Muse Spark declares 32 target rows and every other speculative recipe
+except Gemma 4 declares 128.
 Gemma 4 derives the larger of padded concurrency and draft count plus one,
 giving six rows at its defaults.
 Both sections also accept positive integer `speculative_graph_budget`, overridden
@@ -1253,13 +1319,14 @@ native exact and maximum verification budgets select only captured capacities.
 
 Default request parameters, meaning the values a request receives for fields
 it does not set, such as thinking, reasoning effort, sampling, and output
-limit, are a separate mechanism that this specification does not yet define.
+limit, have no configuration key or command-line flag other than
+`[server] thinking_token_budget`.
 Requests receive the checkpoint's template defaults, the recipe's manually
 verified model-card sampling defaults, and the engine's output limit.
 Sampling defaults are explicit core metadata; config-file sampling values
 do not select them. Sampling requests are clamped to the core's inclusive
 model-author ranges; parameters without ranges are fixed at their defaults.
-Seed remains request-controlled.
+The request controls the seed.
 
 `memory.reserve` exists for one case: a process that starts after Flare and
 needs GPU memory. Processes already running when Flare starts need no
@@ -1304,7 +1371,7 @@ Configuration assigns each decision to one owner:
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
-| Served names | Recipe alias and repository ID, exposed through `/v1/models` |
+| Served names | Recipe canonical model name as the serving alias, plus the checkpoint repository ID, or a local checkpoint directory's name, as the model ID, exposed through `/v1/models`; native `--served-model-name` replaces the alias |
 | API key | `[server] api_key`, overridden by native `--api-key-file`; excluded from cores |
 | Sampling distribution controls | Recipe defaults and optional model-author ranges; request values clamp to ranges, or to defaults when no range exists |
 | Seed, output limit, and stops | Request fields, with declared defaults for missing values |
@@ -1315,7 +1382,7 @@ load time retains draft weights; freeing those weights requires preparation
 with `--no-mtp`.
 
 Host checkpoint and prepared-input retention share the memory and disk settings
-in the [host retention design](prefix-cache-offload.md). Both tiers remain
+in the [host retention design](prefix-cache-offload.md). Both tiers are
 disabled unless configured. The memory setting includes registered checkpoint
 slabs and ordinary retained CPU inputs; bounded transfer, preprocessing, and
 decoded-source windows are accounted for separately at startup.
@@ -1345,14 +1412,14 @@ every rank and have no configuration-file key. See
 | Live state | One null row plus the recipe's execution rows per active request slot; GLM verification commits into one live row |
 | Decode graph capacities | 1 through `--max-concurrency`, rounded to the recipe's captured set |
 | Image feature arena | Prepared image concurrency times per-request feature capacity and embedding width; slots remain owned through request retirement |
-| Prefill chunk | The recipe's chunk, 4,096 tokens for Qwen, GLM, and DeepSeek; `--prefill-chunk-size` overrides |
+| Prefill chunk | The recipe's chunk, 4,096 tokens in every declared recipe; `--prefill-chunk-size` overrides |
 | Speculative catalog and draft counts | Recipe, overridden by `--no-mtp` and the `--mtp-*` flags; the draft count adapts from measured rounds unless fixed |
 | Kernel selections | Autotuned during preparation; cached by checkpoint revision, recipe version, GPU, and settings |
 | HTTP queue, workers, event capacity, body limit | `--max-concurrency` and the recipe's image limits |
 | Compile workers | Automatic or explicit host process budget, divided among local ranks and bounded by host RAM and device memory |
 | Sampling defaults | Complete Ignition recipe declaration, manually verified against the model card and exported in typed Protobuf fields |
-| Template defaults | The checkpoint template's own defaults, pending the same mechanism |
-| Served names | Recipe alias and repository id |
+| Template defaults | The checkpoint template's own defaults |
+| Served names | Recipe canonical model name and checkpoint repository ID |
 
 ## 5. Command behavior
 
@@ -1423,7 +1490,7 @@ multi-host core, including a copy holding only that rank's payloads.
 
 A payload core may contain several tensor-parallel deployments.
 `--tensor-parallel N` selects one by its authenticated prepared size. With no
-selector, a single-deployment core remains the default and a core with
+selector, a single-deployment core selects its one deployment and a core with
 several deployments fails with the available sizes. An absent size lists the
 available sizes; a duplicated size fails rather than choosing one. `--rank`
 selects a rank within the chosen deployment.
@@ -1464,7 +1531,8 @@ selection, and tensor-parallel selection. The latter filters the decoded catalog
 to the selected deployment and reports `selected_tensor_parallel` and the filtered
 `rank_count`; a missing or duplicated size is an error. `--publisher-keys` and
 `--trust-store` cannot be combined with it. Inspection accepts payload format version 2, including compressed executable
-resources, and old-layout internal `ProtectedIndex` envelope 6.
+resources, and logical-resource containers whose signed `ProtectedIndex`
+envelope has format 4 or 6.
 
 ## 6. Capacity errors
 
@@ -1472,24 +1540,25 @@ An estimate that does not fit fails `ignition export` before loading weights wit
 requirement, what is available, and the options that satisfy it:
 
 ```
-error: needs 68.3 GiB weights + 7.0 GiB graphs + 5.2 GiB live state + 0.9 GiB prefix cache
-       + 0.8 GiB minimum pages (4 × 8,192 tokens) = 82.2 GiB;
+error: needs 68.3 GiB weights + 7.0 GiB graphs + 5.2 GiB live state
+       + 0.8 GiB minimum pages (4 × 8,192 tokens) = 81.3 GiB;
        has 95.6 GiB free − 1.0 GiB headroom − 21.0 GiB reserve = 73.6 GiB.
-       Options: [memory] reserve = "12G".
+       Options: [memory] reserve = "13G".
 ```
 
-The requirement is the smallest estimate the engine accepts: the prefix cache
-at its floor and 8,192 tokens of pages per active request. Every listed option
+The requirement is the smallest estimate the engine accepts: weights, graphs,
+live state, and 8,192 tokens of pages per active request. A tensor-parallel
+plan states it per GPU. Every listed option
 satisfies it on its own; the candidates are a smaller `reserve`, a lower
 `--max-concurrency`, `--no-mtp`, and more GPUs. The error cannot occur without
 a `reserve`, another process on the GPU, or a model that does not fit at all,
-because pages and the prefix cache otherwise shrink to supply.
+because pages otherwise shrink to supply.
 
 The estimate is rough. A model near the limit can pass it and exhaust GPU
 memory during preparation; `ignition export` reports that as a capacity error too, quoting
 the failed allocation.
 
-The same form applies to GPU selection, "needs 2 GPUs with 95 GiB; 1
+The same form applies to GPU selection, "deepseek-v4-flash needs 2 or 4 GPUs; 1
 selected; use --gpus 0-1", and to requests rejected at admission over HTTP,
 whose response body names the exceeded capacity and the setting that raises
 it.
@@ -1547,7 +1616,7 @@ its `config.json` names. For a repository, Flare reads `config.json` and the
 safetensors index from the hub without downloading tensors; without
 `@revision` it uses the repository's current commit and reports it. The
 estimate sizes weights from that index and the recipe's placement. The
-recipe's alias remains a served name. An
+recipe's canonical model name remains the serving alias. An
 architecture no recipe supports, or an alias no recipe declares, is a usage
 error listing the supported aliases; a repository the hub cannot provide is a
 fetch error.
@@ -1562,16 +1631,18 @@ revision. Explicit local directories retain their filesystem casing. A local
 alias resolves its directory directly and fails if it is absent.
 `kimi-k3-mxfp4-csf` names `/data/models/Kimi-K3-MXFP4-CSF`.
 External draft checkpoints use the same hub cache as target checkpoints.
-Kimi's Red Hat DSpark checkpoint, `RedHatAI/Kimi-K3-speculator.dspark` at revision
+Kimi K3's Red Hat DSpark checkpoint, `RedHatAI/Kimi-K3-speculator.dspark` at revision
 `38a88101e0d46bb22134b9da340f381b954d40d4`, is downloaded there during preparation
-unless the target checkpoint supplies it in `dspark/`.
+unless the target checkpoint supplies it in `dspark/`. Kimi K3.1 Pro's DSpark
+draft is `Inferact/Kimi-K3.1-Pro-DSpark-preview` at revision
+`6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94`.
 Seven draft tokens and adaptive
 verification are the defaults. `--no-mtp` prepares ordinary execution without
 downloading or loading the draft checkpoint.
 
 ## 9. Recipe obligations
 
-For the command line to stay this small, every recipe declares:
+Every recipe declares:
 
 - aliases, repository ids, revisions, architectures;
 - each revision's stored tensor bytes by placement, device or auxiliary table
@@ -1612,9 +1683,10 @@ connect using `ignition join`. Rank zero receives missing export files through
 the authenticated streams before assembling and signing the core.
 
 `flare orbit run` starts native serving ranks, which distribute core bytes
-through CX7. `flare orbit push --to NODE,...` prestages through agents when the
-target list contains one node per core rank. Ring prestaging requires that
-exact list in physical ring order. Both Orbit commands accept
+through CX7. `flare orbit push --to NODE,...` prestages through agents. A
+target list with one node per core rank stages each rank's data on its node in
+rank order; any other node count stages the complete core on every listed node.
+Ring and chain prestaging require one node per rank in physical order. Both Orbit commands accept
 `--transfer-streams N` (1..64, default 8). Named groups retain the stream count;
 an explicit value overrides it. Agent control and prestaging use paired
 identities, encrypted sessions, and signed grants without additional
@@ -1640,11 +1712,12 @@ rank. See [Orbit](orbit.md) and [multi-host serving](multi-host.md).
 `flare models` manages the prepared-model cache selected by the global
 `--core-cache PATH` flag, which resolves exactly as `HubOptions.core_cache`
 does: an explicit path wins, then `paths.core_cache` from
-`~/.config/flare/config.toml`, then `~/.cache/flare/cores`. The legacy
-`paths.package_cache` setting is accepted as an alias; specifying both names
-is an error. If the default `cores` directory does not exist, Flare uses an
-existing `~/.cache/flare/packages` directory in place. No files move and no
-models need downloading again. The CLI and desktop use the same resolution.
+`~/.config/flare/config.toml`, then `~/.cache/flare/cores`. The
+`paths.package_cache` key is accepted as an alias of `paths.core_cache`;
+specifying both names
+is an error. If the default `cores` directory does not exist and
+`~/.cache/flare/packages` does, Flare uses that directory in place without
+moving files. The CLI and desktop use the same resolution.
 
 ```sh
 flare models list [MODEL] [--json]
@@ -1664,10 +1737,11 @@ default ref atomically and refuses an entry that is not published. `remove`
 refuses an entry that any process leases and refuses the selected default unless
 `--clear-default` is given; it never replaces the default with another entry
 silently. `gc` runs the cache's collection pass: it removes abandoned staging
-trees, unreferenced payload objects, and unreferenced legacy containers. It does
+trees, unreferenced payload objects, and unreferenced logical-resource
+containers under `blobs/legacy/`. It does
 not evict published entries, selected refs, or leased objects. A failed export
-leaves only an abandoned staging tree, which `gc` reclaims; an entry that was
-already published under `models/` is removed only by `models remove`. There is no
+leaves only an abandoned staging tree, which `gc` reclaims; an entry
+published under `models/` is removed only by `models remove`. There is no
 automatic reclamation of published entries.
 
 An unlocked staging tree that holds recognizable Hugging Face transport data is
@@ -1675,7 +1749,8 @@ a resumable download partial, not abandoned export work. `gc` preserves it and
 reports the count as `preserved_transport_trees`; `gc --downloads` is the only
 reclamation path for those trees. Recognition requires a top-level directory
 named `models--*`, `datasets--*`, or `spaces--*` that contains a `blobs`
-directory, which is the layout older Flare releases used for download staging.
+directory. The [download cache](#download-cache) section calls these legacy
+trees.
 
 ### Download cache
 
@@ -1700,7 +1775,7 @@ is `<parent>/transport/hub/v1`:
 
 `acquisition.lock` is a stable inode. An acquisition holds it shared for its
 whole lifetime; `gc --downloads` holds it exclusively and non-blockingly for the
-entire new-root pass. `<scope>` is the lowercase SHA-256 hex of the endpoint, a
+entire shared-root pass. `<scope>` is the lowercase SHA-256 hex of the endpoint, a
 NUL byte, and the Hugging Face repository folder. Content is shared across revisions of one
 endpoint and repository but not across repositories, because Hub ETags are
 repository-local. `<folder>` is the repository folder such as
@@ -1716,8 +1791,9 @@ truncating them. `.<key>.adopt-<pid>-<n>` is a transient copy used while
 adopting read-only Hugging Face cache content; it exists only while `<key>.lock`
 is held, and a crash can leave one behind.
 
-Older releases created transport trees as `.flare-hub-staging-*` directories
-under `--cache-dir` and under the model cache's `staging/trees`. Those trees use
+Flare also recognizes legacy transport trees outside the shared root:
+`.flare-hub-staging-*` directories under `--cache-dir`, and trees under the
+model cache's `staging/trees`. Legacy trees use
 the Hugging Face layout directly: top-level `models--*` folders containing
 `blobs/<etag>`, `<etag>.part`, and `<etag>.lock`, with optional `refs` and
 `snapshots`. They have no version marker. The command reports them separately
@@ -1756,7 +1832,7 @@ A cleanup failure is reported but does not undo the installed core.
 `gc --downloads` reclaims the shared root and legacy trees in addition to the
 ordinary model-cache pass. `--cache-dir` requires `--downloads`. It acquires the
 transport's exclusive acquisition lease before touching repository metadata or
-blobs; when any acquisition holds the lease shared, the whole new-root pass is
+blobs; when any acquisition holds the lease shared, the whole shared-root pass is
 skipped and reported as active. Reclamation:
 
 - Never removes the transport root, its `version` marker, `acquisition.lock`,
@@ -1778,7 +1854,7 @@ skipped and reported as active. Reclamation:
   `staging/trees` tree until its deletion finishes. A cache staging tree with a
   live lease or transfer lock is preserved as active.
 - Never removes a `.flare-hub-staging-*` directory. These directories have no
-  operation lease, so an old writer could start a new transfer after any
+  operation lease, so a process writing that layout could start a transfer after any
   per-file lock check; safe inactivity cannot be established. They are reported
   as unverified legacy staging.
 
@@ -1797,9 +1873,9 @@ is observed can make an inactive-looking file active. Reclamation and
 post-install cleanup exclude acquisitions through the shared/exclusive transport
 lease, so snapshot paths remain present for as long as an acquisition holds its
 lease. Successful installation removes only consumed copies that no other
-snapshot references; `gc --downloads` remains the explicit path that removes
-failed partials and other unused transport content. Explicit `.flare-hub-staging-*`
-directories remain permanently unreclaimable by this command because they carry
+snapshot references; `gc --downloads` is the explicit path that removes
+failed partials and other unused transport content. This command never reclaims
+`.flare-hub-staging-*` directories because they carry
 no lease that establishes inactivity. On platforms without inode identity,
 `retained_bytes` counts each hardlinked path separately and post-install
 cleanup cannot attribute consumed hardlinks, so those copies remain until an
@@ -1834,5 +1910,5 @@ identity, deployments, and capacities without claiming authentication.
 `inspect` resolves `MODEL[@VERSION]` to the selected version while holding its
 lease and then runs the normal core inspection path, so
 `--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
-`--tensor-parallel`, and the section flags keep their established semantics. It does not gain a separate
+`--tensor-parallel`, and the section flags behave as they do for `flare inspect`. It has no separate
 verification path.

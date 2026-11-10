@@ -4,8 +4,11 @@ Flare builds on Windows 11 x64 and ARM64 through Rust's
 `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets.
 Copy an exported `.safetensors` core matching the serving GPU's SM120 or
 SM121 architecture and its publisher profile to the Windows serving host.
-Serving requires payload format version 2 cores with typed prepared
-contracts and signed zstd-compressed executable frames.
+Serving loads payload format version 2 cores with typed prepared
+contracts and signed zstd-compressed executable frames. The loader also accepts
+signed format-4 and format-6 logical-resource containers on every platform
+([runtime core design](runtime-core-design.md)). Not qualified: loading those
+containers on Windows.
 Ignition can also prepare the single-GPU `qwen3.8-27b` recipe on Windows with
 `--no-compile`.
 
@@ -87,10 +90,11 @@ Rebuild and run native tests from any configured PowerShell:
 
 Setup supports ARM64 and x64 paths; validate each architecture on its own host.
 It does not download model weights or establish complete-model GPU correctness.
-The Selene cache suite is not fully qualified on Windows: its process nonce
-source opens `/dev/urandom`, which fails on Windows, and cache read-ahead tests
-have stalled on ARM64. Keep those failures separate from successful build and
-CLI checks when validating native changes.
+Not qualified: the `selene` test suite on Windows. Its process nonce source
+(`selene/src/shared/identity.rs`) opens `/dev/urandom`, which Windows does not
+provide, and its cache read-ahead tests can stall on ARM64. Report those
+failures separately from build and CLI check results when validating native
+changes.
 
 For a manually provisioned environment, follow these requirements:
 
@@ -111,8 +115,8 @@ cargo test --locked --release --manifest-path flare-cli/Cargo.toml
 
 The `Native serving` GitHub Actions workflow builds natively on Linux and Windows,
 runs the native CPU tests, and exercises the Windows executable on Windows.
-GPU tests require explicitly supplied cores and hardware and remain ignored
-in the CPU suite.
+GPU tests require explicitly supplied cores and hardware and are ignored in
+the CPU suite.
 
 ## Serve a prepared core
 
@@ -120,6 +124,13 @@ in the CPU suite.
 .\flare-cli\target\release\flare.exe run C:\models\qwen38-tp1-mtp5.safetensors `
   --publisher-keys C:\models\publisher.json --gpus 0
 ```
+
+`.\flare-cli\target\release\flare.exe` is the output of a build that leaves
+`CARGO_TARGET_DIR` unset, such as the manually provisioned build above. A shell
+configured by `scripts/dev_windows.ps1` builds
+`$env:LOCALAPPDATA\FlareDev\target\release\flare.exe` (or the same path under the
+`-DevRoot` directory), and its `flare` function runs that executable with
+`.local-dev/config.toml`.
 
 Publisher acceptance, request sampling, graph-capacity selection, and HTTP APIs
 follow the [CLI specification](cli-design.md). The default trust store is
@@ -132,20 +143,21 @@ All core shards share each worker's ring and staging allocation; file indices
 keep equal offsets in separate shards distinct.
 Each disk-reader worker refills completed slots during the gather; the default
 four workers share 128 slots and 8 MiB of staging per table. Disk prefix caches
-continue using I/O completion ports. Both paths use unbuffered overlapped I/O with
-bounded queues. File offsets, lengths, and buffers retain the core's
-4 KiB alignment; incompatible storage geometry is rejected. RAM embedding tables
-and memory prefix caches retain their existing explicit storage selections.
+use I/O completion ports. Both paths use unbuffered overlapped I/O with
+bounded queues. File offsets, lengths, and buffers use the core's 4 KiB
+alignment; incompatible storage geometry is rejected. The storage selections for
+RAM embedding tables and memory prefix caches are independent of these disk
+paths.
 Registered prefix-cache slabs can have different CPU and GPU addresses under
 WDDM. Disk I/O uses the CPU address; batched CUDA transfers use the device alias
 resolved at registration, with the same offsets and record layout. Treating the
 CPU address as a GPU pointer can fail with `CUDA_ERROR_ILLEGAL_ADDRESS` on the
 first checkpoint copy.
 
-Qwen Flash TP1 on RTX Spark N1X has been exercised with disk-only and combined
-RAM/disk prefix caching: concurrent requests, checkpoint writes, restoration
-after restart, and clean shutdown. Other model cache layouts and tensor-parallel
-Windows offload still require complete-model validation.
+Windows prefix-cache offload is qualified for Qwen Flash TP1 on RTX Spark N1X
+with disk-only and combined RAM/disk caching: concurrent requests, checkpoint
+writes, restoration after restart, and shutdown. Not qualified: other model
+cache layouts and tensor-parallel offload on Windows.
 
 Retained core handles are also unbuffered and prevent replacement or writes
 while the model is loaded. Buffered core handles are limited to startup:
@@ -161,18 +173,21 @@ the Windows reader and does not require this development handoff.
 
 ## Hardware compatibility
 
-Native ARM64 Flare serves `nvidia/Qwen3.8-27B-NVFP4` on an RTX Spark N1X
-(SM121) under Windows 11 WDDM. Generation, prefix restoration, and resume have
-been exercised with both Linux-prepared and Windows-prepared cores containing
-only device allocations. A Linux-exported SM121 Engram fixture also passes native Windows
-replay with mapped mailboxes, disk and RAM row delivery, inactive rows, and read
-failure handling. Mailbox publication tests cover up to 65,536 IDs across repeated
-allocation-free graph replay on Linux and Windows. These fixture tests do not
-establish complete Qwen PLE model correctness or performance on Windows.
-Concurrent 27B generation can emit EOS before completing a requested counting
-sequence; the complete scheduler test suite does not pass. Linux-prepared device
-reservations can also fail intermittently with an address collision before
-weight loading. Successful single-request generation does not cover these cases.
+Native ARM64 serving of `nvidia/Qwen3.8-27B-NVFP4` is qualified on an RTX Spark
+N1X (SM121) under Windows 11 WDDM for single-request generation, prefix
+restoration, and resume, with Linux-prepared and Windows-prepared cores
+containing only device allocations. Fixture tests on Windows cover native replay
+of a Linux-exported SM121 Engram fixture with mapped mailboxes, disk and RAM row
+delivery, inactive rows, and read failure handling. Mailbox publication tests
+cover up to 65,536 IDs across repeated allocation-free graph replay on Linux and
+Windows.
+
+Not qualified on that configuration: complete Qwen PLE model correctness and
+performance, which the fixture tests do not establish; concurrent generation,
+where 27B requests can emit EOS before completing a requested counting sequence
+and `tests/server/test_scheduler.py` does not pass in full; and repeatable
+loading of Linux-prepared cores, whose device reservations can fail
+intermittently with an address collision before weight loading.
 
 On RTX Spark, CUDA's free and total memory include the dedicated GPU carveout
 and shared system memory. Windows reports only CPU-visible RAM through its
@@ -186,7 +201,7 @@ system-managed page file on demand up to a maximum it chooses, about three times
 RAM. Serving sizes caches from the smaller of CUDA's free memory and the commit the
 process can obtain once every page file reaches its maximum size, then subtracts the
 configured reserve, driver margin, and integrated-GPU host headroom, so the reserve
-remains available to other processes as commit. Page-file capacity is not GPU
+is available to other processes as commit. Page-file capacity is not GPU
 memory, but it bounds GPU allocations: when RAM plus the maximum page-file size is
 smaller than the server's footprint plus other processes' commit, KV capacity
 shrinks to fit. A custom page-file maximum raises that limit without consuming RAM.
@@ -200,18 +215,18 @@ the Windows driver and GPU.
 
 Ignition places rank-zero host storage at 12 TiB on Windows and on Linux when
 all device rank ranges fit below it (up to four Linux ranks). Larger Linux
-layouts use 32 TiB so their host and device ranges remain disjoint, including
+layouts use 32 TiB so their host and device ranges are disjoint, including
 sixteen-rank preparation. Heliopause selects the base and reports each rank's
 host range to Ignition before allocation.
-The core format and mailbox release/acquire protocol are shared. Cores
-still require matching GPU architecture, available virtual addresses, and supported
-CUDA operations. On RTX Spark N1X with driver 617.42, requesting the 16 TiB host
-address used by earlier exports hangs inside `cuMemAddressReserve`; the 32 TiB
-address also stalls, even for a 2 MiB reservation.
-Cores using those host addresses need re-exporting before Windows use. For
-a Linux TP1 core, rebuild Heliopause with the updated preparation code and
-export to a new filename; its host storage will use 12 TiB. Other Windows
-compatibility requirements still apply. The runtime does not relocate graph storage.
+Linux and Windows share the core format and the mailbox release/acquire
+protocol. A core loads on Windows only when its GPU architecture matches, its
+recorded virtual addresses are available, and its CUDA operations are supported.
+Host storage recorded at 16 TiB or 32 TiB cannot be reserved under Windows on
+RTX Spark N1X with NVIDIA driver 617.42: `cuMemAddressReserve` does not return
+for a host address at either base, including a 2 MiB reservation. The runtime
+does not relocate graph storage, so such a core must be re-exported before
+Windows use. Re-export a Linux TP1 core to a different filename; its host
+storage is placed at 12 TiB.
 
 Validate fixed device mappings and graph replay using the exported runtime
 fixtures on each target GPU. Cores with mapped host storage additionally
@@ -239,29 +254,33 @@ Build from the repository root after setting up the native development tools:
 ```
 
 The default launch reads the same user configuration and core cache as the
-normal CLI, including existing downloads under `~/.cache/flare/packages`.
-Pass `--config .\.local-dev\config.toml` only to use the separate development
-cache configured by the setup script.
+CLI: `~/.config/flare/config.toml` and, unless `paths.core_cache` is set,
+`~/.cache/flare/cores`, where `~` is the Windows user profile folder. When
+`cores` is absent and `~/.cache/flare/packages` exists, `packages` is used in
+place. Pass `--config .\.local-dev\config.toml` only to use the separate
+development cache configured by the setup script.
 
 Use `-Platform x64` for an x64 distribution. The helper restores pinned Windows
 App SDK and C++/WinRT packages, links the Rust static library, and bundles the
 Release runtime into one desktop `Flare.exe`. Its launcher silently extracts
 the runtime beneath the Windows Local App Data known folder at
 `Flare/Desktop/<ARM64|x64>/<archive-SHA256>` on first launch, then starts the
-native `flare-winui.exe`. Repeat launches reuse the extracted version; archive
-cache versions are retained. This does not change the model cache, configuration,
-publisher trust, or desktop state. Arguments, including `--config`, are forwarded
-with the caller's working directory preserved.
+native `flare-winui.exe`. Repeat launches reuse the extracted version; versions
+extracted from other archives are not removed. Extraction does not change the
+model cache, configuration, publisher trust, or desktop state. Arguments,
+including `--config`, are forwarded with the caller's working directory
+preserved.
 
 To package an already-built Release folder without rebuilding C++, run
 `./flare-winui/package-single-file.ps1 -Platform ARM64`. Add `-ArchiveOnly` to
 create and validate the embedded ZIP without compiling the launcher. The ZIP
 records file sizes and SHA-256 digests with fixed ordering and timestamps.
-The launcher uses the static C runtime; build outputs remain unsigned. An
+The launcher uses the static C runtime; build outputs are unsigned. An
 installer, signing workflow, and automatic runtime-cache cleanup are not provided.
 
-Omit `-SingleFile` to retain the loose development workflow, launching
-`Release/flare-winui.exe` with its complete adjacent runtime directory.
+Omit `-SingleFile` for the loose development workflow, launching
+`.local-dev\winui\<ARM64|x64>\Release\flare-winui.exe` with its complete
+adjacent runtime directory.
 Serving requires a supported NVIDIA driver; Rust, Python, and the CUDA toolkit
 are development dependencies. See the [desktop build reference](../flare-winui/README.md)
 for output paths and archive contents.
@@ -274,8 +293,9 @@ without another download; this association does not establish trust or claim
 that the local version is the repository's latest revision. Publisher acceptance
 is bound to the verified signing key and namespace. External core references
 do not copy or delete their source files. `desktop-state.json`, beside the
-selected configuration, records references, downloads, appearance, and the model
-directory. Core details distinguish authenticated capabilities from unverified
+selected configuration, records references, downloads, appearance, runtime
+setting overrides, and the model directory. Core details distinguish
+authenticated capabilities from unverified
 metadata. External references can be relocated without copying model files.
 
 Home presents installed cores and actions to find or import a core before a
@@ -300,7 +320,7 @@ are cleared when the serving session ends; they are not saved to disk.
 
 The desktop uses a fixed dark theme with NVIDIA green accents. Windows theme
 changes and saved System or Light preferences do not change its appearance.
-Settings retains the Comfortable and Compact density choices.
+Settings offers Comfortable and Compact density choices.
 Runtime settings include serving-memory and KV-capacity limits, concurrency,
 listener address/port, weight verification, host prefix-cache retention, and
 speculation/embedding overrides. Save persists desktop overrides without
@@ -314,25 +334,29 @@ unless a limit is specified. See the
 Serving uses one prepared model on one local GPU. Switching pauses admission,
 finishes accepted responses, drains execution, and releases the prior session.
 Closing cancels downloads cooperatively and drains serving. Unconfirmed GPU
-drain requires restarting the application. The CLI retains its multi-GPU options.
+drain requires restarting the application. Multi-GPU serving is available only
+through the CLI.
 Inference and switching require validation with a compatible prepared core on
 each target GPU; UI compilation and application tests do not qualify those paths.
 
-The ARM64 desktop has loaded the cached Qwen3.8-27B core on an RTX Spark N1X,
-served multi-turn Chat replies with runtime memory and concurrency defaults,
-and closed cooperatively with its process and local listener released. The x64
-C++ shell compiles, but x64 linking and inference have not been qualified.
-Live network-transfer interruption, switching under load, accessibility, and
-sleep/GPU-reset recovery require additional qualification.
+The ARM64 desktop is qualified on an RTX Spark N1X with a cached Qwen3.8-27B
+core: loading, multi-turn Chat replies with runtime memory and concurrency
+defaults, and cooperative close that releases the process and local listener.
+Not qualified: x64 linking and inference (the x64 C++ shell compiles),
+network-transfer interruption, switching under load, accessibility, and recovery
+from sleep or GPU reset.
 
 ## Prepare Qwen on Windows
 
-The exercised preparation environment uses x64 CPython 3.12, PyTorch
+Preparing `qwen3.8-27b` on Windows is qualified with x64 CPython 3.12, PyTorch
 2.13.0+cu130, CuTe DSL 4.8.0, triton-windows 3.7.1.post27, and the x64 CUDA
 13.4.1 toolkit. On ARM64 Windows, Python and the preparation tools run under
-x64 emulation; the serving executable remains native ARM64. Build Heliopause
+x64 emulation; the serving executable is native ARM64. Build Heliopause
 for `x86_64-pc-windows-msvc` to match Python, using the MSVC ARM64-to-x64
-developer shell. FlashInfer must include its Windows checkpoint reader and
+developer shell. On Windows, Heliopause compiles a bundled static OpenSSL, which
+requires Perl on `PATH`; see
+[environment setup](model-preparation.md#environment-setup). FlashInfer must
+include its Windows checkpoint reader and
 MSVC JIT build support. The Linux dependency lock does not provision this
 Windows environment.
 
@@ -353,14 +377,15 @@ python -m ignition convert CACHE_ENTRY --config C:\models\ignition.toml `
   --form packed --output C:\models\qwen38-27b.safetensors
 ```
 
-`--no-compile` disables forward compilation. Kernel compilation, autotuning,
-warmup, and CUDA graph capture still run before export. The checkpoint reader
-uses unbuffered overlapped reads and bounded pinned transfer buffers; the
-prepared model's storage remains device memory. Export rejects any reachable
+`--no-compile` disables forward compilation only: kernel compilation,
+autotuning, warmup, and CUDA graph capture run before export. The checkpoint
+reader uses unbuffered overlapped reads and bounded pinned transfer buffers; the
+prepared model's storage is device memory. Export rejects any reachable
 library allocation below the restorable address floor. Development signing
 keys use a protected Windows DACL granting access only to the owner and SYSTEM.
 
-Forward compilation uses spawn-based worker pools on Windows. The GPU AOT tests
-exercise parallel metadata-only compilation, saved-forward restoration, mutation
-and alias preservation, and allocation-stable graph replay. Omit `--no-compile`
-to enable compilation for a model export.
+Forward compilation uses spawn-based worker pools on Windows. The GPU tests in
+`tests/preparation/test_aot.py` exercise parallel metadata-only compilation,
+saved-forward restoration, mutation and alias preservation, and
+allocation-stable graph replay. Omit `--no-compile` to enable compilation for a
+model export.
