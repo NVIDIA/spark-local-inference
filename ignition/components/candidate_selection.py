@@ -4,6 +4,8 @@
 
 import torch
 
+from ignition.preparation.tuning import register_finalizer
+
 from .candidate_rows import PreparedCandidateRows
 from .collectives import PreparedAllGather
 from .ordered_row_topk import PreparedOrderedRowTopK
@@ -88,30 +90,66 @@ class PreparedCandidateSelection:
                     ("replication", self.owner.broadcast.reduction.plan))
         raise ValueError("candidate selection implementation has no prepared plans")
 
-    def pack(self, implementation=None):
+    def functional(self, *, session):
+        if self.gather is not None:
+            self.gather.functional(session=session)
+            self.candidates.functional()
+            self.fold.functional(session=session)
+        if self.owner is not None:
+            self.owner.functional(session=session)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        for name in ("indices", "scores", "positions", "output", "active", "packed", "gathered",
+                     "values", "global_ids", "lengths", "selected_scores", "planar", "owner_scores", "owner_ids"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        self.dependencies = []
+
+    def pack(self, implementation=None, *, indices=None, scores=None):
         implementation = self.implementation if implementation is None else implementation
-        live = self.indices >= 0
+        dynamic = indices is not None
+        indices = self.indices if indices is None else indices
+        scores = self.scores if scores is None else scores
+        live = indices >= 0
         if implementation == "owner":
-            self.owner_ids.copy_(torch.where(live, self.indices*self.world+self.rank, -1).to(torch.int32))
-            self.owner_scores.copy_(torch.where(live, self.scores, -torch.inf))
-            return self.planar
+            planar = (torch.empty((2 * self.rows, self.topk), dtype=torch.float32, device=scores.device)
+                      if dynamic else self.planar)
+            owner_scores, owner_ids = planar[:self.rows], planar[self.rows:].view(torch.int32)
+            owner_ids.copy_(torch.where(live, indices * self.world + self.rank, -1).to(torch.int32))
+            owner_scores.copy_(torch.where(live, scores, -torch.inf))
+            return planar
         if implementation == "replicated":
-            self.packed[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
-            self.packed.view(torch.int32)[:, :, 1].copy_(
-                torch.where(live, self.indices*self.world+self.rank, -1).to(torch.int32))
-            return self.packed
+            packed = (torch.empty((self.rows, self.topk, 2), dtype=torch.float32, device=scores.device)
+                      if dynamic else self.packed)
+            packed[:, :, 0].copy_(torch.where(live, scores, -torch.inf))
+            packed.view(torch.int32)[:, :, 1].copy_(
+                torch.where(live, indices * self.world + self.rank, -1).to(torch.int32))
+            return packed
         raise RuntimeError("candidate selection must bind a composition before execution")
 
-    def exchange(self, implementation=None, *, positions=None):
+    def exchange(self, implementation=None, *, positions=None, packed=None, dependencies=()):
         implementation = self.implementation if implementation is None else implementation
-        self.active.copy_((self.positions if positions is None else positions) >= 0)
-        if implementation == "owner":
-            return self.owner()
-        if implementation == "replicated":
-            self.gather(self.packed.view(torch.bfloat16).view(self.rows, -1))
-            self.candidates()
-            self.fold()
-            return self.output
+        if packed is not None:
+            active = positions >= 0
+            if implementation == "owner":
+                return self.owner(packed[self.rows:].view(torch.int32), packed[:self.rows],
+                                  active, dependencies=dependencies)
+            if implementation == "replicated":
+                gathered = self.gather(packed.view(torch.bfloat16).view(self.rows, -1),
+                                      dependencies=dependencies).view(torch.float32).view(self.rows, self.topk * self.world, 2)
+                values, indices, lengths = self.candidates(gathered, active)
+                return self.fold(values, lengths, indices)
+        else:
+            self.active.copy_((self.positions if positions is None else positions) >= 0)
+            if implementation == "owner":
+                return self.owner()
+            if implementation == "replicated":
+                self.gather(self.packed.view(torch.bfloat16).view(self.rows, -1))
+                self.candidates()
+                self.fold()
+                return self.output
         raise RuntimeError("candidate selection must bind a composition before execution")
 
 

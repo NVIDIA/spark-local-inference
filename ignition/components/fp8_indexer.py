@@ -104,7 +104,8 @@ class PreparedFP8Indexer:
         write_fp8_index_keys(keys, slots, self.cache,
                             hadamard=self.hadamard, power_of_two=self.key_power_of_two)
 
-    def functional(self, *, session):
+    def functional(self, *, session, dynamic_cache=False):
+        self.dynamic_cache = dynamic_cache
         self.query_layout = tuple(self.query.shape)
         self.copy_pages = self.packed_pages is not self.pages
         self.selection.functional(session=session)
@@ -114,12 +115,15 @@ class PreparedFP8Indexer:
     def _release_examples(self):
         self.query = self.weights = self.quantized = self.scales = self.scaled_weights = None
         self.query_arguments = self.query_outputs = self.pages = self.packed_pages = None
+        if self.dynamic_cache:
+            self.cache = None
+            self.selection.inputs["index_k_cache"] = None
 
-    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None):
-        output, _, _ = self._run(query, weights, pages, lengths, active)
+    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None, *, cache=None):
+        output, _, _ = self._run(query, weights, pages, lengths, active, cache=cache)
         return output
 
-    def _run(self, query=None, weights=None, pages=None, lengths=None, active=None):
+    def _run(self, query=None, weights=None, pages=None, lengths=None, active=None, *, cache=None):
         if self.query is None:
             rows, heads, _ = self.query_layout
             quantized = torch.zeros(self.query_layout, dtype=torch.float8_e4m3fn, device=query.device)
@@ -130,7 +134,7 @@ class PreparedFP8Indexer:
             glm_pool.quantize_queries(query.view(-1, 128), quantized.view(-1, 128), scales.view(-1),
                                       scaled_weights.view(-1), plan=self.query_plan)
             output = self.selection(quantized, scaled_weights, pages.clone() if self.copy_pages else pages,
-                                    lengths, active)
+                                    lengths, active, cache=cache)
             return output, quantized, scaled_weights
         query = self.query if query is None else query
         weights = self.weights if weights is None else weights

@@ -15,6 +15,7 @@ from ignition.recipes.kimi3.dcp import ContextShards
 
 from .dcp import RECORD_BYTES, TOPK, selection_slots, write_records
 from .indexer import PreparedDSAIndexer, SharedBuffers
+from ignition.preparation.tuning import register_finalizer
 
 
 class PreparedDSA(PreparedMLAProjection):
@@ -69,13 +70,15 @@ class PreparedDSA(PreparedMLAProjection):
             slots = storage.buffer("slots", (rows, TOPK), torch.int32)
             counts = storage.buffer("counts", (rows,), torch.int32)
             starts, pages = constants.starts[:rows + 1], constants.pages[:rows]
-            part = dict(selector=selector, owners=owners, slots=slots, counts=counts)
+            part = dict(selector=selector, owners=owners, slots=slots, counts=counts, starts=starts, pages=pages)
             if mode == "prefill":
                 if peers is None or peers.shape != (self.shards.world,):
                     raise ValueError("Kimi sparse prefill requires every rank's latent-cache address")
                 selected = storage.buffer("records", (rows, TOPK, RECORD_BYTES), FP8)
                 local_history = self.history is not None
-                part["gather"] = PreparedPeerRecordGather(context.staged_address if local_history else peers,
+                part["gather"] = PreparedPeerRecordGather(
+                    torch.tensor([self.history_records.data_ptr()], dtype=torch.int64, device=source.device)
+                    if local_history else peers,
                     owners, slots, counts, selected,
                     peer_records=self.history_records.shape[0] if local_history else cache.shape[0] * cache.shape[1],
                     session=session, name=f"{name}.records{start}",
@@ -117,45 +120,76 @@ class PreparedDSA(PreparedMLAProjection):
             self.query_overlap = ConcurrentAllGather(part["gather"], workspace=workspace, session=session,
                                                      parallel_plans=self.indexer.local_plans)
 
-    def __call__(self, source):
-        self.project(source)
-        self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
-        if self.query_overlap is not None:
-            part, = self.parts.values()
-            part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
-            self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
-        self.indexer.project(source)
-        if self.indexer.sharded is not None:
-            self.indexer.sharded()
+        self.functional(session=session)
         if self.history is not None:
-            self.history_end.copy_((self.metadata.starts + self.metadata.lengths) * (self.metadata.lengths > 0))
-            self.history()
+            self.history.functional()
+        for part in self.parts.values():
+            part["gather"].functional(session=session)
+            if mode == "prefill":
+                part["attention"].functional(session=session, cache=None)
+            else:
+                part["attention"].functional(session=session)
+                part["combine"].functional(session=session)
+        if self.query_overlap is not None:
+            self.query_overlap.functional(session=session)
+        register_finalizer(session, self._release_dsa_examples)
+
+    def _release_dsa_examples(self):
+        self.slots = self.history_end = self.history_records = None
+        for part in self.parts.values():
+            for name in ("owners", "slots", "counts", "quantized", "gathered", "partial", "lse"):
+                part.pop(name, None)
+            if self.history is not None:
+                part["gather"].peers = None
+
+    def __call__(self, source, metadata=None):
+        if metadata is None:
+            raise ValueError("sparse MLA execution requires invocation metadata")
+        projected = self.project(source, metadata)
+        slots = self.shards.token_slots(metadata.positions, metadata.token_page_table)
+        write_records(projected.latent, slots, self.cache.view(-1, RECORD_BYTES))
+        pending = None
+        if self.query_overlap is not None:
+            quantized = projected.absorbed.float().clamp(-448., 448.).to(FP8)
+            pending = self.query_overlap.start(quantized.view(source.shape[0], -1), dependencies=(self.cache,))
+        query, weights = self.indexer.project(source, projected.query_norm, metadata)
+        selected_all = None if self.indexer.sharded is None else self.indexer.sharded(query, weights, metadata)
+        history = None
+        if self.history is not None:
+            end = (metadata.starts + metadata.lengths) * (metadata.lengths > 0)
+            history = self.history(metadata.page_table[0], end)
+        attended = torch.empty((source.shape[0], self.heads, 512), dtype=source.dtype, device=source.device)
         for start, end in self.indexer.bounds:
-            part = self.parts[end - start]
-            positions = self.metadata.positions[start:end]
-            tables = self.metadata.token_page_table[start:end]
-            if self.indexer.sharded is not None:
-                selected = self.indexer.sharded.selected[start:end]
-            elif self.query_overlap is None:
-                selected = part["selector"](self.indexer.query[start:end], self.indexer.head_weights[start:end],
-                                             positions, tables)
+            rows = end - start
+            part = self.parts[rows]
+            positions, tables = metadata.positions[start:end], metadata.token_page_table[start:end]
+            gathered = None
+            if selected_all is not None:
+                selected = selected_all[start:end]
+            elif pending is None:
+                selected = part["selector"](query[start:end], weights[start:end], positions, tables)
             else:
                 selector = part["selector"]
-                dependency = selector.prepare_local(self.indexer.query[start:end],
-                    self.indexer.head_weights[start:end], positions, tables)
-                self.query_overlap.finish(part["quantized"].view(self.absorbed.shape[0], -1), dependency)
-                selected = selector.exchange(positions)
-            selection_slots(selected, positions, tables, part["owners"], part["slots"],
-                part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill",
-                global_records=self.history is not None)
+                packed = selector.prepare_local(query[start:end], weights[start:end], positions, tables)
+                gathered = self.query_overlap.finish(pending, packed)
+                selected = selector.exchange(packed, positions, dependencies=(gathered,))
+            owners = torch.empty((rows, TOPK), dtype=torch.int32, device=source.device)
+            slots = torch.empty_like(owners)
+            counts = torch.empty((rows,), dtype=torch.int32, device=source.device)
+            selection_slots(selected, positions, tables, owners, slots, counts, self.shards,
+                self.cache.shape[0], local=self.mode != "prefill", global_records=history is not None)
             if self.mode == "prefill":
-                part["gather"]()
-                part["attention"](self.absorbed[start:end], self.attended[start:end])
+                records = part["gather"](owners, slots, counts, records=history,
+                    dependencies=() if history is None else (self.history.completed,))
+                output = part["attention"](projected.absorbed[start:end],
+                    cache=records.view(-1, 1, RECORD_BYTES), page_table=part["pages"],
+                    lengths=counts, starts=part["starts"])
             else:
-                if self.query_overlap is None:
-                    part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
-                    part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
-                part["attention"](part["gathered"], part["partial"])
-                part["combine"](part["partial"], part["lse"])
-        return self.finish()
+                if gathered is None:
+                    quantized = projected.absorbed[start:end].float().clamp(-448., 448.).to(FP8)
+                    gathered = part["gather"](quantized.view(rows, -1), dependencies=(self.cache,))
+                partial, lse = part["attention"](gathered.view(rows, self.heads * self.shards.world, RECORD_BYTES),
+                    page_table=slots, lengths=counts, starts=part["starts"])
+                output = part["combine"](partial, lse)
+            attended[start:end].copy_(output)
+        return self.finish(attended, projected)

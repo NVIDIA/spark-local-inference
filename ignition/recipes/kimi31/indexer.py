@@ -8,13 +8,14 @@ import torch
 from ignition.components.candidate_selection import PreparedCandidateSelection
 from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
+from ignition.preparation.tuning import register_finalizer
 from ignition.preparation.scratch import buffer_rows
 
 from .dcp import TOPK, PREFILL_ROWS, index_pages
 
 
 class SharedBuffers:
-    """Named row-capacity storage reused by serial layers and query slices."""
+    """Declaration examples shared by serial layers and query slices."""
 
     def __init__(self, values, device, allocator=None, prefix=""):
         self.values, self.device, self.allocator, self.prefix = values, device, allocator, prefix
@@ -24,11 +25,10 @@ class SharedBuffers:
         name = self.prefix + name
         value = self.values.get(name)
         if value is None or value.shape[0] < shape[0]:
-            value = (torch.zeros(shape, dtype=dtype, device=self.device) if self.allocator is None
-                     else self.allocator.zeros(shape, dtype))
+            value = torch.zeros(shape, dtype=dtype, device=self.device)
             self.values[name] = value
         if value.shape[1:] != shape[1:] or value.dtype != dtype:
-            raise ValueError("Kimi index buffers require matching non-row dimensions and dtype")
+            raise ValueError("Kimi declaration tensors require matching non-row dimensions and dtype")
         return buffer_rows(self.values, name, shape[0])
 
     def zeros(self, shape, dtype):
@@ -41,6 +41,7 @@ class PreparedIndexSelection:
     def __init__(self, query, weights, cache, metadata, shards, context, buffers, *, start, end,
                  mode, session, name, workspace, allocator, latent_cache):
         rows, width = end - start, metadata.token_page_table.shape[1]
+        self.rows, self.width, self.latent_cache = rows, width, latent_cache
         self.shards, self.mode = shards, mode
         storage = SharedBuffers(buffers, query.device, allocator)
         self.pages = storage.buffer("pages", (1 if mode == "prefill" else rows, width * 2), torch.int32)
@@ -73,20 +74,29 @@ class PreparedIndexSelection:
         else:
             self.merge.bind("replicated")
 
-    def prepare_local(self, query, weights, positions, tables):
-        """Produce rank-local candidates without using a peer communication channel."""
-        index_pages(tables[:1] if self.mode == "prefill" else tables, self.pages)
-        self.lengths.copy_(self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32))
-        self.indexer(query.view(query.shape[0], 32, 128), weights)
-        return self.merge.pack()
+        self.indexer.functional(session=session)
+        self.merge.functional(session=session)
+        register_finalizer(session, self._release_examples)
 
-    def exchange(self, positions):
-        """Exchange local candidates and preserve global selection order."""
-        return self.merge.exchange(positions=positions)
+    def _release_examples(self):
+        self.pages = self.lengths = self.local = self.scores = self.selected = None
+
+    def prepare_local(self, query, weights, positions, tables):
+        pages = torch.empty((1 if self.mode == "prefill" else self.rows, self.width * 2),
+                            dtype=torch.int32, device=query.device)
+        index_pages(tables[:1] if self.mode == "prefill" else tables, pages)
+        lengths = self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32)
+        indices, scores = self.indexer(query.view(query.shape[0], 32, 128), weights,
+            pages.expand(self.rows, -1) if self.mode == "prefill" else pages, lengths)
+        return self.merge.pack(indices=indices, scores=scores)
+
+    def exchange(self, packed, positions, *, dependencies=()):
+        return self.merge.exchange(packed=packed, positions=positions,
+                                   dependencies=(self.latent_cache, *dependencies))
 
     def __call__(self, query, weights, positions, tables):
-        self.prepare_local(query, weights, positions, tables)
-        return self.exchange(positions)
+        packed = self.prepare_local(query, weights, positions, tables)
+        return self.exchange(packed, positions)
 
 
 class PreparedDSAIndexer:
@@ -138,6 +148,14 @@ class PreparedDSAIndexer:
                     session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
                     latent_cache=latent_cache)
 
+        for projection in self.projections:
+            projection.functional(session=session)
+        register_finalizer(session, self._release_examples)
+
+    def _release_examples(self):
+        self.query = self.key = self.normalized_key = self.head_weights = None
+        self.query_latent = self.metadata = self.slots = None
+
     @property
     def local_plans(self):
         """Projection, query-quantization, and index-scoring plans with no peer exchange."""
@@ -146,15 +164,15 @@ class PreparedDSAIndexer:
         return (*[projection.plan for projection in self.projections],
                 *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
-    def project(self, source):
-        self.projections[0](self.query_latent)
-        self.projections[1](source)
-        self.projections[2](source)
-        self.head_weights.mul_(32 ** -.5)
-        key = self.key.float()
+    def project(self, source, query_latent, metadata):
+        query = self.projections[0](query_latent)
+        key = self.projections[1](source).float()
+        head_weights = self.projections[2](source) * (32 ** -.5)
         centered = key - key.mean(-1, keepdim=True)
         variance = centered.square().mean(-1, keepdim=True)
-        self.normalized_key.copy_(centered * torch.rsqrt(variance + self.eps)
-            * self.weights["indexer.k_norm.weight"].float() + self.weights["indexer.k_norm.bias"].float())
-        self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        write_fp8_index_keys(self.normalized_key, self.slots, self.cache, hadamard=False, power_of_two=False)
+        normalized_key = (centered * torch.rsqrt(variance + self.eps)
+            * self.weights["indexer.k_norm.weight"].float()
+            + self.weights["indexer.k_norm.bias"].float()).to(source.dtype)
+        slots = self.shards.token_slots(metadata.positions, metadata.token_page_table)
+        write_fp8_index_keys(normalized_key, slots, self.cache, hadamard=False, power_of_two=False)
+        return query, head_weights

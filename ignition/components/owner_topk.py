@@ -112,21 +112,46 @@ class PreparedOwnerTopK:
             runtime=reduction_runtime, session=session, coordinator=coordinator,
             name=name + ".selected", buffers=buffers)
 
-    def __call__(self):
-        if self.transport.local_counts is None:
-            indices, scores = self.transport()
+    def functional(self, *, session):
+        self.transport.functional(session=session)
+        self.candidates.functional()
+        self.fold.functional(session=session)
+        self.broadcast.functional(session=session)
+        for name in ("active", "output", "packed", "owner_active", "global_scores", "global_ids",
+                     "lengths", "selected_scores", "selected_ids"):
+            setattr(self, name, None)
+        return self
+
+    def __call__(self, local_indices=None, local_scores=None, active=None, *, dependencies=()):
+        local_indices = self.transport.local_indices if local_indices is None else local_indices
+        local_scores = self.transport.local_scores if local_scores is None else local_scores
+        if self.transport.counts is None:
+            indices, scores = self.transport(local_indices, local_scores, dependencies=dependencies)
+            counts = None
+        else:
+            local_counts = (self.transport.local_counts if active is None else
+                            torch.empty((self.rows,), dtype=torch.int32, device=local_indices.device))
+            _candidate_transport_counts(local_indices, local_scores, local_counts)
+            indices, scores, counts = self.transport(local_indices, local_scores, local_counts,
+                                                     dependencies=dependencies)
+        if active is None:
+            active, packed, owner_active = self.active, self.packed, self.owner_active
+        else:
+            packed = torch.empty((self.owner_rows, self.width, 2), dtype=torch.float32, device=indices.device)
+            owner_active = torch.empty((self.owner_rows,), dtype=torch.bool, device=indices.device)
+        if counts is None:
             torch.library.wrap_triton(_owner_candidates)[(self.owner_rows, triton.cdiv(self.width, 1024))](
-                indices, scores.view(torch.int32), self.active, self.rank, self.packed.view(torch.int32), self.owner_active,
+                indices, scores.view(torch.int32), active, self.rank, packed.view(torch.int32), owner_active,
                 ROWS=self.rows, OWNER_ROWS=self.owner_rows, WIDTH=self.width, BLOCK=1024, num_warps=4)
         else:
-            _candidate_transport_counts(self.transport.local_indices, self.transport.local_scores,
-                                        self.transport.local_counts)
-            indices, scores, counts = self.transport()
             torch.library.wrap_triton(_owner_candidates_counted)[(self.owner_rows, triton.cdiv(self.width, 1024))](
-                indices, scores.view(torch.int32), counts, self.active, self.rank,
-                self.packed.view(torch.int32), self.owner_active,
+                indices, scores.view(torch.int32), counts, active, self.rank, packed.view(torch.int32), owner_active,
                 ROWS=self.rows, OWNER_ROWS=self.owner_rows, WORLD=self.world,
                 TOPK=self.local_topk, WIDTH=self.width, BLOCK=1024, num_warps=4)
-        self.candidates()
-        self.fold()
-        return self.broadcast()
+        if self.packed is not None:
+            self.candidates()
+            self.fold()
+            return self.broadcast()
+        values, ids, lengths = self.candidates(packed, owner_active)
+        selected = self.fold(values, lengths, ids)
+        return self.broadcast(selected)
