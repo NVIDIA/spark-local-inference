@@ -215,7 +215,11 @@ def _progress(verbose):
     return Progress()
 
 
-def _measure(model, plan, configuration, settings, progress, *, compile_forwards, output=None):
+def _measure(model, plan, configuration, settings, progress, *, compile_forwards, output=None,
+             prepare_options=None, diagnostic_metadata=None, kernel_cache=None):
+    from functools import partial
+    from time import monotonic
+
     import torch
     from tokenizers import Tokenizer
     from ignition.bench.runner import BenchmarkCase, PrefillCase, run_benchmark
@@ -224,7 +228,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
     from ignition.preparation.tuning_replicas import prepare_recipe
 
     snapshot = model.snapshot(configuration.directory("hub_cache"))
-    details = {}
+    details = {} if diagnostic_metadata is None else dict(diagnostic_metadata)
     gpu = plan.gpus[0]
     details["device"] = {"name": gpu.name, "uuid": gpu.uuid, "capability": list(gpu.capability),
                         "total_bytes": gpu.total_bytes}
@@ -259,12 +263,20 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
 
     torch.cuda.set_device(0)
     storage = CoreStorage(world=plan.world_size)
+    preparation_started = monotonic()
     try:
         with storage:
-            prepared = prepare_recipe(model.recipe.prepare, snapshot, plan, compile_forwards=compile_forwards,
-                kernel_cache=configuration.directory("kernel_cache"), progress=progress, core_storage=storage)
+            prepare = model.recipe.prepare if prepare_options is None else partial(model.recipe.prepare, **prepare_options)
+            prepared = prepare_recipe(prepare, snapshot, plan, compile_forwards=compile_forwards,
+                kernel_cache=configuration.directory("kernel_cache") if kernel_cache is None else kernel_cache,
+                progress=progress, core_storage=storage)
+        if diagnostic_metadata is not None:
+            details.setdefault("wall_seconds", {})["preparation"] = monotonic() - preparation_started
         with prepared:
             root = getattr(prepared, "model", prepared)
+            if diagnostic_metadata is not None:
+                details["prepared_memory"] = prepared.memory_report
+            benchmark_started = monotonic()
             tokenizer_asset = root.server_config["assets"]["tokenizer"]
             tokenizer = (Tokenizer.from_str(tokenizer_asset["text"]) if "text" in tokenizer_asset
                          else Tokenizer.from_file(tokenizer_asset["path"]))
@@ -284,6 +296,8 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             execute = run_study if settings.speculation_study else run_benchmark
             result = execute(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
                 repetitions=settings.repetitions, seeds=settings.seeds, progress=record)
+            if diagnostic_metadata is not None:
+                details.setdefault("wall_seconds", {})["benchmark"] = monotonic() - benchmark_started
     except FlareError:
         raise
     except Exception as error:

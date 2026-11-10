@@ -38,16 +38,28 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
-             online_mxfp8_scope="all", peers=None, vision=True, weight_storage=None, draft_head_quantization=None):
+             online_mxfp8_scope="all", peers=None, vision=True, weight_storage=None, draft_head_quantization=None,
+             synthetic_seed=None):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
         ``draft_checkpoint`` loads the declared DSpark or DFlash2 checkpoint.
-        Without ``vision``, the vision encoder stays on disk.
+        Without ``vision``, the vision encoder stays on disk. ``synthetic_seed``
+        selects diagnostic generated values with the same prepared layouts.
         """
         before = torch.cuda.memory_allocated(device)
         pack = (lambda value: value) if weight_storage is None else weight_storage.tree
-        with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
-                              online_mxfp8_scope=online_mxfp8_scope, peers=peers) as loader:
+        loader_args = dict(manifest=manifest, device=device, shard=shard, progress=progress,
+                           online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
+                           peers=peers if synthetic_seed is None else None)
+        if synthetic_seed is None:
+            loader = KimiWeightLoader(**loader_args)
+        else:
+            if vision:
+                raise ValueError("synthetic Kimi preparation is text-only")
+            from ignition.recipes.kimi31.synthetic_weights import SyntheticKimiWeightLoader
+
+            loader = SyntheticKimiWeightLoader(**loader_args, synthetic_seed=synthetic_seed)
+        with loader:
             config = loader.config
             embedding = pack(loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64)))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
@@ -74,7 +86,11 @@ class ModelWeights:
             raw_draft = json.loads((Path(draft_checkpoint) / "config.json").read_text())
             if raw_draft.get("architectures") == ["DFlash2DraftModel"]:
                 from ignition.recipes.kimi31.dflash_weights import DraftWeights
-                draft_config, draft_args = DSparkConfig, dict(draft_head_quantization=draft_head_quantization)
+                draft_config = DSparkConfig
+                draft_args = dict(draft_head_quantization=draft_head_quantization,
+                                  synthetic_seed=synthetic_seed)
+            elif synthetic_seed is not None:
+                raise ValueError("synthetic Kimi preparation requires a DFlash2 draft")
             elif draft_head_quantization is not None:
                 raise ValueError("Kimi draft head conversion requires the MLA DFlash2 draft")
             elif config.dsa is None:

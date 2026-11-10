@@ -33,7 +33,7 @@ class DraftWeights:
 
     @classmethod
     def load(cls, snapshot, config, device, shard, *, target_head, progress=None,
-             online_mxfp8=False, draft_head_quantization=None):
+             online_mxfp8=False, draft_head_quantization=None, synthetic_seed=None):
         manifest = inspect_indexed_checkpoint(snapshot)
         validate_metadata(manifest, config.draft)
         d, h = config.draft, config.hidden
@@ -44,7 +44,14 @@ class DraftWeights:
         conv_range = shard.partition(4 * h // 16, alignment=8)
         pack = (partial(quantize_bf16_linear_as_mxfp8, retain_scale_rows=False)
                 if online_mxfp8 else lambda weight: weight)
-        with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
+        if synthetic_seed is None:
+            loader = DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights")
+        else:
+            from .synthetic_weights import SyntheticDraftWeightLoader
+
+            loader = SyntheticDraftWeightLoader(manifest, device, progress=progress,
+                                                progress_label="Generate draft weights", synthetic_seed=synthetic_seed)
+        with loader:
             def matrix(name, rows=None, columns=None):
                 return loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
                     slice(*(columns or (None, None)))))

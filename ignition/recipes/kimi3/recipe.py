@@ -11,12 +11,18 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            core_storage=None, ranks=None, recipe=None, draft_source=None, draft_directory=None):
+            core_storage=None, ranks=None, recipe=None, draft_source=None, draft_directory=None,
+            synthetic_seed=None, draft_checkpoint=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
     from .config import DRAFT_DIRECTORY, DSPARK_REPOSITORY, DSPARK_REVISION
 
     recipe = RECIPE if recipe is None else recipe
+    if (synthetic_seed is None) != (draft_checkpoint is None):
+        raise ValueError("synthetic preparation requires both a seed and an explicit local draft checkpoint")
+    if synthetic_seed is not None and (recipe.name != "kimi31" or plan.speculation is None
+                                      or plan.speculation.method != "dflash2"):
+        raise ValueError("synthetic preparation supports only Kimi K3.1 with DFlash2")
     if recipe.speculation is None and plan.speculation is not None:
         raise ValueError(f"{recipe.served_model_name} preparation does not support speculation")
     if ranks is not None:
@@ -28,7 +34,9 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
                         speculative_graph_budget=plan.speculation.graph_budget or 64,
                         draft_head_quantization=plan.speculation.draft_head_quantization)
         directory = DRAFT_DIRECTORY if draft_directory is None else draft_directory
-        if (Path(snapshot) / directory).is_dir():
+        if draft_checkpoint is not None:
+            drafting["draft_checkpoint"] = str(Path(draft_checkpoint).resolve())
+        elif (Path(snapshot) / directory).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / directory)
         else:
             from huggingface_hub import snapshot_download
@@ -37,7 +45,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             drafting["draft_checkpoint"] = snapshot_download(repository, revision=revision, cache_dir=plan.hub_cache,
                                                              allow_patterns=("config.json", "model.safetensors"))
     config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
-        benchmark_selection=plan.benchmark_selection,
+        benchmark_selection=plan.benchmark_selection, synthetic_seed=synthetic_seed,
         collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,

@@ -110,7 +110,7 @@ def allocate_prefill_histories(tokens, device):
     return records, indices
 
 
-def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all"):
+def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all", synthetic_seed=None):
     """Scope kernel selections to target geometry, independently of attached drafts.
 
     The target-only descriptor retains its empty draft field. Each operator's
@@ -123,6 +123,10 @@ def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="a
         "contract": "kimi3.graph-inputs.v1"}
     if online_mxfp8_scope != "all":
         value["online_mxfp8_scope"] = online_mxfp8_scope
+    if synthetic_seed is not None:
+        from ignition.recipes.kimi31.synthetic_weights import SYNTHETIC_SCHEMA
+
+        value["synthetic_weights"] = {"schema": SYNTHETIC_SCHEMA, "seed": synthetic_seed}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -147,6 +151,8 @@ class PreparationConfig:
     retain_graphs: bool = False
     kernel_cache: Path | None = None
     benchmark_selection: BenchmarkSelection | None = None
+    # Diagnostic generated values retain checkpoint geometry without payload reads.
+    synthetic_seed: int | None = None
     # Learned draft checkpoint selected by the recipe's speculation method.
     draft_checkpoint: Path | None = None
     draft_head_quantization: str | None = None
@@ -173,6 +179,11 @@ class PreparationConfig:
         if self.mtp_only and (not self.drafting
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
+        if self.synthetic_seed is not None:
+            if type(self.synthetic_seed) is not int or not 0 <= self.synthetic_seed < 2**63:
+                raise ValueError("synthetic seed must be a uint63 integer")
+            if self.draft_checkpoint is None or self.vision or self.tuning_replica is not None:
+                raise ValueError("synthetic Kimi preparation requires a local draft, no vision and no tuning replicas")
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
@@ -305,8 +316,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         peers = None if group is None or core_storage.peer_storage is None else (group, core_storage.peer_storage)
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8, online_mxfp8_scope=config.online_mxfp8_scope,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
-                                    vision=config.vision, weight_storage=core_storage.packed_weights(),
-                                    draft_head_quantization=config.draft_head_quantization)
+                                    vision=config.vision,
+                                    weight_storage=None if config.synthetic_seed is not None else core_storage.packed_weights(),
+                                    draft_head_quantization=config.draft_head_quantization,
+                                    synthetic_seed=config.synthetic_seed)
         del manifest
         release_unused()
     transient = contextlib.ExitStack()
@@ -425,7 +438,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                                                      head_dim=-(-latent // 8) * 8, ipc=core_storage.peer_storage)
                                 for rows in sorted({min(8, max_tokens), channel_rows}))
         identity = target_tuning_identity(weights.config, headers, shard.world_size,
-            online_mxfp8_scope=config.online_mxfp8_scope)
+            online_mxfp8_scope=config.online_mxfp8_scope, synthetic_seed=config.synthetic_seed)
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
