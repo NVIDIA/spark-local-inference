@@ -19,6 +19,7 @@ qualification = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+base64 = "0.22.1"
 helios-core = { package = "flare-helios", path = "../helios", features = ["runtime-package", "frontend"] }
 pyo3 = { version = "0.28.3" }
 libc = "0.2.189"

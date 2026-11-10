@@ -18,10 +18,47 @@ use super::{
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Source {
+    #[serde(with = "envelope_base64")]
     envelope: Vec<u8>,
     publishers: Vec<helios_core::runtime_package::Publisher>,
     #[serde(default)]
     rebuild_manifest: Option<serde_json::Value>,
+}
+
+mod envelope_base64 {
+    use base64::{Engine, display::Base64Display, engine::general_purpose::STANDARD};
+    use serde::{Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S>(envelope: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&Base64Display::new(envelope, &STANDARD))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+
+        impl de::Visitor<'_> for EnvelopeVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a base64-encoded signed weight envelope")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                STANDARD.decode(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EnvelopeVisitor)
+    }
 }
 
 #[pyclass(module = "flare_heliopause")]
@@ -540,4 +577,62 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_reuse_weights, module)?)?;
     module.add_class::<NativeWeightSource>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Source;
+
+    #[test]
+    fn source_metadata_preserves_envelope_bytes() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        for length in [0, 1, 2, 3, 255, 256] {
+            let source = Source {
+                envelope: bytes[..length].to_vec(),
+                publishers: Vec::new(),
+                rebuild_manifest: Some(serde_json::json!({"recipe":"fixture"})),
+            };
+            let json = serde_json::to_string(&source).unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let encoded = metadata["envelope"].as_str().unwrap();
+            assert_eq!(encoded.len(), length.div_ceil(3) * 4);
+            let from_json: Source = serde_json::from_str(&json).unwrap();
+            let from_value: Source = serde_json::from_value(metadata).unwrap();
+            for restored in [from_json, from_value] {
+                assert_eq!(restored.envelope, source.envelope);
+                assert_eq!(restored.rebuild_manifest, source.rebuild_manifest);
+            }
+        }
+    }
+
+    #[test]
+    fn source_metadata_uses_standard_padded_base64() {
+        let source = Source {
+            envelope: vec![0xfb, 0xff],
+            publishers: Vec::new(),
+            rebuild_manifest: None,
+        };
+        let metadata = serde_json::to_value(&source).unwrap();
+        assert_eq!(metadata["envelope"], "+/8=");
+        let restored: Source = serde_json::from_value(metadata).unwrap();
+        assert_eq!(restored.envelope, source.envelope);
+    }
+
+    #[test]
+    fn source_metadata_rejects_invalid_envelope_encoding() {
+        for envelope in [
+            serde_json::json!("*"),
+            serde_json::json!("+/8"),
+            serde_json::json!("+/9="),
+            serde_json::json!("+/8=\n"),
+            serde_json::json!([251, 255]),
+            serde_json::Value::Null,
+        ] {
+            let metadata = serde_json::json!({"envelope":envelope,"publishers":[]});
+            assert!(
+                serde_json::from_value::<Source>(metadata.clone()).is_err(),
+                "{metadata}"
+            );
+        }
+    }
 }

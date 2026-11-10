@@ -2866,7 +2866,10 @@ mod payload_export_tests {
         .to_string();
         let source = super::super::weight_reuse::open_source(root.path(), "model", &profiles)?;
         let mut metadata = serde_json::to_value(&source.source)?;
-        let signed_bytes: Vec<u8> = serde_json::from_value(metadata["envelope"].clone())?;
+        let signed_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            metadata["envelope"].as_str().unwrap(),
+        )?;
         let envelope = helios_core::package::protection::envelope(&signed_bytes)?;
         let stored_rank = helios_core::package::schema::wire::RankBody::decode(
             envelope.ranks[0].body.as_slice(),
