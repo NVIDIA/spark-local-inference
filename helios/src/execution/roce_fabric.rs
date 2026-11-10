@@ -22,6 +22,8 @@
 //! so a cabled partner is reached over its cable. IPv4 link-local subnets (169.254.0.0/16) count as
 //! world-wide, because hosts using link-local addressing share that subnet whether or not their
 //! ports are cabled together. Rails are ordered by breadth and then link address so both ends agree.
+//! Every rank plans over every rank's endpoints, including in ring and chain mode, so both ends of
+//! each link see the same breadths and choose the same devices.
 //!
 //! Each endpoint also records its PCIe link (PCI domain:bus:device): a Spark's ConnectX-7 exposes
 //! each port as two functions, one behind each of its two PCIe x4 links, and the functions behind
@@ -838,7 +840,8 @@ fn direct_peers(endpoints: &[Vec<Endpoint>], rank: usize, routes: &[Vec<(u32, u3
 
 /// The routes of `shape` for `rank`: a mesh routes to every rank; a ring or chain routes only to
 /// the ranks `shape` links, and the native proxy forwards writes to the others. The same plan works
-/// over a switch while keeping unlinked QPs unconnected.
+/// over a switch while keeping unlinked QPs unconnected. Routes are planned over every rank's
+/// endpoints, so both ends of an edge see the same subnet breadths and index-pairing validity.
 pub fn plan_shape_routes(
     endpoints: &[Vec<Endpoint>],
     rank: usize,
@@ -853,18 +856,16 @@ pub fn plan_shape_routes(
         return Err(failure("experimental RoCE ring requires 2..16 ranks"));
     }
     let world = endpoints.len();
-    let peers: Vec<_> = (0..world).filter(|p| *p == rank || shape.linked(rank, *p, world)).collect();
-    let subset: Vec<_> = peers.iter().map(|p| endpoints[*p].clone()).collect();
-    let local = peers.iter().position(|p| *p == rank).unwrap();
-    let planned = plan_routes(&subset, local, rails, links)?;
-    Ok((0..world)
-        .map(|p| {
-            peers
-                .iter()
-                .position(|q| *q == p)
-                .map_or_else(Vec::new, |i| planned[i].clone())
+    let planner = Planner::new(endpoints, rails, links)?;
+    (0..world)
+        .map(|peer| {
+            if peer != rank && shape.linked(rank, peer, world) {
+                planner.peer(rank, peer)
+            } else {
+                Ok(Vec::new())
+            }
         })
-        .collect())
+        .collect()
 }
 
 impl Fabric {
@@ -1346,9 +1347,7 @@ mod tests {
             traffic_class: 0,
             endpoints: pair[0].clone(),
         };
-        let topology = fabric
-            .topology(&pair, 0, Shape::Mesh, Links::All)
-            .unwrap();
+        let topology = fabric.topology(&pair, 0, Shape::Mesh, Links::All).unwrap();
         assert_eq!(topology.direct, vec![false, true]);
         assert_eq!(
             topology.peer_routes(),
@@ -1640,5 +1639,46 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// Asserts that `plans[a][b]` mirrors `plans[b][a]` for every pair of ranks.
+    fn assert_both_ends_agree(plans: &[Vec<Vec<(u32, u32)>>], label: &str) {
+        for a in 0..plans.len() {
+            for b in 0..plans.len() {
+                let mirrored: Vec<_> = plans[b][a].iter().map(|&(l, r)| (r, l)).collect();
+                assert_eq!(plans[a][b], mirrored, "{label}: ranks {a} and {b} disagree");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_and_chain_ends_agree_when_subnets_differ_between_neighborhoods() {
+        // Rank 0 and rank 1 share two subnets. Rank 0's neighborhood (ranks 3, 0 and 1) and rank
+        // 1's (ranks 0, 1 and 2) hold them with different breadths, so planning each rank over its
+        // neighborhood alone chose a different subnet at each end of that edge.
+        let endpoints = vec![
+            vec![endpoint("a", "10.0.0.1/24"), endpoint("b", "10.0.1.1/24")],
+            vec![endpoint("a", "10.0.0.2/24"), endpoint("b", "10.0.1.2/24")],
+            vec![endpoint("a", "10.0.0.3/24"), endpoint("c", "10.0.2.3/24")],
+            vec![endpoint("b", "10.0.1.4/24"), endpoint("c", "10.0.2.4/24")],
+        ];
+        for shape in [Shape::Ring, Shape::Chain] {
+            let plans: Vec<_> = (0..4)
+                .map(|rank| plan_shape_routes(&endpoints, rank, 1, shape, Links::All).unwrap())
+                .collect();
+            assert_both_ends_agree(&plans, shape.name());
+            for (rank, plan) in plans.iter().enumerate() {
+                for (peer, links) in plan.iter().enumerate() {
+                    let linked = peer != rank && shape.linked(rank, peer, 4);
+                    assert_eq!(links.len(), usize::from(linked), "{rank} to {peer}");
+                    for &(l, r) in links {
+                        assert!(same_link(
+                            &endpoints[rank][l as usize],
+                            &endpoints[peer][r as usize]
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
