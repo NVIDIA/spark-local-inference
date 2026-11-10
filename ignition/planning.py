@@ -212,7 +212,9 @@ class Plan:
                 raise UsageError("benchmark graph preparation requires Qwen3.8-27B on one GPU or Kimi K3.1 Pro on sixteen GPUs")
             if selection.speculation_study and self.recipe.name != "qwen38_dense":
                 raise UsageError("speculation studies require Qwen3.8-27B DFlash2")
-            if not selection.prefill_chunk and (self.speculation is None or (8 if selection.speculation_study else selection.width) not in self.speculation.widths):
+            required_widths = (8,) if selection.speculation_study else selection.selected_verification_widths
+            if not selection.prefill_chunk and (self.speculation is None
+                    or not set(required_widths) <= set(self.speculation.widths)):
                 raise UsageError("benchmark rounds require the selected speculative width")
             if selection.max_batch > self.concurrency:
                 raise UsageError("benchmark batches exceed --max-concurrency")

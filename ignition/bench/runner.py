@@ -21,9 +21,10 @@ class BenchmarkCase:
     context_tokens: int
 
     def __post_init__(self):
-        if (self.batch not in (1, 2, 4, 8) or self.width not in (8, 16)
-                or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4,8, W=8,16, P=B*W and positive context")
+        if (self.batch not in (1, 2, 4, 8) or type(self.width) is not int or not 1 <= self.width <= 16
+                or not self.batch <= self.packed_tokens <= self.batch * self.width
+                or self.packed_tokens % self.batch or self.context_tokens <= 0):
+            raise ValueError("round benchmark requires B=1,2,4,8, W=1 through 16, equal positive prefixes within W and positive context")
 
 
 @dataclass(frozen=True)
@@ -173,7 +174,7 @@ def _round(scheduler, case):
     if len(matches) != 1:
         raise ValueError(f"prepared catalog must contain exactly one complete round for {case}")
     shape, graph = matches[0]
-    lanes = [Lane(request, request.consumed, case.width) for request in scheduler.active]
+    lanes = [Lane(request, request.consumed, case.packed_tokens // case.batch) for request in scheduler.active]
     return scheduler._commit(Step("speculative", graph, case.batch, case.width, lanes, 0,
                                   packed_tokens=case.packed_tokens, draft_tokens=shape[4]))
 
@@ -206,7 +207,13 @@ def _check_request_state(model, step, records):
             raise RuntimeError(f"request {request.ident} device state disagrees with graph completion")
 
 
-def _check_metadata(model, step, case):
+def _proposal_counters(forward, step):
+    owner = forward.owner
+    return [(int(owner.generation[lane.request.slot].item()),
+             int(owner.offset[lane.request.slot].item())) for lane in step.lanes]
+
+
+def _check_metadata(model, step, case, *, proposal_before=None):
     if isinstance(case, PrefillCase):
         metadata = model.benchmark_prefills[step.graph]
         if (metadata.live_counts.cpu().tolist() != [case.chunk_tokens, 1]
@@ -216,8 +223,10 @@ def _check_metadata(model, step, case):
             raise RuntimeError("prefill metadata does not describe the exact benchmark chunk")
         return
     forward = model.benchmark_rounds[step.graph]
-    for role, metadata, width in (("target", forward.metadata, case.width),
-                                  ("draft", forward.draft_metadata, forward.draft_inputs.shape[1])):
+    stages = [("target", forward.metadata, case.packed_tokens // case.batch)]
+    if forward.draft is not None:
+        stages.append(("draft", forward.draft_metadata, forward.draft_inputs.shape[1]))
+    for role, metadata, width in stages:
         expected_starts = [case.context_tokens] * case.batch
         expected_lengths = [width] * case.batch
         expected_offsets = [row * width for row in range(case.batch + 1)]
@@ -228,11 +237,14 @@ def _check_metadata(model, step, case):
             raise RuntimeError(f"{role} metadata does not describe the complete benchmark round")
     owner = forward.owner
     verification = forward.operations[2]
+    if forward.draft is None and _proposal_counters(forward, step) != proposal_before:
+        raise RuntimeError("a round without proposals changed draft RNG state")
     for lane in step.lanes:
         slot, generation = lane.request.slot, lane.request.generation
-        if (int(owner.generation[slot].item()) != generation
-                or int(owner.offset[slot].item()) != 4 * step.draft_tokens
-                or int(owner.rng.generation[slot].item()) != generation
+        if forward.draft is not None and (int(owner.generation[slot].item()) != generation
+                or int(owner.offset[slot].item()) != 4 * step.draft_tokens):
+            raise RuntimeError("proposal RNG did not consume its declared draw reservation")
+        if (int(owner.rng.generation[slot].item()) != generation
                 or int(owner.rng.target_offset[slot].item()) != verification.draw_reservation):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
@@ -314,34 +326,50 @@ def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, s
         return measurement_result(cases, measurements, warmup=warmup, repetitions=repetitions,
                                   seeds=seeds, status=status, failure=failure)
 
+    groups = {}
+    for index, case in enumerate(cases):
+        key = (case.batch, case.context_tokens, getattr(case, "chunk_tokens", 0))
+        groups.setdefault(key, []).append(index)
     generation = int(model.benchmark_requests.generation.max().item())
     try:
-        for case, samples in zip(cases, measurements):
+        for indices in groups.values():
+            setup = max((cases[index] for index in indices), key=lambda case: getattr(case, "width", 0))
             for seed in seeds:
-                times = []
-                samples.append(dict(seed=seed, times_ms=times))
                 generation += 1
-                baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
+                baseline = _prefill(model, runner, layout, setup, tokenizer, seed, generation)
                 runner.snapshot()
-                for iteration in range(-1, warmup + repetitions):
-                    scheduler = deepcopy(baseline, {id(layout): layout})
-                    runner.restore()
-                    step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
-                    elapsed = runner.run(_message(scheduler, step))
-                    if iteration >= warmup:
-                        times.append(elapsed / 1e6)
-                    records = _complete(model, runner, scheduler, step, elapsed)
-                    _check_request_state(model, step, records)
-                    if isinstance(case, PrefillCase) and any(
-                            lane.request.consumed != case.context_tokens + case.chunk_tokens
-                            or len(lane.request.generated) != 1 for lane in step.lanes):
-                        raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
-                    if iteration == -1:
-                        _check_metadata(model, step, case)
-                        if not isinstance(case, PrefillCase):
-                            samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
-                if progress is not None:
-                    progress(result("running"))
+                for index in indices:
+                    case, samples = cases[index], measurements[index]
+                    times = []
+                    samples.append(dict(seed=seed, times_ms=times))
+                    for iteration in range(-1, warmup + repetitions):
+                        scheduler = deepcopy(baseline, {id(layout): layout})
+                        runner.restore()
+                        step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
+                        proposal_before = None
+                        if iteration == -1 and not isinstance(case, PrefillCase):
+                            proposal_before = _proposal_counters(model.benchmark_rounds[step.graph], step)
+                        elapsed = runner.run(_message(scheduler, step))
+                        if iteration >= warmup:
+                            times.append(elapsed / 1e6)
+                        records = _complete(model, runner, scheduler, step, elapsed)
+                        _check_request_state(model, step, records)
+                        if isinstance(case, PrefillCase) and any(
+                                lane.request.consumed != case.context_tokens + case.chunk_tokens
+                                or len(lane.request.generated) != 1 for lane in step.lanes):
+                            raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
+                        if iteration == -1:
+                            _check_metadata(model, step, case, proposal_before=proposal_before)
+                            if not isinstance(case, PrefillCase):
+                                forward = model.benchmark_rounds[step.graph]
+                                samples[-1]["acceptance"] = acceptance_observation(forward)
+                                samples[-1]["draft_forward_tokens_per_request"] = (
+                                    forward.draft_inputs.shape[1] if forward.draft is not None else 0)
+                                samples[-1]["draft_context_updated"] = forward.context is not None
+                                samples[-1]["proposal_tokens_per_request"] = step.draft_tokens
+                                samples[-1]["target_tokens_per_request"] = case.packed_tokens // case.batch
+                    if progress is not None:
+                        progress(result("running"))
                 runner.restore()
                 runner.release_snapshot()
     except BaseException as error:

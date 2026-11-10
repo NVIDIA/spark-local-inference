@@ -218,9 +218,10 @@ the timed graph starts.
 |---|---|---|
 | `--prefill` | Measure one exact prefill chunk graph instead of a speculative round | off |
 | `--prefill-chunk-size N` | Prepared prefill capacity; with `--prefill`, the exact timed chunk size, a positive multiple of 128 | Configured or recipe value; Qwen3.8-27B defaults to `4096` |
-| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4,8`; prefill requires `1` | `1,2,4`; `1` with `--prefill` or `--speculation-study` |
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4,8`; prefill and verification prefixes require `1` | `1,2,4`; `1` with `--prefill`, `--speculation-study`, or `--verify-prefixes` |
 | `--contexts LIST` | Distinct consumed context lengths before each measured graph, multiples of 128; prefill also allows zero | `512,2048,8192,16384`; `0` with `--prefill`; `8192` with `--speculation-study` |
 | `--verify-width N` | Target tokens per request, including the pending token; `8,16`, or `8,13,16` with `--speculation-study` | `8` |
+| `--verify-prefixes LIST` | Single-request packed prefixes measured from shared context, within `--verify-width`; proposal count remains fixed above prefix one. Cannot accompany `--prefill` or `--speculation-study` | unset |
 | `--study-widths LIST` | Prepare selected widths from `8,13,16` together and measure each from shared prefilled state; replaces scalar width/depth flags | unset |
 | `--speculation-study` | Measure private single-request speculative graphs without native completion publication or export | off |
 | `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
@@ -240,7 +241,25 @@ that capacity from the concurrency requested through configuration or flags.
 `--no-mtp` applies only with `--prefill`. Mixed prefill and prompt-logprob graphs
 are unsupported.
 
-Kimi K3.1 Pro supports verification width eight. Its selected catalog contains
+For Kimi K3.1 Pro, compare packed verification prefixes without loading weights again:
+
+```sh
+.venv/bin/ignition bench kimi-k3.1-pro --gpus 0-15 \
+  --mtp-draft-tokens 7 \
+  --batches 1 --max-concurrency 1 --verify-prefixes 1,4,6,8 --contexts 8192 \
+  --speculative-token-capacity 8 --prefill-chunk-size 4096 --online-mxfp8 \
+  --autotune-effort default --output /tmp/kimi31-verification-prefixes.json
+```
+
+Each prefix restores the same request, cache and sampling state before replay.
+For prefixes four, six and eight, the learned draft generates and samples all
+seven proposals, then verifies the selected prefix. The graph
+retains logical width eight while physical target rows are four, six or eight.
+Prefix one uses the width-one serving graph: it omits proposal generation but
+updates draft context, so it is not a target-only model measurement. JSON records
+the executed draft-forward size and acceptance separately from replay latency.
+
+Kimi K3.1 Pro supports verification widths through eight. Its selected catalog contains
 the requested speculative rounds and the initialization and prefill graphs
 needed to establish their contexts. Vision weights retain their configured
 residency, while image graphs are omitted from this text benchmark.

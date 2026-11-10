@@ -105,6 +105,19 @@ def test_invalid_selection(values):
         BenchmarkSelection(**values)
 
 
+@pytest.mark.parametrize("values", [
+    dict(verification_prefixes=(4, 1, 8)), dict(verification_prefixes=(1, 1, 8)),
+    dict(verification_prefixes=(1, 4), batches=(1, 2)), dict(verification_prefixes=(0, 8)),
+    dict(verification_prefixes=(1, 9)), dict(verification_prefixes=(True, 8)),
+    dict(verification_prefixes=(1, 8), prefill_chunk=4096, batches=(1,)),
+    dict(verification_prefixes=(1, 8), speculation_study=True, batches=(1,)),
+])
+def test_invalid_serving_prefix_matrix(values):
+    values = {"batches": (1,), **values}
+    with pytest.raises(ValueError, match="verification prefixes"):
+        BenchmarkSelection(**values)
+
+
 def test_plan_retains_explicit_concurrency_and_token_budget():
     plan = replace(_plan(), benchmark_selection=BenchmarkSelection())
     assert plan.concurrency == 32
