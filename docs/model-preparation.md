@@ -1014,6 +1014,30 @@ of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
 
+With the default `--prefill-chunk-size 4096`, the 4096-token prefill graph
+stages owner-encoded latent and index history locally, distributes index-query
+rows across context ranks, and gathers final selected IDs once per layer.
+Stored FP8 records and FP32 index scales are copied byte-for-byte, including
+records written by the current chunk. Projection shapes, normalization and
+weight formats are unchanged. Smaller captured prefill capacities retain direct
+peer reads; they still require peer KV mappings at startup.
+
+At a 1,048,576-token context limit and 4096-token prefill capacity, latent and
+index history share 576 MiB per rank. Index scoring and selected-ID exchange
+finish before latent history overwrites the shared bytes. Independent history
+allocations would require 708 MiB; sharing removes the 132 MiB index allocation
+without changing the persistent KV or index caches. Latent peer staging reserves
+36 MiB, while index staging, selected IDs and their transport channel reserve
+another 106.535 MiB, before query buffers and score scratch. Serial layers reuse
+these allocations, which reduce the remaining KV-page budget. Keep the default
+4096-token capacity for this prefill path; `--prefill-chunk-size 2048` omits it
+and its fixed history storage. The compiled history-copy regression in
+`tests/recipes/test_kimi_prefill_histories.py` checks byte preservation across
+page remapping, partial prefixes, empty rows, and repeated graph replay.
+`qualify/kimi_history_alias.py` compares independent and aliased storage through
+one complete checkpoint attention layer on sixteen GPUs, including exact cache
+bytes, cutoff ties, and attention in the emitted selection order.
+
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)
 draft at revision `6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94`, downloaded into the

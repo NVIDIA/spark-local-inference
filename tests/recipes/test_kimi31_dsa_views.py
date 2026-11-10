@@ -65,7 +65,7 @@ def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometr
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
 
-    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedRowTopK", "PreparedBroadcast",
+    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedOrderedRowTopK",
                  "UnquantizedProjection"):
         monkeypatch.setattr(indexer, name, operation)
     rows = 257
@@ -135,7 +135,7 @@ def test_selected_attention_reuses_only_identical_record_and_constant_views(monk
         self.buffer = lambda name, dtype: torch.zeros(5, dtype=dtype)
 
     def selection(*args, **kwargs):
-        return SimpleNamespace(bounds=bounds, selections={2: object(), 1: object()})
+        return SimpleNamespace(bounds=bounds, selections={2: object(), 1: object()}, sharded=None)
 
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
