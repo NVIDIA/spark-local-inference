@@ -672,22 +672,27 @@ mod tests {
 
     #[test]
     fn tampered_records_and_wrong_versions_are_refused() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            Session::accept(stream, &Key::from_seed(&[1; 32]).unwrap())
-                .err()
-                .unwrap()
-                .to_string()
-        });
-        let mut stream = TcpStream::connect(address).unwrap();
-        stream.write_all(MAGIC).unwrap();
-        stream
-            .write_all(&(PROTOCOL_VERSION + 1).to_le_bytes())
-            .unwrap();
-        stream.write_all(&[0; 32]).unwrap();
-        assert!(server.join().unwrap().contains("protocol"));
+        // A peer one protocol behind (a build without five-field RoCE endpoint records) or ahead.
+        for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                Session::accept(stream, &Key::from_seed(&[1; 32]).unwrap())
+                    .err()
+                    .unwrap()
+                    .to_string()
+            });
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(MAGIC).unwrap();
+            stream.write_all(&version.to_le_bytes()).unwrap();
+            stream.write_all(&[0; 32]).unwrap();
+            let error = server.join().unwrap();
+            assert!(
+                error.contains(&format!("peer speaks agent protocol {version}")),
+                "{error}"
+            );
+        }
 
         let (mut client, mut server) = pair();
         client.write_frame(frame::OK, b"fine").unwrap();

@@ -523,6 +523,7 @@ check `orbit status` and restart saved groups explicitly.
 | Rank identity or graph I/O schema differs | Matching export, prepared world size, serving options, and compatible executables. |
 | Core RoCE proxy ABI mismatch | Align preparation and serving dependencies; re-export when the executable cannot load that ABI. |
 | Missing GID or rail/queue-pair error | Active ports, IPv4 RoCEv2 GIDs, reachable endpoints, and the intended rank order. |
+| `RoCE endpoint record has no PCIe link field` | A rank runs a build that plans rails from addresses alone; run builds with the same route planner on every rank. |
 
 Inspect rank output and `journalctl --user -u flare-agent` before restarting a
 failed group. A collective failure invalidates the serving run; the agent does

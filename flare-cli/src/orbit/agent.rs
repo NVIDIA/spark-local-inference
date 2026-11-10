@@ -1978,7 +1978,7 @@ pub mod tests {
         )
         .unwrap();
         agent.executable = temp.path().join("installed-flare");
-        agent.fabric_endpoints = Some(b"loopback 127.0.0.1/8\n".to_vec());
+        agent.fabric_endpoints = Some(b"loopback 127.0.0.1/8 -\n".to_vec());
         fs::write(&agent.executable, "#!/bin/sh\necho \"$0\"\necho \"$@\"\n").unwrap();
         fs::set_permissions(&agent.executable, fs::Permissions::from_mode(0o755)).unwrap();
         let agent = Arc::new(agent);
