@@ -608,7 +608,7 @@ def main():
         devices=tuple(range(plan.world_size)), context=plan.context, max_active=plan.concurrency,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=not args.no_compile,
-        kernel_cache=configuration.directory('kernel_cache'), retain_graphs=args.measure_replay)
+        kernel_cache=configuration.directory('kernel_cache'))
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),

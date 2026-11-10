@@ -15,11 +15,58 @@ import pytest
 from ignition.preparation.runtime_package import FileSource
 
 
-def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path):
+@pytest.mark.parametrize("flags", [0, 1, 8, 9])
+def test_template_export_declares_flags_without_an_executable(flags):
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_package import _graphs
+
+    def no_executable():
+        pytest.fail("template export must not request an executable")
+
+    graph = SimpleNamespace(raw_cuda_graph=lambda: 123, raw_cuda_graph_exec=no_executable,
+                            _flare_instantiation_flags=flags)
+    assert _graphs({"decode": graph}) == [dict(name="decode", graph=123, instantiate_flags=flags)]
+
+
+@pytest.mark.parametrize("flags", [-1, True, 2, 4, 16, 1.0])
+def test_template_export_rejects_unsupported_flags(flags):
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_package import _graphs
+
+    with pytest.raises(ValueError, match="instantiation flags"):
+        _graphs({"decode": SimpleNamespace(_flare_instantiation_flags=flags)})
+
+
+@pytest.mark.parametrize("graph", [dict(name="decode"), dict(name="decode", recorded=1, graph=1),
+    dict(name="decode", recorded=1, executable=1), dict(name="decode", recorded=1, instantiate_flags=1),
+    dict(name="decode", graph=1, executable=1, instantiate_flags=1),
+    dict(name="decode", graph=1, instantiate_flags=2), dict(name="decode", instantiate_flags=1)])
+def test_export_rejects_inconsistent_graph_resources_and_retains_undrained_owners(tmp_path, graph):
+    import gc
+    import weakref
+    import flare_heliopause
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    with pytest.raises(RuntimeError, match="named graphs require.*preparation owners retained"):
+        flare_heliopause.export_capture(json.dumps(dict(path=str(tmp_path / "rank.json"),
+            context=0, graphs=[graph], allocations=[])), (owner,), None)
+    del owner
+    gc.collect()
+    assert reference() is not None
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("graph", [dict(name="decode", graph=1, executable=1),
+    dict(name="decode", recorded=1), dict(name="decode", graph=1, instantiate_flags=0)])
+def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path, graph):
     import flare_heliopause
 
     request = dict(path=str(tmp_path / "invalid.safetensors"), context=0,
-        graphs=[dict(name="decode", graph=1, executable=1)], allocations=[],
+        graphs=[graph], allocations=[],
         execution=None, package_data=None, rebuild_weights=None, shard_size=64 << 30,
         server=dict(assets={"tokenizer": {}, "chat_template": {}}, frontend={},
             sampling_defaults=dict(seed=0, temperature=1., top_p=.95, top_k=-1, min_p=0.,
@@ -121,6 +168,7 @@ def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
     ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", False),
     ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed", False),
     ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", True),
+    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", "template"),
 ])
 def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected, recorded):
     import shutil
@@ -138,7 +186,7 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
     original = tmp_path / "original"
     result = subprocess.run([
         sys.executable, str(root / "helios/tests" / fixture), str(original),
-        *(["--recorded-graphs"] if recorded else []),
+        *(["--recorded-graphs", recorded] if isinstance(recorded, str) else ["--recorded-graphs"] if recorded else []),
     ], cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     if fixture == "runtime_package_fixture.py":

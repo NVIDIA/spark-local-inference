@@ -16,7 +16,9 @@ from torch.cuda.graphs import CUDAGraph, _RetainedCallbacks
 
 from ignition.preparation import capture
 from ignition.preparation.module_images import ModuleImages
-from ignition.preparation.runtime_package import _graphs, capture_graph, instantiate_graph
+from ignition.preparation.runtime_package import (
+    RecordedExportGraph, _graphs, capture_graph, instantiate_graph, record_export_graph,
+)
 
 
 class Graph:
@@ -70,6 +72,8 @@ class Recorder:
         self.records = {}
         self.events = []
         self.fail = False
+        self.templates = {}
+        self.sequence = itertools.count(1)
 
     def record_graph(self, template, executable):
         assert template == 11 and executable >= 12
@@ -81,6 +85,19 @@ class Recorder:
     def release_graph(self, executable):
         self.records.pop(executable, None)
         self.events.append("release")
+
+    def record_template(self, template, flags):
+        assert template == 11 and flags == 1
+        if self.fail:
+            raise RuntimeError("native graph copy failed")
+        recorded = next(self.sequence)
+        self.templates[recorded] = template
+        self.events.append("record-template")
+        return recorded
+
+    def release_template(self, recorded):
+        self.templates.pop(recorded, None)
+        self.events.append("release-template")
 
 
 @pytest.fixture
@@ -168,3 +185,103 @@ def test_shared_capture_records_after_all_warmups_without_reinstantiation(monkey
     assert all(graph.instantiations == 1 for graph in graphs.values())
     assert calls == [("first", False), ("second", False), ("first", True), ("second", True)]
     assert recorder.events == ["record", "record"]
+
+
+def test_export_metadata_outlives_template_and_retains_external_owners(monkeypatch, recorder):
+    import flare_heliopause
+
+    monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
+    storage = SimpleNamespace(pool=SimpleNamespace(id=(0, 1)), graph_pool=SimpleNamespace(id=(0, 2)))
+    graph = Graph(keep_graph=True)
+    graph.pools = lambda: [(0, 2)]
+    graph.capture_end()
+    kernel_owner = SimpleNamespace()
+    owner = record_export_graph(graph, storage, owners=(kernel_owner,))
+    assert graph.template == graph.executable == graph.instantiations == 0
+    assert owner.pools == (storage.pool, storage.graph_pool)
+    assert owner.owners == (kernel_owner,)
+    assert _graphs({"decode": owner}, recorder=recorder) == [dict(name="decode", recorded=1)]
+    with pytest.raises(ValueError, match="another native module recorder"):
+        _graphs({"decode": owner}, recorder=Recorder())
+    assert recorder.templates == {1: 11}
+    owner.reset()
+    owner.reset()
+    assert owner.pools == owner.owners == ()
+    assert not recorder.templates
+    assert recorder.events == ["record-template", "release-template"]
+    with pytest.raises(ValueError, match="released"):
+        _graphs({"decode": owner}, recorder=recorder)
+
+
+def test_export_rejects_unowned_pool_without_destroying_template(monkeypatch, recorder):
+    storage = SimpleNamespace(pool=SimpleNamespace(id=(0, 1)), graph_pool=SimpleNamespace(id=(0, 2)))
+    graph = Graph(keep_graph=True)
+    graph.pools = lambda: [(0, 3)]
+    graph.capture_end()
+    with pytest.raises(ValueError, match="without an external owner"):
+        record_export_graph(graph, storage)
+    assert graph.template == 11
+    assert not recorder.templates
+
+
+def test_export_releases_metadata_on_collection(recorder):
+    owner = RecordedExportGraph(recorder, 1, 100, ())
+    recorder.templates[1] = 11
+    reference = weakref.ref(owner)
+    del owner
+    gc.collect()
+    assert reference() is None
+    assert not recorder.templates
+
+
+def test_export_resources_accept_recorded_graphs_and_executable_tuners(monkeypatch, recorder):
+    import flare_heliopause
+    from ignition.preparation.graphs import PreparedGraphBundle
+
+    monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
+    monkeypatch.setattr(torch.cuda, "device", lambda ordinal: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda ordinal: (12, 0))
+    recorded = RecordedExportGraph(recorder, 1, 100, ())
+    tuner = Graph(keep_graph=True)
+    tuner.capture_end()
+    tuner.instantiate()
+    bundle = PreparedGraphBundle(device=0, graphs={"decode": recorded, "tuner": tuner}, buffers={})
+    assert bundle._validate_resources(export_graphs=True) == (100, [1, tuner.executable], [])
+    with pytest.raises(TypeError, match="CUDAGraph"):
+        bundle._validate_resources()
+    recorded.context = 101
+    with pytest.raises(ValueError, match="another CUDA context"):
+        bundle._validate_resources(export_graphs=True)
+    recorded.context = 100
+    recorded.reset()
+    with pytest.raises(ValueError, match="released"):
+        bundle._validate_resources(export_graphs=True)
+
+
+def test_export_preserves_collective_consumers_after_replacing_cuda_graph(monkeypatch, recorder):
+    import flare_heliopause
+    from ignition.preparation.startup_tuning import record_consumer
+
+    registry = SimpleNamespace(captures={})
+    session = SimpleNamespace(capture=nullcontext, _startup_collectives=registry)
+    storage = SimpleNamespace(transient=nullcontext, pool=SimpleNamespace(id=(0, 1)),
+                              graph_pool=SimpleNamespace(id=(0, 2)))
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
+    collective = object()
+    def forward():
+        record_consumer(collective)
+    @contextmanager
+    def graph_scope(graph, **kwargs):
+        yield
+        graph.capture_end()
+    monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
+    monkeypatch.setattr(Graph, "pools", lambda self: [(0, 2)], raising=False)
+    for name, value in dict(current_stream=lambda device: stream, stream=lambda stream: nullcontext(),
+                            synchronize=lambda device: None, graph=graph_scope).items():
+        monkeypatch.setattr(torch.cuda, name, value)
+    graphs, _ = capture.capture_forwards({"decode": forward}, {"decode": SimpleNamespace(kind="decode")},
+        session=session, device="cpu", stream=stream, pool=storage.graph_pool.id, compile_decoder=False,
+        retain_graphs=True, warmup_storage=storage)
+    graph = graphs["decode"]
+    assert isinstance(graph, RecordedExportGraph)
+    assert registry.captures == {id(graph): {id(collective)}}

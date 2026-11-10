@@ -111,6 +111,8 @@ struct State {
     pending: HashMap<ThreadId, Vec<(String, Vec<Arc<Image>>)>>,
     allocations: BTreeMap<u64, RecordedAllocation>,
     graphs: BTreeMap<usize, Arc<super::capture::RecordedGraph>>,
+    templates: BTreeMap<usize, Arc<super::capture::RecordedGraph>>,
+    template_sequence: usize,
     error: Option<String>,
 }
 struct CallbackState {
@@ -273,6 +275,8 @@ impl State {
             self.allocations
                 .retain(|_, a| a.context != Some(resource.context));
             self.graphs
+                .retain(|_, graph| graph.context != resource.context);
+            self.templates
                 .retain(|_, graph| graph.context != resource.context);
             self.modules.retain(|_, i| i.context != resource.context);
             // Libraries can retain the same cubin in another CUDA context.
@@ -746,6 +750,28 @@ impl Recorder {
             .remove(&executable);
     }
 
+    fn record_template(&self, graph: usize, flags: u64) -> ExportResult<usize> {
+        self.check_error()?;
+        let recorded = Arc::new(super::capture::record_prepared_template(graph, flags, self)?);
+        let mut state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.template_sequence.checked_add(1)
+            .ok_or_else(|| invalid("graph metadata identifier overflow"))?;
+        state.template_sequence = id;
+        state.templates.insert(id, recorded);
+        Ok(id)
+    }
+
+    pub(crate) fn recorded_template(&self, id: usize) -> ExportResult<Arc<super::capture::RecordedGraph>> {
+        self.check_error()?;
+        self.state().state.lock().unwrap_or_else(|e| e.into_inner())
+            .templates.get(&id).cloned()
+            .ok_or_else(|| invalid("graph export metadata has been released"))
+    }
+
+    fn release_template(&self, id: usize) {
+        self.state().state.lock().unwrap_or_else(|e| e.into_inner()).templates.remove(&id);
+    }
+
     pub(crate) fn image_for(&self, function: usize) -> ExportResult<Arc<[u8]>> {
         self.check_error()?;
         #[cfg(windows)]
@@ -921,6 +947,12 @@ impl NativeModuleRecorder {
     fn release_graph(&self, executable: usize) {
         self.recorder.lock().unwrap().release_graph(executable);
     }
+    fn record_template(&self, py: Python<'_>, graph: usize, flags: u64) -> PyResult<usize> {
+        py.detach(|| self.recorder.lock().unwrap().record_template(graph, flags)).map_err(py_error)
+    }
+    fn release_template(&self, id: usize) {
+        self.recorder.lock().unwrap().release_template(id);
+    }
     fn allocations(&self) -> PyResult<BTreeMap<u64, (u64, String)>> {
         Ok(self
             .recorder
@@ -1067,6 +1099,23 @@ mod tests {
         recorder.release_graph(0x55);
         recorder.release_graph(0x55);
         assert!(recorder.recorded_graph(0x55).is_err());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn template_metadata_survives_graph_destruction_until_its_owner_releases_it() {
+        let mut recorder = graph_recorder();
+        let graph = Arc::new(super::super::capture::RecordedGraph::empty(0x1000));
+        let weak = Arc::downgrade(&graph);
+        recorder.state().state.lock().unwrap().templates.insert(1, graph);
+        call(recorder.state(), "cuGraphExecDestroy", 1, &[1], 0, 0x1000);
+        recorder.stop().unwrap();
+        let retained = recorder.recorded_template(1).unwrap();
+        recorder.release_template(1);
+        recorder.release_template(1);
+        assert!(recorder.recorded_template(1).is_err());
+        assert!(weak.upgrade().is_some());
+        drop(retained);
         assert!(weak.upgrade().is_none());
     }
 

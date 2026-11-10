@@ -177,7 +177,7 @@ def _rank(rank, args, rendezvous):
         context=args.context, max_active=8, expert_scale_compression=args.expert_scale_compression,
         prefill_chunk_size=args.prefill_chunk, vision=False, dspark=True,
         speculative_widths=(1, 6), speculative_token_capacity=48,
-        speculative_fixed_width=6, retain_graphs=True, kernel_cache=args.kernel_cache,
+        speculative_fixed_width=6, kernel_cache=args.kernel_cache,
         diagnostic_graphs=("verification8x6",),
         diagnostic_support_graphs=(f"prefill{args.prefill_chunk}", "proposal8x6"),
         diagnostic_cache_pages=max(pages, math.ceil(args.prefill_chunk / 128) + 16))

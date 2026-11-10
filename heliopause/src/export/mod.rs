@@ -106,8 +106,14 @@ pub(crate) struct Kernel {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GraphHandle {
     pub name: String,
+    #[serde(default)]
     pub graph: usize,
+    #[serde(default)]
     pub executable: usize,
+    #[serde(default)]
+    pub instantiate_flags: Option<u64>,
+    #[serde(default)]
+    pub recorded: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

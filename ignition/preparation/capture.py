@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compile prepared model forwards and capture one native executable per shape."""
+"""Compile prepared model forwards and capture CUDA graphs for their shapes."""
 
 from contextlib import nullcontext
 from time import monotonic
@@ -14,7 +14,7 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
-from .runtime_package import capture_graph, instantiate_graph
+from .runtime_package import capture_graph, instantiate_graph, record_export_graph
 
 
 @_defer_full_collection()
@@ -31,6 +31,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     serving replays variants serially and may choose them in any order.
     All eager warmups precede capture so their transient workspaces do not
     coexist with retained graph intermediates.
+    ``retain_graphs`` records export metadata without executables when
+    ``warmup_storage`` supplies external CUDA pool owners.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
     and graph capture; it is unused for the ordinary serving catalog.
     ``compile_group`` compiles one representative for same-signature trial
@@ -121,7 +123,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 coordinator.barrier(f"capture {name}", coordinator.ranks)
             started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
-            graph = capture_graph(retain_graphs=retain_graphs)
+            exporting = retain_graphs and warmup_storage is not None
+            graph = torch.cuda.CUDAGraph(keep_graph=True) if exporting else capture_graph(retain_graphs=retain_graphs)
             communication = nullcontext() if collective is None else collective.capture(stream=stream)
             def memory_detail():
                 free, total = torch.cuda.mem_get_info(device)
@@ -141,7 +144,13 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     stream.synchronize()
                 with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
-                if retain_graphs:
+                if exporting:
+                    recorded = record_export_graph(graph, warmup_storage, owners=(function,))
+                    registry = getattr(session, "_startup_collectives", None)
+                    if registry is not None:
+                        registry.captures[id(recorded)] = registry.captures.pop(id(graph))
+                    graph = recorded
+                elif retain_graphs:
                     if progress is not None:
                         progress(f"instantiating {name}: {memory_detail()}")
                     instantiate_graph(graph)

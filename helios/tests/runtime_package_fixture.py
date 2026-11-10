@@ -142,7 +142,21 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
                              relocations=storage_relocations.get(name, ()))
                    for name, tensor in tensors.items()]
     fill_arguments = (Argument(4), Argument(2), Argument(8, (Relocation(0, reference("scratch")),)))
-    if recorded_graphs:
+    reference_graphs = graphs.copy()
+    if recorded_graphs == "template":
+        import flare_heliopause
+        from ignition.preparation.runtime_package import RecordedExportGraph
+
+        pool = torch.cuda.MemPool()
+        context, _ = flare_heliopause.current_context()
+        for rows in (32, 64):
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with torch.cuda.graph(graph, pool=pool):
+                run(rows)
+            recorded = images.native.record_template(int(graph.raw_cuda_graph()), 1)
+            graphs[f"rows_{rows}"] = RecordedExportGraph(images.native, recorded, context, (pool,), (gemm,))
+            graph.reset()
+    elif recorded_graphs:
         from ignition.preparation.runtime_package import capture_graph, instantiate_graph
 
         for rows in (32, 64):
@@ -176,7 +190,7 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
     tensors["input"].copy_((tensors["input"].float() * 0.25 + 0.5).to(torch.float8_e4m3fn))
     (root / "modified-input.bin").write_bytes(tensors["input"].view(torch.uint8).cpu().numpy().tobytes())
     for rows in (32, 64):
-        graphs[f"rows_{rows}"].replay()
+        (reference_graphs if recorded_graphs == "template" else graphs)[f"rows_{rows}"].replay()
         torch.cuda.synchronize()
         (root / f"modified-{rows}.bin").write_bytes(tensors[f"rows_{rows}"].view(torch.uint8).cpu().numpy().tobytes())
     (root / "expected.json").write_text(json.dumps({
@@ -193,7 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shard-size", type=int, default=64 << 30)
     parser.add_argument("--legacy", action="store_true")
-    parser.add_argument("--recorded-graphs", action="store_true")
+    parser.add_argument("--recorded-graphs", nargs="?", choices=("executable", "template"), const="executable", default=False)
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     prepare(args.directory, args.shard_size, args.legacy, recorded_graphs=args.recorded_graphs)

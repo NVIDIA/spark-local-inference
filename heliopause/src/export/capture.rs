@@ -582,16 +582,15 @@ fn record_kernel(
 fn record_graph(
     cuda: &Cuda,
     graph: usize,
-    executable: usize,
+    flags: u64,
     mut node_id: impl FnMut(usize) -> ExportResult<u64>,
 ) -> ExportResult<RecordedGraph> {
     let context = cuda.current()?;
-    if graph == 0 || executable == 0 || context == 0 {
+    if graph == 0 || context == 0 || flags & !9 != 0 {
         return Err(invalid(
-            "graph recording requires live template, executable, and context handles",
+            "graph recording requires a live template, context, and supported instantiation flags",
         ));
     }
-    let flags = executable_flags(cuda, executable)?;
     let mut ordered = nodes(cuda, graph)?
         .into_iter()
         .map(|node| Ok((node_id(node as usize)?, node)))
@@ -744,9 +743,18 @@ pub(crate) fn record_prepared_graph(
         ));
     }
     let cuda = Cuda::new()?;
-    record_graph(&cuda, graph, executable, |node| {
+    record_graph(&cuda, graph, executable_flags(&cuda, executable)?, |node| {
         recorder.graph_node_id(node)
     })
+}
+
+pub(crate) fn record_prepared_template(
+    graph: usize,
+    flags: u64,
+    recorder: &Recorder,
+) -> ExportResult<RecordedGraph> {
+    let cuda = Cuda::new()?;
+    record_graph(&cuda, graph, flags, |node| recorder.graph_node_id(node))
 }
 
 fn graph_metadata(
@@ -755,6 +763,15 @@ fn graph_metadata(
     recorder: Option<&Recorder>,
     cupti: Option<&Library>,
 ) -> ExportResult<Arc<RecordedGraph>> {
+    if graph.recorded != 0 {
+        let recorded = recorder
+            .ok_or_else(|| invalid("retained graph metadata requires a native module recorder"))?
+            .recorded_template(graph.recorded)?;
+        if recorded.context != cuda.current()? {
+            return Err(invalid("retained graph metadata belongs to another CUDA context"));
+        }
+        return Ok(recorded);
+    }
     if graph.graph == 0 {
         let recorded = recorder
             .ok_or_else(|| invalid("retained graph metadata requires a native module recorder"))?
@@ -771,7 +788,10 @@ fn graph_metadata(
     Ok(Arc::new(record_graph(
         cuda,
         graph.graph,
-        graph.executable,
+        match graph.instantiate_flags {
+            Some(flags) => flags,
+            None => executable_flags(cuda, graph.executable)?,
+        },
         |node| {
             if let Some(recorder) = recorder {
                 recorder.graph_node_id(node)
@@ -2704,10 +2724,18 @@ pub(crate) fn capture_rank(
         || request
             .graphs
             .iter()
-            .any(|g| g.name.is_empty() || g.executable == 0)
+            .any(|g| {
+                g.name.is_empty()
+                    || if g.recorded != 0 {
+                        g.graph != 0 || g.executable != 0 || g.instantiate_flags.is_some()
+                    } else {
+                        (g.executable == 0) == g.instantiate_flags.is_none()
+                            || g.instantiate_flags.is_some_and(|flags| g.graph == 0 || flags & !9 != 0)
+                    }
+            })
     {
         return Err(invalid(
-            "named live graph executables are required",
+            "named graphs require retained metadata, a live executable, or a live template with supported instantiation flags",
         ));
     }
     if request

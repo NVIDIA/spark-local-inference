@@ -12,6 +12,7 @@ from functools import partial
 import os
 import json
 from pathlib import Path
+import weakref
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,7 @@ class RuntimePackage:
         # Absent cache configuration stays absent: the native exporter owns
         # default destination and cache selection.
         cache = _OPTIONS.get()
-        request = dict(path=str(path), context=context, graphs=_graphs(graphs),
+        request = dict(path=str(path), context=context, graphs=_graphs(graphs, recorder=self.recorder),
             allocations=[asdict(a) for a in self.allocations], kernels=[asdict(k) for k in self.kernels],
             modules={name: str(path) for name,path in self.modules.items()},
             roots=[a.name for a in self.allocations],
@@ -172,6 +173,45 @@ class _RecordedGraphMetadata:
         self.executable = executable
 
 
+class RecordedExportGraph:
+    """Own immutable native graph metadata and its externally retained CUDA pools."""
+
+    def __init__(self, recorder, recorded, context, pools, owners=()):
+        self.recorder, self.recorded, self.context = recorder, recorded, context
+        self.pools = tuple(pools)
+        self.owners = tuple(owners)
+        self._release = weakref.finalize(self, recorder.release_template, recorded)
+
+    def reset(self):
+        self._release()
+        self.recorded = 0
+        self.pools = ()
+        self.owners = ()
+
+
+def record_export_graph(graph, storage, *, owners=()):
+    """Copy an uninstantiated graph before releasing its CUDA template."""
+    import flare_heliopause
+    from .module_images import ModuleImages
+
+    images = ModuleImages.current()
+    if images is None:
+        raise RuntimeError("graph metadata recording requires an active native module recorder")
+    pools = (storage.pool, storage.graph_pool)
+    owned = {pool.id for pool in pools}
+    if not set(graph.pools()) <= owned:
+        raise ValueError("export graph uses a CUDA pool without an external owner")
+    context, _ = flare_heliopause.current_context()
+    recorded = images.native.record_template(int(graph.raw_cuda_graph()), 1)
+    owner = RecordedExportGraph(images.native, recorded, context, pools, owners)
+    try:
+        graph.reset()
+    except BaseException:
+        owner.reset()
+        raise
+    return owner
+
+
 def capture_graph(*, retain_graphs=False):
     """Copy export metadata before releasing a graph's CUDA template."""
     import torch
@@ -198,9 +238,22 @@ def instantiate_graph(graph):
         raise RuntimeError("export graph metadata does not match its instantiated executable")
 
 
-def _graphs(graphs):
+def _graphs(graphs, *, recorder=None):
     result = []
     for name, graph in graphs.items():
+        if isinstance(graph, RecordedExportGraph):
+            if graph.recorder is not recorder:
+                raise ValueError(f"graph {name!r} metadata belongs to another native module recorder")
+            if not graph.recorded:
+                raise ValueError(f"graph {name!r} export metadata has been released")
+            result.append(dict(name=name, recorded=graph.recorded))
+            continue
+        flags = getattr(graph, "_flare_instantiation_flags", None)
+        if flags is not None:
+            if type(flags) is not int or flags < 0 or flags & ~9:
+                raise ValueError("graph instantiation flags may only select automatic free and node priority")
+            result.append(dict(name=name, graph=int(graph.raw_cuda_graph()), instantiate_flags=flags))
+            continue
         executable = int(graph.raw_cuda_graph_exec())
         metadata = getattr(graph, "_flare_graph_metadata", None)
         template = (0 if metadata is not None and metadata.executable and metadata.executable == executable
@@ -283,11 +336,11 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         peer_addresses=[] if storage.peer_storage is None else list(storage.peer_storage.owned),
         peer_mappings=[] if storage.peer_storage is None else
             [part for parts in storage.peer_storage.imported_mappings.values() for part in parts],
-        graphs=_graphs(prepared.graphs), allocations=[asdict(a) for a in allocations], discover_allocations=True,
+        graphs=_graphs(prepared.graphs, recorder=images.native), allocations=[asdict(a) for a in allocations], discover_allocations=True,
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
-        execution=prepared.manifest(all_variants=True), server=None if bundle_only else {**prepared.server_config, **options},
+        execution=prepared.export_manifest(), server=None if bundle_only else {**prepared.server_config, **options},
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
