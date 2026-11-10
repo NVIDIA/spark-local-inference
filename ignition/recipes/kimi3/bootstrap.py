@@ -124,7 +124,7 @@ def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="a
     if online_mxfp8_scope != "all":
         value["online_mxfp8_scope"] = online_mxfp8_scope
     if synthetic_seed is not None:
-        from ignition.recipes.kimi31.synthetic_weights import SYNTHETIC_SCHEMA
+        from ignition.recipes.kimi31.synthetic_config import SYNTHETIC_SCHEMA
 
         value["synthetic_weights"] = {"schema": SYNTHETIC_SCHEMA, "seed": synthetic_seed}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()

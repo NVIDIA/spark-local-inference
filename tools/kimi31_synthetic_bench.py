@@ -48,7 +48,7 @@ def run(options):
     from ignition.cli.config import Configuration, Setting
     from ignition.cli.preparation import Host, derive, resolve_model, speculation
     from ignition.preparation.selection import BenchmarkSelection
-    from ignition.recipes.kimi31.synthetic_weights import SYNTHETIC_SCHEMA
+    from ignition.recipes.kimi31.synthetic_config import SYNTHETIC_SCHEMA
 
     target, draft = options.target.resolve(), options.draft.resolve()
     if not target.is_dir() or not draft.is_dir():
@@ -57,9 +57,6 @@ def run(options):
         raise ValueError("synthetic benchmark requires a DFlash2 draft")
     if options.output.exists():
         raise FileExistsError(f"refusing to overwrite benchmark output {options.output}")
-    options.output.parent.mkdir(parents=True, exist_ok=True)
-    with options.output.open("x"):
-        pass
     if not 0 <= options.seed < 2**63:
         raise ValueError("synthetic seed must be a uint63 integer")
     if any(value < 128 or value % 128 for value in options.contexts):
@@ -114,31 +111,46 @@ def run(options):
             "geometry_target": str(target), "geometry_draft": str(draft),
             "payload_bytes_read": 0,
             "csf_exception_policy": {
-                "sampled_scale_rows": 38912, "zero_exception_rows_percent": 70.8,
-                "mean_exceptions_per_row": 0.368, "maximum_exceptions_per_row": 4,
+                "scope": "generated prepared rows; not checkpoint payload statistics",
+                "target_zero_exception_rows_percent": 70.8,
+                "target_mean_exceptions_per_row": 0.368, "maximum_exceptions_per_row": 4,
+                "row_width_cap": "at most columns - 2 exceptions",
             },
         },
         "limitations": (
-            "Generated values preserve tensor geometry and calibrated CSF exception density. These graph times do not "
+            "Generated values preserve tensor geometry with a controlled CSF exception distribution. "
+            "Values are seeded by prepared source view and do not reproduce real routing or a partition-invariant "
+            "synthetic checkpoint. These graph times do not "
             "establish model quality, speculative acceptance, serving throughput, or runtime parity."
         ),
     }
     print(json.dumps({"plan": plan.to_dict(), "synthetic_weights": metadata["synthetic_weights"]}),
           file=sys.stderr, flush=True)
-    environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
-    preflight_started = monotonic()
-    import torch
-    from flashinfer import sampling
+    options.output.parent.mkdir(parents=True, exist_ok=True)
+    with options.output.open("x"):
+        pass
+    try:
+        environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
+        preflight_started = monotonic()
+        import torch
+        from flashinfer import sampling
 
-    torch.cuda.set_device(0)
-    sampling.get_sampling_module()
-    metadata["sampling_preflight_seconds"] = monotonic() - preflight_started
-    result = bench._measure(model, plan, configuration, settings, bench._progress(options.verbose),
-        compile_forwards=True, output=options.output,
-        prepare_options={"synthetic_seed": options.seed, "draft_checkpoint": str(draft)},
-        diagnostic_metadata=metadata,
-        kernel_cache=kernel_cache)
-    bench.write_result(result, options.output)
+        torch.cuda.set_device(0)
+        sampling.get_sampling_module()
+        metadata["sampling_preflight_seconds"] = monotonic() - preflight_started
+        result = bench._measure(model, plan, configuration, settings, bench._progress(options.verbose),
+            compile_forwards=True, output=options.output,
+            prepare_options={"synthetic_seed": options.seed, "draft_checkpoint": str(draft)},
+            diagnostic_metadata=metadata,
+            kernel_cache=kernel_cache)
+        bench.write_result(result, options.output)
+    except BaseException as error:
+        # Preserve measurements already written by the runner, but never leave
+        # an empty reservation masquerading as a completed diagnostic result.
+        if options.output.stat().st_size == 0:
+            bench.save_result({"status": "failed", "error": str(error),
+                                "error_type": type(error).__name__, **metadata}, options.output)
+        raise
     return 0
 
 

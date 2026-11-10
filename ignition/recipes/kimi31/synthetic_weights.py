@@ -3,6 +3,8 @@
 """Executable synthetic Kimi weights with checkpoint geometry but no payload reads."""
 
 from contextlib import ExitStack
+import hashlib
+import json
 import math
 import zlib
 
@@ -13,7 +15,6 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.recipes.kimi3.weights import KimiWeightLoader
 
 
-SYNTHETIC_SCHEMA = "kimi31-dflash2-synthetic-v2"
 _DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "U8": torch.uint8}
 
 
@@ -22,8 +23,12 @@ def _is_norm(name):
 
 
 def _write_scales(destination, name, seed):
-    """Generate native E8M0 scales with a measured, nondegenerate CSF exception density."""
-    if destination.ndim < 2 or destination.shape[-1] < 8 or not destination.is_contiguous():
+    """Generate a declared exception distribution per prepared E8M0 row.
+
+    The base covers two adjacent codes. Distinct, separated exception codes
+    cannot become a better base pair even for six-column TP16 down scales.
+    """
+    if destination.ndim < 2:
         destination.fill_(127)
         return
     columns = destination.shape[-1]
@@ -35,32 +40,44 @@ def _write_scales(destination, name, seed):
         last = min(first + rows_per_chunk, flat.shape[0])
         rows = torch.arange(first, last, dtype=torch.int64, device=destination.device)
         base = 126 + (rows + salt).remainder(2)
-        flat[first:last].copy_((base[:, None] + column.remainder(2)).to(torch.uint8))
+        values = base[:, None] + column.remainder(2)
         selector = (rows * 17 + salt).remainder(1000)
         exceptions = torch.zeros_like(selector)
         exceptions += (selector >= 708)
         exceptions += (selector >= 940)
         exceptions += (selector >= 987)
         exceptions += (selector >= 997)
+        exceptions.clamp_(max=max(0, columns - 2))
         start = (rows + salt).remainder(columns)
         for ordinal in range(4):
-            selected = exceptions > ordinal
-            indices = selected.nonzero().squeeze(1)
-            position = (start[indices] + ordinal * 37).remainder(columns)
-            flat[first:last][indices, position] = (base[indices] - 2).to(torch.uint8)
+            position = (start + ordinal).remainder(columns)
+            selected = (exceptions[:, None] > ordinal) & (column == position[:, None])
+            values = torch.where(selected, base[:, None] - 2 * (ordinal + 1), values)
+        flat[first:last].copy_(values.to(torch.uint8))
 
 
-def _write(destination, name, seed=0):
-    """Fill one destination on its device without materializing a full host tensor."""
-    if destination.dtype == torch.uint8:
-        # Native MXFP4 payloads use small finite nibbles. Two-value E8M0 windows
-        # carry exceptions at the measured aggregate density of real Kimi scales.
-        if "scale" in name:
-            _write_scales(destination, name, seed)
-        else:
-            destination.fill_(0x11)
+def _view_seed(destination, name, seed, source):
+    """Make distinct prepared shards reproducible without reading source values."""
+    view = destination if source is None else source
+    description = (name, seed, view.storage_offset(), tuple(view.shape), tuple(view.stride()))
+    encoded = json.dumps(description, separators=(",", ":")).encode()
+    return int.from_bytes(hashlib.blake2b(encoded, digest_size=8).digest(), "little")
+
+
+def _write(destination, name, seed=0, *, source=None):
+    """Generate bounded values from a stable source-view identity on the device.
+
+    Random values are defined for each prepared view, not a partition-invariant
+    synthetic checkpoint. Contiguous temporary chunks keep generation independent
+    of destination padding and bound temporary storage to about one million values.
+    """
+    if destination.numel() == 0:
         return
-    if destination.dtype not in (torch.bfloat16, torch.float32):
+    view_seed = _view_seed(destination, name, seed, source)
+    if destination.dtype == torch.uint8 and "scale" in name:
+        _write_scales(destination, name, view_seed)
+        return
+    if destination.dtype not in (torch.uint8, torch.bfloat16, torch.float32):
         raise ValueError(f"synthetic tensor {name} has unsupported dtype {destination.dtype}")
     if "scale" in name:
         destination.fill_(1.0)
@@ -68,23 +85,29 @@ def _write(destination, name, seed=0):
     if name.endswith(".A_log"):
         destination.fill_(-1.0)
         return
-    if _is_norm(name):
-        destination.fill_(1.0)
-        return
     if "bias" in name:
         destination.zero_()
+        return
+    if _is_norm(name):
+        destination.fill_(1.0)
         return
     if destination.ndim == 0:
         destination.fill_(0.001)
         return
+    generator = torch.Generator(device=destination.device).manual_seed(view_seed)
+    dtype = destination.dtype if source is None else source.dtype
     row_values = max(1, destination[0].numel())
     rows_per_chunk = max(1, (1 << 20) // row_values)
-    salt = (seed + zlib.crc32(name.encode())) % 31
     for first in range(0, destination.shape[0], rows_per_chunk):
         last = min(first + rows_per_chunk, destination.shape[0])
-        rows = torch.arange(first, last, dtype=torch.float32, device=destination.device)
-        values = ((rows + salt).remainder(31) - 15) * 0.0001
-        destination[first:last].copy_(values.view(-1, *([1] * (destination.ndim - 1))))
+        values = torch.empty((last - first, *destination.shape[1:]),
+                             dtype=dtype, device=destination.device)
+        if dtype == torch.uint8:
+            # Every nibble is a finite MXFP4 value, with both signs represented.
+            values.random_(0, 256, generator=generator)
+        else:
+            values.uniform_(-0.0015, 0.0015, generator=generator)
+        destination[first:last].copy_(values)
 
 
 class _SyntheticSession:
@@ -157,7 +180,7 @@ class SyntheticWeightLoader:
                 raise ValueError("synthetic transfer has no generated source identity")
             destination.copy_(source)
         else:
-            _write(destination, name, self.synthetic_seed)
+            _write(destination, name, self.synthetic_seed, source=source)
         if numeric:
             record_numeric_tensor(destination)
 
@@ -167,7 +190,7 @@ class SyntheticWeightLoader:
         if extent is not None:
             source = source[extent]
         target = torch.empty(source.shape, dtype=source.dtype if dtype is None else dtype, device=self.device)
-        _write(target, name, self.synthetic_seed)
+        _write(target, name, self.synthetic_seed, source=source)
         record_numeric_tensor(target)
         return target
 
