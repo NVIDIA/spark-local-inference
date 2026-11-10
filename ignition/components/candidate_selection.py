@@ -22,7 +22,7 @@ class PreparedCandidateSelection:
 
     def __init__(self, indices, scores, positions, rank, output, *, world, gather_runtime,
                  owner_runtime, reduction_runtime, session, coordinator, name, buffers,
-                 dependencies=(), alternatives=("replicated", "owner")):
+                 dependencies=(), alternatives=("replicated", "owner"), local_counts=None):
         rows, topk = indices.shape
         if (indices.dtype != torch.int32 or scores.shape != indices.shape or scores.dtype != torch.float32
                 or positions.shape != (rows,) or positions.dtype != torch.int64
@@ -34,6 +34,9 @@ class PreparedCandidateSelection:
             raise ValueError("candidate merging requires matching contiguous local rows and global output IDs")
         if not alternatives or not set(alternatives) <= {"replicated", "owner"}:
             raise ValueError("candidate merging requires supported prepared alternatives")
+        if (local_counts is not None and (local_counts.shape != (rows,) or local_counts.dtype != torch.int32
+                or local_counts.device != indices.device or not local_counts.is_contiguous())):
+            raise ValueError("candidate merging requires contiguous int32 counts per row")
         self.indices, self.scores, self.positions, self.output = indices, scores, positions, output
         self.rank = 0 if rank is None else rank
         self.rows, self.world, self.topk = rows, world, topk
@@ -64,7 +67,7 @@ class PreparedCandidateSelection:
             self.owner_scores, self.owner_ids = self.planar[:rows], self.planar[rows:].view(torch.int32)
             self.owner = PreparedOwnerTopK(self.owner_ids, self.owner_scores, self.active, rank, output,
                 owner_runtime=owner_runtime, reduction_runtime=reduction_runtime, session=session,
-                coordinator=coordinator, name=name+".owner", buffers=buffers)
+                coordinator=coordinator, name=name+".owner", buffers=buffers, local_counts=local_counts)
             self.owner.transport.dependencies = self.dependencies
 
     def bind(self, implementation):

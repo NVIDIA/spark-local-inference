@@ -32,6 +32,24 @@ def _fake_stage(local_indices, local_scores, indices, scores, dependencies, hand
     pass
 
 
+@torch.library.custom_op("flare::candidate_owner_stage_counted", mutates_args=("indices", "scores", "counts"))
+def _stage_counted(local_indices: torch.Tensor, local_scores: torch.Tensor, local_counts: torch.Tensor,
+                   indices: torch.Tensor, scores: torch.Tensor, counts: torch.Tensor,
+                   dependencies: list[torch.Tensor], handle: int) -> None:
+    operation = _OWNERS[handle]
+    if (indices.data_ptr() != operation.indices.data_ptr()
+            or scores.data_ptr() != operation.scores.data_ptr()
+            or counts.data_ptr() != operation.counts.data_ptr()):
+        raise ValueError("counted candidate-stage outputs must alias the reserved channel views")
+    with operation.runtime.capture(plan=operation.plan):
+        operation.runtime.stage_candidates(local_indices, local_scores, local_counts, plan=operation.plan)
+
+
+@_stage_counted.register_fake
+def _fake_stage_counted(local_indices, local_scores, local_counts, indices, scores, counts, dependencies, handle):
+    pass
+
+
 class PreparedCandidateOwnerStage:
     """Deliver rank-major score/ID rows to their contiguous row partitions.
 
@@ -39,12 +57,14 @@ class PreparedCandidateOwnerStage:
     storage; their consumers must complete before another call reuses it.
     """
 
-    def __init__(self, local_indices, local_scores, *, runtime, session, coordinator, name, dependencies=()):
+    def __init__(self, local_indices, local_scores, *, runtime, session, coordinator, name,
+                 local_counts=None, dependencies=()):
         self.runtime = runtime
-        self.local_indices, self.local_scores = local_indices, local_scores
+        self.local_indices, self.local_scores, self.local_counts = local_indices, local_scores, local_counts
         self.dependencies = list(dependencies)
         self.indices, self.scores = runtime.graph_candidate_views(local_indices.shape[0])
-        call = dict(local_indices=local_indices, local_scores=local_scores)
+        self.counts = None if local_counts is None else runtime.graph_count_views(local_indices.shape[0])
+        call = dict(local_indices=local_indices, local_scores=local_scores, local_counts=local_counts)
         self.plan = _owner_preparation.plan(
             _owner_preparation.query_from_runtime(runtime, call=call), runtime=runtime)
         declare(session, (self.plan.request(name=name,
@@ -54,6 +74,10 @@ class PreparedCandidateOwnerStage:
         _OWNERS[self.handle] = self
 
     def __call__(self):
+        if self.local_counts is not None:
+            _stage_counted(self.local_indices, self.local_scores, self.local_counts,
+                           self.indices, self.scores, self.counts, self.dependencies, self.handle)
+            return self.indices, self.scores, self.counts
         _stage(self.local_indices, self.local_scores, self.indices, self.scores, self.dependencies, self.handle)
         return self.indices, self.scores
 
