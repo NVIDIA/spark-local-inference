@@ -498,13 +498,21 @@ def _fake_start_all_gather(source, output, dependencies, handle, stream):
 
 
 @torch.library.custom_op("flare::join_all_gather", mutates_args=("output",))
-def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependency: torch.Tensor, stream: int) -> None:
+def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                     dependency: torch.Tensor, stream: int) -> None:
     torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
 
 
 @_join_all_gather.register_fake
-def _fake_join_all_gather(source, output, dependency, stream):
+def _fake_join_all_gather(source, output, dependencies, dependency, stream):
     pass
+
+
+@dataclass(frozen=True)
+class PendingAllGather:
+    source: torch.Tensor
+    output: torch.Tensor
+    dependencies: list[torch.Tensor]
 
 
 class ConcurrentAllGather:
@@ -535,13 +543,22 @@ class ConcurrentAllGather:
         if self.gather.plan.memory_requirements().scratch_nbytes:
             raise ValueError("concurrent column gather requires a plan without caller scratch")
 
-    def start(self, source):
-        _start_all_gather(source, self.gather.output, self.gather.dependencies,
-                          self.gather.handle, self.stream_handle)
+    def functional(self, *, session):
+        self.gather.functional(session=session)
+        return self
 
-    def finish(self, source, dependency):
-        _join_all_gather(source, self.gather.output, dependency, self.stream_handle)
-        return self.gather.output
+    def start(self, source, *, dependencies=()):
+        output = self.gather.output
+        if output is None:
+            shape, stride, dtype = self.gather.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        dependencies = [*self.gather.dependencies, *dependencies]
+        _start_all_gather(source, output, dependencies, self.gather.handle, self.stream_handle)
+        return PendingAllGather(source, output, dependencies)
+
+    def finish(self, pending, dependency):
+        _join_all_gather(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+        return pending.output
 
 
 @triton.jit
@@ -787,9 +804,10 @@ class PreparedAllGather:
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = None
+        self.dependencies = []
         return self
 
-    def __call__(self, source, output=None):
+    def __call__(self, source, output=None, *, dependencies=()):
         if output is None:
             output = self.output
         if output is None:
@@ -798,7 +816,7 @@ class PreparedAllGather:
         if self.single:
             output.copy_(source)
         else:
-            _all_gather(source, output, self.dependencies, self.handle)
+            _all_gather(source, output, [*self.dependencies, *dependencies], self.handle)
         return output
 
     def run_eager(self, source, output=None):
