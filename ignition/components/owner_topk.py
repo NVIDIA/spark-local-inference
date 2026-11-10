@@ -85,6 +85,11 @@ class PreparedOwnerTopK:
         if (local_counts is not None and (local_counts.shape != (rows,) or local_counts.dtype != torch.int32
                 or local_counts.device != local_indices.device or not local_counts.is_contiguous())):
             raise ValueError("owner selection requires contiguous int32 candidate counts per row")
+        if local_counts is not None:
+            start, end = local_counts.data_ptr(), local_counts.data_ptr() + local_counts.nbytes
+            if any(start < tensor.data_ptr() + tensor.nbytes and tensor.data_ptr() < end
+                   for tensor in (local_indices, local_scores, active, rank, output)):
+                raise ValueError("candidate count scratch must not overlap inputs or output")
         owner_rows, width, topk = -(-rows // world), local_topk * world, output.shape[1]
         self.rows, self.owner_rows, self.width = rows, owner_rows, width
         self.world, self.local_topk = world, local_topk
