@@ -6,7 +6,7 @@ import os
 import pytest
 import torch
 
-from ignition.preparation.package_storage import PackageStorage
+from ignition.preparation.core_storage import CoreStorage
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 @pytest.fixture(scope="module")
 def storage():
     # The native preparation arena is process-wide; all tests share its owner.
-    with PackageStorage(device=0) as owner:
+    with CoreStorage(device=0) as owner:
         yield owner
 
 

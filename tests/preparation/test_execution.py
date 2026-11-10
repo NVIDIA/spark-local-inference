@@ -39,7 +39,7 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     decode, prefill = manifest["graphs"]
     assert decode["estimated_duration_ns"] == 123_000
     assert prefill["estimated_duration_ns"] == 456_000
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
 
     encoded = ExecutionGraph(**{key: value for key, value in decode.items() if key != "handle"})
     assert ExecutionGraph.FromString(encoded.SerializeToString()).estimated_duration_ns == 123_000
@@ -230,7 +230,7 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
     manifest = execution.manifest(all_variants=True)
     assert manifest["abi_version"] == 6
     graph, = manifest["graphs"]
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
     encoded = ExecutionGraph(**{k: v for k, v in graph.items() if k != "handle"})
     decoded = ExecutionGraph.FromString(encoded.SerializeToString())
     assert (decoded.batch_capacity, decoded.token_capacity, decoded.prefill_capacity) == (4, width, prefill)
@@ -239,7 +239,7 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
 
 
 def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds():
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
     legacy = ExecutionGraph.FromString(b"\x12\x0cverification\x20\x08\x28\x06")
     assert (legacy.batch_capacity, legacy.token_capacity, legacy.packed_token_capacity) == (8, 6, 0)
     graph = ExecutionGraph(kind="speculative", batch_capacity=8, token_capacity=6, packed_token_capacity=24,

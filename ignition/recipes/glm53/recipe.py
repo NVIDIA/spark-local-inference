@@ -27,7 +27,7 @@ def _costs(state_row_bytes, graph_bytes, *, ranks, speculating):
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     """Prepare the plan's catalog and speculation settings on process-local GPUs 0 through N-1.
 
     With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
@@ -59,8 +59,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         expand_expert_scales=plan.world_size >= 4,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
-        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 

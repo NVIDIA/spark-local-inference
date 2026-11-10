@@ -84,7 +84,7 @@ def test_native_recorder_tracks_real_driver_allocation_and_context_lifetimes():
     result = subprocess.run([sys.executable, "-c", r'''
 import ctypes as C
 from ignition.preparation.module_images import ModuleImages
-from ignition.preparation.runtime_package import _Cuda
+from ignition.preparation.runtime_core import _Cuda
 
 cuda = _Cuda()
 cuda.call("cuInit", C.c_uint(0))

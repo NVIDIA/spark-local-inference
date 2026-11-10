@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use helios_core::package::{cache, protection, reader, schema::wire as pwire};
+use helios_core::core::{cache, protection, reader, schema::wire as pwire};
 use pyo3::{exceptions::PyValueError, prelude::*};
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ use super::{
 pub(crate) struct Source {
     #[serde(with = "envelope_base64")]
     envelope: Vec<u8>,
-    publishers: Vec<helios_core::runtime_package::Publisher>,
+    publishers: Vec<helios_core::runtime_core::Publisher>,
     #[serde(default)]
     rebuild_manifest: Option<serde_json::Value>,
 }
@@ -105,7 +105,7 @@ pub(crate) fn open_source(
         &publishers,
         protection::Selection::Catalog,
     )?;
-    if catalog.package().model_identity != model {
+    if catalog.core().model_identity != model {
         return Err(invalid("cached weight source belongs to a different model"));
     }
     let mut payloads = BTreeSet::new();
@@ -134,7 +134,7 @@ pub(crate) fn open_source(
                 if payloads.contains(&slice.payload_id) {
                     continue;
                 }
-                let id = helios_core::package::PayloadId::from_bytes(
+                let id = helios_core::core::PayloadId::from_bytes(
                     slice.payload_id.as_slice().try_into()?,
                 );
                 let object = root.payload(id)?.ok_or_else(|| {
@@ -154,7 +154,7 @@ pub(crate) fn open_source(
                     .slice
                     .as_ref()
                     .ok_or_else(|| invalid("cached Engram plane has no slice"))?;
-                let id = helios_core::package::PayloadId::from_bytes(
+                let id = helios_core::core::PayloadId::from_bytes(
                     slice.payload_id.as_slice().try_into()?,
                 );
                 let object = root.payload(id)?.ok_or_else(|| {
@@ -280,7 +280,7 @@ impl Source {
         &self,
         request: &CaptureRequest,
         output: &RankOutput,
-    ) -> Result<protection::VerifiedPackage> {
+    ) -> Result<protection::VerifiedCore> {
         let expected: super::wire::RebuildManifest = super::binding::message(
             "RebuildManifest",
             self.rebuild_manifest
@@ -436,7 +436,7 @@ fn rebind_engram(previous: &pwire::Engram, current: &super::wire::Engram) -> Res
 
 fn map_groups(
     previous: &pwire::RankBody,
-    payloads: &helios_core::package::schema::Catalog,
+    payloads: &helios_core::core::schema::Catalog,
     output: &RankOutput,
     catalog: &weight_payload::WeightPayloadCatalog,
     views: &WeightPayloadSources,
@@ -446,8 +446,8 @@ fn map_groups(
         .rebuild_weights
         .as_ref()
         .ok_or_else(|| invalid("--reuse-weights requires declared weight views"))?;
-    let current = super::package::convert_prepared(rebuild, bundle, Some(views))?;
-    let prior = helios_core::package::prepared_weights::catalog(previous)?.ok_or_else(|| {
+    let current = super::core::convert_prepared(rebuild, bundle, Some(views))?;
+    let prior = helios_core::core::prepared_weights::catalog(previous)?.ok_or_else(|| {
         invalid("cached rank has no prepared weight catalog; export with weights first")
     })?;
     let old_views: BTreeMap<_, _> = prior

@@ -249,7 +249,7 @@ def test_qwen_adapter_passes_speculation_overrides(monkeypatch, tmp_path):
 def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
-                        lambda snapshot, config, prepare, *, progress, package_storage=None, ranks=None, checkpoint=None:
+                        lambda snapshot, config, prepare, *, progress, core_storage=None, ranks=None, checkpoint=None:
                         seen.append((config, prepare, ranks, checkpoint)) or "group")
     from ignition.recipes.glm53 import bootstrap as glm
     from ignition.recipes.qwen38 import bootstrap as qwen

@@ -8,6 +8,11 @@
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!flare-cli/
+!flare-cli/Cargo.toml
+!flare-cli/Cargo.lock
+!flare-cli/src/
+!flare-cli/src/**
 !selene/
 !selene/Cargo.toml
 !selene/Cargo.lock

@@ -1430,7 +1430,7 @@ fn prepare_allocations(
 
 fn validate_allocations(allocations: &[Allocation]) -> ExportResult<()> {
     if allocations.is_empty() {
-        return Err(invalid("runtime package requires allocations and kernels"));
+        return Err(invalid("runtime core requires allocations and kernels"));
     }
     let mut names = HashSet::new();
     let mut intervals = Vec::new();
@@ -1968,7 +1968,7 @@ fn stage_directory(path: &Path) -> ExportResult<PathBuf> {
     fs::create_dir_all(parent)?;
     let stem = path
         .file_name()
-        .ok_or_else(|| invalid("runtime package path requires a filename"))?
+        .ok_or_else(|| invalid("runtime core path requires a filename"))?
         .to_string_lossy();
     loop {
         let stage = parent.join(format!(
@@ -2076,7 +2076,7 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
                     b"nvmlDeviceGetPciInfo_v3\0",
                 )?;
             cuda.check("nvmlDeviceGetPciInfo_v3", get_pci(handle, &mut pci))?;
-            match helios_core::package::naming::platform_from_pci(pci.device_id) {
+            match helios_core::core::naming::platform_from_pci(pci.device_id) {
                 Some(platform) => Ok(Some(platform.to_string())),
                 None => Err(invalid(format!(
                     "NVML reports unsupported GPU PCI id {:#010x}",
@@ -2132,7 +2132,7 @@ fn resolve_weight_payload(
         &retained,
     )?;
     let root = match request.options.cache.as_ref() {
-        Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
+        Some(cache) => Some(helios_core::core::cache::Root::open(cache)?),
         None => None,
     };
     let retained = match device {
@@ -2341,7 +2341,7 @@ fn resolve_weight_payload(
         payload_id: Vec::new(),
     });
     let cached = reused.as_ref().map(|groups| groups.iter().map(|group|
-        helios_core::package::schema::wire::PayloadDescriptor { id: group.payload_id.clone(), nbytes: group.nbytes }).collect()).unwrap_or_default();
+        helios_core::core::schema::wire::PayloadDescriptor { id: group.payload_id.clone(), nbytes: group.nbytes }).collect()).unwrap_or_default();
     let sources = WeightPayloadSources {
         cached, engram: output.weight_payload.as_ref().and_then(|sources| sources.engram.clone()),
         groups: reused.unwrap_or(groups),
@@ -2526,7 +2526,7 @@ fn scan_group_blocks<R>(
     read_into: &mut R,
     spans: &[weight_payload::PayloadSpan],
 ) -> ExportResult<(
-    helios_core::package::PayloadId,
+    helios_core::core::PayloadId,
     u64,
     Vec<(String, u64, u64, u64)>,
 )>
@@ -2552,7 +2552,7 @@ where
         Ok(())
     })?;
     Ok((
-        helios_core::package::PayloadId::from_bytes(hasher.finalize().into()),
+        helios_core::core::PayloadId::from_bytes(hasher.finalize().into()),
         total,
         blocks,
     ))
@@ -2762,11 +2762,11 @@ pub(crate) fn capture_rank(
         return Err(invalid("a rank exports at most one RoCE transport"));
     }
     if request.sources && request.publisher.is_some() {
-        return Err(invalid("a signed package cannot reference staged sources"));
+        return Err(invalid("a signed core cannot reference staged sources"));
     }
     if (request.options.no_weights || request.options.reuse_weights.is_some()) && request.options.cache.is_none() {
         return Err(invalid(
-            "export without weight writes requires a package cache",
+            "export without weight writes requires a core cache",
         ));
     }
     // Validate serving defaults before reading graph handles or storage.
@@ -2901,7 +2901,7 @@ pub(crate) fn capture_rank(
         inspect_phase.advance(1);
     }
     if kernels.is_empty() {
-        return Err(invalid("runtime package requires allocations and kernels"));
+        return Err(invalid("runtime core requires allocations and kernels"));
     }
     if modules.values().any(|image| !image.starts_with(b"\x7fELF")) {
         return Err(invalid("module images must be compiled cubins"));
@@ -3541,7 +3541,7 @@ mod tests {
             wire::Span { offset: 0, nbytes, filename: String::new() },
         );
         let request: CaptureRequest = serde_json::from_value(serde_json::json!({
-            "path": directory.join("package"),
+            "path": directory.join("core"),
             "context": 0,
             "graphs": [],
             "allocations": [],
@@ -3665,10 +3665,10 @@ mod tests {
         assert_ne!(catalog.initial_state.payload_id, state_id);
         // Missing stable weight data still fails under no_weights.
         drop(output);
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         let id: [u8; 32] = weight_id.as_slice().try_into().unwrap();
         let object = root
-            .payload(helios_core::package::PayloadId::from_bytes(id))?
+            .payload(helios_core::core::PayloadId::from_bytes(id))?
             .unwrap();
         let path = object.path().to_path_buf();
         drop(object);
@@ -3703,14 +3703,14 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         root.collect()?;
-        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+        assert!(root.payload(helios_core::core::PayloadId::from_bytes(
             group.payload_id.clone().try_into().unwrap()
         ))?.is_some(), "lease must keep the object during capture");
         drop(output);
         root.collect()?;
-        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+        assert!(root.payload(helios_core::core::PayloadId::from_bytes(
             group.payload_id.clone().try_into().unwrap()
         ))?.is_none(), "released lease lets collection reclaim the object");
         let _ = fs::remove_dir_all(&directory);
@@ -3729,14 +3729,14 @@ mod tests {
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
         let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let id: [u8; 32] = catalog.groups[0].payload_id.clone().try_into().unwrap();
-        let payload = helios_core::package::PayloadId::from_bytes(id);
+        let payload = helios_core::core::PayloadId::from_bytes(id);
         drop(output);
         // Warm: an existing object validates.
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
         assert!(resolve_staged_weight_payload(&request, &mut output)?.is_some());
         drop(output);
         // Corrupted cached bytes are rejected even with the right length.
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         let object = root.payload(payload)?.unwrap();
         let length = object.length();
         let path = object.path().to_path_buf();
@@ -3828,7 +3828,7 @@ mod tests {
         );
         std::io::Read::read_to_end(&mut blocks_reader, &mut stream)?;
         assert_eq!(stream.len() as u64, length);
-        assert_eq!(helios_core::package::PayloadId::of(&stream), id);
+        assert_eq!(helios_core::core::PayloadId::of(&stream), id);
         assert_eq!(stream[0], 7);
         assert_eq!(stream[weight_payload::ELIDE_BLOCK as usize + 7], 11);
         let _ = fs::remove_dir_all(&directory);

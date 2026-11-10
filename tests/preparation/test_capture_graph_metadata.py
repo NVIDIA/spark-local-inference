@@ -16,7 +16,7 @@ from torch.cuda.graphs import CUDAGraph, _RetainedCallbacks
 
 from ignition.preparation import capture
 from ignition.preparation.module_images import ModuleImages
-from ignition.preparation.runtime_package import (
+from ignition.preparation.runtime_core import (
     RecordedExportGraph, _graphs, capture_graph, instantiate_graph, record_export_graph,
 )
 

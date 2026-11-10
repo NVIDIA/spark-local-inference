@@ -1,0 +1,8 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>Hyperflare application icon, small optical size</title>
+  <desc>A simplified block h and solar plume for sixteen through thirty-two pixel icons.</desc>
+  <polygon points="10,2 54,2 62,10 62,54 54,62 10,62 2,54 2,10" fill="#101010" stroke="#333333" stroke-width="1" stroke-linejoin="round"/>
+  <polygon points="29,42 34,26 44,16 56,8 49,24 57,18 49,32 37,45" fill="#76B900"/>
+  <polygon points="12,16 22,16 22,28 33,28 40,35 40,50 30,50 30,38 22,38 22,50 12,50" fill="#F5F0E3"/>
+</svg>

@@ -74,3 +74,21 @@ def test_dependent_gather_declares_slab_read_and_output_write():
     assert arguments["output"].alias_info.is_write
     assert arguments["dependencies"].alias_info is None
     assert "Tensor" in str(arguments["dependencies"].type)
+
+
+def test_paired_timing_uses_maximum_rank_and_preserves_pairing():
+    from qualify.kimi_staged_prefill import summarize_pairs
+
+    samples = [dict(seed=3, pair=0, path='direct', rank_ms=[1., 3.]),
+               dict(seed=3, pair=0, path='staged', rank_ms=[2., 1.]),
+               dict(seed=7, pair=0, path='staged', rank_ms=[5., 4.]),
+               dict(seed=7, pair=0, path='direct', rank_ms=[6., 2.])]
+    result = summarize_pairs(samples)
+    assert result['pairs'] == 2
+    assert result['direct_mean_ms'] == 4.5
+    assert result['staged_mean_ms'] == 3.5
+    assert result['paired_difference_mean_ms'] == -1
+    with pytest.raises(ValueError, match='complete'):
+        summarize_pairs(samples[:-1])
+    with pytest.raises(ValueError, match='duplicate'):
+        summarize_pairs([*samples, samples[0]])

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Structural extraction and model-card defaults at the runtime package boundary."""
+"""Structural extraction and model-card defaults at the runtime core boundary."""
 
 from pathlib import Path
 import json
@@ -11,9 +11,9 @@ from google.protobuf.json_format import MessageToDict, ParseError
 import pytest
 
 from ignition.preparation.frontend import image_settings, prepare_frontend, tokenizer_settings
-from ignition.preparation.package_file import combine, read_index, write_sources
-from ignition.preparation.package_proto import serving
-from ignition.preparation.runtime_package_pb2 import BundleIndex, ModelIndex
+from ignition.preparation.core_file import combine, read_index, write_sources
+from ignition.preparation.core_proto import serving
+from ignition.preparation.runtime_core_pb2 import BundleIndex, ModelIndex
 from ignition.recipes import recipes
 from ignition.recipes.declaration import SamplingDefaults, SamplingRange
 
@@ -133,8 +133,8 @@ def test_typed_settings_survive_publication_and_tensor_parallel_assembly(tmp_pat
     from tests.preparation.payload_fixture import manifest, schema
     combine(result, paths, [], publisher=publisher())
     envelope = manifest(result)
-    package = schema()('PackageBody').FromString(envelope.package_body)
-    index = package
+    core = schema()('CoreBody').FromString(envelope.core_body)
+    index = core
     assert MessageToDict(index.sampling_defaults, preserving_proto_field_name=True) == {
         **source["sampling_defaults"], "seed": "0"}
     assert index.sampling_defaults.HasField("ranges") == bool(ranges)

@@ -9,7 +9,7 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend as _prepare_frontend
 
 

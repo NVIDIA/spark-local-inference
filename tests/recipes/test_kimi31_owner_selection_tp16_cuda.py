@@ -57,7 +57,7 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_head_exchange
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.set_num_threads(2)
@@ -71,7 +71,7 @@ def worker(rank, rendezvous, destination, compile_components, rows_catalog=(128,
     for _ in range(rank + 1):
         next(row_ownership._HANDLES)
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             gather = create_head_exchange(dist.group.WORLD, device,
                 max_rows=128, heads=16, head_dim=8192, ipc=storage.peer_storage)
             runtimes.append(gather)

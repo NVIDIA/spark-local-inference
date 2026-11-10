@@ -102,7 +102,7 @@ class Speculation:
     Preparation captures width one at every request bucket and complete rounds
     within the target-token capacity. `adaptive` sets the serving default: choose
     prepared layouts from measured costs and conditional acceptance estimates
-    when true, or use the fixed maximum verification width when false. Package
+    when true, or use the fixed maximum verification width when false. Core
     loading accepts capacity reductions represented by captured graphs. Drafts
     come from the checkpoint's learned draft model.
     """

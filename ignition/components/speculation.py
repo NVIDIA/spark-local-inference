@@ -478,7 +478,7 @@ class PreparedSpeculativeStateCommit:
 
         # Every row commits from its slot's last selected row, which alone writes the slot's state.
         # Rows are evaluated together from the state before the round; each slot then takes its
-        # owner's values in one update, so no slot is written twice whatever the package capacity.
+        # owner's values in one update, so no slot is written twice whatever the core capacity.
         matches = selected[:, None] & selected[None, :] & (self.slots[:, None] == self.slots[None, :])
         count = matches.sum(1)
         row = torch.where(matches, self.rows[None, :], 0).amax(1)

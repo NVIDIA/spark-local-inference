@@ -147,7 +147,7 @@ def test_rebuild_metadata_preserves_the_selected_physical_graph_catalog(monkeypa
     from types import SimpleNamespace
     from google.protobuf.json_format import ParseDict
     from ignition.components.capacity import packed_speculative_shapes
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from tests.cli.test_planning import derive, gpu
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")

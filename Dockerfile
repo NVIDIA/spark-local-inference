@@ -16,6 +16,7 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY flare/ flare/
+COPY flare-cli/ flare-cli/
 COPY helios/ helios/
 COPY eos/ eos/
 COPY selene/ selene/
@@ -26,9 +27,9 @@ COPY ignition/recipes/kimi3/assets/ ignition/recipes/kimi3/assets/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=flare-target-${TARGETARCH},target=/src/flare/target \
-    cargo build --locked --release --manifest-path flare/Cargo.toml --bin flare \
-    && install -Dm755 flare/target/release/flare /out/flare \
+    --mount=type=cache,id=flare-target-${TARGETARCH},target=/src/flare-cli/target \
+    cargo build --locked --release --manifest-path flare-cli/Cargo.toml --bin flare \
+    && install -Dm755 flare-cli/target/release/flare /out/flare \
     && strip /out/flare
 
 FROM debian:trixie-slim

@@ -3,19 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Canonical download path for a packed payload package: embedded frontend
+//! Canonical download path for a packed payload core: embedded frontend
 //! payloads and located derivation-only dependencies must both resolve.
 //!
-//! The fixture is a real signed package: the tokenizer lives in the primary, one
+//! The fixture is a real signed core: the tokenizer lives in the primary, one
 //! required weight is derived from a second weight payload that no initializer
-//! references, and the package is packed into the first canonical form.
+//! references, and the core is packed into the first canonical form.
 
 use std::path::{Path, PathBuf};
 
-use flare_helios::package::{
+use flare_helios::core::{
     PayloadId, cache, container, conversion, derivation, export, protection, reader, schema::wire,
 };
-use flare_helios::runtime_package::Publisher;
+use flare_helios::runtime_core::Publisher;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use ring::digest::{digest, SHA256};
@@ -38,7 +38,7 @@ fn publish(scratch: &Path, with_derivation: bool) -> Fixture {
 }
 
 fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> Fixture {
-    let directory = scratch.join("package");
+    let directory = scratch.join("core");
     std::fs::create_dir_all(&directory).unwrap();
 
     let source = source.repeat(2);
@@ -78,7 +78,7 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
         .unwrap(),
         id,
     };
-    let runtime = flare_helios::runtime_package::wire::ServingContract {
+    let runtime = flare_helios::runtime_core::wire::ServingContract {
         model_id: "packed-model".into(),
         identity: "packed-model".into(),
         max_sequence_tokens: 8,
@@ -86,9 +86,9 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
         pages: 1,
         state_rows: 1,
         page_tokens: 1,
-        model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+        model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
             vocabulary: 8,
-            graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+            graphs: vec![flare_helios::runtime_core::wire::GraphContract {
                 graph: "decode".into(),
                 ..Default::default()
             }],
@@ -119,8 +119,8 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
             ..Default::default()
         }],
         // Only the derived target is required. The canonical source weight is
-        // located in the package but named by no initializer, and the tokenizer
-        // arrives through the package assets, which live in the primary.
+        // located in the core but named by no initializer, and the tokenizer
+        // arrives through the core assets, which live in the primary.
         initializers: vec![initializer(derived_id, "device-0", derived.len() as u64)],
         graphs: vec![wire::Graph {
             name: "decode".into(),
@@ -131,12 +131,12 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
         ..Default::default()
     };
     let request = export::PublishRequest {
-        package: wire::PackageBody {
+        core: wire::CoreBody {
             model_identity: "packed-model".into(),
             hardware_identity: "sm120".into(),
-            frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+            frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
             sampling_defaults: Some(
-                flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
             ),
             publisher: Some(wire::PublisherMetadata {
                 namespace: "packed".into(),
@@ -157,7 +157,7 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
             }],
             ..Default::default()
         },
-        // Package-scoped payload: embedded in the primary, no companion path.
+        // Core-scoped payload: embedded in the primary, no companion path.
         payloads: vec![export::PublishPayload {
             role: wire::PayloadRole::Frontend,
             relative: String::new(),
@@ -192,14 +192,14 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
                 }],
             }],
         }],
-        package_id: [41u8; 32],
+        core_id: [41u8; 32],
         public_key,
         accepted: "packed".into(),
         no_weights: false,
     };
     export::publish(&request, &key, export::Destination::Directory(&directory)).unwrap();
 
-    // The derived target is removed from the package and described as a copy of the
+    // The derived target is removed from the core and described as a copy of the
     // source payload, which no initializer references.
     if !with_derivation {
         let packed = scratch.join("packed.safetensors");
@@ -241,7 +241,7 @@ fn publish_with_source(scratch: &Path, source: &[u8], with_derivation: bool) -> 
     }
 }
 
-fn verify_package(fixture: &Fixture) -> protection::Selection {
+fn verify_core(fixture: &Fixture) -> protection::Selection {
     let metadata = reader::Metadata::open(&fixture.packed).unwrap();
     protection::verify(
         &metadata.envelope,
@@ -263,21 +263,21 @@ fn packed_download_accepts_embedded_frontend_and_derivation_only_sources() {
     let scratch = tempfile::tempdir().unwrap();
     let fixture = publish(scratch.path(), true);
     let metadata = reader::Metadata::open(&fixture.packed).unwrap();
-    let selection = verify_package(&fixture);
+    let selection = verify_core(&fixture);
     // Only the public install path the download uses: embedded frontend assets and
     // the located derivation source that no initializer names must both resolve.
     let _ = &metadata;
 
     let cache_root = scratch.path().join("cache");
     let store = cache::Root::open(&cache_root).unwrap();
-    let source = cache::PackageSource::open(
+    let source = cache::CoreSource::open(
         &fixture.packed,
         std::slice::from_ref(&fixture.publisher),
         selection,
     )
     .unwrap();
     let entry = store
-        .install_package(source, "packed-model", "entry")
+        .install_core(source, "packed-model", "entry")
         .expect("packed canonical install");
 
     // The derived target is materialized from the located source payload.
@@ -304,7 +304,7 @@ fn packed_download_accepts_embedded_frontend_and_derivation_only_sources() {
 #[test]
 fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_hints() {
     let scratch = tempfile::tempdir().unwrap();
-    let directory = scratch.path().join("chain-package");
+    let directory = scratch.path().join("chain-core");
     std::fs::create_dir_all(&directory).unwrap();
     let c = b"transitive chain canonical source".to_vec();
     let b = c[3..19].to_vec();
@@ -345,7 +345,7 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
         .unwrap(),
         id,
     };
-    let contract = flare_helios::runtime_package::wire::ServingContract {
+    let contract = flare_helios::runtime_core::wire::ServingContract {
         model_id: "chain-model".into(),
         identity: "chain-model".into(),
         max_sequence_tokens: 8,
@@ -353,9 +353,9 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
         pages: 1,
         state_rows: 1,
         page_tokens: 1,
-        model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+        model_contract: Some(flare_helios::runtime_core::wire::ModelContract {
             vocabulary: 8,
-            graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+            graphs: vec![flare_helios::runtime_core::wire::GraphContract {
                 graph: "decode".into(),
                 ..Default::default()
             }],
@@ -364,12 +364,12 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
         ..Default::default()
     };
     let request = export::PublishRequest {
-        package: wire::PackageBody {
+        core: wire::CoreBody {
             model_identity: "chain-model".into(),
             hardware_identity: "sm120".into(),
-            frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+            frontend: Some(flare_helios::runtime_core::wire::FrontendSettings::default()),
             sampling_defaults: Some(
-                flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                flare_helios::runtime_core::wire::DefaultSamplingParameters::default(),
             ),
             publisher: Some(wire::PublisherMetadata {
                 namespace: "chain".into(),
@@ -432,7 +432,7 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
                 }],
             }],
         }],
-        package_id: [51u8; 32],
+        core_id: [51u8; 32],
         public_key,
         accepted: "chain".into(),
         no_weights: false,
@@ -475,14 +475,14 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
     )
     .unwrap();
     let store = cache::Root::open(scratch.path().join("chain-cache")).unwrap();
-    let source = cache::PackageSource::open(
+    let source = cache::CoreSource::open(
         &packed,
         std::slice::from_ref(&publisher),
         selection,
     )
     .unwrap();
     let entry = store
-        .install_package(source, "chain-model", "entry")
+        .install_core(source, "chain-model", "entry")
         .unwrap();
     // The initializer identities are signed; the recipes that produce their bytes
     // are unsigned acquisition hints. Read each derived value through the
@@ -520,7 +520,7 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
     // `b` is intermediate: no initializer names it, but the unsigned hint for `a`
     // copies from it, so it must be materialized and bound through that hint.
     // The ready entry drops recipes (its closure is materialized); the chain is
-    // proven from the signed source package's derivations.
+    // proven from the signed source core's derivations.
     let chain = metadata.derivations.as_ref().unwrap();
     assert!(chain.derivations.iter().any(|hint| {
         hint.target_payload_id == a_id.as_bytes().to_vec()
@@ -594,16 +594,16 @@ fn selected_derivation_closure_ignores_unselected_invalid_hints() {
 fn packed_download_keeps_embedded_frontend_in_the_primary() {
     let scratch = tempfile::tempdir().unwrap();
     let fixture = publish(scratch.path(), false);
-    let selection = verify_package(&fixture);
+    let selection = verify_core(&fixture);
     let store = cache::Root::open(scratch.path().join("cache")).unwrap();
-    let source = cache::PackageSource::open(
+    let source = cache::CoreSource::open(
         &fixture.packed,
         std::slice::from_ref(&fixture.publisher),
         selection,
     )
     .unwrap();
     let entry = store
-        .install_package(source, "packed-model", "entry")
+        .install_core(source, "packed-model", "entry")
         .expect("packed canonical install");
     let primary = container::Container::open(&entry.directory().join("model.safetensors")).unwrap();
     assert!(primary.tensor_names().any(|name| name == "frontend.tokenizer"));
@@ -669,7 +669,7 @@ fn target_recipe<'a>(
 fn serialized_bad_recipe_fails_install_and_keeps_the_previous_default() {
     let scratch = tempfile::tempdir().unwrap();
     let fixture = publish(scratch.path(), true);
-    let selection = verify_package(&fixture);
+    let selection = verify_core(&fixture);
     let model = cache::model_key("packed-model").unwrap();
     let store = cache::Root::open(scratch.path().join("cache")).unwrap();
 
@@ -682,17 +682,17 @@ fn serialized_bad_recipe_fails_install_and_keeps_the_previous_default() {
         true,
     );
     assert_ne!(previous.derived_id, fixture.derived_id);
-    let previous_selection = verify_package(&previous);
-    let previous_source = cache::PackageSource::open(
+    let previous_selection = verify_core(&previous);
+    let previous_source = cache::CoreSource::open(
         &previous.packed,
         std::slice::from_ref(&previous.publisher),
         previous_selection,
     )
     .unwrap();
     let first = store
-        .install_package(previous_source, &model, "v1")
+        .install_core(previous_source, &model, "v1")
         .unwrap();
-    let previous_source = cache::PackageSource::open(
+    let previous_source = cache::CoreSource::open(
         &previous.packed,
         std::slice::from_ref(&previous.publisher),
         previous_selection,
@@ -723,14 +723,14 @@ fn serialized_bad_recipe_fails_install_and_keeps_the_previous_default() {
         "the signed manifest must be unchanged"
     );
 
-    let tampered_source = cache::PackageSource::open(
+    let tampered_source = cache::CoreSource::open(
         &tampered,
         std::slice::from_ref(&fixture.publisher),
         selection,
     )
     .unwrap();
     assert!(
-        store.install_package(tampered_source, &model, "v2").is_err(),
+        store.install_core(tampered_source, &model, "v2").is_err(),
         "a recipe that cannot reproduce the signed target must fail"
     );
     assert!(store.entry(&model, "v2").is_err(), "no new entry may appear");
@@ -741,7 +741,7 @@ fn serialized_bad_recipe_fails_install_and_keeps_the_previous_default() {
     );
     assert!(first.directory().is_dir());
     assert!(store.payload(fixture.derived_id).unwrap().is_none());
-    let previous_source = cache::PackageSource::open(
+    let previous_source = cache::CoreSource::open(
         &previous.packed,
         std::slice::from_ref(&previous.publisher),
         previous_selection,
@@ -755,17 +755,17 @@ fn serialized_bad_recipe_fails_install_and_keeps_the_previous_default() {
 fn cached_authenticated_target_is_reused_despite_unusable_hint() {
     let scratch = tempfile::tempdir().unwrap();
     let fixture = publish(scratch.path(), true);
-    let selection = verify_package(&fixture);
+    let selection = verify_core(&fixture);
     let model = cache::model_key("packed-model").unwrap();
     let store = cache::Root::open(scratch.path().join("cache")).unwrap();
 
-    let clean = cache::PackageSource::open(
+    let clean = cache::CoreSource::open(
         &fixture.packed,
         std::slice::from_ref(&fixture.publisher),
         selection,
     )
     .unwrap();
-    let first = store.install_package(clean, &model, "v1").unwrap();
+    let first = store.install_core(clean, &model, "v1").unwrap();
     assert!(store.payload(fixture.derived_id).unwrap().is_some());
 
     let tampered = scratch.path().join("tampered-warm.safetensors");
@@ -776,7 +776,7 @@ fn cached_authenticated_target_is_reused_despite_unusable_hint() {
             copy.source_offset += 1;
         }
     });
-    let tampered_source = cache::PackageSource::open(
+    let tampered_source = cache::CoreSource::open(
         &tampered,
         std::slice::from_ref(&fixture.publisher),
         selection,
@@ -785,7 +785,7 @@ fn cached_authenticated_target_is_reused_despite_unusable_hint() {
     // The cached target hashes to the signed identity. An unusable unsigned hint
     // must not force materialization and must not override that authoritative
     // object.
-    let progress = flare_helios::package::progress::AcquisitionProgress::new();
+    let progress = flare_helios::core::progress::AcquisitionProgress::new();
     let plan = store
         .plan_acquisition_with(
             tampered_source,
@@ -820,7 +820,7 @@ fn cached_authenticated_target_is_reused_despite_unusable_hint() {
 fn serialized_unrelated_bogus_hint_is_ignored_by_install() {
     let scratch = tempfile::tempdir().unwrap();
     let fixture = publish(scratch.path(), true);
-    let selection = verify_package(&fixture);
+    let selection = verify_core(&fixture);
     let store = cache::Root::open(scratch.path().join("cache")).unwrap();
     let bogus_target = PayloadId::of(b"unselected target");
     let bogus_source = PayloadId::of(b"unselected source");
@@ -843,14 +843,14 @@ fn serialized_unrelated_bogus_hint_is_ignored_by_install() {
             }],
         });
     });
-    let package = cache::PackageSource::open(
+    let core = cache::CoreSource::open(
         &source,
         std::slice::from_ref(&fixture.publisher),
         selection,
     )
     .unwrap();
     let entry = store
-        .install_package(package, "bogus-model", "ok")
+        .install_core(core, "bogus-model", "ok")
         .expect("an unrelated unauthenticated hint must not break the install");
     assert!(store.payload(fixture.derived_id).unwrap().is_some());
     assert!(store.payload(bogus_target).unwrap().is_none());

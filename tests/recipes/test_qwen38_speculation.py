@@ -275,7 +275,7 @@ def test_sixteen_token_commit_preserves_records_histogram_rng_history_and_surviv
 @pytest.mark.parametrize("capacity", [1, 8, 13, 16, 32])
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("clipping", ["none", "budget", "eos", "inactive"])
-def test_package_capacity_bounds_publication_without_truncating_verified_prefix(capacity, short, clipping):
+def test_core_capacity_bounds_publication_without_truncating_verified_prefix(capacity, short, clipping):
     width = min(capacity, 4) if short else capacity
     state, acceptance, commit, records = example(width=width, vocab=64, budget=80, completion_capacity=capacity)
     acceptance.token_ids.copy_(commit.inputs + 1)

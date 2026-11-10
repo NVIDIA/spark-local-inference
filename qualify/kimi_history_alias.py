@@ -215,7 +215,7 @@ def worker(rank, rendezvous, checkpoint, config_path, maximum):
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_head_exchange
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.bootstrap import REDUCE_ROWS, allocate_prefill_histories
@@ -238,7 +238,7 @@ def worker(rank, rendezvous, checkpoint, config_path, maximum):
     reference = probability_encoding_reference
     tail_type = RecordedAttentionTail
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             with KimiWeightLoader(inspect_indexed_checkpoint(Path(checkpoint)), device,
                     shard=TensorParallelShard(rank, WORLD),
                     prefixes=("language_model.model.layers.3.self_attn.",),

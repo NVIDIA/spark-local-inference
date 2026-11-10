@@ -71,12 +71,20 @@ class PreparedIndexSelection:
         else:
             self.merge.bind("replicated")
 
-    def __call__(self, query, weights, positions, tables):
+    def prepare_local(self, query, weights, positions, tables):
+        """Produce rank-local candidates without using a peer communication channel."""
         index_pages(tables[:1] if self.mode == "prefill" else tables, self.pages)
         self.lengths.copy_(self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32))
         self.indexer(query.view(query.shape[0], 32, 128), weights)
-        self.merge.pack()
+        return self.merge.pack()
+
+    def exchange(self, positions):
+        """Exchange local candidates and preserve global selection order."""
         return self.merge.exchange(positions=positions)
+
+    def __call__(self, query, weights, positions, tables):
+        self.prepare_local(query, weights, positions, tables)
+        return self.exchange(positions)
 
 
 class PreparedDSAIndexer:
@@ -127,6 +135,14 @@ class PreparedDSAIndexer:
                     metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
                     session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
                     latent_cache=latent_cache)
+
+    @property
+    def local_plans(self):
+        """Projection, query-quantization, and index-scoring plans with no peer exchange."""
+        indexers = ([part.indexer for part in self.selections.values()] if self.sharded is None
+                    else [part[0] for part in self.sharded.indexers.values()])
+        return (*[projection.plan for projection in self.projections],
+                *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
     def project(self, source):
         self.projections[0](self.query_latent)

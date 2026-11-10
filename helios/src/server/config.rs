@@ -45,7 +45,7 @@ impl Bootstrap {
             .as_object()
             .ok_or("server configuration must be a JSON object")?;
         if object.contains_key("generation_defaults") || object.contains_key("eos_token_ids") {
-            return Err("sampling and token defaults require typed package fields".into());
+            return Err("sampling and token defaults require typed core fields".into());
         }
         let text = |name: &str| {
             object
@@ -334,6 +334,7 @@ impl Bootstrap {
                 .ok_or("adaptive verification alpha must be finite and greater than zero")?;
         }
         let server = ServerConfig {
+            log_to_stderr: true,
             scheduling_policy,
             thinking_token_budget: object.get("thinking_token_budget")
                 .filter(|value| !value.is_null())

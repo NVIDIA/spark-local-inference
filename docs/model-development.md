@@ -45,7 +45,7 @@ Performance changes also require [GPU performance work](performance-work.md).
 - Ignition validates checkpoint configuration for structural data, including
   EOS and template tokens, image preprocessing, and vision position geometry.
   Export only the fields Helios consumes in first-class Protobuf messages.
-  Runtime assets are the tokenizer and chat template; do not package raw generation,
+  Runtime assets are the tokenizer and chat template; do not core raw generation,
   tokenizer, processor, or model configuration files. Helios consumes prepared
   settings without per-model sampling policy or config-file interpretation.
 
@@ -111,9 +111,9 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   normalization reorders tool results, move each result's images with its text.
   Preserve the tokenizer's distinction between ordinary text and special tokens,
   including literal special-token spellings in user and tool content.
-- Explicit request options override packaged defaults. Validate unsupported
+- Explicit request options override prepared defaults. Validate unsupported
   options and malformed content explicitly. Preserve previously exported
-  packages' renderer selection, absent-field defaults, and packaged semantics.
+  cores' renderer selection, absent-field defaults, and prepared semantics.
 
 ### Complete-message endpoints
 
@@ -140,7 +140,7 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 
 ### Jinja integration
 
-- Package an annotated recipe template. Removing its mark annotations must
+- Core an annotated recipe template. Removing its mark annotations must
   reproduce the authoritative template bytes, including any explicitly supported
   inference transformation. Preserve Jinja whitespace-control behavior and test
   actual rendered output; source equality alone does not validate placement.
@@ -160,7 +160,7 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 - Verify the recipe exports the annotated asset and Helios loads it through the
   shared compiler. Do not bypass the missing-annotation error or add a broad
   template fallback. Compatibility substitutions must match the exact template
-  bytes of an existing supported package.
+  bytes of an existing supported core.
 
 ### Programmatic encoder integration
 
@@ -219,8 +219,8 @@ satisfy these requirements:
    segmented and image paths where supported. Synthetic tokenizers are useful
    edge-case tests but do not establish checkpoint-tokenizer parity.
 3. Exercise the native request preparation used by each supported HTTP protocol
-   and load the exported package's frontend assets/settings. Validate older
-   packages when changing their loading or default semantics.
+   and load the exported core's frontend assets/settings. Validate older
+   cores when changing their loading or default semantics.
 4. Demonstrate repeated-prompt and changed-suffix cache reuse through the actual
    service, including ordinary and speculative execution where supported. Check
    consumed-prefix accounting and continuation correctness. Frontend CPU tests

@@ -12,8 +12,8 @@ from fixture_frontend import server_config
 from signing import publisher
 from ignition.preparation.execution import GraphSignature, PreparedExecution
 from ignition.preparation.module_images import ModuleImages
-from ignition.preparation.package_storage import PackageStorage
-from ignition.preparation.runtime_package import export_model
+from ignition.preparation.core_storage import CoreStorage
+from ignition.preparation.runtime_core import export_model
 from tests.components.test_packed_speculation_cuda import _fixture
 
 
@@ -21,7 +21,7 @@ from tests.components.test_packed_speculation_cuda import _fixture
 def prepare(root, rank):
     root.mkdir(parents=True)
     torch.cuda.set_device(rank)
-    with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
+    with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
         fixture = _fixture(3)
         fixture.logits.fill_(-torch.inf)
         for position in range(8):
@@ -75,8 +75,8 @@ def prepare(root, rank):
                     pending_inputs=fixture.target.candidates),
                 resources=(fixture, forward, initial_state, initial_rng, storage))
             model.server_config = server_config(root)
-            model.package_data = None
-            export_model(model, images, storage, root / "package", options={}, publisher=publisher())
+            model.core_data = None
+            export_model(model, images, storage, root / "core", options={}, publisher=publisher())
         finally:
             graph.reset()
 

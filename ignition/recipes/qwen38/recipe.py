@@ -24,7 +24,7 @@ def _costs(state_row_bytes, page_layer_bytes, graph_bytes, *, speculating):
     return RankCosts(state_row_bytes, layers * page_layer_bytes, graph_bytes)
 
 
-def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage=None,
+def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
             ranks=None):
     """Prepare the plan's catalog and speculation settings on process-local GPUs 0 through N-1.
 
@@ -65,12 +65,12 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
-        storage = {} if package_storage is None else {"package_storage": package_storage}
+        storage = {} if core_storage is None else {"core_storage": core_storage}
         return prepare_model(snapshot, config, progress=progress, compile_decoder=compile_forwards,
                              **storage)
     from ignition.preparation.rank_group import prepare_group
 
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 

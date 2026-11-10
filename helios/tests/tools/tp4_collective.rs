@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Reload package-owned TP4 transports after the Python preparation process exits.
+//! Reload core-owned TP4 transports after the Python preparation process exits.
 
 #[path = "allocation_watch.rs"]
 mod allocation_watch;
 
 use flare_helios::{
     execution::{BufferDescriptor, ExecutionManifest, ExecutionWorker},
-    runtime_package::{KvCacheLimit, LoadOptions, NativeModel, test_support},
+    runtime_core::{KvCacheLimit, LoadOptions, NativeModel, test_support},
     startup::StartupProgress,
 };
 use serde::Deserialize;
@@ -104,7 +104,7 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // Bound the toy cache to its declared 128-token context. Memory mode's
     // 8192-token minimum is intended for model-serving memory allocation.
     let options = LoadOptions { kv_cache_limit: KvCacheLimit::Context, ..LoadOptions::default() };
-    let owner = unsafe { NativeModel::load(test_support::authorize(root.join("package")),
+    let owner = unsafe { NativeModel::load(test_support::authorize(root.join("core")),
         &[0, 1, 2, 3], &options, &StartupProgress::silent())? };
     let manifests = owner.manifests()?;
     assert_eq!(manifests.len(), 4);
@@ -232,9 +232,9 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(error) = shutdown.error { return Err(error.into()); }
     }
     let maps = std::fs::read_to_string("/proc/self/maps")?;
-    assert!(!maps.contains("libpython") && !maps.contains("libtorch") && !maps.contains("site-packages"));
+    assert!(!maps.contains("libpython") && !maps.contains("libtorch") && !maps.contains("site-cores"));
     drop(workers);
     drop(owner);
-    println!("native TP4 collective package replay passed after Python exit: changed inputs, poisoned outputs, exact payload bytes, source preservation, allocation stability, all-rank drain");
+    println!("native TP4 collective core replay passed after Python exit: changed inputs, poisoned outputs, exact payload bytes, source preservation, allocation stability, all-rank drain");
     Ok(())
 }

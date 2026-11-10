@@ -246,7 +246,7 @@ def test_deepseek41_export_geometry_passes_native_bootstrap():
 
 def test_generated_admission_pending_token_rejects_an_undeclared_read():
     import flare_heliopause
-    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.preparation import runtime_core_pb2 as p
 
     _, contract, manifest = _recipe_metadata("deepseek41")
     consumer = next(graph for graph in contract["graphs"] if graph["kind"] == p.SPECULATIVE)
@@ -258,7 +258,7 @@ def test_generated_admission_pending_token_rejects_an_undeclared_read():
 
 def test_qwen_dense_packed_catalog_and_zero_lag_cursor_pass_native_contract_validation():
     import flare_heliopause
-    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.preparation import runtime_core_pb2 as p
 
     config, contract, manifest = _recipe_metadata("qwen38_dense")
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))

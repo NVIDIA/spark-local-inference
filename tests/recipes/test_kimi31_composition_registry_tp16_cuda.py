@@ -22,7 +22,7 @@ def worker(rank, rendezvous, output):
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.dcp import ContextShards
     from ignition.recipes.kimi31.indexer import SharedBuffers
@@ -38,7 +38,7 @@ def worker(rank, rendezvous, output):
     graphs, channels = {}, []
     rows_catalog = (8, 7, 6, 5, 4, 3, 2, 1)
     try:
-        with PackageStorage(rank=rank, world=16, device=rank) as storage:
+        with CoreStorage(rank=rank, world=16, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             gather = create_head_exchange(dist.group.WORLD, device, max_rows=128,
                 heads=16, head_dim=8192, ipc=storage.peer_storage)

@@ -210,7 +210,7 @@ class PreparedPromptScoring:
 
 
 class PromptScoring:
-    """One package's optional outputs, communication channel, and serial scratch pool."""
+    """One core's optional outputs, communication channel, and serial scratch pool."""
 
     def __init__(self, capacity, device, *, frame, group=None, ipc=None, remote_runtime=None):
         self.outputs = PromptOutputs(capacity, device)

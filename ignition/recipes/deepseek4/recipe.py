@@ -17,7 +17,7 @@ from ignition.recipes.declaration import (
 )
 
 def prepare(
-    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage=None
+    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None
 ):
     from ignition.preparation.rank_group import prepare_group
 
@@ -50,7 +50,7 @@ def prepare(
         stream_overlap=plan.stream_overlap,
         **drafting,
     )
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage)
 
 
 def usage(prepared):

@@ -6,7 +6,7 @@
 import torch
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
+from ignition.components.collectives import ConcurrentAllGather, PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.peer_record_gather import PreparedPeerRecordGather
 from ignition.components.interleaved_history import PreparedInterleavedHistory
@@ -108,11 +108,23 @@ class PreparedDSA(PreparedMLAProjection):
                     runtime=context.heads, session=session, coordinator=context.coordinator, name=name + ".combine",
                     threads=512, block_limit=8)
             self.parts[rows] = part
+        self.query_overlap = None
+        if mode == "decode" and self.absorbed.shape[0] == 1 and workspace is not None and workspace.overlap:
+            part, = self.parts.values()
+            # Both candidate transports consume the joined query before reusing the channel.
+            part["gather"].dependencies.append(cache)
+            part["selector"].merge.dependencies.append(part["gather"].output)
+            self.query_overlap = ConcurrentAllGather(part["gather"], workspace=workspace, session=session,
+                                                     parallel_plans=self.indexer.local_plans)
 
     def __call__(self, source):
         self.project(source)
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
+        if self.query_overlap is not None:
+            part, = self.parts.values()
+            part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
+            self.query_overlap.start(part["quantized"].view(self.absorbed.shape[0], -1))
         self.indexer.project(source)
         if self.indexer.sharded is not None:
             self.indexer.sharded()
@@ -123,9 +135,17 @@ class PreparedDSA(PreparedMLAProjection):
             part = self.parts[end - start]
             positions = self.metadata.positions[start:end]
             tables = self.metadata.token_page_table[start:end]
-            selected = (self.indexer.sharded.selected[start:end] if self.indexer.sharded is not None
-                        else part["selector"](self.indexer.query[start:end], self.indexer.head_weights[start:end],
-                                              positions, tables))
+            if self.indexer.sharded is not None:
+                selected = self.indexer.sharded.selected[start:end]
+            elif self.query_overlap is None:
+                selected = part["selector"](self.indexer.query[start:end], self.indexer.head_weights[start:end],
+                                             positions, tables)
+            else:
+                selector = part["selector"]
+                dependency = selector.prepare_local(self.indexer.query[start:end],
+                    self.indexer.head_weights[start:end], positions, tables)
+                self.query_overlap.finish(part["quantized"].view(self.absorbed.shape[0], -1), dependency)
+                selected = selector.exchange(positions)
             selection_slots(selected, positions, tables, part["owners"], part["slots"],
                 part["counts"], self.shards, self.cache.shape[0], local=self.mode != "prefill",
                 global_records=self.history is not None)
@@ -133,8 +153,9 @@ class PreparedDSA(PreparedMLAProjection):
                 part["gather"]()
                 part["attention"](self.absorbed[start:end], self.attended[start:end])
             else:
-                part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
-                part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
+                if self.query_overlap is None:
+                    part["quantized"].copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
+                    part["gather"](part["quantized"].view(self.absorbed.shape[0], -1))
                 part["attention"](part["gathered"], part["partial"])
                 part["combine"](part["partial"], part["lse"])
         return self.finish()

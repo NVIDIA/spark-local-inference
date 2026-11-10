@@ -723,7 +723,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
     from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
         create_all_reduce_runtime, create_head_exchange)
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import ModelConfig
@@ -743,7 +743,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                             timeout=timedelta(minutes=20))
     runtimes, graphs, compiled = [], [], {}
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             from ignition.recipes.kimi3.dcp import write_records
 
             records = torch.linspace(-1024, 1024, 3 * RECORD, device=device).view(3, RECORD).bfloat16()

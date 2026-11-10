@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .execution import TunedBinding, TuningGraph
-from .runtime_package import capture_graph, instantiate_graph
+from .runtime_core import capture_graph, instantiate_graph
 
 _CAPTURE = ContextVar("startup_tuning_capture", default=None)
 
@@ -149,7 +149,7 @@ class CollectiveStartupTuning:
                   if owner in self.owner_groups}
         storage = self.session.benchmark_storage
         if needed and storage is None:
-            raise RuntimeError("collective startup capture requires package storage")
+            raise RuntimeError("collective startup capture requires core storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
         if any(self.groups[key].cache_policy == "cold" for key in needed):
             # Cold races only read their L2 eviction input; resident weights serve.

@@ -68,7 +68,7 @@ def test_study_wrapper_rejects_manifest_and_closes_graphs_before_model():
     model = StudyModel(SimpleNamespace(close=lambda: closed.append("model")),
                        {8: SimpleNamespace(close=lambda: closed.append("study8")),
                         16: SimpleNamespace(close=lambda: closed.append("study16"))})
-    with pytest.raises(ValueError, match="cannot produce native package metadata"):
+    with pytest.raises(ValueError, match="cannot produce native core metadata"):
         model.manifest(all_variants=True)
     model.close()
     assert closed == ["study8", "study16", "model"]

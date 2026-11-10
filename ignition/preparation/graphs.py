@@ -15,7 +15,7 @@ from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 
 if TYPE_CHECKING:
     import torch
-    from .runtime_package import RecordedExportGraph
+    from .runtime_core import RecordedExportGraph
 
 
 def _named_copy(values: Mapping[str, Any], kind: str) -> MappingProxyType:
@@ -125,7 +125,7 @@ class PreparedGraphBundle:
     def _validate_resources(self, *, export_graphs=False) -> tuple[int, list[int], list[tuple[int, int]]]:
         import torch
         import flare_heliopause
-        from .runtime_package import RecordedExportGraph
+        from .runtime_core import RecordedExportGraph
 
         with torch.cuda.device(self._device):
             capability = torch.cuda.get_device_capability(self._device)

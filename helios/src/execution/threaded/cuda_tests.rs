@@ -4,7 +4,7 @@
  */
 
 use super::*;
-use crate::runtime_package::{NativeResources, driver::Driver, test_support};
+use crate::runtime_core::{NativeResources, driver::Driver, test_support};
 
 fn uploads(limits: [i32; 4], confidence: f32, reset: bool, terminal: bool, slots: [i32; 4]) -> Vec<OwnedUpload> {
     let mut values = vec![
@@ -24,11 +24,11 @@ fn borrowed(owned: &[OwnedUpload]) -> Vec<Upload<'_>> {
 }
 
 #[test]
-#[ignore = "requires four assigned CUDA devices and FLARE_THREADED_TEST_PACKAGE"]
+#[ignore = "requires four assigned CUDA devices and FLARE_THREADED_TEST_CORE"]
 fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
-    let root = std::path::PathBuf::from(std::env::var_os("FLARE_THREADED_TEST_PACKAGE").expect("fixture directory"));
+    let root = std::path::PathBuf::from(std::env::var_os("FLARE_THREADED_TEST_CORE").expect("fixture directory"));
     let owners: Vec<_> = (0..4).map(|rank| unsafe {
-        NativeResources::load(test_support::authorize(root.join(format!("rank-{rank}/package"))), rank).unwrap()
+        NativeResources::load(test_support::authorize(root.join(format!("rank-{rank}/core"))), rank).unwrap()
     }).collect();
     let mut manifests: Vec<_> = owners.iter().map(|owner| owner.execution_manifest().unwrap()).collect();
     let root_manifest = manifests.remove(0);

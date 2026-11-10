@@ -33,8 +33,8 @@ def rank_main(rank, world, rendezvous, options):
         create_all_reduce_runtime, create_all_gather_runtime, create_head_exchange)
     from ignition.preparation.disposable import storage_ranges
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.runtime_core import _Cuda
     from ignition.preparation.scratch import GraphBufferPool, ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import ModelConfig, DSparkConfig
@@ -53,7 +53,7 @@ def rank_main(rank, world, rendezvous, options):
     block, batch, history = 8, 2, 1056
     h, vocab_size = config.hidden, config.vocabulary
     outcomes = []
-    with PackageStorage(rank=rank, world=world, device=rank) as storage:
+    with CoreStorage(rank=rank, world=world, device=rank) as storage:
         with DirectWeightLoader(inspect_indexed_checkpoint(target), device,
                 prefixes=("language_model.model.embed_tokens", "language_model.lm_head")) as loader:
             embedding = loader.load_tensor("language_model.model.embed_tokens.weight",

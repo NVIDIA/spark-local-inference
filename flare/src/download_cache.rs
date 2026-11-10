@@ -5,7 +5,7 @@
 
 //! Inspection and reclamation for the Hugging Face download transport cache.
 //!
-//! `flare download` fetches prepared packages through one shared tree per download
+//! `flare download` fetches prepared cores through one shared tree per download
 //! parent. The root lives at `<parent>/transport/hub/v1` and contains a version
 //! marker, blobs scoped by endpoint and repository, per-content transfer locks,
 //! resumable partials, quarantined suspect bytes, and repository metadata whose
@@ -17,16 +17,18 @@
 //! free, preserves the transport root and its marker, and never removes lock
 //! inodes.
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io,
     path::{Path, PathBuf},
 };
 
 use serde::Serialize;
 
-use flare_helios::package::cache::is_legacy_hub_transport;
+use flare_helios::core::cache::is_legacy_hub_transport;
 
 const VERSION: &[u8] = b"flare-hub-transport 1\n";
 const LEGACY_PREFIX: &str = ".flare-hub-staging-";
@@ -641,7 +643,9 @@ fn reclaim_installed_commit(
         {
             continue;
         }
-        if !installed.contains(&identity(&metadata, &entry.path())) || links(&metadata) > 1 {
+        if !installed.contains(&identity(&metadata, &entry.path()))
+            || links(&metadata, &entry.path()) > 1
+        {
             continue;
         }
         let lock = blobs.join(format!("{name}.lock"));
@@ -681,14 +685,16 @@ fn snapshot_inodes(path: &Path, identities: &mut HashSet<(u64, u64)>) -> Result<
 }
 
 #[cfg(unix)]
-fn links(metadata: &fs::Metadata) -> u64 {
+fn links(metadata: &fs::Metadata, _path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink()
 }
 
-#[cfg(not(unix))]
-fn links(_metadata: &fs::Metadata) -> u64 {
-    1
+#[cfg(windows)]
+fn links(_metadata: &fs::Metadata, path: &Path) -> u64 {
+    windows_file_identity(path)
+        .map(|(_, links)| links)
+        .unwrap_or(u64::MAX)
 }
 
 fn reclaim_repositories(root: &Path, reclaimed: &mut Reclaimed) -> Result<(), Failure> {
@@ -1322,14 +1328,21 @@ fn identity(metadata: &fs::Metadata, _path: &Path) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn identity(_metadata: &fs::Metadata, path: &Path) -> (u64, u64) {
+    if let Some((identity, _)) = windows_file_identity(path) {
+        return identity;
+    }
+    // An unreadable identity cannot establish that two paths share an object.
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
-    (0, hasher.finish())
+    (u64::MAX, hasher.finish())
 }
+
+#[cfg(windows)]
+use crate::windows::file_identity as windows_file_identity;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -1977,5 +1990,27 @@ mod tests {
         });
         assert_eq!(removed, 1);
         assert!(!tree.exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn hardlinks_share_an_identity_and_are_counted_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let alias = temporary.path().join("alias");
+        fs::write(&source, b"content").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+        let source_metadata = fs::metadata(&source).unwrap();
+        let alias_metadata = fs::metadata(&alias).unwrap();
+        assert_eq!(
+            identity(&source_metadata, &source),
+            identity(&alias_metadata, &alias)
+        );
+        assert_eq!(links(&source_metadata, &source), 2);
+        assert_eq!(unique_bytes(temporary.path()).unwrap(), 7);
     }
 }

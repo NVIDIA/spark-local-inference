@@ -2,7 +2,7 @@
 
 The private model bucket is `s3://flare-models-555824081510-us-west-2/` in
 `us-west-2`. Public access is blocked, object ownership is bucket-owner enforced,
-and default encryption uses S3-managed AES-256 keys. Executable package storage uses
+and default encryption uses S3-managed AES-256 keys. Executable core storage uses
 one zstd level-3 frame per resource; S3-managed encryption remains separate
 storage-at-rest protection. Incomplete multipart uploads
 expire after seven days; completed objects do not expire.
@@ -12,7 +12,7 @@ Rich dependencies independently of the preparation environment:
 
 ```sh
 uv run scripts/s3_upload.py /path/to/model.flare
-uv run scripts/s3_upload.py /path/to/model.flare s3://flare-models-555824081510-us-west-2/packages/model.flare
+uv run scripts/s3_upload.py /path/to/model.flare s3://flare-models-555824081510-us-west-2/cores/model.flare
 uv run scripts/s3_upload.py /path/to/model.flare --threads 32 --part-size-mib 128
 ```
 

@@ -95,7 +95,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
     from torch._inductor.async_compile import CompiledTritonKernels
     from torch._inductor.codecache import PyCodeCache
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.runtime_core import _Cuda
 
     coordinator = None
     root = tmp_path

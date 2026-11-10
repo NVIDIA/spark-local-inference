@@ -343,7 +343,7 @@ pub struct Rates {
     /// Allocated draft positions per progressing generation request round.
     pub depth: Option<f64>,
     /// Weight bytes read per second: complete speculative programs per second times the bytes one decode
-    /// step reads, as the package declares; zero when it declares none.
+    /// step reads, as the core declares; zero when it declares none.
     pub weights: f64,
 }
 
@@ -447,7 +447,7 @@ pub fn gibibytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
-/// Weight bandwidth as `N GB/s`, or a dash when the package declares no decode weight bytes.
+/// Weight bandwidth as `N GB/s`, or a dash when the core declares no decode weight bytes.
 pub fn weight_bandwidth(s: Snapshot, r: Rates) -> String {
     if s.decode_weight_bytes == 0 {
         "—".into()

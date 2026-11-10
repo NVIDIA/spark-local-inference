@@ -27,15 +27,15 @@ def check_export(tmp_path):
     from ignition.preparation.capture import capture_forwards
     from ignition.preparation.execution import GraphSignature, PreparedExecution, TuningGraph
     from ignition.preparation.module_images import ModuleImages
-    from ignition.preparation.package_file import read_sources
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.runtime_package import (
-        Allocation, RecordedExportGraph, RuntimePackage, capture_graph, instantiate_graph,
+    from ignition.preparation.core_file import read_sources
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.runtime_core import (
+        Allocation, RecordedExportGraph, RuntimeCore, capture_graph, instantiate_graph,
     )
 
     with ModuleImages() as images:
         torch.cuda.set_device(0)
-        storage = PackageStorage()
+        storage = CoreStorage()
         with storage:
             source = torch.arange(1024, device="cuda", dtype=torch.float32)
             output = torch.empty_like(source)
@@ -77,7 +77,7 @@ def check_export(tmp_path):
                            for name, tensor in buffers.items()]
             allocations.extend(Allocation(f"graph-pool-{index}", segment["address"], segment["total_size"])
                 for index, segment in enumerate(storage.graph_pool.snapshot(include_traces=False)))
-            package = RuntimePackage(allocations=allocations, modules={}, kernels=(),
+            package = RuntimeCore(allocations=allocations, modules={}, kernels=(),
                 recorder=images.native, owners=(bundle, storage))
             package.write(path, bundle.graphs, execution=manifest, sources=True)
             index, _ = read_sources(path)

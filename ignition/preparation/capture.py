@@ -14,7 +14,7 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
-from .runtime_package import capture_graph, instantiate_graph, record_export_graph
+from .runtime_core import capture_graph, instantiate_graph, record_export_graph
 
 
 @_defer_full_collection()

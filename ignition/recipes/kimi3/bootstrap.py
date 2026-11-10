@@ -287,7 +287,7 @@ def _benchmark_state(buffers, pool, requests, speculation):
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage):
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     snapshot = Path(snapshot).resolve()
     model_config = ModelConfig.load(snapshot)
     if model_config.dsa is not None:
@@ -301,16 +301,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
         headers = [shard.header_sha256 for shard in manifest.shards]
-    with package_storage.transient():
-        peers = None if group is None or package_storage.peer_storage is None else (group, package_storage.peer_storage)
+    with core_storage.transient():
+        peers = None if group is None or core_storage.peer_storage is None else (group, core_storage.peer_storage)
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8, online_mxfp8_scope=config.online_mxfp8_scope,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
-                                    vision=config.vision, weight_storage=package_storage.packed_weights(),
+                                    vision=config.vision, weight_storage=core_storage.packed_weights(),
                                     draft_head_quantization=config.draft_head_quantization)
         del manifest
         release_unused()
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     layout = continuation_layout(weights.config, shard.world_size, speculative_tokens=config.draft_tokens)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if snapshots < 1:
@@ -324,7 +324,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(weights.config, shard.world_size, state_rows + 1, pages, device,
-            speculative_tokens=config.draft_tokens, storage=package_storage,
+            speculative_tokens=config.draft_tokens, storage=core_storage,
             maximum_pages=total_memory // page_bytes(weights.config),
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(capture_state_rows, config.tuning_state_rows))
@@ -341,13 +341,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=channel_rows,
-            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+            hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
-            columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
+            columns=weights.config.vocabulary, ipc=core_storage.peer_storage)
         # Prefill rows beyond a channel's capacity gather in chunks, as they reduce.
         embedding_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
-            columns=weights.config.hidden, ipc=package_storage.peer_storage)
+            columns=weights.config.hidden, ipc=core_storage.peer_storage)
         context_collective = markov_collective = draft_context_collective = convolution_collective = None
         if drafting:
             # Embedding lookup and accepted-feature projection run serially,
@@ -356,18 +356,22 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             if isinstance(weights.config.draft, DFlash2Config):
                 draft_context_collective = create_head_exchange(group, device, max_rows=channel_rows,
                     heads=shard.world_size, head_dim=(weights.config.draft.layers*576//shard.world_size+7)//8*8,
-                    ipc=package_storage.peer_storage)
+                    ipc=core_storage.peer_storage)
                 convolution_collective = create_head_exchange(group, device,
                     max_rows=slots*(config.draft_tokens+1), heads=shard.world_size,
-                    head_dim=4*weights.config.hidden//16//shard.world_size, ipc=package_storage.peer_storage)
+                    head_dim=4*weights.config.hidden//16//shard.world_size, ipc=core_storage.peer_storage)
             else:
                 markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
-                    columns=2 * weights.config.vocabulary, ipc=package_storage.peer_storage)
+                    columns=2 * weights.config.vocabulary, ipc=core_storage.peer_storage)
         router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
             columns=2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32),
-            ipc=package_storage.peer_storage)
-        route_collective = (create_route_runtime(group, device, ipc=package_storage.peer_storage)
+            ipc=core_storage.peer_storage)
+        route_collective = (create_route_runtime(group, device, ipc=core_storage.peer_storage)
                             if shard.world_size > 1 else None)
+        prefill_route_collective = (create_head_exchange(group, device, max_rows=channel_rows,
+            heads=shard.world_size,
+            head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
+            ipc=core_storage.peer_storage) if shard.world_size > 1 else None)
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
@@ -379,35 +383,35 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 extra["attention_constants"] = AttentionConstants.allocate(device, query_capacity=config.decode_tokens)
                 extra["candidates"] = create_head_exchange(group, device,
                     max_rows=max(min(config.prefill_chunk_size, 128), config.decode_tokens),
-                    heads=shard.world_size, head_dim=8192, ipc=package_storage.peer_storage)
+                    heads=shard.world_size, head_dim=8192, ipc=core_storage.peer_storage)
                 if (drafting and config.compile_decoder and config.autotune_effort != "off"
                         and config.collective_tuning == "static"):
                     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
 
                     extra["candidate_owners"] = PCIeDCPTopKOwnerExchange.from_exchange_group(
                         exchange_group=group, device=device, max_rows=config.draft_tokens + 1,
-                        topk=2048, stream_affine=False, ipc=package_storage.peer_storage)
+                        topk=2048, stream_affine=False, ipc=core_storage.peer_storage)
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
             heads = weights.config.text["num_attention_heads"]
             context = ContextParallel(ContextShards.on(rank, shard.world_size, device),
                 heads=create_head_exchange(group, device, max_rows=max(config.decode_tokens, slots * config.draft_tokens),
                                            heads=heads, head_dim=512,
-                                           query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
-                coordinator=coordinator, peers=pool.share_pages(package_storage, group), slab=None, **extra)
+                                           query_head_dim=RECORD_BYTES, ipc=core_storage.peer_storage),
+                coordinator=coordinator, peers=pool.share_pages(core_storage, group), slab=None, **extra)
             if weights.config.dsa is not None and config.prefill_chunk_size >= 4096:
                 from ignition.components.shared_pages import SharedPages
 
                 staging = SharedPages(group, device, config.context // shard.world_size * RECORD_BYTES,
-                                      ipc=package_storage.peer_storage)
+                                      ipc=core_storage.peer_storage)
                 index_staging = SharedPages(group, device, config.context // shard.world_size * 132,
-                                            ipc=package_storage.peer_storage)
+                                            ipc=core_storage.peer_storage)
                 context = replace(context, staging=staging, stage_runtime=collective,
                     stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
                     index_staging=index_staging,
                     index_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
                     selections=create_head_exchange(group, device,
                         max_rows=-(-config.prefill_chunk_size // shard.world_size),
-                        heads=shard.world_size, head_dim=4096, ipc=package_storage.peer_storage))
+                        heads=shard.world_size, head_dim=4096, ipc=core_storage.peer_storage))
             if getattr(context, "candidate_owners", None) is not None:
                 from ignition.recipes.kimi31.selection_tuning import CandidateSelectionTuning
 
@@ -418,7 +422,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         text = weights.config.text
         latent = (text["q_lora_rank"] + text["kv_lora_rank"] + text["qk_rope_head_dim"]) // shard.world_size
         latent_runtimes = tuple(create_head_exchange(group, device, max_rows=rows, heads=shard.world_size,
-                                                     head_dim=-(-latent // 8) * 8, ipc=package_storage.peer_storage)
+                                                     head_dim=-(-latent // 8) * 8, ipc=core_storage.peer_storage)
                                 for rows in sorted({min(8, max_tokens), channel_rows}))
         identity = target_tuning_identity(weights.config, headers, shard.world_size,
             online_mxfp8_scope=config.online_mxfp8_scope)
@@ -427,15 +431,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,
-            headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
+            headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
         graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-        deferred_pool = package_storage.scratch_pool()
-        with package_storage.scratch_pool() as scratch_pool:
+        deferred_pool = core_storage.scratch_pool()
+        with core_storage.scratch_pool() as scratch_pool:
             patches = PATCH_CAPACITIES if config.vision and config.benchmark_selection is None else ()
             cursor, residual_blocks, shared_scratch, text_shapes = allocate_serial_workspace(
                 graph_buffers, text_rows=max_tokens, hidden_size=weights.config.hidden,
@@ -481,7 +485,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     # The first residual mixture consumes the gathered embedding before its
     # storage is reused for the running prefix. Committed blocks stay separate.
@@ -497,7 +501,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         batch_sizes = config.benchmark_selection.batches
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
-        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes)
+        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
+        prefill_route_runtime=prefill_route_collective)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation
@@ -600,13 +605,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
     finally:
         deferred_pool.materialize()
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
         deferred_pool.release_backing()
 
     if context is not None and getattr(context, "selection_tuning", None) is not None:
-        with phase(progress, "Tune sparse candidate compositions"), package_storage.transient():
+        with phase(progress, "Tune sparse candidate compositions"), core_storage.transient():
             tuning["candidate_compositions"] = context.selection_tuning.tune(session)
 
     def materialize():
@@ -614,7 +619,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         deferred_pool.materialize()
         # Maintenance graphs need snapshot destinations beside live rows;
         # operator tuning does not. Grow before complete-forward warmup.
-        package_storage.grow("STATE_ROWS", capture_state_rows)
+        core_storage.grow("STATE_ROWS", capture_state_rows)
         pool.memory_capacity[0] = capture_state_rows
         if vision_inputs is not None:
             vision_inputs.vision_slot.fill_(-1)
@@ -629,7 +634,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
             compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
             retain_graphs=config.retain_graphs, materialize=materialize,
-            warmup_storage=package_storage,
+            warmup_storage=core_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "vision", "speculative"))
     finally:
         scratch_pool.materialize()
@@ -706,6 +711,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
                    vocabulary_collective, embedding_collective, router_collective, route_collective,
+                   prefill_route_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective))

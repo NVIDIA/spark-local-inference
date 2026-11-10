@@ -1233,7 +1233,7 @@ fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
 }
 
 #[test]
-fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
+fn core_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
     for capacity in [1usize, 8, 16, 33, 65] {
         let tokens: Vec<_> = (0..capacity).map(|i| 100 + i as i64).collect();
         let record = CompletionRecord { generation: 1, submission_sequence: 2, consumed_tokens: capacity as i64,
@@ -1279,7 +1279,7 @@ fn package_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
 }
 
 #[test]
-fn package_sized_logprobs_and_survival_decode_active_and_padding_rows() {
+fn core_sized_logprobs_and_survival_decode_active_and_padding_rows() {
     for capacity in [1usize, 8, 16, 33, 65] {
         let mut records = vec![CompletionRecord { vector: Some(TokenVector {
             tokens: vec![-1; capacity], ..Default::default() }), ..Default::default() }; 2];

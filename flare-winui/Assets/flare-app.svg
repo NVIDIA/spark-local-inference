@@ -1,0 +1,11 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64">
+  <title>Hyperflare application icon</title>
+  <desc>A cream block h with a green solar plume on a clipped charcoal tile.</desc>
+  <polygon points="10,2 54,2 62,10 62,54 54,62 10,62 2,54 2,10" fill="#101010" stroke="#333333" stroke-width="1" stroke-linejoin="round"/>
+  <polygon points="11,4 53,4 60,11 60,16 48,8 12,8 4,16 4,11" fill="#191919"/>
+  <polygon points="29,42 34,27 43,17 55,8 49,22 57,17 51,29 42,35 37,45" fill="#76B900"/>
+  <polygon points="39,30 44,22 50,17 44,28" fill="#B4E75D"/>
+  <polygon points="14,18 23,18 23,31 34,31 40,37 40,51 32,51 32,40 23,40 23,51 14,51" fill="#333333"/>
+  <polygon points="13,16 22,16 22,29 33,29 39,35 39,49 31,49 31,38 22,38 22,49 13,49" fill="#F5F0E3"/>
+</svg>

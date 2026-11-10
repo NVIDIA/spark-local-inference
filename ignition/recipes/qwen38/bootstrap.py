@@ -36,7 +36,7 @@ from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
-from ignition.preparation import runtime_package_pb2 as contract_proto
+from ignition.preparation import runtime_core_pb2 as contract_proto
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import device_memory_info
 from ignition.preparation.deferred import deferred_mode
@@ -255,19 +255,19 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
     return prepare_model(snapshot, config, progress=progress, compile_decoder=config.compile_decoder,
-                         rank=rank, group=group, package_storage=package_storage)
+                         rank=rank, group=group, core_storage=core_storage)
 
 
 @torch.no_grad()
 def prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, progress=None,
-                  compile_decoder: bool = True, rank: int = 0, group=None, package_storage=None) -> PreparedModel:
+                  compile_decoder: bool = True, rank: int = 0, group=None, core_storage=None) -> PreparedModel:
     config = PreparationConfig() if config is None else config
     transient = contextlib.ExitStack()
     try:
         prepared = _prepare_model(snapshot, config, progress=progress, compile_decoder=compile_decoder,
-            rank=rank, group=group, package_storage=package_storage, transient=transient)
+            rank=rank, group=group, core_storage=core_storage, transient=transient)
     except BaseException as error:
         try:
             transient.close()
@@ -282,7 +282,7 @@ def prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, pr
 @with_autotune_effort
 def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, transient,
                    progress=None, compile_decoder: bool = True, rank: int = 0,
-                   group=None, package_storage=None) -> PreparedModel:
+                   group=None, core_storage=None) -> PreparedModel:
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionModel
 
     from .vision_state import (
@@ -305,10 +305,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     torch.cuda.set_device(device)
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_qwen38_checkpoint(snapshot)
-    # Loading, construction and tuning free most of what they allocate; a transient package pool returns
+    # Loading, construction and tuning free most of what they allocate; a transient core pool returns
     # that memory to the device once tuning completes, before compiled forwards are bound.
-    if package_storage is not None:
-        transient.enter_context(package_storage.transient())
+    if core_storage is not None:
+        transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
         shard_hyperconnections=config.shard_hyperconnections,
         force_moe_decode_a16=config.force_moe_decode_a16)
@@ -342,7 +342,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
             converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
             draft_head = converters[config.draft_head_quantization](head)
-    host_storage = {} if package_storage is None else {"host_allocator": package_storage.host_allocate}
+    host_storage = {} if core_storage is None else {"host_allocator": core_storage.host_allocate}
     table = PLETable.load(manifest, device, tokens=config.token_capacity, progress=progress, **host_storage)
     sample_rows = max(batch * width for batch, width in config.speculative_shapes) if config.mtp else config.request_capacity
     sample_rows += bool(config.mixed_shapes)
@@ -351,7 +351,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     hidden_rows = (max(sample_rows, draft_rows, min(config.token_capacity, draft_config.attention.window))
                    if has_dflash else 0)
     coordinator = CollectivePreparation(group) if group is not None else None
-    ipc = None if package_storage is None else package_storage.peer_storage
+    ipc = None if core_storage is None else core_storage.peer_storage
     collective = vocabulary_collective = hidden_gather_collective = None
     reduction_width = 10240 if config.shard_hyperconnections else 2560
     if coordinator is not None and coordinator.spans_hosts:
@@ -360,7 +360,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         collective = vocabulary_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, vocabulary_rows, hidden_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=max(vocabulary_rows * (248320 // shard.world_size) * 2,
-                             hidden_rows * (2560 // shard.world_size) * 2), package_storage=package_storage, ring=config.roce_ring, ring_open=config.roce_chain)
+                             hidden_rows * (2560 // shard.world_size) * 2), core_storage=core_storage, ring=config.roce_ring, ring_open=config.roce_chain)
         hidden_gather_collective = collective if has_dflash else None
     elif group is not None:
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
@@ -378,7 +378,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    "force_moe_decode_a16": config.force_moe_decode_a16,
                    "speculative_method": config.speculative_method,
                    "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
-        headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
+        headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
     session.__enter__()
     graphs = {}
     try:
@@ -390,8 +390,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             # Verification commits into each request's live row, so a request holds one row.
             state_rows = snapshots + slots
             state = HybridStatePool.allocate(state_rows + 1, device,
-                speculative_tokens=speculative_tokens, world_size=shard.world_size, storage=package_storage,
-                backed_slots=(min(state_rows + 1, config.preparation_state_rows) if package_storage is not None else None),
+                speculative_tokens=speculative_tokens, world_size=shard.world_size, storage=core_storage,
+                backed_slots=(min(state_rows + 1, config.preparation_state_rows) if core_storage is not None else None),
                 draft_config=draft_config)
             register_benchmark_state(
                 session, next(iter(state.gdn.values())).recurrent,
@@ -580,14 +580,14 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
         report(f"selected prepared kernels: {tuning['selection_counts']}")
         stream = torch.cuda.Stream(device=device)
-        graph_pool = torch.cuda.graph_pool_handle() if package_storage is None else package_storage.graph_pool.id
+        graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
         compiled_functions = {}
         def capture_catalog(*, compile_decoder, materialize=None, label="Prepare serving graphs"):
             captured, compiled = capture_forwards(functions, signatures, session=session, device=device,
                 stream=stream, pool=graph_pool, compile_decoder=compile_decoder, materialize=materialize,
                 progress=progress, label=label, cache_root=config.kernel_cache,
                 collective=collective, coordinator=coordinator, retain_graphs=config.retain_graphs,
-                warmup_storage=package_storage)
+                warmup_storage=core_storage)
             graphs.update(captured)
             compiled_functions.clear()
             compiled_functions.update(compiled)
@@ -607,7 +607,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
 
             mode = deferred_mode()
             with compile_only_launches():
-                rebind_cache({index: value.resize_pages_for_preparation(planned_pages if package_storage is not None else page_capacity, metadata_mode=mode)
+                rebind_cache({index: value.resize_pages_for_preparation(planned_pages if core_storage is not None else page_capacity, metadata_mode=mode)
                               for index, value in cache.items()})
 
         final_cache = None
@@ -617,8 +617,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 free = minimum_across_ranks(device_memory_info(device)[0], group)
                 if page_capacity * page_bytes + config.headroom_bytes > free:
                     raise MemoryError("insufficient memory for preparation KV pages and configured headroom")
-                if package_storage is not None:
-                    final_cache = {index: value.resize_pages_for_preparation(planned_pages, storage=package_storage,
+                if core_storage is not None:
+                    final_cache = {index: value.resize_pages_for_preparation(planned_pages, storage=core_storage,
                         prefix=f"kv-{index}-", backed_pages=page_capacity) for index, value in cache.items()}
                 else:
                     final_cache = {index: value.resize_pages_for_preparation(page_capacity)
@@ -701,7 +701,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     }, layers=('layers', 'tree.model.language_model.layers')), device=device.index, max_active=config.max_active, graphs=graphs, buffers=buffers, signatures=signatures,
             export_zero_ranges=(*export_zero_ranges, *(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges(),
                                 *((t.data_ptr(), t.nbytes) for t in table.buffers().values())),
-            export_events=table.events(), package_data=table if rank == 0 else None,
+            export_events=table.events(), core_data=table if rank == 0 else None,
             resources=resources, server_config=server_config, memory_report=memory, session=session,
             close_resources=(table, *((scoring,) if scoring is not None else ()),
                              *((hidden_gather_collective,) if hidden_gather_collective is not None

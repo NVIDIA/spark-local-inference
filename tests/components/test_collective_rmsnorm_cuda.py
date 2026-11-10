@@ -19,7 +19,7 @@ def _rank(rank, world, rendezvous):
     from ignition.components.collectives import PreparedAllReduceRMSNorm
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -27,7 +27,7 @@ def _rank(rank, world, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world,
                             timeout=timedelta(minutes=10))
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=36,
                 hidden_size=4096, element_bytes=4, ipc=storage.peer_storage)
@@ -98,7 +98,7 @@ def _projection_transport_rank(rank, world, rendezvous):
     from ignition.components.collectives import PreparedAllReduceRMSNorm
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -106,7 +106,7 @@ def _projection_transport_rank(rank, world, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world,
                             timeout=timedelta(minutes=5))
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=36,
                 hidden_size=4096, element_bytes=4, ipc=storage.peer_storage)

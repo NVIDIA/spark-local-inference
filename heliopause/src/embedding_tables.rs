@@ -88,7 +88,7 @@ impl NativeEmbeddingTables {
         {
             let _ = (py, catalog, descriptors);
             Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "shared RAM table handoff for ignition debug-serve requires Linux; load an exported package for native RAM serving",
+                "shared RAM table handoff for ignition debug-serve requires Linux; load an exported core for native RAM serving",
             ))
         }
     }

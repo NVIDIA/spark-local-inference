@@ -5,7 +5,7 @@
 """XTML frontend, KDA continuations, and paged latent attention bindings."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .config import PAGE_TOKENS
 from .vision import PATCH_CAPACITIES, FEATURES

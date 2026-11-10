@@ -688,7 +688,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     use flare_selene::testing::pattern as fill;
     use flare_selene::{
         PageId, StateSlotId,
@@ -1284,22 +1284,22 @@ mod tests {
         sender
     }
 
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn transfers_round_trip_pages_and_a_row_through_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn transfers_round_trip_pages_and_a_row_through_a_loaded_core() {
         use crate::{
             cuda::Stream,
-            runtime_package::{LoadOptions, NativeModel},
+            runtime_core::{LoadOptions, NativeModel},
             startup::StartupProgress,
         };
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let model = unsafe {
             NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
+                crate::runtime_core::test_support::authorize(std::path::Path::new(&core)),
                 &[0],
                 &LoadOptions::default(),
                 &StartupProgress::silent(),
@@ -1532,11 +1532,11 @@ mod tests {
     /// Two contexts on the first two devices, each with `k` and `v` page planes
     /// and a row plane; a split pool must cost each device only its part and
     /// carry each rank's units in that rank's part.
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     #[test]
     #[ignore = "requires two CUDA devices"]
     fn split_pools_cost_each_device_its_part_and_round_trip_units() {
-        use crate::runtime_package::driver::Driver as Loader;
+        use crate::runtime_core::driver::Driver as Loader;
         use flare_selene::{Plane, slab::SlabPool};
         const PAGES: u64 = 80;
         const ROWS: u64 = 4;

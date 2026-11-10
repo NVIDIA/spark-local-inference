@@ -115,7 +115,7 @@ class Settings:
         if args.mixed_prefill or args.prompt_logprobs:
             raise UsageError("ignition bench measures speculative rounds or unscored prefill; --mixed-prefill and --prompt-logprobs do not apply")
         if args.official_source is not None:
-            raise UsageError("--official-source applies to package publishing; ignition bench exports no package")
+            raise UsageError("--official-source applies to core publishing; ignition bench exports no core")
         return cls(tuple(sorted(batches)), tuple(sorted(contexts)), 8 if args.prefill else width,
                    args.warmup, args.repetitions, args.seeds, args.prefill, study, study_widths or (),
                    verification_prefixes or ())
@@ -220,7 +220,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
     from tokenizers import Tokenizer
     from ignition.bench.runner import BenchmarkCase, PrefillCase, run_benchmark
     from ignition.bench.study import StudyCase, run_study
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning_replicas import prepare_recipe
 
     snapshot = model.snapshot(configuration.directory("hub_cache"))
@@ -258,11 +258,11 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             print(f"Measured {counts}", file=sys.stderr, flush=True)
 
     torch.cuda.set_device(0)
-    storage = PackageStorage(world=plan.world_size)
+    storage = CoreStorage(world=plan.world_size)
     try:
         with storage:
             prepared = prepare_recipe(model.recipe.prepare, snapshot, plan, compile_forwards=compile_forwards,
-                kernel_cache=configuration.directory("kernel_cache"), progress=progress, package_storage=storage)
+                kernel_cache=configuration.directory("kernel_cache"), progress=progress, core_storage=storage)
         with prepared:
             root = getattr(prepared, "model", prepared)
             tokenizer_asset = root.server_config["assets"]["tokenizer"]

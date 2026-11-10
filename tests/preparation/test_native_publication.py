@@ -8,9 +8,9 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from helios.tests.signing import publisher, publish_legacy
-from ignition.preparation import runtime_package_pb2 as proto
-from ignition.preparation.package_file import combine, write_sources, read_index
-from ignition.preparation.package_snapshot import convert, payload_promote
+from ignition.preparation import runtime_core_pb2 as proto
+from ignition.preparation.core_file import combine, write_sources, read_index
+from ignition.preparation.core_snapshot import convert, payload_promote
 from tests.preparation.payload_fixture import publish, rank_source, verify_signatures, manifest, schema
 
 
@@ -29,7 +29,7 @@ def test_payload_publication_signs_every_body_and_conversion_preserves_signature
 def test_metadata_only_sources_cannot_select_a_legacy_publisher(tmp_path):
     source = tmp_path / 'rank.json'
     write_sources(source, proto.ModelIndex(version=4, ranks=[proto.BundleIndex()]), [])
-    output = tmp_path / 'package'
+    output = tmp_path / 'core'
     with pytest.raises(ValueError):
         combine(output, [source], [], publisher=publisher())
     assert not output.exists()
@@ -41,7 +41,7 @@ def test_unsupported_legacy_conversion_preserves_input_and_requires_reexport(tmp
     index = proto.ModelIndex(version=4, ranks=[proto.BundleIndex()])
     publish_legacy(source, index, [], publisher=publisher())
     assert read_index(source)[0].version == 4
-    with pytest.raises(ValueError, match='legacy package format is unsupported; re-export'):
+    with pytest.raises(ValueError, match='legacy core format is unsupported; re-export'):
         convert(source, tmp_path / 'converted', form=form)
     assert not (tmp_path / 'converted').exists()
 
@@ -60,14 +60,14 @@ def test_publication_failure_preserves_existing_destination(tmp_path):
 def test_missing_source_fails_without_publishing(tmp_path):
     source = rank_source(tmp_path / 'source')
     (source.parent / 'weights').unlink()
-    output = tmp_path / 'package'
+    output = tmp_path / 'core'
     with pytest.raises(ValueError):
         combine(output, [source], [], publisher=publisher())
     assert not output.exists()
 
 
 def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
-    from tests.preparation.test_package_protection import development_publisher, development_profile
+    from tests.preparation.test_core_protection import development_publisher, development_profile
     original = development_publisher()
     index = proto.ModelIndex(version=4, rebuild=proto.RebuildManifest(
         version=1, recipe='fixture', checkpoint_repository='test/weights', checkpoint_revision='b' * 40,
@@ -94,14 +94,14 @@ def test_payload_promotion_carries_the_exported_license(tmp_path):
     """Signing rewrites publisher identity only; the checkpoint's recorded license survives."""
     from dataclasses import replace
     from ignition.preparation.protection import License
-    from tests.preparation.test_package_protection import development_publisher, development_profile
+    from tests.preparation.test_core_protection import development_publisher, development_profile
 
     license_link = 'https://huggingface.co/example/model/blob/abcdef/LICENSE'
     original = replace(development_publisher(), license=License('apache-2.0', license_link))
     source = rank_source(tmp_path / 'source')
     output = tmp_path / 'development'
     combine(output, [source], [], publisher=original)
-    recorded = schema()('PackageBody').FromString(manifest(output).package_body).publisher
+    recorded = schema()('CoreBody').FromString(manifest(output).core_body).publisher
     assert (recorded.license_name, recorded.license_link) == ('apache-2.0', license_link)
     target = publisher()
     promoted = tmp_path / 'production'
@@ -110,7 +110,7 @@ def test_payload_promotion_carries_the_exported_license(tmp_path):
                     target_publisher=dict(namespace=target.namespace, official_source=target.official_source,
                                           development=False))
     envelope = verify_signatures(promoted, Ed25519PublicKey.from_public_bytes(target.public_key))
-    publisher_metadata = schema()('PackageBody').FromString(envelope.package_body).publisher
+    publisher_metadata = schema()('CoreBody').FromString(envelope.core_body).publisher
     assert publisher_metadata.namespace == target.namespace
     assert publisher_metadata.official_source == target.official_source
     assert not publisher_metadata.development
@@ -128,8 +128,8 @@ def test_cli_rejects_legacy_publication_without_creating_output(tmp_path, operat
     config = tmp_path / 'config.toml'
     config.write_text('')
     output = tmp_path / 'output'
-    args = SimpleNamespace(package=source, output=output, form='directory', config=config)
-    with pytest.raises(UsageError, match='legacy package format is unsupported; re-export'):
+    args = SimpleNamespace(core=source, output=output, form='directory', config=config)
+    with pytest.raises(UsageError, match='legacy core format is unsupported; re-export'):
         getattr(publishing, operation)(args)
     assert not output.exists()
     assert read_index(source)[0].version == 4

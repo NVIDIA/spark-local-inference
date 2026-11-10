@@ -63,14 +63,14 @@ class ContinuationPool(StateStorage):
     @classmethod
     def allocate(cls, layer_types, world_size, slots, pages, device, *, mtp=False, storage=None, maximum_pages=None,
                  context_ranks=1, virtual=None):
-        """`storage` places everything in a package; `virtual`, an in-process VirtualStorage, holds
+        """`storage` places everything in a core; `virtual`, an in-process VirtualStorage, holds
         only the KV pages. Either gives each page pool `maximum_pages` of shape and backs `pages`."""
         layer_types = tuple(layer_types)
         if type(pages) is not int or pages <= 0:
             raise ValueError("GLM continuation storage requires positive page capacity")
-        package_storage = storage
+        core_storage = storage
         storage = StateStorage.allocate(continuation_layout(layer_types, world_size, mtp=mtp), slots, device, storage=storage)
-        page_storage = package_storage if package_storage is not None else virtual
+        page_storage = core_storage if core_storage is not None else virtual
         maximum = pages if page_storage is None else maximum_pages
         if maximum is None or maximum < pages:
             raise ValueError("GLM virtual page capacity must cover prepared pages on every rank")
@@ -100,7 +100,7 @@ class ContinuationPool(StateStorage):
                    storage.region("consumed_tokens"), storage.region("last_hidden"), draft)
 
     def share_pages(self, storage, group):
-        """Bind peer cache addresses after the package's physical page prefixes have been allocated."""
+        """Bind peer cache addresses after the core's physical page prefixes have been allocated."""
         states = [layer for layer in self.decoder.layers if isinstance(layer, MLAState)]
         regions = {region.address: region for region in storage.dynamic_regions}
         addresses = storage.peer_storage.share_regions(group, [regions[state.cache.data_ptr()] for state in states])

@@ -13,7 +13,7 @@ from google.protobuf.json_format import ParseDict
 from ignition.cli import _parser, display, preparation
 from ignition.components.capacity import batch_capacities, prefill_capacities, serving_modes
 from ignition.errors import UsageError
-from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 from ignition.recipes import ResolvedModel, recipes, resolve
 from ignition.recipes.declaration import Speculation
 from tests.cli.test_planning import derive, gpu
