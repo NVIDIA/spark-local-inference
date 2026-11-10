@@ -94,8 +94,13 @@ storage, downloads retained bytes, serializes resources, and owns asset writes,
 hashing, zstd level-3 executable compression, signing, conversion, rank payload
 transfer, and publication. Each executable resource is one zstd level-3 frame
 with a signed decoded length and compressed-chunk commitments.
-Keep captured buffers, contexts, graph templates, and kernel owners alive until
-native work confirms a drain; an unsuccessful drain retains their owners.
+During module recording, each graph's post-instantiation hook copies its nodes,
+argument bytes, attributes, and annotated edges into native storage. PyTorch
+then releases the CUDA template while retaining the executable and graph pool.
+Native export resolves allocations and validates bindings against the copied
+metadata. Keep captured buffers, contexts, graph executables, copied metadata,
+and kernel owners alive until native work confirms a drain; an unsuccessful
+drain retains their owners.
 
 Native transfer pools bound file buffers and pinned CUDA download storage from
 available host memory and preparation rank count. Preserve direct bulk I/O,

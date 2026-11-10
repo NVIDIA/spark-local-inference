@@ -14,6 +14,7 @@ from ignition.progress import graph_catalog, phase
 from .aot import ForwardCache
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
+from .runtime_package import capture_graph, instantiate_graph
 
 
 @_defer_full_collection()
@@ -120,7 +121,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 coordinator.barrier(f"capture {name}", coordinator.ranks)
             started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
-            graph = torch.cuda.CUDAGraph(keep_graph=True) if retain_graphs else torch.cuda.CUDAGraph()
+            graph = capture_graph(retain_graphs=retain_graphs)
             communication = nullcontext() if collective is None else collective.capture(stream=stream)
             def memory_detail():
                 free, total = torch.cuda.mem_get_info(device)
@@ -143,7 +144,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 if retain_graphs:
                     if progress is not None:
                         progress(f"instantiating {name}: {memory_detail()}")
-                    graph.instantiate()
+                    instantiate_graph(graph)
             except Exception as error:
                 error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
                 raise

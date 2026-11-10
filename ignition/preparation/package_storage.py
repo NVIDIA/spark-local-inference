@@ -230,7 +230,7 @@ class PackageStorage:
         import torch
 
         ranges = []
-        for segment in torch.cuda.memory_snapshot():
+        for segment in torch.cuda.memory_snapshot(include_traces=False):
             if (segment["device"] != self.device
                     or tuple(segment["segment_pool_id"]) not in self._preparation_pools):
                 continue

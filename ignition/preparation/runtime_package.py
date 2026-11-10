@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes as C
 from dataclasses import asdict, dataclass
+from functools import partial
 import os
 import json
 from pathlib import Path
@@ -143,9 +144,69 @@ class RuntimePackage:
         self.export_counts = output["export_counts"]
 
 
+@dataclass
+class _RecordedGraphMetadata:
+    recorder: object
+    executable: int = 0
+
+    def release(self, executable):
+        try:
+            self.recorder.release_graph(executable)
+        finally:
+            if self.executable == executable:
+                self.executable = 0
+
+    def record(self, graph):
+        if self.executable:
+            self.release(self.executable)
+        executable = int(graph.raw_cuda_graph_exec())
+        try:
+            self.recorder.record_graph(int(graph.raw_cuda_graph()), executable)
+            graph.register_destroy_callback(partial(self.release, executable))
+        except BaseException as error:
+            try:
+                self.release(executable)
+            except BaseException as cleanup:
+                error.add_note(f"graph metadata cleanup failed: {cleanup!r}")
+            raise
+        self.executable = executable
+
+
+def capture_graph(*, retain_graphs=False):
+    """Copy export metadata before releasing a graph's CUDA template."""
+    import torch
+    from .module_images import ModuleImages
+
+    if not retain_graphs:
+        return torch.cuda.CUDAGraph()
+    images = ModuleImages.current()
+    if images is None:
+        return torch.cuda.CUDAGraph(keep_graph=True)
+    graph = torch.cuda.CUDAGraph(keep_graph=False)
+    metadata = _RecordedGraphMetadata(images.native)
+    graph._flare_graph_metadata = metadata
+    graph.register_post_instantiate_hook(metadata.record)
+    return graph
+
+
+def instantiate_graph(graph):
+    """Instantiate retained templates or validate recorded export executables."""
+    metadata = getattr(graph, "_flare_graph_metadata", None)
+    if metadata is None:
+        graph.instantiate()
+    elif not metadata.executable or metadata.executable != int(graph.raw_cuda_graph_exec()):
+        raise RuntimeError("export graph metadata does not match its instantiated executable")
+
+
 def _graphs(graphs):
-    return [dict(name=name, graph=int(graph.raw_cuda_graph()), executable=int(graph.raw_cuda_graph_exec()))
-            for name, graph in graphs.items()]
+    result = []
+    for name, graph in graphs.items():
+        executable = int(graph.raw_cuda_graph_exec())
+        metadata = getattr(graph, "_flare_graph_metadata", None)
+        template = (0 if metadata is not None and metadata.executable and metadata.executable == executable
+                    else int(graph.raw_cuda_graph()))
+        result.append(dict(name=name, graph=template, executable=executable))
+    return result
 
 
 def _cache_options(cache, options=None):

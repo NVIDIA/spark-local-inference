@@ -194,7 +194,7 @@ def collect_inventory(prepared, storage, package, *, external=()):
     for name, tensor in prepared.buffers.items():
         claims.extend(Claim(start, end, "Graph I/O / persistent state", f"buffers[{name!r}]", priority=40)
                       for start, end in tensor_ranges(tensor))
-    segments = [s for s in torch.cuda.memory_snapshot() if s["device"] == storage.device]
+    segments = [s for s in torch.cuda.memory_snapshot(include_traces=False) if s["device"] == storage.device]
     for segment in segments:
         graph_pool = tuple(segment["segment_pool_id"]) == tuple(storage.graph_pool.id)
         for block in segment["blocks"]:

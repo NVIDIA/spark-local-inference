@@ -125,7 +125,10 @@ def test_inventory_separates_physical_cache_host_peers_and_package_alignment(mon
 
     monkeypatch.setattr(flare_heliopause, 'memory_inventory', lambda: dict(
         device=0, total_bytes=10000, free_bytes=8000, mappings=[(100, 300)]))
-    monkeypatch.setattr(torch.cuda, 'memory_snapshot', lambda: [])
+    def snapshot(*, include_traces):
+        assert include_traces is False
+        return [dict(device=1)]
+    monkeypatch.setattr(torch.cuda, 'memory_snapshot', snapshot)
     monkeypatch.setattr(torch.cuda, 'memory_allocated', lambda device: 300)
     monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda device: 300)
     monkeypatch.setattr(memory_inventory, 'owner_claims', lambda prepared: [

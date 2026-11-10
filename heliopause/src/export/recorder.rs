@@ -12,7 +12,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::{Arc, Condvar, Mutex};
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 
 #[repr(C)]
@@ -43,17 +45,29 @@ struct Call {
 struct Image {
     context: usize,
     module_id: u32,
-    cubin: Arc<[u8]>,
+    cubin: Arc<Cubin>,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct Cubin {
+    // Weak index entries must not keep unloaded cubin byte allocations alive.
+    bytes: Arc<[u8]>,
+}
+impl Deref for Cubin {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 #[derive(Clone, Debug)]
 struct Binding {
-    cubin: Arc<[u8]>,
+    cubin: Arc<Cubin>,
     context: usize,
     image: Option<Arc<Image>>,
     owner: Arc<()>,
 }
 impl Binding {
-    fn new(cubin: Arc<[u8]>, context: usize) -> Self {
+    fn new(cubin: Arc<Cubin>, context: usize) -> Self {
         Self {
             cubin,
             context,
@@ -88,6 +102,7 @@ pub(crate) struct RecordedAllocation {
 }
 #[derive(Default)]
 struct State {
+    cubins: HashMap<u64, Vec<Weak<Cubin>>>,
     images: BTreeMap<(usize, u32), Arc<Image>>,
     modules: BTreeMap<usize, Binding>,
     libraries: BTreeMap<usize, Binding>,
@@ -95,6 +110,7 @@ struct State {
     kernels: BTreeMap<usize, Arc<Image>>,
     pending: HashMap<ThreadId, Vec<(String, Vec<Arc<Image>>)>>,
     allocations: BTreeMap<u64, RecordedAllocation>,
+    graphs: BTreeMap<usize, Arc<super::capture::RecordedGraph>>,
     error: Option<String>,
 }
 struct CallbackState {
@@ -151,6 +167,29 @@ fn materializer(name: &str) -> bool {
         )
 }
 impl State {
+    fn cubin(&mut self, bytes: &[u8]) -> Arc<Cubin> {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hash);
+        let bucket = self.cubins.entry(hash.finish()).or_default();
+        let mut matched = None;
+        bucket.retain(|weak| {
+            let Some(cubin) = weak.upgrade() else {
+                return false;
+            };
+            if matched.is_none() && cubin.bytes.as_ref() == bytes {
+                matched = Some(cubin);
+            }
+            true
+        });
+        if let Some(cubin) = matched {
+            return cubin;
+        }
+        let cubin = Arc::new(Cubin {
+            bytes: Arc::from(bytes),
+        });
+        bucket.push(Arc::downgrade(&cubin));
+        cubin
+    }
     fn drop_module(&mut self, context: usize, module_id: u32) {
         let image = self.images.remove(&(context, module_id));
         if let Some(image) = image {
@@ -233,6 +272,8 @@ impl State {
             }
             self.allocations
                 .retain(|_, a| a.context != Some(resource.context));
+            self.graphs
+                .retain(|_, graph| graph.context != resource.context);
             self.modules.retain(|_, i| i.context != resource.context);
             // Libraries can retain the same cubin in another CUDA context.
             for binding in self.libraries.values_mut() {
@@ -263,7 +304,7 @@ impl State {
         let image = Arc::new(Image {
             context: resource.context,
             module_id: module.id,
-            cubin: Arc::from(unsafe { std::slice::from_raw_parts(module.image, module.size) }),
+            cubin: self.cubin(unsafe { std::slice::from_raw_parts(module.image, module.size) }),
         });
         self.images
             .insert((image.context, image.module_id), image.clone());
@@ -361,7 +402,7 @@ impl State {
                 };
                 let cubin = cubin
                     .filter(|i| i.starts_with(b"\x7fELF"))
-                    .map(Arc::<[u8]>::from)
+                    .map(|image| self.cubin(&image))
                     .or_else(|| {
                         if images.len() == 1 {
                             Some(images[0].cubin.clone())
@@ -385,6 +426,9 @@ impl State {
                             .insert(output(0)?, image.in_context(call.context));
                     }
                 }
+            }
+            "cuGraphExecDestroy" => {
+                self.graphs.remove(&value(0));
             }
             "cuModuleUnload" => {
                 self.modules.remove(&value(0));
@@ -593,7 +637,7 @@ impl Recorder {
             for id in [
                 18, 19, 20, 22, 23, 678, 679, 680, 681, 682, 683, 687, 742, 85, 686, 374, 384, 451,
                 452, 543, 675, 676, 307, 442, 477, 478, 481, 652, 653, 243, 245, 38, 39, 271, 294,
-                301, 302, 379, 551, 552, 598, 599, 600, 601, 611, 612,
+                301, 302, 379, 551, 552, 598, 599, 600, 601, 611, 612, 516,
             ] {
                 self.check("cuptiEnableCallback", unsafe {
                     enable(1, self.subscriber, 1, id)
@@ -665,6 +709,43 @@ impl Recorder {
         Ok(id)
     }
 
+    fn record_graph(&self, graph: usize, executable: usize) -> ExportResult<()> {
+        self.release_graph(executable);
+        self.check_error()?;
+        let recorded = Arc::new(super::capture::record_prepared_graph(
+            graph, executable, self,
+        )?);
+        self.state()
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graphs
+            .insert(executable, recorded);
+        Ok(())
+    }
+    pub(crate) fn recorded_graph(
+        &self,
+        executable: usize,
+    ) -> ExportResult<Arc<super::capture::RecordedGraph>> {
+        self.check_error()?;
+        self.state()
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graphs
+            .get(&executable)
+            .cloned()
+            .ok_or_else(|| invalid("executable has no retained graph metadata"))
+    }
+    fn release_graph(&self, executable: usize) {
+        self.state()
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graphs
+            .remove(&executable);
+    }
+
     pub(crate) fn image_for(&self, function: usize) -> ExportResult<Arc<[u8]>> {
         self.check_error()?;
         #[cfg(windows)]
@@ -694,7 +775,7 @@ impl Recorder {
         {
             let state = self.state().state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(image) = state.modules.get(&module) {
-                return Ok(image.cubin.clone());
+                return Ok(image.cubin.bytes.clone());
             }
         }
         let (kernels, mut functions, libraries) = {
@@ -751,7 +832,7 @@ impl Recorder {
                 }
             }
             if let Some(image) = state.modules.get(&module) {
-                return Ok(image.cubin.clone());
+                return Ok(image.cubin.bytes.clone());
             }
         }
         let mut name = std::ptr::null();
@@ -783,11 +864,12 @@ impl Recorder {
             ));
         }
         state.bind_module(module, &image);
-        Ok(image.cubin.clone())
+        Ok(image.cubin.bytes.clone())
     }
 }
 impl Drop for Recorder {
     fn drop(&mut self) {
+        self.state().state.lock().unwrap_or_else(|e| e.into_inner()).graphs.clear();
         if self.stop().is_err() && self.subscriber != 0 {
             // Failed unsubscription leaves CUDA free to invoke the retained callback state.
             if let Some(state) = self.state.take() {
@@ -826,6 +908,18 @@ impl NativeModuleRecorder {
             .unwrap()
             .check_error()
             .map_err(py_error)
+    }
+    fn record_graph(&self, py: Python<'_>, graph: usize, executable: usize) -> PyResult<()> {
+        py.detach(|| {
+            self.recorder
+                .lock()
+                .unwrap()
+                .record_graph(graph, executable)
+        })
+        .map_err(py_error)
+    }
+    fn release_graph(&self, executable: usize) {
+        self.recorder.lock().unwrap().release_graph(executable);
     }
     fn allocations(&self) -> PyResult<BTreeMap<u64, (u64, String)>> {
         Ok(self
@@ -948,6 +1042,74 @@ mod tests {
         };
         call(owner, name, 1, &params, 0, context);
     }
+    fn graph_recorder() -> Recorder {
+        Recorder {
+            library: None,
+            state: Some(Box::new(CallbackState::new())),
+            subscriber: 0,
+        }
+    }
+
+    #[test]
+    fn graph_metadata_survives_stop_and_releases_idempotently() {
+        let mut recorder = graph_recorder();
+        let graph = Arc::new(super::super::capture::RecordedGraph::empty(0x1000));
+        let weak = Arc::downgrade(&graph);
+        recorder
+            .state()
+            .state
+            .lock()
+            .unwrap()
+            .graphs
+            .insert(0x55, graph);
+        recorder.stop().unwrap();
+        assert!(recorder.recorded_graph(0x55).is_ok());
+        recorder.release_graph(0x55);
+        recorder.release_graph(0x55);
+        assert!(recorder.recorded_graph(0x55).is_err());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn graph_metadata_tracks_successful_executable_and_context_destruction() {
+        let owner = CallbackState::new();
+        owner.state.lock().unwrap().graphs.insert(
+            0x55,
+            Arc::new(super::super::capture::RecordedGraph::empty(0x1000)),
+        );
+        owner.state.lock().unwrap().graphs.insert(
+            0x66,
+            Arc::new(super::super::capture::RecordedGraph::empty(0x2000)),
+        );
+        call(&owner, "cuGraphExecDestroy", 1, &[0x55], 1, 0x1000);
+        assert_eq!(owner.state.lock().unwrap().graphs.len(), 2);
+        call(&owner, "cuGraphExecDestroy", 1, &[0x55], 0, 0x1000);
+        assert!(!owner.state.lock().unwrap().graphs.contains_key(&0x55));
+        resource(&owner, 0x2000, 0, 2, &[]);
+        assert!(owner.state.lock().unwrap().graphs.is_empty());
+    }
+
+    #[test]
+    fn failed_graph_recording_discards_replaced_metadata_and_drop_releases_records() {
+        let recorder = graph_recorder();
+        recorder.state().state.lock().unwrap().graphs.insert(
+            0x55,
+            Arc::new(super::super::capture::RecordedGraph::empty(0x1000)),
+        );
+        assert!(recorder.record_graph(0, 0x55).is_err());
+        assert!(recorder.recorded_graph(0x55).is_err());
+        let graph = Arc::new(super::super::capture::RecordedGraph::empty(0x1000));
+        let weak = Arc::downgrade(&graph);
+        recorder
+            .state()
+            .state
+            .lock()
+            .unwrap()
+            .graphs
+            .insert(0x55, graph);
+        drop(recorder);
+        assert!(weak.upgrade().is_none());
+    }
     #[test]
     fn occupancy_queries_bind_even_when_configuration_fails() {
         for name in [
@@ -977,7 +1139,7 @@ mod tests {
                     } else {
                         &state.functions
                     };
-                    assert_eq!(&*bindings[&0x1234].cubin, b"queried cubin");
+                    assert_eq!(&**bindings[&0x1234].cubin, b"queried cubin");
                 }
                 resource(&owner, 0x1000, 7, 7, &[]);
                 let state = owner.state.lock().unwrap();
@@ -1030,8 +1192,8 @@ mod tests {
         assert!(state.pending.is_empty());
         assert_eq!(state.functions.len(), 16);
         for i in 1..=8 {
-            assert_eq!(&*state.functions[&i].cubin, b"native cubin");
-            assert_eq!(&*state.functions[&(100 + i)].cubin, b"outer cubin");
+            assert_eq!(&**state.functions[&i].cubin, b"native cubin");
+            assert_eq!(&**state.functions[&(100 + i)].cubin, b"outer cubin");
         }
     }
     #[test]
@@ -1133,6 +1295,18 @@ mod tests {
             assert!(state.modules.is_empty());
         }
     }
+    fn retained_cubin_bytes(state: &State) -> usize {
+        state
+            .images
+            .values()
+            .map(|image| &image.cubin)
+            .chain(state.modules.values().map(|binding| &binding.cubin))
+            .chain(state.libraries.values().map(|binding| &binding.cubin))
+            .map(|cubin| (cubin.as_ptr(), cubin.len()))
+            .collect::<BTreeMap<_, _>>()
+            .values()
+            .sum()
+    }
     fn library_image(tag: u8) -> Vec<u8> {
         let mut image = vec![0; 128];
         image[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -1142,6 +1316,123 @@ mod tests {
         image[60..62].copy_from_slice(&1u16.to_le_bytes());
         image[68..72].copy_from_slice(&8u32.to_le_bytes());
         image
+    }
+    #[test]
+    fn eager_load_shares_original_and_resource_cubin() {
+        let owner = CallbackState::new();
+        let image = library_image(1);
+        let module = 0x10usize;
+        call(&owner, "cuModuleLoadData", 0, &[], 0, 0x1000);
+        resource(&owner, 0x1000, 7, 6, &image);
+        call(
+            &owner,
+            "cuModuleLoadData",
+            1,
+            &[&module as *const _ as usize, image.as_ptr() as usize],
+            0,
+            0x1000,
+        );
+        let (original, materialized) = {
+            let state = owner.state.lock().unwrap();
+            assert!(state.error.is_none(), "{:?}", state.error);
+            let original = &state.modules[&module].cubin;
+            let materialized = &state.images[&(0x1000, 7)].cubin;
+            assert_eq!(original, materialized);
+            assert!(Arc::ptr_eq(original, materialized));
+            assert_eq!(retained_cubin_bytes(&state), image.len());
+            (Arc::downgrade(original), Arc::downgrade(materialized))
+        };
+        resource(&owner, 0x1000, 7, 7, &[]);
+        assert!(materialized.upgrade().is_some());
+        assert!(original.upgrade().is_some());
+        call(&owner, "cuModuleUnload", 1, &[module], 0, 0x1000);
+        assert!(original.upgrade().is_none());
+        assert_eq!(retained_cubin_bytes(&owner.state.lock().unwrap()), 0);
+    }
+    #[test]
+    fn identical_resource_cubins_share_bytes_across_contexts() {
+        let owner = CallbackState::new();
+        let image = library_image(1);
+        resource(&owner, 0x1000, 7, 6, &image);
+        resource(&owner, 0x2000, 8, 6, &image);
+        let state = owner.state.lock().unwrap();
+        assert_eq!(retained_cubin_bytes(&state), image.len());
+        assert!(Arc::ptr_eq(
+            &state.images[&(0x1000, 7)].cubin,
+            &state.images[&(0x2000, 8)].cubin
+        ));
+        let payload = state.images[&(0x1000, 7)].cubin.bytes.clone();
+        assert_eq!(Arc::weak_count(&payload), 0);
+        drop(state);
+        resource(&owner, 0x1000, 0, 2, &[]);
+        {
+            let state = owner.state.lock().unwrap();
+            assert_eq!(state.images.len(), 1);
+            assert_eq!(&**state.images[&(0x2000, 8)].cubin, &image);
+        }
+        assert_eq!(Arc::strong_count(&payload), 2);
+        resource(&owner, 0x2000, 8, 7, &[]);
+        let state = owner.state.lock().unwrap();
+        assert!(!state.cubins.is_empty());
+        assert!(
+            state
+                .cubins
+                .values()
+                .flatten()
+                .all(|weak| weak.upgrade().is_none())
+        );
+        assert_eq!(Arc::strong_count(&payload), 1);
+        assert_eq!(Arc::weak_count(&payload), 0);
+    }
+    #[test]
+    fn original_and_resource_cubins_keep_different_bytes() {
+        let owner = CallbackState::new();
+        let original = library_image(1);
+        let materialized = library_image(2);
+        let module = 0x10usize;
+        call(&owner, "cuModuleLoadData", 0, &[], 0, 0x1000);
+        resource(&owner, 0x1000, 7, 6, &materialized);
+        call(
+            &owner,
+            "cuModuleLoadData",
+            1,
+            &[&module as *const _ as usize, original.as_ptr() as usize],
+            0,
+            0x1000,
+        );
+        let state = owner.state.lock().unwrap();
+        assert!(state.error.is_none(), "{:?}", state.error);
+        let binding = &state.modules[&module].cubin;
+        let resource = &state.images[&(0x1000, 7)].cubin;
+        assert_eq!(binding.bytes.as_ref(), original);
+        assert_eq!(resource.bytes.as_ref(), materialized);
+        assert!(!Arc::ptr_eq(binding, resource));
+        assert_eq!(
+            retained_cubin_bytes(&state),
+            original.len() + materialized.len()
+        );
+    }
+    #[test]
+    fn cubin_hash_matches_require_equal_bytes() {
+        let owner = CallbackState::new();
+        let first = library_image(1);
+        let second = library_image(2);
+        resource(&owner, 0x1000, 7, 6, &first);
+        {
+            let mut state = owner.state.lock().unwrap();
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            second.hash(&mut hash);
+            let image = Arc::downgrade(&state.images[&(0x1000, 7)].cubin);
+            state.cubins.entry(hash.finish()).or_default().push(image);
+        }
+        resource(&owner, 0x1000, 8, 6, &second);
+        let state = owner.state.lock().unwrap();
+        assert_eq!(&**state.images[&(0x1000, 7)].cubin, first);
+        assert_eq!(&**state.images[&(0x1000, 8)].cubin, second);
+        assert!(!Arc::ptr_eq(
+            &state.images[&(0x1000, 7)].cubin,
+            &state.images[&(0x1000, 8)].cubin
+        ));
     }
     fn load_library(owner: &CallbackState, library: usize, image: &[u8], context: usize) {
         call(owner, "cuLibraryLoadData", 0, &[], 0, context);
@@ -1190,20 +1481,24 @@ mod tests {
                 &state.modules[&0x100].owner,
                 &state.modules[&0x200].owner
             ));
+            assert!(Arc::ptr_eq(
+                &state.modules[&0x100].cubin,
+                &state.modules[&0x200].cubin
+            ));
         }
         call(&owner, "cuLibraryUnload", 1, &[0x10], 0, 0x1000);
         {
             let state = owner.state.lock().unwrap();
             assert!(!state.modules.contains_key(&0x100));
-            assert_eq!(&*state.modules[&0x200].cubin, first);
+            assert_eq!(&**state.modules[&0x200].cubin, first);
             assert!(state.libraries.contains_key(&0x20));
         }
         load_library(&owner, 0x10, &replacement, 0x1000);
         library_module(&owner, 0x10, 0x100, 0x1000, None);
         let state = owner.state.lock().unwrap();
         assert!(state.error.is_none(), "{:?}", state.error);
-        assert_eq!(&*state.modules[&0x100].cubin, replacement);
-        assert_eq!(&*state.modules[&0x200].cubin, first);
+        assert_eq!(&**state.modules[&0x100].cubin, replacement);
+        assert_eq!(&**state.modules[&0x200].cubin, first);
     }
     #[test]
     fn module_unload_invalidates_only_its_materialized_aliases() {

@@ -65,29 +65,40 @@ def test_native_graph_export_preserves_construction_order_across_branches(tmp_pa
         executable = C.c_void_p()
         cuda.call("cuGraphInstantiateWithFlags", C.byref(executable),
                   C.c_void_p(graph.raw_cuda_graph()), C.c_uint64(0))
+        paths = []
         try:
-            owner = RuntimePackage(allocations=[Allocation("weight", data.data_ptr(), data.nbytes)],
-                                   modules={}, kernels=[], recorder=images.native, owners=(data, graph))
-            path = tmp_path / "rank.json"
-            owner.write(path, {"branches": SimpleNamespace(raw_cuda_graph=graph.raw_cuda_graph,
-                raw_cuda_graph_exec=lambda: executable.value)}, sources=True)
+            for recorded in (False, True):
+                if recorded:
+                    images.native.record_graph(int(graph.raw_cuda_graph()), executable.value)
+                    graph.reset()
+                owner = RuntimePackage(allocations=[Allocation("weight", data.data_ptr(), data.nbytes)],
+                                       modules={}, kernels=[], recorder=images.native, owners=(data, graph))
+                path = tmp_path / ("recorded.json" if recorded else "live.json")
+                owner.write(path, {"branches": SimpleNamespace(raw_cuda_graph=(lambda: 0) if recorded else graph.raw_cuda_graph,
+                    raw_cuda_graph_exec=lambda: executable.value)}, sources=True)
+                paths.append(path)
         finally:
+            images.native.release_graph(executable.value)
             cuda.call("cuGraphExecDestroy", executable)
-    index, locate = read_sources(path)
-    description, = index.ranks[0].graphs
-    contents = bytearray()
-    for source, offset, nbytes in locate(index.ranks[0].resources[description.resource]):
-        with source.open("rb") as stream:
-            stream.seek(offset)
-            contents.extend(stream.read(nbytes))
     import struct
-    decoded, cursor = [], 0
-    for record in [proto.Node] * description.node_count + [proto.Edge] * description.edge_count:
-        size, = struct.unpack_from("<I", contents, cursor)
-        cursor += 4
-        decoded.append(record.FromString(contents[cursor:cursor + size]))
-        cursor += size
-    assert cursor == len(contents)
+    exports = []
+    for path in paths:
+        index, locate = read_sources(path)
+        description, = index.ranks[0].graphs
+        contents = bytearray()
+        for source, offset, nbytes in locate(index.ranks[0].resources[description.resource]):
+            with source.open("rb") as stream:
+                stream.seek(offset)
+                contents.extend(stream.read(nbytes))
+        decoded, cursor = [], 0
+        for record in [proto.Node] * description.node_count + [proto.Edge] * description.edge_count:
+            size, = struct.unpack_from("<I", contents, cursor)
+            cursor += 4
+            decoded.append(record.FromString(contents[cursor:cursor + size]))
+            cursor += size
+        assert cursor == len(contents)
+        exports.append(decoded)
+    assert exports[0] == exports[1]
     memset = [(i, node.memset.value) for i, node in enumerate(decoded[:description.node_count])
               if node.WhichOneof("operation") == "memset"]
     assert [value for _, value in memset] == [17, 29, 41]
@@ -106,11 +117,12 @@ def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
-@pytest.mark.parametrize("fixture,binary,expected", [
-    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches"),
-    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed"),
+@pytest.mark.parametrize("fixture,binary,expected,recorded", [
+    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", False),
+    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed", False),
+    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", True),
 ])
-def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected):
+def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected, recorded):
     import shutil
 
     import flare_heliopause
@@ -126,6 +138,7 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
     original = tmp_path / "original"
     result = subprocess.run([
         sys.executable, str(root / "helios/tests" / fixture), str(original),
+        *(["--recorded-graphs"] if recorded else []),
     ], cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     if fixture == "runtime_package_fixture.py":

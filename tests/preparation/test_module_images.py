@@ -21,7 +21,60 @@ def test_native_recorder_rejects_an_unloadable_library(tmp_path, present):
         path.write_bytes(b"not a shared library")
     with pytest.raises((OSError, RuntimeError), match="invalid-cupti"):
         ModuleImages(path)
-    assert ModuleImages.active == 0
+    assert ModuleImages.current() is None
+
+
+def test_recorder_scope_restores_nested_context_and_stop_failure(monkeypatch):
+    from contextvars import Context
+    from types import SimpleNamespace
+
+    class Recorder:
+        fail_stop = False
+        def __init__(self, library):
+            pass
+        def start(self):
+            pass
+        def stop(self):
+            if self.fail_stop:
+                raise RuntimeError("recorder stop failed")
+
+    monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(NativeModuleRecorder=Recorder))
+    outer, inner = ModuleImages("cupti"), ModuleImages("cupti")
+    assert ModuleImages.current() is None
+    with outer:
+        assert ModuleImages.current() is outer
+        assert Context().run(ModuleImages.current) is None
+        with inner:
+            assert ModuleImages.current() is inner
+        assert ModuleImages.current() is outer
+        inner.native.fail_stop = True
+        with pytest.raises(RuntimeError, match="stop failed"), inner:
+            assert ModuleImages.current() is inner
+        assert ModuleImages.current() is outer
+    assert ModuleImages.current() is None
+
+
+def test_recorder_start_failure_does_not_replace_active_scope(monkeypatch):
+    from types import SimpleNamespace
+
+    class Recorder:
+        fail_start = False
+        def __init__(self, library):
+            pass
+        def start(self):
+            if self.fail_start:
+                raise RuntimeError("recorder start failed")
+        def stop(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(NativeModuleRecorder=Recorder))
+    outer, inner = ModuleImages("cupti"), ModuleImages("cupti")
+    inner.native.fail_start = True
+    with outer:
+        with pytest.raises(RuntimeError, match="start failed"):
+            inner.__enter__()
+        assert ModuleImages.current() is outer
+    assert ModuleImages.current() is None
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
@@ -38,7 +91,7 @@ cuda.call("cuInit", C.c_uint(0))
 context, device = C.c_void_p(), C.c_int()
 cuda.call("cuDeviceGet", C.byref(device), C.c_int(0))
 with ModuleImages() as images:
-    assert ModuleImages.active == 1
+    assert ModuleImages.current() is images
     cuda.call("cuCtxCreate_v2", C.byref(context), C.c_uint(0), device)
     try:
         pointer = C.c_uint64()
@@ -52,6 +105,6 @@ with ModuleImages() as images:
     finally:
         cuda.call("cuCtxDestroy_v2", context)
     assert pointer.value not in images.allocations
-assert ModuleImages.active == 0
+assert ModuleImages.current() is None
 '''], cwd=root, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

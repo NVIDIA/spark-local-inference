@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .execution import TunedBinding, TuningGraph
+from .runtime_package import capture_graph, instantiate_graph
 
 _CAPTURE = ContextVar("startup_tuning_capture", default=None)
 
@@ -177,10 +178,10 @@ class CollectiveStartupTuning:
             with torch.cuda.device(device):
                 stream = torch.cuda.Stream(device=device)
                 stream.wait_stream(torch.cuda.current_stream(device))
-                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                graph = capture_graph(retain_graphs=True)
                 with self.session.capture(), torch.cuda.graph(graph, pool=storage.graph_pool.id, stream=stream):
                     producer.run()
-                graph.instantiate()
+                instantiate_graph(graph)
                 stream.synchronize()
             tuners[name] = TuningGraph(graph, tuple(outputs), status)
             resources.append(producer)

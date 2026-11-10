@@ -269,7 +269,7 @@ def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=N
         raise RuntimeError("rank preparation requires exclusive ownership of the control group")
     from .module_images import ModuleImages
 
-    recording = package_storage is not None and ModuleImages.active > 0
+    recording = package_storage is not None and ModuleImages.current() is not None
     rendezvous = TemporaryDirectory(prefix="flare-ranks-")
     address = Path(rendezvous.name, "gloo").as_uri()
     context = mp.get_context("spawn")

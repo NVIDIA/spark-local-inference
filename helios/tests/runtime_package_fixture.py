@@ -12,18 +12,18 @@ from signing import publisher
 
 
 def prepare(root, shard_size=64 << 30, legacy=False, *, capacity=65, allocation_padding=0,
-            weight_delta=0., layer_groups=False):
+            weight_delta=0., layer_groups=False, recorded_graphs=False):
     import torch
     from ignition.preparation.module_images import ModuleImages
 
     torch.cuda.set_device(0)
     with ModuleImages() as images:
         _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
-                 weight_delta, layer_groups)
+                 weight_delta, layer_groups, recorded_graphs)
 
 
 def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
-             weight_delta, layer_groups):
+             weight_delta, layer_groups, recorded_graphs):
     import torch
     import cutlass
     from cuda.bindings import driver as cuda
@@ -71,20 +71,22 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
     other_gemm(tensors["input"][:64], other_weight, tensors["scale"], tensors["scale"],
                other_output, tensors["alpha"])
     graphs = {}
-    for rows in (32, 64):
+
+    def run(rows):
         source, scratch = tensors["input"][1:rows + 1], tensors["scratch"][1:rows + 1]
+        scratch.zero_()
+        gemm(source, tensors["weight"], tensors["scale"], tensors["scale"],
+             scratch, tensors["alpha"])
+        tensors[f"rows_{rows}"].copy_(scratch)
+
+    for rows in (32, 64):
         output = torch.zeros(rows, 128, 1, dtype=torch.bfloat16, device="cuda")
         tensors[f"rows_{rows}"] = output
-        def run():
-            scratch.zero_()
-            gemm(source, tensors["weight"], tensors["scale"], tensors["scale"],
-                 scratch, tensors["alpha"])
-            output.copy_(scratch)
-        run()
+        run(rows)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph):
-            run()
+            run(rows)
         graph.instantiate()
         graphs[f"rows_{rows}"] = graph
         graph.replay()
@@ -109,11 +111,12 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
             assert status == cuda.CUresult.CUDA_ERROR_INVALID_VALUE
             break
         sizes.append(size)
-    assert sizes == [128, 4, 16, 16, 8, 8, 128, 8, 128, 4, 16, 128, 8, 128,
-                     4, 16, 16, 16, 8, 16, 16, 4, 12, 12, 4, 12, 12, 8, 8, 8]
-    tensor_maps = {0: "input", 6: "weight", 8: "scale", 11: "scale", 13: "scratch"}
+    assert sizes == [128, 4, 16, 16, 8, 8, 128, 8, 128, 8, 8, 128, 8, 8, 128,
+                     8, 16, 16, 16, 8, 16, 16, 4, 12, 12, 4, 12, 12, 8, 8, 8]
+    tensor_maps = {0: "input", 6: "weight", 8: "weight", 11: "weight", 14: "scratch"}
     pointer_fields = {2: "input", 3: "input", 4: "alpha", 5: "alpha", 7: "weight",
-                      10: "scale", 12: "scale", 15: "scratch", 27: "alpha", 28: "alpha", 29: "alpha"}
+                      9: "scale", 10: "scale", 12: "scale", 13: "scale", 16: "scratch",
+                      28: "alpha", 29: "alpha", 30: "alpha"}
     arguments = []
     def reference(name):
         return Reference(name, {"input": 128, "scratch": 256}.get(name, 0))
@@ -139,6 +142,22 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
                              relocations=storage_relocations.get(name, ()))
                    for name, tensor in tensors.items()]
     fill_arguments = (Argument(4), Argument(2), Argument(8, (Relocation(0, reference("scratch")),)))
+    if recorded_graphs:
+        from ignition.preparation.runtime_package import capture_graph, instantiate_graph
+
+        for rows in (32, 64):
+            graph = capture_graph(retain_graphs=True)
+            with torch.cuda.graph(graph):
+                run(rows)
+            instantiate_graph(graph)
+            graphs[f"rows_{rows}"].reset()
+            graphs[f"rows_{rows}"] = graph
+            try:
+                graph.raw_cuda_graph()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("recorded graph retained its CUDA template")
     package = RuntimePackage(allocations=allocations, modules={}, recorder=images.native,
                              kernels=[Kernel(function, "dense", tuple(arguments)),
                                       Kernel(int(fill.func), "fill", fill_arguments)],
@@ -174,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shard-size", type=int, default=64 << 30)
     parser.add_argument("--legacy", action="store_true")
+    parser.add_argument("--recorded-graphs", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size, args.legacy)
+    prepare(args.directory, args.shard_size, args.legacy, recorded_graphs=args.recorded_graphs)

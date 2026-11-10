@@ -41,12 +41,15 @@ def test_unused_bytes_include_live_block_padding_and_retired_pools(monkeypatch):
     def segment(device, pool, blocks):
         return dict(device=device, segment_pool_id=pool, blocks=blocks)
 
-    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda: [
-        segment(0, (0, 1), [block(0, 64, 32), block(64, 32, 0, "inactive"), block(96, 32, 32)]),
-        segment(0, (0, 2), [block(128, 64, 24, "active_awaiting_free")]),
-        segment(0, (0, 3), [block(192, 64, 0, "inactive")]),
-        segment(1, (0, 1), [block(256, 64, 0, "inactive")]),
-    ])
+    def snapshot(*, include_traces):
+        assert include_traces is False
+        return [
+            segment(0, (0, 1), [block(0, 64, 32), block(64, 32, 0, "inactive"), block(96, 32, 32)]),
+            segment(0, (0, 2), [block(128, 64, 24, "active_awaiting_free")]),
+            segment(0, (0, 3), [block(192, 64, 0, "inactive")]),
+            segment(1, (0, 1), [block(256, 64, 0, "inactive")]),
+        ]
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", snapshot)
     unused = storage.unused_ranges()
     assert unused == [(base + 32, base + 64), (base + 64, base + 96), (base + 152, base + 192)]
 
