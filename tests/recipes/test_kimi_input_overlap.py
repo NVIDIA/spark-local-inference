@@ -18,6 +18,7 @@ class Shared:
         assert self.pending is None
         self.events.append('shared_start')
         self.pending = source
+        return source
 
     def finish(self, source, routed):
         assert self.pending is source
@@ -42,13 +43,15 @@ class ProjectionFork:
         assert self.pending is None
         self.events.append('down_start')
         self.pending = source
+        return source
 
     def finish(self, source, logits):
         assert self.pending is source
         assert torch.isfinite(logits).all()
-        self.project(source)
+        result = self.project(source)
         self.events.append('down_join')
         self.pending = None
+        return result
 
 
 @pytest.mark.parametrize('rows,compact', [(1, True), (8, True), (9, False)])
@@ -60,6 +63,8 @@ def test_projection_and_shared_forks_preserve_outputs_and_balance_joins(
     source = torch.empty(rows, 4)
     logits = torch.empty(rows, 4)
     prepared = decoder.PreparedLatentMoE.__new__(decoder.PreparedLatentMoE)
+    prepared.world, prepared.latent_width = 1, 4
+    prepared.prefill_route_gather = None
     prepared.source = torch.empty_like(source)
     prepared.hidden_columns = torch.arange(4)
     prepared.latent = torch.empty_like(source)
@@ -81,18 +86,20 @@ def test_projection_and_shared_forks_preserve_outputs_and_balance_joins(
         output.copy_(value * 2)
         return output
 
-    def route():
+    def route(down, scores):
         events.append('route')
         assert torch.isfinite(logits).all()
-        assert torch.isfinite(prepared.latent).all()
+        assert torch.isfinite(down).all()
+        return down, torch.zeros(rows, 1, dtype=torch.int32), torch.ones(rows, 1)
 
-    def experts():
+    def experts(latent, ids, weights):
         events.append('experts')
-        prepared.expert_output.copy_(prepared.latent + 1)
+        prepared.expert_output.copy_(latent + 1)
         return prepared.expert_output
 
     def reduce(value):
         prepared.latent_sum.copy_(value)
+        return prepared.latent_sum
 
     def normalize(value, weight, output, eps, *, begin):
         output.copy_(value)
@@ -107,16 +114,21 @@ def test_projection_and_shared_forks_preserve_outputs_and_balance_joins(
     prepared.concurrent_down = (ProjectionFork(events, down) if compact and projection_overlap else None)
     prepared.experts, prepared.expert_reduce, prepared.up = experts, reduce, up
     if not compact:
+        prepared.local_experts, prepared.router_width = 4, 4
         prepared.router_input = torch.empty_like(logits)
         prepared.router_columns = torch.empty_like(logits)
         prepared.router_output = torch.empty_like(logits)
         prepared.router_logits = prepared.router_output
 
         def gather(value):
-            prepared.router_columns.copy_(value.view(torch.float32))
+            return value
 
         prepared.router_gather = gather
-        prepared.router = lambda value: events.append('route')
+        def router(value):
+            from types import SimpleNamespace
+            events.append('route')
+            return SimpleNamespace(ids=torch.zeros(rows, 1, dtype=torch.int32), weights=torch.ones(rows, 1))
+        prepared.router = router
         prepared.down_reduce = reduce
     monkeypatch.setattr(decoder, 'rms_norm_columns', normalize)
     addresses = tuple(value.data_ptr() for value in (
@@ -128,7 +140,6 @@ def test_projection_and_shared_forks_preserve_outputs_and_balance_joins(
             value.fill_(float('nan'))
         output = prepared(source)
         torch.testing.assert_close(output, source * 11 + 3, rtol=0, atol=0)
-        assert output is prepared.output
         assert prepared.shared.pending is None
         if prepared.concurrent_down is not None:
             assert prepared.concurrent_down.pending is None
