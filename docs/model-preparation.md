@@ -245,6 +245,15 @@ device memory can reduce it; local preparation ranks share the budget. Set
 overrides that setting. Omitting both retains automatic sizing, including
 shared-memory limits on DGX Spark.
 
+Forward compilation allocates workers across each host after checking cached
+forwards. Ranks without a worker lend missing forwards to other
+ranks on that host; every serving rank still binds and captures its full catalog.
+Concurrency uses a 16 GiB host-RAM estimate per worker, plus device storage on
+integrated GPUs. When that estimate admits no worker, one worker per host may
+start under the 2 GiB minimum host allowance plus integrated device storage.
+These allowances estimate compiler demand; actual peaks depend on the forward.
+Linux cgroup-v2 memory limits also constrain the available RAM used for admission.
+
 On integrated GPUs, kernel tuning is divided into memory-bounded jobs. The
 terminal dashboard shows the active job number and total job count, with a
 separate live display for each job. Redirecting output records plain kernel

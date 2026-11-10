@@ -502,8 +502,8 @@ def _variant_compilers(selections):
 def _balance_compilations(counts, workers):
     """Spread forwards missing from one host's cache over its ranks' compilers.
 
-    Rank `i` must compile `counts[i]` forwards with `workers[i]` workers; a rank without workers,
-    whose GPU lacks room for one, lends all of them. Returns, per rank, the (owner, index)
+    Rank `i` must compile `counts[i]` forwards with `workers[i]` workers; a rank without admitted
+    workers lends all of them. Returns, per rank, the (owner, index)
     forwards it compiles: each rank keeps its own until lending one finishes sooner elsewhere.
     Every rank derives the same assignment.
     """
@@ -779,7 +779,7 @@ class ForwardCache:
         """
         import torch.distributed as dist
         from ignition.progress import phase
-        from .compile_pool import CompilePool
+        from .compile_pool import CompilePool, allocate_workers, compiler_resources
         from .inductor_tuning import InductorSelections
 
         group, ranks = coordinator.group, coordinator.ranks
@@ -792,19 +792,10 @@ class ForwardCache:
         compilers = _variant_compilers(selections)
         work = [(name, variant, functions[name]) for (name, variant), compiler in compilers.items() if compiler == share]
         selected, outcome, error, compiler, paths, lent, sent = {}, (None, None), None, None, {}, set(), []
-        unavailable, loans = None, []
+        loans = []
         with ExitStack() as scope:
             stage = scope.enter_context(phase(progress, "Compile model forwards", total=len(work)))
             compiler_scope = scope.enter_context(ExitStack())
-            try:
-                compiler = compiler_scope.enter_context(CompilePool(
-                    self.device, headroom_bytes=self.headroom_bytes, pools=coordinator.local_ranks,
-                    options=self.options, compile_workers=self.compile_workers))
-            except MemoryError as failure:
-                # A rank whose GPU has no room for a compiler lends its forwards to the others on this host.
-                unavailable = f"{type(failure).__name__}: {failure}"
-            except Exception as failure:
-                error = f"{type(failure).__name__}: {failure}"
             # Variants that only one rank selects, such as rank zero's sampling, can leave that rank most of
             # the catalog. Ranks on one host share its cache, so a rank lends forwards it cannot restore, whether
             # missing or bound differently by another launch, to ranks whose compilers would otherwise finish
@@ -822,16 +813,45 @@ class ForwardCache:
                         restored[index] = bound, path
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
+            resources = None
+            try:
+                release_unused()
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
+            # Include every rank's retained cache-restoration owners in host memory admission.
+            dist.barrier(group=group)
+            try:
+                resources = compiler_resources(self.device, headroom_bytes=self.headroom_bytes,
+                    options=self.options, compile_workers=self.compile_workers)
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
-            dist.all_gather_object(demand, (len(missing), 0 if compiler is None else compiler.workers), group=group)
-            if not coordinator.spans_hosts and any(workers for _, workers in demand):
-                assigned = _balance_compilations([count for count, _ in demand], [workers for _, workers in demand])
+            dist.all_gather_object(demand, (len(missing), resources, error), group=group)
+            try:
+                failures = [(rank, failure) for rank, (_, _, failure) in zip(ranks, demand) if failure is not None]
+                if failures:
+                    raise RuntimeError(f"forward compiler resource collection failed: {failures}")
+                counts = [count for count, _, _ in demand]
+                workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
+                stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
+                assigned = [[] for _ in ranks]
+                for host in dict.fromkeys(coordinator.hosts):
+                    members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                    if not any(counts[index] for index in members):
+                        continue
+                    local = _balance_compilations([counts[index] for index in members],
+                                                  [workers[index] for index in members])
+                    for borrower, forwards in zip(members, local):
+                        assigned[borrower] = [(members[owner], index) for owner, index in forwards]
+                if workers[share]:
+                    compiler = compiler_scope.enter_context(CompilePool(
+                        self.device, options=self.options, workers=workers[share]))
                 loans = [(borrower, missing[index]) for borrower, forwards in enumerate(assigned)
                          for owner, index in forwards if owner == share and borrower != share]
                 lent = {work[index][:2] for _, index in loans}
-                try:
-                    from .forward_metadata import dumps
+                from .forward_metadata import dumps
 
+                if loans:
                     jobs = self.root / 'lent'
                     jobs.mkdir(parents=True, exist_ok=True)
                     for borrower, index in loans:
@@ -839,22 +859,24 @@ class ForwardCache:
                         path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
                         job = jobs / f"{path.stem}.forward"
                         with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
-                            pickle.dump((dumps(forward), str(path)), file)
-                        os.replace(file.name, job)
+                            temporary = Path(file.name)
+                            try:
+                                pickle.dump((dumps(forward), str(path)), file)
+                                file.close()
+                                os.replace(temporary, job)
+                            finally:
+                                temporary.unlink(missing_ok=True)
                         sent.append((borrower, str(job)))
                         # The borrower compiles it before every rank gathers the outcome below.
                         paths[name, variant] = str(path), True
-                except Exception as failure:
-                    error = error or f"{type(failure).__name__}: {failure}"
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
             mailed = [None] * len(ranks)
             dist.all_gather_object(mailed, sent, group=group)
             borrowed = [job for jobs in mailed for borrower, job in jobs if borrower == share]
             try:
                 if error is not None:
                     raise RuntimeError(error)
-                if compiler is None and (borrowed or any(index not in {i for _, i in loans} for index in missing)
-                                         if not coordinator.spans_hosts else missing):
-                    raise RuntimeError(unavailable)
                 pending = []
 
                 def finish():
@@ -899,6 +921,8 @@ class ForwardCache:
                 outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
             outcomes = [None] * len(ranks)
             dist.all_gather_object(outcomes, outcome, group=group)
+            for _, job in sent:
+                Path(job).unlink(missing_ok=True)
             # Forwards lent to other ranks are complete once every rank reports.
             stage.update(advance=len(lent))
         failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
