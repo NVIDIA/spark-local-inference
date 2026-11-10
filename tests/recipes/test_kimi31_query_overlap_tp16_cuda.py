@@ -184,7 +184,7 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                         for name, prepared in (('serial', serial), ('overlap', operation))}
             production = {name: AttentionForward(prepared, source, metadata)
                           for name, prepared in (('serial', serial), ('overlap', operation))}
-            observed, = observations.stages
+            observed = observations.last_stage
             packed, local_ids, local_scores, index_query, index_scales, index_weights = observed.index
 
             def restore():

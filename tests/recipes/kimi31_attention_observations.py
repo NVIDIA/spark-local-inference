@@ -51,8 +51,7 @@ class AttentionForward:
             copy_observations(self.observations, result)
             self.output.copy_(result.output)
             # The gather's source may be overwritten once its join has completed.
-            for stage, observed in zip(result.stages, self.observations.stages, strict=True):
-                _overwrite_query(stage.quantized, observed.quantized)
+            _overwrite_query(result.last_stage.quantized, self.observations.last_stage.quantized)
         return self.output
 
 
@@ -67,7 +66,7 @@ class AttentionTail:
         from ignition.recipes.kimi31.dcp import selection_slots
 
         operation, result = self.operation, self.observations
-        stage, = result.stages
+        stage = result.last_stage
         rows = stage.selected.shape[0]
         part = operation.parts[rows]
         owners = torch.empty_like(stage.owners)

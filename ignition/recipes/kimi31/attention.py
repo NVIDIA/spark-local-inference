@@ -37,7 +37,7 @@ class _AttentionResult(NamedTuple):
     output: torch.Tensor
     projected: MLAProjectionOutput
     attended: torch.Tensor
-    stages: tuple[_AttentionStage, ...]
+    last_stage: _AttentionStage
 
 
 class PreparedDSA(PreparedMLAProjection):
@@ -183,7 +183,6 @@ class PreparedDSA(PreparedMLAProjection):
         if self.history is not None:
             end = (metadata.starts + metadata.lengths) * (metadata.lengths > 0)
             history = self.history(metadata.page_table[0], end)
-        stages = []
         attended = torch.empty((source.shape[0], self.heads, 512), dtype=source.dtype, device=source.device)
         for start, end in self.indexer.bounds:
             rows = end - start
@@ -221,6 +220,6 @@ class PreparedDSA(PreparedMLAProjection):
                     page_table=slots, lengths=counts, starts=part["starts"])
                 output = part["combine"](partial, lse)
             attended[start:end].copy_(output)
-            stages.append(_AttentionStage(quantized, gathered, partial, lse, selected,
-                selected_scores, owners, slots, counts, index))
-        return _AttentionResult(self.finish(attended, projected), projected, attended, tuple(stages))
+        last_stage = _AttentionStage(quantized, gathered, partial, lse, selected,
+            selected_scores, owners, slots, counts, index)
+        return _AttentionResult(self.finish(attended, projected), projected, attended, last_stage)

@@ -293,7 +293,7 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                     arena.tensor.fill_(255)
                     poison_observations(variant.observations)
                     variant.forward.output.fill_(19)
-                    observed, = variant.observations.stages
+                    observed = variant.observations.last_stage
                     torch.cuda.synchronize(device)
                     dist.barrier()
                     before = torch.cuda.memory_stats(device)

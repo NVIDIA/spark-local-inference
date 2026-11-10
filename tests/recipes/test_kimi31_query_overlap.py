@@ -164,7 +164,8 @@ def test_candidate_alternatives_share_query_join_dependency(monkeypatch):
 
 
 @pytest.mark.parametrize('overlap', [False, True])
-def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypatch, overlap):
+@pytest.mark.parametrize('observe', [False, True])
+def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypatch, overlap, observe):
     events = []
     op = attention.PreparedDSA.__new__(attention.PreparedDSA)
     op.absorbed = torch.ones((1, 1, RECORD_BYTES), dtype=torch.bfloat16)
@@ -195,14 +196,17 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
         def exchange(self, packed_arg, positions, **kwargs):
             assert packed_arg is packed
             assert not pending
+            assert kwargs['dependencies'] == ((gathered,) if overlap else ())
             events.append('candidate_exchange')
             return selected
-        def __call__(self, query, weights, positions, tables):
-            self.prepare_local(query, weights, positions, tables)
-            return self.exchange(packed, positions)
+        def prepare_local_result(self, query, weights, positions, tables):
+            return self.prepare_local(query, weights, positions, tables), None, None, None, None, None
+        def exchange_result(self, packed_arg, positions, **kwargs):
+            return self.exchange(packed_arg, positions, **kwargs), None
 
     class Fork:
         def start(self, source, **kwargs):
+            assert kwargs['dependencies'] == (op.cache,)
             events.append('query_start')
             pending.append(source)
             return source
@@ -213,6 +217,7 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
             return gathered
 
     def gather(source, **kwargs):
+        assert kwargs['dependencies'] == (op.cache,)
         events.append('query_gather')
         gathered.copy_(source.view_as(gathered))
         return gathered
@@ -228,7 +233,14 @@ def test_attention_joins_before_candidate_exchange_and_preserves_output(monkeypa
                      combine=lambda *args: events.append('combine') or torch.zeros((1, 1, 512)), starts=None)}
     op.query_overlap = Fork() if overlap else None
     op.finish = lambda *args: result
-    assert op(torch.ones((1, 1)), op.metadata).item() == RECORD_BYTES
+    source = torch.ones((1, 1))
+    if observe:
+        observed = op._run(source, op.metadata)
+        assert observed.output.item() == RECORD_BYTES
+        assert observed.last_stage.selected is selected
+        assert observed.last_stage.gathered is gathered
+    else:
+        assert op(source, op.metadata).item() == RECORD_BYTES
     if overlap:
         assert events == ['projection', 'cache_write', 'query_start', 'index_projection',
                           'local_selection', 'query_join', 'candidate_exchange', 'slots', 'attention', 'combine']
