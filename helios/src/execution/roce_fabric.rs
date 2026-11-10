@@ -21,8 +21,9 @@
 //! two or more ranks joins all of them; otherwise per-peer pairing prefers the narrowest subnets,
 //! so a cabled partner is reached over its cable. IPv4 link-local subnets (169.254.0.0/16) count as
 //! world-wide, because hosts using link-local addressing share that subnet whether or not their
-//! ports are cabled together; per-peer pairing uses a link-local pair only between LLDP neighbors.
-//! Rails are ordered by breadth and then link address so both ends agree. Every rank plans over every
+//! ports are cabled together. A link-local pair carries a rail only between LLDP neighbors, which
+//! per-peer pairing alone considers, so index pairing never applies to a rail device with a
+//! link-local address. Rails are ordered by breadth and then link address so both ends agree. Every rank plans over every
 //! rank's endpoints, including in ring and chain mode, so both ends of each link see the same
 //! breadths and choose the same devices.
 //!
@@ -655,8 +656,9 @@ fn shared_links<'a>(devices: impl IntoIterator<Item = &'a Endpoint>) -> usize {
 /// rail devices share a PCIe link, no devices of two ranks are LLDP neighbors (a cable that
 /// per-peer pairing prefers or, with `Links::Shared`, avoids), and, when `links` admits direct
 /// cables, no subnet links some ranks but not all of them (a direct cable that per-peer pairing
-/// prefers). With `Links::Shared`, every rail device must also have a known address outside
-/// link-local space, so that each rail verifiably rides a subnet every rank holds.
+/// prefers). No rail device may have a link-local address, which links only LLDP neighbors, and
+/// LLDP neighbors already rule index pairing out. With `Links::Shared`, every rail device must
+/// also have a known address, so that each rail verifiably rides a subnet every rank holds.
 fn index_pairing_valid(
     endpoints: &[Vec<Endpoint>],
     rails: usize,
@@ -683,13 +685,12 @@ fn index_pairing_valid(
     {
         return false;
     }
-    if links == Links::Shared
-        && endpoints.iter().any(|devices| {
-            devices[..rails]
-                .iter()
-                .any(|d| d.network().is_none_or(link_local))
+    if endpoints.iter().any(|devices| {
+        devices[..rails].iter().any(|d| match d.network() {
+            Some(network) => link_local(network),
+            None => links == Links::Shared,
         })
-    {
+    }) {
         return false;
     }
     for a in 0..endpoints.len() {
@@ -805,6 +806,7 @@ impl<'a> Planner<'a> {
         // a link only when its devices are LLDP neighbors. Links::Shared admits only subnets every
         // rank holds between devices that are not LLDP neighbors.
         let mut candidates: Vec<(Key, u32, u32)> = Vec::new();
+        let mut unverified_link_local = false;
         for (l, x) in local.iter().enumerate() {
             for (r, y) in remote.iter().enumerate() {
                 if !same_link(x, y) {
@@ -814,6 +816,7 @@ impl<'a> Planner<'a> {
                 let breadth = self.breadths[&network];
                 let adjacent = lldp_adjacent(x, y);
                 if link_local(network) && !adjacent {
+                    unverified_link_local = true;
                     continue;
                 }
                 if self.links == Links::Shared && (breadth < world || adjacent) {
@@ -849,8 +852,13 @@ impl<'a> Planner<'a> {
         candidates.sort();
         best_matching(&candidates, rails, local, remote).ok_or_else(|| {
             let reach = (1..rails).rev().find(|&k| best_matching(&candidates, k, local, remote).is_some()).unwrap_or(0);
+            let hint = if unverified_link_local {
+                "; link-local addresses link only devices that are LLDP neighbors"
+            } else {
+                ""
+            };
             failure(format!(
-                "rank {rank}: {reach} of {rails} RoCE rails have a link to rank {peer}; local {local:?}, remote {remote:?}"
+                "rank {rank}: {reach} of {rails} RoCE rails have a link to rank {peer}{hint}; local {local:?}, remote {remote:?}"
             ))
         })
     }
@@ -1814,6 +1822,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn index_pairing_admits_no_link_local_rail_device() {
+        // Device 0 holds a link-local address on an unconnected private port, and devices 1 and 2
+        // are on a switch. Every subnet joins every rank and no PCIe link is shared, so only the
+        // link-local device stands between this fabric and index pairing.
+        let rank = |r: u8| {
+            vec![
+                endpoint("p", &format!("169.254.1.{r}/16")),
+                endpoint("s0", &format!("192.168.0.{r}/24")),
+                endpoint("s1", &format!("192.168.1.{r}/24")),
+            ]
+        };
+        let endpoints: Vec<_> = (1..=4).map(rank).collect();
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "link-local device first");
+        for rank in 0..4 {
+            for peer in (0..4).filter(|&p| p != rank) {
+                assert_eq!(plans[rank][peer], vec![(1, 1), (2, 2)], "{rank} to {peer}");
+            }
+        }
+        // With the link-local device after the rail devices, index pairing still applies.
+        let last: Vec<Vec<Endpoint>> = endpoints
+            .iter()
+            .map(|d| vec![d[1].clone(), d[2].clone(), d[0].clone()])
+            .collect();
+        assert!(index_pairing_valid(&last, 2, &breadths(&last), Links::All));
+        assert_eq!(
+            plan_routes(&last, 0, 2, Links::All).unwrap()[2],
+            vec![(0, 0), (1, 1)]
+        );
+        // Ranks addressed only by link-local addresses have a link only between LLDP neighbors.
+        let only: Vec<Vec<Endpoint>> = (1..=2)
+            .map(|r| vec![endpoint("p", &format!("169.254.1.{r}/16"))])
+            .collect();
+        let error = plan_routes(&only, 0, 1, Links::All)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("link-local addresses link only devices that are LLDP neighbors"),
+            "{error}"
+        );
+        let mut cabled = only.clone();
+        cabled[0][0].mac = Some("02:00:00:00:00:01".into());
+        cabled[1][0].neighbors = vec!["02:00:00:00:00:01".into()];
+        assert_eq!(
+            plan_routes(&cabled, 0, 1, Links::All).unwrap()[1],
+            vec![(0, 0)]
+        );
     }
 
     #[test]

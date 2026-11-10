@@ -110,10 +110,13 @@ two-rank group on a cabled pair has no evidence of its cable: its rails take one
 device behind each PCIe link and then the lowest-numbered network, which is the
 switch only when the switch's subnets sort below the cable's. IPv4 link-local
 addresses (169.254.0.0/16) never identify a cable, and two link-local addresses
-form a link only between LLDP neighbors. Among equally verified links, a
-peer's two rails use devices behind different PCIe links: a DGX Spark's two
-ConnectX-7 functions behind one PCIe x4 link share its bandwidth, so a two-rank
-group on a cabled pair uses one function behind each link. Core distribution
+form a link only between LLDP neighbors. A device whose only RoCE address is
+link-local therefore carries rails only over a cable that LLDP identifies; LLDP
+does not cross a switch, so switch ports need configured subnets. Among equally
+verified links, a peer's two rails use devices behind different PCIe links: a
+DGX Spark's two ConnectX-7 functions behind one PCIe x4 link share its
+bandwidth, so a two-rank group on a cabled pair uses one function behind each
+link. Core distribution
 and Orbit prestaging connect each pair of ranks over the same devices as its RDMA
 rails.
 
@@ -527,7 +530,7 @@ check `orbit status` and restart saved groups explicitly.
 | Checkpoint source changed | Keep source checkpoint files unchanged through loading. |
 | Rank identity or graph I/O schema differs | Matching export, prepared world size, serving options, and compatible executables. |
 | Core RoCE proxy ABI mismatch | Align preparation and serving dependencies; re-export when the executable cannot load that ABI. |
-| Missing GID or rail/queue-pair error | Active ports, IPv4 RoCEv2 GIDs, reachable endpoints, and the intended rank order. |
+| Missing GID or rail/queue-pair error | Active ports, IPv4 RoCEv2 GIDs, reachable endpoints, and the intended rank order. Link-local addresses link only LLDP neighbors; configure subnets on switch ports. |
 | `RoCE endpoint record has no PCIe link field` | A rank runs a build that plans rails from addresses alone; run builds with the same route planner on every rank. |
 
 Inspect rank output and `journalctl --user -u flare-agent` before restarting a
