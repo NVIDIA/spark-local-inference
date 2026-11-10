@@ -554,6 +554,48 @@ mod tests {
     }
 
     #[test]
+    fn mtp_only_catalog_loads_with_drafts_and_rejects_ordinary_execution() {
+        for ranks in [1, 2, 16] {
+            let catalog = || (0..ranks).map(|_| {
+                let mut package = package();
+                let execution = package.execution.as_mut().unwrap();
+                execution.graphs.retain(|graph| graph.speculation_enabled != Some(false));
+                for graph in &mut execution.graphs {
+                    graph.speculation_enabled = Some(true);
+                }
+                let names: HashSet<_> = execution.graphs.iter().map(|graph| graph.name.clone()).collect();
+                package.graphs.retain(|graph| names.contains(&graph.name));
+                package
+            }).collect::<Vec<_>>();
+            let mut packages = catalog();
+            LoadOptions::default().select(&mut packages, &mut config()).unwrap();
+            for package in &packages {
+                let execution = package.execution.as_ref().unwrap();
+                assert!(execution.graphs.iter().all(|graph| graph.speculation_enabled == Some(true)));
+                for batch in [1, 2, 4] {
+                    assert!(execution.graphs.iter().any(|graph|
+                        graph.kind == "speculative" && graph.batch_capacity == batch && graph.token_capacity == 1));
+                }
+            }
+            let error = LoadOptions { mtp_draft_tokens: Some(0), ..Default::default() }
+                .select(&mut catalog(), &mut config()).unwrap_err();
+            assert!(error.to_string().contains("rank 0 lacks init graph"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rebuild_speculation_preserves_mtp_only_and_defaults_its_absence_to_false() {
+        for mtp_only in [false, true] {
+            let metadata = wire::RebuildSpeculation { mtp_only, ..Default::default() };
+            let decoded = wire::RebuildSpeculation::decode(metadata.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded.mtp_only, mtp_only);
+        }
+        let mut metadata = serde_json::to_value(wire::RebuildSpeculation::default()).unwrap();
+        metadata.as_object_mut().unwrap().remove("mtp_only");
+        assert!(!serde_json::from_value::<wire::RebuildSpeculation>(metadata).unwrap().mtp_only);
+    }
+
+    #[test]
     fn history_override_preserves_the_selected_graphs() {
         let mut baseline = [package()];
         LoadOptions::default()

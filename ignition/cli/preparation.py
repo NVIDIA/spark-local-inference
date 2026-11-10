@@ -167,6 +167,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         graph_budget = Setting(None if default is None else default.graph_budget, "recipe")
     explicit_graph_budget = graph_budget.value is not None and graph_budget.source not in ("recipe", "[defaults]")
     given = [flag for flag, value in (
+        ("--mtp-only", args.mtp_only or None),
         ("--speculative-method", method_flag),
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
@@ -190,6 +191,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     drafts = default.draft_tokens if args.mtp_draft_tokens is None else args.mtp_draft_tokens
     if not 0 <= drafts <= limit:
         raise UsageError(f"--mtp-draft-tokens must be 0 through {limit}; --no-mtp disables speculation")
+    if args.mtp_only and drafts == 0:
+        raise UsageError("--mtp-only requires positive learned draft depth; --mtp-draft-tokens 0 disables MTP at loading")
     adaptive = default.adaptive and not args.no_mtp_adaptive_verification
     capacity = args.speculative_token_capacity
     if configuration is not None:
@@ -213,6 +216,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     if (draft_head or markov_head) and drafts < 1:
         raise UsageError("draft head quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
+                       mtp_only=args.mtp_only,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
                        draft_head_quantization=draft_head, markov_head_quantization=markov_head,
                        vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)

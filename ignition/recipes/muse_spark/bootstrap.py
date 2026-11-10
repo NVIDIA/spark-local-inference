@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity
+from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, serving_modes
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
@@ -70,8 +70,12 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dflash
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Muse Spark draft model supports at most seven draft tokens")
         if len(self.devices) != 8 or len(set(self.devices)) != 8 or any(d < 0 for d in self.devices):
@@ -220,7 +224,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                               packed_token_capacity=packed_tokens)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
-        modes = (True, False) if config.dflash else (False,)
+        modes = serving_modes(config.dflash, config.mtp_only)
         for enabled in modes:
             suffix = "-no-mtp" if config.dflash and not enabled else ""
             mode_weights = weights if enabled else replace(weights, draft=None)

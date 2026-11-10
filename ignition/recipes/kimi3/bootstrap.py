@@ -17,7 +17,10 @@ from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_token_capacity
+from ignition.components.capacity import (
+    batch_capacities, prefill_capacities, request_capacity,
+    speculative_token_capacity, serving_modes,
+)
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
@@ -110,8 +113,12 @@ class PreparationConfig:
     # Recipe-owned serving metadata travels with each rank's preparation configuration.
     sampling_defaults: dict | None = None
     frontend_template: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.drafting
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -387,8 +394,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             frame=frame, sequence=sequence, session=session, workspace=arena, collectives=collectives,
             decoder_buffers=decoder_buffers, draft_tokens=config.draft_tokens, context_runtime=context_collective,
             page_tokens=config.page_tokens, markov_runtime=markov_collective)
-    modes = (drafting,) if config.benchmark_selection is not None else ((True, False) if drafting else (False,))
-    count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
+    modes = (drafting,) if config.benchmark_selection is not None else serving_modes(drafting, config.mtp_only)
+    count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
+             + (len(batch_sizes) if False in modes else 0)
              + len(config.speculative_round_shapes) + len(patches))
     if config.benchmark_selection is not None:
         count = prefill_graph_count(prefill_sizes, scoring) + len(batch_sizes) + len(config.speculative_round_shapes)
@@ -404,7 +412,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
         for enabled in modes:
-            # Speculative packages also hold plain graphs, selected when Flare loads without drafts.
             mode_weights = weights if enabled else replace(weights, draft=None)
             suffix = "-no-mtp" if drafting and not enabled else ""
             for kind, mode, sizes in prefill_modes(prefill_sizes,

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from ignition.components.capacity import (
+    serving_modes,
     batch_capacities,
     prefill_capacities,
     request_capacity,
@@ -92,6 +93,7 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    mtp_only: bool = False
 
     @property
     def speculative_shapes(self):
@@ -106,6 +108,9 @@ class PreparationConfig:
         return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if self.mtp_only and (self.draft_checkpoint is None
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Gemma 4 draft model supports at most seven draft tokens")
         if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
@@ -347,10 +352,10 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     )
     forwards, signatures, metadata = {}, {}, {}
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
-    modes = (True, False) if drafting else (False,)
+    modes = serving_modes(drafting, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
-        + len(batch_sizes)
+        + (len(batch_sizes) if False in modes else 0)
         + len(config.speculative_shapes)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:

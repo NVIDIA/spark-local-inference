@@ -374,6 +374,7 @@ class Plan:
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
+                "mtp_only": self.speculation.mtp_only,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,

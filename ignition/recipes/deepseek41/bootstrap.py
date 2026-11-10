@@ -18,7 +18,10 @@ from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
-from ignition.components.capacity import speculative_token_capacity, batch_capacities, prefill_capacities, request_capacity
+from ignition.components.capacity import (
+    speculative_token_capacity, batch_capacities, prefill_capacities,
+    request_capacity, serving_modes,
+)
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
@@ -130,8 +133,12 @@ class PreparationConfig:
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dspark
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -467,11 +474,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
-    modes = (True, False) if config.dspark else (False,)
+    modes = serving_modes(config.dspark, config.mtp_only)
     count = (len(modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
-             + len(config.batch_capacities))
+             + (len(config.batch_capacities) if False in modes else 0))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)

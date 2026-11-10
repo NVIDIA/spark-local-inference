@@ -271,7 +271,7 @@ def test_speculation_settings_are_validated_and_described():
     assert fixed.widths == (1, 2, 3) and fixed.fixed_width == 3
     assert Speculation(0).widths == (1,) and Speculation(0, adaptive=False).fixed_width == 1
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
-    assert record == {"draft_tokens": 5, "adaptive": True,
+    assert record == {"draft_tokens": 5, "adaptive": True, "mtp_only": False,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
                       "draft_head_quantization": None, "markov_head_quantization": None,
                       "vocabulary_parallel_sampling": False}

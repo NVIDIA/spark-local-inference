@@ -1296,8 +1296,11 @@ Select a subset of a package's captured execution capacities:
 
 `--mtp-draft-tokens N` limits each round to N drafts plus its pending input.
 `--mtp-draft-tokens 0` selects ordinary prefill, decode, and prefix-cache graphs
-without draft execution or draft-state updates. Every speculative package also
-contains these ordinary graphs. Adaptive width-one rounds retain draft state so
+without draft execution or draft-state updates. Speculative exports contain
+these ordinary graphs by default. Ignition's `--mtp-only` omits their construction,
+tuning, compilation, and capture, reducing preparation resources and package graph
+count. It requires positive draft depth and rejects `--no-mtp`; packages exported
+with it reject native `--mtp-draft-tokens 0`. Adaptive width-one rounds retain draft state so
 later rounds can resume speculation. Ignition's `--no-mtp` excludes the draft model
 during preparation. `--mtp-adaptive-verification` selects among the loaded
 widths; `--no-mtp-adaptive-verification` selects the fixed width where captured,

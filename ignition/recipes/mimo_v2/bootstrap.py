@@ -18,6 +18,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.capacity import (
+    serving_modes,
     speculative_token_capacity,
     batch_capacities,
     prefill_capacities,
@@ -89,8 +90,12 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dflash
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("MiMo V2 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -291,11 +296,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
-    modes = (True, False) if config.dflash else (False,)
+    modes = serving_modes(config.dflash, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(config.prefill_capacities, scoring) + 4 * len(config.batch_capacities))
         + len(config.speculative_round_shapes)
-        + len(config.batch_capacities)
+        + (len(config.batch_capacities) if False in modes else 0)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:

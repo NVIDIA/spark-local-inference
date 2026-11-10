@@ -48,6 +48,7 @@ def recipe_help(model=None):
             f"  Verification: {'adaptive' if speculation.adaptive else 'fixed width'} by default;"
             " --no-mtp excludes draft weights and state.",
             "  --mtp-draft-tokens 0 retains draft state and captures width-one rounds."))
+        lines.append("  --mtp-only omits MTP-disabled graphs; the package requires speculation at runtime.")
         if speculation.token_capacity is None:
             lines.extend(("  --speculative-token-capacity: at least drafts + 1; default is the larger of",
                           "    power-of-two padded concurrency and drafts + 1."))

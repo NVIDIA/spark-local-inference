@@ -24,7 +24,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "draft_head_quantization": speculation.draft_head_quantization,
         "markov_head_quantization": speculation.markov_head_quantization,
         "vocabulary_parallel_sampling": speculation.vocabulary_parallel_sampling}
-    config = PreparationConfig(collective_tuning=plan.collective_tuning,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning,
         collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,

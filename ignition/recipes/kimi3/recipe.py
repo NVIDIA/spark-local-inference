@@ -34,7 +34,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             repository, revision = (DSPARK_REPOSITORY, DSPARK_REVISION) if draft_source is None else draft_source
             drafting["draft_checkpoint"] = snapshot_download(repository, revision=revision, cache_dir=plan.hub_cache,
                                                              allow_patterns=("config.json", "model.safetensors"))
-    config = PreparationConfig(benchmark_selection=plan.benchmark_selection,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        benchmark_selection=plan.benchmark_selection,
         collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,

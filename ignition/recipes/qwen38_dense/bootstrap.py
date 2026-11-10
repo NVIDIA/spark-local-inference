@@ -20,7 +20,10 @@ from ignition.components.prompt_logprobs import (
 
 from ignition.components.parallel_draft import PreparedParallelDraftRound
 from ignition.components.dflash2 import PreparedContext
-from ignition.components.capacity import parallel_speculative_shapes, batch_capacities, prefill_capacities, request_capacity, speculative_token_capacity
+from ignition.components.capacity import (
+    parallel_speculative_shapes, batch_capacities, prefill_capacities,
+    request_capacity, speculative_token_capacity, serving_modes,
+)
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -78,8 +81,12 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.mtp
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 16:
             raise ValueError("Qwen dense supports at most fifteen draft tokens")
         request_capacity(self.max_active)
@@ -270,7 +277,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     if config.benchmark_selection is not None:
         prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
         batch_sizes = config.benchmark_selection.batches
-    modes = (config.mtp,) if config.benchmark_selection is not None else ((True, False) if config.mtp else (False,))
+    modes = (config.mtp,) if config.benchmark_selection is not None else serving_modes(config.mtp, config.mtp_only)
     prefill_only = config.benchmark_selection is not None and config.benchmark_selection.prefill_chunk
     with phase(progress, "Construct graph catalog"):
         def add(name, forward, kind, rows, tokens, fields, enabled, packed=0):

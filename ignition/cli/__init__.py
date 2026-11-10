@@ -174,6 +174,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     speculative.add_argument("--no-mtp", action="store_true",
                           help="disable multi-token speculation: load no draft model and decode one token"
                                " per step; cannot accompany other speculation flags")
+    speculative.add_argument("--mtp-only", action="store_true",
+                          help="omit MTP-disabled execution graphs; package requires speculation at runtime."
+                               " Requires positive draft depth and cannot accompany --no-mtp")
     speculative.add_argument("--mtp-draft-tokens", type=int, metavar="N",
                           help="most draft tokens verified per round; limits and defaults depend on MODEL."
                                " 0 selects width-one rounds while retaining draft state; --no-mtp excludes it")

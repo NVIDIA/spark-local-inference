@@ -18,7 +18,10 @@ from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
-from ignition.components.capacity import speculative_token_capacity, batch_capacities, prefill_capacities, request_capacity
+from ignition.components.capacity import (
+    speculative_token_capacity, batch_capacities, prefill_capacities,
+    request_capacity, serving_modes,
+)
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
@@ -109,8 +112,12 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.mtp
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("GLM verification storage supports at most seven draft tokens")
         if self.expert_activation not in ("auto", "a4", "a16"):
@@ -444,10 +451,11 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
-    serving_modes = (True, False) if config.mtp else (False,)
-    graph_count = (len(serving_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
+    graph_modes = serving_modes(config.mtp, config.mtp_only)
+    graph_count = (len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
-                   + len(config.batch_capacities) + (len(config.speculative_shapes) if config.mtp else 0))
+                   + (len(config.batch_capacities) if False in graph_modes else 0)
+                       + (len(config.speculative_shapes) if config.mtp else 0))
     graph_count += len(PATCH_CAPACITIES) if vision_state is not None else 0
     memory(f"after model state (continuation {pool.backing.nbytes >> 20} MiB, {state_rows} rows)")
     with phase(progress, "Construct graph catalog", total=graph_count) as stage:
@@ -474,7 +482,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 forward = PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion, frame, sequence)
                 add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
                 vision_owners.extend((vision_metadata, encoder, forward))
-        for enabled in serving_modes:
+        for enabled in graph_modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             mode_inputs = tuple(field for field in forward_inputs if enabled or field != "draft_page_tables")
             for kind, mode, capacities in prefill_modes(
@@ -514,7 +522,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 add(name, operation, "speculative", batch, width, forward_inputs, enabled=True)
 
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
-        for enabled in serving_modes:
+        for enabled in graph_modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             for capacity in config.batch_capacities:
                 name = f"resume{capacity}" + suffix

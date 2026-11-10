@@ -29,7 +29,7 @@ from ignition.preparation.collectives import (
     create_all_reduce_runtime,
     create_roce_runtime,
 )
-from ignition.components.capacity import speculative_token_capacity, batch_capacities, request_capacity
+from ignition.components.capacity import speculative_token_capacity, batch_capacities, request_capacity, serving_modes
 from ignition.components.sampling import AdmissionBuffers
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.capture import capture_forwards
@@ -108,8 +108,12 @@ class PreparationConfig:
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
     shard_hyperconnections: bool = False
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.mtp
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
 
         if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
@@ -205,7 +209,7 @@ class PreparationConfig:
 
         if not self.mixed_prefill:
             return ()
-        modes = (True, False) if self.mtp else (False,)
+        modes = serving_modes(self.mtp, self.mtp_only)
         return tuple((enabled, b, w, p) for enabled in modes
             for b, w, p in mixed_shapes(self.max_active, self.prefill_chunk_size,
                                         self.speculative_widths if enabled else (1,),
@@ -447,10 +451,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 buffers.update(speculation.buffers())
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
             runtime=collective, coordinator=coordinator)
-        serving_modes = (True, False) if config.mtp else (False,)
-        graph_count = (4 + len(serving_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
+        graph_modes = serving_modes(config.mtp, config.mtp_only)
+        graph_count = (4 + len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                                               + 4 * len(config.batch_capacities))
-                       + len(config.batch_capacities) + (len(config.speculative_shapes) if config.mtp else 0)
+                       + (len(config.batch_capacities) if False in graph_modes else 0)
+                       + (len(config.speculative_shapes) if config.mtp else 0)
                        + len(config.mixed_shapes))
         with phase(progress, "Construct graph catalog", total=graph_count) as stage:
             def add(name, function, kind, batch, tokens, fields, *, enabled=None, prefill_capacity=0):
@@ -478,7 +483,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 add(f"vision{capacity}", PreparedVisionGeneration(handoff, encoder), "vision", 1, capacity, vision_fields)
                 owners.extend((handoff, encoder))
 
-            for enabled in serving_modes:
+            for enabled in graph_modes:
                 suffix = "-no-mtp" if config.mtp and not enabled else ""
                 forward_fields = (*inputs.buffers(), "sampling_grammar_mask",
                                   *(("draft_page_tables",) if enabled and has_mtp else ()))
@@ -545,7 +550,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
 
             state_fields = tuple(f"state_{name}" for name in transfer.__dataclass_fields__ if name != "errors")
             admission_fields = tuple(admission.__dataclass_fields__)
-            for enabled in serving_modes:
+            for enabled in graph_modes:
                 suffix = "-no-mtp" if config.mtp and not enabled else ""
                 forward_fields = (*inputs.buffers(), "sampling_grammar_mask",
                                   *(("draft_page_tables",) if enabled and has_mtp else ()))

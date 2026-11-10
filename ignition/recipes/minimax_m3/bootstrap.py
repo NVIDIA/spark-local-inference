@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from ignition.components.capacity import (batch_capacities, prefill_capacities, request_capacity,
-    image_capacity, speculative_shapes, speculative_token_capacity)
+    image_capacity, speculative_shapes, speculative_token_capacity, serving_modes)
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
@@ -86,8 +86,12 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dspark
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if (not isinstance(self.devices, tuple) or len(self.devices) != 4
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 4)
@@ -293,9 +297,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     buffers["speculative_prefix_limits"] = torch.zeros(slots, dtype=torch.int32, device=device)
     forwards, signatures, metadata = {}, {}, {}
     prefills, batches = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
-    modes = (True, False) if config.dspark else (False,)
+    modes = serving_modes(config.dspark, config.mtp_only)
     patches = PATCH_CAPACITIES if config.vision else ()
-    count = (len(modes) * (len(prefills) + 4 * len(batches)) + len(batches) + len(patches)
+    count = (len(modes) * (len(prefills) + 4 * len(batches))
+             + (len(batches) if False in modes else 0) + len(patches)
              + (len(shapes) + len(packed_shapes) + (2 * len(batches) if draft_depth and not packed_shapes else 0)
                 if config.dspark else 0))
     selected = (None if config.diagnostic_graphs is None

@@ -20,6 +20,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.capacity import (
+    serving_modes,
     batch_capacities,
     prefill_capacities,
     request_capacity,
@@ -99,8 +100,12 @@ class PreparationConfig:
     speculative_token_capacity: int | None = None
     stream_overlap: bool = True
     expert_scale_compression: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.mtp
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
@@ -231,7 +236,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     prefills, batches = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
-    modes = (True, False) if config.mtp else (False,)
+    modes = serving_modes(config.mtp, config.mtp_only)
     with phase(progress, "Construct graph catalog"):
         def add(name, forward, kind, rows, tokens, fields, enabled=None):
             if kind == "scored_prefill":

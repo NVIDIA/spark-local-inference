@@ -117,8 +117,11 @@ class Speculation:
     markov_head_quantization: str | None = None
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and self.draft_tokens < 1:
+            raise ValueError("--mtp-only requires positive learned draft depth")
         if self.method not in (None, "mtp", "dflash2"):
             raise ValueError("speculative method must be omitted, mtp or dflash2")
         if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
@@ -245,11 +248,11 @@ class Recipe:
     markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
-        from ignition.components.capacity import mixed_shapes
+        from ignition.components.capacity import mixed_shapes, serving_modes
 
         if not self.mixed_prefill:
             return ()
-        modes = (True, False) if speculation is not None else (False,)
+        modes = serving_modes(speculation is not None, speculation is not None and speculation.mtp_only)
         return tuple((enabled, b, w, p) for enabled in modes
             for b, w, p in mixed_shapes(concurrency, chunk, speculation.widths if enabled else (1,),
                                         speculation.token_capacity if enabled else None))

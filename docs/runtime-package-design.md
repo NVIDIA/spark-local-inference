@@ -363,6 +363,10 @@ as `RebuildSpeculation.graph_budget`. Packed speculative preparation requires
 an explicit positive budget; rebuilding a catalog must use that recorded value
 rather than selecting a recipe default.
 
+`RebuildSpeculation.mtp_only` records whether preparation omitted MTP-disabled
+execution graphs. Its absent value is false. Graph selection uses the captured
+execution catalog; this preparation setting adds no runtime policy.
+
 Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
 `--all` includes the tensor catalogs. Absent manifests are reported as null.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
@@ -567,9 +571,10 @@ selection flags. Unspecified values retain package defaults. A concurrency limit
 of three requires the batch-four bucket. Zero drafts selects ordinary prefill,
 decode, mixed, resume, and prefix-cache operations. The optional
 `speculation_enabled` field selects complete serving modes for shared operations.
-Preparation includes ordinary programs and width-one speculative programs that
-preserve draft context. Selection removes unused variants before reading graph
-bodies; captured weights and storage remain shared. There are no standalone
+Preparation includes ordinary programs unless `--mtp-only` is selected. Width-one
+speculative programs preserve draft context in both catalogs. Selection removes
+unused variants before reading graph bodies; captured weights and storage remain
+shared. There are no standalone
 proposal or verification operations or separate packed-speculative operation.
 
 Unselected graph templates and executables are never reconstructed. Functions
