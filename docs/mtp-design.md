@@ -119,8 +119,12 @@ The shared native controller selects among the available counts. All ranks
 sample identical gathered distributions with identical device RNG state.
 History-copy proposals are not part of the GLM recipe.
 
-Target KDA layers retain one recurrent checkpoint per verification input.
-Commit selects the accepted checkpoint and convolution suffix. Indexed
+Rounds with drafts record each target KDA layer's per-token corrections without
+advancing the request's committed recurrent row. Commit replays the accepted
+records into that row and shifts the convolution history past the emitted
+tokens, so every round resumes from state column zero. Width one carries no
+drafts: its KDA layers decode the pending token in place through a one-column
+plan, and it performs no record replay or draft-tail restore. Indexed
 attention uses twelve-entry C4 tail rings so speculative writes preserve the
 preceding accepted tail. Prompt absorption and post-verification absorption
 write only the draft layer's latent KV and C4 state, using target feedback.
