@@ -22,11 +22,15 @@ pub struct Link {
 /// Per-source, per-destination links; non-neighbor entries are empty in a ring.
 /// A chain is a ring without the link between the first and last rank. A peer whose topology
 /// has no `chain` field reads a chain as direct mode and rejects it as missing links.
+/// `switch_only` records links planned over subnets every rank holds, ignoring direct cables; it is
+/// serialized only when set, so a topology without it keeps its earlier encoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Topology {
     pub ring: bool,
     #[serde(default)]
     pub chain: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub switch_only: bool,
     pub links: Vec<Vec<Vec<Link>>>,
 }
 
@@ -43,15 +47,19 @@ pub fn discover() -> Result<Vec<u8>, Failure> {
 impl Topology {
     #[cfg(test)]
     pub fn plan(records: &[Vec<u8>], ports: &[u16], ring: bool) -> Result<Self, Failure> {
-        Self::plan_shape(records, ports, ring, false)
+        Self::plan_shape(records, ports, ring, false, false)
     }
 
-    /// Plans direct, ring or chain links; at most one of `ring` and `chain` is set.
+    /// Plans direct, ring or chain links; at most one of `ring` and `chain` is set. Each edge uses
+    /// the devices the RDMA transport routes between the same two ranks, planned over every rank's
+    /// endpoints: a cabled partner over its cable, other peers over the switch, and with
+    /// `switch_only` every peer over subnets that every rank holds.
     pub fn plan_shape(
         records: &[Vec<u8>],
         ports: &[u16],
         ring: bool,
         chain: bool,
+        switch_only: bool,
     ) -> Result<Self, Failure> {
         if ring && chain {
             return Err("fabric transfers use a ring or a chain, not both".into());
@@ -74,13 +82,15 @@ impl Topology {
                 if chain && to != from + 1 {
                     continue;
                 }
-                let pair = vec![endpoints[from].clone(), endpoints[to].clone()];
                 // Count reachable rails per edge, rather than all devices on either host.
+                let policy = roce_fabric::Links::from_switch_only(switch_only);
                 let routes = (1..=roce_fabric::MAX_RAILS)
                     .rev()
-                    .find_map(|rails| roce_fabric::plan_routes(&pair, 0, rails).ok())
+                    .find_map(|rails| {
+                        roce_fabric::plan_link(&endpoints, from, to, rails, policy).ok()
+                    })
                     .ok_or_else(|| format!("no fabric link from rank {from} to rank {to}"))?;
-                for &(local, remote) in &routes[1] {
+                for &(local, remote) in &routes {
                     let address = |rank: usize, device: u32| -> Result<SocketAddrV4, Failure> {
                         let ip = endpoints[rank][device as usize]
                             .ipv4
@@ -100,7 +110,12 @@ impl Topology {
                 }
             }
         }
-        let topology = Self { ring, chain, links };
+        let topology = Self {
+            ring,
+            chain,
+            switch_only,
+            links,
+        };
         topology.validate()?;
         Ok(topology)
     }
@@ -227,6 +242,54 @@ mod tests {
         }
     }
 
+    /// Four Sparks on a switch (10.200.0.0/24, 10.200.1.0/24) whose second port is cabled to one
+    /// partner: ranks 1 and 2 over 10.200.2.0/24 and 10.200.3.0/24, ranks 0 and 3 over
+    /// 10.200.4.0/24 and 10.200.5.0/24, devices in discovery order.
+    fn switch_with_partner_cables() -> Vec<Vec<u8>> {
+        (0..4)
+            .map(|rank| {
+                let host = 11 + rank;
+                let direct = if rank == 1 || rank == 2 { 2 } else { 4 };
+                format!(
+                    "roceP2p1s0f0 10.200.0.{host}/24\nroceP2p1s0f1 10.200.{direct}.{host}/24\n\
+                     rocep1s0f0 10.200.1.{host}/24\nrocep1s0f1 10.200.{}.{host}/24\n",
+                    direct + 1
+                )
+                .into_bytes()
+            })
+            .collect()
+    }
+
+    fn third_octets(topology: &Topology, from: usize, to: usize) -> Vec<u8> {
+        topology.links[from][to]
+            .iter()
+            .map(|link| link.from.ip().octets()[2])
+            .collect()
+    }
+
+    #[test]
+    fn transfer_links_follow_the_partner_cable_or_the_switch_when_switch_only() {
+        let records = switch_with_partner_cables();
+        let topology = Topology::plan_shape(&records, &[29900; 4], false, false, false).unwrap();
+        // Each partner uses both cable functions, one on each PCIe root port; the rest use the switch.
+        assert_eq!(third_octets(&topology, 1, 2), [2, 3]);
+        assert_eq!(third_octets(&topology, 0, 3), [4, 5]);
+        assert_eq!(third_octets(&topology, 1, 0), [0, 1]);
+        assert_eq!(third_octets(&topology, 2, 3), [0, 1]);
+        assert!(!topology.switch_only);
+        let encoded = serde_json::to_string(&topology).unwrap();
+        assert!(!encoded.contains("switch_only"), "{encoded}");
+
+        let switched = Topology::plan_shape(&records, &[29900; 4], false, false, true).unwrap();
+        for (from, to) in [(1, 2), (0, 3), (1, 0), (2, 3)] {
+            assert_eq!(third_octets(&switched, from, to), [0, 1], "{from} to {to}");
+        }
+        let decoded: Topology =
+            serde_json::from_str(&serde_json::to_string(&switched).unwrap()).unwrap();
+        assert!(decoded.switch_only);
+        assert_eq!(decoded, switched);
+    }
+
     #[test]
     fn switched_peers_connect_directly_and_ring_peers_relay() {
         let records = (1..=4)
@@ -265,7 +328,7 @@ mod tests {
                 .map(|rank| format!("a 10.0.0.{rank}/24\n").into_bytes())
                 .collect::<Vec<_>>();
             let topology =
-                Topology::plan_shape(&records, &vec![29900; world], false, true).unwrap();
+                Topology::plan_shape(&records, &vec![29900; world], false, true, false).unwrap();
             assert_eq!(topology.links[0][world - 1].is_empty(), world > 2);
             for source in 0..world {
                 for destination in 0..world {
@@ -294,11 +357,11 @@ mod tests {
             "b 10.0.2.2/24\n",
         ]
         .map(|s| s.as_bytes().to_vec());
-        let topology = Topology::plan_shape(&records, &[29900; 4], false, true).unwrap();
+        let topology = Topology::plan_shape(&records, &[29900; 4], false, true, false).unwrap();
         assert_eq!(topology.path(3, 0).unwrap(), [3, 2, 1, 0]);
         assert!(topology.hop(0, 3, 0).is_err());
         assert!(Topology::plan(&records, &[29900; 4], true).is_err());
-        assert!(Topology::plan_shape(&records, &[29900; 4], true, true).is_err());
+        assert!(Topology::plan_shape(&records, &[29900; 4], true, true, false).is_err());
         let mut both = topology.clone();
         both.ring = true;
         assert!(both.validate().is_err());

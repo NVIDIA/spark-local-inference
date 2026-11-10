@@ -304,7 +304,7 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     }
     let ports = endpoints.iter().map(|e| e.port).collect::<Vec<_>>();
     let records = endpoints.into_iter().map(|e| e.record).collect::<Vec<_>>();
-    let topology = Topology::plan_shape(&records, &ports, config.ring, config.chain)?;
+    let topology = Topology::plan_shape(&records, &ports, config.ring, config.chain, false)?;
     network.set_nonblocking(true)?;
     local_listener.set_nonblocking(true)?;
     reply(serde_json::json!({"ready": true}))?;
@@ -467,7 +467,7 @@ mod tests {
                 .map(|s| s.local_addr().unwrap().port())
                 .collect::<Vec<_>>();
             let records = vec![b"a 127.0.0.1/8\n".to_vec(); world];
-            let topology = Topology::plan_shape(&records, &ports, ring, chain).unwrap();
+            let topology = Topology::plan_shape(&records, &ports, ring, chain, false).unwrap();
             let stopping = AtomicBool::new(false);
             let streams = 4;
             thread::scope(|scope| {
