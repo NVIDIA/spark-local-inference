@@ -89,13 +89,44 @@ def _rank(rank, world, rendezvous, snapshot, mode, capacity, layer_index, follow
                     scratch.mlp_output, output, scratch, following_state, metadata, mode=mode, runtime=runtime,
                     coordinator=coordinator, session=session, name=f"layer{layer_index + 1}", workspace=arena,
                     carry=scratch.mlp_hc)
+            layer.release_outputs(session=session)
+            if following is not None:
+                following.release_outputs(session=session)
+            def observe(operation, destination, index=None):
+                def run(*args, **kwargs):
+                    result = operation(*args, **kwargs)
+                    destination.copy_(result if index is None else result[index])
+                    return result
+                return run
+
+            for item in (layer, following):
+                if item is None:
+                    continue
+                item.attention_hc = observe(item.attention_hc, scratch.attention_hc.normalized, -1)
+                item.attention_reduce = observe(item.attention_reduce, scratch.attention_output)
+                item.mlp_hc = observe(item.mlp_hc, scratch.mlp_hc.normalized, -1)
+            if layer_index >= 3:
+                moe = layer.mlp
+                moe.router_projection = observe(moe.router_projection, scratch.mlp.router_logits)
+                routing = moe.routing
+                def observe_routes(logits):
+                    result = routing(logits)
+                    scratch.mlp.router.ids.copy_(result.ids)
+                    scratch.mlp.router.weights.copy_(result.weights)
+                    return result
+                moe.routing = observe_routes
+                if moe.concurrent_shared is None:
+                    moe.shared = observe(moe.shared, scratch.mlp.shared.output)
+                else:
+                    moe.concurrent_shared.finish = observe(moe.concurrent_shared.finish, scratch.mlp.shared.output)
             session.tune()
+            arena.release_preparation()
 
             def forward():
-                value = layer(source)
+                value, carry = layer(source, metadata)
                 if following is not None:
-                    following(value)
-                arena.tensor.fill_(255)
+                    value, _ = following(value, metadata, carry)
+                output.copy_(value)
 
             compiled = compile_forward(forward)
             compiled()

@@ -43,23 +43,35 @@ def _rotate(Values, Positions, Frequencies, ROW_STRIDE, HEAD_STRIDE, OFFSET, SIG
 class PreparedRotaryAngles:
     """Compute FP32 sine/cosine pairs once for consumers sharing token positions and frequencies."""
 
-    def __init__(self, positions, frequencies, *, buffers):
+    def __init__(self, positions, frequencies, *, buffers=None):
         self.positions, self.frequencies = positions, frequencies
-        self.values = buffers.zeros((positions.numel(), 32, 2), torch.float32)
+        self.values = (torch.zeros((positions.numel(), 32, 2), dtype=torch.float32, device=positions.device)
+                       if buffers is None else buffers.zeros((positions.numel(), 32, 2), torch.float32))
 
-    def __call__(self):
-        torch.library.wrap_triton(_angles)[(self.positions.numel(),)](
-            self.positions, self.frequencies, self.values)
+    def functional(self):
+        self.rows = self.positions.numel()
+        self.positions = self.values = None
+        return self
 
-    def apply(self, tensor, *, inverse=False):
-        if (tensor.ndim not in (2, 3) or tensor.shape[0] != self.values.shape[0]
+    def __call__(self, positions=None):
+        positions = self.positions if positions is None else positions
+        values = self.values
+        if values is None:
+            values = torch.empty((self.rows, 32, 2), dtype=torch.float32, device=positions.device)
+        torch.library.wrap_triton(_angles)[(positions.numel(),)](
+            positions, self.frequencies, values)
+        return values
+
+    def apply(self, tensor, values=None, *, inverse=False):
+        values = self.values if values is None else values
+        if (tensor.ndim not in (2, 3) or tensor.shape[0] != values.shape[0]
                 or tensor.stride(-1) != 1 or tensor.shape[-1] < 64):
             raise ValueError("shared rotary angles require matching rows and unit-column-stride heads")
         heads = tensor.shape[1] if tensor.ndim == 3 else 1
         torch.library.wrap_triton(_rotate)[(tensor.shape[0], heads)](
-            tensor, self.positions, self.frequencies, tensor.stride(0),
+            tensor, values, self.frequencies, tensor.stride(0),
             tensor.stride(1) if tensor.ndim == 3 else 0, tensor.shape[-1] - 64,
-            -1 if inverse else 1, self.values, True)
+            -1 if inverse else 1, values, True)
 
 
 @torch.library.custom_op("flare::cached_rotary", mutates_args=("q_out", "k_out"))
@@ -102,7 +114,8 @@ class CompressedRotary:
                 high = min(math.ceil(boundary(scaling["beta_slow"])), 63)
                 smooth = 1 - ((dims - low) / max(high - low, 1e-3)).clamp(0, 1)
                 frequencies = frequencies / scaling["factor"] * (1 - smooth) + frequencies * smooth
-            self.frequencies[compressed] = frequencies
+            from ignition.preparation.persistent import persistent_copy
+            self.frequencies[compressed] = persistent_copy(frequencies)
 
     def apply(self, tensor, positions, *, compressed, inverse=False):
         """Rotate the last 64 values of each row (and head) in place, in FP32."""

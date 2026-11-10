@@ -66,12 +66,12 @@ def test_prefill_context_tail_preserves_window_bytes_under_native_replay():
             counts = torch.zeros(1, device=device, dtype=torch.int32)
             operation = PreparedContext(weights, inputs, metadata, pool, session=session,
                 name=f"context{capacity}", workspace=arena, cache_format="deepseek_v4",
-                compact_prefill=capacity != 128)
+                compact_prefill=capacity != 128).functional()
             variants[capacity] = inputs, metadata, counts, operation
         session.tune()
         for capacity, (inputs, metadata, counts, operation) in variants.items():
-            def forward(inputs=inputs, counts=counts, operation=operation):
-                operation(inputs, counts)
+            def forward(inputs=inputs, counts=counts, operation=operation, metadata=metadata):
+                operation(inputs, counts, metadata)
 
             compiled = compile_forward(forward)
             compiled()
@@ -127,14 +127,9 @@ def test_prefill_context_tail_preserves_window_bytes_under_native_replay():
                     pool.backing.copy_(snapshot)
                     arena.tensor.fill_(0x5A)
                     inputs.copy_(reference_source)
-                    operation.prefill_positions.fill_(-999)
                     replay(capacity)
                     torch.testing.assert_close(pool.backing, expected, rtol=0, atol=0)
                     torch.testing.assert_close(inputs, reference_source, rtol=0, atol=0)
-                    torch.testing.assert_close(operation.prefill_positions, reference_metadata.positions, rtol=0, atol=0)
-                    expected_slots = row * 128 + reference_metadata.positions[:kept] % 128
-                    torch.testing.assert_close(operation.slots[:kept], expected_slots, rtol=0, atol=0)
-                    assert operation.slots[kept:].eq(-1).all()
         finally:
             worker.close()
             for graph in graphs.values():

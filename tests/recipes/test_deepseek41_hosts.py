@@ -105,8 +105,7 @@ def test_draft_factory_uses_its_bf16_channel_without_changing_target(monkeypatch
     target_runtime, draft_runtime = object(), object()
     calls = []
     monkeypatch.setattr(bootstrap, 'PreparedDraft', lambda *args, **kwargs: calls.append(kwargs) or object())
-    target, draft = bootstrap._forward_factories('bf16', window_staging=None,
-        suffix_scratch=None, vision=None, draft_vocabulary_runtime=draft_runtime)
+    target, draft = bootstrap._forward_factories('bf16', vision=None, draft_vocabulary_runtime=draft_runtime)
     draft(vocabulary_runtime=target_runtime)
     assert calls[0]['vocabulary_runtime'] is draft_runtime
     assert target.keywords['mla_compute_mode'] == calls[0]['mla_compute_mode'] == 'bf16'

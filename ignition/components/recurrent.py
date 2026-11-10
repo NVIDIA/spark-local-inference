@@ -143,3 +143,27 @@ def prepare_sequence_binding(
     return selected
 
 
+
+
+def run_short_conv(plan, *, scratch, x, conv_weight, query_start_loc, state_slot_ids,
+                   state_is_fresh, num_accepted_tokens, num_seqs, num_tokens,
+                   conv_state, out, request_is_prefill=None, conv_bias=None):
+    """Run a prepared short convolution with compiler-owned operand views."""
+    from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up
+    from b12x.preparation.types import require_prepared
+    from b12x.sequence.short_conv.api import _pipeline
+
+    state = require_prepared(plan, "sequence.short_conv", x.device)
+    query = state.query
+    ids_offset = align_up(query.max_seqs * query.channels * query.state_length * 2,
+                          SCRATCH_ALIGN_BYTES)
+    gathered_bytes = query.max_seqs * query.channels * query.state_length * 2
+    gathered_state = scratch[:gathered_bytes].view(torch.bfloat16).view(
+        query.max_seqs, query.channels, query.state_length)
+    request_ids = scratch[ids_offset:ids_offset + query.max_tokens * 4].view(torch.int32)
+    if request_is_prefill is None:
+        request_is_prefill = state_is_fresh
+    _pipeline(x, conv_weight, query_start_loc, state_slot_ids, state_is_fresh,
+              num_accepted_tokens, request_is_prefill, num_seqs, num_tokens,
+              conv_state, out, gathered_state, request_ids, conv_bias, plan.handle)
+    return out

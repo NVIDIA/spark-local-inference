@@ -14,7 +14,8 @@ from b12x.attention.dsa_indexer._glm_pool_kernels import _write_pool
 from b12x.preparation import PreparedCall
 
 from ignition.components.indexer import PreparedSparseIndexer
-from ignition.preparation.tuning import declare
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import declare, register_finalizer
 
 
 @triton.jit
@@ -52,8 +53,8 @@ class PreparedFP8Indexer:
     """
 
     def __init__(self, query, weights, cache, pages, lengths, active, output, *,
-                 mode, session, name, workspace, buffers, prefill_records_per_call=None, topk=512, scores=None,
-                 head_weight_scale=None, hadamard=True, key_power_of_two=True):
+                 mode, session, name, workspace, buffers=None, prefill_records_per_call=None, topk=512, scores=None,
+                 head_weight_scale=None, hadamard=True, key_power_of_two=True, examples=None, example_role=None):
         if type(hadamard) is not bool or type(key_power_of_two) is not bool:
             raise ValueError("FP8 Hadamard and key power-of-two declarations must be booleans")
         if head_weight_scale is not None and (type(head_weight_scale) not in (int, float)
@@ -67,21 +68,30 @@ class PreparedFP8Indexer:
         rows, heads, width = query.shape
         if width != 128 or query.dtype != torch.bfloat16 or cache.shape[1] != 64 * 132:
             raise ValueError("FP8 indexing requires BF16 128-channel queries and 64-record pages")
-        self.cache = cache
+        self.query, self.weights, self.cache = query, weights, cache
         self.hadamard, self.key_power_of_two = hadamard, key_power_of_two
-        self.quantized = buffers.zeros(query.shape, torch.float8_e4m3fn)
-        self.scales = buffers.zeros((rows, heads), torch.float32)
-        self.scaled_weights = buffers.zeros((rows, heads), torch.float32)
+        if examples is not None and (not isinstance(example_role, str) or not example_role):
+            raise ValueError("shared indexer declarations require an explicit operand role")
+
+        def zeros(role, shape, dtype):
+            if examples is not None:
+                return declaration_tensor(examples, example_role + "." + role, shape, dtype, query.device)
+            return (torch.zeros(shape, dtype=dtype, device=query.device) if buffers is None
+                    else buffers.zeros(shape, dtype))
+        self.quantized = zeros("quantized", query.shape, torch.float8_e4m3fn)
+        self.scales = zeros("scales", (rows, heads), torch.float32)
+        self.scaled_weights = zeros("scaled_weights", (rows, heads), torch.float32)
         self.weight_normalization = ((32 / heads) ** 0.5 if head_weight_scale is None
                                      else 32 ** 0.5 * head_weight_scale)
         self.query_outputs = (self.quantized.view(-1, 128), self.scales.view(-1),
                               self.scaled_weights.view(-1))
-        query_arguments = (query.view(-1, 128), *self.query_outputs)
-        self.query_plan = glm_pool.plan_queries(*query_arguments, hadamard=hadamard)
+        self.query_arguments = (query.view(-1, 128), *self.query_outputs)
+        self.query_plan = glm_pool.plan_queries(*self.query_arguments, hadamard=hadamard)
+        query_arguments = self.query_arguments
         declare(session, (self.query_plan.request(name=name + ".query",
             prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*query_arguments))),))
         self.pages = pages
-        self.packed_pages = pages if mode == "prefill" else buffers.zeros(pages.shape, torch.int32)
+        self.packed_pages = pages if mode == "prefill" else zeros("packed_pages", pages.shape, torch.int32)
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
             max_page_table_width=pages.shape[1], topk=topk, mode=mode,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)
@@ -94,10 +104,39 @@ class PreparedFP8Indexer:
         write_fp8_index_keys(keys, slots, self.cache,
                             hadamard=self.hadamard, power_of_two=self.key_power_of_two)
 
-    def __call__(self, query, weights):
+    def functional(self, *, session):
+        self.query_layout = tuple(self.query.shape)
+        self.copy_pages = self.packed_pages is not self.pages
+        self.selection.functional(session=session)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.query = self.weights = self.quantized = self.scales = self.scaled_weights = None
+        self.query_arguments = self.query_outputs = self.pages = self.packed_pages = None
+
+    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None):
+        output, _, _ = self._run(query, weights, pages, lengths, active)
+        return output
+
+    def _run(self, query=None, weights=None, pages=None, lengths=None, active=None):
+        if self.query is None:
+            rows, heads, _ = self.query_layout
+            quantized = torch.zeros(self.query_layout, dtype=torch.float8_e4m3fn, device=query.device)
+            scales = torch.zeros((rows, heads), dtype=torch.float32, device=query.device)
+            scaled_weights = torch.empty((rows, heads), dtype=torch.float32, device=query.device)
+            scaled_weights.copy_(weights)
+            scaled_weights.mul_(self.weight_normalization)
+            glm_pool.quantize_queries(query.view(-1, 128), quantized.view(-1, 128), scales.view(-1),
+                                      scaled_weights.view(-1), plan=self.query_plan)
+            output = self.selection(quantized, scaled_weights, pages.clone() if self.copy_pages else pages,
+                                    lengths, active)
+            return output, quantized, scaled_weights
+        query = self.query if query is None else query
+        weights = self.weights if weights is None else weights
         self.scaled_weights.copy_(weights)
         self.scaled_weights.mul_(self.weight_normalization)
         glm_pool.quantize_queries(query.view(-1, 128), *self.query_outputs, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)
-        return self.selection()
+        return self.selection(), self.quantized, self.scaled_weights

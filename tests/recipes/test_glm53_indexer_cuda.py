@@ -72,12 +72,17 @@ def test_glm_indexer_checkpoint_native_replay(model_weights, mode, rows):
             indexer = PreparedGlmIndexer(module, weights, source, query_residual, projected[:, 2048:2176],
                 projected[:, 2176:2208], scratch, state, metadata,
                 mode=mode, session=session, name="indexer", workspace=arena)
+            projection.functional(session=session)
+            indexer.functional(session=session)
             session.tune()
+            arena.release_preparation()
 
             def forward():
-                projection(source)
-                indexer()
-                arena.tensor.fill_(255)
+                projected = projection(source)
+                _, local = indexer.forward(source, query_residual, projected[:, 2048:2176],
+                    projected[:, 2176:2208], metadata)
+                for field in fields(scratch):
+                    getattr(scratch, field.name).copy_(getattr(local, field.name))
 
             compiled = compile_forward(forward)
             compiled()
@@ -127,7 +132,7 @@ def test_glm_indexer_checkpoint_native_replay(model_weights, mode, rows):
                 expected_indices, expected_lengths = scratch.physical.clone(), scratch.selected_lengths.clone()
                 state.cache.copy_(before_cache)
                 state.tail.copy_(before_tail)
-                # Core export zeroes index scratch; the graph must rebuild everything it reads there.
+                # Poison readbacks so every compared value must be written by replay.
                 for field in fields(scratch):
                     getattr(scratch, field.name).view(torch.uint8).zero_()
                 torch.cuda.synchronize(device)

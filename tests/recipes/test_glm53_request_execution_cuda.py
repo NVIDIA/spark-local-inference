@@ -52,7 +52,7 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
     for mode, capacity in (("prefill", 128), ("decode", 1)):
         metadata = DecoderMetadata.allocate(capacity, 1, 32, "cuda")
         batch = PreparedBatch(inputs, requests, metadata, mode=mode,
-            shard=TensorParallelShard(rank, 4), pages=64)
+            shard=TensorParallelShard(rank, 4), pages=torch.tensor([64], device="cuda"))
         arguments = (requests, inputs.row_slot_ids[:1], inputs.row_generations[:1],
                      inputs.live_rows, records, frame, sequence)
         if rank == 0:
@@ -63,9 +63,11 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
             completion = PreparedCompletion(*arguments)
         completion.prepare()
 
+        batch.functional()
         def forward(batch=batch, completion=completion):
-            batch.begin(batch.validate() * batch.shard.world_size)
-            batch.finish()
+            validation, present = batch.validate()
+            metadata = batch.begin(validation * batch.shard.world_size, present)
+            batch.finish(metadata)
             completion()
 
         operations[mode] = compile_forward(forward)

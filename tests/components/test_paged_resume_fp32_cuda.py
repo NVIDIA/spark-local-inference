@@ -13,7 +13,6 @@ from b12x.preparation import PreparationSession
 from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import DeviceRequestState, RequestAdmission
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool
 from tests.components.completion_support import completion_outputs
 
 pytestmark = pytest.mark.skipif(
@@ -77,11 +76,26 @@ def test_cached_resume_fp32_head_projection_and_capture(rows):
             session=session,
             name="resume-fp32",
             logits_dtype=torch.float32,
-            buffers=GraphBufferPool(device).cursor(),
         )
         assert operation.projection.projection.plan.query.output_dtype == "float32"
-        assert operation.completion.logits is operation.logits
-        assert operation.local_logits.dtype == operation.logits.dtype == torch.float32
+        assert operation.completion.logits is None and operation.logits is None
+        assert operation.local_logits is None
+        observed_logits = torch.empty((rows, vocab), dtype=torch.float32, device=device)
+        observed_local = torch.empty_like(observed_logits)
+        observed_hidden = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+        project = operation.projection
+        local_project = project.projection
+        def observe_local(source):
+            logits = local_project(source)
+            observed_local.copy_(logits)
+            return logits
+        project.projection = observe_local
+        def observe(hidden):
+            observed_hidden.copy_(hidden)
+            logits = project(hidden)
+            observed_logits.copy_(logits)
+            return logits
+        operation.projection = observe
         admit()
         call = compile_forward(operation)
         call()
@@ -99,8 +113,9 @@ def test_cached_resume_fp32_head_projection_and_capture(rows):
                 expected = torch.mm(
                     expected_hidden, weights.head.T, out_dtype=torch.float32
                 )
-                operation.logits.fill_(float("nan"))
-                operation.local_logits.fill_(float("nan"))
+                observed_logits.fill_(float("nan"))
+                observed_local.fill_(float("nan"))
+                observed_hidden.fill_(float("nan"))
                 before = torch.cuda.memory_stats()
                 graph.replay()
                 torch.cuda.synchronize()
@@ -113,15 +128,15 @@ def test_cached_resume_fp32_head_projection_and_capture(rows):
                 ):
                     assert before[key] == after[key]
                 torch.testing.assert_close(
-                    operation.logits, expected, rtol=2e-5, atol=2e-5
+                    observed_logits, expected, rtol=2e-5, atol=2e-5
                 )
                 torch.testing.assert_close(
-                    operation.logits, operation.local_logits, rtol=0, atol=0
+                    observed_logits, observed_local, rtol=0, atol=0
                 )
-                assert (operation.logits != operation.logits.bfloat16().float()).any()
+                assert (observed_logits != observed_logits.bfloat16().float()).any()
                 assert requests.consumed_tokens.eq(3).all()
                 torch.testing.assert_close(
-                    operation.state.hidden, expected_hidden, rtol=0, atol=0
+                    observed_hidden, expected_hidden, rtol=0, atol=0
                 )
         finally:
             graph.reset()

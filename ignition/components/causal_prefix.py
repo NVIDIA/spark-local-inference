@@ -96,5 +96,13 @@ class PreparedCausalPrefixAllocation:
                      confidence.stride(0), confidence.stride(1), batch, depth, token_capacity,
                      request_capacity, triton.next_power_of_2(batch))
 
-    def __call__(self):
-        torch.library.wrap_triton(_allocate)[(1,)](*self.args, num_warps=4, enable_fp_fusion=False)
+    def functional(self):
+        self.geometry = self.args[7:]
+        self.args = None
+        return self
+
+    def __call__(self, confidence, slots, submitted, source_valid, prefix_limits, output_lengths):
+        valid = torch.empty_like(submitted)
+        torch.library.wrap_triton(_allocate)[(1,)](confidence, slots, submitted, source_valid,
+            prefix_limits, output_lengths, valid, *self.geometry, num_warps=4, enable_fp_fusion=False)
+        return valid

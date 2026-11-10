@@ -12,6 +12,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.tensor_fp8 import TensorFP8Weight
 from ignition.components.weights import DirectWeightLoader, _aligned_range
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros, allocated_tensor_bytes
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 from .config import DraftConfig, ModelConfig
@@ -163,7 +164,7 @@ class ModelWeights:
         config.validate_shard(shard)
         prefix = config.text_prefix
         v0, v1, local_vocab = config.vocabulary_partition(shard)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with Gemma4WeightLoader(manifest, device, config=config, shard=shard, progress=progress) as loader:
             embedding, norm = loader.load_tensors((f"{prefix}.embed_tokens.weight", f"{prefix}.norm.weight"))
             if embedding.dtype != torch.bfloat16 or embedding.shape != (config.vocabulary, config.hidden):
@@ -175,7 +176,7 @@ class ModelWeights:
             elif shard.world_size == 1:
                 head = embedding
             else:
-                head = embedding[v0:v1].clone()
+                head = persistent_copy(embedding[v0:v1])
                 record_numeric_tensor(head)
             if _linear_shape(head) != (local_vocab, config.hidden):
                 raise ValueError("Gemma 4 vocabulary projection shape differs from the model")
@@ -192,7 +193,7 @@ class ModelWeights:
             norm=norm,
             head=head,
             layers=layers,
-            allocated_bytes=torch.cuda.memory_allocated(device) - before,
+            allocated_bytes=allocated_tensor_bytes(device) - before,
             ple=ple,
             shard=shard,
             draft=draft,
@@ -231,7 +232,8 @@ class Gemma4WeightLoader(DirectWeightLoader):
         self._copy(raw_w, source[r0:r1, c0:c1])
         self._copy(raw_s, scale[r0:r1, :])
         self._session.flush()
-        dequantized = (raw_w.float() * raw_s.float()).to(torch.bfloat16).contiguous()
+        dequantized = persistent_empty(raw_w.shape, dtype=torch.bfloat16, device=self.device)
+        dequantized.copy_(raw_w.float() * raw_s.float())
         record_numeric_tensor(dequantized)
         return dequantized
 
@@ -257,10 +259,10 @@ class Gemma4WeightLoader(DirectWeightLoader):
         c0, c1 = _aligned_range(columns, k, 16)
         logical_k = c1 - c0
         stored_k = (logical_k + 127) // 128 * 128
-        values = torch.zeros((r1 - r0, stored_k // 2), dtype=torch.uint8, device=self.device)
+        values = persistent_zeros((r1 - r0, stored_k // 2), dtype=torch.uint8, device=self.device)
         scales = torch.zeros((r1 - r0, stored_k // 16), dtype=torch.float8_e4m3fn, device=self.device)
         raw_gain = torch.empty(w_global.shape, dtype=torch.float32, device=self.device)
-        activation_scale = torch.empty(in_global.shape, dtype=torch.float32, device=self.device)
+        activation_scale = persistent_empty(in_global.shape, dtype=torch.float32, device=self.device)
         self._copy(values[:, : logical_k // 2], source[r0:r1, c0 // 2 : c1 // 2])
         self._copy(scales[:, : logical_k // 16], scale[r0:r1, c0 // 16 : c1 // 16])
         self._copy(raw_gain, w_global)
@@ -270,16 +272,18 @@ class Gemma4WeightLoader(DirectWeightLoader):
             raise ValueError(f"{prefix}.weight_global_scale must be a positive finite FP32 scalar")
         if not bool((torch.isfinite(activation_scale) & (activation_scale > 0)).all()):
             raise ValueError(f"{prefix}.input_global_scale must be a positive finite FP32 scalar")
-        gain = raw_gain.reciprocal()
+        gain = persistent_empty(raw_gain.shape, dtype=raw_gain.dtype, device=self.device)
+        torch.reciprocal(raw_gain, out=gain)
         record_numeric_tensor(gain)
         record_numeric_tensor(activation_scale)
         weight = pack_weight(
             values,
-            swizzle_block_scale(scales),
+            swizzle_block_scale(scales, allocate=persistent_empty),
             recipe="nvfp4",
             global_scale=gain,
             global_scale_kind="multiplier",
             activation_global_scale=activation_scale,
+            allocate=persistent_empty,
         )
         return replace(weight, in_features=logical_k)
 
@@ -327,7 +331,8 @@ class Gemma4WeightLoader(DirectWeightLoader):
             self._copy(raw_packed, packed_source)
             self._copy(raw_scale, scale_source)
             self._session.flush()
-            embedding = raw_packed.view(torch.uint8).to(torch.bfloat16)
+            embedding = persistent_empty((c.ple_vocabulary, total_ple), dtype=torch.bfloat16, device=self.device)
+            embedding.copy_(raw_packed.view(torch.uint8))
             del raw_packed
             embedding.sub_(128.0).mul_(raw_scale.to(torch.bfloat16))
             del raw_scale
@@ -448,15 +453,18 @@ class Gemma4WeightLoader(DirectWeightLoader):
         return layer
 
     def _load_experts(self, prefix: str) -> BF16ExpertsWeight | NVFP4ExpertsWeight:
+        self._require_open()
         c = self.config
         experts, inter, hidden = c.num_experts, c.moe_intermediate_size, c.hidden
         r0, r1 = c.moe_intermediate_range(self.shard)
         local_inter = r1 - r0
         fused_key = f"{prefix}.experts.gate_up_proj"
         if fused_key in self.manifest.tensors:
-            gate = self.load_tensor(fused_key, extent=(slice(None), slice(r0, r1), slice(None)))
-            up = self.load_tensor(fused_key, extent=(slice(None), slice(inter + r0, inter + r1), slice(None)))
-            down = self.load_tensor(f"{prefix}.experts.down_proj", extent=(slice(None), slice(None), slice(r0, r1)))
+            source = self._sources[fused_key]
+            down_source = self._sources[f"{prefix}.experts.down_proj"]
+            gate = source[:, r0:r1]
+            up = source[:, inter + r0:inter + r1]
+            down = down_source[:, :, r0:r1]
             if (
                 gate.dtype != torch.bfloat16
                 or up.dtype != torch.bfloat16
@@ -466,23 +474,39 @@ class Gemma4WeightLoader(DirectWeightLoader):
                 or down.shape != (experts, hidden, local_inter)
             ):
                 raise ValueError(f"{prefix}.experts: BF16 expert tensor geometry differs from configuration")
-            return BF16ExpertsWeight(gate_up_proj=torch.cat((gate, up), dim=1).contiguous(), down_proj=down.contiguous())
+            gate_up = persistent_empty((experts, 2 * local_inter, hidden),
+                                       dtype=torch.bfloat16, device=self.device)
+            down_proj = persistent_empty(down.shape, dtype=down.dtype, device=self.device)
+            self._copy(gate_up[:, :local_inter], gate)
+            self._copy(gate_up[:, local_inter:], up)
+            self._copy(down_proj, down)
+            self._session.flush()
+            record_numeric_tensor(gate_up)
+            record_numeric_tensor(down_proj)
+            return BF16ExpertsWeight(gate_up_proj=gate_up, down_proj=down_proj)
 
         first_base = f"{prefix}.experts.0.gate_proj"
         compressed = self.config.quantization.get(first_base, {}).get("quant_algo") == "COMPRESSED_NVFP4"
         w_suffix = "weight_packed" if compressed else "weight"
         g_suffix = "weight_global_scale" if compressed else "weight_scale_2"
 
-        gate_w, up_w, down_w = [], [], []
-        gate_s, up_s, down_s = [], [], []
-        gate_g, up_g, down_g = [], [], []
+        gate_up_weight = persistent_empty((experts, 2 * local_inter, hidden // 2),
+                                          dtype=torch.uint8, device=self.device)
+        gate_up_scale = persistent_empty((experts, 2 * local_inter, hidden // 16),
+                                         dtype=torch.float8_e4m3fn, device=self.device)
+        gate_up_scale_2 = persistent_empty((experts, 2), dtype=torch.float32, device=self.device)
+        down_weight = persistent_empty((experts, hidden, local_inter // 2),
+                                       dtype=torch.uint8, device=self.device)
+        down_scale = persistent_empty((experts, hidden, local_inter // 16),
+                                      dtype=torch.float8_e4m3fn, device=self.device)
+        down_scale_2 = persistent_empty((experts,), dtype=torch.float32, device=self.device)
         for expert in range(experts):
-            for proj, w_list, s_list, g_list, out_dim, in_dim, w_ext, s_ext in (
+            for proj, w_out, s_out, g_out, out_dim, in_dim, w_ext, s_ext in (
                 (
                     "gate_proj",
-                    gate_w,
-                    gate_s,
-                    gate_g,
+                    gate_up_weight[expert, :local_inter],
+                    gate_up_scale[expert, :local_inter],
+                    gate_up_scale_2[expert, :1],
                     local_inter,
                     hidden,
                     (slice(r0, r1), slice(None)),
@@ -490,9 +514,9 @@ class Gemma4WeightLoader(DirectWeightLoader):
                 ),
                 (
                     "up_proj",
-                    up_w,
-                    up_s,
-                    up_g,
+                    gate_up_weight[expert, local_inter:],
+                    gate_up_scale[expert, local_inter:],
+                    gate_up_scale_2[expert, 1:],
                     local_inter,
                     hidden,
                     (slice(r0, r1), slice(None)),
@@ -500,9 +524,9 @@ class Gemma4WeightLoader(DirectWeightLoader):
                 ),
                 (
                     "down_proj",
-                    down_w,
-                    down_s,
-                    down_g,
+                    down_weight[expert],
+                    down_scale[expert],
+                    down_scale_2[expert:expert + 1],
                     hidden,
                     local_inter,
                     (slice(None), slice(r0 // 2, r1 // 2)),
@@ -510,9 +534,9 @@ class Gemma4WeightLoader(DirectWeightLoader):
                 ),
             ):
                 base = f"{prefix}.experts.{expert}.{proj}"
-                w = self.load_tensor(f"{base}.{w_suffix}", extent=w_ext)
-                s = self.load_tensor(f"{base}.weight_scale", extent=s_ext)
-                g = self.load_tensor(f"{base}.{g_suffix}")
+                w = self._sources[f"{base}.{w_suffix}"][w_ext]
+                s = self._sources[f"{base}.weight_scale"][s_ext]
+                g = self._sources[f"{base}.{g_suffix}"]
                 if (
                     w.dtype != torch.uint8
                     or w.shape != (out_dim, in_dim // 2)
@@ -522,18 +546,16 @@ class Gemma4WeightLoader(DirectWeightLoader):
                     or g.numel() != 1
                 ):
                     raise ValueError(f"{base}: NVFP4 expert tensor geometry differs from configuration")
-                if compressed:
-                    g = g.reciprocal()
-                    record_numeric_tensor(g)
-                w_list.append(w)
-                s_list.append(s)
-                g_list.append(g.reshape(1))
-        gate_up_weight = torch.cat((torch.stack(gate_w, dim=0), torch.stack(up_w, dim=0)), dim=1).contiguous()
-        gate_up_scale = torch.cat((torch.stack(gate_s, dim=0), torch.stack(up_s, dim=0)), dim=1).contiguous()
-        gate_up_scale_2 = torch.stack((torch.cat(gate_g, dim=0), torch.cat(up_g, dim=0)), dim=1).contiguous()
-        down_weight = torch.stack(down_w, dim=0).contiguous()
-        down_scale = torch.stack(down_s, dim=0).contiguous()
-        down_scale_2 = torch.cat(down_g, dim=0).contiguous()
+                self._copy(w_out, w)
+                self._copy(s_out, s)
+                self._copy(g_out, g.reshape(1))
+        self._session.flush()
+        if compressed:
+            gate_up_scale_2.reciprocal_()
+            down_scale_2.reciprocal_()
+        for tensor in (gate_up_weight, gate_up_scale, gate_up_scale_2,
+                       down_weight, down_scale, down_scale_2):
+            record_numeric_tensor(tensor)
         return NVFP4ExpertsWeight(
             gate_up_weight=gate_up_weight,
             gate_up_scale=gate_up_scale,

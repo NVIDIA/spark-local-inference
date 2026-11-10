@@ -19,13 +19,14 @@ from ignition.components.paged_schedule import PreparedPagedSchedules
 from ignition.components.rms_norm import PreparedIndexedRMSNorm, PreparedRMSNorm
 from ignition.components.state import save_hidden
 from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.preparation.persistent import persistent_copy
 
 
 def projection(source, weight, output, *, session, name, workspace):
     if isinstance(weight, torch.Tensor):
-        return UnquantizedProjection(source, weight, output, session=session, name=name)
+        return UnquantizedProjection(source, weight, output, session=session, name=name).functional(session=session)
     return QuantizedProjection(source, weight, output, session=session, name=name,
-                               workspace=workspace, activation_mode="auto")
+                               workspace=workspace, activation_mode="auto").functional(session=session)
 
 
 @dataclass(frozen=True)
@@ -38,16 +39,18 @@ class AttentionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, buffers):
+    def allocate(cls, config, shard, tokens, *, device):
         c = config.text
         heads, kv = c["num_attention_heads"] // shard.world_size, c["num_key_value_heads"] // shard.world_size
         dim = c["head_dim"]
-        return cls(buffers.zeros((tokens, (heads + 3 * kv + 1) * dim), torch.bfloat16),
-            buffers.zeros((tokens, heads, dim), torch.bfloat16),
-            buffers.zeros((tokens, kv, dim), torch.float8_e4m3fn),
-            buffers.zeros((kv, tokens, c["sparse_attention_config"]["sparse_topk_blocks"]), torch.int32),
-            buffers.zeros((tokens, heads * dim), torch.bfloat16),
-            buffers.zeros((tokens, config.hidden), torch.bfloat16))
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=device)
+        return cls(zeros((tokens, (heads + 3 * kv + 1) * dim), torch.bfloat16),
+            zeros((tokens, heads, dim), torch.bfloat16),
+            zeros((tokens, kv, dim), torch.float8_e4m3fn),
+            zeros((kv, tokens, c["sparse_attention_config"]["sparse_topk_blocks"]), torch.int32),
+            zeros((tokens, heads * dim), torch.bfloat16),
+            zeros((tokens, config.hidden), torch.bfloat16))
 
     def rows(self, tokens):
         return type(self)(self.projected[:tokens], self.query[:tokens], self.index_query[:tokens],
@@ -75,26 +78,24 @@ class Scratch:
     logits: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, samples, device, *, buffers):
+    def allocate(cls, config, shard, tokens, samples, device):
         c = config.text
-        def zeros(rows, columns, dtype=torch.bfloat16, *, cursor=buffers):
-            return cursor.zeros((rows, columns), dtype)
+        def zeros(rows, columns, dtype=torch.bfloat16):
+            return torch.zeros((rows, columns), dtype=dtype, device=device)
         embedding = zeros(tokens, config.hidden)
         local_embedding = zeros(tokens, config.hidden // shard.world_size)
         normalized, residual, reduced, partial = (zeros(tokens, config.hidden) for _ in range(4))
-        attention_stage, dense_stage, routed_stage = (buffers.fork() for _ in range(3))
-        attention = AttentionScratch.allocate(config, shard, tokens, attention_stage)
+        attention = AttentionScratch.allocate(config, shard, tokens, device=device)
         dense = MLPScratch.allocate(tokens, config.hidden, c["dense_intermediate_size"] // shard.world_size,
-                                    device, buffers=dense_stage)
+                                    device)
         shared = MLPScratch.allocate(tokens, config.hidden, c["shared_intermediate_size"] // shard.world_size,
-                                     device, buffers=routed_stage)
-        router_logits = zeros(tokens, c["num_local_experts"], torch.float32, cursor=routed_stage)
+                                     device)
+        router_logits = zeros(tokens, c["num_local_experts"], torch.float32)
         router = RouterScratch.allocate(tokens, device, experts=c["num_local_experts"],
-            top_k=c["num_experts_per_tok"], buffers=routed_stage)
-        experts = zeros(tokens, config.hidden, cursor=routed_stage)
-        expert_routes = routed_stage.zeros((tokens, c["num_experts_per_tok"], config.hidden), torch.bfloat16)
-        buffers.join(attention_stage, dense_stage, routed_stage)
-        auxiliary = buffers.zeros((tokens, len(config.target_layers), config.hidden), torch.bfloat16)
+            top_k=c["num_experts_per_tok"])
+        experts = zeros(tokens, config.hidden)
+        expert_routes = torch.zeros((tokens, c["num_experts_per_tok"], config.hidden), dtype=torch.bfloat16, device=device)
+        auxiliary = (torch.zeros((tokens, len(config.target_layers), config.hidden), dtype=torch.bfloat16, device=device))
         width = config.vocabulary_partition(shard)[2]
         return cls(embedding, local_embedding, normalized, residual, reduced, partial, attention, dense, shared,
                    router_logits, router, experts, expert_routes, auxiliary, zeros(samples, config.hidden),
@@ -116,25 +117,26 @@ class PreparedAttention:
         self.pack = PreparedPackedAttention(scratch.projected, weights.q_norm, weights.k_norm,
             weights.index_q_norm, weights.index_k_norm, inverse_frequency, metadata,
             scratch.query, scratch.index_query, key, value, index,
-            epsilon=config.text["rms_norm_eps"], session=session, name=name + ".norm_rope_write")
+            epsilon=config.text["rms_norm_eps"], session=session, name=name + ".norm_rope_write").functional(session=session)
         self.indexer = PreparedMSAIndexer(scratch.index_query, index, metadata.page_table, self.lengths,
             metadata.query_start_loc, metadata.positions, scratch.selected,
             session=session, workspace=workspace, name=name + ".indexer",
-            max_q_per_request=metadata.max_query_tokens)
+            max_q_per_request=metadata.max_query_tokens).functional(session=session)
         self.attention = PreparedPagedAttention(scratch.query, key, value, metadata.page_table,
             self.lengths, metadata.query_start_loc, scratch.attended.view_as(scratch.query),
             selected_blocks=scratch.selected, mode=mode, tuning_page_count=int(pool.memory_capacity[1].item()),
             width=metadata.max_query_tokens if mode == "verify" else 1,
-            session=session, workspace=workspace, name=name + ".attention", schedules=schedules)
+            session=session, workspace=workspace, name=name + ".attention", schedules=schedules).functional(session=session, cache_seqlens=None, page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None)
         self.output = projection(scratch.attended, weights.output, scratch.output, session=session,
                                  name=name + ".output", workspace=workspace)
 
-    def __call__(self, source):
-        self.input(source)
-        self.pack()
-        self.indexer()
-        self.attention()
-        return self.output(self.scratch.attended)
+    def __call__(self, source, *, metadata, lengths, schedule_storage):
+        projected = self.input(source)
+        query, index_query = self.pack(projected, metadata)
+        selected = self.indexer(index_query, metadata.page_table, lengths, metadata.query_start_loc, metadata.positions)
+        attended = self.attention(query, page_table=metadata.page_table, cache_seqlens=lengths,
+            cu_seqlens_q=metadata.query_start_loc, selected_blocks=selected, schedule_storage=schedule_storage)
+        return self.output(attended.flatten(1))
 
 
 class PreparedFeedForward:
@@ -150,7 +152,7 @@ class PreparedFeedForward:
         self.experts = self.concurrent = None
         if routed:
             self.router_projection = UnquantizedProjection(source, weights.router, scratch.router_logits,
-                session=session, name=name + ".router")
+                session=session, name=name + ".router").functional(session=session)
             self.router = PreparedRouter(scratch.router_logits, scratch.router, session=session, name=name + ".route",
                 score_func="sigmoid", renormalize=True, routed_scaling_factor=c["routed_scaling_factor"],
                 correction_bias=weights.correction, num_valid_tokens=metadata.live_counts[:1])
@@ -160,19 +162,27 @@ class PreparedFeedForward:
                 self.concurrent = ConcurrentSharedExpert(self.mlp,
                     parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                     session=session, workspace=workspace)
+        self.partial_dtype = scratch.partial.dtype
+        self.output_source = None if self.experts is None else self.experts.output_source
+        if self.concurrent is not None:
+            self.concurrent.functional(session=session)
+        if self.experts is not None:
+            self.experts.functional(session=session)
+            self.router.functional(session=session)
+        self.mlp.functional(session=session)
 
-    def __call__(self, source, *, combine_output=True):
+    def __call__(self, source, *, metadata, combine_output=True):
         if self.experts is None:
             return self.mlp(source)
-        if self.concurrent is not None:
-            self.concurrent.start(source)
-        self.experts.route(self.router_projection(source))
-        routed = self.experts()
-        shared = self.mlp(source) if self.concurrent is None else self.concurrent.finish(source, routed)
+        pending = None if self.concurrent is None else self.concurrent.start(source)
+        logits = self.router_projection(source)
+        routes = self.experts.route(logits, num_valid_tokens=metadata.live_counts[:1])
+        routed = self.experts(source, routes.ids, routes.weights, router_logits=logits,
+                              selected_logits=routes.selected_logits, num_valid_tokens=metadata.live_counts[:1])
+        shared = self.mlp(source) if self.concurrent is None else self.concurrent.finish(pending, routed)
         if not combine_output:
-            return routed
-        self.scratch.partial.copy_(routed.float() + shared.float())
-        return self.scratch.partial
+            return routed, shared
+        return (routed.float() + shared.float()).to(self.partial_dtype)
 
 
 class PreparedDecoderLayer:
@@ -183,7 +193,7 @@ class PreparedDecoderLayer:
         self.attention, self.feed_forward, self.scratch = attention, feed_forward, scratch
         self.input_norm = None if fused and not first else PreparedRMSNorm(
             scratch.residual, weights.input_norm, scratch.normalized, eps=epsilon, session=session,
-            name=name + ".input_norm", zero_centered=True, residual=None if first else scratch.reduced)
+            name=name + ".input_norm", zero_centered=True, residual=None if first else scratch.reduced).functional()
         self.attention_reduce = None
         self.output_norm = None
         self.feed_forward_reduce = None
@@ -193,50 +203,52 @@ class PreparedDecoderLayer:
             self.post_norm = PreparedAllReduceRMSNorm(scratch.attention.output, scratch.residual,
                 weights.post_attention_norm, scratch.normalized, eps=epsilon, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".attention_norm",
-                zero_centered=True, reduction_dtype=torch.bfloat16)
+                zero_centered=True, reduction_dtype=torch.bfloat16).functional(session=session)
             if next_norm is not None:
-                output = scratch.dense.output if weights.experts is None else feed_forward.experts.output_source
+                output = scratch.dense.output if weights.experts is None else feed_forward.output_source
                 input_addend = None if weights.experts is None else scratch.shared.output
                 self.output_norm = PreparedAllReduceRMSNorm(output, scratch.residual, next_norm,
                     scratch.normalized, eps=epsilon, runtime=runtime, coordinator=coordinator,
                     session=session, name=name + ".feed_forward_norm", zero_centered=True,
-                    reduction_dtype=torch.bfloat16, input_addend=input_addend)
+                    reduction_dtype=torch.bfloat16, input_addend=input_addend).functional(session=session)
             else:
-                output = scratch.dense.output if weights.experts is None else feed_forward.experts.output_source
+                output = scratch.dense.output if weights.experts is None else feed_forward.output_source
                 self.final_reduce = PreparedAllReduceAdd(output, scratch.residual, runtime=runtime,
                     coordinator=coordinator, session=session, name=name + ".feed_forward_residual",
                     reduction_dtype=torch.bfloat16,
-                    input_addend=None if weights.experts is None else scratch.shared.output)
+                    input_addend=None if weights.experts is None else scratch.shared.output).functional(session=session)
         else:
             self.attention_reduce = PreparedAllReduce(scratch.attention.output, scratch.reduced, runtime=runtime,
-                coordinator=coordinator, session=session, name=name + ".attention_reduce")
+                coordinator=coordinator, session=session, name=name + ".attention_reduce").functional(session=session)
             self.post_norm = PreparedRMSNorm(scratch.residual, weights.post_attention_norm, scratch.normalized,
                 residual=scratch.reduced, eps=epsilon, zero_centered=True, session=session,
-                name=name + ".attention_norm")
+                name=name + ".attention_norm").functional()
         if self.output_norm is None and self.final_reduce is None:
             output = scratch.dense.output if weights.experts is None else scratch.partial
             self.feed_forward_reduce = PreparedAllReduce(output, scratch.reduced, runtime=runtime,
-                coordinator=coordinator, session=session, name=name + ".feed_forward_reduce")
+                coordinator=coordinator, session=session, name=name + ".feed_forward_reduce").functional(session=session)
 
-    def normalize(self, update):
-        if self.input_norm is None:
-            return self.scratch.normalized
-        return self.input_norm(self.scratch.residual, update)
+    def normalize(self, residual, update, normalized):
+        return normalized if self.input_norm is None else self.input_norm(residual, update)
 
-    def __call__(self, normalized):
-        attended = self.attention(normalized)
+    def __call__(self, normalized, residual, *, metadata, lengths, schedule_storage):
+        attended = self.attention(normalized, metadata=metadata, lengths=lengths, schedule_storage=schedule_storage)
         if self.attention_reduce is not None:
-            self.attention_reduce(attended)
-        normalized = (self.post_norm(attended, self.scratch.residual) if self.fused
-                      else self.post_norm(self.scratch.residual, self.scratch.reduced))
-        output = self.feed_forward(normalized, combine_output=self.output_norm is None and self.final_reduce is None)
+            attended = self.attention_reduce(attended)
+        normalized = (self.post_norm(attended, residual) if self.fused else self.post_norm(residual, attended))
+        fused = self.output_norm is not None or self.final_reduce is not None
+        output = self.feed_forward(normalized, metadata=metadata, combine_output=not fused)
+        routed, shared = output if isinstance(output, tuple) else (output, None)
+        groups = {}
+        if isinstance(routed, WeightedGroupSource):
+            groups = dict(group_weights=routed.weights, group_ids=routed.ids)
+            routed = routed.values
         if self.output_norm is not None:
-            self.output_norm(output, self.scratch.residual)
-            return None
+            return self.output_norm(routed, residual, input_addend=shared, **groups), None
         if self.final_reduce is not None:
-            self.final_reduce(output, self.scratch.residual)
-            return None
-        return self.feed_forward_reduce(output)
+            self.final_reduce(routed, residual, input_addend=shared, **groups)
+            return None, None
+        return None, self.feed_forward_reduce(output)
 
 
 class _Norm(torch.nn.Module):
@@ -254,7 +266,7 @@ class _Attention(torch.nn.Module):
         self.operation, self.reduction = operation, reduction
 
     def forward(self, hidden_states, **kwargs):
-        return self.reduction(self.operation(hidden_states)), None
+        return self.reduction(self.operation(hidden_states, **kwargs)), None
 
 
 class _FeedForward(torch.nn.Module):
@@ -267,7 +279,7 @@ class _FeedForward(torch.nn.Module):
 
 
 class CanonicalPreparedLayer:
-    """Retain the Transformers layer forward with instance-local prepared operators."""
+    """Canonical M3 residual arithmetic with explicit per-call attention metadata."""
 
     def __init__(self, index, attention, feed_forward, weights, config, scratch, *, runtime,
                  coordinator, session, name):
@@ -278,38 +290,43 @@ class CanonicalPreparedLayer:
         self.attention = attention
         self.module.input_layernorm = _Norm(PreparedRMSNorm(scratch.residual, weights.input_norm,
             scratch.normalized, eps=config.text["rms_norm_eps"], zero_centered=True,
-            session=session, name=name + ".input_norm"))
+            session=session, name=name + ".input_norm").functional())
         self.module.post_attention_layernorm = _Norm(PreparedRMSNorm(scratch.residual,
             weights.post_attention_norm, scratch.normalized, eps=config.text["rms_norm_eps"],
-            zero_centered=True, session=session, name=name + ".post_attention_norm"))
+            zero_centered=True, session=session, name=name + ".post_attention_norm").functional())
         attention_reduction = PreparedAllReduce(scratch.attention.output, scratch.reduced, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".attention_reduce")
+            coordinator=coordinator, session=session, name=name + ".attention_reduce").functional(session=session)
         output = scratch.dense.output if weights.experts is None else scratch.partial
         ffn_reduction = PreparedAllReduce(output, scratch.reduced, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".feed_forward_reduce")
+            coordinator=coordinator, session=session, name=name + ".feed_forward_reduce").functional(session=session)
         self.module.self_attn = _Attention(attention, attention_reduction)
         self.module.mlp = _FeedForward(feed_forward, ffn_reduction)
         self.module.eval().requires_grad_(False)
 
-    def __call__(self, hidden):
-        return self.module(hidden)
+    def __call__(self, hidden, *, metadata, lengths, schedule_storage):
+        normalized = self.module.input_layernorm(hidden)
+        attended, _ = self.module.self_attn(normalized, metadata=metadata, lengths=lengths, schedule_storage=schedule_storage)
+        hidden = hidden + attended
+        normalized = self.module.post_attention_layernorm(hidden)
+        projected = self.module.mlp.operation(normalized, metadata=metadata)
+        return hidden + self.module.mlp.reduction(projected)
 
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, embedding_runtime,
-                 vocabulary_runtime, coordinator, session, name, workspace, overlap=True, buffers, vision=None):
+                 vocabulary_runtime, coordinator, session, name, workspace, overlap=True, vision=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
         self.auxiliary = scratch.auxiliary
-        self.cache_lengths = buffers.zeros(metadata.lengths.shape, torch.int32)
+        self.cache_lengths = (torch.zeros_like(metadata.lengths))
         self.schedules = PreparedPagedSchedules(self.cache_lengths, metadata.query_start_loc,
-            len(weights.layers), buffers=buffers)
+            len(weights.layers))
         c = weights.config.text
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids,
             scratch.local_embedding, scratch.embedding, runtime=embedding_runtime, coordinator=coordinator,
-            session=session, name=name + ".embedding", num_rows=metadata.live_counts[:1])
-        inverse = weights.config.rotary_frequencies(scratch.embedding.device)
+            session=session, name=name + ".embedding", num_rows=metadata.live_counts[:1]).functional(session=session, dynamic_inputs=True)
+        inverse = persistent_copy(weights.config.rotary_frequencies(scratch.embedding.device))
         fused = PreparedAllReduceRMSNorm.fits(runtime, scratch.partial)
         self.fused = fused
         self.layers = []
@@ -336,57 +353,63 @@ class PreparedDecoder:
                     runtime=runtime, coordinator=coordinator, session=session, name=prefix)
             self.layers.append(prepared)
         self.schedules.finalize(session)
+        self.schedules.functional(session=session)
         self.norm = PreparedIndexedRMSNorm(scratch.residual, metadata.sample_indices, weights.norm, scratch.hidden,
-            eps=c["rms_norm_eps"], zero_centered=True, session=session, name=name + ".norm")
+            eps=c["rms_norm_eps"], zero_centered=True, session=session, name=name + ".norm").functional()
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            activation_mode="auto", buffers=buffers)
+            activation_mode="auto",  workspace=workspace).functional(session=session)
         self.taps = ({layer + 1: index for index, layer in enumerate(weights.config.target_layers)}
                      if weights.draft is not None else {})
 
-    def __call__(self):
-        s, m = self.scratch, self.metadata
-        self.cache_lengths.copy_(torch.where(m.lengths > 0, (m.starts + m.lengths).int(), 0))
-        self.schedules()
-        if self.vision is None:
-            hidden = self.embedding()
-        else:
-            local = self.embedding.lookup()
-            self.vision.inject(m, local)
-            hidden = self.embedding.gather(local)
+    def __call__(self, metadata):
+        lengths = torch.where(metadata.lengths > 0, (metadata.starts + metadata.lengths).int(), 0)
+        schedule_storage = self.schedules(lengths, metadata.query_start_loc)
+        local = self.embedding.lookup(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
+        if self.vision is not None:
+            self.vision.inject(metadata, local)
+        hidden = self.embedding.gather(local)
+        auxiliary = (torch.empty((hidden.shape[0], len(self.taps), hidden.shape[1]), dtype=hidden.dtype, device=hidden.device)
+                     if self.taps else None)
         if self.fused:
-            s.residual.copy_(hidden)
-            update = None
+            residual, normalized, update = hidden, None, None
             for index, layer in enumerate(self.layers):
-                normalized = layer.normalize(update)
+                normalized = layer.normalize(residual, update, normalized)
                 if index in self.taps:
-                    self.auxiliary[:, self.taps[index]].copy_(s.residual)
-                update = layer(normalized)
+                    auxiliary[:, self.taps[index]].copy_(residual)
+                normalized, update = layer(normalized, residual, metadata=metadata, lengths=lengths, schedule_storage=schedule_storage)
             if update is not None:
-                s.residual.add_(update)
+                residual.add_(update)
+            hidden = residual
         else:
             for index, layer in enumerate(self.layers):
-                hidden = layer(hidden)
+                hidden = layer(hidden, metadata=metadata, lengths=lengths, schedule_storage=schedule_storage)
                 if index + 1 in self.taps:
-                    self.auxiliary[:, self.taps[index + 1]].copy_(hidden)
-            s.residual.copy_(hidden)
+                    auxiliary[:, self.taps[index + 1]].copy_(hidden)
         if len(self.layers) in self.taps:
-            self.auxiliary[:, self.taps[len(self.layers)]].copy_(s.residual)
+            auxiliary[:, self.taps[len(self.layers)]].copy_(hidden)
         if self.taps and self.mode != "verify":
-            self.commit(m.lengths)
-        self.head(self.normalize_head())
+            self.commit(metadata.lengths, auxiliary, metadata)
+        sampled = self.norm(hidden, metadata.sample_indices)
+        return sampled, self.head(sampled), auxiliary, auxiliary if self.mode == "verify" and self.taps else None
 
-    def normalize_head(self):
-        return self.norm(self.scratch.residual, self.metadata.sample_indices)
-
-    def commit(self, counts):
-        if not self.taps:
+    def commit(self, counts, records, metadata):
+        if not self.taps or records is None:
             return
-        m = self.metadata
-        indices = (m.query_start_loc[:-1] + counts - 1).long().clamp(0, self.auxiliary.shape[0] - 1)
-        selected = self.auxiliary[indices].reshape(counts.numel(), -1)
+        indices = (metadata.query_start_loc[:-1] + counts - 1).long().clamp(0, records.shape[0] - 1)
+        selected = records[indices].reshape(counts.numel(), -1)
         destination = self.pool.region("target_hidden").view(self.pool.backing.shape[0], -1)
-        save_hidden(selected, destination, m.state_rows, counts > 0)
+        save_hidden(selected, destination, metadata.state_rows, counts > 0)
+
+    def release_outputs(self):
+        self.scratch = self.metadata = self.auxiliary = self.cache_lengths = None
+        for layer in self.layers:
+            layer.attention.scratch = layer.attention.lengths = None
+            if isinstance(layer, PreparedDecoderLayer):
+                layer.scratch = None
+                layer.feed_forward.scratch = layer.feed_forward.output_source = None
+            else:
+                layer.module.mlp.operation.scratch = layer.module.mlp.operation.output_source = None
 
     def scratch_tensors(self):
-        return self.scratch, self.cache_lengths, self.schedules.storage
+        return ()

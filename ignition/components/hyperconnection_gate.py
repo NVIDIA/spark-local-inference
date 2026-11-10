@@ -6,8 +6,9 @@
 
 from functools import partial
 
+import torch
 from b12x.gemm import hyperconnection_gate
-from b12x.norm import hyperconnection as hc
+from b12x.norm.hyperconnection import api as hc
 from b12x.preparation import FrozenMapping, PreparedCall
 
 from ignition.components.collectives import PreparedChunkedAllReduce
@@ -41,9 +42,16 @@ class PreparedHyperconnectionGate:
             benchmark_call=benchmark,
         ),))
 
+    def functional(self, *, session):
+        self.output_shape, self.workspace_shape = tuple(self.output.shape), tuple(self.workspace.shape)
+        self.output = self.workspace = None
+        return self
+
     def __call__(self, source, normalized):
-        return hyperconnection_gate.run(source, self.weight, normalized, out=self.output,
-                                       workspace=self.workspace, plan=self.plan)
+        output = torch.empty(self.output_shape, dtype=normalized.dtype, device=normalized.device)
+        workspace = torch.empty(self.workspace_shape, dtype=normalized.dtype, device=normalized.device)
+        return hyperconnection_gate.run(source, self.weight, normalized, out=output,
+                                       workspace=workspace, plan=self.plan)
 
 
 class PreparedShardedHyperconnectionGate:
@@ -82,7 +90,16 @@ class PreparedShardedHyperconnectionGate:
 
         register_finalizer(session, finalize)
 
+    def functional(self, *, session):
+        self.output_shape = tuple(self.output.shape)
+        self.up.functional(session=session)
+        self.reduce.functional(session=session)
+        self.logits = self.output = None
+        register_finalizer(session, lambda: setattr(self, "binding", None))
+        return self
+
     def __call__(self, source, normalized):
-        self.reduce(self.up(source))
-        hc.run_gate_mean(normalized, self.logits, binding=self.binding)
-        return self.output
+        logits = self.reduce(self.up(source))
+        output = torch.empty(self.output_shape, dtype=normalized.dtype, device=normalized.device)
+        torch.ops.b12x.hyperconnection_gate_mean(normalized, logits, output, self.plan.handle)
+        return output

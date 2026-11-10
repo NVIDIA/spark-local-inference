@@ -113,7 +113,6 @@ def test_context_norm_rounding_and_fp8_query_values():
 @torch.no_grad()
 def test_context_commits_only_accepted_prefixes_across_ring_boundary():
     from ignition.components.state import StateLayout, StateStorage
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.minimax_m3.draft import PreparedContext
 
     torch.manual_seed(171)
@@ -136,14 +135,14 @@ def test_context_commits_only_accepted_prefixes_across_ring_boundary():
     metadata = SimpleNamespace(positions=positions, starts=torch.tensor([4094, 4090], device=device),
         state_rows=torch.tensor([1, 2], device=device), requests=torch.arange(2, device=device).repeat_interleave(7))
     counts = torch.tensor([3, 5], dtype=torch.int32, device=device)
-    buffers = GraphBufferPool(device).cursor()
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         context = PreparedContext(weights, auxiliary, metadata, pool, runtime=None, coordinator=None,
-            session=session, name="context", workspace=None, buffers=buffers)
+            session=session, name="context", workspace=None)
         torch.testing.assert_close(context.inverse, config.draft.rotary_frequencies(device), rtol=0, atol=0)
         from ignition.preparation.compilation import compile_forward
 
-        compiled = compile_forward(lambda: context(auxiliary, counts))
+        context.functional()
+        compiled = compile_forward(lambda: context(auxiliary, counts, metadata))
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):

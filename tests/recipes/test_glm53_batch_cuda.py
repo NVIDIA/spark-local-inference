@@ -34,8 +34,10 @@ def test_small_request_capacities_pad_rank_agreement(slots):
     inputs.row_slot_ids[0], inputs.row_generations[0], inputs.live_rows[0] = 0, 7, 1
     inputs.token_ids[0] = 5
     inputs.page_tables[0, 0] = 0
-    batch.begin(batch.validate() * 2)
-    assert batch.validation_input.nbytes == 16
+    batch.functional()
+    validation, present = batch.validate()
+    metadata = batch.begin(validation * 2, present)
+    assert validation.nbytes == 16
     assert metadata.indexed.positions.tolist() == [1]
     assert requests.error_code[0] == 0
 
@@ -43,9 +45,10 @@ def test_small_request_capacities_pad_rank_agreement(slots):
     hidden = torch.randn((slots + 1, 16), dtype=torch.bfloat16, device="cuda")
     resume = PreparedResumeState(requests, hidden, inputs.row_slot_ids[:1],
                                  inputs.row_generations[:1], inputs.live_rows, world_size=2, state_rows=inputs.request_state_rows)
-    resume.validation_sum.copy_(resume.validate() * 2)
-    assert resume.validation_input.nbytes == 16
-    torch.testing.assert_close(resume.gather(), hidden[1:2], rtol=0, atol=0)
+    resume.functional()
+    validation, present = resume.validate()
+    assert validation.nbytes == 16
+    torch.testing.assert_close(resume.gather(validation * 2, present=present), hidden[1:2], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("rank,world", [(0, 2), (3, 4)])
@@ -61,9 +64,16 @@ def test_native_glm_metadata_and_consumption(rank, world, mode, capacity):
     batch = PreparedBatch(inputs, requests, metadata, mode=mode,
         shard=TensorParallelShard(rank, world), pages=torch.tensor([64], device="cuda"))
 
+    batch.functional()
     def forward():
-        batch.begin(batch.validate() * world)
-        batch.finish()
+        validation, present = batch.validate()
+        packed = batch.begin(validation * world, present)
+        metadata.token_ids.copy_(packed.token_ids)
+        for name in metadata.recurrent.__dataclass_fields__:
+            getattr(metadata.recurrent, name).copy_(getattr(packed.recurrent, name))
+        for name in metadata.indexed.__dataclass_fields__:
+            getattr(metadata.indexed, name).copy_(getattr(packed.indexed, name))
+        batch.finish(packed)
 
     call = compile_forward(forward)
     call()

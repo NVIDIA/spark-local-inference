@@ -15,7 +15,8 @@ pytestmark = pytest.mark.skipif(not (os.environ.get("FLARE_RUN_CUDA_TESTS") and 
 @pytest.mark.parametrize("world", [1, 2])
 @pytest.mark.parametrize("capacity", [1, 4])
 @pytest.mark.parametrize("requests", [4, 3])
-def test_fused_draft_metadata_matches_reference(world, capacity, requests):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fused_draft_metadata_matches_reference(world, capacity, requests, compiled):
     from ignition.recipes.glm53.dcp import ContextShards
     from ignition.recipes.glm53.mtp import DraftMetadata
 
@@ -23,8 +24,6 @@ def test_fused_draft_metadata_matches_reference(world, capacity, requests):
     generator = torch.Generator().manual_seed(world * 10 + capacity)
     blocks, slots_capacity = 40, 8
     shards = ContextShards.on(1, world, device) if world > 1 else ContextShards()
-    storage = torch.full((requests * capacity, 4096), float("nan"), dtype=torch.bfloat16, device=device)
-    fused = DraftMetadata(requests * capacity, requests, blocks, device, shards=shards, hidden=storage)
     reference = DraftMetadata(requests * capacity, requests, blocks, device, shards=shards)
     slots = torch.tensor([3, 0, 5, 6][:requests], dtype=torch.int64, device=device)
     lengths = torch.randint(0, capacity + 1, (requests,), generator=generator).to(device)
@@ -40,8 +39,13 @@ def test_fused_draft_metadata_matches_reference(world, capacity, requests):
         hidden = torch.randn((requests, capacity, 4096), generator=generator).to(torch.bfloat16).to(device)
     tables = torch.randint(-1, 500, (slots_capacity, blocks), generator=generator, dtype=torch.int32).to(device)
     state_rows = torch.randint(0, 100, (slots_capacity, 8), generator=generator).to(device)
-    for metadata, method in ((fused, fused.set), (reference, reference.set_reference)):
-        method(slots, lengths, starts, tokens, hidden, tables, capacity=capacity, state_rows=state_rows)
+    def pack(lengths):
+        return DraftMetadata.pack(slots, lengths, starts, tokens, hidden, tables,
+            capacity=capacity, state_rows=state_rows, shards=shards)
+    operation = torch.compile(pack, fullgraph=True) if compiled else pack
+    fused = operation(lengths)
+    reference.set_reference(slots, lengths, starts, tokens, hidden, tables,
+        capacity=capacity, state_rows=state_rows)
     torch.cuda.synchronize()
     for name in ("token_ids", "hidden", "output_indices", "num_tokens"):
         assert torch.equal(getattr(fused, name), getattr(reference, name)), name

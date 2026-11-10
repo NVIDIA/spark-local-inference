@@ -49,7 +49,8 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
     op.width, op.batch, op.rows = 6, 1, torch.arange(1, device="cuda:0")
     op.convolution_regions = convolution_regions(pool)
     records = KDARecords.allocate({0: weights}, state.recurrent.shape[0], state.recurrent.shape[1], "cuda:0")
-    op.decoder = SimpleNamespace(scratch=SimpleNamespace(hidden=torch.zeros((6, 4096), dtype=torch.bfloat16, device="cuda:0")))
+    hidden = torch.zeros((6, 4096), dtype=torch.bfloat16, device="cuda:0")
+    verified_output = torch.empty_like(hidden)
     operators = {}
     with RecordedPreparationSession(device=torch.device("cuda:0"), checkpoint="glm53-mtp-state",
             workload_schema="glm-kda-prefix-v1", numerical_policy="default") as session:
@@ -61,7 +62,11 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
                 records=records.layer(0) if width > 1 else None)
         op.kda_commit = PreparedKDACommit(pool, records, operators[6].recurrent_plan,
             metas[6].state_indices[:, 0], metas[6].num_seqs, session=session, workspace=arena)
+        for operator in operators.values():
+            operator.functional(session=session)
         session.tune()
+        arena.release_preparation()
+        operators[1](sources[1], metas[1])
         for width, meta in metas.items():
             meta.query_start_loc.copy_(torch.tensor([0, width], dtype=torch.int32))
             meta.convolution_slots.fill_(1)
@@ -75,12 +80,12 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
         state.convolution.normal_(0, .1, generator=generator)
         initial_r, initial_c = state.recurrent.clone(), state.convolution.clone()
         sources[6].copy_(chain[:6])
-        operators[6](sources[6])
-        op.commit_state(slots.long(), counts)
+        verified_output.copy_(operators[6](sources[6], metas[6], records=records.layer(0)))
+        op.commit_state(slots.long(), counts, records, metas[6], hidden)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            operators[6](sources[6])
-            op.commit_state(slots.long(), counts)
+            verified_output.copy_(operators[6](sources[6], metas[6], records=records.layer(0)))
+            op.commit_state(slots.long(), counts, records, metas[6], hidden)
         session.freeze()
         # Each verified token's output matches decoding the tokens one at a time. Plain decode and verification
         # read different columns of an arbitrary convolution history, so this check starts from an empty one.
@@ -89,13 +94,13 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
         state.convolution.zero_()
         for index in range(6):
             sources[1].copy_(chain[index:index + 1])
-            plain.append(operators[1](sources[1]).clone())
+            plain.append(operators[1](sources[1], metas[1]).clone())
         state.recurrent.copy_(initial_r)
         state.convolution.zero_()
         counts.fill_(1)
         graph.replay()
         torch.cuda.synchronize()
-        verified = operators[6].projections["o_proj"].output.float()
+        verified = verified_output.float()
         expected = torch.cat(plain).float()
         relative = ((verified - expected).norm() / expected.norm()).item()
         # Recording rounds the recurrence to BF16 before the gated norm, as b12x's recording does.
@@ -105,10 +110,10 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
             state.convolution.copy_(initial_c)
             for index in range(accepted):
                 sources[1].copy_(chain[index:index + 1])
-                operators[1](sources[1])
+                operators[1](sources[1], metas[1])
             expected_r, expected_c = state.recurrent[1].clone(), state.convolution[1, :, :3].clone()
             sources[1].copy_(chain[6:])
-            expected_output = operators[1](sources[1]).clone()
+            expected_output = operators[1](sources[1], metas[1]).clone()
             state.recurrent.copy_(initial_r)
             state.convolution.copy_(initial_c)
             counts.fill_(accepted)
@@ -116,5 +121,5 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
             torch.cuda.synchronize()
             torch.testing.assert_close(state.recurrent[1], expected_r, rtol=.025, atol=.002)
             torch.testing.assert_close(state.convolution[1, :, :3], expected_c, rtol=.025, atol=.002)
-            actual_output = operators[1](sources[1])
+            actual_output = operators[1](sources[1], metas[1])
             torch.testing.assert_close(actual_output, expected_output, rtol=.025, atol=.005)

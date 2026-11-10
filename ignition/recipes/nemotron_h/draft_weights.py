@@ -12,6 +12,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_cat, persistent_copy
 
 
 class DraftWeightLoader(DirectWeightLoader):
@@ -29,19 +30,19 @@ class DraftWeightLoader(DirectWeightLoader):
                 for name in self.manifest.tensors if name.endswith(".weight")
                 and not any(fnmatchcase(name.removesuffix(".weight"), pattern) for pattern in excluded)}
 
-    def projection(self, prefix):
+    def projection(self, prefix, *, temporary=False):
         if prefix in self.quantization:
-            return self.load_linear(prefix)
-        return self.tensor(prefix + ".weight")
+            return self.load_linear(prefix, temporary=temporary)
+        return self.tensor(prefix + ".weight", temporary=temporary)
 
-    def tensor(self, name):
-        value = self.load_tensor(name)
+    def tensor(self, name, *, temporary=False):
+        value = self.load_tensor(name, temporary=temporary)
         if value.dtype != torch.bfloat16:
             raise ValueError(f"LiLiCorr requires BF16 unquantized parameters: {name}")
         return value
 
-    def biased(self, prefix):
-        return self.projection(prefix), self.tensor(prefix + ".bias")
+    def biased(self, prefix, *, temporary=False):
+        return self.projection(prefix, temporary=temporary), self.tensor(prefix + ".bias", temporary=temporary)
 
     def lattice(self, config):
         prefix, c = "lilicorr.", config.text["dflash_config"]
@@ -53,18 +54,21 @@ class DraftWeightLoader(DirectWeightLoader):
         for name in ("output_norm", "anchor_norm"):
             weights[name] = self.tensor(prefix + name + ".weight")
         weights["feature_mlp"] = tuple(self.biased(prefix + "feature_mlp." + name) for name in ("up_proj", "down_proj"))
-        factor, bias = self.biased(prefix + "factor_input_proj")
+        factor = self.projection(prefix + "factor_input_proj", temporary=True)
+        bias = self.tensor(prefix + "factor_input_proj.bias")
         hidden = c["lilicorr_hidden_size"]
         if factor.shape != (hidden, 3 * hidden):
             raise ValueError("LiLiCorr factor input must project candidate, anchor, and their product")
-        weights["factor"] = tuple(part.contiguous() for part in factor.split(hidden, dim=1)), bias
-        edges = [self.biased(prefix + name) for name in ("out_head", "in_head")]
-        weights["edges"] = tuple(torch.cat([edge[i] for edge in edges], dim=0) for i in (0, 1))
+        weights["factor"] = tuple(persistent_copy(part.contiguous())
+                                   for part in factor.split(hidden, dim=1)), bias
+        edges = [self.biased(prefix + name, temporary=True) for name in ("out_head", "in_head")]
+        weights["edges"] = tuple(persistent_cat([edge[i] for edge in edges], dim=0) for i in (0, 1))
         layers = []
         for index in range(c["lilicorr_num_layers"]):
             p = f"{prefix}layers.{index}."
             layers.append(dict(attn_norm=self.tensor(p + "attn_norm.weight"),
-                qkv=(self.tensor(p + "attn.in_proj_weight"), self.tensor(p + "attn.in_proj_bias")),
+                qkv=(self.tensor(p + "attn.in_proj_weight"),
+                     self.tensor(p + "attn.in_proj_bias")),
                 output=self.biased(p + "attn.out_proj"), mlp_norm=self.tensor(p + "mlp_norm.weight"),
                 mlp=tuple(self.biased(p + "mlp." + name) for name in ("up_proj", "down_proj"))))
         weights["layers"] = tuple(layers)
@@ -89,11 +93,13 @@ class DraftWeights:
             layers = []
             for index in range(config.layers):
                 p = f"layers.{index}."
-                qkv = torch.cat([loader.projection(p + "self_attn." + name) for name in ("q_proj", "k_proj", "v_proj")])
+                qkv = loader.load_linear_group(tuple(p + "self_attn." + name
+                    for name in ("q_proj", "k_proj", "v_proj")))
                 layers.append(dict(qkv=qkv, context=qkv[config.text["num_attention_heads"] * config.text["head_dim"]:],
                     output=loader.projection(p + "self_attn.o_proj"),
                     q_norm=loader.tensor(p + "self_attn.q_norm.weight"), k_norm=loader.tensor(p + "self_attn.k_norm.weight"),
-                    sink=loader.tensor(p + "self_attn.attention_sink_bias").float(),
+                    sink=persistent_copy(loader.tensor(
+                        p + "self_attn.attention_sink_bias", temporary=True).float()),
                     input_norm=loader.tensor(p + "input_layernorm.weight"),
                     post_norm=loader.tensor(p + "post_attention_layernorm.weight"),
                     mlp=tuple(loader.projection(p + "mlp." + name) for name in ("gate_proj", "up_proj", "down_proj")),
@@ -101,5 +107,5 @@ class DraftWeights:
                         projection=loader.projection(p + kind + ".kernel_projection"))
                        for kind in ("attention_conv", "mlp_conv")}))
             lattice = loader.lattice(config)
-        context_kv = torch.cat([layer["context"] for layer in layers])
+        context_kv = persistent_cat([layer["context"] for layer in layers])
         return cls(projection, hidden_norm, norm, context_kv, tuple(layers), lattice)

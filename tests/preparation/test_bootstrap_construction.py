@@ -629,12 +629,13 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     assert len(constructors["PreparedGDN"]) == 36 * len(decoders)
     assert len(constructors["PreparedPLE"]) == len(decoders)
     for decoder, args in decoders:
+        assert decoder.scratch is None
         assert len(decoder.layers) == 48
         assert args["workspaces"] is session.arena
         assert args["completion"].records.shape == (
             2,
             config.request_capacity,
-            24,
+            16 + config.completion_token_capacity,
         )
         assert args["completion"].records.dtype == torch.int64
         pool = args["state"].pool
@@ -644,11 +645,11 @@ def test_prepare_model_constructs_real_catalog_on_meta(
         assert pool.backing.shape[0] == (
             1 + config.request_capacity + pool.layout.snapshot_capacity(config.snapshot_budget_bytes)
         )
-        assert decoder.scratch.residual.dtype == torch.bfloat16
-        assert decoder.scratch.logits.dtype == torch.bfloat16
+        assert args["scratch"].residual.dtype == torch.bfloat16
+        assert args["scratch"].logits.dtype == torch.bfloat16
         assert pool.layout.speculative_tokens == (0 if proposal == "ordinary" else 7)
-        assert decoder.scratch.residual.shape == (args["state"].tokens, 10240)
-        assert decoder.scratch.logits.shape == (
+        assert args["scratch"].residual.shape == (args["state"].tokens, 10240)
+        assert args["scratch"].logits.shape == (
             (args["state"].tokens if decoder.verification else args["state"].rows),
             248320,
         )
@@ -687,6 +688,15 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     )
     assert all(memory.scratch_nbytes >= 0 for memory in session.memory.values())
 
+
+
+def test_mixed_catalog_constructs_on_meta(monkeypatch, checkpoint):
+    session, signatures, _ = _install_boundaries(monkeypatch, checkpoint)
+    config = bootstrap.PreparationConfig(max_active=4, mtp=True, mixed_prefill=True)
+    with FakeTensorMode(allow_non_fake_inputs=True), MetadataValues(), pytest.raises(ConstructionComplete):
+        bootstrap.prepare_model(checkpoint[0].snapshot, config)
+    assert session.closed
+    assert sum(signature.kind == "mixed" for signature in signatures) == len(config.mixed_shapes)
 
 def test_recording_metadata_preserves_values_and_rejects_unknown_scalars():
     with FakeTensorMode(), MetadataValues():

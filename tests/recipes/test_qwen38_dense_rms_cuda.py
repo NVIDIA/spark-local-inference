@@ -17,7 +17,7 @@ def test_target_hidden_norm_checkpoint_compiled_replay(tokens):
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.scratch import GraphBufferPool
+    from tests.tensor_examples import TensorExamples
     from ignition.recipes import resolve
     from ignition.recipes.qwen38_dense.config import TEXT_PREFIX
     from ignition.recipes.qwen38_dense.decoder import RMSNorm
@@ -32,8 +32,8 @@ def test_target_hidden_norm_checkpoint_compiled_replay(tokens):
     width, layers = config["hidden_size"], config["num_hidden_layers"]
     assert width == 5120 and layers == 64
     device = torch.device("cuda:0")
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     source = buffers.zeros((tokens, width), torch.bfloat16)
     output = buffers.zeros((tokens, width), torch.bfloat16)
     saved = torch.empty((2 * layers, tokens, width), dtype=torch.bfloat16, device=device)

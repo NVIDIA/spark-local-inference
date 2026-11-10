@@ -85,6 +85,8 @@ installations are also accepted.
 The fixes preserve cooperative CUDA launch attributes in serialized kernels,
 match Triton's 150-character cache filenames, retain dependencies on mutated
 inputs when replacing kernel templates, and reduce compiler bookkeeping costs.
+Inductor retains zeroed graph workspaces through the final graph operation, so
+its memory planner cannot reuse their storage while the graph still needs it.
 Triton's helper cache key uses machine, operating system, and interpreter pointer
 width without invoking `file`, avoiding subprocess probing under profiler injection.
 Compiled-forward and Torch graph cache identities include the runtime patches.
@@ -1309,10 +1311,10 @@ independently by `--speculative-graph-budget`.
 Every model export prints a VRAM inventory for each rank after final publication,
 including exports without `--verbose`. Heliopause measures device usage and core
 allocator mappings; Ignition attributes retained ranges to checkpoint tensors,
-scratch pools, graph temporaries, I/O and persistent state, communication buffers,
+graph temporaries, I/O and persistent state, communication buffers,
 kernel globals, and allocator slack. Owner fields and defining source locations
 identify the largest consumers in each category. Aliased ranges count once;
-shared scratch displays representative tensor owners.
+shared storage displays representative tensor owners.
 
 Preparation-only storage is separate from fixed core storage. Cache figures
 count physically backed pages, not their virtual serving capacity. Mapped host
