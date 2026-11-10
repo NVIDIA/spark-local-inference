@@ -27,9 +27,19 @@ class PreparedTorchRMSNorm:
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(source, weight, out=output, eps=self.eps), output=output)),))
 
+    def functional(self, *, session):
+        del session
+        self.output_layout = (tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype)
+        self.output = None
+        return self
+
     def __call__(self, source):
-        torch.ops.b12x.torch_rmsnorm(source, self.weight, self.output, self.eps, self.plan.handle)
-        return self.output
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        torch.ops.b12x.torch_rmsnorm(source, self.weight, output, self.eps, self.plan.handle)
+        return output
 
 
 class PreparedRMSNorm:

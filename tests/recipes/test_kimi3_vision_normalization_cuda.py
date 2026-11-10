@@ -1,4 +1,4 @@
-"""Prepared vision normalization preserves BF16 image features and scratch aliases."""
+"""Prepared vision normalization preserves BF16 image features with local output."""
 
 import os
 
@@ -9,16 +9,10 @@ from b12x.preparation import PreparationSession
 from ignition.recipes.kimi3.vision import VisionScratch, _RMSNorm
 
 
-def test_normalization_reuses_attention_storage_but_not_projection_inputs():
+def test_declaration_operands_are_disjoint():
     scratch = VisionScratch.allocate(256, "cpu")
-    assert scratch.normalized.shape == (256, 1024)
-    assert scratch.normalized.data_ptr() == scratch.query.data_ptr()
-    assert (
-        scratch.normalized.untyped_storage().data_ptr()
-        == scratch.value.untyped_storage().data_ptr()
-    )
-    assert scratch.normalized.data_ptr() != scratch.qkv.data_ptr()
-    assert scratch.normalized.data_ptr() != scratch.hidden.data_ptr()
+    values = [getattr(scratch, name) for name in scratch.__dataclass_fields__]
+    assert len({value.untyped_storage().data_ptr() for value in values}) == len(values)
     assert scratch.rows(128).normalized.shape == (128, 1024)
 
 
@@ -46,7 +40,7 @@ def test_prepared_norm_is_exact_under_compiled_replay(rows, width, eps, inplace)
         operation = _RMSNorm(
             weight, source, output, eps, session=session, name="vision.norm"
         )
-        forward = compile_forward(lambda: operation(source))
+        forward = compile_forward(lambda: output.copy_(operation(source)))
         forward()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
