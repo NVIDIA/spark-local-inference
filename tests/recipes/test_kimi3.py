@@ -97,7 +97,7 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
     from ignition.recipes.kimi3.weights import KimiWeightLoader
     from ignition.recipes.kimi3.kda import PreparedKDA
     from ignition.components.recurrent import DeltaState, DeltaMetadata
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
 
     device = torch.device("cuda:0")
@@ -115,9 +115,8 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         metadata = DeltaMetadata.allocate(1, device)
         torch.manual_seed(41)
         source = torch.randn((tokens, 7168), device=device, dtype=torch.bfloat16)
-        graph_buffers = GraphBufferPool(device)
         op = PreparedKDA(weights["attention"], source, state, metadata, mode=mode, eps=1e-5,
-                        session=session, name="kda", workspace=arena, buffers={}, allocator=graph_buffers.cursor())
+                        session=session, name="kda", workspace=arena, buffers={})
         session.tune(show_progress=False)
         metadata.query_start_loc[1] = tokens
         metadata.convolution_slots[0] = 1
@@ -128,7 +127,7 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         metadata.fresh.fill_(True)
         state.convolution.zero_()
         state.recurrent.zero_()
-        output = op(source).clone()
+        output = op(source, metadata).clone()
         assert torch.isfinite(output).all() and output.abs().max() > 0
         expected_state = state.recurrent[1].clone()
         from b12x.sequence.kda_prefill.reference import recurrent_kda
@@ -156,10 +155,7 @@ def test_checkpoint_kda(config, mode, tokens, online_mxfp8):
         stream.wait_stream(torch.cuda.current_stream(device))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            replayed = op(source)
-        for chunks in graph_buffers.chunks.values():
-            for chunk in chunks:
-                chunk.fill_(float("nan"))
+            replayed = op(source, metadata)
         graph.replay()
         torch.cuda.synchronize(device)
         torch.testing.assert_close(replayed, output, rtol=0, atol=0)
@@ -178,7 +174,7 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
     from ignition.components.paged_batch import Metadata
     from ignition.recipes.kimi3.weights import KimiWeightLoader
     from ignition.recipes.kimi3.attention import PreparedMLA
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
 
     device = torch.device("cuda:0")
@@ -197,16 +193,15 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
         cache = torch.zeros((pages, 128, 576), dtype=torch.float8_e4m3fn, device=device)
         torch.manual_seed(41)
         source = torch.randn((tokens, 7168), device=device, dtype=torch.bfloat16)
-        graph_buffers = GraphBufferPool(device)
         op = PreparedMLA(weights, source, metadata, cache, eps=config.mla_norm_eps, mode=mode, session=session,
-                         name="mla", workspace=arena, buffers={}, allocator=graph_buffers.cursor())
+                         name="mla", workspace=arena, buffers={})
         session.tune(show_progress=False)
         metadata.query_start_loc[1] = tokens
         metadata.lengths.fill_(tokens)
         metadata.page_table.copy_(torch.arange(pages, device=device)[None])
         metadata.positions.copy_(torch.arange(tokens, device=device))
         metadata.token_page_table.copy_(metadata.page_table.expand(tokens, -1))
-        output = op(source).clone()
+        output = op(source, metadata).clone()
         w = _reference_attention(weights)
         projected = F.linear(source, w["latent_gate"][:2112])
         def norm(x, weight):
@@ -238,10 +233,7 @@ def test_checkpoint_mla(config, mode, tokens, online_mxfp8):
         stream.wait_stream(torch.cuda.current_stream(device))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            replayed = op(source)
-        for chunks in graph_buffers.chunks.values():
-            for chunk in chunks:
-                chunk.fill_(float("nan") if chunk.is_floating_point() else -1)
+            replayed = op(source, metadata)
         graph.replay()
         torch.cuda.synchronize(device)
         torch.testing.assert_close(replayed, output, rtol=0, atol=0)

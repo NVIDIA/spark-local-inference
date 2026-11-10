@@ -18,7 +18,7 @@ class SharedBuffers:
     """Declaration examples shared by serial layers and query slices."""
 
     def __init__(self, values, device, allocator=None, prefix=""):
-        self.values, self.device, self.allocator, self.prefix = values, device, allocator, prefix
+        self.values, self.device, self.prefix = values, device, prefix
         self.ordinal = 0
 
     def buffer(self, name, shape, dtype):
@@ -82,16 +82,24 @@ class PreparedIndexSelection:
         self.pages = self.lengths = self.local = self.scores = self.selected = None
 
     def prepare_local(self, query, weights, positions, tables):
+        return self.prepare_local_result(query, weights, positions, tables)[0]
+
+    def prepare_local_result(self, query, weights, positions, tables):
         pages = torch.empty((1 if self.mode == "prefill" else self.rows, self.width * 2),
                             dtype=torch.int32, device=query.device)
         index_pages(tables[:1] if self.mode == "prefill" else tables, pages)
         lengths = self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32)
-        indices, scores = self.indexer(query.view(query.shape[0], 32, 128), weights,
+        (indices, scores), quantized, scales, scaled_weights = self.indexer._run_observed(
+            query.view(query.shape[0], 32, 128), weights,
             pages.expand(self.rows, -1) if self.mode == "prefill" else pages, lengths)
-        return self.merge.pack(indices=indices, scores=scores)
+        packed = self.merge.pack(indices=indices, scores=scores)
+        return packed, indices, scores, quantized, scales, scaled_weights
 
     def exchange(self, packed, positions, *, dependencies=()):
-        return self.merge.exchange(packed=packed, positions=positions,
+        return self.exchange_result(packed, positions, dependencies=dependencies)[0]
+
+    def exchange_result(self, packed, positions, *, dependencies=()):
+        return self.merge.exchange_with_scores(packed=packed, positions=positions,
                                    dependencies=(self.latent_cache, *dependencies))
 
     def __call__(self, query, weights, positions, tables):
@@ -165,6 +173,10 @@ class PreparedDSAIndexer:
                 *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
     def project(self, source, query_latent, metadata):
+        query, _, _, head_weights = self.project_result(source, query_latent, metadata)
+        return query, head_weights
+
+    def project_result(self, source, query_latent, metadata):
         query = self.projections[0](query_latent)
         key = self.projections[1](source).float()
         head_weights = self.projections[2](source) * (32 ** -.5)
@@ -175,4 +187,4 @@ class PreparedDSAIndexer:
             + self.weights["indexer.k_norm.bias"].float()).to(source.dtype)
         slots = self.shards.token_slots(metadata.positions, metadata.token_page_table)
         write_fp8_index_keys(normalized_key, slots, self.cache, hadamard=False, power_of_two=False)
-        return query, head_weights
+        return query, key.to(source.dtype), normalized_key, head_weights

@@ -293,16 +293,26 @@ def test_index_projections_layernorm_and_prefill_slice_boundary(compile_projecti
         session.tune(show_progress=False)
         cache.zero_()
 
+        observed_query = torch.empty((rows, 4096), dtype=source.dtype, device=device)
+        observed_key = torch.empty((rows, 128), dtype=source.dtype, device=device)
+        observed_normalized_key = torch.empty_like(observed_key)
+        observed_weights = torch.empty((rows, 32), dtype=source.dtype, device=device)
+
         def forward():
-            indexer.project(source)
+            query, key, normalized_key, head_weights = indexer.project_result(source, query_latent, metadata)
+            observed_query.copy_(query)
+            observed_key.copy_(key)
+            observed_normalized_key.copy_(normalized_key)
+            observed_weights.copy_(head_weights)
             for start, end in indexer.bounds:
                 part = indexer.selections[end - start]
-                part(indexer.query[start:end], indexer.head_weights[start:end],
-                    metadata.positions[start:end], metadata.token_page_table[start:end])
-                selected[start:end].copy_(part.selected)
-                quantized[start:end].copy_(part.indexer.quantized)
-                scales[start:end].copy_(part.indexer.scales)
-                scaled_weights[start:end].copy_(part.indexer.scaled_weights)
+                packed, _, _, quantized_part, scales_part, scaled_part = part.prepare_local_result(
+                    query[start:end], head_weights[start:end], metadata.positions[start:end],
+                    metadata.token_page_table[start:end])
+                selected[start:end].copy_(part.exchange(packed, metadata.positions[start:end]))
+                quantized[start:end].copy_(quantized_part)
+                scales[start:end].copy_(scales_part)
+                scaled_weights[start:end].copy_(scaled_part)
 
         compiled = compile_forward(forward) if compile_projection else forward
         compiled()
@@ -322,27 +332,27 @@ def test_index_projections_layernorm_and_prefill_slice_boundary(compile_projecti
                           "segment.all.allocated", "segment.all.freed"):
                 assert before[field] == after[field]
         expected_key = (source.float() @ weights["indexer.wk"].float().T).bfloat16()
-        torch.testing.assert_close(indexer.key.float(), expected_key.float(), rtol=.02, atol=.002)
+        torch.testing.assert_close(observed_key.float(), expected_key.float(), rtol=.02, atol=.002)
         expected_weights = torch.mm(source, weights["indexer.weights_proj"].T) * 32 ** -.5
-        assert indexer.head_weights.dtype == torch.bfloat16
-        torch.testing.assert_close(indexer.head_weights.float(), expected_weights.float(), rtol=.008, atol=1e-5)
-        expected_norm = torch.nn.functional.layer_norm(indexer.key.float(), (128,),
+        assert observed_weights.dtype == torch.bfloat16
+        torch.testing.assert_close(observed_weights.float(), expected_weights.float(), rtol=.008, atol=1e-5)
+        expected_norm = torch.nn.functional.layer_norm(observed_key.float(), (128,),
             weights["indexer.k_norm.weight"].float(), weights["indexer.k_norm.bias"].float(), eps).bfloat16()
-        torch.testing.assert_close(indexer.normalized_key.float(), expected_norm.float(), rtol=0, atol=0)
-        wrong_norm = torch.nn.functional.layer_norm(indexer.key.float(), (128,),
+        torch.testing.assert_close(observed_normalized_key.float(), expected_norm.float(), rtol=0, atol=0)
+        wrong_norm = torch.nn.functional.layer_norm(observed_key.float(), (128,),
             weights["indexer.k_norm.weight"].float(), weights["indexer.k_norm.bias"].float(),
             1e-5 if eps == 1e-6 else 1e-6).bfloat16()
         assert not torch.allclose(expected_norm.float(), wrong_norm.float(), rtol=.1, atol=.001)
-        expected_k, expected_key_scale = _identity_fp8_reference(indexer.normalized_key[:256], power_of_two=False)
+        expected_k, expected_key_scale = _identity_fp8_reference(observed_normalized_key[:256], power_of_two=False)
         physical_keys = cache.view(-1, 64 * 132)
         actual_k = physical_keys[[4, 5, 0, 1], :8192].view(torch.float8_e4m3fn).reshape(256, 128)
         actual_key_scale = physical_keys[[4, 5, 0, 1], 8192:].view(torch.float32).flatten()
         torch.testing.assert_close(actual_k.view(torch.uint8), expected_k.view(torch.uint8), rtol=0, atol=0)
         torch.testing.assert_close(actual_key_scale, expected_key_scale, rtol=0, atol=0)
-        expected_q, expected_query_scale = _identity_fp8_reference(indexer.query.view(rows, 32, 128), power_of_two=True)
+        expected_q, expected_query_scale = _identity_fp8_reference(observed_query.view(rows, 32, 128), power_of_two=True)
         torch.testing.assert_close(quantized.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0)
         torch.testing.assert_close(scales, expected_query_scale, rtol=0, atol=0)
-        expected_scaled = (indexer.head_weights.float() * scales) * 128 ** -.5
+        expected_scaled = (observed_weights.float() * scales) * 128 ** -.5
         torch.testing.assert_close(scaled_weights, expected_scaled, rtol=0, atol=0)
         for row, chosen in enumerate(selected[:-1].cpu().tolist()):
             assert set(token for token in chosen if token >= 0) == set(range(row + 1))
@@ -808,22 +818,23 @@ def test_mla_query_and_latent_norm_use_configured_epsilon(eps):
         session.register_scratch(arena)
         projection = PreparedMLAProjection(weights, source, None, None, eps=eps, mode="prefill",
             session=session, name="projection", workspace=arena, buffers={})
+        projection.functional(session=session)
         session.tune(show_progress=False)
-        projection.project(source)
+        result = projection.project(source)
         torch.cuda.synchronize(device)
-        torch.testing.assert_close(projection.query_norm, expected_query, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, :512], expected_latent, rtol=0, atol=0)
+        torch.testing.assert_close(result.query_norm, expected_query, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, :512], expected_latent, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            projection.project(source)
+            result = projection.project(source)
         session.freeze()
-        projection.query_norm.fill_(19)
-        projection.latent.fill_(19)
+        result.query_norm.fill_(19)
+        result.latent.fill_(19)
         before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize(device)
         assert before == torch.cuda.memory_stats(device)["allocation.all.allocated"]
-        torch.testing.assert_close(projection.query_norm, expected_query, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, :512], expected_latent, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, 512:], projected[:, query_width + 512:latent_width], rtol=0, atol=0)
+        torch.testing.assert_close(result.query_norm, expected_query, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, :512], expected_latent, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, 512:], projected[:, query_width + 512:latent_width], rtol=0, atol=0)
         graph.reset()

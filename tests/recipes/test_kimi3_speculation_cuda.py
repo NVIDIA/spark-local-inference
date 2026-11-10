@@ -64,7 +64,7 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             meta.num_seqs.fill_(1)
             meta.num_tokens.fill_(tokens)
         def verify_commit():
-            verify(source)
+            verify(source, verify_meta, records=records.layer(0))
             replay(counts)
             torch.library.wrap_triton(_commit_convolution)[(1, 1, 18)](
                 pool.backing.view(torch.bfloat16), offsets, verify_meta.state_indices[:, 0], counts,
@@ -77,16 +77,16 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             compiled()
         pool.backing.zero_()
         for i in range(3):
-            decode(source[i:i+1])
+            decode(source[i:i+1], decode_meta)
         initial = pool.backing.clone()
         initial_recurrent = state.recurrent.clone()
         expected, outputs = [], []
         for i in range(8):
-            outputs.append(decode(source[i:i+1]).clone())
+            outputs.append(decode(source[i:i+1], decode_meta).clone())
             expected.append((state.convolution[1, :, :3].clone(), state.recurrent[1].clone()))
         for count in range(1, 9):
             pool.backing.copy_(initial)
-            actual = verify(source).clone()
+            actual = verify(source, verify_meta, records=records.layer(0)).clone()
             torch.testing.assert_close(state.recurrent, initial_recurrent, rtol=0, atol=0)
             counts.fill_(count)
             pool.backing.copy_(initial)

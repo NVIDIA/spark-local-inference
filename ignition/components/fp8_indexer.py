@@ -124,6 +124,10 @@ class PreparedFP8Indexer:
         return output
 
     def _run(self, query=None, weights=None, pages=None, lengths=None, active=None, *, cache=None):
+        output, quantized, _, scaled_weights = self._run_observed(query, weights, pages, lengths, active, cache=cache)
+        return output, quantized, scaled_weights
+
+    def _run_observed(self, query=None, weights=None, pages=None, lengths=None, active=None, *, cache=None):
         if self.query is None:
             rows, heads, _ = self.query_layout
             quantized = torch.zeros(self.query_layout, dtype=torch.float8_e4m3fn, device=query.device)
@@ -135,7 +139,7 @@ class PreparedFP8Indexer:
                                       scaled_weights.view(-1), plan=self.query_plan)
             output = self.selection(quantized, scaled_weights, pages.clone() if self.copy_pages else pages,
                                     lengths, active, cache=cache)
-            return output, quantized, scaled_weights
+            return output, quantized, scales, scaled_weights
         query = self.query if query is None else query
         weights = self.weights if weights is None else weights
         self.scaled_weights.copy_(weights)
@@ -143,4 +147,4 @@ class PreparedFP8Indexer:
         glm_pool.quantize_queries(query.view(-1, 128), *self.query_outputs, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)
-        return self.selection(), self.quantized, self.scaled_weights
+        return self.selection(), self.quantized, self.scales, self.scaled_weights

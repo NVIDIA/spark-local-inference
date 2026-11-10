@@ -130,26 +130,30 @@ class PreparedCandidateSelection:
         raise RuntimeError("candidate selection must bind a composition before execution")
 
     def exchange(self, implementation=None, *, positions=None, packed=None, dependencies=()):
+        return self.exchange_with_scores(implementation, positions=positions, packed=packed,
+                                         dependencies=dependencies)[0]
+
+    def exchange_with_scores(self, implementation=None, *, positions=None, packed=None, dependencies=()):
         implementation = self.implementation if implementation is None else implementation
         if packed is not None:
             active = positions >= 0
             if implementation == "owner":
                 return self.owner(packed[self.rows:].view(torch.int32), packed[:self.rows],
-                                  active, dependencies=dependencies)
+                                  active, dependencies=dependencies), None
             if implementation == "replicated":
                 gathered = self.gather(packed.view(torch.bfloat16).view(self.rows, -1),
                                       dependencies=dependencies).view(torch.float32).view(self.rows, self.topk * self.world, 2)
                 values, indices, lengths = self.candidates(gathered, active)
-                return self.fold(values, lengths, indices)
+                return self.fold._run(values, lengths, indices)
         else:
             self.active.copy_((self.positions if positions is None else positions) >= 0)
             if implementation == "owner":
-                return self.owner()
+                return self.owner(), None
             if implementation == "replicated":
                 self.gather(self.packed.view(torch.bfloat16).view(self.rows, -1))
                 self.candidates()
                 self.fold()
-                return self.output
+                return self.output, self.selected_scores
         raise RuntimeError("candidate selection must bind a composition before execution")
 
 

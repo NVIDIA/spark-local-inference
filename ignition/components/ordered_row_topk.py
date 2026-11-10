@@ -133,6 +133,9 @@ class PreparedOrderedRowTopK:
         return self
 
     def __call__(self, scores=None, lengths=None, indices=None):
+        return self._run(scores, lengths, indices)[0]
+
+    def _run(self, scores=None, lengths=None, indices=None):
         if scores is None:
             scores, lengths, indices = self.scores, self.lengths, self.indices
             output_scores, output = self.output_scores, self.output
@@ -154,4 +157,4 @@ class PreparedOrderedRowTopK:
             scores.view(torch.int32), indices, lengths, cutoffs, greater, ties,
             output_scores.view(torch.int32), output, WIDTH=self.width, K=self.topk,
             TILES=self.tiles, BLOCK=_TILE, COUNT_BLOCK=triton.next_power_of_2(self.tiles), num_warps=4)
-        return output
+        return output, output_scores
