@@ -10,6 +10,7 @@ from b12x.sequence import gdn_decode, kda_prefill, short_conv
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.recurrent import prepare_sequence_binding
 from ignition.components.kda_speculation import _record, register_recording
+from ignition.preparation.scratch import buffer_rows
 
 from .projections import prepare_projection
 
@@ -27,7 +28,7 @@ class PreparedKDA:
             if key not in buffers or buffers[key].shape[0] < tokens:
                 buffers[key] = (torch.zeros((tokens, channels), dtype=torch.bfloat16, device=device) if allocator is None
                                 else allocator.zeros((tokens, channels), torch.bfloat16))
-            return buffers[key][:tokens]
+            return buffer_rows(buffers, key, tokens)
 
         self.forget = buffer("forget_input", 128)
         raw_g = buffer("raw_g", width)

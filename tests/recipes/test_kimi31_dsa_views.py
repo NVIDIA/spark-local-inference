@@ -61,43 +61,40 @@ def test_shared_buffers_growth_does_not_reuse_prior_storage_views():
     assert (original == 7).all()
 
 
-def test_equal_selection_stages_share_scratch_and_preserve_input_offsets(monkeypatch):
+def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometry(monkeypatch):
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
 
-    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedRowTopK", "PreparedBroadcast"):
+    for name in ("PreparedFP8Indexer", "PreparedAllGather", "PreparedRowTopK", "PreparedBroadcast",
+                 "UnquantizedProjection"):
         monkeypatch.setattr(indexer, name, operation)
     rows = 257
-    query = torch.zeros((rows, 4096), dtype=torch.bfloat16)
-    weights = torch.zeros((rows, 32), dtype=torch.bfloat16)
-    cache = torch.zeros((4, 64 * 132), dtype=torch.uint8)
+    source = torch.empty((rows, 7168), dtype=torch.bfloat16)
+    query = torch.empty((rows, 1536), dtype=torch.bfloat16)
+    weights = {field: torch.empty(shape, dtype=torch.bfloat16) for field, shape in (
+        ("indexer.wq_b", (4096, 1536)), ("indexer.wk", (128, 7168)),
+        ("indexer.weights_proj", (32, 7168)), ("indexer.k_norm.weight", (128,)),
+        ("indexer.k_norm.bias", (128,)))}
+    cache = torch.zeros((6, 64, 132), dtype=torch.uint8)
     metadata = SimpleNamespace(positions=torch.arange(rows),
-        token_page_table=torch.zeros((rows, 2), dtype=torch.int32))
+        token_page_table=torch.zeros((rows, 3), dtype=torch.int32))
     shards = ContextShards.on(0, 1, "cpu")
-    buffers = {}
-    bounds = ((0, 128), (128, 256), (256, 257))
-    parts = tuple(indexer.PreparedIndexSelection(query, weights, cache, metadata, shards, None,
-        buffers, start=start, end=end, mode="prefill", session=None, name=f"selection{start}",
-        workspace=None, allocator=None, latent_cache=None) for start, end in bounds)
-    names = ("pages", "lengths", "local", "scores", "packed", "gathered", "global_scores",
-             "global_ids", "fold_lengths", "selected_scores", "selected")
-    for name in names:
-        assert getattr(parts[0], name) is getattr(parts[1], name)
-    assert parts[2].lengths is not parts[0].lengths
-    _assert_geometry(parts[2].lengths, parts[0].lengths[:1])
-    for part, (start, end) in zip(parts, bounds, strict=True):
-        _assert_geometry(part.positions, metadata.positions[start:end])
-        _assert_geometry(part.tables, metadata.token_page_table[start:end])
-        _assert_geometry(part.indexer.args[0], query[start:end].view(end - start, 32, 128))
-        _assert_geometry(part.indexer.args[1], weights[start:end])
+    prepared = indexer.PreparedDSAIndexer(weights, source, query, metadata, cache, shards,
+        context=None, eps=1e-5, mode="prefill", session=None, name="selection", workspace=None,
+        buffers={}, latent_cache=None)
+    assert prepared.bounds == ((0, 128), (128, 256), (256, 257))
+    assert tuple(prepared.selections) == (128, 1)
+    full, tail = prepared.selections[128], prepared.selections[1]
+    _assert_geometry(tail.lengths, full.lengths[:1])
+    for part, (start, end) in ((full, (0, 128)), (tail, (256, 257))):
+        _assert_geometry(part.indexer.args[0], prepared.query[start:end].view(end - start, 32, 128))
+        _assert_geometry(part.indexer.args[1], prepared.head_weights[start:end])
         _assert_geometry(part.indexer.args[3], part.pages.expand(end - start, -1))
         assert part.indexer.args[5] is None
         assert part.indexer.args[6] is part.local
         assert part.indexer.kwargs["scores"] is part.scores
-    assert parts[0].positions.storage_offset() != parts[1].positions.storage_offset()
-    assert parts[0].indexer.args[0].storage_offset() != parts[1].indexer.args[0].storage_offset()
-    assert len({id(part.indexer.plan) for part in parts}) == len(parts)
-    assert len({id(part.fold.plan) for part in parts}) == len(parts)
+    assert full.indexer.plan is not tail.indexer.plan
+    assert full.fold.plan is not tail.fold.plan
 
 
 def test_worker_serialization_preserves_shared_prefix_identity():
@@ -138,7 +135,7 @@ def test_selected_attention_reuses_only_identical_record_and_constant_views(monk
         self.buffer = lambda name, dtype: torch.zeros(5, dtype=dtype)
 
     def selection(*args, **kwargs):
-        return SimpleNamespace(bounds=bounds, parts=(object(), object(), object()))
+        return SimpleNamespace(bounds=bounds, selections={2: object(), 1: object()})
 
     def operation(*args, **kwargs):
         return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
@@ -155,19 +152,16 @@ def test_selected_attention_reuses_only_identical_record_and_constant_views(monk
         index_cache=torch.zeros((4, 64 * 132), dtype=torch.uint8), eps=1e-5, mode="prefill",
         session=None, name="attention", workspace=None, buffers={}, context=context,
         peers=torch.zeros(16, dtype=torch.int64))
-    first, second, tail = (part["attention"] for part in prepared.parts)
-    assert first.args[1] is second.args[1]
-    assert first.args[3] is second.args[3]
-    assert first.args[5] is second.args[5]
+    assert tuple(prepared.parts) == (2, 1)
+    first, tail = (part["attention"] for part in prepared.parts.values())
+    assert first is prepared.parts[2]["attention"]
     assert tail.args[1] is not first.args[1]
-    for part, (start, end) in zip(prepared.parts, bounds, strict=True):
-        rows = end - start
+    for rows, (start, end) in ((2, (0, 2)), (1, (4, 5))):
+        part = prepared.parts[rows]
         call = part["attention"]
         _assert_geometry(call.args[0], prepared.absorbed[start:end])
         _assert_geometry(call.args[2], prepared.attended[start:end])
         _assert_geometry(call.args[3], constants.pages[:rows])
         _assert_geometry(call.args[5], constants.starts[:rows + 1])
         _assert_geometry(call.args[1], part["gather"].args[4].view(-1, 1, RECORD_BYTES))
-    assert first.args[0].storage_offset() != second.args[0].storage_offset()
-    assert first.args[2].storage_offset() != second.args[2].storage_offset()
-    assert len({id(part["attention"].plan) for part in prepared.parts}) == len(bounds)
+    assert first.plan is not tail.plan

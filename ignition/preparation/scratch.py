@@ -13,6 +13,19 @@ from weakref import finalize
 import torch
 
 
+def buffer_rows(values, name, rows):
+    """Reuse a named buffer's row prefix while its tensor identity is unchanged."""
+    value = values[name]
+    views = values.setdefault("row_views", {})
+    cached = views.get(name)
+    if cached is None or cached[0] is not value:
+        cached = (value, {})
+        views[name] = cached
+    if rows not in cached[1]:
+        cached[1][rows] = value[:rows]
+    return cached[1][rows]
+
+
 def scratch_views(backing, shapes):
     """Partition scratch into disjoint tensors with independent storage descriptors.
 

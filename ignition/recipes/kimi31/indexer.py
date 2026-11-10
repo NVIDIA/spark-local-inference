@@ -9,6 +9,7 @@ from ignition.components.collectives import PreparedAllGather, PreparedBroadcast
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.row_topk import PreparedRowTopK
+from ignition.preparation.scratch import buffer_rows
 
 from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
 
@@ -19,7 +20,6 @@ class SharedBuffers:
     def __init__(self, values, device, allocator=None, prefix=""):
         self.values, self.device, self.allocator, self.prefix = values, device, allocator, prefix
         self.ordinal = 0
-        self.views = values.setdefault("row_views", {})
 
     def buffer(self, name, shape, dtype):
         name = self.prefix + name
@@ -30,14 +30,7 @@ class SharedBuffers:
             self.values[name] = value
         if value.shape[1:] != shape[1:] or value.dtype != dtype:
             raise ValueError("Kimi index buffers require matching non-row dimensions and dtype")
-        cached = self.views.get(name)
-        if cached is None or cached[0] is not value:
-            cached = (value, {})
-            self.views[name] = cached
-        rows = shape[0]
-        if rows not in cached[1]:
-            cached[1][rows] = value[:rows]
-        return cached[1][rows]
+        return buffer_rows(self.values, name, shape[0])
 
     def zeros(self, shape, dtype):
         name = str(self.ordinal)
@@ -49,8 +42,6 @@ class PreparedIndexSelection:
     def __init__(self, query, weights, cache, metadata, shards, context, buffers, *, start, end,
                  mode, session, name, workspace, allocator, latent_cache):
         rows, width = end - start, metadata.token_page_table.shape[1]
-        self.positions = metadata.positions[start:end]
-        self.tables = metadata.token_page_table[start:end]
         self.shards, self.mode = shards, mode
         storage = SharedBuffers(buffers, query.device, allocator)
         self.pages = storage.buffer("pages", (1 if mode == "prefill" else rows, width * 2), torch.int32)
@@ -83,15 +74,15 @@ class PreparedIndexSelection:
             coordinator=None if context is None else context.coordinator, name=name + ".selected",
             buffers=SharedBuffers(buffers, query.device, allocator, prefix="consensus."))
 
-    def __call__(self):
-        index_pages(self.tables[:1] if self.mode == "prefill" else self.tables, self.pages)
-        self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
-        self.indexer()
+    def __call__(self, query, weights, positions, tables):
+        index_pages(tables[:1] if self.mode == "prefill" else tables, self.pages)
+        self.lengths.copy_(self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32))
+        self.indexer(query.view(query.shape[0], 32, 128), weights)
         pack_candidates(self.local, self.scores, self.packed, self.shards)
         self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
         self.global_scores.copy_(self.gathered[:, :, 0])
         self.global_ids.copy_(self.gathered.view(torch.int32)[:, :, 1])
-        self.fold_lengths.copy_(torch.where(self.positions >= 0, self.global_ids.shape[1], 0))
+        self.fold_lengths.copy_(torch.where(positions >= 0, self.global_ids.shape[1], 0))
         self.fold()
         self.broadcast()
         return self.selected
@@ -130,11 +121,14 @@ class PreparedDSAIndexer:
         self.bounds = tuple((start, min(start + step, rows)) for start in range(0, rows, step))
         selection_buffers = buffers.setdefault("selection", {})
         cache_pages = cache.view(-1, 64 * 132)
-        self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
-            metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
-            session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
-            latent_cache=latent_cache)
-            for start, end in self.bounds)
+        self.selections = {}
+        for start, end in self.bounds:
+            rows = end - start
+            if rows not in self.selections:
+                self.selections[rows] = PreparedIndexSelection(self.query, self.head_weights, cache_pages,
+                    metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
+                    session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
+                    latent_cache=latent_cache)
 
     def project(self, source):
         self.projections[0](self.query_latent)
@@ -147,4 +141,4 @@ class PreparedDSAIndexer:
         self.normalized_key.copy_(centered * torch.rsqrt(variance + self.eps)
             * self.weights["indexer.k_norm.weight"].float() + self.weights["indexer.k_norm.bias"].float())
         self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        self.parts[0].indexer.write_keys(self.normalized_key, self.slots)
+        self.selections[self.bounds[0][1]].indexer.write_keys(self.normalized_key, self.slots)

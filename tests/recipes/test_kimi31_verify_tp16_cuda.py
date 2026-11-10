@@ -192,15 +192,17 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                         workspace=arena, buffers=buffers, context=context)
                     variants[name] = variant
                 largest = variants["verify129"].operation
+                largest_part = largest.parts[largest.absorbed.shape[0]]
                 for variant in variants.values():
                     operation = variant.operation
+                    part = operation.parts[variant.capacity]
                     for field in ("absorbed", "attended", "latent", "query_norm"):
                         assert getattr(operation, field).data_ptr() == getattr(largest, field).data_ptr()
                     assert operation.indexer.query.data_ptr() == largest.indexer.query.data_ptr()
-                    assert operation.parts[0]["selector"].selected.data_ptr() == largest.parts[0]["selector"].selected.data_ptr()
+                    assert part["selector"].selected.data_ptr() == largest_part["selector"].selected.data_ptr()
                     for field in ("quantized", "gathered", "partial", "lse"):
-                        assert operation.parts[0][field].data_ptr() == largest.parts[0][field].data_ptr()
-                    assert operation.parts[0]["attention"].arguments["cu_seqlens_q"].numel() == variant.capacity + 1
+                        assert part[field].data_ptr() == largest_part[field].data_ptr()
+                    assert part["attention"].arguments["cu_seqlens_q"].numel() == variant.capacity + 1
                 session.tune(show_progress=False)
                 for variant in variants.values():
                     variant.forward = _TargetForward(variant, source)
@@ -269,7 +271,7 @@ def _rank(rank, rendezvous, compile_decoder, force_external, cache_root):
                     arena.tensor.fill_(255)
                     operation.attended.fill_(17)
                     operation.projections["output"].output.fill_(19)
-                    part = operation.parts[0]
+                    part = operation.parts[variant.capacity]
                     part["partial"].fill_(torch.nan)
                     part["lse"].fill_(torch.nan)
                     selector = part["selector"]

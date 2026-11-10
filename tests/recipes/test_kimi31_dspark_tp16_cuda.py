@@ -550,8 +550,8 @@ def _sequence_draft(prepared, metadata, rank):
         operation.query.copy_(projection.absorbed)
         operation.gather(operation.query.flatten(1))
         stage["gathered"] = operation.gathered.clone()
-        operation.history_attention()
-        operation.current_attention()
+        operation.history_attention(operation.gathered, operation.history)
+        operation.current_attention(operation.gathered, operation.current)
         for name in ("history", "history_lse", "current", "current_lse"):
             stage[name] = getattr(operation, name).clone()
         merge_attention(operation.history, operation.history_lse, operation.current, operation.current_lse,

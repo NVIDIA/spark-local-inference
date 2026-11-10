@@ -57,10 +57,10 @@ def test_ragged_tuning_partition_covers_physical_queries(monkeypatch, tokens, ba
         session.tune()
         assert observed
         cache.fill_(.125)
-        attention()
+        attention(query, output)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            attention()
+            attention(query, output)
         session.freeze()
         for reverse in (False, True):
             counts = starts.diff().flip(0) if reverse else starts.diff()

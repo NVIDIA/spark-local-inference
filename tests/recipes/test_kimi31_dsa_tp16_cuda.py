@@ -121,7 +121,7 @@ def _rank(rank, rendezvous):
                     selection_slots(selected, positions, tables, owners, slots, counts, shards,
                                     physical_pages, local=True)
                     gather_heads(query.view(rows, -1))
-                    attention()
+                    attention(gathered_query, partial)
                     combine(partial, lse)
 
                 forward()

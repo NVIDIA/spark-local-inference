@@ -17,6 +17,7 @@ from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.kda_speculation import PreparedKDAReplay
+from ignition.preparation.scratch import buffer_rows
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import PreparedMLA
@@ -115,7 +116,7 @@ class PreparedMLP:
             if field not in buffers or buffers[field].shape[0] < rows:
                 buffers[field] = (torch.zeros((rows, width), dtype=source.dtype, device=device) if allocator is None
                                   else allocator.zeros((rows, width), source.dtype))
-            return buffers[field][:rows]
+            return buffer_rows(buffers, field, rows)
         width = (weights["gate_up"].shape[0] if isinstance(weights["gate_up"], torch.Tensor)
                  else weights["gate_up"].out_features)
         self.input = buffer("input", width // 2)
@@ -172,7 +173,7 @@ class PreparedLatentMoE:
                 shape = (max(tokens, ROUTE_ROWS), width)
                 buffers[field] = (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
                                   else allocator.zeros(shape, dtype))
-            return buffers[field][:tokens]
+            return buffer_rows(buffers, field, tokens)
 
         self.source = buffer("source", hidden // shard.world_size)
         self.hidden_columns, self.latent_begin = storage.hidden_columns, storage.latent_begin
