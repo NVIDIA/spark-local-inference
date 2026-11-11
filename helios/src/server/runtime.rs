@@ -2224,6 +2224,9 @@ impl<'a> Worker<'a> {
                 StoreEvent::Stored {
                     checkpoint, result, ..
                 } => {
+                    if let Err(error) = &result {
+                        eprintln!("HOST_CACHE_STORE_ERROR checkpoint={} error={error}", checkpoint.value());
+                    }
                     self.metrics.host_retry_abandoned[5]
                         .fetch_add(u64::from(result.is_err()), Ordering::Relaxed);
                     self.scheduler.unpin_checkpoint(checkpoint)?;
@@ -2304,6 +2307,9 @@ impl<'a> Worker<'a> {
         for publication in publications {
             progress = true;
             let outcome = store.store(&publication);
+            if let Err(error) = &outcome {
+                eprintln!("HOST_CACHE_STORE_SUBMIT_ERROR checkpoint={} error={error}", publication.id.value());
+            }
             if let Ok(outcome) = outcome {
                 self.metrics.host_store_outcome(outcome);
                 match outcome {

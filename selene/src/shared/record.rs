@@ -41,10 +41,12 @@
 //! | 173 | 4 | rank count, `u32` |
 //! | 177 | variable | rank entries |
 //!
-//! Each rank entry is a plane count as `u32`, that many plane unit sizes as
-//! `u64`, and the row unit size as `u64`. Unit sizes are the unpadded sizes
-//! the GPU geometry declares; padding is derived. Version 2 uses flag bit 31
-//! for replicated pages and bit 30 for a replicated row. The bytes after
+//! Each rank entry is a plane count as `u32`, that many plane unit sizes, and
+//! the row unit size as `u64`. Versions 1 and 2 encode plane sizes as `u64`;
+//! version 3 uses `u32` so large tensor-parallel geometries fit the same block.
+//! Unit sizes are the unpadded sizes the GPU geometry declares; padding is derived.
+//! Version 2 uses flag bit 31 for replicated pages and bit 30 for a replicated row.
+//! Version 3 permits both replicated and ordinary records. The bytes after
 //! the last rank entry are zero. A geometry whose entries do not fit in the block is
 //! rejected. The segment offsets are derived: the page segment starts after
 //! the checksum segment and the row segment after `tail_pages` page records.
@@ -72,8 +74,9 @@ use crate::{Error, PrefixKey, Result};
 use crate::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
-pub const VERSION: u32 = 1;
-const REPLICATED_VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+const LEGACY_VERSION: u32 = 1;
+const LEGACY_REPLICATED_VERSION: u32 = 2;
 const REPLICATED: u32 = 1 << 31;
 const REPLICATED_ROW: u32 = 1 << 30;
 pub const HEADER_BYTES: usize = BLOCK_BYTES as usize;
@@ -98,8 +101,9 @@ impl RankSizes {
         padded(self.row_bytes)
     }
 
-    fn encoded_bytes(&self) -> usize {
-        4 + 8 * self.planes.len() + 8
+    fn encoded_bytes(&self, version: u32) -> usize {
+        let plane_bytes = if version == VERSION { 4 } else { 8 };
+        4 + plane_bytes * self.planes.len() + 8
     }
 }
 
@@ -109,8 +113,10 @@ pub struct Replication {
     pub row: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Header {
+    /// Encoding version retained across legacy read/rewrite cycles; not semantic identity.
+    version: u32,
     pub identity: [u8; 32],
     pub fingerprint: [u8; 16],
     pub flags: u32,
@@ -126,6 +132,26 @@ pub struct Header {
     /// Seconds since the Unix epoch.
     pub created: u64,
 }
+
+impl PartialEq for Header {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.fingerprint == other.fingerprint
+            && self.flags == other.flags
+            && self.key == other.key
+            && self.parent == other.parent
+            && self.bucket == other.bucket
+            && self.page_tokens == other.page_tokens
+            && self.tail_pages == other.tail_pages
+            && self.ranks == other.ranks
+            && self.page_segment == other.page_segment
+            && self.row_segment == other.row_segment
+            && self.row_checksum == other.row_checksum
+            && self.created == other.created
+    }
+}
+
+impl Eq for Header {}
 
 impl Header {
     /// A header for a record under `layout`, with segment offsets derived from
@@ -171,6 +197,7 @@ impl Header {
         created: u64,
     ) -> Result<Self> {
         let mut header = Self {
+            version: VERSION,
             identity,
             fingerprint,
             flags: 0,
@@ -193,15 +220,14 @@ impl Header {
     }
 
     pub fn encode(&self) -> Result<[u8; HEADER_BYTES]> {
-        self.validate()?;
+        self.encode_version(self.version)
+    }
+
+    fn encode_version(&self, version: u32) -> Result<[u8; HEADER_BYTES]> {
+        self.validate_version(version)?;
         let mut bytes = [0u8; HEADER_BYTES];
         let mut cursor = Cursor::new(&mut bytes);
         cursor.put(&MAGIC);
-        let version = if self.replicated() {
-            REPLICATED_VERSION
-        } else {
-            VERSION
-        };
         cursor.put(&version.to_le_bytes());
         cursor.put(&self.flags.to_le_bytes());
         cursor.put(&self.identity);
@@ -226,11 +252,21 @@ impl Header {
         for rank in &self.ranks {
             cursor.put(&(rank.planes.len() as u32).to_le_bytes());
             for size in &rank.planes {
-                cursor.put(&size.to_le_bytes());
+                if version == VERSION {
+                    cursor.put(&(*size as u32).to_le_bytes());
+                } else {
+                    cursor.put(&size.to_le_bytes());
+                }
             }
             cursor.put(&rank.row_bytes.to_le_bytes());
         }
         Ok(bytes)
+    }
+
+    #[cfg(test)]
+    fn encode_legacy_for_test(&self, version: u32) -> Result<[u8; HEADER_BYTES]> {
+        assert_ne!(version, VERSION);
+        self.encode_version(version)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -245,9 +281,9 @@ impl Header {
             return Err(invalid("record header magic is not FLARECKP"));
         }
         let version = cursor.u32("version")?;
-        if version != VERSION && version != REPLICATED_VERSION {
+        if ![LEGACY_VERSION, LEGACY_REPLICATED_VERSION, VERSION].contains(&version) {
             return Err(invalid(format!(
-                "record header version {version} is unsupported; expected 1 or 2"
+                "record header version {version} is unsupported; expected 1, 2, or 3"
             )));
         }
         let flags = cursor.u32("flags")?;
@@ -284,7 +320,11 @@ impl Header {
             let plane_count = cursor.u32("plane count")?;
             let mut planes = Vec::new();
             for _ in 0..plane_count {
-                planes.push(cursor.u64("plane size")?);
+                planes.push(if version == VERSION {
+                    u64::from(cursor.u32("plane size")?)
+                } else {
+                    cursor.u64("plane size")?
+                });
             }
             let row_bytes = cursor.u64("row size")?;
             if planes.is_empty() {
@@ -295,6 +335,7 @@ impl Header {
             ranks.push(RankSizes { planes, row_bytes });
         }
         let header = Self {
+            version,
             identity,
             fingerprint,
             flags,
@@ -309,10 +350,12 @@ impl Header {
             row_checksum,
             created,
         };
-        if (version == REPLICATED_VERSION) != header.replicated() {
+        if (version == LEGACY_VERSION && header.replicated())
+            || (version == LEGACY_REPLICATED_VERSION && !header.replicated())
+        {
             return Err(invalid("record version disagrees with replication flags"));
         }
-        header.validate()?;
+        header.validate_version(version)?;
         Ok(header)
     }
 
@@ -331,6 +374,13 @@ impl Header {
         self.flags = (self.flags & !(REPLICATED | REPLICATED_ROW))
             | (u32::from(replication.pages) * REPLICATED)
             | (u32::from(replication.row) * REPLICATED_ROW);
+        if self.version != VERSION {
+            self.version = if self.replicated() {
+                LEGACY_REPLICATED_VERSION
+            } else {
+                LEGACY_VERSION
+            };
+        }
         let derived = self.derive()?;
         self.page_segment = derived.page_segment;
         self.row_segment = derived.row_segment;
@@ -359,6 +409,10 @@ impl Header {
     /// computed with overflow checks here, so the unchecked size accessors are
     /// safe on any header `new` or `decode` returned.
     fn validate(&self) -> Result<()> {
+        self.validate_version(VERSION)
+    }
+
+    fn validate_version(&self, version: u32) -> Result<()> {
         if self.ranks.is_empty() {
             return Err(invalid("record header rank count is zero"));
         }
@@ -368,7 +422,12 @@ impl Header {
         }) {
             return Err(invalid("record replication disagrees with rank sizes"));
         }
-        let entry_bytes: usize = self.ranks.iter().map(RankSizes::encoded_bytes).sum();
+        if version == VERSION
+            && self.ranks.iter().any(|rank| rank.planes.iter().any(|size| *size > u32::MAX as u64))
+        {
+            return Err(invalid("record header plane size does not fit the version 3 u32 encoding"));
+        }
+        let entry_bytes: usize = self.ranks.iter().map(|rank| rank.encoded_bytes(version)).sum();
         if FIXED_FIELD_BYTES + entry_bytes > HEADER_BYTES {
             return Err(invalid(format!(
                 "record header for {} ranks and {} planes needs {} bytes, more than the \
@@ -1156,6 +1215,68 @@ mod tests {
     }
 
     #[test]
+    fn compact_v3_supports_sixteen_ranks_and_reads_legacy_headers() {
+        let ranks = (0..16)
+            .map(|_| RankSizes {
+                planes: vec![4096; 48],
+                row_bytes: 4096,
+            })
+            .collect::<Vec<_>>();
+        let compact = Header::from_sizes(
+            2048,
+            ranks,
+            IDENTITY,
+            FINGERPRINT,
+            key(640, 1),
+            Some(key(100, 2)),
+            [0; 16],
+            0,
+            0,
+        )
+        .unwrap();
+        let encoded = compact.encode().unwrap();
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), VERSION);
+        assert_eq!(Header::decode(&encoded).unwrap(), compact);
+        assert!(
+            compact
+                .encode_legacy_for_test(LEGACY_VERSION)
+                .unwrap_err()
+                .to_string()
+                .contains("6513")
+        );
+
+        let small = Header::from_sizes(
+            2048,
+            compact.ranks[..1].to_vec(),
+            IDENTITY,
+            FINGERPRINT,
+            key(640, 1),
+            Some(key(100, 2)),
+            [0; 16],
+            0,
+            0,
+        )
+        .unwrap();
+        let legacy = small.encode_legacy_for_test(LEGACY_VERSION).unwrap();
+        assert_eq!(Header::decode(&legacy).unwrap(), small);
+        let mut replicated = small.clone();
+        replicated
+            .set_replication(Replication {
+                pages: true,
+                row: false,
+            })
+            .unwrap();
+        let legacy_replicated = replicated
+            .encode_legacy_for_test(LEGACY_REPLICATED_VERSION)
+            .unwrap();
+        assert_eq!(Header::decode(&legacy_replicated).unwrap(), replicated);
+
+        let mut oversized = compact.clone();
+        oversized.ranks[0].planes[0] = u64::MAX;
+        assert!(oversized.encode().unwrap_err().to_string().contains("u32"));
+    }
+
+    #[test]
     fn row_presence_follows_the_file_length() {
         let geometry = geometries().remove(0);
         let paged = header(&geometry, 64 * 3, None);
@@ -1205,7 +1326,7 @@ mod tests {
             Header::decode(&bytes).unwrap_err().to_string()
         };
         assert!(corrupt(0, b'X').contains("magic"));
-        assert!(corrupt(8, 3).contains("version"));
+        assert!(corrupt(8, 4).contains("version"));
         assert!(corrupt(88, 2).contains("parent presence"));
         assert!(corrupt(142, 0).contains("page segment"));
         assert!(corrupt(150, 0).contains("row segment"));
@@ -1224,7 +1345,7 @@ mod tests {
         let mut wide = header.clone();
         wide.ranks = vec![
             RankSizes {
-                planes: vec![4096; 500],
+                planes: vec![4096; 2000],
                 row_bytes: 4096,
             };
             1
@@ -1238,7 +1359,7 @@ mod tests {
         let mut too_many = header.clone();
         too_many.ranks = vec![
             RankSizes {
-                planes: vec![4096; 100],
+                planes: vec![4096; 200],
                 row_bytes: 4096,
             };
             5
@@ -1290,7 +1411,7 @@ mod tests {
         let geometry = geometries().remove(0);
         let header = header(&geometry, 640, Some(100));
         assert_eq!(header.tail_pages, 9);
-        let encoded = header.encode().unwrap();
+        let encoded = header.encode_legacy_for_test(LEGACY_VERSION).unwrap();
         let patched = |fields: &[(usize, u64)]| {
             let mut bytes = encoded;
             for (offset, value) in fields {
@@ -1460,7 +1581,9 @@ mod tests {
             directory.join(file_name(&key(290, 29))),
         ];
         fs::write(&deleted[8], b"not a record").unwrap();
-        let mut overflowing = header(&geometry, 290, None).encode().unwrap();
+        let mut overflowing = header(&geometry, 290, None)
+            .encode_legacy_for_test(LEGACY_VERSION)
+            .unwrap();
         overflowing[PLANE_0..PLANE_0 + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         fs::write(&deleted[9], overflowing).unwrap();
         let foreign = directory.join("README");
