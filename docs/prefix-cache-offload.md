@@ -247,11 +247,16 @@ policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Each tier drops a non-root record's row once its only child commits, keeping
-the pages; readers and spills delay removal until they release the row. DRAM
-releases row slots, disk truncates at the row segment, and later spills omit it.
-A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
-the remaining tokens.
+Disk drops a non-root record's row once its only child commits, keeping the
+pages. DRAM retains these redundant rows while its free retention space exceeds
+two continuation rows. Reserved transfer intake does not count as retention
+headroom. When that threshold is reached, or an incoming record needs more
+space than is free, DRAM reclaims eligible redundant rows before evicting other
+records. Readers and spills delay row removal until their pins are released.
+DRAM releases row slots, disk truncates at the row segment, and later spills
+omit removed rows. A rewind or later fork restores its retained endpoint when
+available; otherwise it restores the nearest row-bearing ancestor and
+re-prefills the remaining tokens.
 With lazy write-behind, a crash or an incomplete shutdown drain can lose the
 DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
 row-bearing ancestor. Startup prunes childless page-only records and any
@@ -393,11 +398,18 @@ the storage namespace identity, the layout fingerprint, the key (consumed count 
 digest), the parent key, the bucket digest, the page token count, the tail
 page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
-time. Version 2 uses flag bit 31 for a replicated page segment and bit 30 for a
-replicated row. Page offsets use one fixed stride for the whole record. Version-1
-records still recover, and the layout fingerprint is unchanged. An older binary
-treats replicated version-2 files as invalid and **deletes them during recovery**;
-downgrading therefore starts those records cold. A checksum segment follows,
+time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
+plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
+remain `u64`. New records use version 3 when every plane fits `u32`, otherwise
+the `u64` format is retained. All encodings still require the header to fit 4 KiB.
+Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
+replicated row; version 3 also permits non-replicated records. Page offsets use
+one fixed stride for the whole record. Version-1 and version-2 records still
+recover and preserve their encoding on rewrite; cross-rank agreement compares
+canonical header fields independently of the file's encoding version. The
+layout fingerprint is unchanged. A binary that does not support a record's
+version treats it as invalid and **deletes it during recovery**; downgrading
+therefore starts those records cold. A checksum segment follows,
 one 64-bit xxh3 over each stored page record, padded to
 4 KiB, so a restore that reads only a suffix of the pages verifies each page
 it read. The page segment follows, page-major: page `i`, then rank `r`, then

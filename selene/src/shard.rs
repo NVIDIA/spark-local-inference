@@ -1201,7 +1201,7 @@ fn shape(header: &Header) -> Result<[u8; 16]> {
     header.fingerprint = [0; 16];
     header.row_checksum = 0;
     let mut hash = Blake2b::<U16>::new();
-    hash.update(header.encode()?);
+    hash.update(header.canonical_encoding()?);
     Ok(hash.finalize().into())
 }
 
