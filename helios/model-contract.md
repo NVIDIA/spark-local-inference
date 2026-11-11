@@ -149,6 +149,10 @@ Each speculative descriptor declares four independent physical extents:
 
 D is not inferred from W: rectangular programs usually have D = W − 1, while a
 confidence program can generate a full block and verify a shorter useful prefix.
+A mixed descriptor whose embedded round speculates also declares D = W − 1
+(the only depth the binding accepts for it) with `verify_tokens` and
+`draft_source`; the runtime selects mixed graphs by that depth and runs the
+mixed step itself at depth 0.
 Lane limits cannot exceed `min(D + 1, W)` or request output/context limits.
 The host chooses the cohort and physical program from completed observations
 before that program generates proposals.

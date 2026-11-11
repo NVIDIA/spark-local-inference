@@ -28,7 +28,9 @@ def graph_catalog(progress, signatures):
     from math import prod
     from rich.table import Table
 
-    counts = Counter((s.kind, s.speculation_enabled, s.draft_tokens or 0,
+    # Mixed graphs print at the depth their step runs at (zero), so their widths merge into one row;
+    # the manifest's mixed depth is the package's selection key, not a prepared draw count.
+    counts = Counter((s.kind, s.speculation_enabled, s.draft_tokens if s.kind == "speculative" else 0,
                       s.batch_capacity, s.token_capacity, s.packed_token_capacity, s.prefill_capacity)
                      for s in signatures)
     groups = defaultdict(list)

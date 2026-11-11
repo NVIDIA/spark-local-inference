@@ -116,3 +116,82 @@ def test_packing_preserves_native_row_order_and_physical_slots(prompt_row, width
     live = int(inputs.query_lengths.sum())
     assert packed[:live].tolist() == inputs.token_ids[:live].tolist()
     assert not packing.prompt_valid.any() if prompt_row == -1 else packing.prompt_valid.sum() == length
+
+
+def test_mixed_packed_decoder_keeps_its_sample_rows_and_brings_no_sampler(monkeypatch):
+    """The packed decoder is not built in verification mode, which aliases sample rows to hidden rows."""
+    import inspect
+
+    from ignition.components.completion import CompletionOutputs
+    from ignition.components.recurrent import DeltaMetadata
+    from ignition.preparation.scratch import GraphBufferPool
+    from ignition.recipes.qwen38 import mixed_model
+    from ignition.recipes.qwen38.decoder import DecoderScratch, PreparedDecoder
+    from ignition.recipes.qwen38.mixed_state import MixedScratch
+    from ignition.recipes.qwen38.ple import PLEMetadata
+
+    batch, width, prefill = 2, 3, 16
+    tokens = prefill + (batch - 1) * width
+    decoders = []
+
+    class State:
+        def __init__(self, inputs, requests, pool, *, tokens, rows, mode, maintain_draft_state):
+            self.inputs, self.requests, self.pool, self.tokens, self.rows, self.mode = inputs, requests, pool, tokens, rows, mode
+            self.gdn = DeltaMetadata.allocate(rows, "cpu")
+            self.ple = PLEMetadata(torch.zeros(tokens, dtype=torch.int64), self.gdn.query_start_loc,
+                torch.zeros((rows, 2), dtype=torch.int64), self.gdn.convolution_slots, self.gdn.fresh,
+                self.gdn.accepted_tokens, self.gdn.num_seqs, self.gdn.num_tokens)
+
+    class Decoder:
+        """Records the factory's call after binding it to the real decoder's signature."""
+
+        def __init__(self, weights, scratch, state, *args, **kwargs):
+            inspect.signature(PreparedDecoder.__init__).bind(self, weights, scratch, state, *args, **kwargs)
+            self.scratch, self.state, self.kwargs = scratch, state, kwargs
+            decoders.append(self)
+
+    class Sampler:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare(self, *args, **kwargs):
+            pass
+
+        prepare_broadcast = prepare
+
+    class Half:
+        """Stands in for the prefill absorption and the speculative round: calls the decoder factory as the round does."""
+
+        def __init__(self, owner, *args, **kwargs):
+            factory = kwargs.get("decoder_factory")
+            if factory is None:
+                args[0].residual_output = kwargs["residual_output"]
+            else:
+                b, w = args[:2]
+                self.decoder = factory(owner.weights, owner.scratch.rows(b * w, b * w), State(owner.inputs, None, None,
+                    tokens=b * w, rows=b, mode="decode", maintain_draft_state=False), None, None, None, None, None, None,
+                    None, session=None, name="round.target", max_cache_pages=None,
+                    residual_output=kwargs["residual_output"], verification=True, **owner.collectives)
+
+        def prepare(self):
+            pass
+
+    monkeypatch.setattr(mixed_model, "PreparedDecoderState", State)
+    monkeypatch.setattr(mixed_model, "PreparedDecoder", Decoder)
+    monkeypatch.setattr(mixed_model, "PreparedSampling", Sampler)
+    monkeypatch.setattr(mixed_model, "MixedEmbeddingInjection", lambda *args: None)
+    monkeypatch.setattr(mixed_model, "PreparedPrefillAbsorption", Half)
+    monkeypatch.setattr(mixed_model, "PreparedSpeculativeRound", Half)
+    pool = GraphBufferPool("cpu", chunk_bytes=1 << 20)
+    owner = SimpleNamespace(weights=None, inputs=DecoderInputs.allocate("cpu", context=256, tokens=tokens, capacity=batch),
+        requests=None, pool=None, scratch=DecoderScratch.allocate(tokens, "cpu", sample_rows=batch * width + 1,
+                                                                   buffers=pool.cursor()),
+        completion=CompletionOutputs.allocate((2, batch, 24), device="cpu"), session=None, owners=[],
+        collectives=dict(vocabulary_runtime=None, coordinator=None), sampling_workspace=None, frame=None, sequence=None)
+    scratch = MixedScratch.allocate(prefill, batch * width, "cpu", world_size=1)
+    mixed_model.PreparedMixedRound(owner, batch, width, prefill, "mixed", scratch=scratch, features=None, enabled=True)
+    (decoder,) = decoders
+    # The packed decoder keeps b*w+1 sample rows the role states gather into, so it is not built in
+    # verification mode (which aliases sample rows to hidden rows) and brings no sampler of its own.
+    assert decoder.kwargs["verification"] is False and decoder.kwargs["sampler"] is False
+    assert decoder.scratch.sample_hidden.shape[0] == batch * width + 1 < decoder.scratch.hidden.shape[0]
