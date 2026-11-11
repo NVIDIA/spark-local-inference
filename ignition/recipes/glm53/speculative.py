@@ -133,7 +133,9 @@ class PreparedPrefill:
         self.owner, self.generation, self.feedback = owner, generation, feedback
         tokens = feedback.shape[0]
         device = feedback.device
-        self.metadata = DraftMetadata(tokens, 1, owner.inputs.page_tables.shape[1], device, shards=owner.shards)
+        # Target generation finishes before draft metadata overwrites its normalized attention input.
+        self.metadata = DraftMetadata(tokens, 1, owner.inputs.page_tables.shape[1], device, shards=owner.shards,
+                                      hidden=generation.decoder.scratch.attention_hc.normalized)
         self.absorb = owner.draft(self.metadata, f"{name}.absorb", cache_only=True, mode="prefill")
         self.previous = torch.zeros((1, 4096), dtype=torch.bfloat16, device=device)
         self.indices = torch.arange(tokens, device=device)

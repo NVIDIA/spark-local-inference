@@ -23,7 +23,8 @@ def test_fused_draft_metadata_matches_reference(world, capacity, requests):
     generator = torch.Generator().manual_seed(world * 10 + capacity)
     blocks, slots_capacity = 40, 8
     shards = ContextShards.on(1, world, device) if world > 1 else ContextShards()
-    fused = DraftMetadata(requests * capacity, requests, blocks, device, shards=shards)
+    storage = torch.full((requests * capacity, 4096), float("nan"), dtype=torch.bfloat16, device=device)
+    fused = DraftMetadata(requests * capacity, requests, blocks, device, shards=shards, hidden=storage)
     reference = DraftMetadata(requests * capacity, requests, blocks, device, shards=shards)
     slots = torch.tensor([3, 0, 5, 6][:requests], dtype=torch.int64, device=device)
     lengths = torch.randint(0, capacity + 1, (requests,), generator=generator).to(device)

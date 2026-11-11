@@ -482,6 +482,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 forward = PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion, frame, sequence)
                 add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
                 vision_owners.extend((vision_metadata, encoder, forward))
+        prefill_feedback = (torch.empty((config.prefill_chunk_size, 4096), dtype=torch.bfloat16, device=device)
+                            if config.mtp else None)
         for enabled in graph_modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             mode_inputs = tuple(field for field in forward_inputs if enabled or field != "draft_page_tables")
@@ -493,7 +495,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     metadata[name] = DecoderMetadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decoder_storage
                     scratch[name] = storage.rows(capacity, mode, sample_rows=rows)
-                    feedback = (torch.empty((capacity, 4096), dtype=torch.bfloat16, device=device)
+                    feedback = (prefill_feedback[:capacity]
                                 if enabled and kind != "scored_prefill" else None)
                     decoders[name] = PreparedDecoder(weights, scratch[name], pool.decoder, metadata[name], mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,

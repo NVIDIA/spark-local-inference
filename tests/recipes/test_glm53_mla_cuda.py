@@ -6,7 +6,9 @@
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +16,8 @@ from b12x.attention import sparse_mla
 from cuda.bindings import driver as cuda
 
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.linear import BatchedQuantizedProjection, BatchedUnquantizedProjection
+from ignition.components.sparse_mla import PreparedSparseMLA
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
@@ -234,4 +238,87 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
         finally:
             if worker is not None:
                 worker.close()
+            graph.reset()
+
+
+@pytest.mark.parametrize("model_weights", [2], indirect=True)
+@torch.no_grad()
+def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weights):
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    from ignition.recipes.glm53.dcp import ContextShards, PREFILL_SLICE_ROWS
+
+    module, weights, world = model_weights
+    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, 64 // world
+    torch.manual_seed(53)
+    caches = [pack_mla_kv_cache_reference(torch.randn(blocks * 256, 512, device=device)).view(-1, 64, 528)
+              for _ in range(world)]
+    peers = torch.tensor([cache.data_ptr() for cache in caches], dtype=torch.int64, device=device)
+    storage = MLAScratch.allocate(capacity, heads, blocks, "prefill", device, context_ranks=world)
+    queries = torch.randn(storage.query.shape, dtype=torch.bfloat16, device=device) * .1
+    arena, operations, graphs, compiled = ScratchArena(device), {}, {}, {}
+    kv = weights["kv_b_proj"]
+    projection = BatchedUnquantizedProjection if isinstance(kv, torch.Tensor) else BatchedQuantizedProjection
+    if isinstance(kv, torch.Tensor):
+        values = kv.view(heads, 512, 512)
+        absorb_weights, expand_weights = values[:, :256], values[:, 256:]
+    else:
+        values, scales = kv.weight.values.view(heads, 512, 512), kv.weight.scale_rows.view(heads, 512, 16)
+        absorb_weights, expand_weights = (values[:, :256], scales[:, :256]), (values[:, 256:], scales[:, 256:])
+    with RecordedPreparationSession(device=device, checkpoint="glm53-cp-scratch",
+            workload_schema="glm-cp-scratch-v1", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        for rows in (capacity, 2049):
+            for alias in (False, True):
+                key = rows, alias
+                s = storage.rows(rows, "prefill")
+                if not alias:
+                    s = replace(s, expanded=torch.empty_like(s.expanded))
+                metadata = IndexMetadata.allocate(rows, 1, blocks, device)
+                metadata.positions.copy_(torch.arange(rows, device=device) + 8)
+                metadata.block_table[0].copy_(torch.arange(blocks, device=device))
+                s.index.physical.fill_(-1)
+                s.index.physical[:, :4].copy_(torch.arange(4, device=device))
+                s.index.selected_lengths.fill_(4)
+                # Isolate the production CP slice loop with real projections, attention and peer-cache reads.
+                op = PreparedGlmMLA.__new__(PreparedGlmMLA)
+                op.scratch, op.metadata, op.state = s, metadata, SimpleNamespace(peers=peers)
+                op.context = SimpleNamespace(shards=ContextShards.on(0, world, device))
+                op.windows, op.slices = (), []
+                caps = sparse_mla.Caps(device=device, num_q_heads=heads, max_q_rows=PREFILL_SLICE_ROWS, max_width=2051,
+                    softmax_scale=module.scaling, max_batch=PREFILL_SLICE_ROWS, max_kv_rows=s.slab.shape[0],
+                    kv_dtype=torch.uint8, head_dim=512, v_head_dim=512, page_size=64,
+                    model_type=sparse_mla.ModelType.GLM_NEXT, cache_record_bytes=528, mode="extend")
+                for start in range(0, rows, PREFILL_SLICE_ROWS):
+                    end = min(start + PREFILL_SLICE_ROWS, rows)
+                    absorbed, attended = s.absorbed_query[:end - start], s.attended[:end - start]
+                    name = f"cp{rows}.{alias}.{start}"
+                    absorb = projection(s.query[start:end].transpose(0, 1), absorb_weights,
+                        absorbed.transpose(0, 1), major="n", session=session, name=name + ".absorb")
+                    attention = PreparedSparseMLA(absorbed, s.slab.view(-1, 64, 528), s.index.physical[start:end],
+                        s.visible[start:end], s.index.selected_lengths[start:end], attended, caps=caps,
+                        session=session, name=name + ".attention", workspace=arena)
+                    expand = projection(attended.transpose(0, 1), expand_weights,
+                        s.expanded[start:end].transpose(0, 1), major="k", session=session, name=name + ".expand")
+                    op.slices.append((start, end, absorb, attention, expand))
+                operations[key] = op
+        session.tune()
+        for key, op in operations.items():
+            def forward(op=op):
+                op.scratch.query.copy_(queries[:op.scratch.query.shape[0]])
+                op.attend_gathered_context()
+                arena.tensor.fill_(255)
+            compiled[key] = compile_forward(forward)
+            compiled[key]()
+            graphs[key] = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graphs[key]):
+                compiled[key]()
+        session.freeze()
+        for rows in (capacity, 2049, capacity):
+            graphs[rows, False].replay()
+            expected = operations[rows, False].scratch.expanded.clone()
+            storage.query.fill_(float("nan"))
+            graphs[rows, True].replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(operations[rows, True].scratch.expanded, expected)
+        for graph in graphs.values():
             graph.reset()

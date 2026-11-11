@@ -17,6 +17,8 @@ from ignition.recipes.glm53.batch import BatchInputs
 from ignition.recipes.glm53.dcp import ContextShards
 from ignition.recipes.glm53.speculative import PreparedRound
 from ignition.recipes.glm53.mtp import DraftMetadata
+from ignition.recipes.glm53.stack import DecoderScratch
+from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.glm53.state import DecoderMetadata
 from ignition.components.recurrent import DeltaMetadata
 
@@ -76,8 +78,12 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     assert op.metadata.recurrent.state_indices.tolist() == state_indices
 
 
-def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
-    metadata = DraftMetadata(3, 3, 2, "cpu")
+@pytest.mark.parametrize("reuse", [False, True])
+def test_draft_rows_exclude_exhausted_requests_and_restore_output_order(reuse):
+    scratch = DecoderScratch.allocate(3, 2, "prefill", "cpu", shard=TensorParallelShard(0, 2), sample_rows=1)
+    storage = scratch.attention_hc.normalized if reuse else None
+    metadata = DraftMetadata(3, 3, 2, "cpu", hidden=storage)
+    metadata.hidden.fill_(float("nan"))
     slots = torch.tensor([2, 0, 1])
     state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
     tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
@@ -89,11 +95,23 @@ def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
     assert metadata.indexed.token_slots.tolist() == [10 * 256 + 255, 21 * 256 + 254, -1]
     assert metadata.token_ids[:2].tolist() == [8, 9]
     assert metadata.hidden[metadata.output_indices][1:, 0].tolist() == [1, 2]
+    assert hidden[:, 0].tolist() == [0, 1, 2]
+    if reuse:
+        assert torch.equal(storage, metadata.hidden)
+        assert storage.data_ptr() == metadata.hidden.data_ptr()
     metadata.set(slots, torch.zeros(3, dtype=torch.int64), torch.full((3,), 512),
                  torch.tensor([7, 8, 9]), hidden, tables, capacity=1, state_rows=state_rows)
     assert metadata.num_tokens.item() == 0
+    assert not metadata.hidden.count_nonzero()
     assert metadata.indexed.positions.tolist() == [-1, -1, -1]
     assert metadata.indexed.token_slots.tolist() == [-1, -1, -1]
+
+
+@pytest.mark.parametrize("hidden", [torch.empty((2, 4096)), torch.empty((1, 4096), dtype=torch.bfloat16),
+    torch.empty((4096, 2), dtype=torch.bfloat16).t(), torch.empty((2, 4096), device="meta", dtype=torch.bfloat16)])
+def test_draft_hidden_storage_rejects_incompatible_views(hidden):
+    with pytest.raises(ValueError, match="draft hidden storage"):
+        DraftMetadata(2, 1, 2, "cpu", hidden=hidden)
 
 
 @pytest.fixture(autouse=True)
