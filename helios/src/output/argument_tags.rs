@@ -159,11 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_calls_fail_without_coercion() {
+    fn malformed_calls_fail() {
         for body in [
             "",
             "run<arg_key></arg_key><arg_value>x</arg_value>",
-            "run<arg_key>count</arg_key><arg_value>two</arg_value>",
             "run<arg_key>text</arg_key><arg_value>a</arg_value><arg_key>text</arg_key><arg_value>b</arg_value>",
             "run<arg_key>text</arg_key><arg_value>unfinished",
             "run<arg_key>x</arg_key>text",
@@ -171,6 +170,64 @@ mod tests {
             assert!(
                 ArgumentTags::parse(body, &config().tools).is_err(),
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_type_declarations_fail_unless_a_valid_branch_matches() {
+        let tools = vec![json!({"type":"function", "function": {
+        "name":"run", "parameters":{"type":"object", "properties":{
+            "bad":{"type":42}, "union":{"anyOf":[{"type":42}]},
+            "mixed":{"oneOf":[{"type":42},{"type":"integer"}]}
+        }}}})];
+        let call = |key: &str, value: &str| {
+            ArgumentTags::parse(
+                &format!("run<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"),
+                &tools,
+            )
+        };
+        for (key, value) in [("bad", "123"), ("union", "123"), ("mixed", "two")] {
+            assert!(call(key, value).is_err(), "{key}={value}");
+        }
+        assert_eq!(call("mixed", "123").unwrap()[0].1, "{\"mixed\":123}");
+    }
+
+    #[test]
+    fn mismatched_argument_types_retain_generated_values_without_coercion() {
+        let tools = vec![json!({"type":"function", "function": {
+        "name":"run", "parameters":{"type":"object", "properties":{
+            "count":{"type":"integer"}, "enabled":{"type":"boolean"},
+            "items":{"type":"array"}, "choice":{"anyOf":[{"type":"integer"},{"type":"null"}]},
+            "listed":{"anyOf":[{"type":"object"},{"type":"string"}]}
+        }}}})];
+        let text = "</think><tool_call>run<arg_key>enabled</arg_key><arg_value>\"true\"</arg_value><arg_key>count</arg_key><arg_value>two</arg_value><arg_key>items</arg_key><arg_value>2.5</arg_value><arg_key>choice</arg_key><arg_value>false</arg_value><arg_key>listed</arg_key><arg_value>3</arg_value></tool_call>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = ArgumentTagOutput::new(OutputConfig {
+                tools: tools.clone(),
+                ..config()
+            });
+            let mut output = Accumulator::new("test".into());
+            for part in [&text[..split], &text[split..]] {
+                output
+                    .apply(parser.push(Input::Text(part)).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            let message = output.message();
+            let arguments: Value = serde_json::from_str(
+                message["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arguments,
+                json!({"enabled":"true", "count":"two", "items":2.5, "choice":false, "listed":"3"}),
+                "split {split}"
             );
         }
     }
