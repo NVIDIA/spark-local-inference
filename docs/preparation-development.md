@@ -96,16 +96,17 @@ storage, downloads retained bytes, serializes resources, and owns asset writes,
 hashing, zstd level-3 executable compression, signing, conversion, rank payload
 transfer, and publication. Each executable resource is one zstd level-3 frame
 with a signed decoded length and compressed-chunk commitments.
-Export capture copies each graph's nodes, argument bytes, attributes, and
-annotated edges into native storage without instantiating an executable.
-Ignition retains the external CUDA memory pools and captured kernel owners,
-then resets the capture object to release its template. Diagnostic captures
-retain executables; their post-instantiation hooks can copy the same metadata
-before PyTorch releases their templates. Native export resolves allocations
-and validates bindings against the copied metadata. Keep captured buffers,
-contexts, copied metadata, pool owners, kernel owners, and any diagnostic
-executables alive until native work confirms a drain; an unsuccessful drain
-retains their owners.
+Ordinary export retains CUDA templates and instantiated executables, including
+their external memory pools and captured kernel owners, until native export
+has drained. Budget preparation memory for those executables across the serving
+graph catalog. Native export copies nodes, argument bytes, attributes, and
+annotated edges, then resolves allocations and validates their bindings.
+Diagnostic captures can copy the same metadata through post-instantiation hooks
+before PyTorch releases their templates. The core stores graph descriptions,
+not the Python executables; Helios creates executable instances at load time.
+Keep captured buffers, contexts, metadata, pool owners, kernel owners, and graph
+handles alive until native work confirms a drain; an unsuccessful drain retains
+their owners.
 
 Native transfer pools size file-buffer concurrency from available host memory
 and preparation rank count, accounting for pinned CUDA download storage. Each
