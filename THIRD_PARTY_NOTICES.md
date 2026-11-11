@@ -92,9 +92,9 @@ notice files of every NuGet package pinned in `flare-winui/packages.config` into
 no license text. The pinned WebView2 package supplies build metadata only; its
 notices are included although none of its files are bundled.
 
-The Visual C++ runtime DLLs are copied from the `Microsoft.VC143.CRT` directory
-of the Visual Studio installation that built the desktop, under its
-`VC\Redist` folder. Microsoft's
+The Visual C++ runtime DLLs are copied from the newest app-local runtime
+directory, such as `Microsoft.VC143.CRT`, of the Visual Studio installation that
+built the desktop, under its `VC\Redist` folder. Microsoft's
 [Visual Studio 2022 redistribution list](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)
 permits distributing unmodified files from that folder with a program, subject
 to the Visual Studio license terms. Visual Studio supplies no license file

@@ -168,6 +168,8 @@ jobs:
           New-Item -ItemType Directory -Path $launch | Out-Null
           Copy-Item -LiteralPath (Join-Path $extract 'flare\Flare.exe') -Destination $launch
           $launcher = Start-Process -FilePath (Join-Path $launch 'Flare.exe') -WorkingDirectory $launch -PassThru
+          # Windows PowerShell reports no exit code unless the handle is opened before the process exits.
+          $null = $launcher.Handle
           if (-not $launcher.WaitForExit(120000)) {
               $launcher.Kill()
               throw 'The launcher did not exit within 120 seconds.'
