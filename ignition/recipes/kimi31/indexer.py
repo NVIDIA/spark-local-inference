@@ -48,6 +48,7 @@ class PreparedIndexSelection:
         self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
         self.scores = storage.buffer("local_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
+        self.candidate_counts = storage.buffer("candidate_counts", (rows,), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
         self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
             cache, pages, self.lengths, None, self.local, mode="prefill" if mode == "prefill" else "decode", session=session,
@@ -65,7 +66,8 @@ class PreparedIndexSelection:
             reduction_runtime=tuning.reduction if tune else None, session=session,
             coordinator=None if context is None else context.coordinator, name=name + ".merge",
             buffers=SharedBuffers(buffers, query.device, allocator, prefix="merge."),
-            dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",))
+            dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",),
+            local_counts=self.candidate_counts if tune else None)
         if tune:
             tuning.register(self.merge)
         else:

@@ -26,6 +26,38 @@ def _owner_candidates(Indices, ScoreBits, Active, Rank, Packed, OwnerActive,
         tl.store(OwnerActive + row, live)
 
 
+@triton.jit
+def _owner_candidates_counted(Indices, ScoreBits, Counts, Active, Rank, Packed, OwnerActive,
+                              ROWS: tl.constexpr, OWNER_ROWS: tl.constexpr, WORLD: tl.constexpr,
+                              TOPK: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    global_row = tl.load(Rank) * OWNER_ROWS + row
+    active = tl.load(Active + global_row, global_row < ROWS, other=0) != 0
+    peer = column // TOPK
+    offset = column % TOPK
+    count = tl.load(Counts + row * WORLD + peer, mask=column < WIDTH, other=0)
+    count = tl.maximum(0, tl.minimum(count, TOPK))
+    live = active & (offset < count)
+    ids = tl.load(Indices + row * WIDTH + column, live, other=-1)
+    bits = tl.load(ScoreBits + row * WIDTH + column, live, other=-8388608)
+    tl.store(Packed + (row * WIDTH + column) * 2, bits, column < WIDTH)
+    tl.store(Packed + (row * WIDTH + column) * 2 + 1, ids, column < WIDTH)
+    if tl.program_id(1) == 0:
+        tl.store(OwnerActive + row, active)
+
+
+def _candidate_transport_counts(indices, scores, output):
+    """Find the last position that is not canonical padding on every row.
+
+    A nonprefix valid ID, malformed entry or nonfinite score extends the
+    transported prefix. Only a canonical (-1, -inf) suffix is elided.
+    """
+    columns = torch.arange(1, indices.shape[1] + 1, dtype=torch.int32, device=indices.device)
+    noncanonical = (indices != -1) | (scores != -torch.inf)
+    output.copy_(torch.where(noncanonical, columns, 0).amax(dim=1))
+
+
 class PreparedOwnerTopK:
     """Select the same rank-major candidates on one owner per query.
 
@@ -36,7 +68,8 @@ class PreparedOwnerTopK:
     """
 
     def __init__(self, local_indices, local_scores, active, rank, output, *,
-                 owner_runtime, reduction_runtime, session, coordinator, name, buffers, dependencies=()):
+                 owner_runtime, reduction_runtime, session, coordinator, name, buffers,
+                 dependencies=(), local_counts=None):
         rows, local_topk = local_indices.shape
         world = owner_runtime.world_size
         if (output.ndim != 2 or output.shape[0] != rows or output.dtype != torch.int32
@@ -49,12 +82,21 @@ class PreparedOwnerTopK:
                 or any(t.device != local_indices.device or not t.is_contiguous()
                        for t in (local_indices, local_scores, active, rank, output))):
             raise ValueError("owner selection requires matching candidate rows and communication ranks")
+        if (local_counts is not None and (local_counts.shape != (rows,) or local_counts.dtype != torch.int32
+                or local_counts.device != local_indices.device or not local_counts.is_contiguous())):
+            raise ValueError("owner selection requires contiguous int32 candidate counts per row")
+        if local_counts is not None:
+            start, end = local_counts.data_ptr(), local_counts.data_ptr() + local_counts.nbytes
+            if any(start < tensor.data_ptr() + tensor.nbytes and tensor.data_ptr() < end
+                   for tensor in (local_indices, local_scores, active, rank, output)):
+                raise ValueError("candidate count scratch must not overlap inputs or output")
         owner_rows, width, topk = -(-rows // world), local_topk * world, output.shape[1]
         self.rows, self.owner_rows, self.width = rows, owner_rows, width
+        self.world, self.local_topk = world, local_topk
         self.rank, self.active, self.output = rank, active, output
         self.transport = PreparedCandidateOwnerStage(local_indices, local_scores,
             runtime=owner_runtime, session=session, coordinator=coordinator, name=name + ".stage",
-            dependencies=dependencies)
+            dependencies=dependencies, local_counts=local_counts)
         self.packed = buffers.zeros((owner_rows, width, 2), torch.float32)
         self.owner_active = buffers.zeros((owner_rows,), torch.bool)
         self.global_scores = buffers.zeros((owner_rows, width), torch.float32)
@@ -71,10 +113,20 @@ class PreparedOwnerTopK:
             name=name + ".selected", buffers=buffers)
 
     def __call__(self):
-        indices, scores = self.transport()
-        torch.library.wrap_triton(_owner_candidates)[(self.owner_rows, triton.cdiv(self.width, 1024))](
-            indices, scores.view(torch.int32), self.active, self.rank, self.packed.view(torch.int32), self.owner_active,
-            ROWS=self.rows, OWNER_ROWS=self.owner_rows, WIDTH=self.width, BLOCK=1024, num_warps=4)
+        if self.transport.local_counts is None:
+            indices, scores = self.transport()
+            torch.library.wrap_triton(_owner_candidates)[(self.owner_rows, triton.cdiv(self.width, 1024))](
+                indices, scores.view(torch.int32), self.active, self.rank, self.packed.view(torch.int32), self.owner_active,
+                ROWS=self.rows, OWNER_ROWS=self.owner_rows, WIDTH=self.width, BLOCK=1024, num_warps=4)
+        else:
+            _candidate_transport_counts(self.transport.local_indices, self.transport.local_scores,
+                                        self.transport.local_counts)
+            indices, scores, counts = self.transport()
+            torch.library.wrap_triton(_owner_candidates_counted)[(self.owner_rows, triton.cdiv(self.width, 1024))](
+                indices, scores.view(torch.int32), counts, self.active, self.rank,
+                self.packed.view(torch.int32), self.owner_active,
+                ROWS=self.rows, OWNER_ROWS=self.owner_rows, WORLD=self.world,
+                TOPK=self.local_topk, WIDTH=self.width, BLOCK=1024, num_warps=4)
         self.candidates()
         self.fold()
         return self.broadcast()
