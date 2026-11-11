@@ -1,3 +1,7 @@
+[ ] Ensure Rust bridge updates relink the WinUI executable during incremental
+    builds. MSBuild can retain flare-winui.exe after the bridge library changes;
+    verify loose and single-file outputs without requiring /t:Rebuild.
+
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
     Payload cores report rebuild: null even when DeploymentBody.rebuild is present.
 

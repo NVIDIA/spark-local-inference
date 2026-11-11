@@ -109,7 +109,10 @@ Discovery cards show the repository author, published precision, task, license,
 context, and hardware builds when that metadata is available. Missing fields
 are omitted. Hub file sizes cover every file in one resolved revision, including
 documentation and other deployments; they are not an exact download size or a
-GPU memory requirement. Details identifies the revision and commit. Cached
+GPU memory requirement. Cards show the last update date of the resolved hardware
+branch when Hugging Face provides it. Details identifies the branch, commit, and
+last commit time in UTC. For downloaded discovery entries, this date describes
+the Hub branch; the installed core may be from an earlier commit. Cached
 cores show logical payload size as Core data, with context and hardware from
 installed deployments. Logical payload size can differ from storage usage.
 Discovery reads Hub metadata and small configuration files, without fetching
@@ -120,10 +123,13 @@ promotional subtitles; the empty Downloads view shows No downloads and Browse
 models alongside access to core storage.
 
 Home centers on running a local core and observing its runtime. Installed
-cores have a Run model action. Add model opens a single chooser for Hugging Face
-discovery, a repository link, or a local core file or folder. Model details are
-available in Models. Loading shows runtime progress. A running model exposes
-switch and stop controls alongside the serving address and its copy action.
+cores have a Run model action. Cached models with one recorded Hugging Face
+repository use its repository name on Home and in the library. Local exports
+use the model name recorded in their core metadata. Add model opens a single
+chooser for Hugging Face discovery, a repository link, or a local core file or
+folder. Model details are available in Models. Loading shows runtime progress.
+A running model exposes switch and stop controls alongside the serving address
+and its copy action.
 Chat remains available in the sidebar for testing the active session.
 The dashboard uses the CLI overview's two-second rate window and 120-second
 history for prefill, generation, verification, and draft acceptance/depth.
@@ -147,8 +153,13 @@ Clear failed removes failed entries from download history. Completed, active,
 paused, and cancelled entries remain, and downloaded data is kept for retries.
 
 Model details inspect signed metadata without granting publisher consent or
-loading the GPU. The PC filter hides cores whose inspected requirements are
-known to be incompatible; unknown candidates remain visible. Chat streams
+loading the GPU. For this PC hides undownloaded repositories whose published
+platform branches exclude the first visible GPU's platform, and local cores
+whose inspected requirements are known to be incompatible. Missing build metadata
+or an unknown GPU platform leaves a repository visible. Downloaded cores use
+their inspected requirements even if the repository no longer publishes a
+matching platform branch. A matching branch does not establish core compatibility
+or available memory; loading performs those checks. Chat streams
 multi-turn test conversations from the active Helios session.
 Enter sends a message; Shift+Enter adds a line.
 Stop preserves partial output, and New chat clears the conversation. Successful

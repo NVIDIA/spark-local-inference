@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <cwctype>
+#include <format>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -110,6 +111,14 @@ std::wstring parameter_text(uint64_t value) {
     if(value>=1'000'000)return number(value/1e6,1)+L"M";
     return count_text(value);
 }
+std::wstring updated_text(std::wstring const& value,bool date_only=false) {
+    std::chrono::sys_time<std::chrono::milliseconds> updated;
+    std::wistringstream input(value);
+    input>>std::chrono::parse(L"%FT%TZ",updated);
+    if(input.fail())return value;
+    if(date_only)return std::format(L"{:%Y-%m-%d}",updated);
+    return std::format(L"{:%Y-%m-%d %H:%M:%S} UTC",std::chrono::floor<std::chrono::seconds>(updated));
+}
 std::wstring state_name(uint32_t state) {
     switch (state) {
     case FLARE_LOADING: return L"Loading";
@@ -132,6 +141,8 @@ struct ModelItem {
     std::wstring author, task, license, quantization, hardware, revision, revision_commit, base_model;
     uint64_t context_tokens{}, parameter_count{}, revision_bytes{};
     uint32_t rank_count{}, metadata_known{};
+    std::wstring revision_updated_at;
+    bool published_build_mismatch{};
     bool catalog() const { return (flags & FLARE_MODEL_CATALOG) != 0; }
     bool available() const { return (flags & (FLARE_MODEL_LOCAL | FLARE_MODEL_EXTERNAL)) != 0; }
     bool recommended() const { return (flags & FLARE_MODEL_RECOMMENDED) != 0; }
@@ -628,8 +639,12 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
             models.push_back({ utf8(view.id), wide(view.name), wide(view.source), wide(view.version), wide(view.path), wide(view.description), wide(view.error), view.flags, view.logical_bytes, view.size_known != 0 });
             auto& item=models.back();item.author=wide(view.author);item.task=wide(view.task);item.license=wide(view.license);item.quantization=wide(view.quantization);item.hardware=wide(view.hardware);item.revision=wide(view.revision);item.revision_commit=wide(view.revision_commit);item.base_model=wide(view.base_model);
             item.context_tokens=view.context_tokens;item.parameter_count=view.parameter_count;item.revision_bytes=view.revision_bytes;item.rank_count=view.rank_count;item.metadata_known=view.metadata_known;
+            item.revision_updated_at=wide(view.revision_updated_at);
+            item.published_build_mismatch=view.published_build_mismatch!=0;
             for (auto field : { view.id, view.name, view.source, view.version, view.path, view.description, view.error }) fingerprint += std::to_wstring(field.length) + L":" + wide(field);
             for (auto field : { view.author, view.task, view.license, view.quantization, view.hardware, view.revision, view.revision_commit, view.base_model }) fingerprint += std::to_wstring(field.length) + L":" + wide(field);
+            fingerprint+=std::to_wstring(view.revision_updated_at.length)+L":"+wide(view.revision_updated_at);
+            fingerprint+=L"/"+std::to_wstring(view.published_build_mismatch);
             fingerprint += L"/"+std::to_wstring(view.context_tokens)+L"/"+std::to_wstring(view.parameter_count)+L"/"+std::to_wstring(view.revision_bytes)+L"/"+std::to_wstring(view.rank_count)+L"/"+std::to_wstring(view.metadata_known);
             fingerprint += L"/" + std::to_wstring(view.flags) + L"/" + std::to_wstring(view.logical_bytes) + L"/" + std::to_wstring(view.size_known) + L";";
         }
@@ -653,7 +668,10 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
         size_t count = 0,recommended_count=0,other_count=0;
         for (auto const& model : models_) {
             if (model.catalog() != discover_tab_) continue;
-            if(filter_incompatible_) {auto match=compatibilities_.find(model.id);if(match!=compatibilities_.end()&&match->second==FLARE_COMPATIBILITY_INCOMPATIBLE)continue;}
+            if(filter_incompatible_) {
+                if(model.catalog()&&!model.available()&&model.published_build_mismatch)continue;
+                auto match=compatibilities_.find(model.id);if(match!=compatibilities_.end()&&match->second==FLARE_COMPATIBILITY_INCOMPATIBLE)continue;
+            }
             auto searchable = model.name + L" " + model.description + L" " + model.source + L" " + model.author + L" " + model.task + L" " + model.quantization;
             std::transform(searchable.begin(), searchable.end(), searchable.begin(), [](wchar_t c){return static_cast<wchar_t>(std::towlower(c));});
             if (!query.empty() && searchable.find(query) == std::wstring::npos) continue;
@@ -690,6 +708,7 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
             auto hardware=model.hardware;if(model.metadata_known&FLARE_MODEL_RANKS)hardware+=(hardware.empty()?L"":L" · ")+std::to_wstring(model.rank_count)+(model.rank_count==1?L" GPU":L" GPUs");
             if(!hardware.empty())model_fact(facts,model.available()?L"Core target":L"Builds",hardware);
             if(!model.license.empty())model_fact(facts,L"License",model.license);
+            if(!model.revision_updated_at.empty())model_fact(facts,L"Hub updated",updated_text(model.revision_updated_at,true)+L" · "+model.revision);
             ToolTipService::SetToolTip(facts,box_value(model.available()?L"Context and hardware are recorded in the installed core. Core data counts logical payload bytes; storage and GPU memory use can differ. Loading performs compatibility checks.":L"Metadata reported by the repository. Hub files is the complete revision size, not GPU memory or an exact download estimate."));
             content.Children().Append(facts);
             if(model.flags&FLARE_MODEL_ACTIVE)content.Children().Append(label(L"● In use",12));

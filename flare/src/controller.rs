@@ -73,8 +73,10 @@ pub struct ModelMetadata {
     pub license: String,
     pub quantization: String,
     pub hardware: String,
+    pub build_target_match: Option<bool>,
     pub revision: String,
     pub revision_commit: String,
+    pub revision_updated_at: String,
     pub base_model: String,
     pub context_tokens: Option<u64>,
     pub parameter_count: Option<u64>,
@@ -1081,8 +1083,10 @@ impl Worker {
                             license: entry.license,
                             quantization: entry.quantization,
                             hardware: entry.hardware,
+                            build_target_match: entry.build_target_match,
                             revision: entry.revision,
                             revision_commit: entry.revision_commit,
+                            revision_updated_at: entry.revision_updated_at,
                             base_model: entry.base_model,
                             context_tokens: entry.context_tokens,
                             parameter_count: entry.parameter_count,
@@ -1272,6 +1276,14 @@ fn external_id(path: &Path) -> String {
     format!("external:{:016x}", hash.finish())
 }
 
+fn local_model_name(entry: &crate::application::LibraryEntry) -> String {
+    let name = match entry.hub_repositories.as_slice() {
+        [repository] => repository.split_once('/').map_or(entry.model.as_str(), |(_, name)| name),
+        _ => &entry.model,
+    };
+    recommendations::local_name(name, &entry.hub_repositories)
+}
+
 fn local_model_metadata(entry: &crate::application::LibraryEntry) -> ModelMetadata {
     let mut result = ModelMetadata {
         author: entry.hub_repositories.first()
@@ -1355,6 +1367,35 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn local_card_names_use_an_unambiguous_acquisition_repository() {
+        let mut entry = crate::application::LibraryEntry {
+            model: "checkpoint".into(),
+            model_key: "checkpoint".into(),
+            version: "gb10-tp1-build".into(),
+            selected: false,
+            leased: false,
+            verification: crate::application::VerificationState::Unverified,
+            hub_repositories: vec![
+                "local-inference-lab/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-FLARE".into(),
+            ],
+            metadata: None,
+            error: None,
+        };
+        assert_eq!(
+            local_model_name(&entry),
+            "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-FLARE"
+        );
+        entry.hub_repositories.push("another-publisher/another-name".into());
+        assert_eq!(local_model_name(&entry), "checkpoint");
+        entry.hub_repositories.clear();
+        assert_eq!(local_model_name(&entry), "checkpoint");
+        entry.model = "Locally prepared model".into();
+        assert_eq!(local_model_name(&entry), "Locally prepared model");
+        entry.hub_repositories.push(recommendations::PREPARED_REPOSITORY.into());
+        assert_eq!(local_model_name(&entry), recommendations::DISPLAY_MODEL);
+    }
+
+    #[test]
     fn local_card_context_uses_an_unambiguous_deployment() {
         let mut entry = crate::application::LibraryEntry {
             model: "Model".into(), model_key: "model".into(), version: "version".into(),
@@ -1426,7 +1467,7 @@ mod tests {
                 id: format!("hub:{source}"),
                 name: source.into(),
                 source: source.into(),
-                metadata: ModelMetadata { context_tokens: Some(1048576), hardware: "GB202".into(), ..Default::default() },
+                metadata: ModelMetadata { context_tokens: Some(1048576), hardware: "GB202".into(), build_target_match: Some(false), revision: "gb202".into(), revision_updated_at: "2026-11-05T18:06:29Z".into(), ..Default::default() },
                 flags: 16,
                 ..Default::default()
             })
@@ -1436,7 +1477,11 @@ mod tests {
         assert_eq!(matched[0].id, "local:local-model@selected");
         assert_eq!(matched[0].metadata.context_tokens, Some(262144));
         assert_eq!(matched[0].metadata.hardware, "GB10");
+        assert_eq!(matched[0].metadata.build_target_match, Some(false));
         assert_eq!(matched[0].metadata.rank_count, Some(1));
+        assert_eq!(matched[0].metadata.revision, "gb202");
+        assert_eq!(matched[0].metadata.revision_updated_at, "2026-11-05T18:06:29Z");
+        assert!(models[1].metadata.revision_updated_at.is_empty());
         assert_eq!(matched[0].name, repository);
         assert_eq!(matched[0].logical_bytes, Some(42));
         assert_eq!(matched[0].flags, 1 | 16);
@@ -1863,7 +1908,7 @@ impl Worker {
                 .unwrap_or_default();
             models.push(ModelView {
                 id: id.clone(),
-                name: recommendations::local_name(&entry.model, &entry.hub_repositories),
+                name: local_model_name(entry),
                 version: entry.version.clone(),
                 source: "Local library".into(),
                 path,

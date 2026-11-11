@@ -142,6 +142,8 @@ typedef struct flare_model {
     uint64_t context_tokens, parameter_count, revision_bytes;
     uint32_t rank_count;
     uint32_t metadata_known;
+    flare_string revision_updated_at;
+    uint32_t published_build_mismatch;
 } flare_model;
 enum {
     FLARE_MODEL_CONTEXT = 1, FLARE_MODEL_PARAMETERS = 2,
