@@ -343,6 +343,17 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `host_bytes_in` | Bytes copied from the host store into GPU pages and rows | `flare_host_cache_bytes_in_total` |
 | `learned_drafter` | Boolean: the model has a learned drafter | none |
 
+GPU checkpoint retention exports `flare_checkpoint_captures_total{role}` with
+`anchor`, `message`, and `endpoint` roles, and
+`flare_checkpoint_skips_total{reason}` with `unknown_cost`, `work_budget`, and
+`storage` reasons. Skip counters count selection or capture rejections, not failed
+requests. `flare_checkpoint_extra_work_nanoseconds_total` sums charged predicted
+extra prefill and copy work; it is not a GPU timing measurement.
+`flare_checkpoint_anchor_reservations` reports unused anchor guards, excluding
+armed destinations and in-flight copies.
+`flare_host_cache_copyout_headroom_deferrals_total` counts local copy-out offers
+deferred by the GPU headroom check before acquiring checkpoint pins.
+
 Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
 `end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
@@ -562,8 +573,10 @@ request preservation of all thinking blocks
 marks the end of that block as a candidate prefix-checkpoint boundary, for the
 first four such blocks in a request; `cache_control` elsewhere is ignored. The
 markers do not change the rendered prompt, and the scheduler chooses among
-candidate boundaries within its checkpoint budget as it does for message
-boundaries.
+candidate boundaries under its work allowance and global storage availability.
+Hints remain advisory; they do not reserve a snapshot or override the
+conversation-anchor priority described in
+[exact endpoint capture](core-design.md#exact-endpoint-capture).
 
 ## Stateless Responses
 

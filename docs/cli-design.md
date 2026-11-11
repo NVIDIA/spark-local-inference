@@ -689,6 +689,18 @@ zero disables that term. Terminal age starts when termination is observed and
 includes queued-work drainage. These are scheduling preferences, not deadlines.
 The controls use the core's captured snapshot graphs and require no re-export.
 
+`--scheduler-checkpoint-extra-work-fraction FRACTION` bounds optional checkpoint
+work relative to productive request work. The default is `0.05`; values must be
+finite and in `[0,1]`. It overrides
+`[server] scheduler_checkpoint_extra_work_fraction`. The scheduler always considers
+the last eligible message endpoint as a best-effort conversation anchor, even
+when timing estimates are unavailable or the fraction is zero. Earlier messages
+and a distinct prompt end consume the fraction of estimated uncached prefill
+work; a distinct terminal endpoint earns its allowance from completed productive
+decode. Extra work includes snapshot copies and additional prefill caused by
+splitting chunks. Snapshot storage remains globally shared and reclaimable for
+mandatory execution. This option requires no core re-export.
+
 `flare run CORE` loads an exported file and reads host defaults from
 `~/.config/flare/config.toml` using its Rust configuration reader. `--config PATH`
 selects another file. Explicit flags override configuration values. `CORE` accepts a
@@ -1241,7 +1253,8 @@ Ignition and native Flare read this file; `--config PATH` selects another file.
 An absent default file supplies no overrides; an explicitly selected missing
 file or an invalid runtime setting is an error. Help does not read the file.
 
-Native `flare run` applies `[server] host`, `port`, `api_key`, and `thinking_token_budget`,
+Native `flare run` applies `[server] host`, `port`, `api_key`, `thinking_token_budget`,
+and `scheduler_checkpoint_extra_work_fraction`,
 `[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
 settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] core_cache`. Flags override these defaults, including explicit
@@ -1271,6 +1284,7 @@ host = "127.0.0.1"
 port = 8000
 api_key = ""                      # Empty: no authentication.
 # thinking_token_budget = 1536    # Optional default reasoning-token cap.
+# scheduler_checkpoint_extra_work_fraction = 0.05  # Fraction of productive work for extra captures.
 
 [defaults]
 model = "qwen3.8-flash"
@@ -1345,8 +1359,10 @@ value in preference to that recorded reserve.
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
 recomputing it. Immutable snapshot capacity is bounded by borrowable KV backing
-and the prepared virtual extent. The per-request capture budget is capped at
-eight. Snapshot slots share physical backing with KV pages and
+and the prepared virtual extent. Checkpoint work uses the request-local work
+allowance described in [native serving flags](#32-native-serving-flags), without
+a capture-count cap or a per-request snapshot share. Snapshot slots share physical
+backing with KV pages and
 acquire it only when retaining a checkpoint. Unpinned checkpoints are evicted
 to admit requests. If active requests or transfers own all suitable backing,
 the engine skips optional checkpoint retention. There is no dedicated snapshot
@@ -1416,7 +1432,7 @@ every rank and have no configuration-file key. See
 | Tensor-parallel size | Count of `--gpus`, or the smallest recipe-supported size whose estimate fits the first GPUs with enough free memory |
 | Context limit | The smaller of the prepared context ceiling and loaded KV capacity after per-request draft-page storage; admission also checks available shared capacity |
 | KV pages | Remaining supply after the runtime memory limit or core reserve, engine headroom, weights, graphs, scratch, and execution rows; bounded by `--kv-cache-limit` and prepared virtual extents. Retained snapshot rows borrow page backing; the load display reports total KV capacity |
-| Prefix cache | Immutable snapshot capacity bounded by borrowable KV backing and the prepared virtual extent, acquired on demand and evicted under pressure; per-request capture budget capped at eight |
+| Prefix cache | Immutable snapshot capacity bounded by borrowable KV backing and the prepared virtual extent, acquired on demand and evicted under pressure; extra captures bounded by predicted work and global storage availability |
 | Live state | One null row plus the recipe's execution rows per active request slot; GLM verification commits into one live row |
 | Decode graph capacities | 1 through `--max-concurrency`, rounded to the recipe's captured set |
 | Image feature arena | Prepared image concurrency times per-request feature capacity and embedding width; slots remain owned through request retirement |

@@ -360,12 +360,18 @@ capacity. Among candidates of one graph kind and cohort that perform the same
 logical work, selection first discards any shape whose capacities are all at
 least as large as another candidate's and larger in at least one. An unmeasured
 prefill graph is not explored when a smaller loaded capacity consumes the same
-tokens. Admission
-budgets cache captures from snapshot capacity divided by configured maximum
-concurrency, clamped to one through eight. It reserves prompt and terminal
-endpoints and selects remaining message checkpoints at approximately equal token
-distances through the uncached suffix. Only selected boundaries interrupt
-prefill. `prefill_chunk_size` must be 64-aligned, at least 64, and within the
+tokens. Checkpoint selection prioritizes the last eligible message boundary,
+using the prompt end when no message boundary is eligible. Earlier messages and
+a distinct prompt end compete within a work allowance of
+`scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill work,
+defaulting to 0.05. Extra captures charge snapshot-copy cost and additional prefill
+caused by splitting chunks. Productive completed decode earns the same fraction
+of measured time for a distinct terminal capture. Unknown costs exclude extras
+while preserving best-effort anchor retention. There is no capture-count cap or
+per-request share of snapshot rows. The global allocator accounts for snapshot
+aliases, guards a later anchor against earlier optional captures, and reclaims
+unused guards for mandatory execution. Only obtainable capture destinations
+introduce prefill cuts. See [checkpoint ownership](../docs/core-design.md#exact-endpoint-capture). `prefill_chunk_size` must be 64-aligned, at least 64, and within the
 context capacity. Batched graphs use power-of-two capacities up to the selected
 concurrency rounded up to a power of two.
 Prefill, decode cohorts, speculative widths, mixed graphs, and prerequisite

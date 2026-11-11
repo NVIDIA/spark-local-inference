@@ -8,6 +8,7 @@ A flag overrides the configuration file, which overrides the recipe. Every
 resolved setting carries the source that supplied it.
 """
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass
@@ -19,7 +20,8 @@ DEFAULT_PATH = Path("~/.config/flare/config.toml")
 
 _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str},
-    "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int},
+    "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int,
+               "scheduler_checkpoint_extra_work_fraction": (int, float)},
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
@@ -34,6 +36,7 @@ _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
 _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "server.thinking_token_budget": None,
+    "server.scheduler_checkpoint_extra_work_fraction": 0.05,
     "memory.reserve": "0",
     "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
@@ -108,8 +111,12 @@ class Configuration:
         for key, value in table.items():
             if key not in schema:
                 raise UsageError(f"{path}: unknown key {key} in [{section}]")
-            if type(value) is not schema[key]:
-                raise UsageError(f"{path}: {key} in [{section}] must be {schema[key].__name__}")
+            expected = schema[key]
+            if type(value) not in (expected if isinstance(expected, tuple) else (expected,)):
+                name = "a number" if isinstance(expected, tuple) else expected.__name__
+                raise UsageError(f"{path}: {key} in [{section}] must be {name}")
+            if key == "scheduler_checkpoint_extra_work_fraction" and not (0 <= value <= 1 and math.isfinite(value)):
+                raise UsageError(f"{path}: {key} in [{section}] must be finite and between zero and one")
             if key in ("drain_on_shutdown", "max_age"):
                 text = value.strip()
                 if text in (("", "on", "off", "0") if key == "drain_on_shutdown" else ("", "off")):

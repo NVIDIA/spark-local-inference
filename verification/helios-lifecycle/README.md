@@ -40,7 +40,7 @@ It also checks that premature cancellation release in a temporary copy of the
 model violates `QueuedReferencesRetainOwnership`.
 Additional model faults check early rank commitment, early queue removal, and
 ownership release after partial dispatch failure, lost inherited fences, and
-speculative pending bounds.
+speculative pending bounds, and publication before checkpoint-copy completion.
 
 ## Scheduler ownership
 
@@ -186,7 +186,7 @@ inherited read fences, retirement retention, and completion-gated reclamation.
 `cache::lifecycle_tests::bounded_cache_ownership_matches_tla` calls the production
 `PrefixCheckpointCache` methods through depth ten. Successor branches copy every
 cache field before calling an operation. The visited key includes the projection
-and relative LRU order. The 29-integer projection contains completed fence,
+and relative retention order. The 29-integer projection contains completed fence,
 publication count, three original-page read fences, and eight fields per node
 (status, parent, original parent, page mask, readiness fence, last-use fence,
 direct pins, retirement fence). All observed edges are checked against
@@ -197,13 +197,43 @@ transactional rejection, duplicate-publication caller ownership, and unique
 returned resources. A separate test compares `reclaimable_if_pinned` with actual
 pinning and eviction in 36 chain, branch, readiness, and pin configurations.
 Victim selection is abstracted to any eligible victim; the model does not prove
-LRU ranking or identity/resource reuse.
+demand/role retention ranking or identity/resource reuse.
 
 The scheduler alias test independently covers all 225 pairs of contiguous ranges
 within four pages, reservation budgets zero through five, both release orders,
 and reacquisition. It checks actual snapshot reservation/release against
 per-page owner counts, free sets, backing-page statistics, and retained page
 budgets. It does not exercise physical CUDA memory aliasing.
+
+## Checkpoint destination reservations
+
+`CheckpointReservation.tla` checks two requests, three snapshot rows, and submission
+fences zero through two. Each row is free, an unused anchor guard, an armed capture
+destination, an in-flight copy, a published checkpoint, a retired destination, or
+mandatory execution storage. A request may hold one guard while an earlier extra
+capture owns another row. Mandatory allocation can revoke a guard; it cannot
+reclaim an armed or copying destination before completion. Cancellation immediately
+releases unused guards and retains outstanding destinations through their final
+fence. Publication requires copy completion. Submitted and completed fences do
+not wrap, and rows can be reused within those bounds.
+
+`scheduler::checkpoint_lifecycle_tests` calls the production scheduler's planning,
+commit, completion, and cancellation methods. It cancels an anchor capture during
+its producing submission, while waiting to copy, during its copy submission, and
+after publication. The tests check release after the relevant fence and published
+checkpoint survival after cancellation. A separate guard test checks oldest-first
+revocation and overlapping backing aliases through the production allocator and
+revocation helper. Guard setup in that test assigns allocated rows directly to
+live requests; it does not exercise optional-cut selection.
+
+A 15-integer projection contains submitted/completed fences, the live-request
+mask, and each row's phase, request owner, retention fence, and observed GPU-use
+fence. TLC checks the observed edges with the same transition relations used by
+`Next`. Scheduler commit and completion are atomic compositions of reservation,
+arming, submission, publication, and reclamation actions. These traces cover
+selected cancellation boundaries, not exhaustive Rust-state exploration. Optional
+work arithmetic, victim ranking, physical CUDA aliases, and executor fence truth
+remain outside this model.
 
 ## Speculative accounting
 

@@ -331,6 +331,7 @@ struct Active<'a> {
     stops: super::stops::TokenStops,
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
+    checkpoint_accounting: crate::scheduler::CheckpointAccounting,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
     // The client decoder runs on another thread; the worker needs reasoning state at the cut.
     reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
@@ -365,6 +366,7 @@ struct Parked<'a> {
     stops: super::stops::TokenStops,
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
+    checkpoint_accounting: crate::scheduler::CheckpointAccounting,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
     reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
 }
@@ -977,6 +979,14 @@ impl Drop for ImagePreparation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CopyoutResources {
+    completed: crate::cache::Fence,
+    scheduler: crate::scheduler::SchedulerStats,
+    exports: usize,
+    next: Option<(usize, u32, bool)>,
+}
+
 struct Worker<'a> {
     config: &'a ModelConfig,
     frontend: &'a crate::frontend::Frontend,
@@ -994,6 +1004,8 @@ struct Worker<'a> {
     store: Option<Box<dyn flare_selene::HostStore>>,
     deferred_stores: Vec<(crate::cache::CheckpointId, flare_selene::StoreReason)>,
     store_progress: u64,
+    deferred_copyouts: Vec<crate::cache::CheckpointId>,
+    copyout_resources: Option<CopyoutResources>,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
     exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
@@ -1027,6 +1039,8 @@ impl<'a> Worker<'a> {
             store: None,
             deferred_stores: Vec::new(),
             store_progress: 0,
+            deferred_copyouts: Vec::new(),
+            copyout_resources: None,
             exports: HashMap::new(),
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
@@ -1308,6 +1322,7 @@ impl<'a> Worker<'a> {
             let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
                 matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
             });
+            let checkpoint_accounting = parked.as_ref().map(|parked| parked.checkpoint_accounting.clone());
             let spec = incoming.spec();
             self.scheduler
                 .advance_to(super::observation::monotonic_ns())?;
@@ -1320,6 +1335,7 @@ impl<'a> Worker<'a> {
                     incoming.pool_lookup.as_ref(),
                     spec,
                     incoming.pool_plan.as_ref(),
+                    checkpoint_accounting,
                     self.prefill_rate,
                     self.metrics,
                 )
@@ -1330,7 +1346,7 @@ impl<'a> Worker<'a> {
                     handle
                 })
             } else {
-                self.scheduler.admit(spec)
+                admit_with_checkpoint_accounting(&mut self.scheduler, spec, checkpoint_accounting)
             };
             let handle = match admission {
                 Ok(handle) => handle,
@@ -1420,6 +1436,7 @@ impl<'a> Worker<'a> {
                     },
                     last_token: None,
                     carried: Carried::default(),
+                    checkpoint_accounting: Default::default(),
                     reasoning: incoming.prompt.reasoning_cut.as_mut().map(|cut| {
                         super::output::Decoder::new(
                             self.frontend,
@@ -1449,6 +1466,7 @@ impl<'a> Worker<'a> {
                 selected_images,
                 prepared_image: None,
                 carried: parked.carried,
+                checkpoint_accounting: self.scheduler.request(handle)?.checkpoint_accounting(),
                 held_logprobs: parked.held_logprobs,
                 reasoning: parked.reasoning,
             });
@@ -1952,6 +1970,7 @@ impl<'a> Worker<'a> {
             live.prompt_tokens,
             live.reused_prompt_tokens(),
         );
+        let checkpoint_accounting = live.checkpoint_accounting();
         self.scheduler.finish(handle)?;
         let active = self.active[slot].take().unwrap();
         self.admissions[slot] = None;
@@ -1966,6 +1985,7 @@ impl<'a> Worker<'a> {
         let generated_tokens = active.carried.generated_tokens + generated;
         incoming.prompt.sampling.seed = continuation_seed(seed, generated_tokens);
         let parked = Parked {
+            checkpoint_accounting,
             last_token: active.last_token,
             stops: active.stops,
             text_stops: active.text_stops,
@@ -2307,9 +2327,43 @@ impl<'a> Worker<'a> {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+        let resources = CopyoutResources {
+            completed: self.scheduler.completed(),
+            scheduler: self.scheduler.stats(),
+            exports: self.exports.len(),
+            next: next_admission(&self.scheduler, &self.parked, &self.pending)
+                .map(|next| (next.prompt_tokens, next.max_new_tokens, next.growable)),
+        };
+        let retry_copyouts = retry || progress || self.copyout_resources != Some(resources);
+        self.copyout_resources = Some(resources);
+        let deferred_copyouts = std::mem::take(&mut self.deferred_copyouts);
+        for id in &deferred_copyouts {
+            if !publications.iter().any(|publication| publication.id == *id) {
+                if let Some(publication) = self.scheduler.publication(*id) {
+                    if retry_copyouts {
+                        publications.push(publication);
+                    } else {
+                        self.deferred_copyouts.push(*id);
+                    }
+                }
+            }
+        }
         for publication in publications {
+            let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+            if !self.scheduler.export_fits(publication.id, next) {
+                if !deferred_copyouts.contains(&publication.id) {
+                    self.metrics.copyout_headroom_deferrals.fetch_add(1, Ordering::Relaxed);
+                    progress = true;
+                }
+                self.deferred_copyouts.push(publication.id);
+                continue;
+            }
             progress = true;
+            self.scheduler.pin_checkpoint(publication.id)?;
             let outcome = store.store(&publication);
+            if !matches!(outcome, Ok(StoreOutcome::Queued)) {
+                self.scheduler.unpin_checkpoint(publication.id)?;
+            }
             if let Err(error) = &outcome {
                 eprintln!(
                     "HOST_CACHE_STORE_SUBMIT_ERROR checkpoint={} error={error}",
@@ -2319,7 +2373,7 @@ impl<'a> Worker<'a> {
             if let Ok(outcome) = outcome {
                 self.metrics.host_store_outcome(outcome);
                 match outcome {
-                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
+                    StoreOutcome::Queued => {},
                     StoreOutcome::Retry(reason) => {
                         if !waiting.iter().any(|(id, _)| *id == publication.id) {
                             waiting.push((publication.id, reason));
@@ -2391,6 +2445,7 @@ impl<'a> Worker<'a> {
                 continue;
             }
             let handle = active.request;
+            active.checkpoint_accounting = live.checkpoint_accounting();
             self.scheduler.cancel(handle)?;
             self.requeue(handle, true);
             progress = true;
@@ -2418,6 +2473,7 @@ impl<'a> Worker<'a> {
         self.parked.push_front((
             incoming,
             Parked {
+                checkpoint_accounting: active.checkpoint_accounting,
                 last_token: active.last_token,
                 stops: active.stops,
                 text_stops: active.text_stops,
@@ -2544,6 +2600,15 @@ fn begin_pool_lookup(
     incoming.pool_plan = Some(plan);
 }
 
+fn admit_with_checkpoint_accounting(
+    scheduler: &mut RequestScheduler,
+    spec: RequestSpec,
+    accounting: Option<crate::scheduler::CheckpointAccounting>,
+) -> Result<RequestHandle> {
+    let plan = scheduler.plan_admission(&spec)?;
+    Ok(scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting)?.handle)
+}
+
 /// Plan the admission, look the history up in the host store above the GPU
 /// checkpoint, and start a restore when the transfer beats recomputation.
 fn admit_with_host_store(
@@ -2552,6 +2617,7 @@ fn admit_with_host_store(
     pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
     queued_plan: Option<&crate::scheduler::AdmissionPlan>,
+    accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
 ) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
@@ -2565,7 +2631,7 @@ fn admit_with_host_store(
     let result = (|| {
         use crate::offload::LookupOutcome;
         if plan.resident_tokens() == plan.history().token_count() {
-            return Ok((scheduler.admit_planned(spec, plan, None)?.handle, None));
+            return Ok((scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting.clone())?.handle, None));
         }
         let mut outcome = LookupOutcome::NoMatch;
         let mut before = u64::MAX;
@@ -2583,7 +2649,7 @@ fn admit_with_host_store(
             before = hit.consumed_tokens;
         };
         let Some(hit) = hit else {
-            let handle = scheduler.admit_planned(spec, plan, None)?.handle;
+            let handle = scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting.clone())?.handle;
             // Lookups count once per admitted request, not per attempt of a waiting one.
             scheduler.record_host_lookup();
             return Ok((handle, Some(outcome)));
@@ -2593,10 +2659,10 @@ fn admit_with_host_store(
             consumed_tokens: hit.consumed_tokens,
             pages: hit.pages,
         };
-        let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
+        let admitted = match scheduler.admit_planned_with_checkpoint_accounting(spec.clone(), plan, Some(inbound), accounting.clone()) {
             Ok(admitted) => admitted,
             Err(Error::Admission(AdmissionError::Capacity(_))) => {
-                let handle = scheduler.admit(spec)?;
+                let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
                 scheduler.record_host_lookup();
                 return Ok((handle, Some(LookupOutcome::CapacityRejected)));
             }
@@ -2607,12 +2673,12 @@ fn admit_with_host_store(
             return Ok((admitted.handle, Some(LookupOutcome::Admitted)));
         };
         let key = ticket.key;
+        let admitted_accounting = scheduler.request(admitted.handle)?.checkpoint_accounting();
         if store.fetch(hit, ticket).is_err() {
             // No event follows a rejected fetch; this request is the ticket's only
             // waiter, so retire it and admit the request again without the store.
             scheduler.finish_inbound(key, false)?;
-            return scheduler
-                .admit(spec)
+            return admit_with_checkpoint_accounting(scheduler, spec, Some(admitted_accounting))
                 .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
         }
         Ok((admitted.handle, Some(LookupOutcome::Admitted)))
@@ -3315,6 +3381,7 @@ mod tests {
             text_stops: None,
             held_logprobs: VecDeque::new(),
             carried: Carried::default(),
+            checkpoint_accounting: Default::default(),
             reasoning: None,
         };
         let mut active: [Option<Active<'_>>; 4] = std::array::from_fn(|_| None);
@@ -3506,6 +3573,7 @@ mod tests {
                 super::super::stops::TextStops::new(&frontend, vec!["END".into()]).unwrap(),
             ),
             carried: Carried::default(),
+            checkpoint_accounting: Default::default(),
             reasoning: None,
         };
         request.incoming.observe_token(0);

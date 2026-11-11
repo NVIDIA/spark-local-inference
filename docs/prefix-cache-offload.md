@@ -188,14 +188,10 @@ pub trait HostStore {
 ```
 
 The worker calls `store` for each offered checkpoint, without waiting for GPU
-pressure. The scheduler defers a message checkpoint whose own planned prompt
-checkpoint is its direct child less than one physical page later, and terminal
-checkpoints, until a request resumes at that exact checkpoint. A preempted
-terminal counts as resumed. If its prompt capture cannot obtain a snapshot, the
-message is offered while the request still pins it; cancellation or error before
-that capture offers it at retirement. Deferral does not change GPU captures,
-prefill cuts, or retention; deferred points can be lost to GPU
-eviction before reuse, and are not announced to the pool until offered.
+pressure. Completed message and prompt checkpoints are offered after publication.
+Terminal checkpoints are offered when a request resumes at that exact checkpoint;
+a preempted terminal counts as resumed. A terminal checkpoint can be evicted
+before reuse and is not announced to the pool until offered.
 Compaction also offers a deferred branch point as its heir and refreshes
 descendant offers with their new parent.
 `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
@@ -203,8 +199,8 @@ requires a committed local copy. `Retry` accepts no copy. The worker retains onl
 checkpoint IDs for retries after store progress and discards IDs that have left
 the GPU cache. `Deferred` releases the copy pin and schedules the same retry when
 a queued publication cannot obtain host capacity. A failed transfer releases its
-pin without retrying. GPU eviction uses the GPU cache's LRU, leaf and compaction
-rules. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
+pin without retrying. GPU eviction uses demand/role retention ranking with leaf removal or
+ancestor compaction. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
 Submissions never wait; `poll` drains completions and failures.
 A `PublishedCheckpoint` names the GPU checkpoint, its key, its nearest offered
 ancestor's key, its bucket digest, every page of
@@ -259,12 +255,14 @@ is absent from the host index is stored as a root record holding its complete
 page chain, so a skipped or evicted ancestor never makes its descendants
 unrestorable.
 
-Eviction follows `PrefixCheckpointCache::evict`: remove the least recently
-used unpinned leaf; when every leaf is pinned, compact the least recently used
-unpinned single-child ancestor by dropping its row and keeping its pages. A
-compacted node stays in the tree as page-only, no longer matches lookups, and
-continues to supply chain pages. A node is evictable only when its store's
-policy allows it: the memory store standalone evicts any unpinned node, the
+GPU eviction ranks eligible checkpoints by logical-request demand epoch,
+retention role, consumed-token count, and identity, as specified in
+[checkpoint lifetime](core-design.md#branching-and-lifetime). Host-store eviction
+independently removes the least recently used unpinned leaf; when every leaf is
+pinned, it compacts the least recently used unpinned single-child ancestor by
+dropping its row and keeping its pages. A compacted host node stays in the tree
+as page-only, no longer matches lookups, and continues to supply chain pages.
+A node is evictable only when its store's policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
@@ -1033,11 +1031,12 @@ same completion events the store produces.
   not; snapshot aliases go through the same `projected_fits` arithmetic that
   admission uses, and the next request's pages come from `admission_pages`,
   which admission also uses. A pin is never revoked once a copy has started.
-- **Evictions.** Every `PrefixCheckpointCache::evict` call goes through
-  `RequestScheduler::evict`, which queues the key of each
-  retired checkpoint, and for a compaction the offered descendant that took
-  its pages. The
-  worker passes them to `HostStore::evicted` before the next `store`. The
+- **Evictions.** Mandatory resource reclamation uses `RequestScheduler::evict`;
+  optional snapshot allocation applies its selected victims individually.
+  Both paths call `RequestScheduler::record_evictions`, which queues each retired
+  checkpoint's key and, for compaction, the offered descendant that took its
+  pages. The worker passes these notices to `HostStore::evicted` before the next
+  `store`. The
   notice is sent when the checkpoint is logically retired, not at its fence;
   the pin of an export in flight keeps a leaf from being evicted and
   compaction never moves pages. The queue is bounded like the publication

@@ -88,14 +88,14 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
         pages: 0,
         snapshots: 1,
     });
-    let heir = s.publication(c).unwrap();
-    assert_eq!(heir.chain_pages, [PageId(0), PageId(1), PageId(2)]);
-    assert_eq!(heir.parent, Some(keys[0]));
+    let heir = s.publication(b).unwrap();
+    assert_eq!(heir.chain_pages, [PageId(0), PageId(1)]);
+    assert_eq!(heir.parent, None);
     assert_eq!(heir.tail_pages, 2);
     assert_eq!(
         s.take_evictions(),
         [EvictedCheckpoint {
-            key: keys[1],
+            key: keys[0],
             heir: Some(heir),
         }]
     );
@@ -108,7 +108,7 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     }
     let notices = s.take_evictions();
     assert_eq!(notices.len(), 2);
-    assert_eq!(notices[0].key, keys[0]);
+    assert_eq!(notices[0].key, keys[1]);
     assert_eq!(notices[0].heir.as_ref().unwrap().key, keys[2]);
     assert_eq!(notices[1].key, keys[2]);
     assert_eq!(notices[1].heir, None);
@@ -487,4 +487,22 @@ fn a_key_republished_under_a_new_checkpoint_id_can_be_pinned() {
     s.pin_checkpoint(current).unwrap();
     assert!(s.export_chain(current, 0, true).is_some());
     s.unpin_checkpoint(current).unwrap();
+}
+
+#[test]
+fn export_headroom_protects_anchor_guard_rows_and_their_alias_pages() {
+    let mut s = scheduler(2, 16, 3);
+    s.share_snapshot_pages(&[8..12, 10..14, 0..0]).unwrap();
+    let h = history(1);
+    let checkpoint = publish(&mut s, &h, None, 64, &[0], 0);
+    let mut request = spec(64, 1);
+    request.prompt.fill(999);
+    let handle = s.admit(request).unwrap();
+    assert!(s.export_fits(checkpoint, Some(next(8))));
+    let guard = s.reserve_snapshot(0).unwrap();
+    s.request_mut(handle).unwrap().anchor_guard = Some(guard);
+    assert!(!s.export_fits(checkpoint, Some(next(8))));
+    assert!(s.export_fits(checkpoint, Some(next(7))));
+    assert_eq!(s.request(handle).unwrap().anchor_guard, Some(guard));
+    assert!(!s.free_snapshots.contains(&guard));
 }

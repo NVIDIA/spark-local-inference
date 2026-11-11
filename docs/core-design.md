@@ -1429,26 +1429,38 @@ them into the prepared token stream without splitting atomic image spans. Cache
 reuse depends on the actual prepared prefix identity; context-dependent changes
 to earlier tokens cannot reuse a checkpoint for different tokens.
 
-At admission, the scheduler budgets newly captured cache snapshots from the
-loaded snapshot capacity divided by configured maximum concurrency, rounded
-down and capped at eight. A nonempty pool permits at least one capture per
-request; an empty pool permits none. The budget reserves a terminal capture and,
-when generation can continue beyond the prompt and the budget permits, a prompt
-capture. A single output token shares the prompt and terminal endpoint.
+The scheduler chooses the last eligible complete-message boundary as the request's
+conversation anchor. If no message boundary is eligible, the prompt end is the
+anchor. Anchor retention is best effort and independent of duration estimates.
+Earlier complete-message boundaries compete in reverse message order; a distinct
+prompt end follows them. There is no capture-count limit or allocation of a fixed
+snapshot share to each request.
 
-The remaining budget selects message checkpoints within the uncached prompt
-suffix. If all eligible boundaries fit, retain them all. Otherwise, place token
-targets at equal intervals between the reused prefix and the prompt end, choose
-the nearest eligible message boundary to each target, and deduplicate the
-results. Equal-distance ties choose the earlier boundary. Only selected boundaries
-interrupt prefill; unselected messages can share a full captured prefill chunk.
-The budget limits new captures, not existing reusable checkpoints or mandatory
-state transfers between conditioned-input windows.
+Extra captures use a request-local work allowance. Its prefill component is
+`scheduler_checkpoint_extra_work_fraction` times the estimated uncached prefill
+work, with a default fraction of 0.05. An extra endpoint charges the additional
+predicted prefill time caused by splitting its enclosing interval, plus its
+snapshot-copy time. Unknown or stale costs exclude extras without excluding the
+anchor. Productive completed decode earns the same fraction of measured decode
+time for a distinct terminal endpoint. A coincident prompt and terminal endpoint
+uses one capture. Mandatory conditioned-input state transfers do not consume this
+allowance. Preemption preserves the logical request's earned and spent allowance.
 
-Endpoints are not rounded to token groups or KV pages. The scheduler obtains a
-snapshot destination when it reaches a selected endpoint, using normal cache eviction.
-If all snapshot slots are pinned, inference continues without publishing that
-checkpoint. The number of messages does not enlarge the prepared snapshot pool.
+Snapshot rows come from the global allocator, which accounts for their physical
+KV-page aliases. Selection checks a conservative feasible set of rows for the
+chosen future cuts without reserving those rows or evicting for them. Each
+immediate allocation minimizes the additional page backing within that set.
+Before arming an earlier extra, the scheduler attempts to guard
+a row for the later anchor. An unused guard may be revoked for mandatory request
+pages or state transfers. Prefill destinations are armed before their producing
+submission. A distinct terminal destination is obtained after generation drains,
+before the terminal snapshot submission. Cancellation retains an armed or copying
+destination through its last GPU-use fence. Snapshot copy and publication
+preserve that ownership. Initial selection excludes extras without feasible
+storage. If a selected extra loses storage or its copy estimate expires, prefill
+can retain the selected cut while omitting the copy. Executed splits remain
+charged; unsubmitted copies release their work reservations. Inference continues.
+Endpoint cuts remain exact token boundaries, independent of KV-page geometry.
 
 At each required prefill endpoint, the scheduler drains submitted work, snapshots
 the exact live state, and publishes only after the copy fence completes. The
@@ -1509,17 +1521,24 @@ request publishes additional shared ancestors.
 Track logical references separately from outstanding GPU use. A page or slot
 becomes reusable only after both have ended.
 
-Under snapshot-only pressure, thin checkpoint chains before evicting their
-endpoints. A removable checkpoint has exactly one child and no direct request
-pin. Prefer interior checkpoints over chain roots, and remove the checkpoint
-whose surviving parent and child delimit the shortest token interval. Break
-equal-distance ties by least recent access. This retains sparse history coverage
-while preserving conversation endpoints during long prefills, including endpoints
-of idle conversations. If no chain can be thinned, evict the least recently
-used unpinned leaf, regardless of its age. Endpoint retention is a preference,
-not a reservation that can prevent progress when only endpoints remain.
-Under KV-page pressure, select the least recently used eligible
-leaf or removable ancestor and recheck physical backing after each retirement.
+GPU retention orders eligible checkpoints by logical-request demand epoch, then
+role, then consumed-token count, then checkpoint identity. Prompt and terminal
+endpoints have the lowest role, earlier message checkpoints follow, and the
+conversation anchor has the highest role. Demand recency takes precedence over
+role, so an idle conversation's anchor can be reclaimed before a recently used
+endpoint. One successfully admitted logical request receives one demand epoch;
+all its captures inherit that epoch. Cache reuse touches the matched checkpoint
+and its ancestors. Duplicate publication retains the maximum role and epoch.
+Preemption carries the epoch into readmission.
+
+The global allocator compares victims for both snapshot rows and physical page
+backing. A removable checkpoint is an unpinned leaf or an ancestor with exactly
+one child and no direct request pin. Fenced retirement and alias ownership still
+control when its resources can be reused. Optional capture cannot displace an
+equal or higher retention rank. Mandatory execution resources can reclaim any
+eligible rank and revoke unused anchor guards. Host, disk, and remote-store
+retention keep their independent eviction policies. Local copy-out checks GPU
+headroom before pinning a checkpoint chain for transfer.
 
 Removing an ancestor transfers its storage without invalidating descendants:
 transfer its ordered page segment and last-use fence to that child, bypass the

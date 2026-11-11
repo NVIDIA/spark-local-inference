@@ -67,9 +67,15 @@
     in the same run; it is validated on SM120 only. Drive the workload with
     scripts/repro_glm_batched_speculation.py.
 
-[ ] Exercise per-message checkpoint restore and prefill graph selection through
-    Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
+[ ] Qualify measured-work checkpoint selection and history-rewrite reuse through
+    Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services with warm timing
+    catalogs, host copy-out pressure, and tensor-parallel execution. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
+
+[ ] Correct the 10-byte core payload fixtures in Orbit agent tests
+    running_groups_are_stopped_and_outlive_their_controller_session and
+    groups_run_together_on_disjoint_gpus_and_status_lists_them; their transfer
+    ranges and file-size assertions currently require 13 bytes.
 
 [ ] Validate multi-window image prefill, prefix skipping, and CPU record reuse
     through DeepSeek, MiMo, Kimi, and Nemotron services. Extend Step TP4 coverage

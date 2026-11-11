@@ -420,6 +420,27 @@ phase transitions also require completion feedback. Dependency checks apply to t
 program. A finishing prefill exposes its decoder and checkpoint operation only
 after completion.
 
+Checkpoint retention uses the exact token endpoints supplied by the native
+frontend. The last eligible completed message is a best-effort conversation
+anchor; the prompt end substitutes when there is no eligible message. Earlier
+messages are considered in reverse order, followed by a distinct prompt end.
+Additional prefill splits and snapshot copies must fit a request-local allowance
+of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
+work, defaulting to 0.05. Unknown costs disable extras while preserving anchor
+eligibility. Productive completed decode earns the same fraction of measured
+time for a distinct terminal capture. There is no fixed capture count or
+concurrency-based snapshot share.
+
+An extra prefill cut is selected only with an obtainable snapshot destination.
+If its cost expires after dispatch, its copy can be skipped after the split has
+already executed. A row guarded for the later anchor protects it from earlier
+optional captures; mandatory execution
+may revoke an unused guard. Armed destinations and in-flight copies retain their
+rows through GPU completion and cancellation. The alias-aware global allocator
+uses demand recency, checkpoint role, and endpoint length to compare eligible
+victims. See [complete-state checkpoint ownership](core-design.md#exact-endpoint-capture)
+for publication, preemption accounting, and retention rules.
+
 Feedback-dependent candidates remain visible while ordinary work is queued.
 Selection uses projected prices and ages at the queue's expected end. When the
 final winner requires an empty window, the scheduler submits nothing until

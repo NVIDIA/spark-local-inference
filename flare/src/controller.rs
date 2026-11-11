@@ -2196,6 +2196,9 @@ impl Worker {
         let phase = progress.phase("Load tokenizer", None);
         let mut config = owner.server_config().clone();
         config["thinking_token_budget"] = serde_json::json!(self.settings.thinking_token_budget);
+        if let Some(fraction) = self.settings.scheduler_checkpoint_extra_work_fraction {
+            config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
+        }
         let mut loaded = match LoadedSession::new(owner, config) {
             Ok(loaded) => loaded,
             Err(error) => {
