@@ -22,7 +22,9 @@
                 if(model.metadata_known&FLARE_MODEL_PARAMETERS)property(detail_rows_,L"Parameters",count_text(model.parameter_count));
                 if(!model.hardware.empty())property(detail_rows_,L"Published builds",model.hardware);
                 if(!model.license.empty())property(detail_rows_,L"License",model.license);
-                if(model.metadata_known&FLARE_MODEL_REVISION_SIZE){property(detail_rows_,L"Revision files",bytes(model.revision_bytes));property(detail_rows_,L"Revision",model.revision);detail_rows_.Children().Append(label(L"Includes every file in this Hub revision. The selected core download and GPU memory use can differ.",12,true));}
+                if(model.metadata_known&FLARE_MODEL_REVISION_SIZE){property(detail_rows_,L"Revision files",bytes(model.revision_bytes));detail_rows_.Children().Append(label(L"Includes every file in this Hub revision. The selected core download and GPU memory use can differ.",12,true));}
+                if(!model.revision.empty())property(detail_rows_,L"Revision",model.revision);
+                if(!model.revision_updated_at.empty())property(detail_rows_,L"Last updated",updated_text(model.revision_updated_at));
                 if(!model.revision_commit.empty())property(detail_rows_,L"Commit",model.revision_commit);
                 detail_rows_.Children().Append(label(L"These details are reported by the Hugging Face repository. Core verification and compatibility checks run before use.",12,true));
             } else detail_rows_.Children().Append(label(L"Inspecting core metadata…",14,true));
@@ -44,6 +46,7 @@
         if(fingerprint==detail_fingerprint_)return;detail_fingerprint_=fingerprint;
         detail_rows_.Children().Clear();detail_rows_.Children().Append(label(detail_model_.description.empty()?L"Prepared Flare core":detail_model_.description,14,true));
         property(detail_rows_,L"Source",detail_model_.catalog()?detail_model_.source:L"On this PC");
+        if(!detail_model_.revision_updated_at.empty())property(detail_rows_,L"Hub last updated",updated_text(detail_model_.revision_updated_at)+L" · "+detail_model_.revision);
         property(detail_rows_,L"Publisher",wide(value.publisher));
         property(detail_rows_,L"Core checks",wide(value.metadata_status));
         property(detail_rows_,L"Core size",detail_model_.size_known?bytes(detail_model_.size):L"Not reported");
