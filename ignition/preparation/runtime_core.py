@@ -190,15 +190,18 @@ class RecordedExportGraph:
 
 
 def record_export_graph(graph, storage, *, owners=()):
-    """Keep an instantiated graph valid for every serving replay.
+    """Retain a captured template, its executable and external export resources.
 
-    Replacing the executable with reset template metadata breaks repeated
-    full-model launches, so preserve the executable export path instead.
+    Owners must not reference the graph: Torch's destruction finalizer retains
+    them independently. Native replay callers must drain before resetting graphs.
     """
     pools = (storage.pool, storage.graph_pool)
     owned = {pool.id for pool in pools}
     if not set(graph.pools()) <= owned:
         raise ValueError("export graph uses a CUDA pool without an external owner")
+    # Device pointers in captured nodes do not retain their Python resource owners.
+    # Release these references only when the graph is reset or collected.
+    graph.retain_object((pools, tuple(owners)), synchronize_before_release=True)
     instantiate_graph(graph)
     return graph
 

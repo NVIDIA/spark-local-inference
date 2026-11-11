@@ -71,16 +71,16 @@ checkpoint ranges; generated tokenizer and template assets supply text.
 Heliopause owns CUPTI callbacks, graph introspection, pointer reachability,
 device-to-host transfers, graph and core serialization, asset materialization,
 cubin debug stripping, hashing, compression, signing, conversion, rank payload channels,
-and publication. Export capture copies graph nodes, argument bytes, attributes,
-and annotated edges into native storage without instantiating an executable.
-Ignition retains external CUDA pool and kernel owners, then resets the capture
-object to release its template. Diagnostic executable captures can record the
-same metadata through post-instantiation hooks before releasing their templates.
-Export performs function discovery,
-allocation binding, relocation checks, and serialization against that copy.
-Callers supplying live templates use the same extraction and validation path.
-Export retains copied metadata, storage, contexts, external pool owners, kernel
-owners, and any diagnostic executables until native CUDA work has drained.
+and publication. Ordinary export retains each captured CUDA template and an
+instantiated executable, together with its external CUDA pool and kernel owners.
+This keeps one executable per exported graph resident during preparation.
+Native export copies graph nodes, argument bytes, attributes, and annotated edges;
+it performs function discovery, allocation binding, relocation checks, and
+serialization while those resources remain alive. The Python executable is not
+stored in the core: Helios reconstructs and instantiates graphs when loading it.
+Diagnostic captures can also record metadata through post-instantiation hooks
+before releasing their templates. Export retains graph resources, copied metadata,
+storage, contexts, pool owners, and kernel owners until native CUDA work has drained.
 A failed drain retains those
 owners. Final assembly consumes rank indexes and open source file ranges
 independently of the prepared model.

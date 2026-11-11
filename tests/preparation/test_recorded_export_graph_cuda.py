@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export graph metadata retains CUDA storage without graph handles."""
+"""Retained export graphs preserve storage and serialize their execution metadata."""
 
 import os
 from pathlib import Path
@@ -12,7 +12,7 @@ import pytest
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
-def test_export_capture_releases_cuda_handles_and_preserves_storage(tmp_path):
+def test_export_capture_retains_cuda_handles_and_preserves_storage(tmp_path):
     subprocess.run([sys.executable, "-c",
         "from pathlib import Path; import sys; "
         "from tests.preparation.test_recorded_export_graph_cuda import check_export; "

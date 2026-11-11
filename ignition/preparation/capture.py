@@ -31,7 +31,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     serving replays variants serially and may choose them in any order.
     All eager warmups precede capture so their transient workspaces do not
     coexist with retained graph intermediates.
-    ``retain_graphs`` records export metadata without executables when
+    ``retain_graphs`` keeps templates and executables for export when
     ``warmup_storage`` supplies external CUDA pool owners.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
     and graph capture; it is unused for the ordinary serving catalog.
