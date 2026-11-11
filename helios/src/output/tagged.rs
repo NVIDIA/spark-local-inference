@@ -393,6 +393,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             function: D::FUNCTION,
             tool_ends_reasoning: D::TOOL_ENDS_REASONING,
             response: None,
+            message_close: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })
     }
