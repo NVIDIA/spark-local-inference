@@ -157,6 +157,17 @@ def test_finished_rank_keeps_participating_until_peers_finish(monkeypatch):
     assert len(advances) == 1 and len(exchanges) == 3
 
 
+def test_reconciliation_supplies_selected_configs_to_preparation_job(monkeypatch):
+    owner = coordinator(monkeypatch)
+    configs, calls = {object(): object()}, []
+    done = SimpleNamespace(done=True, ready_cache=None, ready_tuning=(), ready_collective_tuning=None,
+                           ready_collectives=())
+    job = SimpleNamespace(advance=lambda **kwargs: done, result=lambda: "prepared")
+    session = SimpleNamespace(begin=lambda requests, **kwargs: calls.append(kwargs) or job)
+    assert owner.prepare(session, (), autotune=False, selected_configs=configs) == "prepared"
+    assert calls == [{"autotune": False, "selected_configs": configs}]
+
+
 def test_mixed_job_authorizes_collective_only_after_every_rank_is_ready(monkeypatch):
     owner = coordinator(monkeypatch)
     ready = progress()

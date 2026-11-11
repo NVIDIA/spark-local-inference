@@ -19,7 +19,7 @@ from b12x.preparation import (
     AutotuneEffort, MemoryRequirements, PreparationDisplay, PreparationSession,
     autotune_effort as b12x_autotune_effort,
 )
-from b12x.preparation.session import _declaration_key
+from b12x.preparation.session import _declaration_key, _plans_of
 from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
@@ -555,6 +555,15 @@ class RecordedPreparationSession(PreparationSession):
                         self.release_many(retired)
                 requests = tuple(self._recorded_requests.values())
                 self._context_original_requests = None
+            if (self._coordinator is not None and len(self._coordinator.ranks) > 1
+                    and not self._sharded and self._replica_coordinator is None):
+                configs, changed = self._coordinator.reconcile_selections(requests)
+                if changed:
+                    for job in self._jobs(requests):
+                        plans = {plan for request in job for plan in _plans_of(request)}
+                        results.append(self._coordinator.prepare(self, job, progress=progress,
+                            autotune=self.autotune,
+                            selected_configs={plan: config for plan, config in configs.items() if plan in plans}))
             selections = []
             coverage = {name: value for result in results for name, value in result.coverage.items()}
             for request in requests:
