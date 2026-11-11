@@ -30,7 +30,7 @@ def check_export(tmp_path):
     from ignition.preparation.core_file import read_sources
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.runtime_core import (
-        Allocation, RecordedExportGraph, RuntimeCore, capture_graph, instantiate_graph,
+        Allocation, RuntimeCore, capture_graph, instantiate_graph,
     )
 
     with ModuleImages() as images:
@@ -51,9 +51,9 @@ def check_export(tmp_path):
                 session=SimpleNamespace(capture=nullcontext), device=0, stream=stream,
                 pool=storage.graph_pool.id, warmup_storage=storage, retain_graphs=True, compile_decoder=False)
             graph = graphs["decode"]
-            assert isinstance(graph, RecordedExportGraph)
-            assert graph.owners == (forward,)
-            assert storage.graph_pool.use_count() == 1
+            assert isinstance(graph, torch.cuda.CUDAGraph)
+            assert graph._keep_graph
+            assert storage.graph_pool.use_count() >= 1
             before = [(segment["address"], segment["total_size"])
                       for segment in storage.graph_pool.snapshot(include_traces=False)]
             torch.cuda.empty_cache()
@@ -70,8 +70,9 @@ def check_export(tmp_path):
                 tuning_graphs={"tune": TuningGraph(tuner, ("selector",), "status")})
             manifest = bundle.export_manifest()
             assert all("handle" not in value for value in (*manifest["graphs"], *manifest["tuning_graphs"]))
-            with pytest.raises(TypeError, match="CUDAGraph"):
-                bundle.manifest()
+            runtime_manifest = bundle.manifest()
+            assert runtime_manifest["graphs"][0]["kind"] == "decode"
+            assert "handle" in runtime_manifest["graphs"][0]
             path = tmp_path / "rank.json"
             allocations = [Allocation(name, tensor.data_ptr(), tensor.nbytes)
                            for name, tensor in buffers.items()]

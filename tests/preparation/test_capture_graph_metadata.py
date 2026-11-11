@@ -187,7 +187,7 @@ def test_shared_capture_records_after_all_warmups_without_reinstantiation(monkey
     assert recorder.events == ["record", "record"]
 
 
-def test_export_metadata_outlives_template_and_retains_external_owners(monkeypatch, recorder):
+def test_export_instantiates_and_retains_executable(monkeypatch, recorder):
     import flare_heliopause
 
     monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
@@ -196,21 +196,14 @@ def test_export_metadata_outlives_template_and_retains_external_owners(monkeypat
     graph.pools = lambda: [(0, 2)]
     graph.capture_end()
     kernel_owner = SimpleNamespace()
-    owner = record_export_graph(graph, storage, owners=(kernel_owner,))
-    assert graph.template == graph.executable == graph.instantiations == 0
-    assert owner.pools == (storage.pool, storage.graph_pool)
-    assert owner.owners == (kernel_owner,)
-    assert _graphs({"decode": owner}, recorder=recorder) == [dict(name="decode", recorded=1)]
-    with pytest.raises(ValueError, match="another native module recorder"):
-        _graphs({"decode": owner}, recorder=Recorder())
-    assert recorder.templates == {1: 11}
-    owner.reset()
-    owner.reset()
-    assert owner.pools == owner.owners == ()
+    returned = record_export_graph(graph, storage, owners=(kernel_owner,))
+    assert returned is graph
+    assert graph.instantiations == 1
+    assert graph.template == 11
+    assert graph.executable == 12
+    assert _graphs({"decode": graph}) == [dict(name="decode", graph=11, executable=12)]
     assert not recorder.templates
-    assert recorder.events == ["record-template", "release-template"]
-    with pytest.raises(ValueError, match="released"):
-        _graphs({"decode": owner}, recorder=recorder)
+    assert recorder.events == []
 
 
 def test_export_rejects_unowned_pool_without_destroying_template(monkeypatch, recorder):
@@ -283,5 +276,6 @@ def test_export_preserves_collective_consumers_after_replacing_cuda_graph(monkey
         session=session, device="cpu", stream=stream, pool=storage.graph_pool.id, compile_decoder=False,
         retain_graphs=True, warmup_storage=storage)
     graph = graphs["decode"]
-    assert isinstance(graph, RecordedExportGraph)
+    assert isinstance(graph, Graph)
+    assert graph.instantiations == 1
     assert registry.captures == {id(graph): {id(collective)}}

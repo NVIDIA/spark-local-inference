@@ -190,26 +190,17 @@ class RecordedExportGraph:
 
 
 def record_export_graph(graph, storage, *, owners=()):
-    """Copy an uninstantiated graph before releasing its CUDA template."""
-    import flare_heliopause
-    from .module_images import ModuleImages
+    """Keep an instantiated graph valid for every serving replay.
 
-    images = ModuleImages.current()
-    if images is None:
-        raise RuntimeError("graph metadata recording requires an active native module recorder")
+    Replacing the executable with reset template metadata breaks repeated
+    full-model launches, so preserve the executable export path instead.
+    """
     pools = (storage.pool, storage.graph_pool)
     owned = {pool.id for pool in pools}
     if not set(graph.pools()) <= owned:
         raise ValueError("export graph uses a CUDA pool without an external owner")
-    context, _ = flare_heliopause.current_context()
-    recorded = images.native.record_template(int(graph.raw_cuda_graph()), 1)
-    owner = RecordedExportGraph(images.native, recorded, context, pools, owners)
-    try:
-        graph.reset()
-    except BaseException:
-        owner.reset()
-        raise
-    return owner
+    instantiate_graph(graph)
+    return graph
 
 
 def capture_graph(*, retain_graphs=False):
