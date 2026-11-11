@@ -5,6 +5,10 @@
 [ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
     Payload cores report rebuild: null even when DeploymentBody.rebuild is present.
 
+[ ] Validate GLM TP4/TP8 A16 expert preparation through export and native replay.
+    Verify DirectWeightLoader.load_nvfp4_experts keeps only final scale layouts
+    in persistent storage when loading expanded CSF scales.
+
 [ ] Preserve explicit A16 activation arithmetic in SM103 MXFP8 projections.
     QuantizedProjection does not pass activation_mode to sm103_projection.query_for;
     PackedProjectionQuery.mode chooses quantized activations from output width.

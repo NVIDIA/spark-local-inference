@@ -1656,10 +1656,11 @@ class DirectWeightLoader:
         ``scale_vectors`` supplies up/gate and down global multipliers followed
         by their activation reciprocal scales. Gate/up scalar compatibility is
         the recipe's responsibility. ``a4_prefill=True`` retains calibrated A4
-        prefill execution on the A16 packed weight owner. Without ``scale_scratch`` (and always on
-        SM103) the CSF scales expand once here into persistent storage. With it,
-        each call expands them into the scratch, which serialized layers can
-        share; both buffers remain caller-owned through replay.
+        prefill execution on the A16 packed weight owner. Without ``scale_scratch``
+        (and always on SM103), CSF scales expand once during loading. Source scales
+        replaced by weight preparation use temporary storage. With scratch, each
+        call expands them into the caller-owned buffers, which serialized layers
+        can share through replay.
         """
         import torch
         from b12x.moe import fused_moe as moe
@@ -1724,16 +1725,26 @@ class DirectWeightLoader:
         self._session.flush()
         if self._display is not None:
             self._display.update(self._session.payload_bytes)
+        if not sm103:
+            plan = moe.plan_weights(
+                source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+                activation=moe.ActivationSpec(mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
+                                              swiglu_limit=swiglu_limit,
+                                              **({} if a4_prefill is None else {"a4_prefill": a4_prefill})),
+                geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local),
+            )
         if expand:
             from b12x._lib.quant._csf_prepare import expand_source_scales, validate_source
 
             # SM103's kernels take row-major scales; b12x takes the native swizzled F8_128x4 grid.
             native = ((count, 2 * local, hidden_size // 16), (count, hidden_size, local // 16))
+            scale_allocate = (persistent_empty if not sm103 and plan.prepared_format.packing.value == "source_native"
+                              else torch.empty)
             expanded = []
             for source, shape in zip((scales13, scales2), native if sm103 else shapes, strict=True):
                 validate_source(source)
-                expanded.append((torch.empty if sm103 else persistent_empty)(shape, dtype=torch.uint8 if sm103 else torch.float8_e4m3fn,
-                                            device=self.device))
+                expanded.append(scale_allocate(shape, dtype=torch.uint8 if sm103 else torch.float8_e4m3fn,
+                                               device=self.device))
                 expand_source_scales(source, expanded[-1], swizzled=not sm103)
             if sm103:
                 return _sm103_fp4_experts(w13, expanded[0], w2, expanded[1], scale_vectors, format="nvfp4",
@@ -1745,13 +1756,6 @@ class DirectWeightLoader:
         # axis 1; the core schema's single concatenation axis cannot express
         # both, so these buffers stay unprovenanced rather than claim a mapping
         # the consumer would misread.
-        plan = moe.plan_weights(
-            source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
-            activation=moe.ActivationSpec(mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
-                                          swiglu_limit=swiglu_limit,
-                                          **({} if a4_prefill is None else {"a4_prefill": a4_prefill})),
-            geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local),
-        )
         packed = moe.PackedWeights(
             w13=w13, w2=w2, w13_block_scales=block_scales[0], w2_block_scales=block_scales[1],
             w13_global_scales=device_scales[0], w2_global_scales=device_scales[1],
