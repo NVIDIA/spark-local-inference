@@ -7,6 +7,7 @@
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from ignition.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-flash-yarn4', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -109,7 +110,7 @@ def test_a_different_revision_of_a_declared_repository_is_not_the_pinned_checkpo
 
 @pytest.mark.parametrize("name", ["qwen", "Qwen3.8-Flash", "qwen3.8-flash@main"])
 def test_unknown_aliases_list_the_supported_aliases(name):
-    with pytest.raises(UsageError, match="supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"):
+    with pytest.raises(UsageError, match="supported models: qwen3.8-flash, qwen3.8-flash-yarn4, qwen3.8-27b, qwen3.8-27b-qad, glm-5.3-flash"):
         resolve(name)
 
 
@@ -266,3 +267,70 @@ def test_alias_preserves_selected_checkpoint_when_directory_is_shared(tmp_path, 
         assert model.recipe is recipe and model.checkpoint is checkpoint
         assert model.directory == tmp_path
     assert resolve(str(tmp_path)).checkpoint is checkpoints[0]
+
+
+def test_rope_parameters_extend_a_resolved_qwen_checkpoint_like_its_yarn_declaration():
+    from ignition.cli import _parser
+    from ignition.cli.preparation import rope_scaled
+
+    native = resolve("qwen3.8-flash")
+    args = _parser().parse_args(["export", "qwen3.8-flash", "--rope-parameters",
+                                 '{"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144}'])
+    checkpoint = rope_scaled(native, args.rope_parameters)
+    assert checkpoint.context == 524_288 and checkpoint.alias == native.checkpoint.alias
+    assert (checkpoint.rope_scaling.factor, checkpoint.rope_scaling.original_max_position_embeddings,
+            checkpoint.rope_scaling.beta_fast, checkpoint.rope_scaling.beta_slow) == (2., 262_144, 32., 1.)
+    # The four-times parameters reproduce the declared variant exactly.
+    declared = resolve("qwen3.8-flash-yarn4").checkpoint
+    assert replace(rope_scaled(native, {"factor": 4.}), alias=declared.alias) == declared
+    shorter = rope_scaled(native, {"factor": 4, "max_position_embeddings": 524_288, "beta_fast": 16, "beta_slow": 2})
+    assert shorter.context == 524_288 and (shorter.rope_scaling.beta_fast, shorter.rope_scaling.beta_slow) == (16, 2)
+    # A JSON editor's whole-number float is the same context.
+    floated = rope_scaled(native, {"factor": 2, "original_max_position_embeddings": 262144.0,
+                                   "max_position_embeddings": 524288.0})
+    assert floated == checkpoint and type(floated.context) is int
+    assert type(floated.rope_scaling.original_max_position_embeddings) is int
+
+
+@pytest.mark.parametrize("parameters, message", [
+    ({"factor": 2, "mscale": 1}, "frequency-only"),
+    ({"factor": 2, "attention_factor": 1.07}, "frequency-only"),
+    ({"factor": 2, "rope_theta": 1e7}, "unknown"),
+    ({"rope_type": "linear", "factor": 2}, "rope_type must be yarn"),
+    ({"original_max_position_embeddings": 262144}, "factor is required"),
+    ({"factor": 1}, "invalid rope scaling"),
+    ({"factor": 2, "original_max_position_embeddings": 131072}, "must extend"),
+    ({"factor": 2, "max_position_embeddings": 600_000}, "must extend"),
+    ({"factor": 2, "beta_fast": 1, "beta_slow": 32}, "invalid rope scaling"),
+    ({"factor": 2, "original_max_position_embeddings": 262144.5}, "invalid rope scaling"),
+    ({"factor": 2, "max_position_embeddings": 524287.5}, "must extend"),
+])
+def test_rope_parameters_refuse_what_the_interpolation_cannot_apply(parameters, message):
+    from ignition.cli.preparation import rope_scaled
+
+    with pytest.raises(UsageError, match=message):
+        rope_scaled(resolve("qwen3.8-flash"), parameters)
+
+
+def test_rope_parameters_refuse_recipes_without_rope_scaling():
+    from ignition.cli.preparation import rope_scaled
+
+    with pytest.raises(UsageError, match="declares no rope scaling"):
+        rope_scaled(resolve("glm-5.3-flash"), {"factor": 2})
+
+
+def test_rope_parameters_reach_bench_and_are_refused_without_rope_scaling(tmp_path, capsys):
+    from ignition.cli import main
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    assert main(["bench", "qwen3.8-27b", "--config", str(config), "--rope-parameters", '{"factor": 4}']) == 2
+    assert "declares no rope scaling" in capsys.readouterr().err
+
+
+def test_rope_parameters_flag_takes_a_json_object():
+    from ignition.cli import _parser
+
+    for value in ("2", "not json"):
+        with pytest.raises(SystemExit):
+            _parser().parse_args(["export", "qwen3.8-flash", "--rope-parameters", value])

@@ -142,7 +142,7 @@ def table(result):
 def run(args):
     settings = Settings.from_args(args)
     configuration = Configuration.load(args.config)
-    model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b")
+    model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b", getattr(args, "rope_parameters", None))
     if model.recipe.name not in ("qwen38_dense", "kimi31"):
         raise UsageError("ignition bench supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark")
     if settings.speculation_study and model.recipe.name != "qwen38_dense":

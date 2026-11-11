@@ -83,25 +83,39 @@ def prepare_cached_rotary(session):
     register_finalizer(session, get_rope_module)
 
 
+def interpolated_frequencies(theta, pairs, factor, original_max_position_embeddings, beta_fast, beta_slow,
+                             device):
+    """Inverse frequencies `1 / theta ** (i / pairs)` interpolated to extend context by `factor`.
+
+    Pairs that complete fewer rotations than `beta_slow` over the original context
+    compress by `factor`; pairs beyond `beta_fast` rotations keep their exact
+    frequencies; the pairs between ramp linearly, as the YaRN and DeepSeek
+    rope-scaling formulations define.
+    """
+    dims = torch.arange(pairs, device=device, dtype=torch.float32)
+    frequencies = 1 / theta ** (dims / pairs)
+
+    def boundary(rotations, original=original_max_position_embeddings, theta=theta):
+        return (2 * pairs) * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+
+    low = max(math.floor(boundary(beta_fast)), 0)
+    high = min(math.ceil(boundary(beta_slow)), pairs - 1)
+    smooth = 1 - ((dims - low) / max(high - low, 1e-3)).clamp(0, 1)
+    return frequencies / factor * (1 - smooth) + frequencies * smooth
+
+
 class CompressedRotary:
     def __init__(self, config, device):
         text = config.text
         scaling = text["rope_scaling"]
         self.frequencies = {}
-        dims = torch.arange(32, device=device, dtype=torch.float32)
         for compressed in (False, True):
             base = text["compress_rope_theta"] if compressed else text["rope_theta"]
-            frequencies = 1 / base ** (dims / 32)
+            frequencies = 1 / base ** (torch.arange(32, device=device, dtype=torch.float32) / 32)
             if compressed:
-                original = scaling["original_max_position_embeddings"]
-
-                def boundary(rotations, original=original, base=base):
-                    return 64 * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(base))
-
-                low = max(math.floor(boundary(scaling["beta_fast"])), 0)
-                high = min(math.ceil(boundary(scaling["beta_slow"])), 63)
-                smooth = 1 - ((dims - low) / max(high - low, 1e-3)).clamp(0, 1)
-                frequencies = frequencies / scaling["factor"] * (1 - smooth) + frequencies * smooth
+                frequencies = interpolated_frequencies(base, 32, scaling["factor"],
+                    scaling["original_max_position_embeddings"], scaling["beta_fast"], scaling["beta_slow"],
+                    device)
             self.frequencies[compressed] = frequencies
 
     def apply(self, tensor, positions, *, compressed, inverse=False):

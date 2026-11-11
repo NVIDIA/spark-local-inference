@@ -54,7 +54,7 @@ def test_export_uses_the_configured_model(host, tmp_path, capsys):
 
 
 @pytest.mark.parametrize("arguments, code, message", [
-    (["export", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"),
+    (["export", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-flash-yarn4, qwen3.8-27b, qwen3.8-27b-qad, glm-5.3-flash"),
     (["export", "qwen3.8-flash", "--gpus", "x"], 2, "--gpus expects indices"),
     (["export", "qwen3.8-flash", "--gpus", "9"], 2, "does not have"),
     (["export", "qwen3.8-flash", "--max-concurrency", "65"], 2, "1 through 64"),
