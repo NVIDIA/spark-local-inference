@@ -107,8 +107,10 @@ contexts, copied metadata, pool owners, kernel owners, and any diagnostic
 executables alive until native work confirms a drain; an unsuccessful drain
 retains their owners.
 
-Native transfer pools bound file buffers and pinned CUDA download storage from
-available host memory and preparation rank count. Preserve direct bulk I/O,
+Native transfer pools size file-buffer concurrency from available host memory
+and preparation rank count, accounting for pinned CUDA download storage. Each
+rank can allocate at least one file buffer; low available RAM does not reject
+export before an allocation is attempted. Preserve direct bulk I/O,
 exact unaligned tails, cache verification before reuse, and hash-before-write
 publication. `--no-weights` must fail on any missing exact stored-data blob;
 correctness and cache checks remain required. See
@@ -212,6 +214,15 @@ that survives a graph boundary belongs to explicit external storage. Retain the
 pool, compiled kernels, graph executables, and native resources until replay
 drains. CUDA libraries can retain allocations referenced by captured kernel
 arguments without Python tensor owners. Preserve those resources through drain.
+
+After warmup, capture compiled forwards in descending order of their largest
+compiler-planned allocation, with total planned bytes breaking ties. This lets
+smaller requests reuse backing retained by larger captures. Tensor-parallel ranks
+agree on one order using the maximum request sizes across ranks. Uncompiled
+forwards follow in catalog order. Compiler metadata does not include allocations
+inside opaque operators, and the ordering does not guarantee optimal packing for
+forwards with multiple allocations. Keep temporary destinations explicit so the
+compiler can plan them.
 
 Recipes that retain graph-buffer pools keep their caller-owned scratch until
 their serving forwards expose the required reads, writes, and dependencies.

@@ -104,6 +104,7 @@ class PreparedDenseMLA:
     def functional(self, *, session, cache=...):
         if cache is not ...:
             self.arguments = {**self.arguments, "kv_cache": cache}
+        self.page_table_stride = self.arguments["page_table"].stride()
         self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
         self.return_lse = self.lse is not None
         self.lse_layout = None if self.lse is None else (tuple(self.lse.shape), tuple(self.lse.stride()))
@@ -130,6 +131,9 @@ class PreparedDenseMLA:
         output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
         lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device).zero_() if self.return_lse else None
         scratch = [torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout]
+        if page_table.stride() != self.page_table_stride:
+            page_table = torch.empty_strided(page_table.shape, self.page_table_stride,
+                dtype=page_table.dtype, device=page_table.device).copy_(page_table)
         _attend(query, a["kv_cache"] if cache is None else cache, output, page_table, lengths, starts,
                 scratch, self.plan.handle, self.scale, lse,
                 a["kv_scale"] if kv_scale is None else kv_scale, a["q_scale"] if q_scale is None else q_scale)

@@ -91,13 +91,14 @@ class VisionScratch:
             (patches // 4, 4096), (patches // 4, HIDDEN), (patches, 1024),
             (patches // 4, HIDDEN)), strict=True))
         # Each prepared kernel has disjoint operands; serving forwards allocate their own tensors.
-        roles = dict.fromkeys(("patches", "qkv", "query", "projected", "mlp_up",
+        roles = dict.fromkeys(("patches", "qkv", "projected", "mlp_up",
                                "activated", "normalized", "post_normalized"), "projection_output")
         roles.update(dict.fromkeys(("hidden", "attended", "mlp_down", "merged", "output"), "projection_input"))
-        roles.update(key="attention_key", value="attention_value")
         tensors = {name: declaration_tensor(examples, f"vision.{roles[name]}", shapes[name],
                                             torch.bfloat16, device)
-                   for name in sorted(shapes, key=lambda name: prod(shapes[name]), reverse=True)}
+                   for name in sorted(roles, key=lambda name: prod(shapes[name]), reverse=True)}
+        # Attention reads disjoint Q/K/V heads within each packed projection row.
+        tensors.update(zip(("query", "key", "value"), tensors["qkv"].view(patches, 3, 12, 128).unbind(1), strict=True))
         return cls(*(tensors[name] for name in cls.__dataclass_fields__))
 
     def rows(self, patches):
@@ -135,6 +136,17 @@ def interpolate_positions(weight, indices, factors, output):
             * factors[start:end, :, None]).sum(1).to(output.dtype))
 
 
+@torch.library.custom_op("flare::vision_rotary_qkv", mutates_args=("qkv",))
+def _apply_rotary_qkv(qkv: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor) -> None:
+    query, key, _ = qkv.unbind(1)
+    apply_cached_rotary(query, key, cache, positions, query, key, True)
+
+
+@_apply_rotary_qkv.register_fake
+def _fake_rotary_qkv(qkv, cache, positions):
+    pass
+
+
 class _Attention(nn.Module):
     def __init__(self, weights, scratch, cu, positions, *, session, workspace, name):
         super().__init__()
@@ -146,11 +158,10 @@ class _Attention(nn.Module):
             session=session, workspace=workspace, name=name + '.attention').functional(session=session)
 
     def forward(self, source, *, cu_seqlens, position_embeddings):
-        q, k, v = self.qkv(source).view(-1, 3, 12, 128).unbind(1)
-        query = torch.empty_like(q, memory_format=torch.contiguous_format)
-        key = torch.empty_like(k, memory_format=torch.contiguous_format)
-        apply_cached_rotary(q, k, position_embeddings, self.positions, query, key, True)
-        attended = self.attend(query, key, v.contiguous(), cu_seqlens)
+        qkv = self.qkv(source).view(-1, 3, 12, 128)
+        _apply_rotary_qkv(qkv, position_embeddings, self.positions)
+        query, key, value = qkv.unbind(1)
+        attended = self.attend(query, key, value, cu_seqlens)
         return self.output(attended.view(-1, 1536))
 
 

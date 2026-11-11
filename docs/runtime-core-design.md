@@ -273,9 +273,11 @@ released. CUDA downloads and storage commits each use a two-slot pinned ring
 with 8 MiB per slot, reserving 32 MiB per preparation rank.
 File transfer workers share bounded pools of 8 MiB buffers with 4 KiB alignment
 padding, including a reserved scratch pool for unaligned source ranges.
-Each transfer pool budget starts from the smaller of 1 GiB and one sixteenth
-of available host RAM. Capture divides this budget across preparation ranks and
-reserves both pinned rings before sizing file buffers. Capture releases its
+Transfer concurrency uses the smaller of 1 GiB and one sixteenth of available
+host RAM, divided across preparation ranks after accounting for capture's pinned
+rings. Every rank retains at least one lazily allocated file buffer even when
+this estimate cannot cover the minimum storage. Low available RAM reduces
+concurrency; allocation and I/O failures propagate normally. Capture releases its
 storage-transfer pool and pinned rings before materializing frontend assets.
 Publication after model closure uses the full file-transfer budget. Concurrent
 preparation and rank-transfer processes budget their pools independently.

@@ -24,6 +24,7 @@ def test_prepared_operator_examples_are_disjoint(monkeypatch):
 
     class Attention(Projection):
         def __init__(self, query, key, value, cu, output, **kwargs):
+            assert all(tensor.stride() == (4608, 128, 1) for tensor in (query, key, value))
             operands.append((kwargs["name"], (query, key, value, output)))
 
     monkeypatch.setattr(vision, "UnquantizedProjection", Projection)
@@ -43,9 +44,14 @@ def test_prepared_operator_examples_are_disjoint(monkeypatch):
         vision.PreparedVision(weights, scratch, None, session=None, workspace=None, name=f"vision.{capacity}")
     assert operands
     for name, tensors in operands:
-        spans = sorted((tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes) for tensor in tensors)
+        spans = sorted(
+            (tensor.data_ptr() + row * tensor.stride(0) * tensor.element_size(),
+             tensor.data_ptr() + row * tensor.stride(0) * tensor.element_size()
+             + tensor[0].numel() * tensor.element_size())
+            for tensor in tensors for row in range(tensor.shape[0])
+        )
         assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), name
-    assert len({tensor.untyped_storage().data_ptr() for tensor in examples.values()}) == 4
+    assert len({tensor.untyped_storage().data_ptr() for tensor in examples.values()}) == 2
 
 
 @pytest.mark.skipif(

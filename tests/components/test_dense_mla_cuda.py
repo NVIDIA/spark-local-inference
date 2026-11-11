@@ -80,3 +80,74 @@ def test_ragged_tuning_partition_covers_physical_queries(monkeypatch, tokens, ba
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
             torch.testing.assert_close(output, torch.full_like(output, .125), atol=.002, rtol=.02)
         graph.reset()
+
+
+def test_functional_broadcast_page_table_compilation_and_replay(monkeypatch):
+    from ignition import runtime_patches
+    from ignition.components.paged_batch import Metadata
+
+    runtime_patches.apply()
+    device = torch.device("cuda", 0)
+    tokens, heads, columns, page = 7, 96, 8192, 128
+    query = torch.zeros((tokens, heads, 576), dtype=torch.bfloat16, device=device)
+    cache = torch.full((1, page, 576), .125, dtype=torch.bfloat16, device=device)
+    output = torch.empty((tokens, heads, 512), dtype=torch.bfloat16, device=device)
+    table = torch.zeros((tokens, columns), dtype=torch.int32, device=device)
+    pages = torch.zeros((1, columns), dtype=torch.int32, device=device)
+    lengths = torch.full((tokens,), 64, dtype=torch.int32, device=device)
+    starts = torch.arange(tokens + 1, dtype=torch.int32, device=device)
+    request_starts = torch.tensor([64], dtype=torch.int64, device=device)
+    request_lengths = torch.tensor([tokens], dtype=torch.int32, device=device)
+    rows = torch.zeros(1, dtype=torch.int64, device=device)
+    token_ids = torch.zeros((1, tokens), dtype=torch.int64, device=device)
+    live_rows = torch.ones(1, dtype=torch.int32, device=device)
+    caps = dense_mla.Caps(device=device, mode="decode", kv_dtype=cache.dtype,
+        q_dtype=query.dtype, num_q_heads=heads, page_size=page, max_total_q=tokens,
+        max_batch=tokens, max_cache_tokens=columns * page, max_page_table_width=columns,
+        num_cache_pages=1, use_cuda_graph=True, partial_dtype=torch.float32)
+    with RecordedPreparationSession(device=device, checkpoint="dense-mla-broadcast-pages",
+            workload_schema="decode7-context8192-pages", numerical_policy="bf16",
+            autotune_effort="off", compile_workers=2) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        attention = PreparedDenseMLA(query, cache, output, table, lengths, starts,
+            caps=caps, scale=192 ** -.5, session=session, name="attention", workspace=arena)
+        attention.functional(session=session)
+        session.tune(show_progress=False)
+        arena.release_preparation()
+
+        def forward():
+            metadata = Metadata.pack(request_starts, request_lengths, rows, pages, token_ids,
+                live_rows, token_capacity=tokens, sample_count=tokens, max_query_tokens=tokens)
+            result = attention(query, page_table=metadata.token_page_table, lengths=lengths, starts=starts)
+            output.copy_(result)
+
+        metadata = Metadata.pack(request_starts, request_lengths, rows, pages, token_ids,
+            live_rows, token_capacity=tokens, sample_count=tokens, max_query_tokens=tokens)
+        assert metadata.token_page_table.stride() == (0, 1)
+        original_bind, observed = dense_mla.bind, []
+
+        def checked_bind(plan, **kwargs):
+            stride = kwargs["page_table"].stride()
+            observed.append(stride)
+            assert stride == (columns, 1)
+            return original_bind(plan, **kwargs)
+
+        monkeypatch.setattr(dense_mla, "bind", checked_bind)
+        forward()
+        compiled = compile_forward(forward)
+        observed.clear()
+        compiled()
+        assert observed == [(columns, 1)]
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        assert observed == [(columns, 1), (columns, 1)]
+        session.freeze()
+        output.fill_(torch.nan)
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        assert torch.isfinite(output).all()
+        graph.reset()

@@ -298,7 +298,7 @@ class PreparedDraft:
         return hidden, self.head(hidden)
 
     def __call__(self, metadata):
-        return self.forward(metadata)[1]
+        return self.forward(metadata)[1], None
 
 
 class PreparedMarkov:

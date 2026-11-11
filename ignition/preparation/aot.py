@@ -524,6 +524,12 @@ class BoundForward:
         return (self.artifact.backend if isinstance(self.artifact, (_GuardedForwardCall, _CapturedForwardResources))
                 else self.artifact._artifacts.compiled_fn)
 
+    @property
+    def capture_allocation_sizes(self):
+        """CUDA allocation requests from the compiled forward's memory plan."""
+        return tuple(int(size) for device, size in self.backend.artifact._flare_graph._flare_pool_sizes
+                     if device == "cuda")
+
     def prepare_capture(self):
         """Retain execution guards and kernel owners after portable cache writes finish."""
         if isinstance(self.artifact, _CapturedForwardResources):

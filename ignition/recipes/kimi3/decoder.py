@@ -94,7 +94,7 @@ class Scratch:
     def allocate(cls, tokens, rows, config, world_size, device, *, examples=None):
         def tensor(role, shape):
             return declaration_tensor(examples, role, shape, torch.bfloat16, device)
-        return cls(tensor("kimi.activations", (tokens, config.hidden)),
+        return cls(tensor("kimi.hidden_input", (tokens, config.hidden)),
                    tensor("kimi.hidden", (rows, config.hidden)),
                    tensor("kimi.local_logits", (rows, config.vocabulary // world_size)),
                    tensor("kimi.logits", (rows, config.vocabulary)))
@@ -112,7 +112,8 @@ class PreparedMLP:
                  else weights["gate_up"].out_features)
         examples = {} if examples is None else examples
         def tensor(role, columns):
-            return declaration_tensor(examples, "kimi.mlp." + role, (rows, columns), source.dtype, device)
+            key = "kimi.hidden_output" if role == "output" else "kimi.mlp." + role
+            return declaration_tensor(examples, key, (rows, columns), source.dtype, device)
         intermediate = tensor("intermediate", width // 2)
         self.gate_up = prepare_projection(source, weights["gate_up"], tensor("gate_up", width),
             session=session, name=name + ".gate_up", workspace=workspace)
@@ -170,7 +171,8 @@ class PreparedLatentMoE:
         latent = c["routed_expert_hidden_size"]
         examples = {} if examples is None else examples
         def buffer(role, width, dtype=torch.bfloat16):
-            return declaration_tensor(examples, "kimi.moe." + role, (tokens, width), dtype, device)
+            key = "kimi.hidden_output" if role == "output" else "kimi.moe." + role
+            return declaration_tensor(examples, key, (tokens, width), dtype, device)
         self.hidden_columns, self.latent_begin = storage.hidden_columns, storage.latent_begin
         self.world, self.latent_width = shard.world_size, latent
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
@@ -184,7 +186,10 @@ class PreparedLatentMoE:
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
         self.router_projection = UnquantizedProjection(source, weights["router"], local_logits,
             session=session, name=name + ".router").functional(session=session)
-        routes = RouterScratch.allocate(tokens, device, experts=c["num_experts"], top_k=c["num_experts_per_token"])
+        top_k = c["num_experts_per_token"]
+        routes = RouterScratch(buffer("selected_logits", top_k, torch.float32),
+            buffer("route_ids", top_k, torch.int32),
+            buffer("route_weights", top_k, torch.float32).fill_(1 / top_k))
         self.route_gather = self.prefill_route_gather = None
         if route_runtime is not None and tokens <= ROUTE_ROWS:
             down_output = buffer("local_down", latent // shard.world_size)
@@ -201,7 +206,8 @@ class PreparedLatentMoE:
                     session=session, name=name + ".latent_down_rows", workspace=workspace)
                 self.prefill_route_gather = PreparedColumnPairGather(down_output, local_logits, latent_example, logits,
                     runtime=prefill_route_runtime, session=session, coordinator=coordinator,
-                    name=name + ".latent_router_gather", buffers={}).functional(session=session)
+                    name=name + ".latent_router_gather",
+                    buffers=examples.setdefault("kimi.moe.paired_columns", {})).functional(session=session)
             else:
                 self.down = prepare_projection(buffer("source", hidden // shard.world_size), weights["latent_down"],
                     buffer("down", latent), session=session, name=name + ".latent_down", workspace=workspace)
@@ -288,7 +294,7 @@ class PreparedDecoder:
         for index, w in enumerate(weights.layers):
             prefix, kind = f"{name}.layer{index}", config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
-                          buffers=examples.setdefault(kind, {}))
+                          buffers=examples)
             if kind == "kda":
                 attention = PreparedKDA(w["attention"], source, pool.recurrent(index), delta,
                     eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
@@ -310,7 +316,7 @@ class PreparedDecoder:
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     prefill_route_runtime=prefill_route_runtime if mode == "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace, storage=buffers, examples=examples)
-            total = declaration_tensor(examples, "reduction", source.shape, source.dtype, source.device)
+            total = declaration_tensor(examples, "kimi.hidden_output", source.shape, source.dtype, source.device)
             reduce = PreparedChunkedAllReduce(source, total, runtime=runtime, coordinator=coordinator,
                 session=session, name=prefix + ".reduce").functional(session=session)
             self.layers.append((w, attention, mlp, reduce))

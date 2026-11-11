@@ -251,7 +251,7 @@ shared-memory limits on DGX Spark.
 Forward compilation allocates workers across each host after checking cached
 forwards. Ranks without a worker lend missing forwards to other
 ranks on that host; every serving rank binds and captures its full catalog.
-Concurrency uses a 16 GiB host-RAM estimate per worker, plus device storage on
+Concurrency uses a 32 GiB host-RAM estimate per worker, plus device storage on
 integrated GPUs. When that estimate admits no worker, one worker per host may
 start under the 2 GiB minimum host allowance plus integrated device storage.
 These allowances estimate compiler demand; actual peaks depend on the forward.
@@ -1041,21 +1041,27 @@ records written by the current chunk. Projection shapes, normalization and
 weight formats are unchanged. Smaller captured prefill capacities use direct
 peer reads and require peer KV mappings at startup.
 
-At a 1,048,576-token context limit and 4096-token prefill capacity, latent and
-index history share 576 MiB per rank. Index scoring and selected-ID exchange
-finish before latent history overwrites the shared bytes. Independent history
-allocations would require 708 MiB; sharing removes the 132 MiB index allocation
-without changing the persistent KV or index caches. Latent peer staging reserves
-36 MiB, while index staging, selected IDs and their transport channel reserve
-another 106.535 MiB, before query buffers and score scratch. Serial layers reuse
-these allocations, which reduce the remaining KV-page budget. Keep the default
-4096-token capacity for this prefill path; `--prefill-chunk-size 2048` omits it
-and its fixed history storage. The compiled history-copy regression in
+At a 1,048,576-token context limit, latent history contains 576 MiB per rank
+and index history contains 132 MiB. These histories are invocation-local tensors.
+Index scoring and selected-ID exchange finish before latent history is produced,
+so Inductor can reuse their storage when their declared dependencies allow it.
+Peer-visible staging and transport buffers remain persistent. The graph-pool
+size depends on the compiled schedule and the complete captured graph catalog.
+The 4096-token prefill path uses these histories; `--prefill-chunk-size 2048`
+uses direct peer reads instead. The compiled history-copy regression in
 `tests/recipes/test_kimi_prefill_histories.py` checks byte preservation across
 page remapping, partial prefixes, empty rows, and repeated graph replay.
-`qualify/kimi_history_alias.py` compares independent and aliased storage through
-one complete checkpoint attention layer on sixteen GPUs, including exact cache
-bytes, cutoff ties, and attention in the emitted selection order.
+
+Target, draft, and vision forwards allocate activations, verification records,
+and operator workspaces inside compilation. Inductor plans their lifetimes, and
+serialized graph variants share one CUDA graph pool. Preparation releases
+declaration examples and tuning workspace before compilation. Weights, request
+state, recurrent and attention caches, completion frames, and image features
+retain explicit storage across graph boundaries.
+
+MoonViT attention rotates Q and K in the packed QKV projection and passes its
+strided Q/K/V views directly to attention. Tuning fixtures preserve those views
+in one private backing allocation, with a shared host seed for restoration.
 
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)

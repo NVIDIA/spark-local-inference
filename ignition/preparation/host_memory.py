@@ -12,7 +12,7 @@ from pathlib import Path
 
 _WORKER_BYTES = 2 << 30
 # Conservative concurrency estimate; complete-forward tracing can outgrow kernel tuning workers.
-FORWARD_WORKER_BYTES = 16 << 30
+FORWARD_WORKER_BYTES = 32 << 30
 _HEADROOM_BYTES = 8 << 30
 # Kernel modules and temporary compiler objects retained by each tuning rank.
 _TUNING_GROWTH_BYTES = 1 << 30

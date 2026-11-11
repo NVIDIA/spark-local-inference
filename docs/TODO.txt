@@ -14,6 +14,10 @@
     payload file and cache lease. Report the required limit before partially
     assembling ranks; see heliopause/src/export/core.rs and model-preparation.md.
 
+[ ] Prevent healthy TP forward compilation from exhausting the two-hour Gloo
+    timeout in ForwardCache._prepare_ranks when idle ranks gather outcomes.
+    Preserve compiler failure and dead-peer detection while waiting for work.
+
 [ ] Restore loading and serving for cores with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in
     helios/proto/runtime_core.proto. Validate their original captured graphs
@@ -102,7 +106,7 @@
     Windows text/image/speculative replay. SM103 execution and CSF repacking
     need GPU validation beyond metadata tests. See windows.md#serve-a-prepared-core.
 
-[ ] Validate compiler-owned temporaries in a complete GLM export. Migrate Kimi,
+[ ] Validate compiler-owned temporaries in complete GLM and Kimi exports. Migrate
     Step, Muse, and MiMo from graph-buffer pools, then validate complete exports.
     Exercise native text/image transitions, speculative rollback, and full graph
     catalogs with tensor parallelism. Measure fixed memory and KV capacity. See
@@ -111,6 +115,11 @@
 [ ] Fix Int32 partial-output address overflow in FlashInfer dense MLA split
     stores for Kimi prefill4096; use element offsets that cover the allocated
     tensor. Validate with Compute Sanitizer and the unchanged attention reference.
+
+[ ] Resolve CUDA_ERROR_ILLEGAL_ADDRESS when serving a 6112-token prompt from
+    Kimi K3.1 Pro core gb202-tp16-202611111208, exported with concurrency 2 and
+    prefill capacity 4096. Short text and image requests complete. Repeat the
+    long prompt in a fresh native serving process before closing this item.
 
 [ ] Resolve Step TP8 package publication exceeding the 128 MiB envelope limit
     after all 111 graphs capture. Preserve bounded package loading and validate

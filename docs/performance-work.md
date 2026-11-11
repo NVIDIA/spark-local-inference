@@ -222,7 +222,7 @@ that suffix geometry. Layer histories must be committed before their source
 intermediates can be reused. Vision upload pixels retain their declared
 precision and validation before conversion into encoder activations.
 
-Kimi, Step, Muse, and MiMo retain caller-owned graph-buffer paths. Their
+Step, Muse, and MiMo retain caller-owned graph-buffer paths. Their
 buffer cursors may reuse storage only after the last consumer and must
 keep concurrent expert branches and draft-context values disjoint.
 Tensor-parallel ranks must bind equivalent layouts, including storage

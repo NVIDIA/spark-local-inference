@@ -126,7 +126,9 @@ class PreparedContext:
         self.eps = config.draft.text["rms_norm_eps"]
 
         def buffer(role, *shape, dtype=torch.bfloat16):
-            return declaration_tensor(examples, "mla_dspark.context." + role, (tokens, *shape), dtype, device)
+            key = {"projected": "kimi.hidden_output", "normalized": "kimi.hidden_input"}.get(
+                role, "mla_dspark.context." + role)
+            return declaration_tensor(examples, key, (tokens, *shape), dtype, device)
 
         self.local = buffer("local", config.hidden // weights.shard.world_size)
         self.projected = buffer("projected", config.hidden)
@@ -353,4 +355,4 @@ class PreparedDraft:
         return hidden, self.head(hidden)
 
     def __call__(self, metadata):
-        return self.forward(metadata)[1]
+        return self.forward(metadata)[1], None

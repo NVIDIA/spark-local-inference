@@ -49,7 +49,8 @@ class PreparedMLAProjection:
         device = source.device
 
         def buffer(key, *shape, dtype=None, rows=None):
-            return declaration_tensor(buffers, 'mla.' + key, (tokens, *shape),
+            role = 'kimi.hidden_output' if key == 'output' else 'mla.' + key
+            return declaration_tensor(buffers, role, (tokens, *shape),
                 source.dtype if dtype is None else dtype, device)
 
         latent_width = weights["query_norm"].shape[0] + RECORD_BYTES

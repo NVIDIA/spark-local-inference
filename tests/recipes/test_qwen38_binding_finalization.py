@@ -64,6 +64,9 @@ class Session:
         for request in requests:
             self.requests[request.name] = request
 
+    def release_benchmark_cache(self):
+        pass
+
     def finalize(self):
         for arena in self.arenas:
             arena.finalize()

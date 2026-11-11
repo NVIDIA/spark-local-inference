@@ -469,7 +469,6 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
     from ignition.preparation.disposable import storage_ranges
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
-    from ignition.recipes.kimi3.decoder import DecoderStorage
     from ignition.recipes.kimi31.dcp import AttentionConstants, PREFILL_ROWS, RECORD_BYTES, TOPK
     from ignition.recipes.kimi31.indexer import SharedBuffers
 
@@ -491,7 +490,6 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
     slots = buffers.buffer("slots", (PREFILL_ROWS, TOPK), torch.int32)
     slot_seed = torch.zeros_like(slots)
     slot_seed[:, :17] = torch.arange(PREFILL_ROWS * 17, device=device).view(PREFILL_ROWS, 17)
-    storage = DecoderStorage(scratch, hidden_columns=None, latent_begin=None)
     with RecordedPreparationSession(device=device, checkpoint="kimi31-attention-constants",
             workload_schema="selected-page-attention", numerical_policy="default") as session:
         arena = ScratchArena(device)
@@ -524,7 +522,7 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
         assert operations[0][2] is not operations[3][2]
         session.tune(show_progress=False)
         scratch["workspace"] = arena.tensor
-        disposable = storage_ranges(storage.scratch_tensors())
+        disposable = storage_ranges(scratch)
         for constant in (constants.pages, constants.starts, constants.scale):
             address = constant.untyped_storage().data_ptr()
             extent = constant.untyped_storage().nbytes()
@@ -550,7 +548,7 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
             graphs.append((layer_operations, compiled, graph))
         session.freeze()
         for layer_operations, compiled, graph in graphs:
-            for tensor in storage.scratch_tensors():
+            for tensor in scratch.values():
                 if isinstance(tensor, torch.Tensor):
                     tensor.zero_()
             query.copy_(query_seed)

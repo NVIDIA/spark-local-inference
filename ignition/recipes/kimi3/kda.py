@@ -29,7 +29,8 @@ class PreparedKDA:
         device = source.device
 
         def buffer(key, channels):
-            return declaration_tensor(buffers, 'kda.' + key, (tokens, channels), torch.bfloat16, device)
+            role = 'kimi.hidden_output' if key == 'output' else 'kda.' + key
+            return declaration_tensor(buffers, role, (tokens, channels), torch.bfloat16, device)
 
         self.heads, self.width = heads, width
 

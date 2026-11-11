@@ -15,7 +15,9 @@ cuda = pytest.mark.skipif(os.getenv("FLARE_RUN_CUDA_TESTS") != "1", reason="requ
 
 @cuda
 @torch.no_grad()
-def test_checkpoint_kda_verification_commits_only_accepted_prefix():
+def test_checkpoint_kda_verification_commits_only_accepted_prefix(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     from ignition.components.kda_speculation import KDARecords, PreparedKDAReplay
     from ignition.components.parallel import TensorParallelShard
     from ignition.components.recurrent import DeltaMetadata
@@ -55,7 +57,7 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
         verify = PreparedKDA(w, source, state, verify_meta, mode="verify", eps=1e-5,
             session=session, name="verify", workspace=arena, buffers=buffers, records=records.layer(0))
         replay = PreparedKDAReplay(pool.backing, [state.recurrent], records, verify.plan,
-            verify_meta.state_indices[:, 0], session=session, workspace=arena)
+            session=session).functional()
         session.tune(show_progress=False)
         for meta, tokens in ((verify_meta, 8), (decode_meta, 1)):
             meta.query_start_loc[1] = tokens
@@ -65,7 +67,7 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             meta.num_tokens.fill_(tokens)
         def verify_commit():
             verify(source, verify_meta, records=records.layer(0))
-            replay(counts)
+            replay(counts, records, verify_meta)
             torch.library.wrap_triton(_commit_convolution)[(1, 1, 18)](
                 pool.backing.view(torch.bfloat16), offsets, verify_meta.state_indices[:, 0], counts,
                 pool.layout.row_bytes // 2, 2304, 10, 128)
