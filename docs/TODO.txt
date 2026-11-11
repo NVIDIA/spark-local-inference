@@ -444,3 +444,20 @@
     inference, Flare.exe on a machine without the development environment,
     transfer interruption, switching under load, accessibility, and recovery
     from sleep or GPU reset. See flare-winui/README.md.
+
+[ ] Run .github/workflows/release.yml on GitHub-hosted runners through
+    workflow_dispatch; it has never run there. The run must establish that
+    ubuntu-24.04-arm provides Docker for the clean-container check, that both
+    Windows images provide the Visual Studio components, Windows SDK
+    10.0.26100.0, Clang, and winget that scripts/setup_windows.ps1 and
+    flare-winui/build.ps1 expect, that the x64 desktop links, and that a hosted
+    Windows session can open the desktop window. Close when one dispatched run
+    passes on all four runners. See release.md.
+
+[ ] Review THIRD_PARTY_NOTICES.md's statement of the terms under which the
+    Windows desktop archive redistributes the Windows App SDK and Visual C++
+    runtime files. Close when the project owner has approved the wording.
+
+[ ] Publish Debian packages with releases and update the APT repository from
+    them. release.yml builds no .deb, and no tracked tool builds or signs an
+    APT index. See debian.md and release.md.

@@ -56,7 +56,11 @@ Omit `-SingleFile` for the loose development workflow. The build copies the
 selected Windows App SDK components and Visual C++ runtime files beside
 `flare-winui.exe`; distribute that complete Release directory when using this
 form. Both distribution forms are unsigned build outputs, without an MSIX or
-installer.
+installer. Neither form contains license notices. `packaging/archive.py
+--winui-packages` packages the single-file `Flare.exe` with the notices of its
+Rust and NuGet dependencies, as
+[third-party notices](../THIRD_PARTY_NOTICES.md#updating-the-notices-and-creating-archives)
+describes; [binary releases](../docs/release.md) publish that archive.
 Windows App SDK's WebView metadata is required
 to generate the WinUI projection, but no WebView loader is linked or copied.
 

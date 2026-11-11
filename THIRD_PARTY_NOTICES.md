@@ -81,9 +81,27 @@ archive packager copies no shared libraries or CUDA SDK components.
 The Windows desktop instead bundles app-local Windows App SDK and Visual C++
 runtime files. Its dependency versions are pinned in
 `flare-winui/packages.config`, `flare-winui/bridge/Cargo.lock`, and
-`flare-winui/launcher/Cargo.lock`. The desktop single-file packager does not
-collect these dependencies' distribution notices, and the CLI notice inventory
-above does not cover the complete desktop distribution.
+`flare-winui/launcher/Cargo.lock`. The CLI notice inventory above does not
+cover the desktop.
+
+The desktop release archive carries the desktop's notices. `packaging/archive.py
+--winui-packages` collects the Rust dependency notices of the two desktop
+lockfiles for the archive's target into `third_party/rust/`, and the license and
+notice files of every NuGet package pinned in `flare-winui/packages.config` into
+`third_party/nuget/`. Packaging fails when a pinned crate or NuGet package has
+no license text. The pinned WebView2 package supplies build metadata only; its
+notices are included although none of its files are bundled.
+
+The Visual C++ runtime DLLs are copied from the `Microsoft.VC143.CRT` directory
+of the Visual Studio installation that built the desktop, under its
+`VC\Redist` folder. Microsoft's
+[Visual Studio 2022 redistribution list](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)
+permits distributing unmodified files from that folder with a program, subject
+to the Visual Studio license terms. Visual Studio supplies no license file
+beside them, and the archive contains none for them.
+
+The single-file `Flare.exe` embeds the bundled runtime but no notices.
+Distribute it inside the release archive.
 
 | System component | Terms and use |
 | --- | --- |
@@ -133,3 +151,17 @@ Use the matching target, executable path, and `.zip` output on Windows. The
 packager includes LICENSE, NOTICE, this document, adapted-code licenses, native
 dependency notices, and toolchain notices. It copies no Python packages,
 Heliopause extension, model weights, or prepared model assets.
+
+Package the Windows desktop after `scripts/build_winui.ps1 -SingleFile`, from
+the shell that `scripts/dev_windows.ps1` configures, so that `cargo` and `rustc`
+are the toolchain that built it. `--winui-packages` names the directory into
+which the build restored the pinned NuGet packages:
+
+```powershell
+rustup component add rust-docs
+python packaging/archive.py --binary .local-dev/winui/ARM64/SingleFile/Flare.exe `
+  --target aarch64-pc-windows-msvc --winui-packages .local-dev/native-packages `
+  --output flare-windows-arm64.zip
+```
+
+[Binary releases](docs/release.md) lists the archives a release publishes.

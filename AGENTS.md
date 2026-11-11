@@ -217,7 +217,7 @@ and hardware sections of the preparation guide.
 | Change the core container format, conversion, signing, or publisher trust | [Core format](docs/core-format-design.md), [signing](docs/signing.md), and [core compatibility](#model-core-compatibility) |
 | Change Helios lifecycle, cancellation, or rank coordination order | [Verification guidance](docs/verification.md), [the lifecycle models](verification/helios-lifecycle/README.md), and [the lifecycle skill](.agents/skills/helios-lifecycle/SKILL.md) |
 | Build or change Windows serving or the desktop client | [Windows serving](docs/windows.md) and [the desktop client](flare-winui/README.md) |
-| Build containers, Debian packages, or release archives | [Container](docs/container.md), [Debian package](docs/debian.md), and [third-party notices](THIRD_PARTY_NOTICES.md) |
+| Build containers, Debian packages, or release archives, or change the release workflow | [Container](docs/container.md), [Debian package](docs/debian.md), [binary releases](docs/release.md), and [third-party notices](THIRD_PARTY_NOTICES.md) |
 
 For sampling or frontend metadata changes, also read
 [sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).

@@ -52,7 +52,10 @@ installation may require administrator consent. Python 3.12 and an editable
 Ignition test environment supply frontend fixtures; model preparation dependencies
 and the CUDA toolkit are not installed. Add `-Test` to run the native test suites
 after building and checking the CLI. Rerunning setup preserves an existing
-`.local-dev/config.toml`.
+`.local-dev/config.toml`. `-RustToolchain VERSION` installs and selects that
+Rust toolchain in place of `stable`. `-BuildToolsOnly` stops after installing
+the compilers and build tools: it creates no Python environment, fixtures, or
+configuration and does not build the CLI.
 
 Enter the environment and use prepared cores:
 
@@ -277,6 +280,8 @@ create and validate the embedded ZIP without compiling the launcher. The ZIP
 records file sizes and SHA-256 digests with fixed ordering and timestamps.
 The launcher uses the static C runtime; build outputs are unsigned. An
 installer, signing workflow, and automatic runtime-cache cleanup are not provided.
+[Binary releases](release.md) publish `Flare.exe` with its license notices as
+`flare-windows-amd64.zip` and `flare-windows-arm64.zip`.
 
 Omit `-SingleFile` for the loose development workflow, launching
 `.local-dev\winui\<ARM64|x64>\Release\flare-winui.exe` with its complete

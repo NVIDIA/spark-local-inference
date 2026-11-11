@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [CmdletBinding()]
-param([switch]$Test, [string]$DevRoot)
+param([switch]$Test, [string]$DevRoot, [string]$RustToolchain = 'stable', [switch]$BuildToolsOnly)
 
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path -Parent $PSScriptRoot
@@ -76,8 +76,13 @@ $rustup = Join-Path $env:CARGO_HOME 'bin/rustup.exe'
 if (-not (Test-Path -LiteralPath $rustup)) {
     $installer = Join-Path $downloads 'rustup-init.exe'
     Invoke-WebRequest -UseBasicParsing "https://static.rust-lang.org/rustup/dist/$rustHost/rustup-init.exe" -OutFile $installer
-    & $installer -y --profile minimal --default-toolchain stable --default-host $rustHost --no-modify-path
+    & $installer -y --profile minimal --default-toolchain $RustToolchain --default-host $rustHost --no-modify-path
     if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed.' }
+} elseif ($PSBoundParameters.ContainsKey('RustToolchain')) {
+    & $rustup toolchain install $RustToolchain --profile minimal
+    if ($LASTEXITCODE -ne 0) { throw "Rust toolchain $RustToolchain installation failed." }
+    & $rustup default $RustToolchain
+    if ($LASTEXITCODE -ne 0) { throw "Rust toolchain $RustToolchain selection failed." }
 }
 & $rustup component add rustfmt clippy
 if ($LASTEXITCODE -ne 0) { throw 'Rust development component installation failed.' }
@@ -85,6 +90,10 @@ $cmakeRoot = Join-Path $tools 'cmake'
 Install-ZipTool "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-$cmakePlatform.zip" (Join-Path $downloads 'cmake.zip') $cmakeRoot (Join-Path $cmakeRoot "cmake-4.4.4-windows-$cmakePlatform/bin/cmake.exe")
 $protocRoot = Join-Path $tools 'protoc'
 Install-ZipTool 'https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip' (Join-Path $downloads 'protoc.zip') $protocRoot (Join-Path $protocRoot 'bin/protoc.exe')
+if ($BuildToolsOnly) {
+    Write-Host 'Flare build tools are installed. Enter a shell with scripts/dev_windows.ps1.'
+    return
+}
 
 $python = Join-Path $repository '.venv/Scripts/python.exe'
 if (-not (Test-Path -LiteralPath $python)) {
