@@ -202,6 +202,7 @@ macro_rules! path_command {
 }
 no_argument_command!(flare_app_refresh, Command::Refresh);
 no_argument_command!(flare_app_stop, Command::Stop);
+no_argument_command!(flare_app_clear_failed_downloads, Command::ClearFailedDownloads);
 string_command!(flare_app_discover, Command::Discover);
 string_command!(flare_app_download, Command::Download);
 string_command!(flare_app_activate, Command::Activate);

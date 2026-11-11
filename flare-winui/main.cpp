@@ -282,6 +282,7 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
         clicked(L"LibraryTab", [this] { select_source(false); });
         clicked(L"ViewDownloadsButton", [this] { select_page(2); });
         clicked(L"DownloadsFindButton", [this] { select_source(true); select_page(1); });
+        clicked(L"DownloadsClearFailedButton", [this] { accepted(flare_app_clear_failed_downloads(app_)); });
         clicked(L"CopyEndpointButton",[this]{if(endpoint_.empty())return;copy_text(endpoint_+L"/v1");copied_endpoint_=endpoint_;endpoint_copy_until_=std::chrono::steady_clock::now()+std::chrono::seconds(2);text(L"EndpointCopyStatus",L"Copied");});
         clicked(L"CopyErrorButton",[this]{
             try {
@@ -734,13 +735,15 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
         text(L"DownloadsSummary", count == 0 ? L"No downloads" :
             std::to_wstring(count) + (count==1?L" transfer":L" transfers") + (count > 100 ? L". Showing the first 100." : L"."));
         control<Button>(L"DownloadsFindButton").Visibility(count?Visibility::Collapsed:Visibility::Visible);
-        uint32_t running=0;flare_download summary{};int summary_rank=99;
+        uint32_t running=0;flare_download summary{};int summary_rank=99;bool has_failed=false;
         auto list = control<StackPanel>(L"DownloadList");
         list.Visibility(count?Visibility::Visible:Visibility::Collapsed);
         std::vector<uint64_t> seen;
-        for (size_t i = 0; i < std::min(count, size_t{100}); ++i) {
+        for (size_t i = 0; i < count; ++i) {
             flare_download value{};
             if (!flare_snapshot_download(snapshot, i, &value)) continue;
+            has_failed=has_failed||value.state==FLARE_DOWNLOAD_FAILED;
+            if(i>=100)continue;
             if(value.state==FLARE_DOWNLOAD_RUNNING||value.state==FLARE_DOWNLOAD_QUEUED)++running;
             int rank=value.state==FLARE_DOWNLOAD_RUNNING?0:value.state==FLARE_DOWNLOAD_QUEUED?1:value.state==FLARE_DOWNLOAD_PAUSED?2:value.state==FLARE_DOWNLOAD_FAILED?3:4;
             if(rank<summary_rank){summary_rank=rank;summary=value;}
@@ -803,6 +806,7 @@ struct DesktopApp : ApplicationT<DesktopApp, Markup::IXamlMetadataProvider> {
             found->pause.Visibility(value.can_cancel ? Visibility::Visible : Visibility::Collapsed);
             found->use.Visibility(value.state==FLARE_DOWNLOAD_COMPLETE&&value.installed_model.length?Visibility::Visible:Visibility::Collapsed);
         }
+        control<Button>(L"DownloadsClearFailedButton").Visibility(has_failed?Visibility::Visible:Visibility::Collapsed);
         control<InfoBadge>(L"DownloadBadge").Value(static_cast<int32_t>(running));control<InfoBadge>(L"DownloadBadge").Visibility(running?Visibility::Visible:Visibility::Collapsed);
         text(L"DownloadSummary",count?wide(summary.name)+L" · "+wide(summary.phase):L"No downloads queued");
         control<Grid>(L"HomeSupportPanels").Visibility(dashboard_.available||running?Visibility::Visible:Visibility::Collapsed);

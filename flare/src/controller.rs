@@ -56,6 +56,7 @@ pub enum Command {
     Discover(String),
     OpenModel(PathBuf),
     Download(String),
+    ClearFailedDownloads,
     Activate(String),
     Stop,
     Resume(u64),
@@ -1140,6 +1141,7 @@ impl Worker {
             Command::Download(source) => {
                 self.queue_download(id, source, self.settings.model_directory.clone())
             }
+            Command::ClearFailedDownloads => self.clear_failed_downloads(),
             Command::Resume(previous) => {
                 let saved = self
                     .persistent
@@ -1535,6 +1537,111 @@ mod tests {
         assert_eq!(restored.downloads[0].id, 17);
         state.save(&path).unwrap();
         assert!(Persistent::load(&path).is_ok());
+    }
+    #[test]
+    fn clear_failed_downloads_preserves_other_entries_files_and_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = configuration(directory.path());
+        let state_file = config.with_file_name("desktop-state.json");
+        let data = directory.path().join("models");
+        std::fs::create_dir_all(&data).unwrap();
+        let partial = data.join("core.incomplete");
+        let installed = data.join("model.safetensors");
+        std::fs::write(&partial, b"partial core data").unwrap();
+        std::fs::write(&installed, b"installed core data").unwrap();
+        let states = [FAILED, COMPLETE, FAILED, PAUSED, CANCELLED, QUEUED, RUNNING];
+        let saved = Persistent {
+            appearance: Appearance { compact: true, ..Default::default() },
+            extra: serde_json::from_value(serde_json::json!({"retained_preference": 7})).unwrap(),
+            downloads: states.iter().enumerate().map(|(index, state)| SavedDownload {
+                installed_model: String::new(),
+                id: index as u64 + 1,
+                source: format!("publisher/model-{index}@gb10"),
+                directory: data.clone(),
+                state: *state,
+                error: String::new(),
+            }).collect(),
+            ..Default::default()
+        };
+        saved.save(&state_file).unwrap();
+        let app = Controller::new(Some(config.clone())).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.len() == states.len());
+        // Restored transfers are paused; live transfer state must survive cleanup too.
+        app.shared.update(|inner| {
+            for (slot, state) in inner.downloads.iter_mut().zip(states) {
+                slot.view.state = state;
+                if matches!(state, QUEUED | RUNNING) {
+                    inner.operations.insert(slot.view.operation_id, Operation::new());
+                }
+            }
+        });
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        let cleared = wait_for(&app, |view| {
+            !view.busy && view.downloads.len() == states.len() - 2
+        });
+        assert!(cleared.error.is_empty());
+        assert_eq!(
+            cleared.downloads.iter().map(|download| download.state).collect::<Vec<_>>(),
+            [COMPLETE, PAUSED, CANCELLED, QUEUED, RUNNING]
+        );
+        assert_eq!(
+            cleared.downloads.iter().map(|download| download.operation_id).collect::<Vec<_>>(),
+            [2, 4, 5, 6, 7]
+        );
+        {
+            let inner = app.shared.inner.lock().unwrap();
+            for id in [6, 7] {
+                assert!(!inner.operations[&id].cancel.load(Ordering::Acquire));
+            }
+        }
+        let persisted = Persistent::load(&state_file).unwrap();
+        assert_eq!(
+            persisted.downloads.iter().map(|download| download.id).collect::<Vec<_>>(),
+            [2, 4, 5, 6, 7]
+        );
+        assert!(persisted.appearance.compact);
+        assert_eq!(persisted.extra, saved.extra);
+        assert_eq!(std::fs::read(&partial).unwrap(), b"partial core data");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"installed core data");
+        close(&app);
+        drop(app);
+        let restored = Controller::new(Some(config)).unwrap();
+        assert_eq!(restored.snapshot().downloads.len(), states.len() - 2);
+        assert!(restored.snapshot().downloads.iter().all(|download| download.state != FAILED));
+        close(&restored);
+    }
+    #[test]
+    fn clear_failed_downloads_keeps_history_when_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = configuration(directory.path());
+        let state_file = config.with_file_name("desktop-state.json");
+        let saved = Persistent {
+            downloads: vec![SavedDownload {
+                installed_model: String::new(),
+                id: 1,
+                source: "publisher/model@gb10".into(),
+                directory: directory.path().join("models"),
+                state: FAILED,
+                error: "Transfer failed".into(),
+            }],
+            ..Default::default()
+        };
+        saved.save(&state_file).unwrap();
+        let app = Controller::new(Some(config)).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.len() == 1);
+        std::fs::remove_file(&state_file).unwrap();
+        std::fs::create_dir(&state_file).unwrap();
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        let failed = wait_for(&app, |view| !view.busy && !view.error.is_empty());
+        assert_eq!(failed.downloads.len(), 1);
+        assert_eq!(failed.downloads[0].state, FAILED);
+        assert_eq!(failed.downloads[0].error, "Transfer failed");
+        std::fs::remove_dir(&state_file).unwrap();
+        saved.save(&state_file).unwrap();
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.is_empty());
+        assert!(Persistent::load(&state_file).unwrap().downloads.is_empty());
+        close(&app);
     }
     #[test]
     fn loading_observation_exposes_stable_stage_and_measured_progress() {
@@ -2236,6 +2343,18 @@ impl Worker {
                 cancelled: false,
             });
         }
+        Ok(())
+    }
+    fn clear_failed_downloads(&mut self) -> Result<(), String> {
+        let mut saved = self.persistent.clone();
+        saved.downloads.retain(|download| download.state != FAILED);
+        if saved.downloads.len() == self.persistent.downloads.len() {
+            return Ok(());
+        }
+        saved.save(&self.settings.state_file)?;
+        self.persistent = saved;
+        self.shared
+            .update(|state| state.downloads.retain(|slot| slot.view.state != FAILED));
         Ok(())
     }
     fn finish_download(&mut self, done: DownloadDone) {
