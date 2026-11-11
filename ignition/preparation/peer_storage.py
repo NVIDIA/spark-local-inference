@@ -34,10 +34,10 @@ class PeerStorage(CudaRTLibrary):
         self.imported = {}
         self.imported_mappings = {}
         self.dynamic = {}
-        storage.library.flare_package_allocate.restype = C.c_void_p
+        storage.library.flare_core_allocate.restype = C.c_void_p
 
     def cudaMalloc(self, size):
-        pointer = self.storage.library.flare_package_allocate(
+        pointer = self.storage.library.flare_core_allocate(
             C.c_size_t(size), C.c_int(self.storage.device), None)
         if pointer is None:
             raise self.storage.error or MemoryError("collective allocation failed")
@@ -45,7 +45,7 @@ class PeerStorage(CudaRTLibrary):
         return pointer
 
     def cudaFree(self, pointer):
-        self.storage.library.flare_package_free(C.c_void_p(pointer), C.c_size_t(0),
+        self.storage.library.flare_core_free(C.c_void_p(pointer), C.c_size_t(0),
                                                C.c_int(self.storage.device), None)
         if self.storage.error:
             raise self.storage.error

@@ -16,6 +16,8 @@ def test_support_forward_is_neither_compiled_nor_captured(monkeypatch):
     calls = []
     selected = lambda: calls.append("speculative")
     selected.prepare_capture = lambda: 0
+    selected.retire_after_capture = lambda: None
+    selected.capture_allocation_sizes = ()
     support = lambda: calls.append("support")
     stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
 
@@ -57,22 +59,24 @@ def test_trial_inputs_are_restored_before_warmup_and_outside_graph_capture(monke
             state["capturing"] = False
 
     def restore(name):
-        assert name == "trial" and not state["capturing"]
+        assert name in ("trial", "other") and not state["capturing"]
         state["value"] += 1
         calls.append(("restore", state["value"]))
 
     def forward():
-        calls.append(("run", state["value"]))
+        calls.append(("run", state["value"], state["capturing"]))
 
     monkeypatch.setattr(capture.torch.cuda, "current_stream", lambda device: stream)
     monkeypatch.setattr(capture.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(capture.torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(capture.torch.cuda, "CUDAGraph", lambda: "graph")
     monkeypatch.setattr(capture.torch.cuda, "graph", graph_scope)
-    capture.capture_forwards({"trial": forward}, {"trial": SimpleNamespace(kind="speculative")},
+    capture.capture_forwards(dict.fromkeys(("trial", "other"), forward),
+        {name: SimpleNamespace(kind="speculative") for name in ("trial", "other")},
         session=SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: {}), capture=nullcontext),
         device="cuda:0", stream=stream, pool=None, compile_decoder=False, before_run=restore)
-    assert calls == [("restore", 1), ("run", 1), ("restore", 2), ("run", 2)]
+    assert calls == [("restore", 1), ("run", 1, False), ("restore", 2), ("run", 2, False),
+                     ("restore", 3), ("run", 3, True), ("restore", 4), ("run", 4, True)]
 
 
 def test_grouped_capture_compiles_one_representative_and_captures_each_owner(monkeypatch):
@@ -80,11 +84,15 @@ def test_grouped_capture_compiles_one_representative_and_captures_each_owner(mon
     stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
     class Bound:
         cache_hit = False
+        capture_allocation_sizes = ()
         def __init__(self, owner):
             self.owner = owner
 
         def prepare_capture(self):
             return 0
+
+        def retire_after_capture(self):
+            pass
 
         def __call__(self):
             events.append(("run", self.owner))

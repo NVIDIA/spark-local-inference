@@ -6,6 +6,7 @@
 import gc
 import os
 from functools import partial
+from types import SimpleNamespace
 from importlib import import_module
 from pathlib import Path
 
@@ -16,11 +17,22 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                 reason="requires an explicitly assigned CUDA device")
 
 
-def _forward_with_reuse(block, source, staged, arena, output):
+def _forward_with_reuse(block, source, staged, arena, output, metadata):
     staged.copy_(source)
-    output.copy_(block(staged))
+    output.copy_(block(staged, metadata))
     arena.tensor.fill_(255)
     staged.fill_(float("nan"))
+
+
+class RouterReadback:
+    def __init__(self, operation, ids, weights):
+        self.operation, self.ids, self.weights = operation, ids, weights
+
+    def __call__(self, logits, **kwargs):
+        routes = self.operation(logits, **kwargs)
+        self.ids.copy_(routes.ids)
+        self.weights.copy_(routes.weights)
+        return routes
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 64])
@@ -31,7 +43,7 @@ def test_checkpoint_latent_moe(tokens, schedule, tmp_path):
     from ignition.components.parallel import TensorParallelShard
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compile_pool import CompilePool
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.moe import PreparedLatentMoE
     from ignition.recipes.nemotron_h.weights import NemotronWeightLoader
     from ignition.reference.qwen38_quant import CheckpointTensors
@@ -50,14 +62,19 @@ def test_checkpoint_latent_moe(tokens, schedule, tmp_path):
     staged = torch.empty_like(source)
     count = torch.tensor([tokens], device="cuda", dtype=torch.int32)
     with PreparationSession(device="cuda:0", autotune=False) as session:
-        arena, buffers = ScratchArena("cuda:0", overlap=schedule != "serial"), GraphBufferPool("cuda:0")
+        arena = ScratchArena("cuda:0", overlap=schedule != "serial")
         block = PreparedLatentMoE(weights, staged, config, 1, session=session, name="moe",
-                                 workspace=arena, buffers=buffers.cursor(), num_valid_tokens=count)
+                                 workspace=arena, num_valid_tokens=count)
         if schedule != "serial":
             block.concurrent_shared.defer_launch = schedule == "routed_first"
+        block.functional(session=session)
         arena.finalize()
+        metadata = SimpleNamespace(live_counts=count)
+        ids_readback = torch.empty((tokens, 9), device="cuda", dtype=torch.int32)
+        weights_readback = torch.empty((tokens, 9), device="cuda", dtype=torch.float32)
+        block.router = RouterReadback(block.router, ids_readback, weights_readback)
         actual = torch.empty_like(source)
-        operation = partial(_forward_with_reuse, block, source, staged, arena, actual)
+        operation = partial(_forward_with_reuse, block, source, staged, arena, actual, metadata)
         artifact_path = tmp_path / "moe.bin"
         with CompilePool(source.device) as compiler:
             compiler.submit(operation, artifact_path).result()
@@ -106,5 +123,5 @@ def test_checkpoint_latent_moe(tokens, schedule, tmp_path):
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(actual[:live], complete[:live], rtol=.01, atol=.001)
-            assert torch.all(block.router.scratch.ids[live:] == -1)
-            assert torch.count_nonzero(block.router.scratch.weights[live:]) == 0
+            assert torch.all(ids_readback[live:] == -1)
+            assert torch.count_nonzero(weights_readback[live:]) == 0

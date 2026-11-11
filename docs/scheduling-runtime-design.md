@@ -3,16 +3,29 @@
 Helios selects prepared physical graphs by expected useful value per execution
 time. Request-level token and delivery prices provide fairness. A decode-age
 continuation term prices the delay caused by a nonpreemptible graph. The
-implementation is in `helios/src/scheduler/{policy,service,utility,cost}.rs`;
+implementation is `helios/src/scheduler.rs` (commit, completion, and request
+resources) and the modules in `helios/src/scheduler/`: `policy.rs` (candidates
+and selection), `utility.rs` (value arithmetic and cohort selection),
+`service.rs` (service prices), `cost.rs` (duration estimates), `refresh.rs`
+(timing-refresh and acceptance-learning credit), `learning.rs` (acceptance
+probes), `rounds.rs` (speculative round candidates and confidence forecasts),
+and `speculation.rs` (acceptance estimates).
 [`scheduling-utility.md`](scheduling-utility.md) defines the utility and price
-flow. Python experiments are in `scripts/scheduling_sim/`.
+flow. Python experiments are in `scripts/scheduling_sim/`; they do not run in
+Helios. The diagnostic `ignition debug-serve --direct` path has its own Python
+scheduler in `ignition/direct/`. It reproduces the selection specified here
+only for decode rounds, and it estimates graph costs with a 7/8 moving average
+that reverts to unmeasured after 30 seconds. The duration estimates, funded
+refresh, and acceptance learning specified below describe Helios alone.
 
 The native catalog contains prefill, scored prefill, ordinary decode, complete
 speculative generation, mixed prefill/generation, vision, and state operations.
 A complete speculative graph contains proposal generation, optional confidence
 and prefix allocation, target verification, and accepted-state commit. Proposal
 and verification are internal stages, not independently scheduled operations.
-Mixed capture remains controlled by Ignition's `--mixed-prefill` flag.
+Ignition captures mixed graphs only when given `--mixed-prefill`, and only for
+recipes that declare mixed capture; the Qwen3.8 Flash recipe
+(`ignition/recipes/qwen38`, alias `qwen3.8-flash`) is the one that does.
 
 ## Speculative graph coverage
 
@@ -55,7 +68,9 @@ completion or retains proposals for later verification dispatches.
 
 For prefix-survival estimates `s_i`, expected output at width W is
 `1 + sum(s_1..s_(W-1))`, bounded by actual proposal work, output limits, and
-context capacity. Each request tracks acceptance by source. Accepted prefixes
+context capacity. Speculative selection scores raise each `s_i` to the exponent
+`adaptive_verification_alpha`, which defaults to one. Each request tracks
+acceptance by source. Accepted prefixes
 supply positive observations; a rejection supplies zero to longer offered
 prefixes. Termination censors the remaining suffix. Width-one rounds measure
 cost without supplying acceptance observations.
@@ -65,11 +80,13 @@ D. Its FP32 sidecar has shape `[2, request_slots, draft_capacity]`, covering eve
 produced prefix. Only completed rounds update host forecasts. Rank zero's
 confidence drives host decisions; peer estimates must be valid probabilities
 but need not agree bitwise. Exact request identities, consumption, emitted
-prefixes, and committed state still agree across ranks.
+prefixes, and committed state agree across ranks.
 
-Confidence forecasts and verified acceptance remain separate observations.
-Forecasts average completed joint-prefix probabilities, starting from a
-population prior with weight one sixty-fourth. Acceptance prefixes start with
+Confidence forecasts and verified acceptance are separate observations.
+A request's forecast averages its completed joint-prefix probabilities,
+starting from a population prior. That prior begins at `0.5^d` for the `d`-th
+draft position and moves toward each completed prefix probability with weight
+one sixty-fourth. Forecast and acceptance prefix estimates start with
 weight two, cap at 128, and age with a half-life of 128 generated tokens.
 Unobserved suffixes retain their means. Ordinary selection uses the historical
 means; funded acceptance learning uses the bounded optimistic estimate
@@ -149,8 +166,8 @@ shape whose capacities are all at least as large as an alternative, with at
 least one strictly larger capacity. Mixed candidates also require the same prompt
 row and logical prompt work. Speculative candidates also require the same
 actual proposal depth. Timing estimates cannot make redundant padding preferable.
-A batch-four candidate serving three requests still competes with a batch-two
-candidate serving two requests. Bounded cost-refresh probes remain separate
+A batch-four candidate serving three requests competes with a batch-two
+candidate serving two requests. Bounded cost-refresh probes are separate
 from ordinary selection. Selection does not enumerate exponentially many
 request subsets.
 
@@ -214,7 +231,7 @@ the exact consumed state. Restore binds that state to a fresh request generation
 then the next window's vision graphs write compact feature offsets from zero.
 The logical request retains its original prompt, seed, sampling settings, and
 usage counters. Private window snapshots neither publish prefix-cache entries
-nor require host caching. Existing snapshot and restore operations preserve
+nor require host caching. Snapshot and restore operations preserve
 partial pages and every declared continuation history.
 
 A terminal snapshot enables the visible response completion and frees the
@@ -224,7 +241,7 @@ when validated completion identifies termination, or when preemption initiates
 retirement. Queued work and final-token publication do not reset that clock.
 Preemption retires a resident execution request without completing its response.
 
-For snapshot duration `T`, terminal age `A`, and the snapshot family's existing
+For snapshot duration `T`, terminal age `A`, and the snapshot family's
 batch-feasible reference interval `sigma`, the lane contributes
 `terminal_value + terminal_age_price * sigma * (A + T)`. Its age coefficient also
 enters every candidate's common waiting cost. In a two-stage sequence, a terminal
@@ -233,9 +250,9 @@ the remaining sequence. Nonterminal snapshots retain prerequisite utility.
 
 Terminal work competes through the same value-per-time score, cohort selection,
 and padding rules as inference. It has no priority override or admission-order
-constraint. Unknown snapshot timings retain discovery semantics; no duration or
+constraint. Unknown snapshot timings follow the discovery rules; no duration or
 reference interval is invented. Snapshot execution earns no token or streaming
-burst credit. Both balanced and throughput policies retain terminal value and
+burst credit. Both balanced and throughput policies apply terminal value and
 urgency. Successful snapshot completion and cache publication precede admission
 of an immediate continuation after normal response completion. Error and
 cancellation paths preserve fenced resource ownership regardless of utility.
@@ -263,8 +280,8 @@ unknown.
 The raw device observation is the maximum positive rank-local CUDA replay interval.
 When the prepared graphs expose frame-owned readiness timestamps, the cost sample
 subtracts exposed embedding-delivery delay after aggregating the ranks' intervals.
-This covers RAM and disk delivery, including CPU mailbox coordination. Raw replay
-and wall durations remain unchanged for service charges and reported throughput.
+This covers RAM and disk delivery, including CPU mailbox coordination. Service
+charges and reported throughput use the raw replay and wall durations.
 Graph estimates use these GPU observations for both isolated and queued executions.
 Host dispatch, completion delivery, and polling time do not enter a graph's cost.
 Missing or zero device intervals neither change an estimate nor make it fresh.
@@ -274,8 +291,9 @@ capacity consumes the same tokens up to the next message or prompt endpoint.
 Measured graphs remain eligible according to their observed costs.
 
 An indeterminate candidate wins over a determinate candidate, then competes by
-expected useful value. Equal values prefer shorter known time, less recently
-used requests, and smaller physical padding. Unknown graphs require an empty
+expected useful value. Equal values prefer shorter known time, more served
+requests, less recently used requests, and smaller physical padding, in that
+order. Unknown graphs require an empty
 submission queue and completion feedback. A lone cold request consequently tries
 its largest useful prefill or speculation extent without a solo-request rule.
 
@@ -295,7 +313,7 @@ Full credit permits one stale alternative to displace the ordinary measured
 winner. Feasible alternatives are ordered by the later of their last valid
 observation and last attempted dispatch, then by ordinary useful-value ranking.
 Attempts advance only on committed execution. Invalid timing does not make
-the estimate fresh, and its isolated wall time still pays for the attempt.
+the estimate fresh, and its isolated wall time pays for the attempt.
 Ordinary winners update their costs through normal service without spending
 refresh credit.
 
@@ -335,7 +353,7 @@ already-started episode can incur debt; another episode waits for full credit.
 Idle clears positive credit and preserves debt. For ordinary duration `O`,
 acceptance-probe duration `P`, and one episode's actual duration `D`, the bound is
 `P <= 0.01 / 0.99 * O + D`. Initial cost discovery is accounted separately.
-Cost-model estimates remain median replay durations corrected for measured
+Cost-model estimates are median replay durations corrected for measured
 readiness stalls; exploration budgets use raw physical time.
 `flare_scheduler_execution_nanoseconds_total` and
 `flare_scheduler_executions_total` expose ordinary, discovery, timing-refresh,
@@ -352,8 +370,11 @@ reusing its slot.
 `complete` validates every lane before updating graph costs, acceptance, service
 prices, or committed state. Useful service comes from differences against
 committed counters, never counters saved before earlier queued work completed.
-Each successful frame contributes one measured device interval to service
-history. Unselected participants receive zero service over that interval.
+Each successful frame with a positive device interval contributes one measured
+interval to service history: the maximum rank-local device interval for a
+queued frame, and the larger of that interval and the host wall interval from
+dispatch through observed completion for an isolated frame. Unselected
+participants receive zero service over that interval.
 Accounting changes do not invalidate unrelated immutable plans.
 
 Completion initially records zero deliveries. The first successful visible
@@ -377,8 +398,13 @@ fn plan(&self) -> Option<ScheduledPlan>;
 fn commit(&mut self, plan: &ScheduledPlan, fence: Fence) -> Result<()>;
 fn complete(&mut self, fence: Fence, records: &[CompletionRecord],
             timing: ExecutionTiming) -> Result<Vec<GeneratedToken>>;
-fn published_output(&mut self, request: RequestHandle, fence: Fence) -> Result<()>;
+fn published_output(&mut self, handle: RequestHandle, fence: Fence) -> Result<()>;
 ```
+
+A speculative program with D > 0 whose target rows the device allocates must
+complete through `complete_packed_round`, which also takes its confidence
+sidecar. The `complete_with_survival` and `complete_packed_round_with_survival`
+variants add the `completion_speculative_survival` rows.
 
 A plan freezes physical shape, logical lane work, request epochs, estimated
 execution duration, and selection score. Commit checks ownership, epochs,
@@ -416,7 +442,7 @@ actually published. Projection never publishes tokens or commits sampled state.
 
 A queued speculative lane can advance by at most `min(lane ceiling, P)` tokens.
 Output limits and continuation positions account for that bound. Page reservations
-still cover the full execution ceiling and declared draft storage, and remain
+cover the full execution ceiling and declared draft storage, and stay
 pinned through the lane's last submitted fence.
 
 ## Policy preferences
@@ -434,11 +460,12 @@ Defaults specify these preferences:
 | `terminal_age_price` | 1 | Linear terminal-wait cost coefficient, value/ms² |
 | `adaptation_ms` | 100 | Service-price adaptation time |
 | `estimate_ttl_ns` | 30,000,000,000 | Timing freshness interval |
+| `adaptive_verification_alpha` | 1 | Exponent on prefix-survival estimates in speculative selection scores |
 
 These weights express a throughput/cadence tradeoff. They are not graph timing
 measurements or latency guarantees. Setting fairness or age coefficients to zero
 removes the corresponding preference; intrinsic throughput alone does not ensure
-starvation freedom. The native CLI defaults to `--scheduler-policy balanced`,
+starvation freedom. `flare run` defaults to `--scheduler-policy balanced`,
 which uses these coefficients. `--scheduler-policy throughput` retains token
 fairness and output-token value while setting delivery fairness and decode-age
 price to zero. It favors token throughput and can select longer output bursts.
@@ -447,15 +474,18 @@ sampling policy. `--scheduler-terminal-value` and `--scheduler-terminal-age-pric
 override the terminal coefficients after preset selection. Values must be finite
 and nonnegative; zero disables the corresponding preference. Disabling both
 removes terminal service value under throughput policy. These coefficients are
-preferences, not latency bounds.
+preferences, not latency bounds. `--mtp-adaptive-verification-alpha` sets
+`adaptive_verification_alpha`; it must be finite and greater than zero, and
+[the CLI design](cli-design.md) describes its effect.
 
 ## Mixed execution contract
 
 A mixed graph declares `batch_capacity` total physical request rows,
 `token_capacity` decode verification positions per row, and `prefill_capacity`
 prompt tokens. The batch capacity is a power of two from 2 through 64; decode
-width is 1 through 8; prompt capacity is positive and aligned to 64. Other graph
-families set `prefill_capacity` to zero. Package selection retains the explicit
+width is 1 through the core's completion token capacity, which is eight when
+the core declares none; prompt capacity is positive and aligned to 64. Other graph
+families set `prefill_capacity` to zero. Core selection retains the explicit
 `speculation_enabled` variant matching the loaded decode mode, including width
 one with draft-state maintenance enabled. Fixed-width limits apply to mixed and
 separate speculative graphs alike.
@@ -485,7 +515,7 @@ Completion validates and updates each row by its phase. A prompt row commits
 its full scheduled prompt extent and can publish one first output token; a
 speculative row commits the accepted prefix. Prompt checkpoints, acceptance
 learning, publication prices, cancellation generations, and fenced page
-retirement retain their ordinary contracts. Mixed submissions require completion
+retirement follow the same contracts as in separate graphs. Mixed submissions require completion
 feedback before another graph is queued. State-row reservation covers the
 maximum verification width across separate and mixed catalogs.
 
@@ -545,9 +575,17 @@ expiry and recovery; and output gaps. Mixed tests compare every legal cohort
 against exhaustive useful-work/time enumeration, exercise fitting prompt tails,
 ordinary and speculative decode rows, malformed completions, independent shape
 expiry, and concurrent prompt/decode workloads. Native input tests check packed
-prompt offsets, one query-length upload, row sampling masks, and role validation. Scheduler lifecycle tests separately
+prompt offsets, one query-length upload, row sampling masks, and role validation.
+Scheduler lifecycle tests separately
 exercise prescribed cache and resource transitions without assuming those
-operations always outrank another runnable request.
+operations always outrank another runnable request. Run the scheduler and
+runtime phase tests without a GPU:
+
+```sh
+cargo test --manifest-path helios/Cargo.toml --features server --lib scheduler::
+cargo test --manifest-path helios/Cargo.toml --features server --lib \
+  server::runtime::phase_tests::
+```
 
 Five- and sixteen-request startup traces cover zero, three, and seven accepted
 drafts, with both untrained and preseeded acceptance histories. On the measured
@@ -572,6 +610,6 @@ FLARE_RUN_CUDA_TESTS=1 FLARE_SCHEDULER_TEST_URL=http://127.0.0.1:18131 \
 
 The HTTP tests print actual prompt/output token counts, client SSE arrival
 gaps, and server graph-counter deltas. SSE arrival gaps are not GPU execution
-times or per-token latencies. Mixed capture correctness requires packages that
+times or per-token latencies. Mixed capture correctness requires cores that
 contain mixed model forwards. Synthetic scheduler traces do not establish GPU
 throughput.

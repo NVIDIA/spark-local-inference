@@ -173,14 +173,79 @@ class PreparedVerificationState:
     def prepare_residual(self, residual):
         self.residual = residual
 
-    def begin(self):
-        self._validate()
-        self.token_state.gather()
-        self._metadata()
+    def functional(self, *, dynamic_inputs=False):
+        if self.gdn is None:
+            return self
+        from .decoder_state import PreparedDecoderState
+        examples = {f"gdn.{name}": getattr(self.gdn, name) for name in self.gdn.__dataclass_fields__}
+        examples.update({f"qsa.{name}": getattr(self.qsa, name) for name in self.qsa.__dataclass_fields__})
+        examples.update({name: getattr(self.token_state, name)
+                         for name in ("pending_tokens", "positions", "history", "active")})
+        examples.update(token_ids=self.token_ids, candidates=self._metadata.args[5])
+        if dynamic_inputs:
+            examples.update({f"input.{name}": getattr(self.inputs, name) for name in
+                             ("row_slot_ids", "row_generations", "live_rows")})
+            examples["token_limits"] = self._metadata.args[23]
+        commits = getattr(self, "_commit", ())
+        if commits:
+            examples.update(hidden=commits[0].args[0], residual=commits[0].args[1],
+                            emitted=commits[0].args[7])
+        def detach(call):
+            slots = {index: name for index, value in enumerate(call.args)
+                     for name, example in examples.items() if value is not None and value is example}
+            args = tuple(None if index in slots else value for index, value in enumerate(call.args))
+            call.args = ()
+            return call.kernel, call.compiled, args, call.grid, call.options, slots
+        self._runtime_metadata = detach(self._metadata)
+        self._runtime_commit = tuple(detach(call) for call in commits)
+        self._runtime_validate = detach(self._validate) if dynamic_inputs else None
+        self._launch_runtime = PreparedDecoderState._launch_runtime
+        self.token_state.functional(dynamic_inputs=dynamic_inputs)
+        if dynamic_inputs:
+            self.inputs = None
+        self.gdn = self.qsa = self.ple = self.token_ids = self.hidden = self.sample = self.residual = None
+        return self
 
-    def finish(self):
-        if self.sample is not self.hidden:
-            self.sample.copy_(self.hidden)
+    def begin_runtime(self, candidates, inputs=None):
+        inputs = self.inputs if inputs is None else inputs
+        if inputs is None:
+            raise ValueError("functional verification requires runtime role inputs")
+        input_values = {f"input.{name}": getattr(inputs, name) for name in
+                        ("row_slot_ids", "row_generations", "live_rows")}
+        input_values["token_limits"] = inputs.query_lengths[:self.rows]
+        if self._runtime_validate is None:
+            self._validate()
+            pending, positions, history, active = self.token_state.gather()
+        else:
+            self._launch_runtime(self._runtime_validate, input_values)
+            pending, positions, history, active = self.token_state.gather(inputs.row_slot_ids[:self.rows],
+                inputs.row_generations[:self.rows], inputs.live_rows)
+        device = candidates.device
+        token_ids = torch.full((self.tokens,), 248044, dtype=torch.int64, device=device)
+        gdn = DeltaMetadata.allocate(self.rows, device, verification_columns=8)
+        q = QSAMetadata.allocate(tokens=self.tokens, batch=self.rows,
+            context=inputs.page_tables.shape[1] * 64, device=device)
+        qsa = QSAMetadata(q.main_block_table, q.main_block_table, q.raw_state_slot_ids,
+            q.request_ids, q.query_positions, q.rope_positions, q.sequence_lengths,
+            gdn.query_start_loc, gdn.accepted_tokens, q.is_prefilling, q.slot_mapping)
+        ple = PLEMetadata(token_ids, gdn.query_start_loc, history, gdn.convolution_slots,
+            gdn.fresh, gdn.accepted_tokens, gdn.num_seqs, gdn.num_tokens)
+        values = {f"gdn.{name}": getattr(gdn, name) for name in gdn.__dataclass_fields__}
+        values.update({f"qsa.{name}": getattr(qsa, name) for name in qsa.__dataclass_fields__})
+        values.update(pending_tokens=pending, positions=positions, history=history, active=active,
+                      token_ids=token_ids, candidates=candidates)
+        values.update(input_values)
+        self._launch_runtime(self._runtime_metadata, values)
+        from .decoder_state import DecoderRuntime
+        return DecoderRuntime(gdn, qsa, ple, values, inputs)
+
+    def finish_runtime(self, runtime, hidden, residual):
+        return hidden
+
+    def commit_runtime(self, runtime, hidden, residual, emitted):
+        values = {**runtime.values, "hidden": hidden, "residual": residual, "emitted": emitted}
+        for operation in self._runtime_commit:
+            self._launch_runtime(operation, values)
 
     def prepare_commit(self, emitted_count, consumed_before, residual, hidden):
         pool, slots = self.pool, self.inputs.row_slot_ids
@@ -192,7 +257,3 @@ class PreparedVerificationState:
              emitted_count, self.previous_accepted, self.inputs.request_state_rows, self.width,
              pool.last_hidden.stride(0), saved_residual.stride(0), saved_rope.stride(0), 1024, self.requests.capacity),
             (self.rows, 10, 1)))
-
-    def commit(self):
-        for operation in self._commit:
-            operation()

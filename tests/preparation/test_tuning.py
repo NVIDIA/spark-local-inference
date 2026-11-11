@@ -132,6 +132,8 @@ def backend(monkeypatch):
     monkeypatch.setattr(PreparationSession, "prepare", prepare)
     monkeypatch.setattr(PreparationSession, "candidate_memory_envelope", envelope)
     monkeypatch.setattr(PreparationSession, "configure_compile_workers", workers)
+    monkeypatch.setattr(PreparationSession, "configure_scratch_limit",
+                        lambda self, limit: setattr(self, "_scratch_limit", limit))
     monkeypatch.setattr("ignition.preparation.host_memory.available_bytes", lambda: 128 << 30)
     monkeypatch.setattr(PreparationSession, "_check_thread", lambda self: None)
     monkeypatch.setattr(PreparationSession, "_synchronize", lambda self: events.append(("drain",)))
@@ -523,7 +525,8 @@ def test_worker_budget_accounts_for_all_preparing_ranks(backend, monkeypatch):
 
     monkeypatch.setattr(PreparationSession, "configure_compile_workers", configure)
     coordinator = SimpleNamespace(ranks=(0, 1, 2, 3), barrier=lambda: None, local_ranks=4, spans_hosts=False,
-                                  same_on_every_rank=lambda value: False)
+                                  same_on_every_rank=lambda value: False,
+                                  reconcile_selections=lambda requests: ({}, False))
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda device: SimpleNamespace(is_integrated=False, name="NVIDIA GB10"))
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator)
@@ -540,6 +543,56 @@ def test_explicit_cpu_budget_reaches_b12x_without_environment_switch(backend):
     report = session.tune()
     assert report["compile_workers"] == 24
     assert ("workers", 24) in events
+
+
+def test_rank_reconciliation_preserves_job_bounds_and_precedes_finalizers(backend, monkeypatch):
+    order, prepared = [], []
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(is_integrated=False, name="NVIDIA GB10"))
+
+    class Plan:
+        pass
+
+    requests = [declaration(name) for name in ("first", "second")]
+    for request in requests:
+        plan = Plan()
+        plan.__dict__.update(vars(request.plan))
+        request.plan = plan
+
+    def reconcile(actual):
+        assert tuple(actual) == tuple(requests)
+        order.append("reconcile")
+        return {requests[0].plan: {"tile": 64}}, True
+
+    def prepare(session, actual, *, selected_configs, autotune, **kwargs):
+        assert autotune is True
+        prepared.append((tuple(request.name for request in actual), selected_configs))
+        for plan, config in selected_configs.items():
+            plan.selection = SimpleNamespace(source="override", config=config)
+        return SimpleNamespace(coverage={}, cache_hits=0, benchmarked_candidates=0, restored_candidates=0,
+            rejected_candidates=0, elapsed_seconds=0., parent_cute_compilations=0,
+            parent_triton_compilations=0, close=lambda: None)
+
+    coordinator = SimpleNamespace(ranks=(0, 1), local_ranks=2, spans_hosts=False,
+        barrier=lambda *args: None, same_on_every_rank=lambda value: False,
+        reconcile_selections=reconcile, prepare=prepare)
+    session = make_session(device=0, checkpoint="revision", coordinator=coordinator)
+    session.declare(requests)
+    monkeypatch.setattr(session, "_jobs", lambda requests: tuple((request,) for request in requests))
+
+    class Context:
+        def finalist_policies(self, requests):
+            return {}
+
+        def __call__(self, session, requests, finalists):
+            order.append("context")
+            return {}, {}
+
+    session.register_finalizer(lambda: order.append(tuple(request.plan.selection.config["tile"]
+                                                          for request in requests)))
+    session.tune(contextual=Context())
+    assert order == ["context", "reconcile", (64, 32)]
+    assert prepared == [(("first",), {requests[0].plan: {"tile": 64}}), (("second",), {})]
 
 
 
@@ -567,7 +620,8 @@ def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, ident
         local_ranks=1 if spans_hosts else 2, spans_hosts=spans_hosts,
         same_on_every_rank=lambda value: identical and matching_catalog and value ==
             ("NVIDIA GB10", _local_tuning_catalog((declaration("op"),))),
-        share_selections=shared.append, agree_selections=lambda selections: None, prepare=prepare)
+        share_selections=shared.append, agree_selections=lambda selections: None,
+        reconcile_selections=lambda requests: ({}, False), prepare=prepare)
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator, compile_workers=workers)
     session.declare((declaration("op"),))
     report = session.tune()
@@ -1348,6 +1402,38 @@ def test_operator_benchmark_owners_release_after_trial_close(backend, operator):
 
 
 GIB = 1 << 30
+
+
+@pytest.mark.parametrize("retain_call", [False, True])
+def test_candidate_inputs_retire_cached_fixtures_but_preserve_live_and_borrowed_owners(backend, retain_call):
+    from ignition.preparation.fixtures.resources import candidate_inputs
+
+    class Owner:
+        pass
+
+    session = make_session(device=0, checkpoint="fixture-lifetimes")
+    borrowed = Owner()
+    session.register_benchmark_resource("borrowed", borrowed, restore=lambda: None)
+    session._tune_status = "tuning"
+    preceding = session.benchmark_resource("previous", Owner)
+    reference = weakref.ref(preceding)
+    live_call_owner = preceding if retain_call else None
+    del preceding
+
+    def allocate():
+        assert (reference() is not None) == retain_call
+        assert session._benchmark_resources == {"borrowed": borrowed}
+        return Owner()
+
+    acquire = candidate_inputs(allocate, session=session)
+    active = acquire()
+    assert acquire() is active
+    active_ref = weakref.ref(active)
+    del active
+    assert active_ref() is None
+    del live_call_owner
+    assert reference() is None
+    session.close()
 
 
 def test_projection_candidates_share_private_strided_operands(backend):

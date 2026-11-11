@@ -10,6 +10,7 @@ import inspect
 import operator
 import os
 import pickle
+import sys
 import tempfile
 import zlib
 from concurrent.futures import FIRST_COMPLETED, wait
@@ -29,6 +30,8 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, treespec_loads
 
+from ignition import runtime_patches
+
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
                           _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
@@ -41,12 +44,17 @@ _CHECK_BINDINGS = ContextVar("flare_check_bindings", default=False)
 
 
 def _load_inductor(data, original, *, frozen=False):
+    runtime_patches.apply()
     from torch._functorch._aot_autograd.aot_autograd_result import deserialize_bundled_cache_entry
+    from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
     entry, kernels, constants = pickle.loads(data)
     if kernels or constants:
         raise ValueError("compiled native launches must use runtime kernel bindings")
+    # Torch copies graph attributes into runtime wrappers during deserialization.
+    entry.compiled_fw.result.inductor_post_grad_graph_str = None
+    entry.compiled_fw.result.cache_linemap = None
     relocate_inductor(entry, original, freeze_tuning=frozen)
     if frozen and entry.compiled_fw.result._triton_bundle is not None:
         from .inductor_tuning import _materialize_selected_cubin
@@ -56,6 +64,11 @@ def _load_inductor(data, original, *, frozen=False):
                 _materialize_selected_cubin(result)
     serialized = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
     compiled = deserialize_bundled_cache_entry(entry)
+    serializer = getattr(compiled.serialize, "__self__", None)
+    if (not isinstance(serializer, SerializableCompiledFunction)
+            or getattr(compiled, "__wrapped__", None) is not serializer
+            or getattr(compiled, "serialize_fn", None) is not serializer.serialize_fn):
+        raise RuntimeError("unsupported bundled Inductor serialization wrappers")
     if frozen and entry.compiled_fw.result._triton_bundle is not None:
         from .device_binding import _freeze_tuning_winners
 
@@ -69,6 +82,8 @@ def _load_inductor(data, original, *, frozen=False):
             graph._triton_bundle.kernel_artifacts.clear()
     artifact = AOTCompiledArtifact(compiled)
     artifact._flare_graph = entry.compiled_fw.result
+    # simple_wraps copies the serializer callback into the execution wrapper's dictionary.
+    artifact._flare_serialization_owners = (compiled, serializer)
     return artifact, serialized
 
 
@@ -147,10 +162,27 @@ def _guard_serialization():
 
 @contextmanager
 def _guard_code_cache(root):
-    from torch._dynamo import guards
+    """Reuse guard code without retaining construction stacks in executable guards."""
+    from torch._dynamo import guards, package
 
     with _GUARD_LOCK:
         original = guards.build_guard_function
+        original_manager = package.load_guard_manager
+
+        def load_manager(state, *args, **kwargs):
+            for guard in state.output_graph._guards:
+                guard.stack = None
+                guard.user_stack = None
+            original_parts = guards.get_verbose_code_parts
+
+            def shared_parts(*args, **kwargs):
+                return [sys.intern(part) for part in original_parts(*args, **kwargs)]
+
+            guards.get_verbose_code_parts = shared_parts
+            try:
+                return original_manager(state, *args, **kwargs)
+            finally:
+                guards.get_verbose_code_parts = original_parts
 
         def build(code_parts, closure_args):
             key = hashlib.sha256(pickle.dumps((tuple(code_parts), closure_args))).hexdigest()
@@ -171,9 +203,11 @@ def _guard_code_cache(root):
 
         token = _GUARD_TENSOR_MODE.set(torch._subclasses.FakeTensorMode())
         guards.build_guard_function = build
+        package.load_guard_manager = load_manager
         try:
             yield
         finally:
+            package.load_guard_manager = original_manager
             guards.build_guard_function = original
             _GUARD_TENSOR_MODE.reset(token)
 
@@ -206,6 +240,39 @@ class _Input:
             storage = _byte_storage(value) if self.region is None else _storage_region(value, *self.region)
             value = storage.view(dtype).as_strided(shape, stride, offset)
         return value
+
+
+def _share_storage_descriptors(inputs, signature, calls):
+    """Share immutable storage descriptors within one deserialized forward."""
+    integers, tuples = {}, {}
+
+    def share(value):
+        kind = type(value)
+        if kind is int:
+            return int, integers.setdefault(value, value)
+        if kind in (bool, type(None), torch.dtype, torch.device):
+            return kind, value
+        if kind is not tuple:
+            return None, value
+        parts = [share(part) for part in value]
+        if any(kind is None for kind, _ in parts):
+            return None, value
+        kinds = tuple(kind for kind, _ in parts)
+        result = tuple(part for _, part in parts)
+        pool = tuples.setdefault(kinds, {})
+        return (tuple, kinds), pool.setdefault(result, result)
+
+    for item in inputs:
+        item.index = share(item.index)[1]
+        item.view = share(item.view)[1]
+        item.region = share(item.region)[1]
+    signature = tuple(share(item)[1] for item in signature)
+    for _, _, _, operands, positions in calls:
+        for index, operand in enumerate(operands):
+            operands[index] = share(operand)[1]
+        for index, position in enumerate(positions):
+            positions[index] = share(position)[1]
+    return signature
 
 
 def _serialized_triton_launch(kernel, constants, arguments):
@@ -254,8 +321,37 @@ def _deserialized_triton_launch(kernel_info):
     return kernel
 
 
+def _serialized_invocations(invocations):
+    """Record opaque launches without their process-local Triton table indices."""
+    from torch._library.custom_ops import _maybe_get_opdef
+    from torch._dynamo.aot_compile_types import _serialize_triton_kernel
+
+    calls = []
+    for call in invocations:
+        target = call.target
+        leaves = call.leaves
+        if target is torch.ops.higher_order.triton_kernel_wrapper_mutation:
+            args, kwargs = tree_unflatten(leaves, call.tree)
+            kwargs = dict(kwargs)
+            kernel = kernel_side_table.get_kernel(kwargs['kernel_idx'])
+            constants = kernel_side_table.get_constant_args(kwargs['constant_args_idx'])
+            kernel, constants = _serialized_triton_launch(kernel, constants, kwargs['kwargs'])
+            name = ('triton', _serialize_triton_kernel(kernel), constants)
+            kwargs['kernel_idx'] = kwargs['constant_args_idx'] = None
+            leaves, _ = tree_flatten((args, kwargs))
+        elif isinstance(target, torch._ops.OpOverload):
+            definition = _maybe_get_opdef(target)
+            registration = None if definition is None else definition._init_fn.__module__
+            name = ('op', target.namespace, target._opname, target._overloadname, registration)
+        else:
+            raise TypeError(f'cannot serialize native operator: {target}')
+        calls.append((name, leaves, treespec_dumps(call.tree), call.operands, call.integers))
+    return calls
+
+
 class StorageBackend(SerializableCallable):
     def __init__(self, module, examples, *, options=None):
+        runtime_patches.apply()
         from torch._guards import detect_fake_mode
         from torch._inductor import standalone_compile
 
@@ -336,32 +432,10 @@ class StorageBackend(SerializableCallable):
 
     @classmethod
     def serialize_compile_artifacts(cls, fn):
-        from torch._library.custom_ops import _maybe_get_opdef
-        from torch._dynamo.aot_compile_types import _serialize_triton_kernel
-
         with _artifact_kernel_table():
             artifact = (fn.artifact.serialize() if fn._serialized_artifact is None
                         else zlib.decompress(fn._serialized_artifact))
-        calls = []
-        for call in fn.invocations:
-            target = call.target
-            leaves = call.leaves
-            if target is torch.ops.higher_order.triton_kernel_wrapper_mutation:
-                args, kwargs = tree_unflatten(leaves, call.tree)
-                kwargs = dict(kwargs)
-                kernel = kernel_side_table.get_kernel(kwargs['kernel_idx'])
-                constants = kernel_side_table.get_constant_args(kwargs['constant_args_idx'])
-                kernel, constants = _serialized_triton_launch(kernel, constants, kwargs['kwargs'])
-                name = ('triton', _serialize_triton_kernel(kernel), constants)
-                kwargs['kernel_idx'] = kwargs['constant_args_idx'] = None
-                leaves, _ = tree_flatten((args, kwargs))
-            elif isinstance(target, torch._ops.OpOverload):
-                definition = _maybe_get_opdef(target)
-                registration = None if definition is None else definition._init_fn.__module__
-                name = ('op', target.namespace, target._opname, target._overloadname, registration)
-            else:
-                raise TypeError(f'cannot serialize native operator: {target}')
-            calls.append((name, leaves, treespec_dumps(call.tree), call.operands, call.integers))
+        calls = _serialized_invocations(fn.invocations)
         return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen))
 
     @classmethod
@@ -374,6 +448,7 @@ class StorageBackend(SerializableCallable):
         original_device = devices.pop()
         fn.signature = tuple((*item[:4], restore_device(item[4].type, item[4].index), item[5])
                              if isinstance(item, tuple) else item for item in fn.signature)
+        fn.signature = _share_storage_descriptors(fn.inputs, fn.signature, calls)
         fn.invocations = []
         for name, leaves, tree, operands, integers in calls:
             tree = treespec_loads(tree)
@@ -403,6 +478,7 @@ def _execute(forward):
 
 
 def aot_forward(forward, *, options=None):
+    runtime_patches.apply()
     options = dict(_OPTIONS if options is None else options)
     sources = r'.*\.(?:_?handle|stream_handle|launch_order|plans\[\d+\])$'
     with _guard_serialization(), torch.compiler.config.patch(unbacked_sources=sources):
@@ -425,26 +501,86 @@ class _GuardedForwardCall:
 
 
 @dataclass
+class _CapturedForwardResources:
+    backend: StorageBackend
+
+    def __call__(self, owner):
+        raise RuntimeError("captured forward no longer supports Python execution")
+
+
+@dataclass
 class BoundForward:
     artifact: object
     owner: object
     cache_hit: bool
     pending: object = None
+    execution_identity: str | None = None
 
     def __call__(self):
         return self.artifact(self.owner)
 
+    @property
+    def backend(self):
+        return (self.artifact.backend if isinstance(self.artifact, (_GuardedForwardCall, _CapturedForwardResources))
+                else self.artifact._artifacts.compiled_fn)
+
+    @property
+    def capture_allocation_sizes(self):
+        """CUDA allocation requests from the compiled forward's memory plan."""
+        return tuple(int(size) for device, size in self.backend.artifact._flare_graph._flare_pool_sizes
+                     if device == "cuda")
+
     def prepare_capture(self):
         """Retain execution guards and kernel owners after portable cache writes finish."""
+        if isinstance(self.artifact, _CapturedForwardResources):
+            raise RuntimeError("captured forward no longer supports Python execution")
+        if isinstance(self.artifact, _GuardedForwardCall):
+            return 0
         state = self.artifact._artifacts
         if (tuple(state.signature.parameters) != ("forward",) or state.runtime_env.closure
                 or state.guard_manager is None or not isinstance(state.compiled_fn, StorageBackend)):
             raise RuntimeError("capture requires a storage-bound, closed compiled forward")
+        guards = state.guard_manager
+        if guards.cache_entry is not None or guards.extra_state is not None:
+            raise RuntimeError("capture requires standalone compiled guards")
         backend = state.compiled_fn
+        serialization_owners = getattr(backend.artifact, "_flare_serialization_owners", ())
+        if serialization_owners and any(owner.serialize_fn is not serialization_owners[0].serialize_fn
+                                        for owner in serialization_owners):
+            raise RuntimeError("bundled Inductor serializer changed before capture")
         released = len(state.guards_state) + len(backend._serialized_artifact or b"")
         backend._serialized_artifact = None
-        self.artifact = _GuardedForwardCall(self.artifact.fn, state.guard_manager, backend)
+        for owner in serialization_owners:
+            owner.serialize_fn = None
+        if serialization_owners:
+            backend.artifact._flare_serialization_owners = ()
+        # Torch copies loading and serialization metadata into execution wrappers.
+        pending = [backend.artifact.inner_fn.compiled_fn, getattr(backend.artifact, "_flare_graph", None)]
+        visited = set()
+        while pending:
+            owner = pending.pop()
+            if owner is None or id(owner) in visited:
+                continue
+            visited.add(id(owner))
+            for field, value in (("source_code", ""), ("_triton_bundle", None), ("runnable_graph_str", ""),
+                                 ("inductor_provenance_mapping_str", None),
+                                 ("inductor_provenance_stack_traces_str", None)):
+                if hasattr(owner, field):
+                    setattr(owner, field, value)
+            pending.append(getattr(owner, "__wrapped__", None))
+        # Standalone execution checks the full root, without Dynamo's diff tree or debug lists.
+        guards.diff_guard_root = None
+        guards.diff_guard_sources.clear()
+        guards.code_parts.clear()
+        guards.verbose_code_parts = None
+        self.artifact = _GuardedForwardCall(self.artifact.fn, guards, backend)
         return released
+
+    def retire_after_capture(self):
+        """Release Python guards after capture while retaining graph execution resources."""
+        if isinstance(self.artifact, _GuardedForwardCall):
+            self.artifact = _CapturedForwardResources(self.artifact.backend)
+            release_unused()
 
 
 def _completed(pending):
@@ -458,8 +594,8 @@ def _completed(pending):
 
 # Command-line, planning, display, and diagnostic direct-execution sources do not change compiled forwards.
 _COMMAND_SOURCES = ('cli', 'direct', 'errors.py', 'planning.py', 'progress.py')
-# Nor does writing and signing the package file after preparation.
-_PUBLICATION_SOURCES = ('preparation/model_package.py', 'preparation/package_file.py', 'preparation/protection.py')
+# Nor does writing and signing the core file after preparation.
+_PUBLICATION_SOURCES = ('preparation/model_core.py', 'preparation/core_file.py', 'preparation/protection.py')
 
 
 def _variant_compilers(selections):
@@ -481,8 +617,8 @@ def _variant_compilers(selections):
 def _balance_compilations(counts, workers):
     """Spread forwards missing from one host's cache over its ranks' compilers.
 
-    Rank `i` must compile `counts[i]` forwards with `workers[i]` workers; a rank without workers,
-    whose GPU lacks room for one, lends all of them. Returns, per rank, the (owner, index)
+    Rank `i` must compile `counts[i]` forwards with `workers[i]` workers; a rank without admitted
+    workers lends all of them. Returns, per rank, the (owner, index)
     forwards it compiles: each rank keeps its own until lending one finishes sooner elsewhere.
     Every rank derives the same assignment.
     """
@@ -546,6 +682,7 @@ class ForwardCache:
 
     def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
                  lock_gpu_clocks=False):
+        runtime_patches.apply()
         import flashinfer
         from torch._inductor.codecache import torch_key
 
@@ -556,7 +693,7 @@ class ForwardCache:
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
-        key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(),
+        key = hashlib.sha256(pickle.dumps((namespace, options, torch_key(), runtime_patches.identity(),
             properties.name, properties.major, properties.minor, properties.multi_processor_count)))
         for source in (Path(__file__).resolve().parents[1], Path(flashinfer.__file__).resolve().parent):
             for path in sorted(source.rglob('*.py')):
@@ -585,17 +722,18 @@ class ForwardCache:
         mismatch fails on all ranks and cannot trigger compilation on peers.
         """
         if (not forwards or not isinstance(template, BoundForward) or template.pending is not None
-                or not isinstance(template.artifact._artifacts.compiled_fn, StorageBackend)):
+                or not isinstance(template.backend, StorageBackend)):
             raise ValueError("group binding requires a completed storage-bound forward")
         artifact = template.artifact
         failures = {}
         for name, owner in forwards.items():
             try:
+                template.prepare_capture()
+                artifact = template.artifact
                 if type(owner) is not type(template.owner):
                     raise BindingMismatch("grouped forward type differs from its compiled representative")
-                if not artifact.guard_check(owner):
-                    reason = artifact._artifacts.guard_manager.check_verbose(
-                        artifact.prepare_f_locals(owner))
+                if not artifact.guards.check({"forward": owner}):
+                    reason = artifact.guards.check_verbose({"forward": owner})
                     raise BindingMismatch(f"compiled forward guard differs: {reason}")
                 token = _CHECK_BINDINGS.set(True)
                 try:
@@ -624,7 +762,8 @@ class ForwardCache:
             detail = [(rank, name, reason) for rank, (_, _, items) in zip(ranks, gathered, strict=True)
                       for name, reason in sorted(items.items())]
             raise BindingMismatch(f"grouped forward bindings differ from compiled guards: {detail[:4]}")
-        return {name: BoundForward(artifact, owner, template.cache_hit)
+        return {name: BoundForward(artifact, owner, template.cache_hit,
+                                   execution_identity=template.execution_identity)
                 for name, owner in forwards.items()}
 
     @contextmanager
@@ -684,7 +823,8 @@ class ForwardCache:
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
                                        materialize=materialize, warmup=warmup, before_run=before_run)
-        selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
+        selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
+                                        source_identity=self.root.name)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
@@ -702,6 +842,9 @@ class ForwardCache:
                             compiled[name] = self._warm(bound, path, name=name, progress=None,
                                                        selections=selections, warmup=warmup,
                                                        before_run=None if before_run is None else lambda name=name: before_run(name))
+                            compiled[name].prepare_capture()
+                            selections.release(compiled[name])
+                            release_unused(generation=0)
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -732,6 +875,9 @@ class ForwardCache:
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
+                        compiled[name].prepare_capture()
+                        selections.release(compiled[name])
+                        release_unused(generation=0)
                     stage.update(advance=1)
         release_unused()
         return compiled
@@ -750,7 +896,7 @@ class ForwardCache:
         """
         import torch.distributed as dist
         from ignition.progress import phase
-        from .compile_pool import CompilePool
+        from .compile_pool import CompilePool, allocate_workers, compiler_resources
         from .inductor_tuning import InductorSelections
 
         group, ranks = coordinator.group, coordinator.ranks
@@ -763,18 +909,10 @@ class ForwardCache:
         compilers = _variant_compilers(selections)
         work = [(name, variant, functions[name]) for (name, variant), compiler in compilers.items() if compiler == share]
         selected, outcome, error, compiler, paths, lent, sent = {}, (None, None), None, None, {}, set(), []
-        unavailable, loans = None, []
+        loans = []
         with ExitStack() as scope:
             stage = scope.enter_context(phase(progress, "Compile model forwards", total=len(work)))
-            try:
-                compiler = scope.enter_context(CompilePool(
-                    self.device, headroom_bytes=self.headroom_bytes, pools=coordinator.local_ranks,
-                    options=self.options, compile_workers=self.compile_workers))
-            except MemoryError as failure:
-                # A rank whose GPU has no room for a compiler lends its forwards to the others on this host.
-                unavailable = f"{type(failure).__name__}: {failure}"
-            except Exception as failure:
-                error = f"{type(failure).__name__}: {failure}"
+            compiler_scope = scope.enter_context(ExitStack())
             # Variants that only one rank selects, such as rank zero's sampling, can leave that rank most of
             # the catalog. Ranks on one host share its cache, so a rank lends forwards it cannot restore, whether
             # missing or bound differently by another launch, to ranks whose compilers would otherwise finish
@@ -792,16 +930,45 @@ class ForwardCache:
                         restored[index] = bound, path
             except Exception as failure:
                 error = error or f"{type(failure).__name__}: {failure}"
+            resources = None
+            try:
+                release_unused()
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
+            # Include every rank's retained cache-restoration owners in host memory admission.
+            dist.barrier(group=group)
+            try:
+                resources = compiler_resources(self.device, headroom_bytes=self.headroom_bytes,
+                    options=self.options, compile_workers=self.compile_workers)
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
             demand = [None] * len(ranks)
-            dist.all_gather_object(demand, (len(missing), 0 if compiler is None else compiler.workers), group=group)
-            if not coordinator.spans_hosts and any(workers for _, workers in demand):
-                assigned = _balance_compilations([count for count, _ in demand], [workers for _, workers in demand])
+            dist.all_gather_object(demand, (len(missing), resources, error), group=group)
+            try:
+                failures = [(rank, failure) for rank, (_, _, failure) in zip(ranks, demand) if failure is not None]
+                if failures:
+                    raise RuntimeError(f"forward compiler resource collection failed: {failures}")
+                counts = [count for count, _, _ in demand]
+                workers = allocate_workers([resources for _, resources, _ in demand], counts, coordinator.hosts)
+                stage.update(f"{sum(workers)} compiler workers; per rank {workers}")
+                assigned = [[] for _ in ranks]
+                for host in dict.fromkeys(coordinator.hosts):
+                    members = [index for index, name in enumerate(coordinator.hosts) if name == host]
+                    if not any(counts[index] for index in members):
+                        continue
+                    local = _balance_compilations([counts[index] for index in members],
+                                                  [workers[index] for index in members])
+                    for borrower, forwards in zip(members, local):
+                        assigned[borrower] = [(members[owner], index) for owner, index in forwards]
+                if workers[share]:
+                    compiler = compiler_scope.enter_context(CompilePool(
+                        self.device, options=self.options, workers=workers[share]))
                 loans = [(borrower, missing[index]) for borrower, forwards in enumerate(assigned)
                          for owner, index in forwards if owner == share and borrower != share]
                 lent = {work[index][:2] for _, index in loans}
-                try:
-                    from .forward_metadata import dumps
+                from .forward_metadata import dumps
 
+                if loans:
                     jobs = self.root / 'lent'
                     jobs.mkdir(parents=True, exist_ok=True)
                     for borrower, index in loans:
@@ -809,22 +976,24 @@ class ForwardCache:
                         path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
                         job = jobs / f"{path.stem}.forward"
                         with tempfile.NamedTemporaryFile(dir=jobs, suffix='.tmp', delete=False) as file:
-                            pickle.dump((dumps(forward), str(path)), file)
-                        os.replace(file.name, job)
+                            temporary = Path(file.name)
+                            try:
+                                pickle.dump((dumps(forward), str(path)), file)
+                                file.close()
+                                os.replace(temporary, job)
+                            finally:
+                                temporary.unlink(missing_ok=True)
                         sent.append((borrower, str(job)))
                         # The borrower compiles it before every rank gathers the outcome below.
                         paths[name, variant] = str(path), True
-                except Exception as failure:
-                    error = error or f"{type(failure).__name__}: {failure}"
+            except Exception as failure:
+                error = error or f"{type(failure).__name__}: {failure}"
             mailed = [None] * len(ranks)
             dist.all_gather_object(mailed, sent, group=group)
             borrowed = [job for jobs in mailed for borrower, job in jobs if borrower == share]
             try:
                 if error is not None:
                     raise RuntimeError(error)
-                if compiler is None and (borrowed or any(index not in {i for _, i in loans} for index in missing)
-                                         if not coordinator.spans_hosts else missing):
-                    raise RuntimeError(unavailable)
                 pending = []
 
                 def finish():
@@ -863,8 +1032,14 @@ class ForwardCache:
                 outcome = paths, None
             except Exception as failure:
                 outcome = None, f"{type(failure).__name__}: {failure}"
+            try:
+                compiler_scope.close()
+            except Exception as failure:
+                outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
             outcomes = [None] * len(ranks)
             dist.all_gather_object(outcomes, outcome, group=group)
+            for _, job in sent:
+                Path(job).unlink(missing_ok=True)
             # Forwards lent to other ranks are complete once every rank reports.
             stage.update(advance=len(lent))
         failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
@@ -882,57 +1057,57 @@ class ForwardCache:
             release_unused()
             if materialize is not None:
                 materialize()
-            with phase(progress, "Load compiled forwards", total=len(functions) - len(selected)) as stage:
-                for name, forward in functions.items():
-                    if name in selected:
-                        continue
-                    path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
-                    with _guard_code_cache(self.root / 'guards'):
-                        selected[name] = self._load(forward, Path(path), required=True,
-                            before_run=None if before_run is None else lambda name=name: before_run(name))
-                    selected[name].cache_hit = not compiled
-                    stage.update(advance=1)
         except Exception as failure:
-            import traceback
-
-            traceback.print_exc(limit=-40)
             error = f"{type(failure).__name__}: {failure}"
         errors = [None] * len(ranks)
         dist.all_gather_object(errors, error, group=group)
         if any(errors):
-            raise RuntimeError(f"compiled forward binding failed: {errors}")
-        release_unused()
+            raise RuntimeError(f"compiled forward materialization failed: {errors}")
         selections = InductorSelections(self.device, coordinator=coordinator,
-                                        lock_gpu_clocks=self.lock_gpu_clocks)
-        failure = None
-        try:
-            for bound in selected.values():
-                selections.register(bound)
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        selections._check(failure)
-        with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
-            for name in functions:
+                                        lock_gpu_clocks=self.lock_gpu_clocks, source_identity=self.root.name)
+        published, released = [], 0
+        with phase(progress, "Load and warm compiled forwards", total=len(functions)) as stage:
+            for name, forward in functions.items():
+                failure = None
+                try:
+                    if name not in selected:
+                        path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
+                        with _guard_code_cache(self.root / 'guards'):
+                            selected[name] = self._load(forward, Path(path), required=True,
+                                before_run=None if before_run is None else lambda name=name: before_run(name))
+                        selected[name].cache_hit = not compiled
+                    bound = selected[name]
+                    selections.register(bound)
+                except Exception as error:
+                    import traceback
+
+                    traceback.print_exc(limit=-40)
+                    failure = f"{name}: {type(error).__name__}: {error}"
+                selections._check(failure)
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
-                    selections.warm(selected[name], warmup,
+                    selections.warm(bound, warmup,
                                     before_run=None if before_run is None else lambda name=name: before_run(name))
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
+                failure = None
+                try:
+                    selections.freeze(bound)
+                    variant = getattr(forward, 'compilation_variant', 'shared')
+                    if compilers[name, variant] == share:
+                        path, _ = paths[name, variant]
+                        bound.artifact.save_compiled_function(path)
+                        published.append(path)
+                    released += bound.prepare_capture()
+                    selections.release(bound)
+                    release_unused(generation=0)
+                except Exception as error:
+                    failure = f"{name}: {type(error).__name__}: {error}"
+                selections._check(failure)
                 stage.update(advance=1)
-        published, failure = [], None
-        try:
-            for name, bound in selected.items():
-                selections.freeze(bound)
-                variant = getattr(functions[name], 'compilation_variant', 'shared')
-                if compilers[name, variant] == share:
-                    path, _ = paths[name, variant]
-                    bound.artifact.save_compiled_function(path)
-                    published.append(path)
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        selections._check(failure)
+            stage.update(f"{released >> 20} MiB portable state released; guards and kernel owners retained")
+        release_unused()
         if coordinator.spans_hosts:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
@@ -1010,7 +1185,8 @@ class ForwardCache:
         from .inductor_tuning import InductorSelections
 
         if selections is None:
-            selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
+            selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks,
+                                        source_identity=self.root.name)
         path.parent.mkdir(parents=True, exist_ok=True)
         if not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph'):
             bound.artifact.save_compiled_function(str(path))

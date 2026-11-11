@@ -4,9 +4,9 @@
 """Complete MiniMax M3 continuations through native host offload and readmission.
 
 Requires FLARE_RUN_CUDA_TESTS=1, four assigned CUDA_VISIBLE_DEVICES, and
-FLARE_MINIMAX_TEST_PACKAGE, FLARE_MINIMAX_TEST_BINARY, and
-FLARE_TEST_PUBLISHER_KEYS locating a TP4 package, release executable, and its
-trusted local-development publisher profile. The package must contain ordinary
+FLARE_MINIMAX_TEST_CORE, FLARE_MINIMAX_TEST_BINARY, and
+FLARE_TEST_PUBLISHER_KEYS locating a TP4 core, release executable, and its
+trusted local-development publisher profile. The core must contain ordinary
 decode and seven-proposal DSpark graphs with concurrency four and prefill 4096.
 """
 
@@ -25,16 +25,16 @@ import urllib.request
 
 import pytest
 
-from ignition.preparation.package_file import read_index
+from ignition.preparation.core_file import read_index
 from tests.server.test_prefix_cache_offload import Service
 
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1"
     or any(not os.environ.get(name) for name in (
-        "CUDA_VISIBLE_DEVICES", "FLARE_MINIMAX_TEST_PACKAGE", "FLARE_MINIMAX_TEST_BINARY",
+        "CUDA_VISIBLE_DEVICES", "FLARE_MINIMAX_TEST_CORE", "FLARE_MINIMAX_TEST_BINARY",
         "FLARE_TEST_PUBLISHER_KEYS")),
-    reason="requires four assigned GPUs and a signed native MiniMax M3 package",
+    reason="requires four assigned GPUs and a signed native MiniMax M3 core",
 )
 
 
@@ -49,7 +49,7 @@ def server(tmp_path, drafts):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    args = [os.environ["FLARE_MINIMAX_TEST_BINARY"], "run", os.environ["FLARE_MINIMAX_TEST_PACKAGE"],
+    args = [os.environ["FLARE_MINIMAX_TEST_BINARY"], "run", os.environ["FLARE_MINIMAX_TEST_CORE"],
             "--offline", "--gpus", "0,1,2,3", "--host", "127.0.0.1", "--port", str(port),
             "--publisher-keys", str(profile), "--dangerously-approve-key", fingerprint,
             "--dangerously-accept-publisher", publisher["namespace"],
@@ -104,11 +104,11 @@ def ask(service, model, prompt):
 
 @pytest.mark.parametrize("drafts", [0, 7], ids=["ordinary", "dspark"])
 def test_evicted_complete_continuation_is_readmitted_and_branched(tmp_path, drafts):
-    package, _ = read_index(os.environ["FLARE_MINIMAX_TEST_PACKAGE"])
-    assert len(package.ranks) == 4
-    contract = package.contract
+    core, _ = read_index(os.environ["FLARE_MINIMAX_TEST_CORE"])
+    assert len(core.ranks) == 4
+    contract = core.contract
     assert contract.page_tokens == 128 and contract.prefill_chunk_size == 4096
-    assert contract.snapshots > 0 and package.ranks[0].execution.max_active >= 4
+    assert contract.snapshots > 0 and core.ranks[0].execution.max_active >= 4
     assert 8 in contract.speculative_widths
     prompt = "Reference offload. " + " ".join(
         f"Item {index} records code {index * 17 % 997}." for index in range(600))

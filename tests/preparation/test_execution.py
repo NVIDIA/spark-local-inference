@@ -28,6 +28,59 @@ def _execution(*, model_class=PreparedExecution, **changes):
     return model_class(**(arguments | changes))
 
 
+def test_model_closes_private_graphs_before_kernel_plans_and_storage(monkeypatch):
+    import torch
+    from ignition.preparation.model import PreparedModel
+
+    order = []
+    graph = SimpleNamespace(reset=lambda: order.append("serving graph"))
+    observer = SimpleNamespace(close=lambda: order.append("private graph"))
+    session = SimpleNamespace(close=lambda: order.append("kernel plans"))
+    storage = SimpleNamespace(close=lambda: order.append("storage"))
+    model = _execution(model_class=PreparedModel,
+        graphs={"decode": graph, "prefill": graph}, server_config={}, memory_report={},
+        session=session, graph_resources=(observer,), close_resources=(storage,))
+    model.runtime = SimpleNamespace(close=lambda: order.append("native drain"), drained=True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: order.append("synchronize"))
+
+    model.close()
+
+    assert order == ["native drain", "synchronize", "serving graph", "serving graph",
+                     "private graph", "kernel plans", "storage"]
+    assert model.closed and not model._graph_resources and not model._close_resources
+    model.close()
+    assert order.count("private graph") == 1
+
+
+@pytest.mark.parametrize("failure", ("native drain", "synchronize", "private graph"))
+def test_model_retains_graph_owners_when_shutdown_fails(monkeypatch, failure):
+    import torch
+    from ignition.preparation.model import PreparedModel
+
+    order = []
+    def step(name):
+        order.append(name)
+        if name == failure:
+            raise RuntimeError(name)
+    graph = SimpleNamespace(reset=lambda: step("serving graph"))
+    observer = SimpleNamespace(close=lambda: step("private graph"))
+    session = SimpleNamespace(close=lambda: step("kernel plans"))
+    storage = SimpleNamespace(close=lambda: step("storage"))
+    model = _execution(model_class=PreparedModel,
+        graphs={"decode": graph, "prefill": graph}, server_config={}, memory_report={},
+        session=session, graph_resources=(observer,), close_resources=(storage,), resources=(observer,))
+    model.runtime = SimpleNamespace(close=lambda: step("native drain"), drained=failure != "native drain")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: step("synchronize"))
+
+    with pytest.raises(RuntimeError, match=failure):
+        model.close()
+
+    assert not model.closed
+    assert model._graph_resources == (observer,) and model._close_resources == (storage,)
+    assert model.resources == (observer,)
+    assert "kernel plans" not in order and "storage" not in order
+
+
 def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     execution = _execution(estimated_durations_ns={"decode": 123_000, "prefill": 456_000})
     spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1)]
@@ -39,7 +92,7 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     decode, prefill = manifest["graphs"]
     assert decode["estimated_duration_ns"] == 123_000
     assert prefill["estimated_duration_ns"] == 456_000
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
 
     encoded = ExecutionGraph(**{key: value for key, value in decode.items() if key != "handle"})
     assert ExecutionGraph.FromString(encoded.SerializeToString()).estimated_duration_ns == 123_000
@@ -216,10 +269,14 @@ def test_invalid_graph_durations_fail_before_cuda(durations):
         _execution(estimated_durations_ns=durations)
 
 
-@pytest.mark.parametrize("prefill,width,enabled", [(64, 1, False), (64, 1, True), (512, 8, True)])
-def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, prefill, width, enabled):
+@pytest.mark.parametrize("prefill,width,enabled,depth", [
+    (64, 1, False, None),
+    (64, 1, True, None),
+    (512, 8, True, 15),
+])
+def test_mixed_manifest_preserves_speculative_depth_and_ordinary_mode(monkeypatch, prefill, width, enabled, depth):
     signature = GraphSignature("mixed", 4, width, ("prefill_row",),
-                               speculation_enabled=enabled, prefill_capacity=prefill)
+                               speculation_enabled=enabled, prefill_capacity=prefill, draft_tokens=depth)
     execution = _execution()
     buffers = dict(execution.buffers)
     buffers["completion_records"] = _tensor("int64", (2, 4, 32))
@@ -230,16 +287,53 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
     manifest = execution.manifest(all_variants=True)
     assert manifest["abi_version"] == 6
     graph, = manifest["graphs"]
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
     encoded = ExecutionGraph(**{k: v for k, v in graph.items() if k != "handle"})
     decoded = ExecutionGraph.FromString(encoded.SerializeToString())
     assert (decoded.batch_capacity, decoded.token_capacity, decoded.prefill_capacity) == (4, width, prefill)
     assert decoded.speculation_enabled == enabled
+    if enabled:
+        expected_depth = width - 1 if depth is None else depth
+        assert decoded.HasField("draft_tokens") and decoded.draft_tokens == expected_depth
+        assert decoded.HasField("verify_tokens") and decoded.verify_tokens == width
+        assert decoded.draft_source == 1
+    else:
+        assert not decoded.HasField("draft_tokens") and not decoded.HasField("verify_tokens")
+        assert decoded.draft_source == 0
+    assert decoded.packed_token_capacity == 0
     assert "prefill_row" in [b.buffer_name for b in decoded.input_bindings]
 
 
+def test_speculative_mixed_diagnostic_manifest_selects_enabled_variant(monkeypatch):
+    signatures = {
+        "mixed-ordinary": GraphSignature("mixed", 4, 1, ("prefill_row",),
+            speculation_enabled=False, prefill_capacity=64),
+        "mixed-speculative": GraphSignature("mixed", 4, 4, ("prefill_row",),
+            speculation_enabled=True, prefill_capacity=64),
+    }
+    buffers = dict(_execution().buffers)
+    buffers["prefill_row"] = _tensor("int32", (1,))
+    execution = _execution(graphs=dict.fromkeys(signatures, object()), signatures=signatures, buffers=buffers)
+    spans = [(4096, 4), (8192, 8), (12288, 2048), (16384, 128), (20480, 1), (24576, 4)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
+
+    assert [graph["name"] for graph in execution.manifest()["graphs"]] == ["mixed-speculative"]
+    assert {graph["name"] for graph in execution.manifest(all_variants=True)["graphs"]} == set(signatures)
+
+
+def test_mixed_draft_depth_requires_speculation_and_matches_width_one():
+    ordinary = dict(kind="mixed", batch_capacity=4, token_capacity=1, inputs=("prefill_row",),
+                    speculation_enabled=False, prefill_capacity=64)
+    with pytest.raises(ValueError, match="speculation-enabled graph"):
+        GraphSignature(**(ordinary | {"draft_tokens": 0}))
+    speculative = ordinary | {"speculation_enabled": True}
+    assert GraphSignature(**speculative).draft_tokens == 0
+    with pytest.raises(ValueError, match="width-one graphs require zero"):
+        GraphSignature(**(speculative | {"draft_tokens": 1}))
+
+
 def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds():
-    from ignition.preparation.runtime_package_pb2 import ExecutionGraph
+    from ignition.preparation.runtime_core_pb2 import ExecutionGraph
     legacy = ExecutionGraph.FromString(b"\x12\x0cverification\x20\x08\x28\x06")
     assert (legacy.batch_capacity, legacy.token_capacity, legacy.packed_token_capacity) == (8, 6, 0)
     graph = ExecutionGraph(kind="speculative", batch_capacity=8, token_capacity=6, packed_token_capacity=24,

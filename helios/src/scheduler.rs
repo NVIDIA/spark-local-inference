@@ -1430,7 +1430,7 @@ impl RequestScheduler {
         history.append(&spec.prompt, &spec.conditioning)?;
         if spec.prompt_logprobs && self.scored_prefill_catalog.is_empty() {
             return Err(crate::Error::admission(crate::AdmissionError::Invalid,
-                "prompt logprobs are not available in this model package"));
+                "prompt logprobs are not available in this model core"));
         }
         let lookup = if spec.prompt_logprobs {
             Lookup { checkpoint: None, consumed_tokens: 0, pages: Vec::new(), snapshot: None }

@@ -124,7 +124,7 @@ class ExecutionTests(unittest.TestCase):
             time.sleep(.001)
         self.fail("native completion event did not arrive within 10 seconds")
 
-    def test_package_capacities_emit_full_vectors_through_two_native_frames(self):
+    def test_core_capacities_emit_full_vectors_through_two_native_frames(self):
         for capacity in (1, 8, 13, 16, 33):
             with self.subTest(capacity=capacity):
                 owner = Resources(self.native, capacity, capacity)

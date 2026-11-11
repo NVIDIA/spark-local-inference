@@ -24,8 +24,8 @@ def test_compiled_gather_reads_only_backed_state_rows():
     import ctypes as C
     from b12x.sequence._shared.disk_table import _tensor_from_pointer
     from ignition.components.state import gather_rows
-    from ignition.preparation.package_storage import DeviceRegion
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.core_storage import DeviceRegion
+    from ignition.preparation.runtime_core import _Cuda
 
     torch.cuda.init()
     torch.empty(0, device="cuda")

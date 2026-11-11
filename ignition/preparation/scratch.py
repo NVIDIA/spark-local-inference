@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Caller-owned byte storage for serialized planned operators."""
+"""Preparation workspace and typed invocation-local scratch views."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ from math import prod
 from weakref import finalize
 
 import torch
+
+
+def buffer_rows(values, name, rows):
+    """Reuse a named buffer's row prefix while its tensor identity is unchanged."""
+    value = values[name]
+    views = values.setdefault("row_views", {})
+    cached = views.get(name)
+    if cached is None or cached[0] is not value:
+        cached = (value, {})
+        views[name] = cached
+    if rows not in cached[1]:
+        cached[1][rows] = value[:rows]
+    return cached[1][rows]
 
 
 def scratch_views(backing, shapes):
@@ -37,10 +50,10 @@ def scratch_views(backing, shapes):
 
 
 class ScratchArena:
-    """Grow during preparation, then retain one address for graph capture.
+    """Share tuning workspace and retire declaration storage before compilation.
 
-    With ``overlap`` false, recipes compose every branch on the main stream:
-    the arena then creates no auxiliary stream and accepts no concurrent plans.
+    With ``overlap`` false, preparation creates no auxiliary stream and accepts
+    no concurrent plans. Serving forwards allocate their own temporary tensors.
     """
 
     def __init__(self, device, *, overlap=True, allocation_pool=None):
@@ -50,7 +63,9 @@ class ScratchArena:
         self.allocation_pool = allocation_pool
         self.overlap = overlap
         self.frozen = False
+        self._released = False
         self._finalizers = []
+        self._preparation_releases = []
         self._parallel_plans = []
         self._auxiliary_stream = None
         self._recorded_views = None
@@ -66,6 +81,7 @@ class ScratchArena:
 
     @property
     def auxiliary_stream(self):
+        self._require_active()
         if not self.overlap:
             raise RuntimeError("stream overlap is disabled; compose this branch on the main stream")
         if self._auxiliary_stream is None:
@@ -82,7 +98,7 @@ class ScratchArena:
         return self._auxiliary_stream
 
     def register_parallel(self, *plans):
-        """Declare plans whose workspaces must coexist within a captured fork."""
+        """Declare plans that need disjoint workspace during preparation."""
         if not self.overlap:
             raise RuntimeError("stream overlap is disabled; serial plans share scratch")
         if self.frozen:
@@ -109,6 +125,7 @@ class ScratchArena:
                     for group in self._parallel_plans), default=0)
 
     def reserve(self, nbytes):
+        self._require_active()
         if type(nbytes) is not int or nbytes < 0:
             raise ValueError("scratch size must be a nonnegative integer")
         if nbytes > self.nbytes:
@@ -123,7 +140,38 @@ class ScratchArena:
     def freeze(self):
         self.frozen = True
 
+    def release_preparation(self):
+        """Retire finalized workspace before capture when all consumers use local scratch.
+
+        The caller must finish tuning and binding finalizers, synchronize their
+        work, and ensure no execution depends on this arena's storage. Existing
+        tensor views retain their own storage ownership; this method does not
+        inspect consumers or infer whether release is safe.
+        """
+        if self._released:
+            return
+        if not self.frozen or self._finalizers:
+            raise RuntimeError("scratch preparation release requires completed binding finalization")
+        for callback in self._preparation_releases:
+            callback()
+        self._preparation_releases.clear()
+        self.tensor = torch.empty(0, dtype=torch.uint8, device=self.device)
+        self._parallel_plans.clear()
+        self._released = True
+
+    def register_preparation_release(self, callback):
+        """Release shared declaration owners after every binding has finalized."""
+        self._require_active()
+        if not callable(callback):
+            raise TypeError("preparation release must be callable")
+        self._preparation_releases.append(callback)
+
+    def _require_active(self):
+        if self._released:
+            raise RuntimeError("scratch preparation storage has been released")
+
     def trim(self, nbytes):
+        self._require_active()
         if type(nbytes) is not int or nbytes < 0:
             raise ValueError("scratch size must be a nonnegative integer")
         capacity = (nbytes + 255) // 256 * 256
@@ -132,9 +180,14 @@ class ScratchArena:
         if capacity < self.nbytes:
             if self.frozen:
                 raise RuntimeError("cannot trim a frozen scratch arena")
+            device = self.device
             with (nullcontext() if self.allocation_pool is None else
-                  torch.cuda.use_mem_pool(self.allocation_pool, device=self.device.index)):
-                self.tensor = torch.empty(capacity, dtype=torch.uint8, device=self.device)
+                  torch.cuda.use_mem_pool(self.allocation_pool, device=device.index)):
+                # Tuning has drained and scratch contents are disposable. Release
+                # our candidate owner before allocating the selected capacity;
+                # external views, if any, still retain their own valid storage.
+                self.tensor = torch.empty(0, dtype=torch.uint8, device=device)
+                self.tensor = torch.empty(capacity, dtype=torch.uint8, device=device)
 
     def views(self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]) -> tuple[torch.Tensor, ...]:
         """Return disjoint views for simultaneous use within one serialized call.
@@ -169,6 +222,7 @@ class ScratchArena:
 
     def finalize(self, *, group=None, retain=False):
         """Bind scratch views, retaining callbacks only for preparation trial graphs."""
+        self._require_active()
         if group is None:
             for callback in self._finalizers:
                 callback()
@@ -269,66 +323,12 @@ def planned_scratch(specs, workspace=None):
 
 
 def prime_owners(workspace, *owners):
-    """Keep the arena in prepared plans without pinning pre-finalization views.
+    """Keep preparation storage without retaining disposable declaration views.
 
-    b12x retains priming owners until a plan is released. Serving components
-    own their finalized bindings; benchmark calls retain concrete trial views.
+    b12x retains priming owners until a plan is released. Functional execution
+    supplies invocation tensors; standalone calls retain their concrete owners.
     """
     return (workspace,) if isinstance(workspace, ScratchArena) else owners
-
-
-def overlay(objects, *, keep=()):
-    """Place each scratch dataclass's tensors at the start of one shared byte buffer.
-
-    The objects overlap one another, so they must never be live at the same time.
-    Views within an object keep their relationships. Nested dataclasses of a `keep`
-    type retain their own storage, for example buffers holding prepared constants.
-    """
-    import dataclasses
-
-    def tensors(value, found):
-        if isinstance(value, keep):
-            return
-        if isinstance(value, torch.Tensor):
-            if value.numel():
-                found.append(value)
-        elif dataclasses.is_dataclass(value):
-            for field in dataclasses.fields(value):
-                tensors(getattr(value, field.name), found)
-
-    layouts, device = [], None
-    for value in objects:
-        found, offsets, size = [], {}, 0
-        tensors(value, found)
-        for tensor in found:
-            storage = tensor.untyped_storage()
-            if storage.data_ptr() not in offsets:
-                offsets[storage.data_ptr()] = size
-                size += (storage.nbytes() + 255) // 256 * 256
-            device = tensor.device
-        layouts.append((offsets, size))
-    if device is None:
-        return tuple(objects)
-    shared = torch.zeros(max(size for _, size in layouts), dtype=torch.uint8, device=device)
-    if shared.numel() % 8:
-        raise ValueError("overlaid scratch must keep 8-byte storage alignment")
-
-    def rebase(value, offsets):
-        if isinstance(value, keep):
-            return value
-        if isinstance(value, torch.Tensor):
-            if not value.numel():
-                return value
-            # as_strided offsets count elements from the start of the shared storage.
-            start = offsets[value.untyped_storage().data_ptr()] // value.element_size()
-            return shared.view(value.dtype).as_strided(value.shape, value.stride(), start + value.storage_offset())
-        if dataclasses.is_dataclass(value):
-            return dataclasses.replace(value, **{field.name: rebase(getattr(value, field.name), offsets)
-                                                 for field in dataclasses.fields(value) if field.init})
-        return value
-
-    return tuple(rebase(value, offsets) for value, (offsets, _) in zip(objects, layouts, strict=True))
-
 
 
 class GraphBufferPool:

@@ -71,8 +71,18 @@ class PreparedCompressedCacheWriter:
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
 
-    def __call__(self, values):
-        _write(values, self.cache, self.slots, self.plan.handle, self.history, self.history_rows)
+    def functional(self, *, session, cache=...):
+        if cache is not ...:
+            self.cache = cache
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.slots = self.history_rows = None
+
+    def __call__(self, values, slots=None, *, history_rows=None, cache=None):
+        _write(values, self.cache if cache is None else cache, self.slots if slots is None else slots, self.plan.handle,
+               self.history, self.history_rows if history_rows is None else history_rows)
 
 
 @torch.library.custom_op("flare::compressed_mla", mutates_args=("out", "scratch"))
@@ -123,7 +133,7 @@ class PreparedCompressedMLA:
                 owners=prime_owners(workspace, inputs, scratch, binding))
 
         benchmark_inputs = candidate_inputs(partial(Inputs, query, window, indexed, self.inputs,
-            cache_format, window_page_size, indexed_page_size))
+            cache_format, window_page_size, indexed_page_size), session=session)
         declare(session, (self.plan.request(name=name, prepare_call=prepare,
             benchmark_call=partial(benchmark_call, inputs=benchmark_inputs, workspace=workspace)),))
         register_finalizer(session, self.rebind, workspace=workspace)
@@ -131,7 +141,29 @@ class PreparedCompressedMLA:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
-    def __call__(self):
+    def functional(self, *, session, window=...):
+        if window is not ...:
+            self.window = window
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.query = self.output = self.inputs = self.workspace = self.scratch = None
+
+    def __call__(self, query=None, indices=None, lengths=None, *, indexed_indices=None,
+                 indexed_lengths=None, page_table=None, window=None):
+        if self.inputs is not None:
+            return self._bound_call()
+        shape, stride, dtype = self.output_layout
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+        scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        _attend(query, self.window if window is None else window, indices, lengths, self.indexed, indexed_indices, indexed_lengths,
+                page_table, self.sink, output, scratch, self.scale, self.plan.handle)
+        return output
+
+    def _bound_call(self):
         args = self.inputs
         _attend(self.query, self.window, args["swa_indices"], args["swa_lengths"], self.indexed,
             args["indexed_indices"], args["indexed_lengths"], args["indexed_page_table"],

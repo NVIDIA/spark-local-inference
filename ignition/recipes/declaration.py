@@ -102,7 +102,7 @@ class Speculation:
     Preparation captures width one at every request bucket and complete rounds
     within the target-token capacity. `adaptive` sets the serving default: choose
     prepared layouts from measured costs and conditional acceptance estimates
-    when true, or use the fixed maximum verification width when false. Package
+    when true, or use the fixed maximum verification width when false. Core
     loading accepts capacity reductions represented by captured graphs. Drafts
     come from the checkpoint's learned draft model.
     """
@@ -117,8 +117,11 @@ class Speculation:
     markov_head_quantization: str | None = None
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and self.draft_tokens < 1:
+            raise ValueError("--mtp-only requires positive learned draft depth")
         if self.method not in (None, "mtp", "dflash2"):
             raise ValueError("speculative method must be omitted, mtp or dflash2")
         if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
@@ -199,6 +202,9 @@ class Recipe:
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as
     MXFP8 while loading, trading checkpoint precision for decode bandwidth.
+    `online_mxfp8_scope` selects the conversion group for preparation; `all` selects
+    the complete eligible set. `online_mxfp8_scopes` also accepts groups recorded in
+    prepared metadata so an explicit precision choice retains its meaning.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
@@ -234,6 +240,8 @@ class Recipe:
     stream_overlap: bool = False
     mixed_prefill: bool = False
     online_mxfp8: bool = False
+    online_mxfp8_scope: str = "all"
+    online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     mla_compute_modes: tuple[str, ...] = ("auto",)
@@ -245,16 +253,18 @@ class Recipe:
     markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
-        from ignition.components.capacity import mixed_shapes
+        from ignition.components.capacity import mixed_shapes, serving_modes
 
         if not self.mixed_prefill:
             return ()
-        modes = (True, False) if speculation is not None else (False,)
+        modes = serving_modes(speculation is not None, speculation is not None and speculation.mtp_only)
         return tuple((enabled, b, w, p) for enabled in modes
             for b, w, p in mixed_shapes(concurrency, chunk, speculation.widths if enabled else (1,),
                                         speculation.token_capacity if enabled else None))
 
     def __post_init__(self):
+        if self.online_mxfp8_scope not in self.online_mxfp8_scopes:
+            raise ValueError("recipe online MXFP8 scope must belong to its supported conversion groups")
         if self.export_repository:
             import re
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*', self.export_repository) or '..' in self.export_repository:

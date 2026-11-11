@@ -4,6 +4,7 @@
 """Serialized expert candidates share bounded scratch and exact routing inputs."""
 
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -12,6 +13,20 @@ from b12x._lib.scratch import ScratchBufferSpec, scratch_tensor
 from ignition.components import moe
 from ignition.preparation.fixtures import fused_moe as moe_fixtures
 from ignition.preparation.scratch import ScratchArena
+
+
+def test_expert_fixture_lifetime_belongs_to_its_producer_calls():
+    source = torch.zeros(4, 32, dtype=torch.bfloat16)
+    fixture = moe_fixtures.ExpertBenchmarkInputs(source, experts=16, top_k=4,
+                                                allocate_router=moe.RouterScratch.allocate)
+    owner = weakref.ref(fixture)
+    producers = fixture.producers
+    del fixture
+    assert owner() is not None
+    for produce in producers:
+        produce()
+    del produce, producers
+    assert owner() is None
 
 
 @pytest.mark.parametrize("a4_prefill", [False, True])
@@ -95,7 +110,7 @@ def test_candidate_cohort_reuses_exact_operands_and_one_arena(monkeypatch, token
     assert all(call.owners[3] is experts and call.owners[2].input_scales_static for call in calls)
     assert all(call.owners[2].a4_prefill is a4_prefill for call in calls)
     assert all(call.reset is None and call.restore is None for call in calls)
-    assert all(call.benchmark_producers is fixture.producers for call in calls)
+    assert all(call.produce is call.benchmark_producers[0] for call in calls)
     assert operator.scratch is None
     assert len(fixture.producers) == 6
     for index in (0, 1, 2, 0):

@@ -13,6 +13,13 @@ DEFAULT_COMPLETION_TOKEN_CAPACITY = 8
 BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 
 
+def serving_modes(enabled: bool, mtp_only: bool = False) -> tuple[bool, ...]:
+    """Select generation modes before constructing their graphs."""
+    if mtp_only and not enabled:
+        raise ValueError("--mtp-only requires enabled learned speculation")
+    return (True,) if mtp_only else ((True, False) if enabled else (False,))
+
+
 def completion_token_capacity(value=0):
     """Resolve the ABI's omitted capacity to eight; positive uint32 values are literal."""
     if type(value) is not int or not 0 <= value < 1 << 32:

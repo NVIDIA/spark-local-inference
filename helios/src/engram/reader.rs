@@ -80,7 +80,7 @@ impl Aligned {
 
 #[cfg(test)]
 pub(super) fn open_file(path: &Path) -> Result<File> {
-    crate::os::direct_file(path, false).map_err(|e| format!("open Engram package: {e}").into())
+    crate::os::direct_file(path, false).map_err(|e| format!("open Engram core: {e}").into())
 }
 
 pub(crate) struct Resident {

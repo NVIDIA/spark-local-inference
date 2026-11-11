@@ -19,11 +19,11 @@ from b12x.preparation import (
     AutotuneEffort, MemoryRequirements, PreparationDisplay, PreparationSession,
     autotune_effort as b12x_autotune_effort,
 )
-from b12x.preparation.session import _declaration_key
+from b12x.preparation.session import _declaration_key, _plans_of
 from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
-from .host_memory import cpu_workers, release_unused, tuning_limits
+from .host_memory import candidate_scratch_limit, cpu_workers, release_unused, tuning_limits
 
 
 # Requests per tuning job on an integrated GPU: collective declarations with a coordinator,
@@ -46,6 +46,9 @@ def _local_tuning_catalog(requests):
 
 def _prepare_compiler_toolchain():
     """Resolve forward math libraries before native program identities are recorded."""
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
     from torch._inductor import config
     from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
 
@@ -335,12 +338,20 @@ class RecordedPreparationSession(PreparationSession):
         if key not in self._benchmark_resources:
             # Calls own their operands until their trials drain. Cache only the active
             # fixture; keeping every completed shape's inputs can exhaust GPU memory.
-            self._benchmark_resources = {key: value for key, value in self._benchmark_resources.items()
-                                         if key in self._benchmark_restorers}
+            self.release_benchmark_cache()
             # Retired pools release fixture segments once their final trial owner drops them.
             with (nullcontext() if self.benchmark_storage is None else self.benchmark_storage.transient()):
                 self._benchmark_resources[key] = factory()
         return self._benchmark_resources[key]
+
+    def release_benchmark_cache(self):
+        """Drop cached fixtures; live trial calls and borrowed state retain their owners."""
+        self._check_thread()
+        if self._tune_status != "tuning":
+            raise RuntimeError("benchmark fixtures can only be retired during tuning")
+        self._benchmark_resources = {key: value for key, value in self._benchmark_resources.items()
+                                     if key in self._benchmark_restorers}
+        torch.accelerator.memory.empty_host_cache()
 
     def register_benchmark_resource(self, key: Hashable, resource, *, restore):
         """Borrow preparation-only storage until trial cleanup and restoration finish."""
@@ -394,14 +405,37 @@ class RecordedPreparationSession(PreparationSession):
                 envelopes[key] = self.candidate_memory_envelope(groups[key])
             return envelopes[key].scratch_nbytes
 
-        parallel = arena.parallel_nbytes(scratch_bytes)
-        remaining = [request for key, group in groups.items() if key not in envelopes for request in group]
-        requirements = list(envelopes.values())
-        if remaining:
-            requirements.append(self.candidate_memory_envelope(remaining))
-        envelope = MemoryRequirements.sequential(requirements)
+        def requirements():
+            parallel = arena.parallel_nbytes(scratch_bytes)
+            remaining = [request for key, group in groups.items() if key not in envelopes for request in group]
+            values = list(envelopes.values())
+            if remaining:
+                values.append(self.candidate_memory_envelope(remaining))
+            return MemoryRequirements.sequential(values), parallel
+
+        envelope, parallel = requirements()
         before = arena.nbytes
         required = max(envelope.scratch_nbytes, parallel)
+        if self.autotune:
+            pools = 1 if self._coordinator is None else self._coordinator.local_ranks
+            if self.tuning_replica is not None:
+                pools = self.tuning_replica.processes
+            limit = candidate_scratch_limit(self.device.ordinal, pools=pools,
+                headroom_bytes=self.headroom_bytes, pending_persistent_bytes=envelope.pending_persistent_nbytes)
+            if self._replica_coordinator is not None:
+                limit = min(self._replica_coordinator.gather(limit))
+            elif self._coordinator is not None:
+                from .rank_group import minimum_across_ranks
+
+                limit = minimum_across_ranks(limit, self._coordinator.group)
+            self.configure_scratch_limit(limit)
+            if required > limit:
+                envelopes.clear()
+                envelope, parallel = requirements()
+                required = max(envelope.scratch_nbytes, parallel)
+                if required > limit:
+                    raise MemoryError(f"concurrent kernel scratch requires {required} bytes; "
+                                      f"the shared tuning budget is {limit} bytes")
         arena.reserve(required)
         return {"initial_bytes": before, "candidate_scratch_bytes": required,
                 "parallel_candidate_scratch_bytes": parallel,
@@ -521,6 +555,15 @@ class RecordedPreparationSession(PreparationSession):
                         self.release_many(retired)
                 requests = tuple(self._recorded_requests.values())
                 self._context_original_requests = None
+            if (self._coordinator is not None and len(self._coordinator.ranks) > 1
+                    and not self._sharded and self._replica_coordinator is None):
+                configs, changed = self._coordinator.reconcile_selections(requests)
+                if changed:
+                    for job in self._jobs(requests):
+                        plans = {plan for request in job for plan in _plans_of(request)}
+                        results.append(self._coordinator.prepare(self, job, progress=progress,
+                            autotune=self.autotune,
+                            selected_configs={plan: config for plan, config in configs.items() if plan in plans}))
             selections = []
             coverage = {name: value for result in results for name, value in result.coverage.items()}
             for request in requests:
@@ -621,6 +664,7 @@ class RecordedPreparationSession(PreparationSession):
                 try:
                     with torch.cuda.device(self.device.ordinal):
                         torch.cuda.empty_cache()
+                        torch.accelerator.memory.empty_host_cache()
                     self._tune_status = "ready"
                 except BaseException:
                     self._tune_status = "failed"

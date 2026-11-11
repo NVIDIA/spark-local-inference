@@ -122,7 +122,7 @@ pub struct Snapshot {
     pub host_bytes_out: u64,
     /// Bytes copied from the host store into GPU pages and rows.
     pub host_bytes_in: u64,
-    /// Bytes of weights one decode step reads for one request, as the package declares; zero
+    /// Bytes of weights one decode step reads for one request, as the core declares; zero
     /// when it declares none. Times verification steps per second, the weight bandwidth consumed.
     #[serde(default)]
     pub decode_weight_bytes: u64,
@@ -1150,7 +1150,7 @@ impl Metrics {
             ),
             (
                 "decode_weight_bytes",
-                "Bytes of weights one decode step reads for one request, as the package declares; zero when undeclared.",
+                "Bytes of weights one decode step reads for one request, as the core declares; zero when undeclared.",
                 self.decode_weight_bytes,
             ),
             (
@@ -1571,7 +1571,7 @@ fn sixteen_width_metrics_include_fifteenth_draft() {
 
 #[cfg(test)]
 #[test]
-fn package_capacity_sizes_metrics_beyond_copy_mask_depth() {
+fn core_capacity_sizes_metrics_beyond_copy_mask_depth() {
     for capacity in [8, 13, 16, 32, 65] {
         let metrics = Metrics::new(0, 0, 0, capacity);
         let drafts = capacity - 1;

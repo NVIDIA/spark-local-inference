@@ -141,6 +141,7 @@ class PreparedRegionSelection:
     def __init__(self, query, weights, cache, metadata, selected, *, ratio, session, workspace, name, buffers=None):
         tokens, groups, heads, dim = query.shape
         self.metadata, self.groups = metadata, groups
+        self.tokens, self.selected_shape, self.selected_dtype = tokens, tuple(selected.shape), selected.dtype
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=query.device) if buffers is None else buffers.zeros(shape, dtype)
         self.requests = zeros((tokens * groups,), torch.int32)
@@ -189,9 +190,31 @@ class PreparedRegionSelection:
     def _bind(self, workspace):
         self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
 
-    def __call__(self):
+    def functional(self, *, session):
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.cache = self.arguments[2]
+        self.scratch_layout = (tuple(self.scratch.shape), tuple(self.scratch.stride()), self.scratch.dtype)
+        self.lengths_layout = (tuple(self.lengths.shape), self.lengths.dtype)
+        self.metadata = self.requests = self.positions = self.lengths = self.arguments = self.scratch = None
+
+    def __call__(self, query=None, weights=None, metadata=None):
+        if self.arguments is None:
+            device = query.device
+            requests = metadata.requests[:, None].expand(self.tokens, self.groups).reshape(-1).to(torch.int32).contiguous()
+            positions = metadata.positions[:, None].expand(self.tokens, self.groups).reshape(-1).to(torch.int64).contiguous()
+            lengths = (metadata.starts + metadata.lengths).to(self.lengths_layout[1])
+            selected = torch.empty(self.selected_shape, dtype=self.selected_dtype, device=device)
+            shape, stride, dtype = self.scratch_layout
+            scratch = torch.empty_strided(shape, stride, dtype=dtype, device=device)
+            _execute(query.flatten(0, 1), weights.flatten(0, 1), self.cache, metadata.page_table,
+                     requests, positions, lengths, selected.flatten(0, 1), scratch, self.plan.handle)
+            return selected
         m = self.metadata
         self.requests.view(-1, self.groups).copy_(m.requests[:, None])
         self.positions.view(-1, self.groups).copy_(m.positions[:, None])
         self.lengths.copy_(m.starts + m.lengths)
         _execute(*self.arguments, self.scratch, self.plan.handle)
+        return self.arguments[-1].view(self.selected_shape)

@@ -29,36 +29,54 @@ class Pipeline:
         self.preceding, self.block = preceding, block
         self.active = torch.ones_like(pending, dtype=torch.bool)
         self.limits = torch.full_like(pending, len(proposals) + 1)
+        self.functional = False
+        self.scratch_layout = {}
 
     def __call__(self):
+        block_state = None if self.block is None else self.block.begin(self.pending.device)
         previous = torch.where(self.active, self.pending, 0)
         for index, operation in enumerate(self.proposals):
             self.bias.copy_(self.transitions[previous.remainder(self.transitions.shape[0])])
             self.offset.fill_(4 * index)
             self.preceding[:, index].copy_(previous)
-            operation()
+            if self.functional:
+                scratch = {name: torch.empty(shape, dtype=dtype, device=self.pending.device)
+                           for name, (shape, dtype) in self.scratch_layout.items()}
+                scratch['support_ids'] = block_state['support_ids'][index]
+                scratch['support_probabilities'] = block_state['support_probabilities'][index]
+                logits = torch.empty((self.drafts.shape[0], 1, self.base.shape[-1]),
+                                     dtype=torch.float32, device=self.pending.device)
+                operation.run(scratch, logits, source_logits=self.base[:, index], candidates=self.drafts,
+                              source_bias=self.bias, seed=self.seed, offset=self.offset, sampled=self.sampled,
+                              slots=self.slots, generations=self.generations, live_rows=self.live_rows)
+            else:
+                operation()
             self.drafts[:, index].copy_(self.sampled)
             if self.block is None:
                 self.retained[:, index].copy_(operation.probabilities[:, 0])
                 self.valid[:, index].copy_(operation.valid[:, 0] & self.active & (index < self.limits - 1))
             else:
-                self.block.retain(index, operation)
+                if self.functional:
+                    self.block.retain(block_state, index, scratch, self.sampled)
+                else:
+                    support_ids, support_probabilities = operation.proposal._support
+                    self.block.retain(block_state, index, dict(support_ids=support_ids,
+                        support_probabilities=support_probabilities, valid=operation.valid), self.sampled)
             previous = self.drafts[:, index]
         if self.block is not None:
-            self.block.finish(self.active, self.limits)
+            self.block.finish(block_state, self.drafts, self.retained, self.valid, self.sampled, self.active, self.limits)
             self.preceding[:, 0].copy_(torch.where(self.active, self.pending, 0))
             self.preceding[:, 1:].copy_(self.drafts[:, :-1])
 
 
 def rank_main(rank, rendezvous, output):
     from ignition.components.draft_sampling import PreparedDraftDistribution, PreparedDraftBlockBroadcast
-    from ignition.components.parallel_draft import prepare_sampling_scratch, prepare_sampling_broadcasts
+    from ignition.components.parallel_draft import prepare_sampling_broadcasts
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from ignition.components.speculation import DRAFT_RNG_DOMAIN
     from ignition.preparation.collectives import CollectivePreparation, create_result_broadcast_runtime
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -88,10 +106,9 @@ def rank_main(rank, rendezvous, output):
                     slots = torch.arange(batch, dtype=torch.int32, device=device)
                     epochs = torch.full((batch,), 7, dtype=torch.int64, device=device)
                     live = torch.tensor([batch], dtype=torch.int32, device=device)
-                    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-                    cursor = pool.cursor()
-                    scratch = prepare_sampling_scratch(batch, depth + 1, vocab, device,
-                                                       buffers=cursor, verification=False)
+                    scratch = {"proposal": {
+                        name: torch.zeros(shape, dtype=dtype, device=device)
+                        for name, (shape, dtype) in PreparedDraftDistribution.scratch_layout(batch, 1, vocab).items()}}
                     drafts = torch.zeros((batch, depth), dtype=torch.int64, device=device)
                     retained = torch.zeros((batch, depth, vocab), device=device)
                     valid = torch.zeros((batch, depth), dtype=torch.bool, device=device)
@@ -111,16 +128,24 @@ def rank_main(rank, rendezvous, output):
                     if variant == 'serial':
                         prepare_sampling_broadcasts(proposals, None,
                             collectives=dict(vocabulary_runtime=runtime, coordinator=coordinator),
-                            session=session, name=f'serial{batch}', buffers=cursor)
+                            session=session, name=f'serial{batch}')
                     else:
                         block = PreparedDraftBlockBroadcast(proposals, drafts, retained, valid, sampled,
                             runtime=runtime, session=session, coordinator=coordinator,
-                            name=f'block{batch}', buffers=cursor)
+                            name=f'block{batch}')
                     pipeline = Pipeline(proposals, base, transitions, bias, drafts, retained, valid,
                                         offset, sampled, pending, preceding, block)
-                    owners[batch, variant] = (pipeline, state, live, pool, cursor, base, transitions)
+                    pipeline.seed = seed
+                    pipeline.slots, pipeline.generations, pipeline.live_rows = slots, epochs, live
+                    pipeline.scratch_layout = {name: (tuple(value.shape), value.dtype)
+                                              for name, value in scratch['proposal'].items()}
+                    owners[batch, variant] = (pipeline, state, live, base, transitions)
             session.tune(show_progress=False)
             for key, owner in owners.items():
+                if key[1] == 'block':
+                    for operation in owner[0].proposals:
+                        operation.functional(session=None, dynamic_inputs=True)
+                    owner[0].functional = True
                 call = compile_forward(owner[0])
                 call()
                 torch.cuda.synchronize()

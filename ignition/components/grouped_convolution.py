@@ -36,7 +36,8 @@ def _convolve(X, Delta, Base, Y, N: tl.constexpr, H: tl.constexpr, GROUP: tl.con
 
 
 class PreparedGroupedConvolution:
-    def __init__(self, source, weights, *, block_size, group_size, session, name, buffers, token_capacity=None):
+    def __init__(self, source, weights, *, block_size, group_size, session, name, buffers, token_capacity=None,
+                 runtime=None, coordinator=None):
         self.block_size, self.group_size = block_size, group_size
         self.base, self.tokens, self.hidden = weights["base"], *source.shape
         capacity = self.tokens if token_capacity is None else token_capacity
@@ -52,18 +53,55 @@ class PreparedGroupedConvolution:
             if key not in buffers:
                 buffers[key] = torch.zeros((capacity, width), dtype=torch.bfloat16, device=source.device)
         self.coefficients, self.before, self.after = (buffers[k][:self.tokens] for k in ("coefficients", "before", "after"))
-        self.project = UnquantizedProjection(source, weights["projection"], self.coefficients,
-                                             session=session, name=name + ".coefficients")
+        self.gather = None
+        local = self.coefficients
+        if runtime is not None:
+            from .collectives import PreparedChunkedAllGather
 
-    def convolve(self, source, side, output):
+            if "local_coefficients" not in buffers:
+                buffers["local_coefficients"] = torch.zeros((capacity, channels // runtime.world_size),
+                                                            dtype=source.dtype, device=source.device)
+            local = buffers["local_coefficients"][:self.tokens]
+            self.gather = PreparedChunkedAllGather(local, self.coefficients, runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".gather")
+        self.project = UnquantizedProjection(source, weights["projection"], local,
+                                             session=session, name=name + ".coefficients")
+        self._functional_layout = None
+
+    def functional(self, *, session):
+        """Return convolution outputs as local values while retaining weights and its prepared plan."""
+        if self._functional_layout is None:
+            self._functional_layout = (tuple(self.coefficients.shape), self.coefficients.stride(),
+                                       self.coefficients.dtype, tuple(self.before.shape), self.before.stride(),
+                                       self.before.dtype)
+            self.project.functional(session=session)
+            if self.gather is not None:
+                self.gather.functional(session=session)
+            self.coefficients = self.before = self.after = None
+        return self
+
+    def convolve(self, source, side, output=None, coefficients=None):
+        functional = self._functional_layout is not None
+        coefficients = self.coefficients if coefficients is None else coefficients
+        if output is None:
+            if functional:
+                _, _, _, shape, stride, dtype = self._functional_layout
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            else:
+                output = self.before if side == 0 else self.after
+        tokens = source.shape[0]
         torch.library.wrap_triton(_convolve)[(triton.cdiv(source.numel(), 256),)](
-            source, self.coefficients, self.base, output, self.tokens, self.hidden, self.group_size,
-            self.block_size, self.taps, self.coefficients.stride(0), side, 256)
+            source, coefficients, self.base, output, tokens, self.hidden, self.group_size,
+            self.block_size, self.taps, coefficients.stride(0), side, 256)
         return output
 
     def prepare(self, source):
-        self.project(source)
-        return self.convolve(source, 0, self.before)
+        local = self.project(source)
+        coefficients = local if self.gather is None else self.gather(local)
+        before = self.convolve(source, 0, coefficients=coefficients)
+        return (before, coefficients) if self._functional_layout is not None else before
 
-    def finish(self, source):
-        return self.convolve(source, 1, self.after)
+    def finish(self, source, coefficients=None):
+        if self._functional_layout is None:
+            return self.convolve(source, 1, self.after)
+        return self.convolve(source, 1, coefficients=coefficients)

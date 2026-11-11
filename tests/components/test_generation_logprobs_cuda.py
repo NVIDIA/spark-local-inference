@@ -306,8 +306,7 @@ def test_mixed_output_merge_preserves_the_inactive_frame_during_capture(compiled
     from ignition.components.completion import CompletionOutputs
     from ignition.preparation.compilation import compile_forward
     outputs = CompletionOutputs.allocate((2, 4, 32), device='cuda')
-    cursor = outputs.private_storage.cursor()
-    prompt, decode = outputs.private(cursor), outputs.private(cursor)
+    prompt, decode = outputs.private(), outputs.private()
     prompt.records.fill_(11)
     prompt.logprobs.fill_(12)
     prompt.speculative_survival.fill_(.875)
@@ -484,14 +483,12 @@ def test_packed_columns_beyond_a_short_request_never_read_another_requests_logit
 
 @pytest.mark.parametrize('compiled', [False, True])
 @pytest.mark.parametrize('count', [0, 128])
-def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits(compiled, count):
+def test_verification_reports_raw_target_logits_with_local_filtering_scratch(compiled, count):
     from ignition.components.completion import CompletionOutputs
-    from ignition.components.parallel_draft import prepare_sampling_scratch
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
     from ignition.components.speculation import (PreparedSpeculativeDistributions,
         PreparedStochasticVerification, PreparedSpeculativeCommit, SpeculativeRngState)
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool
     device = 'cuda'
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     state.admit(2, RequestAdmission(9, 42, top_k=1, max_new_tokens=20), [1, 2], consumed_tokens=2)
@@ -504,17 +501,14 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     slots = torch.tensor([2], dtype=torch.int32, device=device)
     epochs = torch.tensor([9], dtype=torch.int64, device=device)
     live = torch.tensor([1], dtype=torch.int32, device=device)
-    pool = GraphBufferPool(device)
-    scratch = prepare_sampling_scratch(1, 3, 4096, device, buffers=pool.cursor(), proposal=False)
-    target = PreparedSpeculativeDistributions(raw, state, slots, epochs, live, drafts, workspace=scratch['target'])
+    target = PreparedSpeculativeDistributions(raw, state, slots, epochs, live, drafts)
     target.prepare()
     probabilities = torch.zeros((1, 2, 4096), device=device)
     probabilities.scatter_(2, drafts[:, :, None], 1)
     rng = SpeculativeRngState.allocate(device)
     verify = PreparedStochasticVerification(probabilities, drafts, target.probabilities,
-        state, slots, epochs, live, rng=rng, target_valid=target.valid, workspace=scratch['verify'])
+        state, slots, epochs, live, rng=rng, target_valid=target.valid)
     verify.prepare()
-    assert target.scores.data_ptr() == verify.safe_draft_probs.data_ptr()
     outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     outputs.requested[2] = 1
     ids = list(reversed(range(count)))
@@ -525,11 +519,19 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
         outputs, frame, sequence, logits=raw, rng=rng)
     commit.prepare()
+    target.functional()
+    verify.functional()
+    commit.functional()
     restore = _snapshot(state)
     def forward():
-        target()
-        verify()
-        commit()
+        target_scratch = {name: torch.empty(shape, dtype=dtype, device=raw.device)
+                          for name, (shape, dtype) in target.layout.items()}
+        verify_scratch = {name: torch.empty(shape, dtype=dtype, device=raw.device)
+                          for name, (shape, dtype) in verify.layout.items()}
+        target.run(target_scratch, raw, candidates=drafts)
+        acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
+            target_scratch["valid"], drafts=drafts, draft_valid=torch.ones_like(drafts, dtype=torch.bool), disjoint=True)
+        commit(raw, acceptance=acceptance, inputs=inputs)
     call = compile_forward(forward) if compiled else forward
     restore()
     graph = torch.cuda.CUDAGraph()

@@ -440,6 +440,8 @@ impl ModelRuntime {
     /// # Safety
     /// The caller retains every prepared graph/context/allocation until close
     /// confirms drain, and grants this runtime exclusive graph mutation access.
+    /// Startup errors do not confirm drain; retain owners conservatively on error,
+    /// or use `start_retaining_drain` to inspect explicit startup drain status.
     pub unsafe fn start(
         manifest: ExecutionManifest,
         config: ModelConfig,
@@ -449,6 +451,23 @@ impl ModelRuntime {
         peers: Option<crate::execution::RankPeers>,
         policy: crate::scheduler::PolicyConfig,
     ) -> Result<Self> {
+        unsafe { Self::start_retaining_drain(manifest, config, queue_capacity, event_capacity, frontend, peers, policy, true) }
+            .map_err(|failure| failure.message)
+    }
+
+    /// # Safety
+    /// Prepared resources remain exclusive and retained until confirmed drain,
+    /// including when startup returns a failure with `drained` set to false.
+    pub unsafe fn start_retaining_drain(
+        manifest: ExecutionManifest,
+        config: ModelConfig,
+        queue_capacity: usize,
+        event_capacity: usize,
+        frontend: Arc<crate::frontend::Frontend>,
+        peers: Option<crate::execution::RankPeers>,
+        policy: crate::scheduler::PolicyConfig,
+        log_to_stderr: bool,
+    ) -> std::result::Result<Self, super::StartFailure> {
         crate::model::catalog::validate(&config, &manifest)?;
         super::observation::initialize_clock();
         if queue_capacity == 0 || queue_capacity > 1024 || !(2..=4096).contains(&event_capacity) {
@@ -612,7 +631,7 @@ impl ModelRuntime {
                         if let Some(warning) =
                             prepared.intake_warning(worker_config.limits.max_active)
                         {
-                            eprintln!("warning: {warning}");
+                            if log_to_stderr { eprintln!("warning: {warning}"); }
                         }
                         crate::offload::open(prepared)
                     })
@@ -693,16 +712,20 @@ impl ModelRuntime {
                 metrics,
             }),
             result => {
-                let returned = thread.join().ok().and_then(|shutdown| shutdown.error);
-                Err(match result {
+                let shutdown = thread.join().unwrap_or_else(|_| Shutdown {
+                    drained: false,
+                    error: Some(Error::execution(ExecutionError::Worker, "model thread panicked before readiness")),
+                });
+                let message = match result {
                     Ok(Err(error)) => error,
                     Err(disconnected) => super::readiness_failure(
                         "model worker exited before readiness",
                         disconnected,
-                        returned,
+                        shutdown.error,
                     ),
                     Ok(Ok(())) => unreachable!("ready success handled above"),
-                })
+                };
+                Err(super::StartFailure { message, drained: shutdown.drained })
             }
         }
     }
@@ -1279,7 +1302,7 @@ impl<'a> Worker<'a> {
                 continue;
             }
             if incoming.prompt.logprobs && self.config.max_top_logprobs == 0 {
-                incoming.reject_admission("logprobs are not available in this model package".into());
+                incoming.reject_admission("logprobs are not available in this model core".into());
                 continue;
             }
             let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
@@ -2201,6 +2224,12 @@ impl<'a> Worker<'a> {
                 StoreEvent::Stored {
                     checkpoint, result, ..
                 } => {
+                    if let Err(error) = &result {
+                        eprintln!(
+                            "HOST_CACHE_STORE_ERROR checkpoint={} error={error}",
+                            checkpoint.value()
+                        );
+                    }
                     self.metrics.host_retry_abandoned[5]
                         .fetch_add(u64::from(result.is_err()), Ordering::Relaxed);
                     self.scheduler.unpin_checkpoint(checkpoint)?;
@@ -2281,6 +2310,12 @@ impl<'a> Worker<'a> {
         for publication in publications {
             progress = true;
             let outcome = store.store(&publication);
+            if let Err(error) = &outcome {
+                eprintln!(
+                    "HOST_CACHE_STORE_SUBMIT_ERROR checkpoint={} error={error}",
+                    publication.id.value()
+                );
+            }
             if let Ok(outcome) = outcome {
                 self.metrics.host_store_outcome(outcome);
                 match outcome {
@@ -3700,5 +3735,5 @@ mod tests {
 #[path = "runtime/phase_tests.rs"]
 mod phase_tests;
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod prompt_tests;

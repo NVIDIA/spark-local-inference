@@ -10,9 +10,16 @@ import torch
 import triton
 import triton.language as tl
 
+from ignition.preparation.persistent import persistent_empty
+
 from .capacity import BATCH_CAPACITIES
 from .sampling import _check_tensor, _compile
 from .state import StateStorage
+
+
+def _pointer_table(values, device):
+    table = persistent_empty((len(values), 2), torch.int64, device)
+    return table.copy_(torch.tensor(values, dtype=torch.int64, device="cpu"))
 
 
 @dataclass(frozen=True)
@@ -234,7 +241,10 @@ class PreparedStateTransfer:
         if consumed.shape != (pool.backing.shape[0], 1) or consumed.dtype != torch.int64:
             raise ValueError("state rows require one int64 consumed endpoint")
         self.state_rows = state_rows
-        self.pool, self.commands, self.tables, self.pages = pool, commands, tables, tuple(pages)
+        excluded_regions = tuple(excluded_regions)
+        excluded = set(excluded_regions)
+        self.pool, self.commands, self.tables = pool, commands, tables
+        self.pages = tuple((name, cache) for name, cache in pages if name not in excluded)
         groups, page_count = defaultdict(list), None
         names = set()
         for name, cache in self.pages:
@@ -249,7 +259,7 @@ class PreparedStateTransfer:
             groups[region.nbytes].append((cache.data_ptr(), region.offset))
         if page_count is None:
             raise ValueError("state transfer requires physical KV page bindings")
-        trailing_pages = tuple(trailing_pages)
+        trailing_pages = tuple((name, cache) for name, cache in trailing_pages if name not in excluded)
         self.trailing_tables = trailing_tables
         trailing_groups = defaultdict(list)
         if trailing_pages:
@@ -260,10 +270,9 @@ class PreparedStateTransfer:
                     raise ValueError("shifted draft pages require two saved pages per cache plane")
                 _check_tensor(cache, cache.shape, torch.uint8, device, name)
                 names.add(name)
-                trailing_groups[cache.shape[1]].append((cache.data_ptr(), region.offset))
-        self.trailing_pointers = {size: torch.tensor(values, dtype=torch.int64, device=device)
-                                 for size, values in trailing_groups.items()}
-        self.pointers = {size: torch.tensor(values, dtype=torch.int64, device=device) for size, values in groups.items()}
+                trailing_groups[region.nbytes].append((cache.data_ptr(), region.offset))
+        self.trailing_pointers = {size: _pointer_table(values, device) for size, values in trailing_groups.items()}
+        self.pointers = {size: _pointer_table(values, device) for size, values in groups.items()}
         c = commands
         self.validate_args = (c.source_slots, c.destination_slots, c.operation, c.expected_consumed, c.num_ops,
             c.errors, consumed, tables, c.request_slots, state_rows, requests.consumed_tokens, requests.consumed_tokens.stride(0), pool.memory_capacity, consumed.stride(0), tables.shape[1], page_tokens, self.capacity)

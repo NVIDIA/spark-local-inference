@@ -14,6 +14,7 @@ class BenchmarkSelection:
     prefill_chunk: int = 0
     speculation_study: bool = False
     study_widths: tuple[int, ...] = ()
+    verification_prefixes: tuple[int, ...] = ()
 
     def __post_init__(self):
         for name, values in (("batches", self.batches), ("contexts", self.contexts)):
@@ -21,8 +22,8 @@ class BenchmarkSelection:
                 raise ValueError(f"benchmark {name} must be a nonempty tuple of integers")
             if tuple(sorted(set(values))) != values:
                 raise ValueError(f"benchmark {name} must be distinct and increasing")
-        if any(batch not in (1, 2, 4) for batch in self.batches):
-            raise ValueError("benchmark batches must be selected from 1, 2, 4")
+        if any(batch not in (1, 2, 4, 8) for batch in self.batches):
+            raise ValueError("benchmark batches must be selected from 1, 2, 4, 8")
         if type(self.prefill_chunk) is not int or self.prefill_chunk < 0 or self.prefill_chunk % 128:
             raise ValueError("benchmark prefill chunk must be zero or a positive multiple of 128")
         if self.prefill_chunk and self.batches != (1,):
@@ -40,6 +41,17 @@ class BenchmarkSelection:
                     or any(type(w) is not int or w not in (8, 13, 16) for w in self.study_widths)
                     or self.width != max(self.study_widths)):
                 raise ValueError("study widths must be increasing distinct widths in 8,13,16 with width equal to their maximum")
+        if self.verification_prefixes:
+            if (self.speculation_study or self.prefill_chunk or self.batches != (1,)
+                    or not isinstance(self.verification_prefixes, tuple)
+                    or tuple(sorted(set(self.verification_prefixes))) != self.verification_prefixes
+                    or any(type(w) is not int or not 1 <= w <= self.width for w in self.verification_prefixes)):
+                raise ValueError("verification prefixes require batch one and distinct increasing prefixes within the prepared width")
+
+    @property
+    def selected_verification_widths(self):
+        return tuple(sorted({1 if prefix == 1 else self.width
+                            for prefix in self.verification_prefixes or (self.width,)}))
 
     @property
     def selected_study_widths(self):
@@ -57,7 +69,8 @@ class BenchmarkSelection:
     def speculative_round_shapes(self):
         if self.prefill_chunk:
             return ()
-        return tuple((batch, self.width, batch * self.width) for batch in self.batches)
+        return tuple((batch, 1 if prefix == 1 else self.width, batch * prefix)
+                     for batch in self.batches for prefix in self.verification_prefixes or (self.width,))
 
     @property
     def required_context(self):
@@ -77,4 +90,5 @@ class BenchmarkSelection:
     def to_dict(self):
         return dict(batches=self.batches, contexts=self.contexts, width=self.width,
                     prefill_chunk=self.prefill_chunk, speculation_study=self.speculation_study, study_widths=self.selected_study_widths,
+                    verification_prefixes=self.verification_prefixes,
                     speculative_round_shapes=self.speculative_round_shapes)

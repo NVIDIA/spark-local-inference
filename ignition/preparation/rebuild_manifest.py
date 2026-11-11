@@ -21,7 +21,7 @@ from types import MappingProxyType
 import math
 import re
 
-from . import runtime_package_pb2 as proto
+from . import runtime_core_pb2 as proto
 
 STABLE = 'stable'
 TUNED = 'tuned'
@@ -221,7 +221,7 @@ def from_plan(model, plan, *, compiled_forwards):
         image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
+        online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
         collective_tuning=plan.collective_tuning)
     if plan.collective_ladder is not None:
@@ -238,6 +238,7 @@ def from_plan(model, plan, *, compiled_forwards):
         result['joint_tuning'] = True
     if (s := plan.speculation) is not None:
         result['speculation'] = dict(draft_tokens=s.draft_tokens,
+            mtp_only=s.mtp_only,
             adaptive=s.adaptive,
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
             draft_prefix_selection=s.draft_prefix_selection,

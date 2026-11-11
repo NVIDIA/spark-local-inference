@@ -4,7 +4,7 @@
 """Dense Qwen text inputs, recurrent continuations, and paged attention storage."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .config import PAGE_TOKENS
 

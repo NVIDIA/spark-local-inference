@@ -9,6 +9,9 @@ import json
 import math
 import random
 import statistics
+import struct
+
+from .executor import BenchmarkExecutor
 
 
 @dataclass(frozen=True)
@@ -19,9 +22,10 @@ class BenchmarkCase:
     context_tokens: int
 
     def __post_init__(self):
-        if (self.batch not in (1, 2, 4) or self.width not in (8, 16)
-                or self.packed_tokens != self.batch * self.width or self.context_tokens <= 0):
-            raise ValueError("round benchmark requires B=1,2,4, W=8,16, P=B*W and positive context")
+        if (self.batch not in (1, 2, 4, 8) or type(self.width) is not int or not 1 <= self.width <= 16
+                or not self.batch <= self.packed_tokens <= self.batch * self.width
+                or self.packed_tokens % self.batch or self.context_tokens <= 0):
+            raise ValueError("round benchmark requires B=1,2,4,8, W=1 through 16, equal positive prefixes within W and positive context")
 
 
 @dataclass(frozen=True)
@@ -86,35 +90,6 @@ def prompt_tokens(tokenizer, length, *, seed, lane):
         if not tokens:
             raise ValueError("checkpoint tokenizer produced an empty benchmark prompt")
     return tokens[:length]
-
-
-class StateSnapshot:
-    """Same-device copies of explicitly declared persistent tensors, outside replay timing."""
-
-    def __init__(self, tensors, stream):
-        import torch
-
-        self.entries = {}
-        seen = set()
-        with torch.cuda.stream(stream), torch.no_grad():
-            for name, tensor in tensors.items():
-                if tensor.device.type != "cuda":
-                    raise ValueError(f"benchmark state {name} must be a CUDA tensor")
-                key = (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-                if key in seen:
-                    continue
-                seen.add(key)
-                saved = torch.empty_like(tensor)
-                saved.copy_(tensor, non_blocking=True)
-                self.entries[name] = (tensor, saved)
-        stream.synchronize()
-
-    def restore(self, stream):
-        import torch
-
-        with torch.cuda.stream(stream), torch.no_grad():
-            for tensor, saved in self.entries.values():
-                tensor.copy_(saved, non_blocking=True)
 
 
 def _message(scheduler, step):
@@ -200,7 +175,7 @@ def _round(scheduler, case):
     if len(matches) != 1:
         raise ValueError(f"prepared catalog must contain exactly one complete round for {case}")
     shape, graph = matches[0]
-    lanes = [Lane(request, request.consumed, case.width) for request in scheduler.active]
+    lanes = [Lane(request, request.consumed, case.packed_tokens // case.batch) for request in scheduler.active]
     return scheduler._commit(Step("speculative", graph, case.batch, case.width, lanes, 0,
                                   packed_tokens=case.packed_tokens, draft_tokens=shape[4]))
 
@@ -233,48 +208,111 @@ def _check_request_state(model, step, records):
             raise RuntimeError(f"request {request.ident} device state disagrees with graph completion")
 
 
-def _check_metadata(model, step, case):
+def _proposal_counters(forward, step):
+    owner = forward.owner
+    return [(int(owner.generation[lane.request.slot].item()),
+             int(owner.offset[lane.request.slot].item())) for lane in step.lanes]
+
+
+def _bound_observations(model, step, case):
     if isinstance(case, PrefillCase):
-        metadata = model.benchmark_prefills[step.graph]
-        if (metadata.live_counts.cpu().tolist() != [case.chunk_tokens, 1]
-                or metadata.starts.cpu().tolist() != [case.context_tokens]
-                or metadata.lengths.cpu().tolist() != [case.chunk_tokens]
-                or metadata.query_start_loc.cpu().tolist() != [0, case.chunk_tokens]):
+        metadata = (("target", model.benchmark_prefills[step.graph]),)
+        forward = None
+    else:
+        forward = model.benchmark_rounds[step.graph]
+        metadata = (("target", forward.metadata),)
+        if forward.draft is not None:
+            metadata += (("draft", forward.draft_metadata),)
+    observations = {f"{role}.{name}": getattr(value, name) for role, value in metadata
+                    for name in ("live_counts", "starts", "lengths", "query_start_loc")}
+    if forward is not None and len(forward.operations) >= 4 and forward.operations[3] is not None:
+        _, _, verification, commit = forward.operations
+        observations.update({f"acceptance.{name}": getattr(verification.output, name) for name in
+                             ("offered_drafts", "accepted_drafts", "survival", "valid")})
+        observations.update({f"commit.{name}": getattr(commit, name) for name in
+                             ("accepted_drafts", "emitted_count", "emitted_ids")})
+    return observations
+
+
+def _upload_step(runner, message):
+    from ignition.direct.executor import _RESERVED
+
+    name = message["graph"]
+    allowed = runner.inputs.get(name)
+    if allowed is None:
+        raise ValueError(f"observation names unknown graph {name!r}")
+    for buffer, offset, data in message["uploads"]:
+        if buffer not in allowed or buffer in _RESERVED:
+            raise ValueError(f"graph {name} does not bind input {buffer}")
+        runner._upload(buffer, offset, data)
+    runner._upload("frame_index", 0, struct.pack("<i", message["frame"]))
+    runner._upload("submission_sequence", 0, struct.pack("<q", message["sequence"]))
+
+
+def _observe(runner, observer, message):
+    """Replay an untimed observation graph with the native graph's complete input uploads."""
+    import torch
+
+    with torch.cuda.stream(runner.stream), torch.no_grad():
+        _upload_step(runner, message)
+        observations = observer()
+    runner.stream.synchronize()
+    for runtime in runner.health:
+        runtime.check_health()
+    return observations
+
+
+def _check_metadata(model, step, case, observations=None, *, proposal_before=None):
+    if observations is None:
+        observations = _bound_observations(model, step, case)
+    if isinstance(case, PrefillCase):
+        if (observations["target.live_counts"].cpu().tolist() != [case.chunk_tokens, 1]
+                or observations["target.starts"].cpu().tolist() != [case.context_tokens]
+                or observations["target.lengths"].cpu().tolist() != [case.chunk_tokens]
+                or observations["target.query_start_loc"].cpu().tolist() != [0, case.chunk_tokens]):
             raise RuntimeError("prefill metadata does not describe the exact benchmark chunk")
         return
     forward = model.benchmark_rounds[step.graph]
-    for role, metadata, width in (("target", forward.metadata, case.width),
-                                  ("draft", forward.draft_metadata, forward.draft_inputs.shape[1])):
+    roles = [("target", case.packed_tokens // case.batch)]
+    if "draft.live_counts" in observations:
+        draft_inputs = getattr(forward, "draft_inputs", None)
+        roles.append(("draft", draft_inputs.shape[1] if draft_inputs is not None else forward.owner.block_size))
+    for role, width in roles:
         expected_starts = [case.context_tokens] * case.batch
         expected_lengths = [width] * case.batch
         expected_offsets = [row * width for row in range(case.batch + 1)]
-        if (metadata.live_counts.cpu().tolist() != [case.batch * width, case.batch]
-                or metadata.starts.cpu().tolist() != expected_starts
-                or metadata.lengths.cpu().tolist() != expected_lengths
-                or metadata.query_start_loc.cpu().tolist() != expected_offsets):
+        if (observations[f"{role}.live_counts"].cpu().tolist() != [case.batch * width, case.batch]
+                or observations[f"{role}.starts"].cpu().tolist() != expected_starts
+                or observations[f"{role}.lengths"].cpu().tolist() != expected_lengths
+                or observations[f"{role}.query_start_loc"].cpu().tolist() != expected_offsets):
             raise RuntimeError(f"{role} metadata does not describe the complete benchmark round")
+    _check_sampling_rng(forward, step, proposal_before)
+
+
+def _check_sampling_rng(forward, step, proposal_before=None):
     owner = forward.owner
     verification = forward.operations[2]
+    if forward.draft is None and proposal_before is not None and _proposal_counters(forward, step) != proposal_before:
+        raise RuntimeError("a round without proposals changed draft RNG state")
     for lane in step.lanes:
         slot, generation = lane.request.slot, lane.request.generation
-        if (int(owner.generation[slot].item()) != generation
-                or int(owner.offset[slot].item()) != 4 * step.draft_tokens
-                or int(owner.rng.generation[slot].item()) != generation
+        if forward.draft is not None and (int(owner.generation[slot].item()) != generation
+                or int(owner.offset[slot].item()) != 4 * step.draft_tokens):
+            raise RuntimeError("proposal RNG did not consume its declared draw reservation")
+        if (int(owner.rng.generation[slot].item()) != generation
                 or int(owner.rng.target_offset[slot].item()) != verification.draw_reservation):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
 
-def acceptance_observation(forward):
+def acceptance_observation(observations):
     """Read one input/RNG draw; restored timing replays are not additional observations."""
-    _, _, verification, commit = forward.operations
-    acceptance = verification.output
-    offered = acceptance.offered_drafts.cpu().tolist()
-    accepted = acceptance.accepted_drafts.cpu().tolist()
-    committed = commit.accepted_drafts.cpu().tolist()
-    emitted = commit.emitted_count.cpu().tolist()
-    tokens = commit.emitted_ids.cpu().tolist()
-    survival = acceptance.survival.cpu().tolist()
-    valid = acceptance.valid.cpu().tolist()
+    offered = observations["acceptance.offered_drafts"].cpu().tolist()
+    accepted = observations["acceptance.accepted_drafts"].cpu().tolist()
+    committed = observations["commit.accepted_drafts"].cpu().tolist()
+    emitted = observations["commit.emitted_count"].cpu().tolist()
+    tokens = observations["commit.emitted_ids"].cpu().tolist()
+    survival = observations["acceptance.survival"].cpu().tolist()
+    valid = observations["acceptance.valid"].cpu().tolist()
     return dict(
         observations_per_request=1,
         survival_semantics="cumulative acceptance probability along the sampled proposal chain",
@@ -285,6 +323,26 @@ def acceptance_observation(forward):
                        proposal_survival=survival[row][:count])
                   for row, count in enumerate(offered)],
     )
+
+
+def _completion_observation(model, step, records, case):
+    """Read acceptance from captured completion when request limits cannot clip the chain."""
+    survival = model.buffers["completion_speculative_survival"][step.frame].cpu().tolist()
+    requests = []
+    for lane in step.lanes:
+        request = lane.request
+        slot = request.slot
+        record = records[slot]
+        emitted, offered, accepted = map(int, (record[8], record[9], record[10]))
+        remaining_before = request.max_new_tokens - len(request.generated) + emitted
+        if remaining_before < case.width or int(model.benchmark_requests.eos_count[slot].item()) != 0:
+            raise RuntimeError("benchmark completion cannot expose unclipped verification acceptance")
+        requests.append(dict(valid=int(record[5]) in (1, 2) and int(record[6]) == 0,
+            offered_draft_count=offered, accepted_draft_count=accepted,
+            committed_draft_count=accepted, emitted_count=emitted,
+            emitted_token_ids=record[16:16 + emitted].tolist(), proposal_survival=survival[slot][:offered]))
+    return dict(observations_per_request=1, observation_source="production_completion",
+        survival_semantics="cumulative acceptance probability along the sampled proposal chain", requests=requests)
 
 
 def measurement_result(cases, measurements, *, warmup, repetitions, seeds, status, failure=None):
@@ -310,13 +368,11 @@ def measurement_result(cases, measurements, *, warmup, repetitions, seeds, statu
     return result
 
 
-def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
+def run_benchmark(prepared, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
     """Measure captured graphs at a real prefix, restoring state before every replay."""
-    import torch
-
-    from ignition.direct.executor import StepRunner
     from ignition.direct.scheduler import Layout
 
+    model = getattr(prepared, "model", prepared)
     cases, seeds = tuple(scenarios), tuple(seeds)
     if not cases or not seeds or warmup < 1 or repetitions < 1:
         raise ValueError("benchmark needs cases, seeds, positive warmup and positive repetitions")
@@ -336,47 +392,77 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
         _round_shape = ("speculative", case.batch, case.width, case.packed_tokens)
         if sum(shape[:4] == _round_shape for shape in layout.packed_shapes) != 1:
             raise ValueError(f"benchmark case has no unique prepared round: {case}")
-    runner = StepRunner(model, eager=False)
+    runner = BenchmarkExecutor(prepared)
     measurements = [[] for _ in cases]
 
     def result(status, failure=None):
         return measurement_result(cases, measurements, warmup=warmup, repetitions=repetitions,
                                   seeds=seeds, status=status, failure=failure)
 
+    groups = {}
+    for index, case in enumerate(cases):
+        key = (case.batch, case.context_tokens, getattr(case, "chunk_tokens", 0))
+        groups.setdefault(key, []).append(index)
     generation = int(model.benchmark_requests.generation.max().item())
     try:
-        for case, samples in zip(cases, measurements):
+        for indices in groups.values():
+            setup = max((cases[index] for index in indices), key=lambda case: getattr(case, "width", 0))
             for seed in seeds:
-                times = []
-                samples.append(dict(seed=seed, times_ms=times))
                 generation += 1
-                baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
-                snapshot = StateSnapshot(model.benchmark_state, runner.stream)
-                for iteration in range(-1, warmup + repetitions):
-                    scheduler = deepcopy(baseline, {id(layout): layout})
-                    snapshot.restore(runner.stream)
-                    step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
-                    allocated = torch.cuda.memory_allocated(runner.device)
-                    elapsed = runner.run(_message(scheduler, step))
-                    if iteration >= warmup:
-                        times.append(elapsed / 1e6)
-                    if torch.cuda.memory_allocated(runner.device) != allocated:
-                        raise RuntimeError("captured benchmark replay changed allocated CUDA memory")
-                    records = _complete(model, runner, scheduler, step, elapsed)
-                    _check_request_state(model, step, records)
-                    if isinstance(case, PrefillCase) and any(
-                            lane.request.consumed != case.context_tokens + case.chunk_tokens
-                            or len(lane.request.generated) != 1 for lane in step.lanes):
-                        raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
-                    if iteration == -1:
-                        _check_metadata(model, step, case)
-                        if not isinstance(case, PrefillCase):
-                            samples[-1]["acceptance"] = acceptance_observation(model.benchmark_rounds[step.graph])
-                if progress is not None:
-                    progress(result("running"))
-                snapshot.restore(runner.stream)
-                runner.stream.synchronize()
-                del snapshot
+                baseline = _prefill(model, runner, layout, setup, tokenizer, seed, generation)
+                runner.snapshot()
+                for index in indices:
+                    case, samples = cases[index], measurements[index]
+                    times = []
+                    samples.append(dict(seed=seed, times_ms=times))
+                    observers = getattr(model, "benchmark_observers", None)
+                    if observers is not None:
+                        scheduler = deepcopy(baseline, {id(layout): layout})
+                        runner.restore()
+                        step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
+                        proposal_before = (None if isinstance(case, PrefillCase) else
+                                           _proposal_counters(model.benchmark_rounds[step.graph], step))
+                        observations = runner.observe(_message(scheduler, step))
+                        _check_metadata(model, step, case, observations, proposal_before=proposal_before)
+                        observed_records = _complete(model, runner, scheduler, step)
+                        _check_request_state(model, step, observed_records)
+                        del observations
+                    for iteration in range(-1, warmup + repetitions):
+                        scheduler = deepcopy(baseline, {id(layout): layout})
+                        runner.restore()
+                        step = _prefill_step(scheduler, case) if isinstance(case, PrefillCase) else _round(scheduler, case)
+                        proposal_before = (None if iteration != -1 or isinstance(case, PrefillCase) else
+                                           _proposal_counters(model.benchmark_rounds[step.graph], step))
+                        elapsed = runner.run(_message(scheduler, step))
+                        if iteration >= warmup:
+                            times.append(elapsed / 1e6)
+                        records = _complete(model, runner, scheduler, step, elapsed)
+                        _check_request_state(model, step, records)
+                        if isinstance(case, PrefillCase) and any(
+                                lane.request.consumed != case.context_tokens + case.chunk_tokens
+                                or len(lane.request.generated) != 1 for lane in step.lanes):
+                            raise RuntimeError("prefill replay did not consume the complete chunk and sample its pending token")
+                        if iteration == -1 and observers is None:
+                            observations = _bound_observations(model, step, case)
+                            _check_metadata(model, step, case, observations, proposal_before=proposal_before)
+                        if iteration == -1 and not isinstance(case, PrefillCase):
+                            forward = model.benchmark_rounds[step.graph]
+                            if observers is not None:
+                                _check_sampling_rng(forward, step, proposal_before)
+                                samples[-1]["acceptance"] = _completion_observation(model, step, records, case)
+                            else:
+                                samples[-1]["acceptance"] = acceptance_observation(observations)
+                            draft_inputs = getattr(forward, "draft_inputs", None)
+                            samples[-1]["draft_forward_tokens_per_request"] = (
+                                0 if forward.draft is None else
+                                draft_inputs.shape[1] if draft_inputs is not None else forward.owner.block_size)
+                            samples[-1]["draft_context_updated"] = forward.context is not None
+                            samples[-1]["proposal_tokens_per_request"] = step.draft_tokens
+                            samples[-1]["target_tokens_per_request"] = case.packed_tokens // case.batch
+                    if progress is not None:
+                        progress(result("running"))
+                runner.restore()
+                runner.release_snapshot()
     except BaseException as error:
         if progress is not None:
             try:

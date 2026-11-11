@@ -658,10 +658,10 @@ fn prepare_questions(
 ) -> Result<Vec<Prompt>> {
     let config = state.model.config();
     if config.logprob_token_id_capacity == 0 {
-        return Err("logprob_token_ids are not available in this model package; re-export to enable decision scoring".into());
+        return Err("logprob_token_ids are not available in this model core; re-export to enable decision scoring".into());
     }
     if !assets.is_empty() && state.images.is_none() {
-        return Err("image assets require a vision model package".into());
+        return Err("image assets require a vision model core".into());
     }
     let options = json!({"enable_thinking":false,"add_generation_prompt":true})
         .as_object()
@@ -673,7 +673,7 @@ fn prepare_questions(
     let mut used = HashSet::new();
     for question in questions {
         if question.options.len() > config.logprob_token_id_capacity {
-            return Err("question exceeds this package's requested-ID capacity".into());
+            return Err("question exceeds this core's requested-ID capacity".into());
         }
         let mut labels = candidates[..question.options.len()].to_vec();
         for pass in 0..2 {

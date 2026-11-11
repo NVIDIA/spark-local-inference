@@ -215,7 +215,7 @@ rank_group.dist = SimpleNamespace(
 )
 torch.cuda.set_device = lambda device: None
 sys.modules["ignition.preparation.module_images"] = SimpleNamespace(ModuleImages=nullcontext)
-sys.modules["ignition.preparation.package_storage"] = SimpleNamespace(PackageStorage=Storage)
+sys.modules["ignition.preparation.core_storage"] = SimpleNamespace(CoreStorage=Storage)
 connection = SimpleNamespace(close=lambda: cleanup("connection-close"))
 def prepare(*args, **kwargs):
     if mode == "tuning":

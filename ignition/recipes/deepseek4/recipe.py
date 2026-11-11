@@ -17,7 +17,7 @@ from ignition.recipes.declaration import (
 )
 
 def prepare(
-    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage=None
+    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None
 ):
     from ignition.preparation.rank_group import prepare_group
 
@@ -32,7 +32,8 @@ def prepare(
               "draft_head_quantization": speculation.draft_head_quantization,
               "markov_head_quantization": speculation.markov_head_quantization}
     )
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -49,7 +50,7 @@ def prepare(
         stream_overlap=plan.stream_overlap,
         **drafting,
     )
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage)
 
 
 def usage(prepared):

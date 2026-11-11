@@ -25,7 +25,7 @@ _SECTIONS = {
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
-    "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
+    "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
 _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
@@ -42,7 +42,7 @@ _BUILT_IN = {
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
-    "paths.package_cache": "~/.cache/flare/packages",
+    "paths.core_cache": "~/.cache/flare/cores",
     "paths.export_staging": "",
     "paths.prefix_cache": "",
     "paths.cuda": "",
@@ -83,6 +83,10 @@ class Configuration:
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
             raise UsageError(f"{resolved}: {error}") from error
         for section, table in values.items():
+            if section == "paths" and isinstance(table, dict) and "package_cache" in table:
+                if "core_cache" in table:
+                    raise UsageError(f"{resolved}: use only core_cache in [paths]; package_cache is its legacy alias")
+                table["core_cache"] = table.pop("package_cache")
             if section == "models" and isinstance(table, dict):
                 for alias, overrides in table.items():
                     cls._validate(resolved, f'models."{alias}"', overrides, _MODEL_KEYS)
@@ -136,6 +140,11 @@ class Configuration:
         section, name = key.split(".")
         if name in self.values.get(section, {}):
             return Setting(self.values[section][name], f"[{section}]")
+        if key == "paths.core_cache":
+            canonical = Path("~/.cache/flare/cores").expanduser()
+            legacy = canonical.with_name("packages")
+            if not canonical.exists() and legacy.is_dir():
+                return Setting(str(legacy), "default")
         return Setting(_BUILT_IN[key], "default")
 
     @property
@@ -191,8 +200,8 @@ class Configuration:
             "", "[paths]",
             f'# hub_cache = "{self.get("paths.hub_cache").value}"',
             f'# kernel_cache = "{self.get("paths.kernel_cache").value}"',
-            f'# package_cache = "{self.get("paths.package_cache").value}"',
-            '# export_staging = ""            # rank files an export assembles from; empty: beside the package',
+            f'# core_cache = "{self.get("paths.core_cache").value}"',
+            '# export_staging = ""            # rank files an export assembles from; empty: beside the core',
             '# cuda = "/opt/cuda"              # explicit CUDA toolkit directory for native builds',
         ]
         self.path.parent.mkdir(parents=True, exist_ok=True)

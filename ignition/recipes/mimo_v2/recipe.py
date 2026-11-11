@@ -10,14 +10,15 @@ from ignition.planning import HEADROOM_BYTES
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation
 
 
-def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage=None):
+def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_graph_budget": speculation.graph_budget or 64, "speculative_fixed_width": speculation.fixed_width}
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -27,7 +28,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
         dflash=speculation is not None, **drafting)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage)
 
 
 def usage(prepared):

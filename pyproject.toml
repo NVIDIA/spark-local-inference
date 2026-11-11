@@ -22,7 +22,7 @@ prepare = [
     "torch==2.14.1+cu132",
     "torchvision==0.29.1+cu132",
     "transformers[torch,vision,chat_template] @ git+https://github.com/huggingface/transformers.git@1d9654e78a23fb167ef539cbd699dfbd3e4830cf",
-    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@1f8ed8a3c46e27d03cff54e08f23e9bc50476d57",
+    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@7b35510bba1bf3540431ed934035291e858683ac",
     "cuda-python==13.3.1",
     "cuda-tile[tileiras]==1.6.0",
     "safetensors==0.8.0",
@@ -31,7 +31,7 @@ prepare = [
     "accelerate==1.14.0",
     "Pillow==12.3.0",
     "flare-heliopause",
-    "protobuf>=7.35.1,<8",
+    "protobuf>=7.36.2,<8",
     "rich>=13",
 ]
 
@@ -50,11 +50,11 @@ include = ["ignition*"]
 
 [tool.setuptools.package-data]
 "ignition.preparation" = ["ladders/*.json"]
-"ignition.patches" = ["*.patch"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
 "ignition.recipes.gemma4" = ["assets/*"]
 "ignition.recipes.kimi3" = ["assets/*"]
+"ignition.recipes.kimi31" = ["assets/*"]
 "ignition.recipes.glm53" = ["assets/*"]
 "ignition.recipes.mimo_v2" = ["assets/*"]
 "ignition.recipes.nemotron_h" = ["assets/*"]

@@ -49,7 +49,8 @@ selene --name pool --root /var/lib/selene --memory 16G --nvme 1T --staging 1G \
   port as you publish the first.
 - `--tls-cert` and `--tls-key` give the manager a TLS identity. Instances select
   the matching connection mode from the address table above.
-- Keep the key out of the image and mount it read-only (`deploy/compose-network.yaml`).
+- Keep the key out of the image and mount it read-only
+  ([`deploy/compose-network.yaml`](../deploy/compose-network.yaml)).
   The compose example publishes control port 9200 and data port 9201, and uses the host PID
   namespace so peer-process checks can see local instances.
 
@@ -59,7 +60,7 @@ level 5 (remote NVMe), as [protocol decision 4](../PROTOCOL.md#decisions) specif
 
 ## The data channel
 
-Hello, sessions, notices, resync, lookup, and disk-recovery readiness work over the network
+Hello, sessions, notices, resync, lookup, and readiness work over the network
 listener exactly as on the Unix socket. An instance without shared memory moves record bytes on
 the **data channel**: a `Claim` or `PutBegin` in mode `DATA_CHANNEL` is granted a single-use token
 and the data listener's address instead of windows. The instance connects (with TLS when the
@@ -74,8 +75,8 @@ manager has a certificate), presents the token and says which carrier moves the 
   window. A commit that reaches the session before the last fill reaches the channel waits for it.
 - **Fencing**: a transfer's windows go back to the store only after its handler has exited and
   its connection is closed (RDMA: its queue pair moved to the error state and destroyed). A stopped handler
-  retains its windows until its exit is observed; readiness `quarantined_bytes` includes these
-  windows while the handler is draining. A remote instance
+  retains its windows until its exit is observed; the `selene_pool_quarantined_bytes` metric
+  includes these windows while the handler is draining. A remote instance
   never touches the manager's windows, so its own exit is not waited for.
 - **Limits**: a transfer that makes no progress for the claim's progress timeout (3 s by
   default) expires; a socket that stalls for 20 s fails. The metrics carry
@@ -101,13 +102,13 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
   -days 3650 -extfile server.ext -out server.pem
 ```
 
-Hand `ca.pem` to the instances (their pool CA setting) unless the host already trusts the CA,
+Hand `ca.pem` to the instances (`--prefix-cache-pool-ca`) unless the host already trusts the CA,
 and `server.pem` and `server-key.pem` to the manager.
 
 ## RDMA (experimental)
 
 The default build and image never link libibverbs. Build with `--features rdma` (or use
-`Dockerfile.rdma`) and start with `--rdma`; the
+[`Dockerfile.rdma`](../Dockerfile.rdma)) and start with `--rdma`, which requires `--listen`; the
 [startup warnings and TLS restriction](#addresses-and-startup-warnings) apply. The container needs
 `--device /dev/infiniband` and `--ulimit memlock=-1:-1`. The manager opens the first device with
 an active port and registers its regions once for local access only; `--rdma` on a host with none
@@ -117,7 +118,8 @@ only its private transfer staging, so it cannot use RDMA to address the manager 
 The manager does every RDMA transfer, one-sided, on a queue pair made for the transfer: it writes
 unsliced claim windows into private slots the instance lends (`CREDIT`). Puts and rank legs
 use TCP. The instance must be built with the
-`rdma` feature and have a device; otherwise, or after one RDMA transfer fails, it asks for the
+`rdma` feature (`flare-cli`'s `rdma` feature enables it in `flare-selene`) and have a device;
+otherwise, or after one RDMA transfer fails, it asks for the
 stream carrier on its connection, so a mixed pool works. Each end advertises a RoCE v2 GID, preferring
 a routable (IPv4-mapped or global) one over a link-local one, because two ends must use the same RoCE
 version and a device's GID index 0 is v1 on some NICs and v2 on others (Soft-RoCE); the path MTU is
@@ -138,6 +140,6 @@ ibv_devices                                    # rxe0 should appear
 | Remote instances run on local tiers only | The address and firewall; whether the instance trusts the manager's CA (the host's CA bundle or its CA file), and the one-line error it logged at start; `Hello.encryption`. |
 | `DATA_CHANNEL` claims or puts refused | The manager has no network listener (`INVALID_CLAIM`, or `PutRefused{INVALID}` saying so). |
 | Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
-| Windows quarantined (`quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs the claim. They return if the exit is seen, else at restart. |
+| Windows quarantined (`selene_pool_quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs a line only when an RDMA teardown failed (`RDMA teardown failed; transfer quarantined`). They return if the exit is seen, else at restart. |
 | TLS handshake failures | The certificate's SAN against the name clients dial; that the CA the clients hold signed the server certificate. |
-| `--rdma` refused | TLS options present, or a build without the `rdma` feature. |
+| `--rdma` refused | TLS options present, no `--listen`, a build without the `rdma` feature, or no RDMA device with an active port. |

@@ -4,6 +4,7 @@
 
 """Collective preparation cannot launch ahead of a peer or mismatched declaration."""
 
+import multiprocessing
 from types import SimpleNamespace
 
 import pytest
@@ -156,6 +157,17 @@ def test_finished_rank_keeps_participating_until_peers_finish(monkeypatch):
     assert len(advances) == 1 and len(exchanges) == 3
 
 
+def test_reconciliation_supplies_selected_configs_to_preparation_job(monkeypatch):
+    owner = coordinator(monkeypatch)
+    configs, calls = {object(): object()}, []
+    done = SimpleNamespace(done=True, ready_cache=None, ready_tuning=(), ready_collective_tuning=None,
+                           ready_collectives=())
+    job = SimpleNamespace(advance=lambda **kwargs: done, result=lambda: "prepared")
+    session = SimpleNamespace(begin=lambda requests, **kwargs: calls.append(kwargs) or job)
+    assert owner.prepare(session, (), autotune=False, selected_configs=configs) == "prepared"
+    assert calls == [{"autotune": False, "selected_configs": configs}]
+
+
 def test_mixed_job_authorizes_collective_only_after_every_rank_is_ready(monkeypatch):
     owner = coordinator(monkeypatch)
     ready = progress()
@@ -290,14 +302,80 @@ def test_sharded_finalists_preserve_empty_shards_and_rank_order():
 
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
     owner = coordinator(monkeypatch)
+    monkeypatch.setattr(dist, "get_rank", lambda: 4)
+
+    def broadcast(values, *, src, group):
+        assert src == 4 and group is owner.group
+        assert len(values) == 1
+
+    def reduce(matching, *, op, group):
+        import torch
+
+        assert group is owner.group and op == dist.ReduceOp.MIN
+        assert matching.device.type == "cpu" and matching.dtype == torch.int32
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(dist, "all_reduce", reduce)
     assert owner.same_on_every_rank("NVIDIA GB10")
-    monkeypatch.setattr(dist, "all_gather_object",
-                        lambda states, value, **kwargs: states.__setitem__(slice(None), [value, "NVIDIA GB300"]))
+    monkeypatch.setattr(dist, "all_reduce", lambda matching, **kwargs: matching.fill_(0))
     assert not owner.same_on_every_rank("NVIDIA GB10")
 
 
+def _equality_rank(rank, world, store, outcome):
+    from datetime import timedelta
+    import traceback
+
+    import torch
+
+    try:
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank,
+                                world_size=world, timeout=timedelta(seconds=15))
+        owner = CollectivePreparation(dist.group.WORLD)
+        catalog = ("NVIDIA GB202", (("projection", {"shape": (64, 128), "dtype": "bf16"}, ()),))
+        changed = ("NVIDIA GB202", (("projection", {"shape": (65, 128), "dtype": "bf16"}, ()),))
+        results = (owner.same_on_every_rank(catalog),
+                   owner.same_on_every_rank(changed if rank == world - 1 else catalog),
+                   owner.same_on_every_rank(False))
+        group = dist.new_group(ranks=[1, 2], backend="gloo", timeout=timedelta(seconds=15))
+        subgroup = None
+        if rank in (1, 2):
+            owner = CollectivePreparation(group)
+            subgroup = (owner.same_on_every_rank(catalog),
+                        owner.same_on_every_rank(changed if rank == 2 else catalog))
+        assert not torch.cuda.is_initialized()
+        outcome.put((rank, (*results, subgroup)))
+    except BaseException:
+        outcome.put((rank, traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_gloo_value_agreement_reaches_every_rank_and_subgroup(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    world = 3
+    outcome = context.Queue()
+    processes = [context.Process(target=_equality_rank,
+        args=(rank, world, tmp_path / "store", outcome)) for rank in range(world)]
+    for process in processes:
+        process.start()
+    try:
+        results = dict(outcome.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        assert results == {0: (True, False, True, None),
+                           1: (True, False, True, (True, False)),
+                           2: (True, False, True, (True, False))}
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+
 @pytest.mark.parametrize("ring", [False, True])
-def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, ring):
+def test_roce_setup_preserves_routing_and_core_transport_owner(monkeypatch, ring):
     import sys
     from ignition.preparation.collectives import create_roce_runtime
 
@@ -308,7 +386,7 @@ def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, r
     monkeypatch.setitem(sys.modules, "b12x.comm", SimpleNamespace(roce=SimpleNamespace(AllReduce=Runtime)))
     storage = SimpleNamespace(transports=[])
     runtime = create_roce_runtime(object(), "cuda:0", max_tokens=32, pipe_tokens=4096,
-                                  hidden_size=4096, gather_bytes=4096, ring=ring, package_storage=storage)
+                                  hidden_size=4096, gather_bytes=4096, ring=ring, core_storage=storage)
     assert runtime.ring is ring and storage.transports == [runtime]
     assert runtime.options["max_size"] == 2 << 20
     assert runtime.options["pipe_bytes"] == 4096 * 4096 * 2

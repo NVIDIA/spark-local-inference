@@ -141,7 +141,7 @@ fn retain(prepared: &mut Prepared, agreed: &HashMap<PrefixKey, bool>) -> Result<
 fn mirrored(prepared: &Prepared) -> Result<bool> {
     if prepared.warm_bytes != 0 {
         return Err(invalid(
-            "a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0",
+            "a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0",
         ));
     }
     Ok(prepared.directory_lock.is_some())
@@ -227,7 +227,7 @@ pub fn join_rank_zero(
                 && peer_layout != layout
             {
                 return Err(invalid(format!(
-                    "rank {} describes a different cache layout than rank zero; every rank of a multi-host package must have the same plane and row sizes",
+                    "rank {} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes",
                     index + 1
                 )));
             }
@@ -373,7 +373,7 @@ pub fn join_peer(
     reader.end()?;
     if zero_layout != layout {
         return Err(invalid(format!(
-            "rank {rank} describes a different cache layout than rank zero; every rank of a multi-host package must have the same plane and row sizes"
+            "rank {rank} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes"
         )));
     }
     let limit = zero_limit.min(limit);

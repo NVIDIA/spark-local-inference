@@ -18,6 +18,7 @@ def load(tmp_path, text):
 
 def test_absent_default_file_yields_built_in_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     configuration = Configuration.load()
     assert not configuration.exists and configuration.path == tmp_path / ".config/flare/config.toml"
     assert configuration.get("server.host") == Setting("127.0.0.1", "default")
@@ -32,6 +33,33 @@ def test_absent_default_file_yields_built_in_values(tmp_path, monkeypatch):
 def test_an_explicit_missing_file_is_a_usage_error(tmp_path):
     with pytest.raises(UsageError, match="does not exist"):
         Configuration.load(tmp_path / "absent.toml")
+
+
+def test_core_cache_accepts_legacy_setting_without_moving_files(tmp_path):
+    cache = tmp_path / "downloaded"
+    cache.mkdir()
+    artifact = cache / "model.safetensors"
+    artifact.write_bytes(b"retained model")
+    configuration = load(tmp_path, f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    assert configuration.directory("core_cache") == cache
+    assert artifact.read_bytes() == b"retained model"
+    with pytest.raises(UsageError, match="use only core_cache"):
+        load(tmp_path, '[paths]\ncore_cache = "one"\npackage_cache = "two"\n')
+
+
+def test_core_cache_defaults_find_existing_downloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    configuration = Configuration.load()
+    canonical = tmp_path / ".cache/flare/cores"
+    legacy = canonical.with_name("packages")
+    assert configuration.directory("core_cache") == canonical
+    legacy.mkdir(parents=True)
+    assert configuration.directory("core_cache") == legacy
+    canonical.mkdir()
+    assert configuration.directory("core_cache") == canonical
+    explicit = load(tmp_path, '[paths]\ncore_cache = "D:/FlareCores"\n')
+    assert explicit.directory("core_cache").as_posix() == "D:/FlareCores"
 
 
 def test_flags_override_the_file_which_overrides_the_recipe(tmp_path):

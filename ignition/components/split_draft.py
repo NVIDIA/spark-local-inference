@@ -75,46 +75,31 @@ def allocate_draft_budget(confidences, budget):
 
 
 class PreparedDraftConfidence:
-    """Preserve checkpoint storage precision while accumulating confidence in FP32."""
+    """Compute FP32 confidence from proposal hidden and predecessor Markov features."""
 
-    def __init__(self, source, weight, output, *, name, bias=None, buffers=None):
-        o, b, w = source.owner, source.batch, source.width
-        hidden = source.draft.head_hidden
-        markov = source.markov.embedding
-        if weight.shape != (1, hidden.shape[1] + markov.shape[1]):
+    def __init__(self, source, weight, output, *, name, bias=None):
+        from .embedding import PreparedEmbedding
+
+        owner, batch, width = source.owner, source.batch, source.width
+        hidden_width = source.draft.head_hidden_shape[-1]
+        embedding = source.markov.embed.weight
+        if weight.shape != (1, hidden_width + embedding.shape[1]):
             raise ValueError("confidence weight must cover hidden and preceding-token Markov features")
-        self.hidden = hidden.view(b, o.block_size, -1)[:, o.logit_offset:o.logit_offset + w - 1]
-        def allocate(shape, dtype):
-            return (torch.empty(shape, dtype=dtype, device=markov.device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.embeddings = allocate((b, w - 1, markov.shape[1]), markov.dtype)
-        self.source = source
-        self.canonical_embedding = None
-        if (getattr(source, "proposal_block", None) is not None
-                or getattr(source, "full_proposal", None) is not None):
-            from .embedding import PreparedEmbedding
+        tokens = torch.empty((batch * (width - 1),), dtype=torch.int64, device=embedding.device)
+        markov = torch.empty((tokens.numel(), embedding.shape[1]), dtype=embedding.dtype, device=embedding.device)
+        features = torch.empty((tokens.numel(), weight.shape[1]), dtype=weight.dtype, device=embedding.device)
+        logits = torch.empty((tokens.numel(), 1), dtype=torch.float32, device=embedding.device)
+        self.embedding = PreparedEmbedding(embedding, tokens, markov, session=owner.session,
+            name=name + ".canonical_predecessors").functional(session=owner.session, dynamic_inputs=True)
+        self.projection = UnquantizedProjection(features, weight, logits,
+            session=owner.session, name=name, bias=bias).functional(session=owner.session)
+        self.batch, self.depth, self.offset = batch, width - 1, owner.logit_offset
+        self.feature_dtype = weight.dtype
 
-            self.preceding = allocate((b, w - 1), torch.int64)
-            self.canonical_embedding = PreparedEmbedding(
-                source.markov.embed.weight, self.preceding.view(-1),
-                self.embeddings.view(-1, markov.shape[1]), session=o.session,
-                name=name + ".canonical_predecessors")
-        self.features = allocate((b, w - 1, weight.shape[1]), weight.dtype)
-        self.logits = allocate((b, w - 1), torch.float32)
-        self.output = output
-        self.projection = UnquantizedProjection(self.features.view(b * (w - 1), -1), weight,
-            self.logits.view(-1, 1), session=o.session, name=name, bias=bias)
-
-    def record_embedding(self, position, embedding):
-        if self.canonical_embedding is None:
-            self.embeddings[:, position].copy_(embedding)
-
-    def __call__(self):
-        if self.canonical_embedding is not None:
-            self.preceding[:, 0].copy_(torch.where(self.source.active, self.source.candidates[:, 0], 0))
-            self.preceding[:, 1:].copy_(self.source.drafts[:, :-1])
-            self.canonical_embedding()
-        self.features[:, :, :self.hidden.shape[-1]].copy_(self.hidden)
-        self.features[:, :, self.hidden.shape[-1]:].copy_(self.embeddings)
-        self.projection(self.features.view(-1, self.features.shape[-1]))
-        self.output.copy_(self.logits.sigmoid())
+    def __call__(self, proposal):
+        hidden = proposal.features["head_hidden"][:, self.offset:self.offset + self.depth]
+        preceding = torch.cat((torch.where(proposal.active[:, None], proposal.candidates[:, :1], 0),
+                               proposal.drafts[:, :self.depth - 1]), dim=1)
+        embedded = self.embedding(token_ids=preceding.reshape(-1)).view(self.batch, self.depth, -1)
+        features = torch.cat((hidden, embedded), dim=-1).to(self.feature_dtype)
+        return self.projection(features.view(self.batch * self.depth, -1)).view(self.batch, self.depth).sigmoid()

@@ -18,6 +18,8 @@ _MUTABLE_BINDING_FIELDS = (
     "compressed_k_cache", "raw_k_ring", "raw_logical_positions",
     "raw_rope_positions", "raw_interval_start_positions", "output", "selected_positions",
 )
+_DYNAMIC_FIELDS = ("query", "index_query", "raw_index_key", "request_ids", "query_positions",
+                   "rope_positions", "sequence_lengths", "query_start_loc", "num_accepted_tokens", "is_prefilling")
 
 
 @torch.library.custom_op("flare::parallel_qsa", mutates_args=("writes", "workspace"))
@@ -29,6 +31,29 @@ def _parallel_qsa(source: torch.Tensor, reads: list[torch.Tensor], writes: list[
 @_parallel_qsa.register_fake
 def _fake_parallel_qsa(source, reads, writes, workspace, handle):
     pass
+
+
+class FunctionalQSA:
+    def __init__(self, attention):
+        self.plan = attention.plan
+        self.read_names = tuple(name for name in attention.binding_kwargs if name not in _MUTABLE_BINDING_FIELDS)
+        self.cache_only = attention.cache_only
+        self.selection_only = attention.sparse is not None
+        self.handle = next(_HANDLES)
+        _CONTEXTS[self.handle] = self
+
+    def __call__(self, source, bindings, dynamic, workspace):
+        reads = [bindings[name] for name in self.read_names] + [dynamic[name] for name in _DYNAMIC_FIELDS]
+        writes = [bindings[name] for name in _MUTABLE_BINDING_FIELDS]
+        _parallel_qsa(source, reads, writes, workspace, self.handle)
+
+    def run(self, reads, writes, workspace):
+        count = len(self.read_names)
+        bindings = dict(zip(self.read_names, reads[:count], strict=True))
+        bindings.update(zip(_MUTABLE_BINDING_FIELDS, writes, strict=True))
+        binding = qsa.bind(self.plan, scratch=workspace, **bindings)
+        qsa.run(binding, **dict(zip(_DYNAMIC_FIELDS, reads[count:], strict=True)),
+                selection_only=self.selection_only, cache_only=self.cache_only)
 
 
 class ConcurrentAttention:
@@ -75,6 +100,33 @@ class ConcurrentAttention:
             ((plan.memory_requirements().scratch_nbytes,), torch.uint8)
             for plan in (self.attention.plan, *(projection.plan for projection in self.projections))))
 
+    def functional(self, *, session):
+        self.output_layouts = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in self.outputs)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.workspace_bytes = self.workspace.numel()
+        self.projection_workspace_bytes = tuple(t.numel() for t in self.projection_workspaces)
+        self.outputs = self.workspace = self.projection_workspaces = None
+        self.arena = None
+
+    def project_runtime(self, source):
+        outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                   for shape, stride, dtype in self.output_layouts]
+        workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
+                      for size in self.projection_workspace_bytes]
+        _parallel_mx_projections(source, self.values, self.scales, outputs,
+            workspaces, self.plans, self.stream_handle, False)
+        return outputs, workspaces
+
+    def attend_runtime(self, source, bindings, dynamic, projection_workspaces):
+        reads = ([bindings[name] for name in self.read_names]
+                 + [dynamic[name] for name in self.dynamic_names] + projection_workspaces)
+        writes = [bindings[name] for name in _MUTABLE_BINDING_FIELDS]
+        workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=source.device)
+        _parallel_qsa(source, reads, writes, workspace, self.handle)
+
     def project(self, source):
         _parallel_mx_projections(source, self.values, self.scales, self.outputs,
             self.projection_workspaces, self.plans, self.stream_handle, False)
@@ -96,4 +148,5 @@ class ConcurrentAttention:
         # Compiled metadata can be materialized after the projection-stream fork.
         self.stream.wait_stream(torch.cuda.current_stream(workspace.device))
         self.ready.record(self.stream)
-        qsa.run(binding, **dict(zip(self.dynamic_names, reads[count:], strict=True)), index_ready=self.ready)
+        dynamic = reads[count:count + len(self.dynamic_names)]
+        qsa.run(binding, **dict(zip(self.dynamic_names, dynamic, strict=True)), index_ready=self.ready)

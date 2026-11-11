@@ -9,6 +9,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from functools import partial
 
 import torch
 
@@ -18,6 +19,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.capacity import (
+    serving_modes,
     speculative_token_capacity,
     batch_capacities,
     prefill_capacities,
@@ -45,7 +47,7 @@ from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import virtual_device_memory, release_unused
 from ignition.preparation.frontend import PromptEncoder, prepare_frontend
 from ignition.preparation.model import PreparedModel
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
@@ -90,8 +92,12 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     # Run single-row decode's shared expert on an auxiliary stream; without overlap it runs serially.
     stream_overlap: bool = True
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dspark
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -164,9 +170,9 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
-    if package_storage is None:
-        raise ValueError("DeepSeek preparation requires package storage")
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
+    if core_storage is None:
+        raise ValueError("DeepSeek preparation requires core storage")
     snapshot = Path(snapshot).resolve()
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
@@ -175,7 +181,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                 draft_head_quantization=config.draft_head_quantization,
                                 markov_head_quantization=config.markov_head_quantization)
@@ -197,7 +203,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             state_rows + 1,
             initial_pages,
             device,
-            storage=package_storage,
+            storage=core_storage,
             maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(state_rows + 1, 1 + execution_rows + slots),
@@ -210,7 +216,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        ipc = package_storage.peer_storage
+        ipc = core_storage.peer_storage
         tokens = max(config.prefill_chunk_size, config.decode_tokens, slots * config.draft_tokens)
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=4096, ipc=ipc)
         prefill_collective = create_dma_all_reduce_runtime(
@@ -244,18 +250,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             numerical_policy="default",
             coordinator=coordinator,
             headroom_bytes=config.headroom_bytes,
-            benchmark_storage=package_storage,
+            benchmark_storage=core_storage,
         )
         session.__enter__()
         session.register_benchmark_resource("continuations", pool, restore=pool.clear_for_preparation)
+        examples = {}
+        dspark_forwards = replace(FORWARDS, decoder=partial(FORWARDS.decoder, examples=examples),
+                           draft=partial(FORWARDS.draft, examples=examples))
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
-        graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-        prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device, blocks=blocks,
-                                           buffers=graph_buffers.cursor())
+        prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device, blocks=blocks)
         decoder_storage = Scratch.allocate(
-            config.decode_tokens, config.decode_samples, shard.world_size, device, blocks=blocks,
-            buffers=graph_buffers.cursor()
+            config.decode_tokens, config.decode_samples, shard.world_size, device, blocks=blocks
         )
         vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -298,18 +304,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 vocabulary_runtime=vocabulary_collective,
                 markov_runtime=markov_collective,
                 coordinator=coordinator,
-                forwards=FORWARDS,
+                forwards=dspark_forwards,
                 page_tokens=PAGE_TOKENS,
             )
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
-    modes = (True, False) if config.dspark else (False,)
+    modes = serving_modes(config.dspark, config.mtp_only)
     count = (
         len(modes) * (prefill_graph_count(config.prefill_capacities, scoring) + 4 * len(config.batch_capacities))
         + len(config.speculative_round_shapes)
-        + len(config.batch_capacities)
+        + (len(config.batch_capacities) if False in modes else 0)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
@@ -348,6 +354,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         session=session,
                         name=name,
                         workspace=arena,
+                        examples=examples,
                     )
                     batch = PreparedBatch(
                         inputs,
@@ -389,17 +396,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         if speculation is not None:
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
-            speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
             for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda shape: (shape[2], shape[0]), reverse=True):
                 name = f"speculative{batch}x{width}-tokens{packed}"
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                                                     buffers=speculation.sampling_buffers.cursor(), target_token_capacity=packed)
+                                                     target_token_capacity=packed)
                 forward.prepare()
                 add(name, forward, "speculative", batch, width, forward_inputs, enabled=True, packed_tokens=packed)
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
-            cursor = graph_buffers.cursor()
-            vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=4096, buffers=cursor)
+            vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=4096)
             encoder = PreparedVision(
                 weights.vision,
                 vision_storage[capacity],
@@ -407,9 +412,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 session=session,
                 workspace=arena,
                 name=name,
-                buffers=cursor,
             )
-            forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
+            forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
@@ -431,6 +435,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     coordinator=coordinator,
                     session=session,
                     name=name,
+                    workspace=arena,
                 )
                 add(
                     name,
@@ -482,7 +487,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    if speculation is not None:
+        speculation.release_examples()
+    examples.clear()
+    metadata.clear()
+    scratch.clear()
+    vision_storage.clear()
+    del prefill_storage, decoder_storage, storage, decoder, batch, encoder
+    arena.release_preparation()
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     pages = initial_pages
 
     def materialize_cache():
@@ -502,7 +515,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
-        warmup_storage=package_storage,
+        warmup_storage=core_storage,
         compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
     )
     session.freeze()
@@ -574,18 +587,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
         memory.update(speculative_round_shapes=config.speculative_round_shapes,
                       speculative_graph_budget=config.speculative_graph_budget)
-    disposable = [
-        prefill_storage,
-        decoder_storage,
-        arena.tensor,
-        metadata,
-        vision_storage,
-        vision_state.arena,
-        graph_buffers.chunks,
-    ]
-    if speculation is not None:
-        disposable.append(speculation.draft_scratch)
-        disposable.append(speculation.sampling_buffers.chunks)
+    disposable = [vision_state.arena]
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):
             forward = forward.forward
@@ -608,7 +610,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             vision_inputs,
             vision_prefill,
             vision_storage,
-            graph_buffers,
             pool,
             requests,
             inputs,
@@ -616,8 +617,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             commands,
             arena,
             forwards,
-            prefill_storage,
-            decoder_storage,
             scratch,
             metadata,
             compiled,

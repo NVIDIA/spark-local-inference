@@ -606,7 +606,7 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Snapshot device-wide usage and the package allocator's physical mappings.
+/// Snapshot device-wide usage and the core allocator's physical mappings.
 ///
 /// Call after preparation has materialized scratch. Imported peer mappings,
 /// dynamically backed caches, and allocations outside this allocator are not

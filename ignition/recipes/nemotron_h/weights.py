@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
 from .config import ModelConfig
 
@@ -28,7 +29,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None):
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with NemotronWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
             config = loader.config
             embedding, norm = loader.load_tensors((PREFIX + ".embeddings.weight", PREFIX + ".norm_f.weight"))
@@ -45,7 +46,7 @@ class ModelWeights:
 
             config = replace(config, draft=DraftConfig.load(draft_checkpoint, config))
             draft = DraftWeights.load(draft_checkpoint, config.draft, device, progress=progress)
-        return cls(config, shard, embedding, norm, head, layers, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
+        return cls(config, shard, embedding, norm, head, layers, allocated_tensor_bytes(device) - before, vision=vision, draft=draft)
 
 
 class NemotronWeightLoader(DirectWeightLoader):
@@ -64,15 +65,16 @@ class NemotronWeightLoader(DirectWeightLoader):
         result = dict(norm=self.load_tensor(prefix + ".norm.weight"))
         kind = self.config.layers[index]
         if kind == "mamba":
-            a, d, bias, convolution, conv_bias, norm = self.load_tensors(tuple(mixer + "." + suffix
-                for suffix in ("A_log", "D", "dt_bias", "conv1d.weight", "conv1d.bias", "norm.weight")))
+            a = self.load_tensor(mixer + ".A_log", dtype=torch.float32, temporary=True)
+            d, bias, convolution, conv_bias, norm = self.load_tensors(tuple(mixer + "." + suffix
+                for suffix in ("D", "dt_bias", "conv1d.weight", "conv1d.bias", "norm.weight")))
             heads, channels = c["mamba_num_heads"], self.config.convolution_width
             if (a.shape != (heads,) or d.shape != (heads,) or bias.shape != (heads,)
                     or convolution.shape != (channels, 1, c["conv_kernel"])
                     or conv_bias.shape != (channels,) or norm.shape != (self.config.mamba_width,)):
                 raise ValueError(f"{mixer}: Mamba parameter geometry differs from configuration")
             result.update(input=self.load_linear(mixer + ".in_proj"),
-                output=self.load_linear(mixer + ".out_proj"), A=-a.float().exp(), D=d,
+                output=self.load_linear(mixer + ".out_proj"), A=persistent_copy(-a.exp()), D=d,
                 dt_bias=bias, convolution=convolution.squeeze(1), convolution_bias=conv_bias, output_norm=norm)
         elif kind == "attention":
             result.update(qkv=self.load_linear_group(tuple(mixer + "." + name

@@ -1,11 +1,25 @@
 # Working on Flare
 
-Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. Ignition, the
+Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. The public
+README names the project Hyperflare; the code, the `flare` CLI, and the
+documentation name it Flare. Ignition, the
 Python package in `ignition/`, prepares models with PyTorch, Transformers, and
 FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
-`heliopause/` crate. The Rust CLI in `flare/` links Helios, the runtime library
-in `helios/`, to serve requests through prepared CUDA graphs. Both Flare and
-Heliopause depend on Helios; Helios has no Python or preparation-tool dependency.
+`heliopause/` crate. The Rust CLI in `flare-cli/` uses the application library in
+`flare/`, which links the Helios runtime in `helios/` to serve requests through
+prepared CUDA graphs. Flare and Heliopause depend on Helios; Helios has no Python
+or preparation-tool dependency.
+
+Helios keeps prefix-cache checkpoints in host memory and record files through
+the Selene crate in `selene/`. The manager service in `selene-manager/`, whose
+binary is `selene`, lets Flare instances share those records. The `eos/` crate
+holds the host operating-system operations that Helios and Selene use. Orbit,
+in `flare-cli/src/orbit/`, pairs a controller with host agents and starts
+serving ranks on their hosts. `flare-winui/` is the Windows desktop client built
+on the `flare/` library. Python tests are in `tests/`, qualification and
+benchmark drivers in `qualify/` and `scripts/`, and the TLA+ lifecycle models
+in `verification/helios-lifecycle/`. Each Rust crate has its own `Cargo.lock`;
+the repository has no Cargo workspace.
 
 ## Required setup and commit review
 
@@ -30,6 +44,16 @@ and descriptions, issue and review comments, plans, and technical reports. Code
 tasks are included whenever they produce prose, including progress messages and
 completion reports.
 
+Every repository document has one or both of two purposes: it specifies the
+architecture, or it instructs agents how to work in the repository. State
+designed behavior that the code does not implement as a specification marked
+designed, not implemented. State support as present qualification: what is
+implemented, the hardware and configurations on which it is qualified, and what
+is not qualified. Record unresolved defects, unrun checks, and pending
+measurements in [docs/TODO.txt](docs/TODO.txt), not in design documents. Do not
+add defect reports, investigation logs, run journals, or progress notes to the
+repository.
+
 Before committing or publishing, review the final text against the skill. Rewrite
 passages that require conversation history, introduce unexplained identifiers, or
 claim results beyond the stated evidence. Review edited PR descriptions and
@@ -40,12 +64,85 @@ the delegate to read and follow it. Pass this requirement to further delegates,
 and review returned prose before incorporating or publishing it. A review
 acknowledgment does not substitute for reading the skill and reviewing the text.
 
+## Required PR descriptions
+
+A PR description must explain the argument for the change to a reviewer who knows
+the repository but has none of the author's working context. **Every description
+must answer these four questions, in this order: why, what exactly changed, what
+benefit or result is claimed, and what evidence supports it.** A description that
+makes the reviewer reconstruct these answers from implementation details, test
+inventories, or linked PRs is incomplete. Rewrite it before publishing, even if
+every individual statement is accurate.
+
+1. **Why is this change being proposed?** Identify the affected workflow and the
+   concrete defect, cost, or missing capability. Explain why it matters and why
+   the chosen approach addresses it. Give the relevant dataflow, ownership, or
+   execution constraint that makes the approach valid. Technical vocabulary and
+   a sequence of operations do not substitute for a causal explanation. Assume
+   an experienced engineer who needs local context, not introductory instruction.
+2. **What exactly did this PR change?** Name the affected components and explain
+   the concrete implementation and behavior changes. Make the before/after
+   explicit: what is replaced, removed, or added, and how the resulting path
+   works. Do not describe both behaviors in the same tense and leave the reader
+   to infer the transition. Identify material numerical, compatibility, and
+   resource-lifetime changes. A file list or a label such as "optimized prefill"
+   does not explain what was done.
+3. **What is the claimed benefit or result?** State the expected or observed
+   effect precisely, distinguishing an expectation from a measured result. Give
+   the headline comparison and metric direction for a measured improvement,
+   with its scope and material limitations attached. Distinguish component
+   measurements from whole-model or service results, and isolated changes from
+   combined-stack results. Never attribute a combined result to one PR. The
+   claimed benefit must be clear before presenting the supporting test and
+   benchmark details.
+4. **What evidence supports those claims?** Connect each material claim to the
+   relevant checks or measurements: the behavior tested, baseline or reference,
+   configuration, result, and limits of the conclusion. State what remains
+   untested or inconclusive. Explain differences between runs when passed and
+   skipped cases would otherwise appear contradictory. Keep material failures,
+   skipped checks, and measurement limitations visible. Test counts and labels
+   such as "qualified" cannot stand in for the tested contract and result.
+   Reproduction commands must identify the required inputs and configuration
+   directly or through a precise reference; placeholder arguments alone do not
+   explain a measurement. Never invent evidence to complete the description.
+
+Apply these requirements to the supporting detail:
+
+- **Give details a clear hierarchy.** Establish the central design and principal
+  correctness or compatibility risks before supporting implementation and
+  validation details. Include details because they help assess the change.
+  Avoid exhaustive inventories of changed files, preserved properties, buffers,
+  and tests. Explain the relevance of non-obvious constraints. Keep reproduction
+  instructions and merge logistics after the technical explanation.
+- **Resolve references where they are needed.** Explain a component's role before
+  using its internal shorthand. Replace phrases such as "ordinary tuning" or
+  "canonical policy" with the relevant settings or a precise reference. Links
+  may carry supporting detail, but the description must contain the central
+  argument. For stacked PRs, explain what each necessary dependency supplies,
+  what this diff contributes, and the required merge order; a chain of PR numbers
+  alone is insufficient.
+- **Remove process assurances that add no technical evidence.** Statements that
+  source "matches the tested implementation," work was reviewed, or a branch is
+  ready do not explain behavior or establish correctness. Report the actual
+  checks and their scope. Do not add audit artifacts or development chronology.
+
+Before publishing or updating a PR, read its description independently of the
+diff and development conversation. **Do not publish it if the rationale, exact
+change, claimed benefit, supporting evidence, or material limitations must be
+guessed.** Repair missing explanations rather than adding headings or more raw
+detail. Scale length to the change: a small fix may need only a short paragraph
+and relevant validation. The content and order are mandatory; particular headings
+and a fixed-length template are not.
+
 ## Contribution scope and rejection criteria
 
 Flare prepares and serves supported model recipes on NVIDIA GPUs through
 FlashInfer/b12x and prepared CUDA graphs. Single-host execution and cross-node
-tensor parallelism are both in scope. Orbit manages the hosts, preparation,
-packages, and rank processes needed for those serving workflows.
+tensor parallelism are both in scope. Orbit pairs a controller with host
+agents, places cores on their hosts, and starts and supervises the rank
+processes for cross-node serving. Cross-node preparation runs through
+`ignition export --ranks` on rank zero and `ignition join` on each peer host,
+without Orbit.
 
 Every contribution must address an explicit maintainer request, a demonstrated
 defect, a measured performance or memory problem, or inaccurate documentation.
@@ -66,7 +163,7 @@ alone do not establish a need for a change.
   be used to bypass them.
 - **Reject weakened guarantees.** Preserve complete cache and speculative state,
   inactive-row behavior, asynchronous resource lifetimes, checkpoint precision,
-  model semantics, and the declared model package contract. Do not remove
+  model semantics, and the declared model core contract. Do not remove
   validation, suppress errors, silently substitute execution paths, or relax references,
   workloads, or numerical bounds to obtain passing checks or favorable metrics.
   Numerical bounds must follow the required arithmetic and measured repeatability.
@@ -110,9 +207,17 @@ and hardware sections of the preparation guide.
 | Add or change a model recipe or execution component | [Model development](docs/model-development.md), [preparation development](docs/preparation-development.md), and the relevant [core design](docs/core-design.md#2-model-preparation) sections |
 | Change tuning, compilation, memory planning, capture, or TP preparation | [Preparation development](docs/preparation-development.md) and [preparation resources](docs/model-preparation.md#preparation-resources) |
 | Change Helios runtime, scheduling, caches, transport, or frontend | [Prepared model contract](helios/model-contract.md), [execution manifest](helios/manifest.md), and the relevant [Helios runtime](helios/README.md) and [core design](docs/core-design.md#3-helios-runtime-and-graph-interface) sections |
-| Change Protobuf metadata or package loading/export | [Runtime package design](docs/runtime-package-design.md), [prepared model contract](helios/model-contract.md), and [package compatibility](#model-package-compatibility) |
+| Change Protobuf metadata or core loading/export | [Runtime core design](docs/runtime-core-design.md), [prepared model contract](helios/model-contract.md), and [core compatibility](#model-core-compatibility) |
 | Diagnose or optimize performance | [GPU performance work](docs/performance-work.md), plus model or preparation development guidance for affected code |
 | Change CLI, API, or configuration behavior | [CLI design](docs/cli-design.md) and the relevant [API](docs/api.md) sections |
+| Change graph selection, scheduling policy, or timing estimates | [Prepared-graph scheduling](docs/scheduling-runtime-design.md) and [scheduling utility](docs/scheduling-utility.md); [scheduling theory](docs/scheduling-theory.md) and [the scheduling oracle](docs/scheduling-oracle.md) for the simulator in `scripts/scheduling_sim/` |
+| Change speculative decoding, log probabilities, or prompt scoring | [Speculative decoding design](docs/mtp-design.md) and [the logprob contract](docs/logprobs-design.md), plus model development guidance |
+| Change prefix-cache offload, host cache tiers, Selene, or its manager | [Prefix-cache offload](docs/prefix-cache-offload.md), [the Selene manager](selene-manager/README.md), and [its protocol](selene-manager/PROTOCOL.md) |
+| Change Orbit, host agents, or multi-host preparation, serving, or transport | [Orbit](docs/orbit.md), [multi-host serving](docs/multi-host.md), and [the RoCE ring](docs/roce-ring.md) |
+| Change the core container format, conversion, signing, or publisher trust | [Core format](docs/core-format-design.md), [signing](docs/signing.md), and [core compatibility](#model-core-compatibility) |
+| Change Helios lifecycle, cancellation, or rank coordination order | [Verification guidance](docs/verification.md), [the lifecycle models](verification/helios-lifecycle/README.md), and [the lifecycle skill](.agents/skills/helios-lifecycle/SKILL.md) |
+| Build or change Windows serving or the desktop client | [Windows serving](docs/windows.md) and [the desktop client](flare-winui/README.md) |
+| Build containers, Debian packages, or release archives | [Container](docs/container.md), [Debian package](docs/debian.md), and [third-party notices](THIRD_PARTY_NOTICES.md) |
 
 For sampling or frontend metadata changes, also read
 [sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).
@@ -125,7 +230,7 @@ Run commands from the repository root:
 
 ```sh
 uv sync --locked --extra prepare --extra test
-cargo build --release --manifest-path flare/Cargo.toml
+cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
 After changing `heliopause/` or Helios code used by the extension, rebuild the
@@ -139,33 +244,69 @@ The [preparation guide](docs/model-preparation.md) owns dependency updates,
 local FlashInfer installation, GPU selection, compiler and tuning resources,
 model-specific launch instructions, and hardware setup. The
 [CLI design](docs/cli-design.md) defines flags, configuration, signing, and
-package selection.
+core selection.
 
 Use the preparation guide's [DeepSeek V4.1](docs/model-preparation.md#deepseek-v41-flash)
 or [DeepSeek V4](docs/model-preparation.md#deepseek-v4-flash) commands for those
 models. For repeated exports with compatible weights, follow
 [re-exporting with cached weights](docs/model-preparation.md#re-exporting-with-cached-weights).
 
-For serving-only Rust changes, rebuild Flare and load a compatible package.
-To exercise changes to prepared kernels, capacities, or the package format,
-export a package containing those changes. Packages must satisfy the declared
-[package contract](#model-package-compatibility). Changing prepared kernels or
+For serving-only Rust changes, rebuild Flare and load a compatible core.
+To exercise changes to prepared kernels, capacities, or the core format,
+export a core containing those changes. Cores must satisfy the declared
+[core contract](#model-core-compatibility). Changing prepared kernels or
 capacities requires re-export; an engine upgrade does not.
-Launch an exported package with `flare/target/release/flare run PACKAGE` when
+Launch an exported core with `flare-cli/target/release/flare run CORE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
 
 `ignition debug-serve` is only for diagnosing model and preparation faults.
 Do not use it for actual serving or apples-to-apples performance comparisons
 against other runtimes, including its native, `--direct`, and `--eager` modes.
-Use `ignition export` followed by `flare run PACKAGE` for those workflows.
+Use `ignition export` followed by `flare run CORE` for those workflows.
 Debug execution retains preparation resources and bounded preparation caches;
-its process, memory, and loading paths differ from native package serving.
+its process, memory, and loading paths differ from native core serving.
 
 For debugging without export, native `ignition debug-serve` requires Heliopause's
 `qualification` Cargo feature. Diagnostic `ignition debug-serve --direct` does not.
 Follow the
-[development launch instructions](docs/cli-design.md#development-without-package-export).
+[development launch instructions](docs/cli-design.md#development-without-core-export).
+
+## Run tests
+
+Run Python tests from the repository root in the synchronized environment:
+
+```sh
+.venv/bin/python -m pytest tests/cli -q
+```
+
+Tests that need a GPU skip unless `FLARE_RUN_CUDA_TESTS=1`. Tensor-parallel tests
+also require `FLARE_RUN_TP_CUDA_TESTS=1` and the assigned devices in
+`CUDA_VISIBLE_DEVICES`. Tests that need a checkpoint, an exported core, or a
+running service read a test-specific variable, such as `FLARE_QWEN38_SNAPSHOT`
+or `FLARE_API_TEST_URL`, and skip without it. Report a skipped test as an unrun
+check.
+
+Test each Rust crate through its own manifest. `.github/workflows/native-serving.yml`
+runs these commands on Linux; `--target-dir flare-cli/target` shares one build
+directory across the crates:
+
+```sh
+cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare-cli/target
+cargo test --locked --release --manifest-path selene/Cargo.toml --features test-support --target-dir flare-cli/target
+cargo test --locked --release --manifest-path selene-manager/Cargo.toml --features test-support --target-dir flare-cli/target
+cargo test --locked --release --manifest-path helios/Cargo.toml --features runtime-core,server --target-dir flare-cli/target
+cargo test --locked --release --manifest-path flare/Cargo.toml --target-dir flare-cli/target
+cargo test --locked --release --manifest-path flare-cli/Cargo.toml
+```
+
+Helios tests that render chat templates fail unless
+`FLARE_TEST_TEMPLATE_DIR` names templates fetched by
+`tests/frontend/prepare_templates.py`; see
+[sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).
+Helios tests lock host memory; the workflow raises the locked-memory limit to
+64 MiB before running them. [Verification guidance](docs/verification.md)
+gives the Kani and TLA+ commands.
 
 ## Architecture and ownership
 
@@ -189,7 +330,8 @@ architectural boundary before committing the change.
   allowlists behind capability flags. A cache scheme may require different page
   geometry, state storage, or restore constraints; keep those differences in
   its storage contract and let shared policy consume that contract.
-- `PreparedContract` is validated Protobuf data, never a runtime policy extension
+- `PreparedContract`, which Helios decodes from the core's Protobuf
+  `ModelContract`, is validated data, never a runtime policy extension
   point. Declare concrete graph value sources, storage views, dependencies,
   frontend syntax, and capacities; shared code validates and binds them. Never
   add per-model boolean flags, including `supports_*`, `can_*`, or default-false
@@ -240,8 +382,8 @@ architectural boundary before committing the change.
 
 - Python loads weights, resolves and autotunes kernels, plans storage, warms
   execution paths, and captures supported graph variants before serving starts.
-  `ignition export` writes a runtime package and closes the prepared model.
-  `flare run PACKAGE` loads that package in a separate Rust serving process.
+  `ignition export` writes a runtime core and closes the prepared model.
+  `flare run CORE` loads that core in a separate Rust serving process.
 - Helios owns sockets, request processing, tokenization, chat templates,
   scheduling, cache operations, graph replay, and output streaming. Serving
   must not call back into Python.
@@ -252,7 +394,7 @@ architectural boundary before committing the change.
   context alive for their full native use. Model state and metadata must be
   explicit storage that Helios can manage without Python execution.
 - `ignition debug-serve --direct [--eager]` is the one Python execution path, a
-  diagnostic and qualification tool requested by the project owner for
+  diagnostic and qualification tool authorized by the project owner for
   reproducing model faults without Helios ([direct execution](docs/direct-execution.md)).
   It is never production serving or a fallback, and only its explicit flags
   select it.
@@ -260,20 +402,20 @@ architectural boundary before committing the change.
   Prefix reuse, branching, and speculative rollback must preserve all relevant
   state, not just token positions and KV pages.
 
-## Model package compatibility
+## Model core compatibility
 
 - Every engine version must load models supported by previous engine versions
   without re-export, re-signing, or changes to captured graphs. Preserve loading
-  and serving compatibility when changing package metadata, storage contracts,
-  and execution code. Retain readers and tests needed by existing packages.
+  and serving compatibility when changing core metadata, storage contracts,
+  and execution code. Retain readers and tests needed by existing cores.
 - Execution ABI numbers are descriptive metadata, not loading gates. Validate
   actual graph operations, buffer layouts, capacities, and dependencies. Protobuf
-  additions must use defaults that preserve existing package behavior; an absent
+  additions must use defaults that preserve existing core behavior; an absent
   or zero completion token capacity means eight.
 - Version semantic changes without abandoning previously supported models.
   Reserve removed Protobuf fields and enum values. Preserve signature, resource,
-  hardware, and structural validation. Test previous package layouts through
-  loading and serving alongside newly exported packages.
+  hardware, and structural validation. Test previous core layouts through
+  loading and serving alongside newly exported cores.
 
 ## Configuration
 
@@ -301,8 +443,8 @@ architectural boundary before committing the change.
 
 ## CUDA kernel and model optimization authorship
 
-Claude Opus 5.5 has repeatedly produced defective low-level kernel changes in
-this project. Do not use it to design or implement low-level CUDA kernels or
+Claude Opus 5.5 is not reliable for low-level kernel changes in this project.
+Do not use it to design or implement low-level CUDA kernels or
 changes to existing model fusion and GPU execution optimizations. This includes
 CUDA C++, PTX, CuTe DSL, and Triton kernels, and changes to projection packing,
 fused arithmetic, stream overlap, or scratch aliasing in optimized model paths.
@@ -322,7 +464,7 @@ domain, and TLA+ for protocol states and asynchronous ordering. Add only the
 checks the affected behavior needs. A passing model does not establish Rust
 conformance or CUDA correctness; validate those boundaries separately.
 
-- Compare other runtimes against an exported package running through `flare run`.
+- Compare other runtimes against an exported core running through `flare run`.
   Timings from `ignition debug-serve` are diagnostic measurements and cannot
   establish comparative serving performance.
 - When a potential correctness, memory, or performance deficiency appears in
@@ -332,6 +474,11 @@ conformance or CUDA correctness; validate those boundaries separately.
 - Validate the affected execution path and capacities. Model and preparation
   development guidance defines shape, graph-transition, state, and lifetime
   checks; GPU performance guidance defines measurement requirements.
+- For excess fixed device memory, follow the
+  [cross-model scratch workflow](docs/performance-work.md#cross-model-scratch-planning).
+  Make graph-local temporaries and their dependencies visible to Inductor before
+  adding manual shared pools. Keep weights, cache history, request state, and
+  other values that cross graph boundaries in explicit persistent storage.
 - Keep ordinary tests and raw benchmark measurements. Do not create development
   audit reports, receipts, provenance bundles, or hash inventories.
 

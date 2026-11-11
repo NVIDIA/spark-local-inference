@@ -4,7 +4,7 @@
  */
 
 // Vendored from FlashInfer's pinned preparation dependency
-// (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c, proxy ABI 10).
+// (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c, proxy ABI 11).
 // Keep the source below identical so preparation and serving share the transport ABI.
 
 // RDMA proxy for the b12x RoCE one-shot all-reduce.
@@ -54,6 +54,15 @@
 // seeing it; otherwise our next two-shot op could stage over the shard while it
 // was still to be sent, and peers would gather that input as our reduced values.
 //
+// The two halves of the two-shot path are also separate operations over the same
+// buffers and flags: a reduce-scatter (ctrl kind[slot] = 3) stages and posts the
+// phase-0 chunks only, and its kernel keeps the reduced shard; a shard gather
+// (ctrl kind[slot] = 4) stages this rank's shard of the message into pipe_send
+// and posts the phase-1 chunks only.  Each releases pipe_send through pipe_done
+// like a complete two-shot op, and the single-copy argument above holds for any
+// sequence of the three kinds: a rank's kernel N finishes only on peers' chunks
+// of N, and every peer posts N + 1 after its kernel N + 1 started.
+//
 // A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
 // the kernel reads from device memory, through
 //
@@ -91,7 +100,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 10
+#define ROCE_ABI_VERSION 11
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -110,6 +119,11 @@
 #define KIND_ONESHOT 0
 #define KIND_TWOSHOT 1
 #define KIND_VARLEN 2
+#define KIND_REDUCE_SCATTER 3
+#define KIND_GATHER_SHARDS 4
+// run_pipe_op phase mask: reduce-scatter chunks, all-gather chunks.
+#define PIPE_PHASE_RS 1u
+#define PIPE_PHASE_AG 2u
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -1076,22 +1090,23 @@ static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chun
   return 0;
 }
 
-// Run two-shot op seq: post each reduce-scatter chunk once the kernel staged it
-// and each all-gather chunk once the kernel reduced it.
+// Run pipelined op seq over the phases in `phases`: post each reduce-scatter
+// chunk once the kernel staged it and each all-gather chunk once the kernel
+// reduced (or, for a shard gather, staged) it.
 static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
-                       uint32_t chunks) {
+                       uint32_t chunks, uint32_t phases) {
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
   uint32_t total = nbytes / 16;
   uint32_t widest = (total + (uint32_t)c->world - 1) / (uint32_t)c->world;
   if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->pipe_bytes || chunks == 0 ||
       chunks > ROCE_MAX_CHUNKS || chunk_packs == 0 || (uint64_t)chunks * chunk_packs < widest) {
     snprintf(c->err, sizeof(c->err),
-             "invalid two-shot op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
+             "invalid pipelined op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
              nbytes, chunks, chunk_packs, c->pipe_bytes);
     return -1;
   }
-  uint32_t rs = 0;
-  uint32_t ag = 0;
+  uint32_t rs = (phases & PIPE_PHASE_RS) ? 0 : chunks;
+  uint32_t ag = (phases & PIPE_PHASE_AG) ? 0 : chunks;
   uint64_t idle = 0;
   while (rs < chunks || ag < chunks) {
     int posted = 0;
@@ -1286,9 +1301,13 @@ static void* proxy_main(void* arg) {
       int rc;
       if (kind == KIND_ONESHOT) {
         rc = post_op(c, s, nbytes);
-      } else if (kind == KIND_TWOSHOT) {
+      } else if (kind == KIND_TWOSHOT || kind == KIND_REDUCE_SCATTER ||
+                 kind == KIND_GATHER_SHARDS) {
+        uint32_t phases = kind == KIND_TWOSHOT          ? (PIPE_PHASE_RS | PIPE_PHASE_AG)
+                          : kind == KIND_REDUCE_SCATTER ? PIPE_PHASE_RS
+                                                        : PIPE_PHASE_AG;
         rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
-                         ctrl[CTRL_SLOT_CHUNKS + slot]);
+                         ctrl[CTRL_SLOT_CHUNKS + slot], phases);
       } else if (kind == KIND_VARLEN) {
         rc = run_varlen_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
                            ctrl[CTRL_SLOT_CHUNKS + slot]);

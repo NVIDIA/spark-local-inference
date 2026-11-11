@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! RoCEnante's RDMA proxy for packages whose ranks run on separate hosts.
+//! RoCEnante's RDMA proxy for cores whose ranks run on separate hosts.
 //!
 //! A rank's graphs launch b12x's RoCE kernels against a pinned region restored at its recorded
 //! address. This side opens the devices of the fabric this host discovered (`roce_fabric`),
@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::roce_fabric::Topology;
 use super::roce_fabric::Shape;
-use crate::runtime_package::RoceSpec;
+use crate::runtime_core::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
-/// The proxy ABI compiled into this runtime; packages record the one their kernels use.
-pub const PROXY_ABI: u32 = 10;
+/// The proxy ABI compiled into this runtime; cores record the one their kernels use.
+pub const PROXY_ABI: u32 = 11;
 /// Control word 7 after a variable-length all-gather met a byte count it cannot send.
 const INVALID_VARLEN_COUNT: u32 = 1;
 
@@ -75,8 +75,9 @@ fn failure(message: impl Into<String>) -> crate::Error {
 }
 
 fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
-    // ABI 10 changes startup-owned ring mailboxes, not the captured kernel region.
-    // Older packages can use the new proxy, but all live peers must use its wire layout.
+    // ABI 10 changes startup-owned ring mailboxes and ABI 11 adds op kinds, not the captured
+    // kernel region.
+    // Older cores can use the new proxy, but all live peers must use its wire layout.
     let size = unsafe { roce_blob_bytes() } as usize;
     if records.len() != world
         || records
@@ -94,7 +95,7 @@ fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
 }
 
 /// One rank's connected transport. Dropping it stops the proxy and releases the HCAs; the region
-/// itself belongs to the package.
+/// itself belongs to the core.
 pub struct RoceTransport {
     context: *mut Context,
     spec: RoceSpec,
@@ -114,15 +115,16 @@ impl RoceTransport {
     ///
     /// # Safety
     /// `spec.region_address` must name `spec.region_bytes` of mapped, locked host memory that the
-    /// package restored for this rank and that outlives the transport; no graph may run on it
+    /// core restored for this rank and that outlives the transport; no graph may run on it
     /// before `connect` returns.
     pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
-        // ABI 9 and 10 have identical kernel-visible layouts and control operations.
-        // ABI 10's wider CPU ring window is allocated by this runtime at startup.
-        if !matches!(spec.proxy_abi, 9 | 10) || abi != PROXY_ABI {
+        // ABI 9, 10 and 11 have identical kernel-visible layouts. ABI 10's wider CPU ring
+        // window is allocated by this runtime at startup. ABI 11 adds the reduce-scatter and
+        // shard-gather op kinds, which cores recording ABI 9 or 10 never post.
+        if !matches!(spec.proxy_abi, 9 | 10 | 11) || abi != PROXY_ABI {
             return Err(failure(format!(
-                "package RoCE kernels use proxy ABI {}, this runtime provides {abi}",
+                "core RoCE kernels use proxy ABI {}, this runtime provides {abi}",
                 spec.proxy_abi
             )));
         }
@@ -138,7 +140,7 @@ impl RoceTransport {
         };
         if status != 0 || layout[3] != spec.ctrl_offset || layout[4] != spec.region_bytes {
             return Err(failure(
-                "package RoCE region differs from the proxy's layout for its geometry",
+                "core RoCE region differs from the proxy's layout for its geometry",
             ));
         }
         if (topology.shape.relays() && !(2..=16).contains(&spec.world))
@@ -146,7 +148,7 @@ impl RoceTransport {
             || !(1..=super::roce_fabric::MAX_RAILS).contains(&topology.rails)
         {
             return Err(failure(format!(
-                "RoCE topology does not match the package's ranks: {} routes and {} rails for {} ranks",
+                "RoCE topology does not match the core's ranks: {} routes and {} rails for {} ranks",
                 topology.routes.len(),
                 topology.rails,
                 spec.world
@@ -161,7 +163,7 @@ impl RoceTransport {
                     .any(|(local, _)| *local as usize >= topology.hcas.len())
             {
                 return Err(failure(format!(
-                    "RoCE topology does not match the package's ranks: rank {} has {} links to rank {peer},                      expected {} ({} rails, {} HCAs)",
+                    "RoCE topology does not match the core's ranks: rank {} has {} links to rank {peer},                      expected {} ({} rails, {} HCAs)",
                     spec.rank,
                     links.len(),
                     if absent { 0 } else { topology.rails },
@@ -382,15 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn native_proxy_abi_matches_package_contract() {
+    fn native_proxy_abi_matches_core_contract() {
         // SAFETY: This query has no arguments, device access, or allocation.
         assert_eq!(unsafe { roce_abi_version() } as u32, PROXY_ABI);
     }
 
     #[test]
-    fn compatible_package_abis_still_validate_the_captured_region() {
+    fn compatible_core_abis_still_validate_the_captured_region() {
         let (region, spec, topology) = specification();
-        for abi in [8, 9, 10, 11] {
+        for abi in [8, 9, 10, 11, 12] {
             let mut spec = spec.clone();
             spec.proxy_abi = abi;
             spec.ctrl_offset += 128;
@@ -400,7 +402,7 @@ mod tests {
                 .expect("invalid layout must fail")
                 .to_string();
             assert!(
-                error.contains(if matches!(abi, 9 | 10) {
+                error.contains(if matches!(abi, 9 | 10 | 11) {
                     "region differs"
                 } else {
                     "proxy ABI"
@@ -436,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incompatible_package_and_routes_before_modifying_region() {
+    fn rejects_incompatible_core_and_routes_before_modifying_region() {
         let (region, spec, topology) = specification();
         for case in 0..10 {
             let mut spec = spec.clone();

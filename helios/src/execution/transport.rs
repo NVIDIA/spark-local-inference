@@ -1503,10 +1503,10 @@ mod input_copy_tests {
     }
 }
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod confidence_tests {
     use super::*;
-    use crate::runtime_package::driver::{CopyEndpoint, CopyParams, Driver};
+    use crate::runtime_core::driver::{CopyEndpoint, CopyParams, Driver};
 
     #[test]
     #[ignore = "requires a CUDA device selected through CUDA_VISIBLE_DEVICES"]

@@ -165,25 +165,25 @@ def benchmark_replays(model, saved, *, warmup=10, repeats=50, graph=None):
 def _rank(rank, args, rendezvous):
     import torch
     import torch.distributed as dist
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.recipes.minimax_m3.bootstrap import PreparationConfig, prepare_rank
 
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4)
-    storage = PackageStorage(rank=rank, world=4, device=rank)
+    storage = CoreStorage(rank=rank, world=4, device=rank)
     pages = 1 + 8 * math.ceil((args.history + 6) / 128)
     config = PreparationConfig(devices=(0, 1, 2, 3), compile_workers=args.compile_workers,
         context=args.context, max_active=8, expert_scale_compression=args.expert_scale_compression,
         prefill_chunk_size=args.prefill_chunk, vision=False, dspark=True,
         speculative_widths=(1, 6), speculative_token_capacity=48,
-        speculative_fixed_width=6, retain_graphs=True, kernel_cache=args.kernel_cache,
+        speculative_fixed_width=6, kernel_cache=args.kernel_cache,
         diagnostic_graphs=("verification8x6",),
         diagnostic_support_graphs=(f"prefill{args.prefill_chunk}", "proposal8x6"),
         diagnostic_cache_pages=max(pages, math.ceil(args.prefill_chunk / 128) + 16))
     with storage:
         model = prepare_rank(args.checkpoint, config, rank=rank, group=dist.group.WORLD,
-            package_storage=storage, progress=lambda message: print(f"rank={rank} {message}", flush=True))
+            core_storage=storage, progress=lambda message: print(f"rank={rank} {message}", flush=True))
     try:
         texts = json.loads(args.texts.read_text())
         if not isinstance(texts, list) or len(texts) != 8 or len(set(texts)) != 8:

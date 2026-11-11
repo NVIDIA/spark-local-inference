@@ -33,6 +33,17 @@ service utility to Rust execution, including prerequisite operations, timing
 discovery, and queued submissions. Python simulation results do not establish
 native behavior or GPU performance.
 
+Three kinds of material appear below. The fixed-value score, the
+fair-allocation reference, the completion-episode oracle, and every
+timing-learning estimator and exploration policy are implemented only in the
+Python simulator. The sections on CPU scheduling, stream age, remaining work,
+and the dynamic objective are analysis. A function they name is a reference
+calculation in `analysis.py`, not a dispatch policy. Helios implements
+the ongoing-service utility and decode-age continuation of
+[`scheduling-utility.md`](scheduling-utility.md) and, from the timing-learning
+comparison, only retained graph costs with funded remeasurement of stale
+graphs.
+
 ## Connection to CPU scheduling
 
 CPU fair scheduling distinguishes a request's entitlement from the granularity
@@ -171,8 +182,8 @@ maximize F(x) = sum_i [v_i * x_i + f_i * log(x_i / x_ref_i)].
 ```
 
 Here `v_i >= 0` is intrinsic token value, `f_i > 0` is a fairness coefficient,
-and `x_ref_i > 0` fixes the units of the logarithm. All coefficients are supplied
-explicitly to the reference. With `v_i=0`, this is weighted proportional
+and `x_ref_i > 0` fixes the units of the logarithm. The values `v_i` and `f_i`
+are supplied explicitly to the reference. With `v_i=0`, this is weighted proportional
 fairness. Concave rate utility and proportional fairness have established
 foundations in [Kelly, Maulloo, and Tan's rate-control formulation](https://www.statslab.cam.ac.uk/~frank/rate.pdf).
 
@@ -205,7 +216,9 @@ The reference has several useful properties:
   valuable. A unit conversion inside the logarithm is not a phase preference.
 
 [`analysis.py`](../scripts/scheduling_sim/analysis.py) implements `fair_allocation`
-with pairwise conditional gradients and scalar line search. It returns time
+with pairwise conditional gradients and scalar line search. Its `token_values`
+argument is `v`, its `fairness_weights` argument is `f`, and it fixes
+`x_ref_i = 1`, which changes the utility only by a constant. It returns time
 shares, rates, utility, and a concavity gap that bounds utility suboptimality.
 It fails explicitly if it cannot meet its requested numerical tolerance. This
 is an offline reference over caller-supplied action vectors, not the dispatcher.
@@ -249,7 +262,8 @@ from their arrival. Prefill requires a first-token waiting cost if such a cost
 is part of the objective; its internal chunk completions do not reset a stream
 age clock.
 
-The identity is tested by `output_age_area`. The fixed-value simulator records
+`analysis.py::output_age_area` evaluates this identity. The fixed-value
+simulator records
 output gaps and integrated linear decode age without optimizing this cost.
 The completion-episode oracle optimizes explicit time and waiting prices.
 An increasing token weight based solely on time since last service is a
@@ -357,25 +371,6 @@ It cannot exceed its best component. Looking ahead is useful because state,
 future value, or fairness changes, not because averaging unchanged rates fixes
 a starvation-prone linear objective.
 
-## Comparison with the cycle-based simulator
-
-The separate worktree `.claude/worktrees/scheduling-sim/` contains
-`scripts/schedsim/policies.py::LeximinPolicy`. It projects in-flight work,
-enumerates prefill, decode, and mixed choices, and compares short action cycles
-through phase completion. Its primary ordering is projected request slowdown;
-throughput breaks ties after feasibility filters that include a stream-gap
-limit.
-
-Its useful contributions are explicit future phase transitions, conditional
-speculative yield, and comparisons extending beyond each graph's own completion
-instant. Its lexicographic slowdown objective and stream-gap filter do not
-implement the value-rate objective specified here. Copying those filters would
-reintroduce a priority stronger than measured efficiency.
-
-Cycle projection and an isolated-completion reference can test dynamic value
-approximations. Neither establishes a universal breadth-before-depth rule,
-a preferred prefill capacity, or a fixed graph-duration ceiling.
-
 ## Running the experiments
 
 From the repository root:
@@ -423,11 +418,20 @@ not GPU occupancy or hardware efficiency.
 
 `python -m scripts.scheduling_sim.learning` compares timing estimators and
 exploration policies over the same useful-work and service-price objective.
-It preserves the fixed-cost CLI and its tests. The timing simulator has one graph
+It is a separate entry point from the fixed-cost CLI,
+`python -m scripts.scheduling_sim`. The timing simulator has one graph
 in flight with synthetic execution costs. It does not model native prerequisites,
 complete speculative B/D/W/P programs, queued submissions, cache storage, or
 tensor-parallel synchronization. Its results do not establish GPU performance
 or explain a particular service trace.
+
+Helios implements one rule from this comparison: a measured graph cost stays
+available after it becomes stale, and ordinary execution funds remeasurement
+of stale graphs (`helios/src/scheduler/cost.rs` and `refresh.rs`, specified in
+the [native timing policy](scheduling-runtime-design.md#funded-timing-refresh)).
+The `retained-refresh` policy below models that rule. The posterior estimators,
+change detectors, sampling and optimistic policies, targeted challengers, and
+service-delay accounting described in this section exist only in the simulator.
 
 The executor owns physical costs, correlated timing noise, regime changes, and
 request outcomes. A learning policy receives duration-free graph geometry,
@@ -484,8 +488,8 @@ beta'  = beta + kappa*w*(z - m)^2 / (2*(kappa + w)).
 Each observation replaces the partial contribution. Completing the block
 promotes that contribution exactly once; overlapping partial means never count
 as independent observations. This is a tempered likelihood with fractional
-block weight. Complete-block detector references, operational means, and
-lifetime history retain their existing semantics. Partial-sample interval
+block weight. Partial blocks do not change complete-block detector references,
+operational means, or lifetime history. Partial-sample interval
 coverage depends on the timing distribution and prior location. Calibration
 diagnostics include both matched and mismatched priors.
 
@@ -535,10 +539,12 @@ nominal error allowances do not guarantee coverage for arbitrary timing noise.
 ### Foreground exploration allowance
 
 By default, bootstrap is compulsory only when no feasible productive graph has a valid
-measurement. It ranks existing useful value, then existing age/padding ties;
+measurement. It ranks candidates by useful value, then by least recent service
+and smaller physical capacity;
 unknown duration is never a numeric zero denominator. Bootstrap time is recorded
-separately and earns no exploration credit. Native TTL comparisons retain their
-unknown-first selection and unknown padded-prefill exclusion. Discretionary
+separately and earns no exploration credit. The `ttl` and `jitter` policies
+instead select any unknown graph first and exclude unknown padded prefill
+graphs. Discretionary
 exploration can still try an oversized graph: equal useful work does not prove
 that the smaller captured graph is faster.
 
@@ -574,7 +580,8 @@ bursts shorter than 245 ms cannot fund a probe at the default settings.
 
 An opportunity requires an alternative physical graph and sufficient credit;
 ungated policies omit the credit condition. The counter advances on commit
-even when exploration nominates the incumbent. Except in the targeted policy,
+even when exploration nominates the incumbent. Except in the `targeted` and
+`retained-refresh` policies,
 every sixteenth opportunity selects the least recently attempted feasible
 alternative. Refresh can be disabled independently, and comparisons of funding
 use equal refresh settings.
@@ -584,7 +591,7 @@ No synthetic work runs while the execution resource is idle.
 
 The `targeted` policy ranks alternative physical graphs by optimistic useful
 value using the configured lower mean-cost quantile. Ordinary dispatch uses the
-configured operational means and the existing service-price objective.
+configured operational means and the service-price objective.
 Prices remain frozen across all candidates in one decision.
 
 A measured challenger must have a higher optimistic score than the ordinary
@@ -694,8 +701,11 @@ predictive execution sampling; and targeted challengers. The exploratory
 policies have funded and ungated variants and cumulative, regime, and
 log-regime estimator alternatives.
 
-The `retained-refresh` policy preserves native unknown-first discovery, service
-prices, useful-value ranking, and exponential timing updates. A measured cost
+The `retained-refresh` policy models the retained-cost rule that Helios
+implements: unknown-first discovery, service prices, useful-value ranking, and
+funded remeasurement of stale graphs. Its cost estimate is an exponential mean,
+whereas Helios uses the median of its last nine replay observations
+(`helios/src/scheduler/cost.rs`). A measured cost
 remains available after its 30-second lifetime. Fresh observations update its
 exponential mean with weight 1/8; the first valid observation after expiry
 replaces that mean. Expiry alone changes neither the measured value nor its
@@ -719,10 +729,10 @@ indefinitely. The aggregate exploration bound permits one graph-duration
 overrun and does not bound individual decode stalls.
 
 Retained EMA and greedy policies bootstrap only while no productive measured
-choice exists. They can leave other graphs unmeasured indefinitely. An expiry
-ablation instead uses the TTL policy with `ttl_ms = 1e12`: it preserves initial
-unknown-first discovery and EMA updates while retaining measurements throughout
-the finite experiment horizons.
+choice exists. They can leave other graphs unmeasured indefinitely. The `ttl`
+policy with `ttl_ms = 1e12` isolates the effect of expiry: it has unknown-first
+discovery and EMA updates, and no measurement expires within the experiment
+horizons.
 
 Softmax samples physical graphs using their best cohort's utility `Q`:
 
@@ -732,11 +742,12 @@ p(graph) proportional to exp((Q - Qmax) / (temperature * (Qmax - Qmin))).
 
 Equal utilities give uniform probabilities. The annealing alternative uses
 `temperature / sqrt(1 + opportunities / 100)`. Epsilon nomination is uniform
-over all feasible physical graphs, including the incumbent. The tuning grid
-uses epsilon `0.01/0.05/0.10`, temperature `0.03/0.10/0.30`, optimistic quantile
-`0.01/0.05/0.10`, and untempered Thompson sampling. One-factor sweeps support
-allowances `0.005/0.01/0.02/0.05`, credit caps `1/5/20` ms, refresh periods
-`0/4/16/64`, and block sizes `8/32`.
+over all feasible physical graphs, including the incumbent. The `--screen-grid`
+tuning grid uses epsilon `0.01/0.05/0.10`, temperature `0.03/0.10/0.30`,
+optimistic quantile `0.01/0.05/0.10`, and untempered Thompson sampling.
+`--sweep NAME=VALUE,VALUE` varies one numeric policy parameter at a time, such
+as `alpha`, `credit_cap_ms`, `refresh_every`, or `block_size`; repeat the flag
+for independent sweeps.
 
 The scenario catalog distinguishes stationary core workloads, cold/idle
 transients, recovery fixtures, and stress cases before measurements. It includes
@@ -764,11 +775,18 @@ configurations. Validation uses frozen configurations and defaults to seeds
 evaluation range disjoint from the tuning seeds. Freeze configurations before
 examining their evaluation range. The `smoke` preset has explicitly shorter
 windows and cannot qualify a policy. Validation subsets remain diagnostic.
-`--output` writes ordinary
+`--output` names a directory that must not already exist; the command fails
+rather than write into an existing one. It receives ordinary
 summary/request/calibration CSVs, configuration inputs, and comparison results.
 `--compress-requests` writes lossless `requests.csv.gz` instead of `requests.csv`.
 `--trace` streams selected graphs, estimated/sampled costs, actual timings,
 decision reasons, useful work, and credit state; tracing uses one worker.
+
+`tests/test_scheduling_timing.py` covers the estimators in `timing.py`,
+`tests/test_scheduling_learning_policy.py` the policies in `learning_policy.py`,
+`tests/test_scheduling_learning_run.py` the execution model in
+`learning_run.py`, and `tests/test_scheduling_learning_experiments.py` the
+scenarios, acceptance criteria, and CLI.
 
 `--comparison-configs` adds fixed controls from a JSON array of `id` and `config`
 objects. Controls do not enter nomination, calibration multiplicity, or winner
@@ -829,13 +847,17 @@ First-token waiting has no independent age penalty: prompt work competes by
 its useful progress and token-service price. A burst earns its accepted token
 volume and one delivery. The delivery reference accounts for feasible batching;
 changing a rate normalizer preserves marginal service prices across phases.
+Helios adds a value and an age price for terminal retirement, which the
+simulator does not model.
 
 The runtime uses no EOS-length prior. Exact conditional completion schedules
-remain an offline reference. Native prerequisite selection uses bounded
+are an offline reference. Native prerequisite selection uses bounded
 lookahead to include a following shared inference graph, with individual
 continuation values for longer chains. The stationary allocation results do not
-prove that approximation optimal. The runtime also projects two queued frames
-into service history and pauses dispatch at feedback dependencies.
+prove that approximation optimal. The runtime queues at most two frames. When
+it selects the second, it projects the queued frame's expected service into
+copies of the service prices; observed service history changes only at
+validated completion. It pauses dispatch at feedback dependencies.
 
 Unknown duration cannot be divided into reward as a numerical zero. The native
 contract uses zero to mean indeterminate, requiring an explicit exploration
@@ -843,5 +865,5 @@ choice. A measured cost stays available when stale; foreground execution funds
 remeasurement as specified in the [native timing policy](scheduling-runtime-design.md#funded-timing-refresh).
 Those bounds do not establish efficient or fair behavior during exploration.
 Native tests cover zero-cost startup, timing freshness, recovery, and phase
-transitions; real-device execution is still required to measure throughput and
-latency cost.
+transitions on synthetic catalogs. They do not establish GPU throughput or
+latency.

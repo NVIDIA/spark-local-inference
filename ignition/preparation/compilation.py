@@ -20,8 +20,11 @@ from torch._higher_order_ops.triton_kernel_wrap import get_mutated_tensors, kern
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from ignition import runtime_patches
+
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
+            'memory_planning': True, 'memory_pool': 'combined',
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
             'triton.cooperative_reductions': True,
             'compile_threads': min(16, os.cpu_count() or 1)}
@@ -125,16 +128,6 @@ def _sigmoid(source: torch.Tensor) -> torch.Tensor:
 @_sigmoid.register_fake
 def _fake_sigmoid(source):
     return torch.sigmoid(source)
-
-
-@torch.library.custom_op('flare::gelu', mutates_args=())
-def _gelu(source: torch.Tensor, approximate: str = 'none') -> torch.Tensor:
-    return torch.nn.functional.gelu(source, approximate=approximate)
-
-
-@_gelu.register_fake
-def _fake_gelu(source, approximate='none'):
-    return torch.empty_like(source)
 
 
 @torch.library.custom_op('flare::native_layer_norm', mutates_args=())
@@ -294,6 +287,7 @@ def _compile_module(module, calls, owner, output_tree):
         node.kwargs = torch.fx.node.map_aggregate(node.kwargs, portable_device)
     cache_code = torch.fx.GraphModule({}, cache_graph).code
     key = hashlib.sha256(pickle.dumps(('compiled-forward-portable-device-v1', cache_code, metadata, _OPTIONS, torch_key(),
+        runtime_patches.identity(),
         torch.cuda.get_device_capability(), torch.cuda.get_device_name()))).hexdigest()
     path = DEFAULT_CACHE_ROOT / 'compiled' / (key + '.bin')
     cache_hit = path.is_file()
@@ -358,6 +352,7 @@ def compile_forward(fn, *, tracer=None):
     weight payloads or process-local kernel handles. Each callable retains its
     own prepared invocations, buffers, and forward owner.
     """
+    runtime_patches.apply()
     output_tree = None
 
     def trace():
@@ -376,7 +371,7 @@ def _lower_storage(module):
     register_lowering(torch.ops.flare.snapshot.default)(_snapshot_lowering)
     graph = module.graph
     # FP32 rounding differences can cross a BF16 rounding boundary.
-    for node in graph.nodes:
+    for node in list(graph.nodes):
         if node.op == 'call_function' and node.target is torch.ops.aten.mean.dim:
             node.target = torch.ops.flare.mean.default
         elif (node.op == 'call_function' and node.target is torch.ops.aten.sigmoid.default
@@ -384,7 +379,11 @@ def _lower_storage(module):
             node.target = torch.ops.flare.sigmoid.default
         elif (node.op == 'call_function' and node.target is torch.ops.aten.gelu.default
                 and node.kwargs.get('approximate', 'none') == 'none'):
-            node.target = torch.ops.flare.gelu.default
+            with graph.inserting_before(node):
+                destination = graph.call_function(torch.ops.aten.empty_like.default, (node.args[0],))
+                destination.meta = node.meta.copy()
+            node.target = torch.ops.aten.gelu.out
+            node.kwargs = {**node.kwargs, 'out': destination}
         elif node.op == 'call_function' and node.target is torch.ops.aten.native_layer_norm.default:
             node.target = torch.ops.flare.native_layer_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:
@@ -642,16 +641,33 @@ def _reads_across_mutations(nodes, keys, mutations):
                  for node, operands in mutations.items() if operands}
     mutable = set().union(*mutations.values()) if mutations else set()
     live, fresh, required = {}, set(), {}
+    fresh_by_storage = {}
+    expires = [[] for _ in range(len(nodes) + 1)]
+
+    def forget(value, pending):
+        if value in fresh:
+            for key in pending:
+                values = fresh_by_storage[key]
+                values.remove(value)
+                if not values:
+                    del fresh_by_storage[key]
+
     for index, node in enumerate(nodes):
         operands = node.all_input_nodes
         reads = set().union(*(live.get(arg, set()) for arg in operands)) if operands else set()
         reads.update(keys[arg] for arg in operands if keys.get(arg) in mutable)
         if node in mutations:
-            for previous, pending in live.items():
-                if previous in fresh and last_use[previous] > index and pending & mutations[node]:
+            affected = set().union(*(fresh_by_storage.get(key, ()) for key in mutations[node]))
+            for previous in affected:
+                if last_use[previous] > index:
                     required.setdefault(previous, []).append(node)
+                    pending = live.pop(previous)
+                    forget(previous, pending)
                     pending.clear()
-        live = {value: pending for value, pending in live.items() if pending and last_use[value] > index}
+        for value in expires[index]:
+            pending = live.pop(value, None)
+            if pending:
+                forget(value, pending)
         if (node in keys and node.op == 'call_function'
                 and isinstance(node.target, torch._ops.OpOverload) and node.target.namespace == 'aten'):
             if keys[node] not in {keys[arg] for arg in operands if arg in keys}:
@@ -659,4 +675,13 @@ def _reads_across_mutations(nodes, keys, mutations):
             live[node] = reads
         elif node in keys and keys[node] in mutable:
             live[node] = {keys[node]}
+        else:
+            continue
+        pending = live[node]
+        if node in fresh:
+            for key in pending:
+                fresh_by_storage.setdefault(key, set()).add(node)
+        # Values are read before expiry, including values inserted without users.
+        end = max(index + 1, last_use[node]) if pending else index + 1
+        expires[end].append(node)
     return {node: required[node] for node in nodes if node in required}

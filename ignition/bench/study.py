@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from ignition.bench.runner import (BenchmarkCase, StateSnapshot, _check_metadata, _prefill, _round,
-                                   acceptance_observation, measurement_result)
+from ignition.bench.executor import StateSnapshot
+from ignition.bench.observations import ObservationForward
+from ignition.bench.runner import (BenchmarkCase, _check_metadata, _message, _observe,
+                                   _prefill, _round, _upload_step, acceptance_observation, measurement_result)
 
 
 @dataclass(frozen=True)
@@ -29,15 +31,14 @@ class StudySignature:
 
 
 class SpeculationStudy:
-    def __init__(self, owner, width, *, buffers):
-        from ignition.components.parallel_draft import PreparedParallelDraftRound
-
+    def __init__(self, owner, width):
         self.owner, self.width = owner, width
         self.name = f"speculation-study-w{width}-block{owner.block_size}"
         self.signature = StudySignature(width, owner.block_size)
-        self.forward = PreparedParallelDraftRound(owner, 1, width, self.name,
-                                                  target_token_capacity=width, buffers=buffers)
-        self.forward.prepare()
+        self.forward = owner.round(1, width, self.name, target_token_capacity=width)
+        self.observer = ObservationForward(self.forward, rows=self.forward.batch,
+            device=owner.requests.generation.device, draft=self.forward.draft is not None, acceptance_width=width)
+        self.observation_name = self.name + "-observations"
         self.graphs, self.compiled = {}, {}
 
     def capture(self, *, cache_root, **kwargs):
@@ -45,8 +46,11 @@ class SpeculationStudy:
 
         root = None if cache_root is None else Path(cache_root) / self.name
         self.graphs, self.compiled = capture_forwards(
-            {self.name: self.forward}, {self.name: self.signature}, cache_root=root,
+            {self.name: self.forward, self.observation_name: self.observer},
+            {self.name: self.signature, self.observation_name: self.signature}, cache_root=root,
             report_catalog=False, label="Capture speculative depth study", **kwargs)
+        self.observation_source = ("compiled_untimed_diagnostic_graph" if kwargs.get("compile_decoder", True)
+                                   else "untimed_diagnostic_graph")
 
     def close(self):
         import torch
@@ -56,6 +60,7 @@ class SpeculationStudy:
             graph.reset()
         self.graphs.clear()
         self.compiled.clear()
+        self.observer.outputs.clear()
 
 
 class StudyModel:
@@ -65,7 +70,7 @@ class StudyModel:
         self.model, self.studies = model, studies
 
     def manifest(self, **kwargs):
-        raise ValueError("speculation studies cannot produce native package metadata")
+        raise ValueError("speculation studies cannot produce native core metadata")
 
     def __enter__(self):
         return self
@@ -79,6 +84,23 @@ class StudyModel:
                 study.close()
         finally:
             self.model.close()
+
+
+def _check_request_state(model, scheduler, case):
+    request = scheduler.active[0]
+    slot = request.slot
+    state = model.benchmark_requests
+    emitted = int(state.generated_tokens[slot].item()) - len(request.generated)
+    pending = int(state.pending_token[slot].item())
+    if (int(state.error_code[slot].item()) != 0 or not 1 <= emitted <= case.width
+            or int(state.rng_counter[slot].item()) != len(request.generated) + emitted
+            or int(state.generation[slot].item()) != request.generation
+            or int(state.seed[slot].item()) != request.sampling.seed
+            or int(state.histogram[slot].sum().item()) != len(request.prompt) + len(request.generated) + emitted
+            or int(state.consumed_tokens[slot].item()) != case.context_tokens + emitted
+            or not 0 <= pending < state.histogram.shape[1] or int(state.histogram[slot, pending].item()) < 1):
+        raise RuntimeError("study replay produced invalid committed request state")
+    return emitted
 
 
 def run_study(prepared, tokenizer, *, scenarios, warmup, repetitions, seeds, progress=None):
@@ -103,10 +125,10 @@ def run_study(prepared, tokenizer, *, scenarios, warmup, repetitions, seeds, pro
         for case in value["cases"]:
             case["effective_draft_block"] = studies[case["width"]].owner.block_size
             for sample in case["samples"]:
-                if sample.get("times_ms") and "acceptance" in sample:
+                if sample.get("times_ms"):
                     import statistics
 
-                    emitted = sum(row["emitted_count"] for row in sample["acceptance"]["requests"])
+                    emitted = statistics.median(sample["emitted_counts"])
                     sample["useful_tokens_per_gpu_second"] = emitted * 1000 / statistics.median(sample["times_ms"])
         return value
 
@@ -128,15 +150,31 @@ def run_study(prepared, tokenizer, *, scenarios, warmup, repetitions, seeds, pro
                                     context_tokens=context, max_new_tokens=request.max_new_tokens)
                 for case, samples in selected:
                     study = studies[case.width]
-                    sample = dict(seed=seed, times_ms=[], shared_input=shared_input.copy())
+                    sample = dict(seed=seed, times_ms=[], emitted_counts=[], shared_input=shared_input.copy())
                     samples.append(sample)
+                    scheduler = deepcopy(baseline, {id(layout): layout})
+                    snapshot.restore(runner.stream)
+                    step = _round(scheduler, BenchmarkCase(1, 8, 8, case.context_tokens))
+
+                    def observe():
+                        study.owner.inputs.query_lengths[:1].fill_(case.width)
+                        study.graphs[study.observation_name].replay()
+                        return study.observer.outputs
+
+                    observations = _observe(runner, observe, _message(scheduler, step))
+                    _check_metadata(SimpleNamespace(benchmark_rounds={study.name: study.forward}),
+                        SimpleNamespace(graph=study.name, lanes=step.lanes, draft_tokens=case.width - 1),
+                        case, observations)
+                    sample["acceptance"] = dict(acceptance_observation(observations),
+                                                observation_source=study.observation_source)
+                    _check_request_state(model, scheduler, case)
+                    del observations
                     for iteration in range(-1, warmup + repetitions):
                         scheduler = deepcopy(baseline, {id(layout): layout})
                         snapshot.restore(runner.stream)
                         step = _round(scheduler, BenchmarkCase(1, 8, 8, case.context_tokens))
                         with torch.cuda.stream(runner.stream), torch.no_grad():
-                            for name, offset, data in scheduler.pack(step):
-                                runner._upload(name, offset, data)
+                            _upload_step(runner, _message(scheduler, step))
                             study.owner.inputs.query_lengths[:1].fill_(case.width)
                             allocated = torch.cuda.memory_allocated(runner.device)
                             runner.started.record(runner.stream)
@@ -146,27 +184,10 @@ def run_study(prepared, tokenizer, *, scenarios, warmup, repetitions, seeds, pro
                         elapsed = runner.started.elapsed_time(runner.finished)
                         if torch.cuda.memory_allocated(runner.device) != allocated:
                             raise RuntimeError("study replay changed allocated CUDA memory")
-                        commit = study.forward.operations[3]
-                        emitted = int(commit.emitted_count[0].item())
-                        request = scheduler.active[0]
-                        slot = request.slot
-                        state = model.benchmark_requests
-                        if (not bool(study.forward.operations[2].output.valid[0].item())
-                                or int(state.error_code[slot].item()) != 0 or not 1 <= emitted <= case.width
-                                or int(state.generated_tokens[slot].item()) != len(request.generated) + emitted
-                                or int(state.rng_counter[slot].item()) != len(request.generated) + emitted
-                                or int(state.generation[slot].item()) != request.generation
-                                or int(state.seed[slot].item()) != request.sampling.seed
-                                or int(state.histogram[slot].sum().item()) != len(request.prompt) + len(request.generated) + emitted
-                                or int(state.consumed_tokens[slot].item()) != case.context_tokens + emitted
-                                or int(state.pending_token[slot].item()) != int(commit.emitted_ids[0, emitted - 1].item())):
-                            raise RuntimeError("study replay produced invalid committed request state")
-                        if iteration == -1:
-                            _check_metadata(SimpleNamespace(benchmark_rounds={study.name: study.forward}),
-                                SimpleNamespace(graph=study.name, lanes=step.lanes, draft_tokens=case.width - 1), case)
-                            sample["acceptance"] = acceptance_observation(study.forward)
+                        emitted = _check_request_state(model, scheduler, case)
                         if iteration >= warmup:
                             sample["times_ms"].append(elapsed)
+                            sample["emitted_counts"].append(emitted)
                     if progress is not None:
                         progress(result("running"))
                 snapshot.restore(runner.stream)

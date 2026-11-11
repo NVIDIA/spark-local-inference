@@ -55,11 +55,11 @@ def weights():
     from ignition.components.dflash2_weights import DraftWeights
     from ignition.components.parallel import TensorParallelShard
     from ignition.recipes.qwen38_dense.config import ModelConfig
-    from ignition.recipes.qwen38_dense.draft_config import DraftConfig
+    from ignition.recipes.qwen38_dense.draft_config import load as load_draft
     if not all((path / "config.json").is_file() for path in (TARGET, DRAFT)):
         pytest.skip("requires pinned Qwen3.8-27B target and DFlash2 checkpoints")
     target = ModelConfig.load(TARGET)
-    config = replace(target, draft=DraftConfig.load(DRAFT, target))
+    config = replace(target, draft=load_draft(DRAFT, target))
     shard = TensorParallelShard(0, 1)
     return SimpleNamespace(config=config, shard=shard,
         draft=DraftWeights.load(DRAFT, config.draft, "cuda:0", shard, online_mxfp8=True))
@@ -128,19 +128,22 @@ def test_context_compiled_mutable_replay_ring_wrap_and_inactive_rows(weights):
     from b12x.preparation import PreparationSession
     from ignition.components.dflash2 import PreparedContext
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     torch.manual_seed(5027)
     source = torch.randn((16, 25600), device="cuda", dtype=torch.bfloat16)
     batch, history = metadata(2), rings()
     set_metadata(batch, [2047, 0], [8, 0], [1, 2])
     counts = torch.tensor([8, 0], device="cuda", dtype=torch.int32)
-    buffers, arena = GraphBufferPool("cuda"), ScratchArena("cuda")
+    arena = ScratchArena("cuda")
     with PreparationSession(device="cuda:0", autotune=False) as session:
         context = PreparedContext(weights, source, batch, SimpleNamespace(reserved_region=history.__getitem__),
-            session=session, name="mxfp8.context", workspace=arena, runtime=None, coordinator=None,
-            buffers=buffers.cursor())
+            session=session, name="mxfp8.context", workspace=arena, runtime=None, coordinator=None)
+        from tests.components.dflash_readback_support import ProjectionReadback
+        projected_readback = torch.empty((16, 5120), dtype=torch.bfloat16, device="cuda")
+        kv_readback = torch.empty((16, 10240), dtype=torch.bfloat16, device="cuda")
+        context.project_kv = ProjectionReadback(context.project_kv, kv_readback, source=projected_readback)
         arena.finalize()
-        forward = compile_forward(lambda: context(source, counts))
+        forward = compile_forward(lambda: context(source, counts, batch))
         forward()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -153,10 +156,10 @@ def test_context_compiled_mutable_replay_ring_wrap_and_inactive_rows(weights):
                 tensor.fill_(7)
             replay(graph)
             projected = rms(projection_reference(context.project, source), weights.draft.hidden_norm)
-            check(context.projected, projected)
-            kv = projection_reference(context.project_kv, context.projected).view(16, 5, 2048)
-            check(context.kv, kv.flatten(1))
-            kv = context.kv.view(16, 5, 2048)
+            check(projected_readback, projected)
+            kv = projection_reference(context.project_kv, projected_readback).view(16, 5, 2048)
+            check(kv_readback, kv.flatten(1))
+            kv = kv_readback.view(16, 5, 2048)
             for index, layer in enumerate(weights.draft.layers):
                 key = rotary(rms(kv[:, index, :1024].reshape(16, 8, 128), layer.key_norm), batch.positions)
                 value = kv[:, index, 1024:].reshape(16, 8, 128)
@@ -175,10 +178,11 @@ def test_context_compiled_mutable_replay_ring_wrap_and_inactive_rows(weights):
 @torch.no_grad()
 def test_attention_mlp_compiled_mutable_replay(weights, index):
     from b12x.preparation import PreparationSession
-    from ignition.components.dflash2 import DraftAttention, DraftScratch
+    from ignition.components.dflash2 import DraftAttention, DraftScratch, _draft_templates
+    from tests.components.dflash_readback_support import ProjectionReadback
     from ignition.components.mlp import PreparedMLP
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     torch.manual_seed(2718 + index)
     source = torch.randn((8, 5120), device="cuda", dtype=torch.bfloat16)
     batch, history = metadata(), rings()
@@ -186,18 +190,30 @@ def test_attention_mlp_compiled_mutable_replay(weights, index):
     for tensor in history.values():
         tensor.copy_((torch.randn(tensor.shape, device="cuda") * .1).to(torch.float8_e4m3fn))
     saved = {name: value.view(torch.uint8).clone() for name, value in history.items()}
-    buffers, private, arena = GraphBufferPool("cuda"), GraphBufferPool("cuda"), ScratchArena("cuda")
+    arena = ScratchArena("cuda")
     layer = weights.draft.layers[index]
     with PreparationSession(device="cuda:0", autotune=False) as session:
-        scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 8, "cuda", buffers=buffers.cursor())
+        geometry = DraftScratch.allocate(weights.config.draft, weights.shard, 8, "cuda")
+        scratch = _draft_templates(weights.config.draft, weights.shard, geometry, "cuda")
         attention = DraftAttention(index, layer, source, weights.config.draft, weights.shard, scratch, batch,
             SimpleNamespace(reserved_region=history.__getitem__), runtime=None, coordinator=None,
-            session=session, name=f"mxfp8.attention{index}", workspace=arena, buffers=private.cursor())
+            session=session, name=f"mxfp8.attention{index}", workspace=arena)
         mlp = PreparedMLP(source, layer.mlp, scratch.mlp.gate_up, scratch.mlp.intermediate, scratch.mlp.output,
             session=session, name=f"mxfp8.mlp{index}", workspace=arena)
+        attention.functional()
+        mlp.functional(session=session)
+        mlp.up_projection = ProjectionReadback(mlp.up_projection, scratch.mlp.gate_up)
+        mlp.down_projection = ProjectionReadback(mlp.down_projection, scratch.mlp.output,
+                                                  source=scratch.mlp.intermediate)
         arena.finalize()
         def body():
-            attention(source)
+            projected, query, key, value = attention.project(source, batch)
+            attended = attention.attend(query, key, value, batch)
+            output = attention.reduce(attention.output(attended.flatten(1)))
+            for destination, actual in ((scratch.qkv, projected), (scratch.query, query),
+                    (scratch.key, key), (scratch.value, value), (scratch.attended, attended.view_as(scratch.attended)),
+                    (scratch.output, output)):
+                destination.copy_(actual)
             mlp(source)
         forward = compile_forward(body)
         forward()

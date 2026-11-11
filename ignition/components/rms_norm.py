@@ -4,14 +4,42 @@
 
 """Prepared RMS normalization reading projection slices with explicit row strides."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
+from b12x.norm import torch_rmsnorm
 from b12x.norm.hyperconnection import api as hyperconnection
 from b12x.preparation import PreparedCall
 
 from ignition.preparation.fixtures.hyperconnection import HyperconnectionBenchmarkInputs
+from ignition.preparation.persistent import persistent_cat
 from ignition.preparation.tuning import benchmark_resource, declare
+
+
+class PreparedTorchRMSNorm:
+    """Caller-owned BF16 RMSNorm with Torch's vectorized FP32 arithmetic."""
+
+    def __init__(self, source, weight, output, *, eps, session, name):
+        self.weight, self.output = weight, output
+        self.eps = torch.finfo(torch.float32).eps if eps is None else float(eps)
+        query = torch_rmsnorm.query_from_call(source, weight, out=output, eps=self.eps)
+        self.plan = torch_rmsnorm.plan(query, device=source.device)
+        declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(source, weight, out=output, eps=self.eps), output=output)),))
+
+    def functional(self, *, session):
+        del session
+        self.output_layout = (tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype)
+        self.output = None
+        return self
+
+    def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        torch.ops.b12x.torch_rmsnorm(source, self.weight, output, self.eps, self.plan.handle)
+        return output
 
 
 class PreparedRMSNorm:
@@ -66,6 +94,10 @@ class PreparedRMSNorm:
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(prepared_source, weight, output, **kwargs)),
             benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalRMSNorm(self.weight, self.plan, self.eps, self.zero_centered,
+                                  self.add_residual, self.staging is not None)
+
     def __call__(self, source, residual=None):
         original_source = source
         if self.staging is not None:
@@ -80,6 +112,31 @@ class PreparedRMSNorm:
             torch.ops.b12x.hyperconnection_grouped_rmsnorm(
                 source, self.weight, self.output, self.eps, self.plan.handle, self.zero_centered)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+    zero_centered: bool
+    add_residual: bool
+    stage_source: bool
+
+    def __call__(self, source, residual=None):
+        original = source
+        if self.stage_source:
+            source = source.contiguous()
+        output = torch.empty(source.shape, dtype=torch.bfloat16, device=source.device)
+        if self.add_residual:
+            torch.ops.b12x.hyperconnection_residual_rmsnorm(
+                source, residual, self.weight, output, self.eps, self.plan.handle, self.zero_centered)
+            if self.stage_source:
+                original.copy_(source)
+        else:
+            torch.ops.b12x.hyperconnection_grouped_rmsnorm(
+                source, self.weight, output, self.eps, self.plan.handle, self.zero_centered)
+        return output
 
 
 class PreparedIndexedRMSNorm:
@@ -116,10 +173,26 @@ class PreparedIndexedRMSNorm:
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalIndexedRMSNorm(self.weight, self.plan, self.eps)
+
     def __call__(self, source, indices):
         torch.ops.b12x.hyperconnection_indexed_rmsnorm(
             source, self.weight, indices, self.output, self.eps, self.plan.handle)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalIndexedRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+
+    def __call__(self, source, indices):
+        output = torch.empty((indices.numel(), source.shape[1]), dtype=torch.bfloat16, device=source.device)
+        torch.ops.b12x.hyperconnection_indexed_rmsnorm(
+            source, self.weight, indices, output, self.eps, self.plan.handle)
+        return output
 
 
 class PreparedPairedRMSNorm:
@@ -131,7 +204,7 @@ class PreparedPairedRMSNorm:
                 or len(weights) != 2 or any(w.shape != left.shape[1:] for w in weights)
                 or weights[0].dtype != weights[1].dtype):
             raise ValueError("paired normalization requires two BF16 matrices and matching gains")
-        self.weight, self.output, self.eps = torch.cat(weights), output, float(eps)
+        self.weight, self.output, self.eps = persistent_cat(weights), output, float(eps)
         self.plan = hyperconnection.plan(hyperconnection.Caps(device=left.device,
             max_tokens=left.shape[0], hidden_size=left.shape[1], streams=2, lowrank=1),
             invocation={"operation": "grouped_rmsnorm", "zero_centered": zero_centered, "eps": self.eps,
@@ -147,6 +220,21 @@ class PreparedPairedRMSNorm:
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(
                 left, self.weight, output, eps=self.eps, paired=right)), benchmark_call=benchmark),))
 
+    def functional(self):
+        return _FunctionalPairedRMSNorm(self.weight, self.plan, self.eps)
+
     def __call__(self, left, right):
         torch.ops.b12x.hyperconnection_paired_rmsnorm(left, right, self.weight, self.output, self.eps, self.plan.handle)
         return self.output
+
+
+@dataclass(frozen=True)
+class _FunctionalPairedRMSNorm:
+    weight: torch.Tensor
+    plan: object
+    eps: float
+
+    def __call__(self, left, right):
+        output = torch.empty((left.shape[0], 2 * left.shape[1]), dtype=torch.bfloat16, device=left.device)
+        torch.ops.b12x.hyperconnection_paired_rmsnorm(left, right, self.weight, output, self.eps, self.plan.handle)
+        return output

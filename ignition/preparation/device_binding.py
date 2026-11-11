@@ -81,9 +81,12 @@ def _device_source(source, original, target, kernel_keys=None):
                 kernel_keys[CompiledTritonKernels.key(kernel.value)] = CompiledTritonKernels.key(rebound)
             replace(kernel, repr(rebound))
     data = source.encode()
-    for start, end, value in sorted(replacements, reverse=True):
-        data = data[:start] + value + data[end:]
-    return data.decode()
+    parts, offset = [], 0
+    for start, end, value in sorted(replacements):
+        parts.extend((data[offset:start], value))
+        offset = end
+    parts.append(data[offset:])
+    return b"".join(parts).decode()
 
 
 def _freeze_tuning_winners(bundle):

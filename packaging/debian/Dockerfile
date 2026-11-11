@@ -16,6 +16,7 @@ ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 WORKDIR /src
 COPY flare/ flare/
+COPY flare-cli/ flare-cli/
 COPY helios/ helios/
 COPY eos/ eos/
 COPY selene/ selene/
@@ -32,9 +33,9 @@ ARG PACKAGE_MAINTAINER
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,id=flare-deb-noble-${TARGETARCH},target=/src/flare/target \
+    --mount=type=cache,id=flare-deb-noble-${TARGETARCH},target=/src/flare-cli/target \
     rustup component add rust-docs \
-    && cargo build --locked --release --jobs 8 --manifest-path flare/Cargo.toml --bin flare \
+    && cargo build --locked --release --jobs 8 --manifest-path flare-cli/Cargo.toml --bin flare \
     && packaging/debian/package.sh
 
 FROM scratch AS artifact

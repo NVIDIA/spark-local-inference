@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 from google.protobuf.json_format import ParseDict
 
-from ignition.preparation import contract as c, runtime_package_pb2 as p
+from ignition.preparation import contract as c, runtime_core_pb2 as p
 from ignition.preparation.execution import GraphSignature
 
 

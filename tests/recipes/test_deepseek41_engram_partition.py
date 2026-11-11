@@ -11,12 +11,12 @@ import pytest
 from b12x.sequence import engram
 
 from ignition.components.parallel import TensorParallelShard
-from ignition.preparation.runtime_package import FileSource
+from ignition.preparation.runtime_core import FileSource
 from ignition.recipes.deepseek41.engram import Tables
 
 
 @pytest.mark.parametrize("world", [1, 2, 3, 4, 8])
-def test_package_planes_and_resident_segments_preserve_full_table_bytes(tmp_path, world):
+def test_core_planes_and_resident_segments_preserve_full_table_bytes(tmp_path, world):
     geometry = engram.build_geometry(layer_ids=(1,), base_table_size=101, compressed_vocab_size=32)
     rows = geometry.num_embeddings[0]
     sources, contents = [], []

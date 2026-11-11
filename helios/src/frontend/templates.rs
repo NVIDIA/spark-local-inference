@@ -20,7 +20,7 @@ struct AnnotationPatch {
 
 pub(super) fn compile(source: &str) -> Result<CompiledTemplate, Error> {
     // Upgrade only the exact previously deployed assets. No upstream template
-    // text is embedded in the binary; the package supplies the source bytes.
+    // text is embedded in the binary; the core supplies the source bytes.
     let digest = format!("{:x}", Sha256::digest(source.as_bytes()));
     for encoded in [QWEN, STEP] {
         let patch: AnnotationPatch =

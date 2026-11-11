@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#![cfg(all(feature = "server", feature = "runtime-package"))]
+#![cfg(all(feature = "server", feature = "runtime-core"))]
 
 #[path = "support/native_prefix.rs"]
 mod native_prefix;

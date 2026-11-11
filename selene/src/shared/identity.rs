@@ -25,7 +25,7 @@ pub struct RankPlanes {
     pub row_bytes: u64,
 }
 
-/// The record geometry of one model package on one rank layout.
+/// The record geometry of one model core on one rank layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Geometry {
     pub page_tokens: u64,
@@ -43,7 +43,7 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The scope of the records a model package writes on `geometry`, one
+    /// The scope of the records a model core writes on `geometry`, one
     /// element per rank, under `layout_fingerprint` (see
     /// [`crate::geometry::fingerprint`] and `shard_fingerprint`).
     pub fn new(

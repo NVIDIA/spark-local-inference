@@ -189,7 +189,7 @@ impl Layout {
 
 /// 16-byte BLAKE2b digest over the rank count, page token count, and every
 /// rank's ordered plane names and unit sizes and row name and unit size.
-/// Packages sharing a model identity can differ here, for example when they
+/// Cores sharing a model identity can differ here, for example when they
 /// were prepared with different draft-token counts.
 pub fn fingerprint(geometry: &[CacheGeometry]) -> [u8; 16] {
     let mut hash = Blake2b::<U16>::new();

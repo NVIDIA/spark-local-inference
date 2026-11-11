@@ -16,13 +16,15 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [features]
 default = []
 test-tools = []
-runtime-package = ["dep:serde", "dep:serde_json", "dep:prost", "dep:prost-build", "dep:ring", "dep:zstd"]
+# Compatibility alias for existing Rust consumers.
+runtime-package = ["runtime-core"]
+runtime-core = ["dep:serde", "dep:serde_json", "dep:prost", "dep:prost-build", "dep:ring", "dep:zstd"]
 frontend = ["dep:serde", "dep:tokenizers", "dep:serde_json", "dep:sha2", "dep:ryu", "dep:deepseek-recipe-core", "dep:deepseek-recipe-encoding"]
 images = ["frontend", "dep:png", "dep:turbojpeg", "dep:image-webp"]
 grammar = ["frontend", "dep:llguidance"]
 server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-stream", "dep:base64", "dep:ratatui", "dep:crossterm", "dep:futures-util", "dep:flate2", "dep:zstd", "dep:brotli", "dep:httpdate", "dep:deepseek-recipe"]
 # RoCEnante's RDMA proxy for ranks on separate hosts; links libibverbs.
-roce = ["dep:cc", "runtime-package"]
+roce = ["dep:cc", "runtime-core"]
 # Lets the prefix cache pool's data channel use RDMA when its manager offers it (experimental);
 # links libibverbs.
 rdma = ["flare-selene/rdma"]
@@ -79,16 +81,16 @@ harness = false
 required-features = ["frontend"]
 
 [[bin]]
-name = "test_fixed_runtime_package"
-path = "tests/tools/test_fixed_runtime_package.rs"
-required-features = ["runtime-package", "test-tools"]
+name = "test_fixed_runtime_core"
+path = "tests/tools/test_fixed_runtime_core.rs"
+required-features = ["runtime-core", "test-tools"]
 test = false
 bench = false
 
 [[bin]]
-name = "test_runtime_package"
-path = "tests/tools/test_runtime_package.rs"
-required-features = ["runtime-package", "test-tools"]
+name = "test_runtime_core"
+path = "tests/tools/test_runtime_core.rs"
+required-features = ["runtime-core", "test-tools"]
 test = false
 bench = false
 
@@ -128,9 +130,9 @@ test = false
 bench = false
 
 [[bin]]
-name = "test_package_protection"
-path = "tests/tools/test_package_protection.rs"
-required-features = ["runtime-package", "test-tools"]
+name = "test_core_protection"
+path = "tests/tools/test_core_protection.rs"
+required-features = ["runtime-core", "test-tools"]
 test = false
 bench = false
 

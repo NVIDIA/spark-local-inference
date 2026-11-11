@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity
+from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, serving_modes
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
@@ -70,8 +70,12 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    mtp_only: bool = False
 
     def __post_init__(self):
+        if self.mtp_only and (not self.dflash
+                or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
+            raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Muse Spark draft model supports at most seven draft tokens")
         if len(self.devices) != 8 or len(set(self.devices)) != 8 or any(d < 0 for d in self.devices):
@@ -112,7 +116,7 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
-def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage):
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     from .recipe import RECIPE
 
     snapshot = Path(snapshot).resolve()
@@ -125,11 +129,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         draft_headers = ([s.header_sha256 for s in inspect_indexed_checkpoint(config.draft_snapshot).shards]
                          if config.dflash else [])
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress,
-        package_storage=package_storage, draft_snapshot=config.draft_snapshot if config.dflash else None)
+        core_storage=core_storage, draft_snapshot=config.draft_snapshot if config.dflash else None)
     del manifest
     release_unused()
     transient = contextlib.ExitStack()
-    transient.enter_context(package_storage.transient())
+    transient.enter_context(core_storage.transient())
     layout = continuation_layout(weights.config, shard, dflash=config.dflash)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if snapshots < 1:
@@ -141,7 +145,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.allocate(weights.config, shard, state_rows + 1, pages, device,
-            storage=package_storage, maximum_pages=total_memory // page_bytes(weights.config, shard),
+            storage=core_storage, maximum_pages=total_memory // page_bytes(weights.config, shard),
             maximum_rows=total_memory // layout.row_bytes, backed_slots=min(state_rows + 1, 1 + 2 * slots),
             dflash=config.dflash)
         vocabulary = weights.config.vocabulary
@@ -158,17 +162,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         routed_width = weights.config.text["num_experts_per_tok"] * expert_width
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=max(config.decode_tokens, draft_rows), hidden_size=routed_width,
-            ipc=package_storage.peer_storage)
+            ipc=core_storage.peer_storage)
         prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
-            hidden_size=routed_width, ipc=package_storage.peer_storage)
+            hidden_size=routed_width, ipc=core_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, draft_rows),
             columns=weights.config.vocabulary_partition(shard)[2] * shard.world_size,
-            ipc=package_storage.peer_storage)
+            ipc=core_storage.peer_storage)
         embedding_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
-            columns=weights.config.hidden, ipc=package_storage.peer_storage)
+            columns=weights.config.hidden, ipc=core_storage.peer_storage)
         preexpert_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
-            columns=expert_width, ipc=package_storage.peer_storage)
+            columns=expert_width, ipc=core_storage.peer_storage)
         identity = hashlib.sha256(json.dumps(dict(config=weights.config.text, headers=headers,
             draft=None if weights.config.draft is None else weights.config.draft.text,
             draft_headers=draft_headers, kv_dtype="float8_e4m3fn",
@@ -178,14 +182,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             tuning_replica=config.tuning_replica, native_dense_activations=config.native_dense_activations,
             lock_gpu_clocks=config.lock_gpu_clocks, device=device, checkpoint=identity,
             workload_schema="muse_spark", numerical_policy="default", coordinator=coordinator,
-            headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
+            headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
         arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
         graph_buffers, private_buffers = (GraphBufferPool(device, chunk_bytes=2 << 20) for _ in range(2))
         target_buffers = GraphBufferPool(device, chunk_bytes=2 << 20) if config.dflash else None
         context_buffers = GraphBufferPool(device, chunk_bytes=2 << 20) if config.dflash else None
-        with package_storage.scratch_pool() as scratch_pool:
+        with core_storage.scratch_pool() as scratch_pool:
             prefill_storage = Scratch.allocate(weights.config, shard, config.prefill_chunk_size, 1, device,
                                                buffers=graph_buffers.cursor())
             decode_storage = Scratch.allocate(weights.config, shard, config.decode_tokens, config.decode_samples, device,
@@ -207,7 +211,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 buffers=graph_buffers.cursor(), decoder_buffers=target_buffers.cursor(),
                 context_buffers=context_buffers.cursor())
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
     prefills, batches = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     with phase(progress, "Construct graph catalog"):
@@ -220,7 +224,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                               packed_token_capacity=packed_tokens)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
-        modes = (True, False) if config.dflash else (False,)
+        modes = serving_modes(config.dflash, config.mtp_only)
         for enabled in modes:
             suffix = "-no-mtp" if config.dflash and not enabled else ""
             mode_weights = weights if enabled else replace(weights, draft=None)
@@ -274,7 +278,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
-    stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
+    stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
     if config.compile_decoder:
         scratch_pool.release_backing()
 
@@ -286,7 +290,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
-            materialize=materialize, warmup_storage=package_storage,
+            materialize=materialize, warmup_storage=core_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative"))
     finally:
         scratch_pool.materialize()

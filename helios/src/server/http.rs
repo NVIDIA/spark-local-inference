@@ -30,7 +30,7 @@ fn rejection(
     stage: &str,
     failure: Error,
 ) -> Response {
-    log_failure(id, stage, &failure);
+    if state.log_to_stderr { log_failure(id, stage, &failure); }
     let mut body = protocol.failure(&failure);
     let (status, message) = rejection_details(state, failure);
     body["error"]["message"] = message.into();
@@ -124,6 +124,8 @@ pub(super) async fn generate(
     Extension(ingress): Extension<Arc<OwnedSemaphorePermit>>,
     request: Request,
 ) -> Response {
+    let admitted_at = request.extensions().get::<super::AdmittedAt>().map(|at| at.0).unwrap_or_else(Instant::now);
+    let mut first_response = state.first_response.observe(admitted_at);
     let ingress_ns = observation::monotonic_ns();
     let protocol = Protocol::from_path(request.uri().path());
     let count = request.uri().path() == "/v1/messages/count_tokens";
@@ -571,11 +573,15 @@ pub(super) async fn generate(
     };
     if streaming {
         let request_id = id.clone();
+        let log_to_stderr = state.log_to_stderr;
         let events = delivery.filter_map(move |event| {
             let event = match event {
-                Delivery::Frame(frame) => Some(Ok::<_, Infallible>(frame.sse())),
+                Delivery::Frame(frame) => {
+                    if super::latency::stream_text(&frame.data) { first_response.output(); }
+                    Some(Ok::<_, Infallible>(frame.sse()))
+                }
                 Delivery::Failed(error, frame) => {
-                    log_failure(&request_id, "stream", &error);
+                    if log_to_stderr { log_failure(&request_id, "stream", &error); }
                     Some(Ok::<_, Infallible>(frame.sse()))
                 }
                 Delivery::Complete(_) => None,
@@ -592,7 +598,17 @@ pub(super) async fn generate(
         futures_util::pin_mut!(delivery);
         while let Some(event) = delivery.next().await {
             match event {
-                Delivery::Complete(body) => return with_request_id(Json(body).into_response(), &id),
+                Delivery::Complete(body) => {
+                    let visible = super::latency::response_text(&body);
+                    let response = with_request_id(Json(body).into_response(), &id);
+                    if !visible { return response; }
+                    let (parts, body) = response.into_parts();
+                    let body = body.into_data_stream().map(move |chunk| {
+                        if chunk.as_ref().is_ok_and(|bytes| !bytes.is_empty()) { first_response.output(); }
+                        chunk
+                    });
+                    return Response::from_parts(parts, axum::body::Body::from_stream(body));
+                }
                 Delivery::Failed(e, _) => return rejection(&state, protocol, &id, "generation", e),
                 _ => {}
             }

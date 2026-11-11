@@ -7,14 +7,15 @@
 import ctypes
 import gc
 import os
+import re
 from pathlib import Path
 
 _WORKER_BYTES = 2 << 30
+# Conservative concurrency estimate; complete-forward tracing can outgrow kernel tuning workers.
+FORWARD_WORKER_BYTES = 32 << 30
 _HEADROOM_BYTES = 8 << 30
 # Kernel modules and temporary compiler objects retained by each tuning rank.
 _TUNING_GROWTH_BYTES = 1 << 30
-# One Inductor compile subprocess inside a forward compiler.
-_COMPILE_THREAD_BYTES = 512 << 20
 # Host memory a preparing process holds for each compiled forward it restores to warm and capture:
 # its generated module and kernel launchers. On GB10, both GLM TP2 ranks grew 3.47-3.50 GB (62 MiB
 # per forward) from KV allocation through loading 56 forwards, warmup and capturing 80 graphs.
@@ -47,6 +48,37 @@ def release_unused(*, generation=2):
     trim(0)
 
 
+def _cgroup_available_bytes(cgroups=Path("/proc/self/cgroup"), mounts=Path("/proc/self/mountinfo")):
+    """Remaining memory under every visible finite cgroup-v2 ancestor limit."""
+    group = next((Path(line.split(":", 2)[2]) for line in cgroups.read_text().splitlines()
+                  if line.startswith("0::")), None)
+    if group is None:
+        return None
+    remaining = []
+    for line in mounts.read_text().splitlines():
+        location, filesystem = line.split(" - ", 1)
+        if filesystem.split()[0] != "cgroup2":
+            continue
+        fields = location.split()
+        root, mount = (Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value))
+                       for value in fields[3:5])
+        if not group.is_relative_to(root):
+            continue
+        directory = mount / group.relative_to(root)
+        while True:
+            try:
+                limit = (directory / "memory.max").read_text().strip()
+                if limit != "max":
+                    used = int((directory / "memory.current").read_text())
+                    remaining.append(max(0, int(limit) - used))
+            except FileNotFoundError:
+                pass
+            if directory == mount:
+                break
+            directory = directory.parent
+    return min(remaining, default=None)
+
+
 def available_bytes():
     if os.name == "nt":
         class MemoryStatus(ctypes.Structure):
@@ -62,7 +94,9 @@ def available_bytes():
         return status.available_physical
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) * 1024
+            available = int(line.split()[1]) * 1024
+            remaining = _cgroup_available_bytes()
+            return available if remaining is None else min(available, remaining)
     raise RuntimeError("Linux MemAvailable is required to size preparation workers")
 
 
@@ -116,16 +150,18 @@ def worker_limit(limit, *, pools=1, available=None, device_bytes=0, headroom_byt
     return min(limit, capacity)
 
 
-def compile_threads(limit, *, workers, available, device_bytes=0, headroom_bytes=0):
-    """Bound each forward compiler's Inductor subprocesses by the RAM its workers leave.
+def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persistent_bytes=0):
+    """Leave physical memory for tuning fixtures, modules, and pending plan storage."""
+    import torch
 
-    On GB10 a worker compiling a GLM forward holds about 2.8 GB, and each of its
-    Inductor compile subprocesses about 0.4 GB; sixteen threads in one worker exhaust
-    the memory a TP2 rank has left.
-    """
-    headroom = max(_HEADROOM_BYTES, headroom_bytes)
-    spare = available - headroom - workers * (_WORKER_BYTES + device_bytes)
-    return max(1, min(limit, spare // (workers * _COMPILE_THREAD_BYTES)))
+    available = device_memory_info(device)[0]
+    if torch.cuda.get_device_properties(device).is_integrated:
+        if os.name == "nt":
+            available = min(available, available_bytes())
+        available = (available - max(_HEADROOM_BYTES, headroom_bytes)) // pools
+    else:
+        available -= headroom_bytes
+    return max(0, available - _TUNING_GROWTH_BYTES - pending_persistent_bytes)
 
 
 def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None):

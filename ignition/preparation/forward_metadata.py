@@ -87,7 +87,7 @@ class _ForwardPickler(pickle.Pickler):
         from b12x.preparation.types import _PreparedSlot, _Prepared
         from torch._dynamo.aot_compile_types import _deserialize_triton_kernel, _serialize_triton_kernel
         from .device_binding import restore_device, restore_prepared_device
-        from .package_storage import PackageStorage
+        from .core_storage import CoreStorage
         from .peer_storage import PeerStorage
 
         if isinstance(value, PreparationSession):
@@ -127,7 +127,7 @@ class _ForwardPickler(pickle.Pickler):
                               torch.distributed.ProcessGroup, socket.socket, ctypes.CDLL, ctypes._Pointer,
                               ctypes._CFuncPtr, ctypes.Structure, ctypes.Array, ctypes._SimpleCData,
                               CompiledKernel, JitCompiledFunction, CompiledCuTeProgram, CuTeRuntimeTensor, local,
-                              DeferredCuTeKernel, DeferredTritonKernel, PreparationSession, PackageStorage,
+                              DeferredCuTeKernel, DeferredTritonKernel, PreparationSession, CoreStorage,
                               PeerStorage, *_LOCK_TYPES)):
             # Preparation sessions, allocators and peer storage retain process-local contexts, not forward
             # metadata; collective runtimes keep peer storage for teardown. CuTe runtime tensors describe

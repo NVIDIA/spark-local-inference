@@ -459,36 +459,89 @@ fn function_layout(cuda: &Cuda, function: usize) -> ExportResult<Vec<(usize, usi
     Err(invalid("kernel exceeds supported parameter count"))
 }
 
-fn kernel_node(
+const KERNEL_ATTRIBUTES: [c_int; 10] = [1, 2, 4, 5, 8, 9, 10, 11, 13, 14];
+
+#[derive(Debug)]
+struct RecordedKernel {
+    function: usize,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared: u32,
+    arguments: Vec<u8>,
+    attributes: Vec<(c_int, [u64; 8])>,
+    attribute_11: bool,
+}
+
+#[derive(Debug)]
+enum RecordedNode {
+    Kernel(RecordedKernel),
+    Copy {
+        source: u64,
+        destination: u64,
+        nbytes: u64,
+    },
+    Memset {
+        destination: u64,
+        pitch: u64,
+        value: u32,
+        element_size: u32,
+        width: u64,
+        height: u64,
+    },
+    Empty,
+    EventWait(usize),
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordedGraph {
+    pub(crate) context: usize,
+    flags: u64,
+    layouts: BTreeMap<usize, Vec<(usize, usize)>>,
+    nodes: Vec<RecordedNode>,
+    edges: Vec<wire::Edge>,
+}
+
+#[cfg(test)]
+impl RecordedGraph {
+    pub(crate) fn empty(context: usize) -> Self {
+        Self {
+            context,
+            flags: 0,
+            layouts: BTreeMap::new(),
+            nodes: vec![],
+            edges: vec![],
+        }
+    }
+}
+
+fn executable_flags(cuda: &Cuda, executable: usize) -> ExportResult<u64> {
+    let mut flags = 0u64;
+    cu!(
+        cuda,
+        "cuGraphExecGetFlags",
+        (Handle, *mut u64),
+        executable as Handle,
+        &mut flags
+    )?;
+    Ok(flags)
+}
+
+fn record_kernel(
     cuda: &Cuda,
     node: Handle,
-    allocations: &[Allocation],
-    kernels: &[Kernel],
-    layouts: &[Vec<(usize, usize)>],
-    indices: &HashMap<usize, usize>,
-) -> ExportResult<wire::Kernel> {
+    layouts: &mut BTreeMap<usize, Vec<(usize, usize)>>,
+) -> ExportResult<RecordedKernel> {
     let (params, function) = kernel_params(cuda, node)?;
-    let index = *indices
-        .get(&function)
-        .ok_or_else(|| invalid("no explicit argument bindings for kernel"))?;
-    let kernel = &kernels[index];
-    let arguments = unsafe { argument_data(&params, &layouts[index])? }
+    if let std::collections::btree_map::Entry::Vacant(entry) = layouts.entry(function) {
+        entry.insert(function_layout(cuda, function)?);
+    }
+    let arguments = unsafe { argument_data(&params, &layouts[&function])? }
         .into_iter()
-        .zip(&kernel.arguments)
-        .map(|(data, argument)| {
-            check_bindings(cuda, allocations, &data, &argument.relocations)?;
-            Ok(wire::Blob {
-                data,
-                relocations: argument
-                    .relocations
-                    .iter()
-                    .map(relocation)
-                    .collect::<ExportResult<_>>()?,
-            })
-        })
-        .collect::<ExportResult<Vec<_>>>()?;
+        .flatten()
+        .collect();
     let mut attributes = Vec::new();
-    for id in [1, 2, 4, 5, 8, 9, 10, 11, 13, 14] {
+    let mut attribute_11 = false;
+    for id in KERNEL_ATTRIBUTES {
         let mut value = [0u64; 8];
         let status = status!(
             cuda,
@@ -502,77 +555,45 @@ fn kernel_node(
             continue;
         }
         cuda.check(&format!("cuGraphKernelNodeGetAttribute({id})"), status)?;
+        if id == 11 {
+            attribute_11 = true;
+        }
         let any = value.iter().any(|&v| v != 0);
-        if id == 13 {
-            if any {
-                return Err(invalid(
-                    "device-updatable kernel nodes require explicit export support",
-                ));
-            }
-            continue;
+        if id == 13 && any {
+            return Err(invalid(
+                "device-updatable kernel nodes require explicit export support",
+            ));
         }
-        if id == 14 && !any {
-            continue;
+        if id != 13 && any {
+            attributes.push((id, value));
         }
-        let relocations = if id == 1 && value[1] != 0 {
-            vec![wire::Relocation {
-                offset: 0,
-                target: Some(reference(allocations, value[0], value[1])?),
-                kind: 0,
-            }]
-        } else {
-            vec![]
-        };
-        attributes.push(wire::Attribute {
-            id,
-            value: Some(wire::Blob {
-                data: value.into_iter().flat_map(u64::to_ne_bytes).collect(),
-                relocations,
-            }),
-        });
     }
-    Ok(wire::Kernel {
-        function: index as u64,
-        grid: params.grid.to_vec(),
-        block: params.block.to_vec(),
+    Ok(RecordedKernel {
+        function,
+        grid: params.grid,
+        block: params.block,
         shared: params.shared,
         arguments,
         attributes,
+        attribute_11,
     })
 }
 
-fn capture_graph(
+fn record_graph(
     cuda: &Cuda,
-    graph: &super::GraphHandle,
-    recorder: Option<&Recorder>,
-    cupti: Option<&Library>,
-    allocations: &[Allocation],
-    kernels: &[Kernel],
-    layouts: &[Vec<(usize, usize)>],
-    indices: &HashMap<usize, usize>,
-    events: &BTreeMap<String, usize>,
-) -> ExportResult<(Vec<wire::Node>, Vec<wire::Edge>, u64)> {
-    let mut ordered = nodes(cuda, graph.graph)?
+    graph: usize,
+    flags: u64,
+    mut node_id: impl FnMut(usize) -> ExportResult<u64>,
+) -> ExportResult<RecordedGraph> {
+    let context = cuda.current()?;
+    if graph == 0 || context == 0 || flags & !9 != 0 {
+        return Err(invalid(
+            "graph recording requires a live template, context, and supported instantiation flags",
+        ));
+    }
+    let mut ordered = nodes(cuda, graph)?
         .into_iter()
-        .map(|node| {
-            let id = if let Some(recorder) = recorder {
-                recorder.graph_node_id(node as usize)?
-            } else {
-                let library = cupti.ok_or_else(|| invalid("graph node ordering requires CUPTI"))?;
-                let function = unsafe {
-                    library.get::<unsafe extern "C" fn(Handle, *mut u64) -> c_int>(
-                        b"cuptiGetGraphNodeId\0",
-                    )?
-                };
-                let mut id = 0u64;
-                let status = unsafe { function(node, &mut id) };
-                if status != 0 {
-                    return Err(invalid(format!("cuptiGetGraphNodeId: CUPTI {status}")));
-                }
-                id
-            };
-            Ok((id, node))
-        })
+        .map(|node| Ok((node_id(node as usize)?, node)))
         .collect::<ExportResult<Vec<_>>>()?;
     ordered.sort_by_key(|&(id, _)| id);
     let node_indices: HashMap<_, _> = ordered
@@ -580,18 +601,11 @@ fn capture_graph(
         .enumerate()
         .map(|(index, &(_, node))| (node as usize, index as u64))
         .collect();
-    let mut result = Vec::new();
+    let mut layouts = BTreeMap::new();
+    let mut result = Vec::with_capacity(ordered.len());
     for (_, node) in ordered {
-        use wire::node::Operation;
         let operation = match node_kind(cuda, node)? {
-            0 => Operation::Kernel(kernel_node(
-                cuda,
-                node,
-                allocations,
-                kernels,
-                layouts,
-                indices,
-            )?),
+            0 => RecordedNode::Kernel(record_kernel(cuda, node, &mut layouts)?),
             1 => {
                 let mut params = CopyParams::default();
                 cu!(
@@ -618,27 +632,19 @@ fn capture_graph(
                         ));
                     }
                 }
-                Operation::Copy(wire::Copy {
-                    source: Some(reference(
-                        allocations,
-                        params
-                            .source
-                            .device
-                            .checked_add(params.source.x as u64)
-                            .ok_or_else(|| invalid("copy source address overflow"))?,
-                        params.width as u64,
-                    )?),
-                    destination: Some(reference(
-                        allocations,
-                        params
-                            .destination
-                            .device
-                            .checked_add(params.destination.x as u64)
-                            .ok_or_else(|| invalid("copy destination address overflow"))?,
-                        params.width as u64,
-                    )?),
+                RecordedNode::Copy {
+                    source: params
+                        .source
+                        .device
+                        .checked_add(params.source.x as u64)
+                        .ok_or_else(|| invalid("copy source address overflow"))?,
+                    destination: params
+                        .destination
+                        .device
+                        .checked_add(params.destination.x as u64)
+                        .ok_or_else(|| invalid("copy destination address overflow"))?,
                     nbytes: params.width as u64,
-                })
+                }
             }
             2 => {
                 let mut params = MemsetParams::default();
@@ -649,27 +655,16 @@ fn capture_graph(
                     node,
                     &mut params
                 )?;
-                let extent = params
-                    .height
-                    .checked_sub(1)
-                    .and_then(|h| h.checked_mul(params.pitch))
-                    .and_then(|n| {
-                        params
-                            .width
-                            .checked_mul(params.element_size as usize)
-                            .and_then(|w| n.checked_add(w))
-                    })
-                    .ok_or_else(|| invalid("invalid graph memset extent"))?;
-                Operation::Memset(wire::Memset {
-                    destination: Some(reference(allocations, params.destination, extent as u64)?),
+                RecordedNode::Memset {
+                    destination: params.destination,
                     pitch: params.pitch as u64,
                     value: params.value,
                     element_size: params.element_size,
                     width: params.width as u64,
                     height: params.height as u64,
-                })
+                }
             }
-            5 => Operation::Empty(wire::Empty {}),
+            5 => RecordedNode::Empty,
             6 => {
                 let mut event = std::ptr::null_mut();
                 cu!(
@@ -679,35 +674,18 @@ fn capture_graph(
                     node,
                     &mut event
                 )?;
-                let name = events
-                    .iter()
-                    .find(|(_, value)| **value == event as usize)
-                    .map(|(name, _)| name.clone())
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "graph {}: undeclared external readiness event",
-                            graph.name
-                        ))
-                    })?;
-                Operation::EventWait(wire::EventWait { event: name })
+                RecordedNode::EventWait(event as usize)
             }
-            kind => {
-                return Err(invalid(format!(
-                    "graph {}: unsupported CUDA graph node type {kind}",
-                    graph.name
-                )));
-            }
+            kind => return Err(invalid(format!("unsupported CUDA graph node type {kind}"))),
         };
-        result.push(wire::Node {
-            operation: Some(operation),
-        });
+        result.push(operation);
     }
     let mut count = 0usize;
     cu!(
         cuda,
         "cuGraphGetEdges_v2",
         (Handle, *mut Handle, *mut Handle, *mut [u8; 8], *mut usize),
-        graph.graph as Handle,
+        graph as Handle,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -721,7 +699,7 @@ fn capture_graph(
             cuda,
             "cuGraphGetEdges_v2",
             (Handle, *mut Handle, *mut Handle, *mut [u8; 8], *mut usize),
-            graph.graph as Handle,
+            graph as Handle,
             sources.as_mut_ptr(),
             destinations.as_mut_ptr(),
             data.as_mut_ptr(),
@@ -745,15 +723,265 @@ fn capture_graph(
             })
         })
         .collect::<ExportResult<Vec<_>>>()?;
-    let mut flags = 0u64;
-    cu!(
+    Ok(RecordedGraph {
+        context,
+        flags,
+        layouts,
+        nodes: result,
+        edges,
+    })
+}
+
+pub(crate) fn record_prepared_graph(
+    graph: usize,
+    executable: usize,
+    recorder: &Recorder,
+) -> ExportResult<RecordedGraph> {
+    if graph == 0 || executable == 0 {
+        return Err(invalid(
+            "graph recording requires live template and executable handles",
+        ));
+    }
+    let cuda = Cuda::new()?;
+    record_graph(&cuda, graph, executable_flags(&cuda, executable)?, |node| {
+        recorder.graph_node_id(node)
+    })
+}
+
+pub(crate) fn record_prepared_template(
+    graph: usize,
+    flags: u64,
+    recorder: &Recorder,
+) -> ExportResult<RecordedGraph> {
+    let cuda = Cuda::new()?;
+    record_graph(&cuda, graph, flags, |node| recorder.graph_node_id(node))
+}
+
+fn graph_metadata(
+    cuda: &Cuda,
+    graph: &super::GraphHandle,
+    recorder: Option<&Recorder>,
+    cupti: Option<&Library>,
+) -> ExportResult<Arc<RecordedGraph>> {
+    if graph.recorded != 0 {
+        let recorded = recorder
+            .ok_or_else(|| invalid("retained graph metadata requires a native module recorder"))?
+            .recorded_template(graph.recorded)?;
+        if recorded.context != cuda.current()? {
+            return Err(invalid("retained graph metadata belongs to another CUDA context"));
+        }
+        return Ok(recorded);
+    }
+    if graph.graph == 0 {
+        let recorded = recorder
+            .ok_or_else(|| invalid("retained graph metadata requires a native module recorder"))?
+            .recorded_graph(graph.executable)?;
+        if recorded.context != cuda.current()?
+            || recorded.flags != executable_flags(cuda, graph.executable)?
+        {
+            return Err(invalid(
+                "retained graph metadata differs from its live executable or context",
+            ));
+        }
+        return Ok(recorded);
+    }
+    Ok(Arc::new(record_graph(
         cuda,
-        "cuGraphExecGetFlags",
-        (Handle, *mut u64),
-        graph.executable as Handle,
-        &mut flags
-    )?;
-    Ok((result, edges, flags))
+        graph.graph,
+        match graph.instantiate_flags {
+            Some(flags) => flags,
+            None => executable_flags(cuda, graph.executable)?,
+        },
+        |node| {
+            if let Some(recorder) = recorder {
+                recorder.graph_node_id(node)
+            } else {
+                let library = cupti.ok_or_else(|| invalid("graph node ordering requires CUPTI"))?;
+                let function = unsafe {
+                    library.get::<unsafe extern "C" fn(Handle, *mut u64) -> c_int>(
+                        b"cuptiGetGraphNodeId\0",
+                    )?
+                };
+                let mut id = 0u64;
+                let status = unsafe { function(node as Handle, &mut id) };
+                if status != 0 {
+                    return Err(invalid(format!("cuptiGetGraphNodeId: CUPTI {status}")));
+                }
+                Ok(id)
+            }
+        },
+    )?))
+}
+
+fn encode_kernel(
+    cuda: &Cuda,
+    recorded: &RecordedKernel,
+    allocations: &[Allocation],
+    kernels: &[Kernel],
+    layouts: &[Vec<(usize, usize)>],
+    indices: &HashMap<usize, usize>,
+) -> ExportResult<wire::Kernel> {
+    let index = *indices
+        .get(&recorded.function)
+        .ok_or_else(|| invalid("no explicit argument bindings for kernel"))?;
+    let kernel = &kernels[index];
+    let mut cursor = 0usize;
+    let arguments = layouts[index]
+        .iter()
+        .zip(&kernel.arguments)
+        .map(|(&(_, size), argument)| {
+            let end = cursor
+                .checked_add(size)
+                .ok_or_else(|| invalid("kernel parameter size overflow"))?;
+            let data = recorded
+                .arguments
+                .get(cursor..end)
+                .ok_or_else(|| invalid("recorded kernel parameter bytes are truncated"))?;
+            cursor = end;
+            check_bindings(cuda, allocations, data, &argument.relocations)?;
+            Ok(wire::Blob {
+                data: data.to_vec(),
+                relocations: argument
+                    .relocations
+                    .iter()
+                    .map(relocation)
+                    .collect::<ExportResult<_>>()?,
+            })
+        })
+        .collect::<ExportResult<Vec<_>>>()?;
+    if cursor != recorded.arguments.len() {
+        return Err(invalid(
+            "recorded kernel parameters differ from the CUDA function layout",
+        ));
+    }
+    let mut attributes = Vec::new();
+    for id in KERNEL_ATTRIBUTES {
+        if id == 13 || id == 11 && !recorded.attribute_11 {
+            continue;
+        }
+        let value = recorded
+            .attributes
+            .iter()
+            .find(|(attribute, _)| *attribute == id)
+            .map(|(_, value)| *value)
+            .unwrap_or([0; 8]);
+        if id == 14 && value.iter().all(|&v| v == 0) {
+            continue;
+        }
+        let relocations = if id == 1 && value[1] != 0 {
+            vec![wire::Relocation {
+                offset: 0,
+                target: Some(reference(allocations, value[0], value[1])?),
+                kind: 0,
+            }]
+        } else {
+            vec![]
+        };
+        attributes.push(wire::Attribute {
+            id,
+            value: Some(wire::Blob {
+                data: value.into_iter().flat_map(u64::to_ne_bytes).collect(),
+                relocations,
+            }),
+        });
+    }
+    Ok(wire::Kernel {
+        function: index as u64,
+        grid: recorded.grid.to_vec(),
+        block: recorded.block.to_vec(),
+        shared: recorded.shared,
+        arguments,
+        attributes,
+    })
+}
+
+fn capture_graph(
+    cuda: &Cuda,
+    name: &str,
+    recorded: &RecordedGraph,
+    allocations: &[Allocation],
+    kernels: &[Kernel],
+    layouts: &[Vec<(usize, usize)>],
+    indices: &HashMap<usize, usize>,
+    events: &BTreeMap<String, usize>,
+) -> ExportResult<(Vec<wire::Node>, Vec<wire::Edge>, u64)> {
+    for (function, layout) in &recorded.layouts {
+        let index = indices
+            .get(function)
+            .ok_or_else(|| invalid("no explicit argument bindings for kernel"))?;
+        if layout != &layouts[*index] {
+            return Err(invalid(
+                "recorded kernel parameters differ from the CUDA function layout",
+            ));
+        }
+    }
+    let nodes = recorded
+        .nodes
+        .iter()
+        .map(|node| {
+            use wire::node::Operation;
+            let operation = match node {
+                RecordedNode::Kernel(kernel) => Operation::Kernel(encode_kernel(
+                    cuda,
+                    kernel,
+                    allocations,
+                    kernels,
+                    layouts,
+                    indices,
+                )?),
+                RecordedNode::Copy {
+                    source,
+                    destination,
+                    nbytes,
+                } => Operation::Copy(wire::Copy {
+                    source: Some(reference(allocations, *source, *nbytes)?),
+                    destination: Some(reference(allocations, *destination, *nbytes)?),
+                    nbytes: *nbytes,
+                }),
+                RecordedNode::Memset {
+                    destination,
+                    pitch,
+                    value,
+                    element_size,
+                    width,
+                    height,
+                } => {
+                    let extent = height
+                        .checked_sub(1)
+                        .and_then(|h| h.checked_mul(*pitch))
+                        .and_then(|n| {
+                            width
+                                .checked_mul(u64::from(*element_size))
+                                .and_then(|w| n.checked_add(w))
+                        })
+                        .ok_or_else(|| invalid("invalid graph memset extent"))?;
+                    Operation::Memset(wire::Memset {
+                        destination: Some(reference(allocations, *destination, extent)?),
+                        pitch: *pitch,
+                        value: *value,
+                        element_size: *element_size,
+                        width: *width,
+                        height: *height,
+                    })
+                }
+                RecordedNode::Empty => Operation::Empty(wire::Empty {}),
+                RecordedNode::EventWait(event) => {
+                    let name = events
+                        .iter()
+                        .find(|(_, value)| **value == *event)
+                        .map(|(name, _)| name.clone())
+                        .ok_or_else(|| {
+                            invalid(format!("graph {name}: undeclared external readiness event"))
+                        })?;
+                    Operation::EventWait(wire::EventWait { event: name })
+                }
+            };
+            Ok(wire::Node {
+                operation: Some(operation),
+            })
+        })
+        .collect::<ExportResult<Vec<_>>>()?;
+    Ok((nodes, recorded.edges.clone(), recorded.flags))
 }
 
 struct DownloadSlot {
@@ -1202,7 +1430,7 @@ fn prepare_allocations(
 
 fn validate_allocations(allocations: &[Allocation]) -> ExportResult<()> {
     if allocations.is_empty() {
-        return Err(invalid("runtime package requires allocations and kernels"));
+        return Err(invalid("runtime core requires allocations and kernels"));
     }
     let mut names = HashSet::new();
     let mut intervals = Vec::new();
@@ -1740,7 +1968,7 @@ fn stage_directory(path: &Path) -> ExportResult<PathBuf> {
     fs::create_dir_all(parent)?;
     let stem = path
         .file_name()
-        .ok_or_else(|| invalid("runtime package path requires a filename"))?
+        .ok_or_else(|| invalid("runtime core path requires a filename"))?
         .to_string_lossy();
     loop {
         let stage = parent.join(format!(
@@ -1848,7 +2076,7 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
                     b"nvmlDeviceGetPciInfo_v3\0",
                 )?;
             cuda.check("nvmlDeviceGetPciInfo_v3", get_pci(handle, &mut pci))?;
-            match helios_core::package::naming::platform_from_pci(pci.device_id) {
+            match helios_core::core::naming::platform_from_pci(pci.device_id) {
                 Some(platform) => Ok(Some(platform.to_string())),
                 None => Err(invalid(format!(
                     "NVML reports unsupported GPU PCI id {:#010x}",
@@ -1904,7 +2132,7 @@ fn resolve_weight_payload(
         &retained,
     )?;
     let root = match request.options.cache.as_ref() {
-        Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
+        Some(cache) => Some(helios_core::core::cache::Root::open(cache)?),
         None => None,
     };
     let retained = match device {
@@ -2113,7 +2341,7 @@ fn resolve_weight_payload(
         payload_id: Vec::new(),
     });
     let cached = reused.as_ref().map(|groups| groups.iter().map(|group|
-        helios_core::package::schema::wire::PayloadDescriptor { id: group.payload_id.clone(), nbytes: group.nbytes }).collect()).unwrap_or_default();
+        helios_core::core::schema::wire::PayloadDescriptor { id: group.payload_id.clone(), nbytes: group.nbytes }).collect()).unwrap_or_default();
     let sources = WeightPayloadSources {
         cached, engram: output.weight_payload.as_ref().and_then(|sources| sources.engram.clone()),
         groups: reused.unwrap_or(groups),
@@ -2298,7 +2526,7 @@ fn scan_group_blocks<R>(
     read_into: &mut R,
     spans: &[weight_payload::PayloadSpan],
 ) -> ExportResult<(
-    helios_core::package::PayloadId,
+    helios_core::core::PayloadId,
     u64,
     Vec<(String, u64, u64, u64)>,
 )>
@@ -2324,7 +2552,7 @@ where
         Ok(())
     })?;
     Ok((
-        helios_core::package::PayloadId::from_bytes(hasher.finalize().into()),
+        helios_core::core::PayloadId::from_bytes(hasher.finalize().into()),
         total,
         blocks,
     ))
@@ -2496,10 +2724,18 @@ pub(crate) fn capture_rank(
         || request
             .graphs
             .iter()
-            .any(|g| g.name.is_empty() || g.graph == 0 || g.executable == 0)
+            .any(|g| {
+                g.name.is_empty()
+                    || if g.recorded != 0 {
+                        g.graph != 0 || g.executable != 0 || g.instantiate_flags.is_some()
+                    } else {
+                        (g.executable == 0) == g.instantiate_flags.is_none()
+                            || g.instantiate_flags.is_some_and(|flags| g.graph == 0 || flags & !9 != 0)
+                    }
+            })
     {
         return Err(invalid(
-            "named live graph templates and executables are required",
+            "named graphs require retained metadata, a live executable, or a live template with supported instantiation flags",
         ));
     }
     if request
@@ -2526,11 +2762,11 @@ pub(crate) fn capture_rank(
         return Err(invalid("a rank exports at most one RoCE transport"));
     }
     if request.sources && request.publisher.is_some() {
-        return Err(invalid("a signed package cannot reference staged sources"));
+        return Err(invalid("a signed core cannot reference staged sources"));
     }
     if (request.options.no_weights || request.options.reuse_weights.is_some()) && request.options.cache.is_none() {
         return Err(invalid(
-            "export without weight writes requires a package cache",
+            "export without weight writes requires a core cache",
         ));
     }
     // Validate serving defaults before reading graph handles or storage.
@@ -2608,12 +2844,20 @@ pub(crate) fn capture_rank(
     if indices.len() != kernels.len() {
         return Err(invalid("kernel function registrations must be unique"));
     }
-    for graph in &request.graphs {
-        for node in nodes(&cuda, graph.graph)? {
-            if node_kind(&cuda, node)? != 0 {
-                continue;
-            }
-            let (_, function) = kernel_params(&cuda, node)?;
+    let standalone_cupti = if recorder.is_none() {
+        Some(unsafe {
+            Library::new(request.cupti_path.as_ref().ok_or_else(|| {
+                invalid("standalone graph export requires a CUPTI library path")
+            })?)?
+        })
+    } else {
+        None
+    };
+    let recorded_graphs = request.graphs.iter().map(|graph| {
+        graph_metadata(&cuda, graph, recorder, standalone_cupti.as_ref())
+    }).collect::<ExportResult<Vec<_>>>()?;
+    for graph in &recorded_graphs {
+        for &function in graph.layouts.keys() {
             if indices.contains_key(&function) {
                 continue;
             }
@@ -2657,7 +2901,7 @@ pub(crate) fn capture_rank(
         inspect_phase.advance(1);
     }
     if kernels.is_empty() {
-        return Err(invalid("runtime package requires allocations and kernels"));
+        return Err(invalid("runtime core requires allocations and kernels"));
     }
     if modules.values().any(|image| !image.starts_with(b"\x7fELF")) {
         return Err(invalid("module images must be compiled cubins"));
@@ -2841,25 +3085,14 @@ pub(crate) fn capture_rank(
         }
         output.index.ranks[0].execution = Some(execution);
     }
-    let standalone_cupti =
-        if recorder.is_none() {
-            Some(unsafe {
-                Library::new(request.cupti_path.as_ref().ok_or_else(|| {
-                    invalid("standalone graph export requires a CUPTI library path")
-                })?)?
-            })
-        } else {
-            None
-        };
     let mut other_resources = Vec::new();
     let graph_phase = progress.phase("Serialize CUDA graphs", Some(request.graphs.len() as u64));
     let mut graph_bytes = 0u64;
     for (index, graph) in request.graphs.iter().enumerate() {
         let (nodes, edges, flags) = capture_graph(
             &cuda,
-            graph,
-            recorder,
-            standalone_cupti.as_ref(),
+            &graph.name,
+            &recorded_graphs[index],
             &allocations,
             &kernels,
             &layouts,
@@ -3308,7 +3541,7 @@ mod tests {
             wire::Span { offset: 0, nbytes, filename: String::new() },
         );
         let request: CaptureRequest = serde_json::from_value(serde_json::json!({
-            "path": directory.join("package"),
+            "path": directory.join("core"),
             "context": 0,
             "graphs": [],
             "allocations": [],
@@ -3432,10 +3665,10 @@ mod tests {
         assert_ne!(catalog.initial_state.payload_id, state_id);
         // Missing stable weight data still fails under no_weights.
         drop(output);
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         let id: [u8; 32] = weight_id.as_slice().try_into().unwrap();
         let object = root
-            .payload(helios_core::package::PayloadId::from_bytes(id))?
+            .payload(helios_core::core::PayloadId::from_bytes(id))?
             .unwrap();
         let path = object.path().to_path_buf();
         drop(object);
@@ -3470,14 +3703,14 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         root.collect()?;
-        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+        assert!(root.payload(helios_core::core::PayloadId::from_bytes(
             group.payload_id.clone().try_into().unwrap()
         ))?.is_some(), "lease must keep the object during capture");
         drop(output);
         root.collect()?;
-        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+        assert!(root.payload(helios_core::core::PayloadId::from_bytes(
             group.payload_id.clone().try_into().unwrap()
         ))?.is_none(), "released lease lets collection reclaim the object");
         let _ = fs::remove_dir_all(&directory);
@@ -3496,14 +3729,14 @@ mod tests {
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
         let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let id: [u8; 32] = catalog.groups[0].payload_id.clone().try_into().unwrap();
-        let payload = helios_core::package::PayloadId::from_bytes(id);
+        let payload = helios_core::core::PayloadId::from_bytes(id);
         drop(output);
         // Warm: an existing object validates.
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
         assert!(resolve_staged_weight_payload(&request, &mut output)?.is_some());
         drop(output);
         // Corrupted cached bytes are rejected even with the right length.
-        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let root = helios_core::core::cache::Root::open(directory.join("cache"))?;
         let object = root.payload(payload)?.unwrap();
         let length = object.length();
         let path = object.path().to_path_buf();
@@ -3595,7 +3828,7 @@ mod tests {
         );
         std::io::Read::read_to_end(&mut blocks_reader, &mut stream)?;
         assert_eq!(stream.len() as u64, length);
-        assert_eq!(helios_core::package::PayloadId::of(&stream), id);
+        assert_eq!(helios_core::core::PayloadId::of(&stream), id);
         assert_eq!(stream[0], 7);
         assert_eq!(stream[weight_payload::ELIDE_BLOCK as usize + 7], 11);
         let _ = fs::remove_dir_all(&directory);
@@ -3958,6 +4191,249 @@ mod tests {
         result
     }
 
+    fn metadata_cuda() -> Cuda {
+        #[cfg(unix)]
+        let library = libloading::os::unix::Library::this().into();
+        #[cfg(windows)]
+        let library = libloading::os::windows::Library::this().unwrap().into();
+        Cuda { library }
+    }
+
+    fn recorded_kernel_graph() -> (RecordedGraph, Vec<Kernel>, Vec<Vec<(usize, usize)>>) {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&0x1010u64.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&17u32.to_ne_bytes());
+        let mut pointers = [
+            bytes.as_mut_ptr().cast(),
+            unsafe { bytes.as_mut_ptr().add(8) }.cast(),
+        ];
+        let params = KernelParams {
+            params: pointers.as_mut_ptr(),
+            ..Default::default()
+        };
+        let layout = vec![(0, 8), (8, 4)];
+        let arguments = unsafe { argument_data(&params, &layout) }
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        bytes.fill(0xff);
+        let graph = RecordedGraph {
+            context: 0x10,
+            flags: 9,
+            layouts: BTreeMap::from([(0x1234, layout.clone())]),
+            nodes: vec![
+                RecordedNode::Kernel(RecordedKernel {
+                    function: 0x1234,
+                    grid: [3, 2, 1],
+                    block: [32, 1, 1],
+                    shared: 4096,
+                    arguments,
+                    attributes: vec![
+                        (1, [0x1010, 8, 0, 0, 0, 0, 0, 0]),
+                        (2, [1, 0, 0, 0, 0, 0, 0, 0]),
+                    ],
+                    attribute_11: true,
+                }),
+                RecordedNode::Copy {
+                    source: 0x1010,
+                    destination: 0x1040,
+                    nbytes: 16,
+                },
+                RecordedNode::Memset {
+                    destination: 0x1080,
+                    pitch: 16,
+                    value: 3,
+                    element_size: 4,
+                    width: 4,
+                    height: 2,
+                },
+                RecordedNode::EventWait(0x5555),
+                RecordedNode::Empty,
+            ],
+            edges: vec![wire::Edge {
+                source: 0,
+                destination: 1,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }],
+        };
+        let kernels = vec![Kernel {
+            function: 0x1234,
+            module: "module".into(),
+            arguments: vec![
+                Argument {
+                    size: 8,
+                    relocations: vec![Relocation {
+                        offset: 0,
+                        target: super::super::Reference {
+                            allocation: "buffer".into(),
+                            offset: 16,
+                        },
+                        kind: "pointer".into(),
+                    }],
+                    numeric: vec![],
+                },
+                Argument {
+                    size: 4,
+                    relocations: vec![],
+                    numeric: vec![(0, 4)],
+                },
+            ],
+        }];
+        (graph, kernels, vec![layout])
+    }
+
+    #[test]
+    fn retained_graph_encodes_owned_arguments_attributes_endpoints_and_edges() {
+        let (graph, kernels, layouts) = recorded_kernel_graph();
+        let allocations = vec![allocation("buffer", 0x1000, 0x100)];
+        let (nodes, edges, flags) = capture_graph(
+            &metadata_cuda(),
+            "serving",
+            &graph,
+            &allocations,
+            &kernels,
+            &layouts,
+            &HashMap::from([(0x1234, 0)]),
+            &BTreeMap::from([("ready".into(), 0x5555)]),
+        )
+        .unwrap();
+        assert_eq!(flags, 9);
+        assert_eq!(edges, graph.edges);
+        let Some(wire::node::Operation::Kernel(kernel)) = &nodes[0].operation else {
+            panic!()
+        };
+        assert_eq!(kernel.grid, [3, 2, 1]);
+        assert_eq!(kernel.block, [32, 1, 1]);
+        assert_eq!(kernel.shared, 4096);
+        assert_eq!(kernel.arguments[0].data, 0x1010u64.to_ne_bytes());
+        assert_eq!(kernel.arguments[1].data, 17u32.to_ne_bytes());
+        assert_eq!(
+            kernel.arguments[0].relocations[0]
+                .target
+                .as_ref()
+                .unwrap()
+                .offset,
+            16
+        );
+        assert_eq!(
+            kernel.attributes.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [1, 2, 4, 5, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            kernel.attributes[0].value.as_ref().unwrap().relocations[0]
+                .target
+                .as_ref()
+                .unwrap()
+                .offset,
+            16
+        );
+        assert!(
+            kernel.attributes[2]
+                .value
+                .as_ref()
+                .unwrap()
+                .data
+                .iter()
+                .all(|&v| v == 0)
+        );
+        let Some(wire::node::Operation::Copy(copy)) = &nodes[1].operation else {
+            panic!()
+        };
+        assert_eq!(copy.source.as_ref().unwrap().offset, 16);
+        assert_eq!(copy.destination.as_ref().unwrap().offset, 64);
+        assert_eq!(copy.nbytes, 16);
+        let Some(wire::node::Operation::Memset(memset)) = &nodes[2].operation else {
+            panic!()
+        };
+        assert_eq!(memset.destination.as_ref().unwrap().offset, 128);
+        assert_eq!(
+            (memset.width, memset.height, memset.pitch, memset.value),
+            (4, 2, 16, 3)
+        );
+        let Some(wire::node::Operation::EventWait(event)) = &nodes[3].operation else {
+            panic!()
+        };
+        assert_eq!(event.event, "ready");
+    }
+
+    #[test]
+    fn retained_graph_preserves_layout_binding_and_event_validation() {
+        let (mut graph, kernels, layouts) = recorded_kernel_graph();
+        let allocations = vec![allocation("buffer", 0x1000, 0x100)];
+        let indices = HashMap::from([(0x1234, 0)]);
+        let events = BTreeMap::from([("ready".into(), 0x5555)]);
+        let encode = |graph: &RecordedGraph,
+                      layouts: &[Vec<(usize, usize)>],
+                      events: &BTreeMap<String, usize>| {
+            capture_graph(
+                &metadata_cuda(),
+                "serving",
+                graph,
+                &allocations,
+                &kernels,
+                layouts,
+                &indices,
+                events,
+            )
+        };
+        assert!(
+            encode(&graph, &[vec![(0, 4), (8, 8)]], &events)
+                .unwrap_err()
+                .to_string()
+                .contains("layout")
+        );
+        assert!(
+            encode(&graph, &layouts, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("readiness event")
+        );
+        let RecordedNode::Kernel(kernel) = &mut graph.nodes[0] else {
+            panic!()
+        };
+        kernel.arguments[0] ^= 1;
+        assert!(
+            encode(&graph, &layouts, &events)
+                .unwrap_err()
+                .to_string()
+                .contains("pointer binding")
+        );
+        let RecordedNode::Kernel(kernel) = &mut graph.nodes[0] else {
+            panic!()
+        };
+        kernel.arguments[0] ^= 1;
+        kernel.arguments.pop();
+        assert!(
+            encode(&graph, &layouts, &events)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn retained_graph_restores_only_supported_zero_attributes() {
+        let (mut graph, kernels, layouts) = recorded_kernel_graph();
+        let RecordedNode::Kernel(kernel) = &mut graph.nodes[0] else {
+            panic!()
+        };
+        kernel.attribute_11 = false;
+        kernel.attributes.push((14, [2, 0, 0, 0, 0, 0, 0, 0]));
+        let encoded = encode_kernel(
+            &metadata_cuda(),
+            kernel,
+            &[allocation("buffer", 0x1000, 0x100)],
+            &kernels,
+            &layouts,
+            &HashMap::from([(0x1234, 0)]),
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.attributes.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [1, 2, 4, 5, 8, 9, 10, 14]
+        );
+    }
     #[test]
     fn packed_arguments_honor_abi_offsets_and_parameterless_launches() {
         let mut bytes = [0u8; 24];

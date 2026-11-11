@@ -88,11 +88,28 @@ class ReductionForward:
 
 @torch.no_grad()
 def test_compile_time_reduction_winner_restores_without_search(tmp_path, monkeypatch):
-    from ignition.preparation import aot
+    import pickle
+    import zlib
+
+    from ignition.preparation import aot, inductor_tuning
     from ignition.preparation.compilation import _OPTIONS
     from ignition.preparation.execution import GraphSignature
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
+    winner_checks = []
+
+    class Probe(inductor_tuning.InductorSelections):
+        def freeze(self, bound):
+            super().freeze(bound)
+            entry, _, _ = pickle.loads(zlib.decompress(bound.backend._serialized_artifact))
+            tuners = entry.compiled_fw.result._triton_bundle.static_autotuners
+            assert tuners
+            for selected in tuners:
+                assert len(selected.kernel.compile_results) == 1
+                assert selected.kernel.inductor_meta["dynamic_scale_rblock"] is False
+            winner_checks.append(bound.cache_hit)
+
+    monkeypatch.setattr(inductor_tuning, "InductorSelections", Probe)
     cache = ForwardCache(namespace={"model": "prepared-reduction"}, device="cuda:0",
         root=tmp_path, options=dict(_OPTIONS, **{"triton.autotune_at_compile_time": True}))
     signature = {"reduce": GraphSignature("prefill", 1, 128)}
@@ -112,13 +129,7 @@ def test_compile_time_reduction_winner_restores_without_search(tmp_path, monkeyp
     monkeypatch.setattr(CachingAutotuner, "benchmark_all_configs", unexpected)
     restored = cache.prepare_many({"reduce": fresh}, signature)["reduce"]
     assert restored.cache_hit
-    backend = restored.artifact._artifacts.compiled_fn
-    entry = backend.artifact.inner_fn.compiled_fn.serialize()
-    tuners = entry.compiled_fw.result._triton_bundle.static_autotuners
-    assert tuners
-    for selected in tuners:
-        assert len(selected.kernel.compile_results) == 1
-        assert selected.kernel.inductor_meta["dynamic_scale_rblock"] is False
+    assert winner_checks == [False, True]
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=torch.cuda.Stream()):

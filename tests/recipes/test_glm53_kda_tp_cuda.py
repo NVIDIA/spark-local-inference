@@ -65,10 +65,13 @@ def _rank(rank, world, rendezvous, snapshot, mode):
                 name=f"kda.{mode}", workspace=arena, checkpoint_export=mode == "prefill")
             reduction = PreparedAllReduce(scratch.output, output, runtime=runtime, session=session,
                                            coordinator=coordinator, name="kda.reduce")
+            operator.functional(session=session)
+            reduction.functional(session=session)
             session.tune()
+            arena.release_preparation()
 
             def forward():
-                reduction(operator(source))
+                output.copy_(reduction(operator(source, metadata)))
 
             compiled = compile_forward(forward)
             compiled()

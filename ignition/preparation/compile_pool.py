@@ -8,13 +8,16 @@ import multiprocessing
 import os
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
+from ignition import runtime_patches
+
 from . import host_memory
 from .compilation import _OPTIONS, _defer_full_collection
-from .host_memory import compile_threads, cpu_workers, device_memory_info, worker_limit
+from .host_memory import cpu_workers, device_memory_info
 
 # Device memory one compiler worker can hold: its CUDA context plus Inductor's constant folding.
 _WORKER_DEVICE_BYTES = 2 << 30
@@ -22,8 +25,74 @@ _WORKER_DEVICE_BYTES = 2 << 30
 _DISCRETE_WORKER_DEVICE_BYTES = 1 << 30
 
 
+@dataclass(frozen=True)
+class CompilerResources:
+    capacity: int
+    available: int
+    limit: int
+    worker_bytes: int
+    headroom: int
+
+
+def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None):
+    """Sample a rank's device capacity and its host's compiler memory budget."""
+    if type(headroom_bytes) is not int or headroom_bytes < 0:
+        raise ValueError("headroom_bytes must be a nonnegative byte count")
+    options = _OPTIONS if options is None else options
+    limit = min(cpu_workers(compile_workers), cpu_workers())
+    if compile_workers is None:
+        limit = min(limit, options['compile_threads'])
+    available = host_memory.available_bytes()
+    free = device_memory_info(device)[0]
+    shared = torch.cuda.get_device_properties(device).is_integrated
+    device_bytes = _WORKER_DEVICE_BYTES if shared else _DISCRETE_WORKER_DEVICE_BYTES
+    capacity = max(0, (free - headroom_bytes) // device_bytes)
+    if compile_workers is None:
+        capacity = min(8, capacity)
+    if shared:
+        available = min(available, free)
+    return CompilerResources(capacity, available, limit,
+        host_memory.FORWARD_WORKER_BYTES + (device_bytes if shared else 0),
+        max(host_memory._HEADROOM_BYTES, headroom_bytes if shared else 0))
+
+
+def allocate_workers(resources, counts, hosts):
+    """Admit forward compiler workers once per host, including zero-worker owners."""
+    workers = [0] * len(resources)
+    for host in dict.fromkeys(hosts):
+        members = [rank for rank, name in enumerate(hosts) if name == host]
+        jobs = sum(counts[rank] for rank in members)
+        if not jobs:
+            continue
+        available = min(resources[rank].available for rank in members)
+        headroom = max(resources[rank].headroom for rank in members)
+        limit = min(jobs, min(resources[rank].limit for rank in members))
+        remaining = available - headroom
+        for _ in range(limit):
+            able = [rank for rank in members if workers[rank] < resources[rank].capacity
+                    and resources[rank].worker_bytes <= remaining]
+            if not able:
+                break
+            rank = min(able, key=lambda rank: (workers[rank], rank))
+            workers[rank] += 1
+            remaining -= resources[rank].worker_bytes
+        if not any(workers[rank] for rank in members):
+            # Small forwards can fit below the concurrency estimate. Preserve one worker per host
+            # under the minimum allowance without multiplying that allowance by the rank count.
+            able = [rank for rank in members if resources[rank].capacity
+                    and resources[rank].worker_bytes - host_memory.FORWARD_WORKER_BYTES
+                    + host_memory._WORKER_BYTES <= remaining]
+            if able:
+                workers[able[0]] = 1
+            else:
+                raise MemoryError(f"host {host!r} has {jobs} missing forwards but no capacity for a forward compiler "
+                                  f"({available >> 20} MiB available host memory, {headroom >> 20} MiB headroom)")
+    return workers
+
+
 @_defer_full_collection()
 def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
+    runtime_patches.apply()
     from .aot import aot_forward
     from .device_binding import bind_device
     from .forward_metadata import loads
@@ -47,41 +116,20 @@ def _compile_forward(payload, device, options, path, num_threads, grad_enabled):
 
 
 class CompilePool:
-    def __init__(self, device, *, headroom_bytes=0, pools=1, options=None, compile_workers=None):
-        """Size workers for `device`, beside `pools - 1` other ranks' pools compiling on this host."""
+    def __init__(self, device, *, headroom_bytes=0, options=None, compile_workers=None, workers=None):
+        """Use admitted workers, or size one rank's pool from its host and device resources."""
         self.device = torch.device(device)
         self.pool = None
         options = dict(_OPTIONS if options is None else options)
-        if type(headroom_bytes) is not int or headroom_bytes < 0:
-            raise ValueError("headroom_bytes must be a nonnegative byte count")
-        if type(pools) is not int or pools < 1:
-            raise ValueError("pools must be a positive count")
-        budget = cpu_workers(compile_workers, pools=pools)
-        # Workers open contexts on the owning device; a nearly full device compiles with fewer of them.
-        free = device_memory_info(self.device)[0]
-        shared = torch.cuda.get_device_properties(self.device).is_integrated
-        if compile_workers is None:
-            budget = max(1, options['compile_threads'] // pools)
-        if shared and os.name == "nt":
-            free = min(free, host_memory.available_bytes())
-        worker_bytes = _WORKER_DEVICE_BYTES if shared else _DISCRETE_WORKER_DEVICE_BYTES
-        capacity = (free - headroom_bytes) // worker_bytes
-        if capacity < 1:
-            raise MemoryError("forward compilation requires memory for a CUDA worker beyond preparation headroom "
-                              f"({free >> 20} MiB free, {headroom_bytes >> 20} MiB headroom, "
-                              f"{worker_bytes >> 20} MiB per worker)")
-        limit = min(8, budget) if compile_workers is None else budget
-        self.workers = worker_limit(min(limit, capacity), pools=pools, available=free if shared else None,
-                                   device_bytes=_WORKER_DEVICE_BYTES if shared else 0,
-                                   headroom_bytes=headroom_bytes if shared else 0)
-        # Each process compiles one forward; nested pools would multiply the host budget.
-        threads = 1
-        if compile_workers is None:
-            threads = max(1, budget // self.workers)
-            if shared:
-                threads = compile_threads(threads, workers=pools * self.workers, available=free,
-                    device_bytes=_WORKER_DEVICE_BYTES, headroom_bytes=headroom_bytes)
-        self.options = dict(options, compile_threads=threads)
+        if workers is None:
+            resources = compiler_resources(self.device, headroom_bytes=headroom_bytes, options=options,
+                                           compile_workers=compile_workers)
+            workers = allocate_workers([resources], [resources.limit], ["local"])[0]
+        if type(workers) is not int or workers < 1:
+            raise ValueError("forward compiler pool requires a positive admitted worker count")
+        self.workers = workers
+        # Nested Inductor pools would escape the host's admitted process budget.
+        self.options = dict(options, compile_threads=1)
 
     def submit(self, forward, path):
         from .forward_metadata import dumps

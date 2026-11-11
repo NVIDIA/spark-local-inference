@@ -275,7 +275,7 @@ def test_dense_mla_ignores_unused_records(mode, rows, kv_dtype, window):
         session.register_scratch(arena)
         operation = PreparedDenseMLA(q, cache, output, pages, lengths, cu, caps=caps, scale=576 ** -.5,
             lse=lse, session=session, workspace=arena, name="dense-mla")
-        graph = _capture(operation, session)
+        graph = _capture(lambda: operation(q, output), session)
         try:
             for length in (1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 257):
                 count = min(rows, length)

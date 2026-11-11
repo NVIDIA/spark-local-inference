@@ -54,7 +54,7 @@ def _rank(rank, directory):
             graph = torch.cuda.CUDAGraph()
             from ignition.components.collectives import _all_gather
             def forward(source, output):
-                _all_gather(source, output, operation.handle)
+                _all_gather(source, output, [], operation.handle)
             compiled = StorageBackend(forward, (source, output))
             compiled(source, output)
             torch.cuda.synchronize()

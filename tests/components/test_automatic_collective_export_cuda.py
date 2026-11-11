@@ -22,12 +22,12 @@ def _rank(rank, directory, readiness):
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.model import PreparedModel
     from ignition.preparation.module_images import ModuleImages
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.runtime_package import export_model
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.runtime_core import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helios/tests"))
-    from collective_package_fixture import _configuration
+    from collective_core_fixture import _configuration
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -36,7 +36,7 @@ def _rank(rank, directory, readiness):
     runtime = session = prepared = None
     graphs = {}
     try:
-        with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
+        with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
             try:
                 coordinator = CollectivePreparation(dist.group.WORLD)
                 runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=13,
@@ -112,12 +112,12 @@ def _rank(rank, directory, readiness):
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 print(f"rank {rank}: export automatic startup storage", flush=True)
-                package = export_model(prepared, images, storage, directory / f"rank-{rank}.json",
+                core = export_model(prepared, images, storage, directory / f"rank-{rank}.json",
                     options={}, bundle_only=True, sources=True)
-                assert package.export_counts["modules"] > 0
+                assert core.export_counts["modules"] > 0
                 assert (directory / f"rank-{rank}.json").is_file()
-                from ignition.preparation.package_file import read_sources_record
-                from ignition.preparation import runtime_package_pb2 as proto
+                from ignition.preparation.core_file import read_sources_record
+                from ignition.preparation import runtime_core_pb2 as proto
 
                 index, _, _ = read_sources_record(directory / f"rank-{rank}.json")
                 allocations = index.ranks[0].allocations
