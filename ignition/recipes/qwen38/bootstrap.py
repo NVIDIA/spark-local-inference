@@ -319,7 +319,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     mtp_weights = None
     has_mtp = config.mtp and config.speculative_method == "mtp"
     has_dflash = config.mtp and config.speculative_method == "dflash2"
-    draft_config = draft_weights = draft_head = None
+    draft_config = draft_weights = draft_head = draft_embedding = None
     if has_mtp:
         from .mtp_weights import MTPWeights
 
@@ -334,6 +334,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         draft_config = load_draft_config(config.draft_snapshot)
         draft_weights = DraftWeights.load(config.draft_snapshot, draft_config, device, shard,
                                           progress=progress, online_mxfp8=config.online_mxfp8)
+        from .dflash import draft_embedding as rank_draft_embedding
+
+        draft_embedding = rank_draft_embedding(weights.tree.model.language_model.embed_tokens.weight, shard)
         if config.draft_head_quantization is not None:
             from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 
@@ -436,7 +439,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 if has_dflash:
                     from .dflash import SpeculativePreparation
                     draft_options = dict(draft_weights=draft_weights, draft_config=draft_config, draft_head=draft_head,
-                                         gather_runtime=hidden_gather_collective)
+                                         draft_embedding=draft_embedding, gather_runtime=hidden_gather_collective)
                 else:
                     from .speculative_model import SpeculativePreparation
                     draft_options = dict(mtp_weights=mtp_weights)
