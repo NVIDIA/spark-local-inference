@@ -197,7 +197,7 @@ impl Header {
         created: u64,
     ) -> Result<Self> {
         let mut header = Self {
-            version: VERSION,
+            version: Self::version_for_sizes(&ranks),
             identity,
             fingerprint,
             flags: 0,
@@ -220,7 +220,35 @@ impl Header {
     }
 
     pub fn encode(&self) -> Result<[u8; HEADER_BYTES]> {
-        self.encode_version(self.version)
+        let version = if self.version == VERSION {
+            VERSION
+        } else if self.replicated() {
+            LEGACY_REPLICATED_VERSION
+        } else {
+            LEGACY_VERSION
+        };
+        self.encode_version(version)
+    }
+
+    fn version_for_sizes(ranks: &[RankSizes]) -> u32 {
+        if ranks
+            .iter()
+            .any(|rank| rank.planes.iter().any(|size| *size > u64::from(u32::MAX)))
+        {
+            LEGACY_VERSION
+        } else {
+            VERSION
+        }
+    }
+
+    /// Equal header fields yield equal bytes regardless of the source file version.
+    pub(crate) fn canonical_encoding(&self) -> Result<[u8; HEADER_BYTES]> {
+        let version = Self::version_for_sizes(&self.ranks);
+        self.encode_version(if version == LEGACY_VERSION && self.replicated() {
+            LEGACY_REPLICATED_VERSION
+        } else {
+            version
+        })
     }
 
     fn encode_version(&self, version: u32) -> Result<[u8; HEADER_BYTES]> {
@@ -409,7 +437,7 @@ impl Header {
     /// computed with overflow checks here, so the unchecked size accessors are
     /// safe on any header `new` or `decode` returned.
     fn validate(&self) -> Result<()> {
-        self.validate_version(VERSION)
+        self.validate_version(self.version)
     }
 
     fn validate_version(&self, version: u32) -> Result<()> {
@@ -1274,6 +1302,86 @@ mod tests {
         let mut oversized = compact.clone();
         oversized.ranks[0].planes[0] = u64::MAX;
         assert!(oversized.encode().unwrap_err().to_string().contains("u32"));
+    }
+
+    #[test]
+    fn legacy_wide_planes_preserve_layout_and_encoded_bytes() {
+        let wide_plane = u64::from(u32::MAX) + 1;
+        for (version, replication) in [
+            (LEGACY_VERSION, Replication::default()),
+            (
+                LEGACY_REPLICATED_VERSION,
+                Replication { pages: true, row: true },
+            ),
+        ] {
+            let mut header = Header::from_sizes(
+                64,
+                vec![RankSizes { planes: vec![4096], row_bytes: 4096 }; 2],
+                IDENTITY,
+                FINGERPRINT,
+                key(64, 1),
+                None,
+                [0; 16],
+                1,
+                0,
+            )
+            .unwrap();
+            for rank in &mut header.ranks {
+                rank.planes[0] = wide_plane;
+            }
+            header.set_replication(replication).unwrap();
+            let bytes = header.encode_legacy_for_test(version).unwrap();
+
+            let decoded = Header::decode(&bytes).unwrap();
+
+            assert_eq!(decoded.encode().unwrap(), bytes);
+            let layout = decoded.layout().unwrap();
+            assert_eq!(layout.page_record_bytes, wide_plane * 2);
+            assert_eq!(layout.ranks[0].plane_bytes, [wide_plane]);
+            assert_eq!(layout.ranks[1].page_offset, wide_plane);
+            assert_eq!(decoded.replication(), replication);
+        }
+    }
+
+    #[test]
+    fn fresh_wide_planes_use_a_lossless_legacy_encoding() {
+        let wide_plane = u64::from(u32::MAX) + 1;
+        let header = Header::from_sizes(
+            64,
+            vec![RankSizes { planes: vec![wide_plane], row_bytes: 4096 }],
+            IDENTITY,
+            FINGERPRINT,
+            key(64, 1),
+            None,
+            [0; 16],
+            1,
+            0,
+        )
+        .unwrap();
+        let bytes = header.encode().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), LEGACY_VERSION);
+        let decoded = Header::decode(&bytes).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(decoded.layout().unwrap().page_record_bytes, wide_plane);
+    }
+
+    #[test]
+    fn legacy_public_replication_flags_select_a_decodable_encoding() {
+        let header = header(&geometries().remove(0), 64, None);
+        let original = header.encode_legacy_for_test(LEGACY_VERSION).unwrap();
+        let mut decoded = Header::decode(&original).unwrap();
+        decoded.flags |= REPLICATED_ROW;
+        let replicated = decoded.encode().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(replicated[8..12].try_into().unwrap()),
+            LEGACY_REPLICATED_VERSION,
+        );
+        decoded = Header::decode(&replicated).unwrap();
+        assert_eq!(decoded.encode().unwrap(), replicated);
+        decoded.flags &= !REPLICATED_ROW;
+        assert_eq!(decoded.encode().unwrap(), original);
+        assert_eq!(Header::decode(&decoded.encode().unwrap()).unwrap(), header);
     }
 
     #[test]

@@ -396,6 +396,14 @@ impl Core {
         if !self.fits(needed) {
             return Ok(None);
         }
+        if self
+            .pool
+            .free_slots()
+            .saturating_sub(self.pool.intake_slots())
+            < needed
+        {
+            self.thin_rows_for(needed);
+        }
         if self.spill && self.retire_for(self.shortfall(needed)) {
             return Ok(None);
         }
@@ -408,6 +416,7 @@ impl Core {
                 Some(Eviction::Leaves(nodes)) => {
                     self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
                     for node in &nodes {
+                        self.thinning.remove(&node.key);
                         self.clean_slots -= self.clean_slots(node);
                         self.release(&node.location);
                     }
@@ -674,6 +683,7 @@ impl Core {
         if !node.ready || node.pinned() {
             return false;
         }
+        self.thinning.remove(key);
         let clean = self.clean_slots(node);
         self.index.drop_row(key);
         let record = &mut self.index.node_mut(key).unwrap().location;
@@ -696,9 +706,18 @@ impl Core {
     }
 
     fn thin_rows(&mut self) {
-        // Keep deep-prefix rows while there is room for at least one more row.
-        // Thinning resumes automatically when DRAM pressure actually requires it.
-        if self.pool.free_slots() > 2 * self.layout.row_slots().max(1) {
+        self.thin_rows_for(self.layout.row_slots().saturating_mul(2));
+    }
+
+    fn thin_rows_for(&mut self, headroom: usize) {
+        // Intake slots belong to transfers, not checkpoint retention. Reclaim
+        // redundant rows before an incoming record evicts reusable endpoints.
+        if self
+            .pool
+            .free_slots()
+            .saturating_sub(self.pool.intake_slots())
+            > headroom
+        {
             return;
         }
         for key in std::mem::take(&mut self.thinning) {
@@ -733,6 +752,7 @@ impl Core {
 
     fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
         for node in self.index.remove(key)? {
+            self.thinning.remove(&node.key);
             self.clean_slots -= self.clean_slots(&node);
             self.release(&node.location);
         }
@@ -1952,6 +1972,125 @@ mod tests {
     }
 
     #[test]
+    fn row_thinning_uses_warm_headroom_for_each_row_geometry() {
+        for row_slots in [1, 3] {
+            for headroom in [2 * row_slots, 2 * row_slots + 1] {
+                let layout =
+                    Layout::new(&[geometry(PT, &[("kv", PAGE)], row_slots as u64 * PAGE)]).unwrap();
+                assert_eq!(layout.row_slots(), row_slots);
+                let intake = crate::offload::intake_slots(&layout, 1);
+                let warm = 3 * (1 + row_slots) + headroom;
+                let pool = SlabPool::new(PAGE, warm + intake, intake).unwrap();
+                let mut core = Core::new(IDENTITY, pool, layout, false);
+                let full = history(192, 1);
+                let checkpoints = [
+                    published(&full, 64, None, 0, 1),
+                    published(&full, 128, Some(64), 0, 2),
+                    published(&full, 192, Some(128), 0, 3),
+                ];
+                for checkpoint in &checkpoints {
+                    assert!(core.store(checkpoint).unwrap());
+                    finish(&mut core);
+                }
+                let thinned = headroom == 2 * row_slots;
+                assert_eq!(
+                    core.index[&checkpoints[1].key].row, !thinned,
+                    "row_slots={row_slots}, warm headroom={headroom}, intake={intake}"
+                );
+                assert_eq!(
+                    core.pool.free_slots(),
+                    intake + headroom + usize::from(thinned) * row_slots
+                );
+                assert!(core.index[&checkpoints[0].key].row);
+                assert!(core.index[&checkpoints[2].key].row);
+                assert_clean_slots(&core);
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_thins_redundant_rows_before_allocating_another_endpoint() {
+        for (warm_slots, next_endpoint) in [(7, 256), (9, 384)] {
+            let mut core = store_core(warm_slots - 1, 1, false);
+            let full = history(next_endpoint, 1);
+            let root = published(&full, 64, None, 0, 1);
+            let middle = published(&full, 128, Some(64), 0, 2);
+            let child = published(&full, 192, Some(128), 0, 3);
+            let tip = published(&full, next_endpoint, Some(192), 0, 4);
+            for checkpoint in [&root, &middle, &child, &tip] {
+                assert!(core.store(checkpoint).unwrap());
+                finish(&mut core);
+            }
+            assert!(core.index[&root.key].row, "warm slots={warm_slots}");
+            assert!(!core.index[&middle.key].row);
+            assert_eq!(
+                core.lookup(&history(64, 1), 0, u64::MAX).map(|hit| hit.key),
+                Some(root.key)
+            );
+            assert!(core.pool.free_slots() >= core.pool.intake_slots());
+            assert_clean_slots(&core);
+        }
+    }
+
+    #[test]
+    fn pressure_thinning_waits_for_the_last_row_pin() {
+        let mut core = store_core(6, 1, false);
+        let full = history(192, 1);
+        let root = published(&full, 64, None, 0, 1);
+        let parent = published(&full, 128, Some(64), 0, 2);
+        let child = published(&full, 192, Some(128), 0, 3);
+        for checkpoint in [&root, &parent] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        core.pin_record(&parent.key).unwrap();
+        assert!(core.store(&child).unwrap());
+        finish(&mut core);
+        assert!(core.index[&parent.key].row);
+        assert!(core.thinning.contains(&parent.key));
+        let before = core.pool.free_slots();
+        core.unpin_record(&parent.key).unwrap();
+        core.settle(&mut Vec::new());
+        assert!(!core.index[&parent.key].row);
+        assert_eq!(core.pool.free_slots(), before + core.layout.row_slots());
+        assert!(!core.thinning.contains(&parent.key));
+        assert_clean_slots(&core);
+    }
+
+    #[test]
+    fn thinning_queue_keeps_only_resident_records_after_removal_and_eviction() {
+        for remove_explicitly in [false, true] {
+            let mut core = store_core(7, 1, false);
+            for salt in 1..=64 {
+                let full = history(192, salt);
+                let checkpoints = [
+                    published(&full, 64, None, 0, 1),
+                    published(&full, 128, Some(64), 0, 2),
+                    published(&full, 192, Some(128), 0, 3),
+                ];
+                for checkpoint in &checkpoints {
+                    assert!(core.store(checkpoint).unwrap());
+                    finish(&mut core);
+                }
+                if remove_explicitly {
+                    // Expiration and explicit removal share this record-removal path.
+                    for checkpoint in checkpoints.iter().rev() {
+                        if core.index.contains(&checkpoint.key) {
+                            core.remove_record(&checkpoint.key).unwrap();
+                        }
+                    }
+                }
+                assert!(
+                    core.thinning.iter().all(|key| core.index.contains(key)),
+                    "stale thinning keys after chain {salt}, explicit removal={remove_explicitly}"
+                );
+                assert!(core.thinning.len() <= core.index.len());
+                assert_clean_slots(&core);
+            }
+        }
+    }
+
+    #[test]
     fn a_record_one_slot_larger_than_warm_is_oversize() {
         let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
@@ -2775,11 +2914,11 @@ mod tests {
             stored(&finish(&mut core)),
             [(grandchild.key, Some(3 * PAGE + ROW))]
         );
-        // Commit retains the child row while headroom remains: nine page slots
-        // and the two rows occupy eleven of twelve warm slots.
-        assert!(core.record(&child.key).unwrap().row.is_some());
+        // With only one warm slot free, commit thins the redundant child row.
+        // Its pages remain available and the grandchild retains its endpoint.
+        assert!(core.record(&child.key).unwrap().row.is_none());
         assert!(core.record(&grandchild.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
 
         // With nothing else evictable the publication is skipped rather than
         // stored at its parent's expense, and the parent's pin is released.
