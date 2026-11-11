@@ -389,6 +389,7 @@ mod tests {
     #[test]
     fn pci_ids_select_the_chip_without_matching_marketing_names() {
         assert_eq!(platform(0x2e1210de), Some("gb10"));
+        assert_eq!(platform(0x2e0610de), Some("gb10"));
         assert_eq!(platform(0x2bb410de), Some("gb202"));
         assert_eq!(platform(0x2bb110de), Some("gb202"));
         assert_eq!(platform(0x2bb510de), Some("gb202"));

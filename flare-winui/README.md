@@ -143,6 +143,8 @@ transfers. Preparation reports completed metadata checks with at most eight
 requests in flight. Transfer speed uses the last two seconds of byte movement;
 speed and ETA are hidden during preparation, validation, and installation.
 Those phases use indeterminate progress, and only a completed install shows 100%.
+Clear failed removes failed entries from download history. Completed, active,
+paused, and cancelled entries remain, and downloaded data is kept for retries.
 
 Model details inspect signed metadata without granting publisher consent or
 loading the GPU. The PC filter hides cores whose inspected requirements are

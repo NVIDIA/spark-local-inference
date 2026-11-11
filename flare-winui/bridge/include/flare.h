@@ -210,6 +210,7 @@ uint64_t flare_app_refresh(flare_app* app);
 uint64_t flare_app_discover(flare_app* app, const char* query, size_t length);
 uint64_t flare_app_open_model(flare_app* app, const uint16_t* path, size_t length);
 uint64_t flare_app_download(flare_app* app, const char* repository, size_t length);
+uint64_t flare_app_clear_failed_downloads(flare_app* app);
 uint64_t flare_app_activate(flare_app* app, const char* model_id, size_t length);
 uint64_t flare_app_stop(flare_app* app);
 uint64_t flare_app_cancel(flare_app* app, uint64_t operation_id);
