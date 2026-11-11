@@ -217,13 +217,16 @@ def test_paired_route_gather_uses_two_row_blocks_only_for_p8(monkeypatch, rows, 
     from ignition.recipes.kimi3 import routing
 
     class Plan:
+        def __init__(self, query):
+            self.query = query
+
         def request(self, *args, **kwargs):
             return object()
 
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(16)))
     monkeypatch.setattr(pcie, "query_from_runtime",
                         lambda runtime, *, surface, call: dict(surface=surface, call=call))
-    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: Plan())
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: Plan(query))
     monkeypatch.setattr(routing, "declare", lambda *args, **kwargs: None)
     runtime = SimpleNamespace(world_size=16, exchange_group=object())
     local_down = torch.zeros((rows, 224), dtype=torch.bfloat16)
@@ -232,7 +235,8 @@ def test_paired_route_gather_uses_two_row_blocks_only_for_p8(monkeypatch, rows, 
         local_down, local_router, torch.zeros(896), torch.zeros((rows, 3584), dtype=torch.bfloat16),
         torch.zeros((rows, 16)), torch.zeros((rows, 16), dtype=torch.int32),
         runtime=runtime, session=None, coordinator=None, name="route")
-    assert operation.pair["row_blocks"] == expected_blocks
+    assert operation.plan.query["call"]["row_blocks"] == expected_blocks
+    assert operation.pair is None
 
 
 def test_native_quantization_covers_all_routed_experts(config):

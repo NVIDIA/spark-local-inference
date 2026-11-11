@@ -86,9 +86,9 @@ def test_scratch_views_reject_unavailable_token_sample_and_request_capacity():
             base.rows(tokens, mode, sample_rows=rows)
 
 
-def test_cp_prefill_query_value_alias_survives_layer_overlay():
+def test_cp_prefill_query_value_alias_survives_declaration_views():
     base = DecoderScratch.allocate(65, 2, "prefill", "cpu", shard=TensorParallelShard(0, 2),
-        sample_rows=1, context_ranks=2, overlay_layers=True)
+        sample_rows=1, context_ranks=2)
     for rows in (65, 16, 65):
         view = base.rows(rows, "prefill", sample_rows=1).mla
         view.query.fill_(float("nan"))

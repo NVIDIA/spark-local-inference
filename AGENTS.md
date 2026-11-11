@@ -474,6 +474,11 @@ conformance or CUDA correctness; validate those boundaries separately.
 - Validate the affected execution path and capacities. Model and preparation
   development guidance defines shape, graph-transition, state, and lifetime
   checks; GPU performance guidance defines measurement requirements.
+- For excess fixed device memory, follow the
+  [cross-model scratch workflow](docs/performance-work.md#cross-model-scratch-planning).
+  Make graph-local temporaries and their dependencies visible to Inductor before
+  adding manual shared pools. Keep weights, cache history, request state, and
+  other values that cross graph boundaries in explicit persistent storage.
 - Keep ordinary tests and raw benchmark measurements. Do not create development
   audit reports, receipts, provenance bundles, or hash inventories.
 

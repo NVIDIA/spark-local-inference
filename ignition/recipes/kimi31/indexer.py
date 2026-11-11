@@ -79,7 +79,7 @@ class PreparedIndexSelection:
         register_finalizer(session, self._release_examples)
 
     def _release_examples(self):
-        self.pages = self.lengths = self.local = self.scores = self.selected = None
+        self.pages = self.lengths = self.local = self.scores = self.selected = self.candidate_counts = None
 
     def prepare_local(self, query, weights, positions, tables):
         return self.prepare_local_result(query, weights, positions, tables)[0]
