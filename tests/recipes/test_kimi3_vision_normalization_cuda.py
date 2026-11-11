@@ -1,4 +1,4 @@
-"""Prepared vision normalization preserves BF16 image features and scratch aliases."""
+"""Prepared vision normalization preserves BF16 image features with local output."""
 
 import os
 
@@ -9,17 +9,49 @@ from b12x.preparation import PreparationSession
 from ignition.recipes.kimi3.vision import VisionScratch, _RMSNorm
 
 
-def test_normalization_reuses_attention_storage_but_not_projection_inputs():
-    scratch = VisionScratch.allocate(256, "cpu")
-    assert scratch.normalized.shape == (256, 1024)
-    assert scratch.normalized.data_ptr() == scratch.query.data_ptr()
-    assert (
-        scratch.normalized.untyped_storage().data_ptr()
-        == scratch.value.untyped_storage().data_ptr()
-    )
-    assert scratch.normalized.data_ptr() != scratch.qkv.data_ptr()
-    assert scratch.normalized.data_ptr() != scratch.hidden.data_ptr()
-    assert scratch.rows(128).normalized.shape == (128, 1024)
+def test_prepared_operator_examples_are_disjoint(monkeypatch):
+    from types import SimpleNamespace
+    from ignition.recipes.kimi3 import vision
+
+    operands = []
+
+    class Projection:
+        def __init__(self, source, weight, output, **kwargs):
+            operands.append((kwargs["name"], (source, output)))
+
+        def functional(self, **kwargs):
+            return self
+
+    class Attention(Projection):
+        def __init__(self, query, key, value, cu, output, **kwargs):
+            assert all(tensor.stride() == (4608, 128, 1) for tensor in (query, key, value))
+            operands.append((kwargs["name"], (query, key, value, output)))
+
+    monkeypatch.setattr(vision, "UnquantizedProjection", Projection)
+    monkeypatch.setattr(vision, "PreparedTorchRMSNorm", Projection)
+    monkeypatch.setattr(vision, "PreparedVarlenAttention", Attention)
+    monkeypatch.setattr(vision, "prepare_cached_rotary", lambda session: None)
+    names = ["vision_tower.patch_embed.pos_emb.weight", "vision_tower.patch_embed.proj.weight",
+             "vision_tower.encoder.final_layernorm.weight", "mm_projector.proj.0.weight",
+             "mm_projector.proj.2.weight", "mm_projector.post_norm.weight"]
+    for layer in range(27):
+        names.extend(f"vision_tower.encoder.blocks.{layer}.{name}" for name in (
+            "norm0.weight", "norm1.weight", "wqkv.weight", "wo.weight", "mlp.fc0.weight", "mlp.fc1.weight"))
+    weights = SimpleNamespace(tensors={name: torch.empty((1, 1024), device="meta") for name in names})
+    examples = {}
+    for capacity in (256, 128):
+        scratch = VisionScratch.allocate(capacity, "cpu", examples=examples)
+        vision.PreparedVision(weights, scratch, None, session=None, workspace=None, name=f"vision.{capacity}")
+    assert operands
+    for name, tensors in operands:
+        spans = sorted(
+            (tensor.data_ptr() + row * tensor.stride(0) * tensor.element_size(),
+             tensor.data_ptr() + row * tensor.stride(0) * tensor.element_size()
+             + tensor[0].numel() * tensor.element_size())
+            for tensor in tensors for row in range(tensor.shape[0])
+        )
+        assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), name
+    assert len({tensor.untyped_storage().data_ptr() for tensor in examples.values()}) == 2
 
 
 @pytest.mark.skipif(
@@ -46,7 +78,7 @@ def test_prepared_norm_is_exact_under_compiled_replay(rows, width, eps, inplace)
         operation = _RMSNorm(
             weight, source, output, eps, session=session, name="vision.norm"
         )
-        forward = compile_forward(lambda: operation(source))
+        forward = compile_forward(lambda: output.copy_(operation(source)))
         forward()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()

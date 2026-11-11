@@ -55,7 +55,7 @@ def test_windowed_context_matches_attention_over_every_position(start, tokens):
         metadata.query_start_loc[1] = tokens
         metadata.positions.fill_(-1)
         metadata.positions[:tokens].copy_(torch.arange(start, start + tokens, device=device))
-        output = op(latent).clone()
+        output = op(latent, absorbed, metadata).clone()
 
     # Every position's record: earlier ones from their owners' caches, the chunk's from its E4M3 latents.
     positions = torch.arange(start, device=device)

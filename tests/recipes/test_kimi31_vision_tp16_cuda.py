@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Checkpoint position interpolation, bounded graph storage, and scratch reuse on TP16."""
+"""Checkpoint position interpolation with compiler-planned temporaries on TP16."""
 
 from datetime import timedelta
 import json
@@ -19,12 +19,25 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
                               reason="requires sixteen explicitly assigned CUDA devices")
 
 
+class _Interpolation:
+    def __init__(self, weight, indices, factors, output):
+        self.weight, self.indices, self.factors, self.output = weight, indices, factors, output
+
+    def __call__(self):
+        from ignition.recipes.kimi3.vision import interpolate_positions
+
+        values = torch.empty_like(self.output)
+        interpolate_positions(self.weight, self.indices, self.factors, values)
+        self.output.copy_(values)
+
+
 @torch.no_grad()
 def _rank(rank, rendezvous):
     import torch.distributed as dist
     from safetensors import safe_open
 
-    from ignition.recipes.kimi3.vision import PATCH_CAPACITIES, VisionScratch, interpolate_positions
+    from ignition.preparation.compilation import compile_forward
+    from ignition.recipes.kimi3.vision import PATCH_CAPACITIES
 
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
@@ -36,8 +49,8 @@ def _rank(rank, rendezvous):
         index = json.loads((CHECKPOINT / "model.safetensors.index.json").read_text())
         with safe_open(CHECKPOINT / index["weight_map"][field], framework="pt", device=rank) as source:
             weight = source.get_tensor(field).reshape(-1, 1024)
-        scratch = VisionScratch.allocate(max(PATCH_CAPACITIES), device)
-        scratch.patches.fill_(17)
+        patches = torch.full((max(PATCH_CAPACITIES), 588), 17, dtype=torch.bfloat16, device=device)
+        destination = torch.empty((max(PATCH_CAPACITIES), 1024), dtype=torch.bfloat16, device=device)
         torch.manual_seed(31 + rank)
         indices = torch.randint(weight.shape[0], (max(PATCH_CAPACITIES), 4), device=device)
         factors = torch.rand(indices.shape, device=device)
@@ -45,26 +58,29 @@ def _rank(rank, rendezvous):
         stream = torch.cuda.Stream(device=device)
         pool = torch.cuda.graph_pool_handle()
         graphs = []
+        compiled_forwards = []
         try:
             for rows in (*reversed(PATCH_CAPACITIES), 4100):
-                output = scratch.query[:rows].view(rows, -1)[:, :1024]
+                output = destination[:rows]
                 expected = (weight[indices[:rows]].float() * factors[:rows, :, None]).sum(1).bfloat16()
+                forward = compile_forward(_Interpolation(weight, indices[:rows], factors[:rows], output))
+                compiled_forwards.append(forward)
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    interpolate_positions(weight, indices[:rows], factors[:rows], output)
+                    forward()
                 stream.synchronize()
                 torch.testing.assert_close(output, expected, atol=0, rtol=0)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream, pool=pool):
-                    interpolate_positions(weight, indices[:rows], factors[:rows], output)
+                    forward()
                 graphs.append(graph)
-                scratch.query.fill_(float("nan"))
+                destination.fill_(float("nan"))
                 before = torch.cuda.memory_stats()
                 graph.replay()
                 torch.cuda.synchronize()
                 after = torch.cuda.memory_stats()
                 torch.testing.assert_close(output, expected, atol=0, rtol=0)
-                assert torch.all(scratch.patches == 17)
+                assert torch.all(patches == 17)
                 assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
                 assert after["allocation.all.freed"] == before["allocation.all.freed"]
             reserved = sum(segment["total_size"] for segment in torch.cuda.memory_snapshot()

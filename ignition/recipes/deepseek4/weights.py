@@ -10,6 +10,7 @@ import torch
 
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.weights import MLPWeights
+from ignition.preparation.persistent import persistent_cat, allocated_tensor_bytes
 
 from .config import ModelConfig
 
@@ -44,7 +45,7 @@ class DSparkWeights:
     draft_head: object | None = None
 
     @classmethod
-    def load(cls, loader):
+    def load(cls, loader, *, markov_head_quantization=None):
         c, shard = loader.config.draft, loader.shard
         last = f"mtp.{c.layers - 1}"
         return cls(
@@ -56,7 +57,8 @@ class DSparkWeights:
             loader.load_head_mix(last + "."),
             loader.load_tensor(last + ".markov_head.markov_w1.weight"),
             loader.load_tensor(
-                last + ".markov_head.markov_w2.weight", extent=slice(*shard.partition(129280, alignment=64))
+                last + ".markov_head.markov_w2.weight", extent=slice(*shard.partition(129280, alignment=64)),
+                temporary=markov_head_quantization == "nvfp4"
             ),
         )
 
@@ -79,13 +81,13 @@ class ModelWeights:
              draft_head_quantization=None, markov_head_quantization=None):
         from ignition.components.vocabulary import nvfp4_draft_head
         config = ModelConfig.load(manifest.metadata_path)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_tensor("head.weight", extent=slice(*shard.partition(129280, alignment=64)))
             head_mix = loader.load_head_mix("")
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
-            draft = DSparkWeights.load(loader) if dspark else None
+            draft = DSparkWeights.load(loader, markov_head_quantization=markov_head_quantization) if dspark else None
             if draft is not None:
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
@@ -106,7 +108,7 @@ class ModelWeights:
             layers,
             draft,
             vision,
-            torch.cuda.memory_allocated(device) - before,
+            allocated_tensor_bytes(device) - before,
         )
 
 
@@ -125,7 +127,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
 
     def load_compressor(self, prefix):
         return {
-            key: self.load_tensor(prefix + "." + suffix)
+            key: self.load_tensor(prefix + "." + suffix, temporary=key in ("values", "gates"))
             for key, suffix in (
                 ("values", "wkv.weight"),
                 ("gates", "wgate.weight"),
@@ -166,7 +168,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
                         or any(part.dtype != parts[0].dtype or part.shape[1:] != parts[0].shape[1:]
                                for part in parts)):
                     raise ValueError("compressor projections require matching unquantized weight formats")
-                attention["compression"] = torch.cat(parts)
+                attention["compression"] = persistent_cat(parts)
         return attention
 
     def load_layer(self, layer, *, draft=False):

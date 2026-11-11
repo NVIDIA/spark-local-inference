@@ -16,6 +16,49 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("with_residual", [False, True])
+@torch.no_grad()
+def test_functional_normalization_capture(compiled, with_residual):
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    source = torch.randn(16, 5168, device="cuda", dtype=torch.bfloat16)[:, :5120]
+    seed = source.clone()
+    residual = torch.randn_like(source) if with_residual else None
+    weight = torch.randn(5120, device="cuda", dtype=torch.float32) * .1
+    output = torch.empty_like(source)
+    observed = torch.empty_like(source)
+    with RecordedPreparationSession(device=source.device, checkpoint="functional-rms",
+            workload_schema="functional-rms", numerical_policy="default") as session:
+        bound = PreparedRMSNorm(source, weight, output, eps=1e-6, residual=residual,
+            zero_centered=True, session=session, name="rms")
+        operation = bound.functional()
+        session.tune()
+        source.copy_(seed)
+        bound(source, residual)
+        expected, expected_source = output.clone(), source.clone()
+
+        def forward():
+            observed.copy_(operation(source, residual))
+
+        call = compile_forward(forward) if compiled else forward
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            call()
+        for _ in range(3):
+            source.copy_(seed)
+            observed.fill_(float("nan"))
+            allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+            torch.testing.assert_close(source, expected_source, rtol=0, atol=0)
+        graph.reset()
+
+
 class NormalizationForward:
     def __init__(self, source, operation):
         self.source, self.operation = source, operation

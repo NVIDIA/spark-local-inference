@@ -156,6 +156,42 @@ def _tuning_results(contributions):
     return tuple(results)
 
 
+def _selected_plan_catalog(requests):
+    from b12x.preparation.session import _declaration_key
+    from b12x.preparation.types import _CompositePlan
+
+    def declaration(plan):
+        if isinstance(plan, _CompositePlan):
+            return (plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
+                    tuple((count, declaration(child)) for count, child in plan.variants.items()))
+        return _declaration_key(plan)[:-1]
+
+    by_name = {request.name: request for request in requests}
+    identities = {}
+
+    def identity(name):
+        if name not in identities:
+            request = by_name[name]
+            identities[name] = (declaration(request.plan),
+                                tuple(identity(dependency) for dependency in request.dependencies))
+        return identities[name]
+
+    entries = []
+
+    def selected(plan, key):
+        if isinstance(plan, _CompositePlan):
+            for count, child in plan.variants.items():
+                selected(child, (key, count))
+        else:
+            config = plan.selection.config
+            entries.append((plan, key, plan.contract.config_payload(config), config))
+
+    for request in requests:
+        if request.collective is None:
+            selected(request.plan, identity(request.name))
+    return entries
+
+
 class CollectivePreparation:
     """Authorize matching collective declarations and synchronize kernel entry.
 
@@ -219,6 +255,36 @@ class CollectivePreparation:
             raise RuntimeError(f"{len(differing)} kernel selections differ from rank zero's, such as "
                                f"{differing[:3]}; preparing again adopts rank zero's tuning decisions")
 
+    def reconcile_selections(self, requests):
+        """Choose one actual configuration for matching declarations across ranks.
+
+        Unequal catalogs cannot shard candidate races. Their shared declarations
+        still need matching scratch layouts before compiled forwards are shared.
+        """
+        entries = _selected_plan_catalog(requests)
+        local = {}
+        for _, key, payload, config in entries:
+            local.setdefault(key, {}).setdefault(payload, config)
+        gathered = [None] * len(self.ranks)
+        dist.all_gather_object(gathered, local, group=self.group)
+        chosen, participants = {}, {}
+        for catalog in gathered:
+            for key, values in catalog.items():
+                chosen.setdefault(key, next(iter(values.items())))
+                participants[key] = participants.get(key, 0) + 1
+        common = {key for key, count in participants.items() if count > 1}
+        changed = any(payload != chosen[key][0]
+                      for catalog in gathered for key, values in catalog.items() if key in common
+                      for payload in values)
+        configs = {}
+        for plan, key, payload, _ in entries:
+            if key in common and payload != chosen[key][0]:
+                config = chosen[key][1]
+                if plan in configs and plan.contract.config_payload(configs[plan]) != chosen[key][0]:
+                    raise ValueError("one plan has conflicting rank-shared configurations")
+                configs[plan] = config
+        return configs, changed
+
     def __call__(self, progress):
         if progress.ready_cache is not None or progress.ready_tuning:
             raise ValueError("collective preparation does not shard tuning candidates")
@@ -241,7 +307,7 @@ class CollectivePreparation:
             raise ValueError("collective preparation requires the complete control group")
         return key
 
-    def prepare(self, session, requests, *, progress=None, autotune=None):
+    def prepare(self, session, requests, *, progress=None, autotune=None, selected_configs=None):
         """Drive a mixed local/collective job until every rank has finished.
 
         A finished rank must still exchange readiness while its peers compile
@@ -256,7 +322,8 @@ class CollectivePreparation:
             while True:
                 try:
                     if job is None:
-                        job = session.begin(requests, autotune=autotune)
+                        options = {} if selected_configs is None else {"selected_configs": selected_configs}
+                        job = session.begin(requests, autotune=autotune, **options)
                     if state is None or not state.done:
                         state = job.advance(**authorization)
                         if progress is not None:

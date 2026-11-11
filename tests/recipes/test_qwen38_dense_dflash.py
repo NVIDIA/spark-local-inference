@@ -221,7 +221,6 @@ def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
     from types import SimpleNamespace
     from ignition.components.parallel import TensorParallelShard
     from ignition.components.sampling import DeviceRequestState
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.qwen38_dense.dflash import SpeculativePreparation
     from ignition.recipes.qwen38_dense.pool import ContinuationPool
 
@@ -230,14 +229,12 @@ def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
     weights = SimpleNamespace(config=config, shard=TensorParallelShard(0, 1),
         tree=SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.empty((config.vocabulary, config.hidden), device="meta"))),
         head=None, draft_head=None)
-    buffers = [GraphBufferPool("meta") for _ in range(3)]
     owner = SpeculativePreparation(weights, pool, requests, None, None,
         completion=None, frame=None, sequence=None, session=None, workspace=None,
-        buffers=buffers[0].cursor(), decoder_buffers=buffers[1], context_buffers=buffers[2],
         verification_width=width)
     assert owner.study_width is None
     assert owner.block_size == owner.draft_scratch.block_size == width
-    assert owner.draft_scratch.embedding.shape == (2 * width, config.hidden)
+    assert (owner.draft_scratch.tokens, owner.draft_scratch.hidden_size) == (2 * width, config.hidden)
     assert owner.records.delta.shape == (48, 2, 48, width, 128)
     assert owner.records.keys.shape == (48, 2, 16, width, 128)
     assert owner.records[0].delta.stride(0) == 48 * width * 128

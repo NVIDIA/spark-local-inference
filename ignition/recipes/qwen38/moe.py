@@ -72,11 +72,10 @@ class SharedExpertScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens: int, device, *, intermediate=640, buffers=None) -> SharedExpertScratch:
+    def allocate(cls, tokens: int, device, *, intermediate=640) -> SharedExpertScratch:
         if tokens <= 0:
             raise ValueError("shared expert capacity must be positive")
-        return cls(*((torch.zeros((tokens, width), dtype=torch.bfloat16, device=device) if buffers is None
-                      else buffers.zeros((tokens, width), torch.bfloat16))
+        return cls(*(torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
                      for width in (2 * intermediate, intermediate, 2560, 1, 2560)))
 
     def rows(self, tokens: int) -> SharedExpertScratch:
@@ -87,12 +86,7 @@ class SharedExpertScratch:
 
 @dataclass(frozen=True)
 class QwenMoeScratch:
-    """Capacity-backed intermediates shared by serial decoder layers.
-
-    The shared-expert output remains live while routed experts execute, so
-    these are distinct buffers. Views for smaller graph buckets share storage;
-    graphs using this scratch must execute in one ordered stream.
-    """
+    """Tensor examples for routed and shared expert preparation."""
 
     router_logits: torch.Tensor
     router: RouterScratch
@@ -101,15 +95,14 @@ class QwenMoeScratch:
     shared: SharedExpertScratch
 
     @classmethod
-    def allocate(cls, tokens: int, device, *, intermediate=640, buffers=None, output=None) -> QwenMoeScratch:
+    def allocate(cls, tokens: int, device, *, intermediate=640, output=None) -> QwenMoeScratch:
         if tokens <= 0:
             raise ValueError("MoE capacity must be positive")
         def zeros(width):
-            return (torch.zeros((tokens, width), dtype=torch.bfloat16, device=device) if buffers is None
-                    else buffers.zeros((tokens, width), torch.bfloat16))
-        return cls(zeros(512), RouterScratch.allocate(tokens, device, experts=512, top_k=10, buffers=buffers),
+            return torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
+        return cls(zeros(512), RouterScratch.allocate(tokens, device, experts=512, top_k=10),
             zeros(2560), zeros(2560) if output is None else output,
-            SharedExpertScratch.allocate(tokens, device, intermediate=intermediate, buffers=buffers))
+            SharedExpertScratch.allocate(tokens, device, intermediate=intermediate))
 
     def rows(self, tokens: int) -> QwenMoeScratch:
         if not 0 < tokens <= self.router_logits.shape[0]:
@@ -150,27 +143,27 @@ class PreparedSharedExpert(PreparedMLP):
         self.gate_projection = UnquantizedProjection(source, weights.gate, self.gate_logits,
             session=session, name=f"{name}.shared_gate")
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        self.project(source)
-        return self.finish()
+    def functional(self, *, session):
+        super().functional(session=session)
+        self.gate_projection.functional(session=session)
+        self.scratch = self.gate_logits = self.projected = None
+        return self
 
-    def project(self, source: torch.Tensor) -> None:
-        super().__call__(source)
-        self.gate_projection(source)
+    def project_runtime(self, source):
+        return super().__call__(source), self.gate_projection(source)
 
-    def finish(self, routed: torch.Tensor | None = None, *, out: torch.Tensor | None = None) -> torch.Tensor:
-        output = self.output if out is None else out
-        shared = self.projected * torch.sigmoid(self.gate_logits)
-        output.copy_(shared if routed is None else routed + shared)
-        return output
+    @staticmethod
+    def finish_runtime(projected, gate, routed=None):
+        shared = projected * torch.sigmoid(gate)
+        return shared if routed is None else routed + shared
 
 
 class PreparedQwenMoe:
     """Native FP32 routing and shared-expert composition around routed experts.
 
-    Construction allocates and prepares all buffers and plans. Calls are
-    recorded into the model CUDA graph; native replay executes its CUDA nodes
-    without calling this Python object. Source storage is fixed per graph.
+    Preparation retains selected plans, weights, and tensor layouts. Calls
+    allocate local outputs and workspaces before CUDA graph capture. Native
+    replay executes the captured nodes without calling this Python object.
     """
 
     def __init__(self, source, weights: QwenMoeWeights, *, session: PreparationSession, name: str,
@@ -211,23 +204,37 @@ class PreparedQwenMoe:
 
             register_finalizer(session, finalize_overlap, workspace=workspace)
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        if source is not self.source and (
-                source.data_ptr() != self.source.data_ptr() or source.shape != self.source.shape):
-            raise ValueError("prepared Qwen MoE requires its fixed source storage")
+    def functional(self, *, session):
+        self.router_projection.functional(session=session)
+        self.routing.functional(session=session)
+        self.experts.functional(session=session)
         if self.concurrent_shared is None:
-            self.shared.project(source)
+            self.shared.functional(session=session)
         else:
-            self.concurrent_shared.start(source)
-        self.router_projection(source)
-        self.routing(self.router_logits)
+            self.concurrent_shared.functional(session=session)
+        self.source = self.scratch = self.router_logits = self.router = None
+        self.routed_output = self.output = None
+        return self
+
+    def _functional(self, source):
+        if self.concurrent_shared is None:
+            projected, gate = self.shared.project_runtime(source)
+        else:
+            pending = self.concurrent_shared.start(source)
+        logits = self.router_projection(source)
+        routes = self.routing(logits)
         if getattr(self.experts, "reduces_into_shared", False):
-            # SM103: one kernel reduces the routed FC2 rows into the shared-expert sum.
-            staged = self.experts.stage_rows()
+            staged = self.experts.stage_rows(source, routes.ids, routes.weights)
             if self.concurrent_shared is not None:
-                self.concurrent_shared.finish(source, staged)
-            return self.experts.reduce(self.shared.finish(), self.output)
-        routed = self.experts()
+                projected = self.concurrent_shared.finish(pending, staged.rows)
+                gate = pending.gate
+            shared = self.shared.finish_runtime(projected, gate)
+            return self.experts.reduce(shared, staged=staged)
+        routed = self.experts(source, routes.ids, routes.weights)
         if self.concurrent_shared is not None:
-            self.concurrent_shared.finish(source, routed)
-        return self.shared.finish(routed, out=self.output)
+            projected = self.concurrent_shared.finish(pending, routed)
+            gate = pending.gate
+        return self.shared.finish_runtime(projected, gate, routed)
+
+    def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        return self._functional(source)

@@ -13,7 +13,7 @@ import torch
 
 from tests.components.completion_support import completion_outputs
 
-from ignition.preparation.scratch import GraphBufferPool
+from tests.tensor_examples import TensorExamples
 from ignition.recipes.qwen38.sampling import DeviceRequestState, RequestAdmission
 from ignition.recipes.qwen38.vision_state import (
     PreparedEmbeddingInjection,
@@ -76,16 +76,22 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
     records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     pixels = buffers.zeros((256, 1536), torch.bfloat16)
     operation = PreparedVisionHandoff(
-        inputs, features, requests, output, completion_outputs(records), frame, sequence, pixels=pixels, buffers=buffers
+        inputs, features, requests, output, completion_outputs(records), frame, sequence, pixels=pixels
     )
     operation.prepare()
+    metadata_example, errors = operation.metadata, torch.empty_like(operation.errors)
+    operation.functional()
     def forward():
-        operation.begin()
-        operation.finish()
+        values, metadata = operation.begin()
+        operation.finish(values, output)
+        errors.copy_(values["errors"])
+        pixels.copy_(values["pixels"])
+        for name in metadata.__dataclass_fields__:
+            getattr(metadata_example, name).copy_(getattr(metadata, name))
 
     if compiled:
         from ignition.preparation.compilation import compile_forward
@@ -112,11 +118,12 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
         inputs.vision_num_patches.fill_(16)
         inputs.vision_cu_seqlens[1] = 16
         inputs.vision_pixel_values[:16].normal_()
-        for chunks in pool.chunks.values():
-            for chunk in chunks:
-                chunk.fill_(37)
+        pixels.fill_(37)
+        errors.fill_(37)
+        for tensor in vars(metadata_example).values():
+            tensor.fill_(37)
         _replay(worker)
-        assert operation.errors.item() == 0
+        assert errors.item() == 0
         assert features.count.tolist() == [0, 0, 4, 0]
         assert features.generation.tolist() == [0, 0, 17, 0]
         assert torch.equal(features.arena[1, :4], output[:4])
@@ -126,8 +133,8 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
         assert records[0, 0][..., :8].tolist() == [0, 0, 0, 0, -1, 0, 0, 0]
         for name, before in requests_before.items():
             assert torch.equal(getattr(requests, name), before), name
-        torch.testing.assert_close(operation.pixels[:16], inputs.vision_pixel_values[:16].bfloat16(), rtol=0, atol=0)
-        assert torch.count_nonzero(operation.pixels[16:]) == 0
+        torch.testing.assert_close(pixels[:16], inputs.vision_pixel_values[:16].bfloat16(), rtol=0, atol=0)
+        assert torch.count_nonzero(pixels[16:]) == 0
         inputs.vision_feature_offset.fill_(4)
         inputs.vision_num_patches.fill_(8)
         inputs.vision_cu_seqlens[1] = 8
@@ -167,7 +174,7 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
             if kind == "epoch":
                 inputs.vision_generation.fill_(16)
             _replay(worker)
-            assert operation.errors.item() & error
+            assert errors.item() & error
             assert features.count[2].item() == 6
             assert torch.equal(features.arena[1], saved)
             assert torch.all(features.arena[0] == 7)
@@ -176,12 +183,12 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
                 assert requests.status[2].item() == 1
                 assert requests.error_code[2].item() == 0
             if kind == "index":
-                assert operation.metadata.num_patches.item() == 0
+                assert metadata_example.num_patches.item() == 0
                 assert (
-                    torch.count_nonzero(operation.metadata.interpolation_indices) == 0
+                    torch.count_nonzero(metadata_example.interpolation_indices) == 0
                 )
-                assert torch.count_nonzero(operation.metadata.position_ids) == 0
-                assert torch.count_nonzero(operation.pixels) == 0
+                assert torch.count_nonzero(metadata_example.position_ids) == 0
+                assert torch.count_nonzero(pixels) == 0
     finally:
         worker.close()
         graph.reset()
@@ -211,14 +218,17 @@ def test_native_embedding_injection_precedes_gather_and_model_mutation(capacity,
         features, requests, indices, slots, epochs, lengths, live, embedding
     )
     operation.prepare()
+    errors = torch.empty_like(operation.errors)
+    operation.functional()
     tokens = torch.tensor(prompt, dtype=torch.int64, device=device)
     starts = torch.tensor([0, capacity], dtype=torch.int32, device=device)
     token_state = PreparedTokenState(requests, tokens, starts, slots, epochs, live, history=requests.ple_history, history_pad_id=248044)
     token_state.prepare()
     def forward():
-        operation.validate()
+        current_errors = operation.validate()
+        errors.copy_(current_errors)
         token_state.gather()
-        operation.inject()
+        operation.inject(embedding, current_errors)
 
     if compiled:
         from ignition.preparation.compilation import compile_forward
@@ -257,7 +267,7 @@ def test_native_embedding_injection_precedes_gather_and_model_mutation(capacity,
             embedding.fill_(7)
             indices[-1] = bad_index
             _replay(worker)
-            assert operation.errors.item() == 2
+            assert errors.item() == 2
             assert token_state.active.item() == 0
             assert requests.status[3].item() == 3
             assert torch.all(embedding == 7)
@@ -276,7 +286,7 @@ def test_native_embedding_injection_precedes_gather_and_model_mutation(capacity,
         indices[-1] = -2
         _replay(worker)
         assert requests.status[3].item() == 1
-        assert operation.errors.item() == 0
+        assert errors.item() == 0
         assert torch.all(embedding == 7)
         lengths.fill_(capacity)
         epochs.fill_(26)

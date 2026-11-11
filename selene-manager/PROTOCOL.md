@@ -3,12 +3,17 @@
 Companion to [selene.proto](../selene/proto/selene.proto), which is normative for fields. This
 file defines who may do what, in which order, and what each party must prove before memory
 is reused. The manager implements the manager side of each flow (section 12 lists what it serves);
-the instance side (`flare-selene`, `selene::pool`) implements the other.
+the instance side (crate `flare-selene`, module `flare_selene::pool` in `selene/src/pool/`)
+implements the other.
 
 ## Decisions
 
+The rules the protocol rests on. The numbered sections give their mechanics and
+cite them by number.
+
 1. **One stream per instance.** `Hello` is a stateless unary call; everything
-   else rides one bidirectional `Session` stream per instance process and scope.
+   else rides one bidirectional `Session` stream per instance process and scope;
+   only the peer ranks of a multi-process instance add `Rank` streams (section 13).
    The stream's order is the only ordering the protocol needs.
 2. **Incarnations.** `manager_incarnation` is a random nonzero 64-bit value picked
    at manager start. `session_incarnation` is assigned by the manager at
@@ -19,8 +24,8 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    host. A process is told apart by a random `process_nonce` (fresh per process,
    unchanged across a reconnect) and by the session incarnation. A new session
    for a known `instance_id` supersedes the old one: the newer incarnation wins,
-   the older is fenced, and the old session's index entries are replaced
-   atomically when the new session's snapshot installs.
+   the older is fenced, and the old session's index entries are removed at once;
+   the new session's snapshot announces its holdings chunk by chunk (section 3).
 3. **Encryption is declared, not negotiated.** The client selects its connection
    mode before connecting; see [address forms and trust](docs/network-operations.md#addresses-and-startup-warnings).
    For TCP clients, `Hello.encryption` must equal what the client connected with,
@@ -72,36 +77,37 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
     Flare's `Match` uses. Zero pages with the row is a legal row-only tail. A
     candidate's `begin_tokens` is likewise exact; its `skip_pages` is the physical
     offset into the first record.
-13. **Claims run after admission, inside `fetch`** (see "Claims run after admission" in the client's state machine). Lookup is asynchronous
+13. **Claims run after admission, inside `fetch`** (`PooledStore::fetch` in `selene/src/pool/store.rs`). Lookup is asynchronous
     while a request queues; claims start when the scheduler has reserved the
     ticket. A failed claim drains before reporting failure; the request
     recomputes, or uses a local copy of the same endpoint when available.
 14. **GPU exports need retained staging first.** A
     GPU-tier export is accepted only after staging for the whole export is
     reserved: the manager reserves it from the index's size before sending the
-    `ExportRequest` (`reserved_bytes`), and the source checks the actual chain
-    against it before pinning. Otherwise the claim fails `NO_WINDOWS` at once.
+    `ExportRequest` (`reserved_bytes`), and the source compares the chain it
+    pinned against it before answering: a larger chain is unpinned and refused,
+    never acknowledged `PINNED`. Otherwise the claim fails `NO_WINDOWS` at once.
     The GPU pin is therefore bounded by the D2H, never by the requester's pace.
     Host-tier sources (DRAM, NVMe) may stream with `window_credits`.
 15. **Export slots are per instance.** An export touches every rank, so the
     per-GPU count (default 2) is also the per-instance count. The same default
     bounds claims in flight per requester. A quarantined export keeps its slot.
-16. **Headroom:** computed
-    counterfactually against Flare's real eviction rules (leaf eviction needs
-    `pins == 0`; compaction needs no direct pin and exactly one remaining child;
-    snapshot aliasing), subtracting the newly protected resources once, and with
-    the reservation arithmetic shared with admission rather than copied.
-17. **Put is included** because the eviction cascade ends in a write into the
+16. **Headroom is counterfactual.** The source's check applies Flare's own
+    eviction rules (leaf eviction needs `pins == 0`; compaction needs no direct
+    pin and exactly one remaining child; snapshot aliasing) to the cache with the
+    export pinned, subtracts the resources the pin protects once, and uses the
+    reservation arithmetic that admission uses, never a copy of it.
+17. **Put is part of the protocol.** The eviction cascade ends in a write into the
     manager's store. Refusals keep the source local and release its selection.
     Retrying requires manager progress, reconnect or a short backoff; the model
     worker never waits for room.
-18. **Entries die with their session, or are replaced atomically by its
-    successor.** When a session ends with no successor the manager removes every
-    entry it announced. When a new session opens for the same `instance_id`, the
-    old session's entries stop being offered at once (its source session is
-    stale: a claim naming it is `STALE_SOURCE`) and are replaced, in one step with
-    respect to lookups, when the new session's snapshot installs. A restarted
-    instance re-announces what its local tiers recovered under the same id.
+18. **Entries die with their session; its successor announces its own.** When a
+    session ends, with or without a successor, the manager removes every entry it
+    announced. When a new session opens for the same `instance_id`, the old
+    session's entries stop being offered at once (its source session is stale: a
+    claim naming it is `STALE_SOURCE`), and the new session's snapshot chunks are
+    applied as they arrive (section 3), so a lookup can see a partial snapshot. A
+    restarted instance re-announces what its local tiers recovered under the same id.
 19. **Lookup input is bucket-keyed.** The request carries the history's aligned
     boundary keys (capped); the manager returns candidates from the matching
     buckets and the client re-verifies each node with `history.key_at`.
@@ -117,10 +123,14 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
     geometry, scope identity, parent, length and its own verification of the
     received payload before indexing. Only a GPU source, having no stored
     checksum, hashes what it wrote.
-22. **Ticket handling.** The pool lookup ticket belongs to one request; it
-    is consumed explicitly at admission, not by dropping the `Incoming` (which
-    moves into `Active`). Candidates are validated against the request's complete
-    held plan, not GPU residency alone (the client's lookup tickets).
+22. **Ticket handling.** The pool lookup ticket (`LookupTicket`,
+    `selene/src/pool/lookup.rs`) belongs to one request; the Helios worker clears
+    it explicitly at admission, not by dropping the `Incoming` (which moves into
+    `Active`). A ticket whose answer is still pending at admission stays with the
+    admitted request. The worker drops it when the request has submitted prefill
+    or carries conditioned inputs, or when the answer arrives without a longer
+    prefix; an answer with a longer prefix is used for one readmission. Candidates
+    are validated against the request's complete held plan, not GPU residency alone.
 
 ## 1. Roles, identity and scope
 
@@ -138,7 +148,7 @@ of the scope, so TP widths never share records.
 
 Every message after `open` carries `Header{manager_incarnation,
 session_incarnation}`. Receivers drop messages with a wrong manager incarnation.
-The manager closes the stream (`SessionClosing{STALE_SESSION}`) on a wrong session
+The manager closes the stream (`SessionClosing{CLOSING_STALE_SESSION}`) on a wrong session
 incarnation, except for the fence-class messages of decision 9.
 
 ## 2. Session lifecycle
@@ -175,13 +185,14 @@ client                                         manager
   stream is a disconnect. A source sends `ExportEnd` for every export before a
   quiesced `Goodbye`; a quarantined export keeps its pin and makes `quiesced`
   false.
-- Reconnect uses exponential backoff with a cap; no more than one Hello in
-  flight. While disconnected the client is in `Local` state (the client's state).
+- Reconnect uses exponential backoff with a cap (100 ms doubling to 1 s); no more
+  than one Hello in flight. While disconnected the client is in `Local` state
+  (`PoolStatus::Local`, `selene/src/pool/shared.rs`).
 
 ## 3. Index hints and resync
 
-Each session announces its current GPU, DRAM and NVMe holdings. Notices upsert,
-spill or evict hints on the ordered control stream. Claims still validate and pin
+Each session announces its GPU, DRAM and NVMe holdings. Notices upsert,
+spill or evict hints on the ordered control stream. Every claim validates and pins
 the actual source before copying; the index grants no ownership.
 
 A snapshot consists of Begin, bounded chunks and End. Begin clears this source's
@@ -192,8 +203,8 @@ predecessor too. Session supersession and disconnection remove that session's hi
 The client takes holdings and clears its unsent queue under one lock. Changes
 after that cut follow the last snapshot chunk. Queue overflow or lost GPU eviction
 notices request another snapshot without blocking the worker. Entry, chunk and
-batch bounds remain enforced. There are no notice sequences, delta buffers,
-watermarks or snapshot timeout.
+batch bounds are enforced. The stream's order is the only ordering: the protocol
+has no notice sequence numbers, delta buffers, watermarks or snapshot timeout.
 
 ## 4. Lookup
 
@@ -203,7 +214,7 @@ The manager answers from its index only; it never contacts a source.
 Manager algorithm for each candidate source entry (endpoint `E` with a row):
 
 1. Skip the requester's own instance and sources the requester cannot reach
-   (decision 4), including sources with no export slots. Busy sources remain eligible.
+   (decision 4), including sources with no export slots. Busy sources are eligible.
 2. Compute the level from the tier and the relation to the requester.
 3. `begin` = `resident_tokens` (exact, not page-aligned); the physical start
    is `floor(begin / page_tokens)`. Walk parents from `E` to the node containing
@@ -213,8 +224,9 @@ Manager algorithm for each candidate source entry (endpoint `E` with a row):
 5. Order by longest match, then fixed copy level and stable source identity; return at most
    `max_candidates`, each with at most `max_chain_nodes` nodes.
 
-Answers: `NOT_READY` (with `retry_after_ms`), `OVERLOADED` (the bound on
-concurrent lookups or the work queue, answered at once, never queued), `INVALID`.
+Answers: `LOOKUP_OK`, `LOOKUP_NOT_READY` (with `retry_after_ms`),
+`LOOKUP_OVERLOADED` (the session already has `max_concurrent_lookups` lookups
+waiting; answered at once, never queued), `LOOKUP_INVALID`.
 The requester treats every non-OK answer, a timeout, and a lost session as "no
 pool candidates for this request" and admits with its local match. Each request
 owns its lookup ticket.
@@ -222,11 +234,11 @@ owns its lookup ticket.
 A candidate is a hint. After the reply the client verifies each node against its
 history; any mismatch drops the candidate. Lookup reserves no export slot: another
 claim can fill the source between lookup and claim, causing `SOURCE_LIMIT`. The
-client retries that refusal within the existing size-scaled restore deadline;
+client retries that refusal within the restore's size-scaled deadline;
 a temporarily busy source does not cause a recompute. A quarantined export keeps
 its slot until drained or its process exits. Pending host writes are not announced
 as ready holdings; a GPU holding can be offered while its separate host copy is
-still in flight.
+in flight.
 
 ## 5. The claim state machine
 
@@ -239,14 +251,15 @@ compare-and-set on that task, not a lock). Ownership and replay tracking are sep
   memory has drained or its process has exited, however long quarantine lasts.
 - **Replay tracking** uses a per-(instance, process) high-water mark. Reusing a
   claim id is refused `INVALID_CLAIM`, without starting another lifecycle.
-  Fence acknowledgments still resolve through records retained for their memory.
+  Fence acknowledgments resolve through the fence records kept for their memory.
   A process entry is dropped after exit and after its final fence record is gone.
 
 ```
                       Claim
  (none) ---------------------------> REQUESTED
-   |  refused at once: NOT_READY, CLAIM_LIMIT, SOURCE_LIMIT, UNKNOWN_SOURCE,
-   |  STALE_SOURCE, INVALID_CLAIM  ==> FAILED  (ClaimTerminal, fence_required=false)
+   |  refused at once: NOT_READY, REGIONS_HELD, RANKS_DETACHED, CLAIM_LIMIT,
+   |  SOURCE_LIMIT, UNKNOWN_SOURCE, STALE_SOURCE, INVALID_CLAIM, CHAIN_GAP,
+   |  NO_WINDOWS  ==> FAILED  (ClaimTerminal, fence_required=false)
 
  REQUESTED --pin held, grant sent--> GRANTED
  GRANTED --exact CopyResult COPY_OK--> COPIED
@@ -284,18 +297,18 @@ refusals (record evicted) are immediate and identical on the wire.
 ```
 requester          manager                    source (model worker via poll)
  Claim ---------->|  checks; reserve retained staging for the whole export
-                  |  (none available: FAILED NO_WINDOWS now); REQUESTED
+                  |  (none available: FAILED NO_WINDOWS at once); REQUESTED
                   | ExportRequest{reserved_bytes}->| poll -> worker:
-                  |                               |   revalidate chain, size <= reserved, headroom, pin_checkpoint
+                  |                               |   revalidate chain, headroom, pin_checkpoint; then size <= reserved
                   |<------------------ PinAck PINNED{records}
                   | pin held; allocate windows
- <--ClaimGranted--|  GRANTED (hold is now in force)
+ <--ClaimGranted--|  GRANTED (the hold is in force)
                   | ExportFill{windows} --------->| D2H into windows (lowest-priority stream)
                   |<------------ WindowFilled{i, xxh3}  (after the D2H drained)
  <--WindowReady---|  GRANTED
  H2D from window i
  WindowReleased-->|  (after H2D drained)
-                  |<------------ ExportEnd{COMPLETE, DRAINED}   (pin released after last fill)
+                  |<------------ ExportEnd{EXPORT_COMPLETE, DRAINED}   (pin released after last fill)
  CopyResult OK -->|  COPIED
  <-ClaimTerminal--|  fence_required
  FenceAck DRAINED>|  windows freed once source also ended
@@ -315,7 +328,7 @@ requester     manager                     source
               |<--- PinAck PINNED (crossed) | case B: pin done, ack sent before the cancel
               | late pin: terminal claim    |   was processed -> manager re-sends
               | ExportCancel (idempotent) ->|   ExportCancel; source unpins after in-flight
-              |                             |   copies drain, ExportEnd{RELEASED}
+              |                             |   copies drain, ExportEnd{EXPORT_RELEASED}
               |<------------ ExportEnd ----|
               | export slot freed           | case C: cancel processed between pin and ack
               |                             |   -> unpin, PinAck REFUSED{CANCELLED}
@@ -333,11 +346,13 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 
 - The requester never touches the windows of a claim it does not hold. It
   ignores `ClaimGranted` and `WindowReady` for such a claim.
-- It answers the following `ClaimTerminal` with `FenceAck{DRAINED}` at once (it
-  has no accesses to drain). For a claim id it has never heard of it does the
-  same. If it already started a copy before releasing, it drains first.
-- A requester that restarted is a new instance; the manager has already failed
-  the old instance's claims with `REQUESTER_LOST` (section 8.3).
+- It answers the following `ClaimTerminal`, when that sets `fence_required`, with
+  `FenceAck{DRAINED}` at once (it has no accesses to drain). For a claim id it has
+  never heard of it does the same. If it already started a copy before releasing,
+  it drains first.
+- A requester that restarted is another process under the same `instance_id`
+  (decision 2); the manager fails the old process's claims with `REQUESTER_LOST`
+  when its stream ends or is superseded (section 8.3).
 
 ### Idempotency
 
@@ -349,7 +364,7 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 | `CopyResult` | first one counts; others ignored |
 | `FenceAck`, `ExportEnd` | first per (claim, party) counts |
 | `PinAck` | first per export counts; a late `PINNED` is released |
-| `ExportCancel` | idempotent; unknown export answered `ExportEnd{RELEASED, DRAINED}` |
+| `ExportCancel` | idempotent; unknown export answered `ExportEnd{EXPORT_RELEASED, DRAINED}` |
 | `NoticeBatch` | applied in stream order |
 | `PutCancel` | idempotent |
 
@@ -358,22 +373,27 @@ is recoverable by timeout.
 
 ## 6. Export on the source
 
-An `ExportRequest` reaches the instance's pool client, which hands it to its
-owner:
+An `ExportRequest` reaches the instance's pool client. Its I/O thread refuses a
+request bound to another session (`STALE_SOURCE`) and one it cannot serve: no
+memory to fill for it, the instance's own export slot count reached, or the
+client closing (`SOURCE_BUSY`; the manager's own pre-check answers
+`SOURCE_LIMIT`). It hands any other request to its owner:
 
 - **GPU tier:** delivered through `poll` to the model worker as
-  `StoreEvent::ExportRequested`. On the worker, atomically (one scheduler step):
+  `StoreEvent::ExportRequested`. On the worker, atomically (one scheduler step,
+  `serve_export` in `helios/src/server/runtime.rs`):
   1. resolve the ready checkpoint by its scoped key; otherwise refuse `NOT_FOUND`;
   2. verify the chain from the physical start (`floor(begin_tokens / page_tokens)`)
-     is contiguous and has the row if wanted (`CHAIN_GAP`), and that its size fits
-     `reserved_bytes` (`NO_WINDOWS`);
-  3. run the headroom check (the client's headroom check); refuse `NO_HEADROOM`;
-  4. check this instance's own export slot count; refuse `SOURCE_BUSY` (the
-     manager's own pre-check answers `SOURCE_LIMIT`);
-  5. `pin_checkpoint(id)`.
-  The refusal is returned at once. It never waits for pages to appear.
-- **Host tiers (DRAM, NVMe):** selene takes a reference on the record chain inside
-  the pool client thread. No model worker involvement.
+     is contiguous and has the row if wanted (`CHAIN_GAP`);
+  3. run the headroom check (`RequestScheduler::export_fits`); refuse `NO_HEADROOM`;
+  4. `pin_checkpoint(id)`.
+  The refusal is returned at once. It never waits for pages to appear. The pool
+  client then compares the pinned chain's size with `reserved_bytes`: a larger
+  chain is unpinned and answered `REFUSED{NO_WINDOWS}` before any window is filled.
+- **Host tiers (DRAM, NVMe):** `PooledStore::poll`, which the model worker calls,
+  takes a reference on the record chain from the local tier
+  (`TierStore::pin_export`) and answers. No `StoreEvent` reaches the scheduler and
+  no headroom check runs; the windows are filled on a host copy thread.
 
 After `PINNED` the source waits for `ExportFill`. A GPU export receives all its
 windows in one `ExportFill` (retained staging was reserved before the pin), so the
@@ -399,8 +419,8 @@ it and writes the windows there, in the direction of a put (section 7.5). The ma
 `ExportFill` and expects no `WindowFilled`: each window is granted on the channel, the source copies
 it (GPU: D2H into a slot of its own registered staging; host: the persisted bytes) and writes it
 with the checksums it states, and `ExportEnd` follows as for any source. The pin is released once
-every copy has drained, exactly as before; the manager's windows are written only by its own
-handler, so they are not the source's to fence.
+every copy has drained, exactly as for a source with shared memory; the manager's windows are
+written only by its own handler, so they are not the source's to fence.
 
 ## 7. Copy, ownership and fencing
 
@@ -446,7 +466,7 @@ FREE --ExportFill--> SOURCE_WRITE --WindowFilled(OK)--> REQUESTER_READ --WindowR
 | `REQUESTER_READ` | requester `FenceAck{DRAINED}` (source drained earlier, by `WindowFilled`) |
 | `SOURCE_WRITE`, source `QUARANTINED` | source process exit, or manager exit |
 | `REQUESTER_READ`, requester `QUARANTINED` | requester process exit, or manager exit |
-| either, with `Goodbye{quiesced}` from one party | still the opposite party's acknowledgment |
+| either, with `Goodbye{quiesced}` from one party | the opposite party's acknowledgment (a `Goodbye` clears only its sender) |
 
 ### 7.3 What "drained" means per medium
 
@@ -465,15 +485,18 @@ unknown), the party reports `QUARANTINED` (or the manager infers it). The memory
 is not reused until the owning process is confirmed exited, or for the lifetime
 of the manager process if exit cannot be observed (remote sessions). A
 disconnected local process that is still alive keeps its windows quarantined
-(`local.rs`).
+(`Core::holders` in `selene-manager/src/pool/claims.rs`; exit is observed through
+the pidfd helpers in `selene-manager/src/local.rs`).
 
 - The manager counts quarantined bytes in `selene_pool_quarantined_bytes` and
-  logs each event once. Claims that cannot get windows fail `NO_WINDOWS`
-  immediately. There is no waiting for quarantined memory.
+  logs each quarantine event once (designed, not implemented: it logs only a
+  failed RDMA queue-pair teardown). Claims that cannot get windows fail
+  `NO_WINDOWS` immediately. Nothing waits for quarantined memory.
 - On the client, a registration handle whose drain failed keeps its region alive
   and mapped (`HostRegistrar` contract); a GPU pin whose copy cannot be drained
   is never unpinned (no `ExportEnded` event is produced for it); the worker stops
-  rather than reuse it (existing `PrefixStore::poll` failure semantics).
+  rather than reuse it (the failure contract of `HostStore::poll` in
+  `selene/src/store.rs`).
 
 ### 7.5 Data channel (other hosts)
 
@@ -494,7 +517,9 @@ first page, page count, row flag, length, row checksum, slot, one checksum per p
 stream carrier by `length` payload bytes, then `END`; for a put `GRANT` from the manager and
 `FILLED` (with the instance's checksums) from the instance, payload following on the stream
 carrier. On the RDMA carrier the payload never travels on the connection: the manager writes a
-claim's window into a private slot the instance lent (`CREDIT`) and then names it in `WINDOW`.
+claim's window into a private slot the instance lent (`CREDIT`) and then names it in `WINDOW`;
+the manager answers an RDMA `HELLO` with `ACCEPT`, its own queue-pair description. `ABORT` (with
+text) is the manager ending a transfer early.
 Puts and rank legs use the stream carrier. Windows arrive in index
 order and are checked by the receiver's coverage exactly as shared windows are, so a transfer that
 ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
@@ -524,9 +549,9 @@ transfers on the data channel (or shared windows for a local end):
   (`SOURCE_LOST`); a requester that does fails it (`COPY_ERROR`) and the source is sent `ExportCancel`.
 - *Fencing.* A window being filled is the source leg handler's to write, so the handler's exit is
   the fence for it, not the source's `ExportEnd`; a window being read by a remote requester is that
-  leg's handler's. Each leg is stopped when the claim ends. A handler not seen to exit within five
-  seconds of the stop quarantines the windows it may touch, counted in
-  `selene_pool_quarantined_bytes`, until its exit is seen. A source whose session ends is fenced
+  leg's handler's. Each leg is stopped when the claim ends. From that stop until the handler's
+  exit is seen, the windows it may touch stay out of service and are counted in
+  `selene_pool_quarantined_bytes`; no timer releases them. A source whose session ends is fenced
   by that: its claims fail, its export is released, and nothing waits for an `ExportEnd` it cannot
   send.
 - *Levels.* A relayed copy keeps the source's tier level (neighbour GPU, host DRAM, host NVMe); the
@@ -537,7 +562,7 @@ transfers on the data channel (or shared windows for a local end):
 Flare sees `Fetched` only after every destination write has drained: selene
 aggregates its H2D submissions (one per part) and reports a single result when
 all have completed, including on failure. Destination pages are discarded by the
-scheduler's existing failed-ticket path only after that.
+scheduler's failed-ticket path only after that.
 
 ## 8. Failure and restart
 
@@ -555,8 +580,9 @@ Detected by stream error, EOF, a `SessionClosing`, or a different
    references, quarantining whatever it could not drain. It keeps the shared
    regions mapped and registered: they are mapped and registered once, at
    startup, and for the life of the process (section 8.6);
-5. continues on its local tiers. Evictions that targeted the manager's NVMe pass
-   the record one tier further down (design: unavailable destination);
+5. continues on its local tiers. Records selected for a put to the manager stay
+   in their local tier, whose own LRU eviction is the end of the chain while the
+   manager is unreachable (section 11);
 6. reconnects with backoff (Hello, open, resync). The regions are the same
    files at the same offsets when the restarted manager reports the same
    `SharedMemory.regions_generation`; a different generation disables the pool
@@ -570,13 +596,13 @@ process picks a new incarnation and becomes `READY` after scanning its NVMe
 records.
 
 - A `ClaimRelease`, `FenceAck` or `ExportEnd` that mentions a vanished claim or
-  export is answered (`UNKNOWN_CLAIM`) or ignored. Old windows were never
-  reusable by the new manager: it reuses the same region files and holds them
-  until each process that had a session has reconnected or exited
+  export is answered (`UNKNOWN_CLAIM`) or ignored. The restarted manager grants
+  none of the previous run's windows: it reuses the same region files and holds
+  them until each process that had a session has reconnected or exited
   (section 8.6).
-- Records the dead manager held in DRAM are lost; NVMe records are recovered.
-  A writer dropped its source copy only at `Stored`, so there is nothing to
-  resend; the record is simply gone and will be recomputed on demand.
+- Records the dead manager held only in DRAM are lost; NVMe records are
+  recovered. A writer drops its source copy at `Stored`, so a lost record cannot
+  be resent; it is recomputed on demand.
 - Readiness does not wait for previous instances; source hints return as they resync.
 
 ### 8.3 Requester restart
@@ -598,7 +624,7 @@ the old stream end. Either way:
 The new process has no pool state: it opens a session under the same id, resyncs
 what it recovered, and its first lookup asks the manager directly. Its claim and
 put counters start afresh (new nonce), and it attests nothing for the old process.
-There is no catalog mirror to rebuild and so no catalog-after-restart race. A request that arrived
+The client keeps no copy of the manager's index, so it has nothing to rebuild. A request that arrived
 before the session was open is admitted without pool candidates.
 
 ### 8.4 Source death
@@ -609,15 +635,15 @@ On stream end or process exit the manager:
    them;
 2. fails every claim served by it `SOURCE_LOST`;
 3. quarantines the windows in `SOURCE_WRITE` until the source process is
-   confirmed exited. Windows already in `REQUESTER_READ` hold valid bytes the
-   source no longer touches and follow the requester's fence;
+   confirmed exited. Windows in `REQUESTER_READ` hold valid bytes the source
+   does not touch and follow the requester's fence;
 4. never trusts partially filled windows: the requester's all-or-nothing rule
    discards the restore.
 
 If the stream dropped but the process lives (a blip), the process reconnects;
 its `ExportEnd{fence}` for old exports arrives on the new session
 (decision 9) and releases the quarantined windows. No hold survives the source
-dying: "a hold protects against eviction only".
+dying: a hold protects against eviction only (`ClaimGranted` in selene.proto).
 
 ### 8.5 Session loss summary
 
@@ -625,8 +651,8 @@ dying: "a hold protects against eviction only".
 |---|---|---|---|---|
 | stream ends, process gone | `REQUESTER_LOST` | `SOURCE_LOST` | removed | reclaimed (exit confirmed) |
 | stream ends, process alive | `REQUESTER_LOST` | `SOURCE_LOST` | removed | quarantined until fence acks arrive on a new session or the process exits |
-| superseded by a reconnect (same process) | `REQUESTER_LOST` | `SOURCE_LOST` | hidden, replaced at the new snapshot | as above; the old stream's fence acks are accepted on the new session |
-| superseded by another process (same `instance_id`) | `REQUESTER_LOST` | `SOURCE_LOST` | hidden, replaced at the new snapshot | quarantined until the old process's exit is confirmed; the new process attests nothing for it |
+| superseded by a reconnect (same process) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | as above; the old stream's fence acks are accepted on the new session |
+| superseded by another process (same `instance_id`) | `REQUESTER_LOST` | `SOURCE_LOST` | removed; the new session's snapshot announces its own | quarantined until the old process's exit is confirmed; the new process attests nothing for it |
 | manager restart | all dead | all dead | gone | the same region files, held until the previous run's processes have reconnected (drained) or exited (8.6) |
 
 ### 8.6 Persistent shared regions
@@ -667,9 +693,9 @@ Other files are left alone. Shutdown retains the regions for reconnecting client
 - manager unreachable at the first connect: it waits a bounded time, then runs
   local-only for the life of the process and never attaches later.
 
-**Why reuse is safe.** Reusing the files gives up what new files used to
-guarantee: that no access under the dead manager can alias a window of the new
-one. Physical fencing (7.1) is restored by the following rule instead. The
+**Why reuse is safe.** Reusing the files gives up what files created per
+incarnation would guarantee: that no access under the dead manager can alias a
+window of the new one. Physical fencing (7.1) is kept by the following rule. The
 manager records the pid and start time of every process with a local session, in
 a file that survives a crash. When it starts on reused regions, each recorded
 process that is still the same live process is a previous-run holder, and the
@@ -722,15 +748,19 @@ published. Waiting restores use the bounded claim-slot queue.
 | Window credits (streamed claims and puts) | 2 | manager | no more windows until a release |
 | Claim deadline | setup clamped to 30 s + bytes at 8 MiB/s | manager | `FAILED{DEADLINE}` |
 | No progress | 3 s | manager | `FAILED{NO_PROGRESS}` |
-| Concurrent lookups | 8 | manager | `OVERLOADED` |
-| Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `INVALID` (manager) |
+| Concurrent lookups per session | 8 | manager | `LOOKUP_OVERLOADED` |
+| Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `LOOKUP_INVALID` (manager) |
 
 - Exports run on the lowest-priority copy stream.
-- A refusal is a normal outcome. The requester moves to its next candidate for
-  the same endpoint or recomputes; it does not retry the same source for 1 s.
+- A refusal is a normal outcome. The requester claims again 250 ms after a
+  `SOURCE_LIMIT` or `REGIONS_HELD` refusal, within the restore's deadline; after
+  any other refusal it uses a local copy of the same endpoint when it has one,
+  else recomputes (section 9). A source that refused `NO_HEADROOM` is not chosen
+  again for 1 s.
 - None of these scale with max-concurrency.
-- The limits are defaults carried in `Hello`; configuration can override them
-  because they come from hardware and the scheduler, not flags.
+- The limits are carried in `Hello` (`Limits`). The manager serves
+  `flare_selene::shared::Limits::default()`; it has no command-line option for
+  them, and only a build with the `test-support` feature can set other values.
 
 ## 11. Put (spill into the manager's store)
 
@@ -743,7 +773,7 @@ writer                          manager
  PutFilled{i, xxh3} ----------->|  verified by the manager
  ...
  PutCommit{metadata} ---------->|
- <------ Stored{bytes}          |  committed, indexed: the writer may now drop its copy
+ <------ Stored{bytes}          |  committed, indexed: the writer may drop its copy
  or  <-- PutRefused{reason}     |  PRESENT is success; refusals keep the source local
 ```
 
@@ -770,11 +800,11 @@ writer                          manager
 
 The manager embeds `store::Store` as a library through its command interface.
 The store owns record admission, storage, durability and recovery; the pool actor
-owns sessions, hints, claims and fences. There is no second store wire service.
+owns sessions, hints, claims and fences. The pool protocol is the manager's only
+wire service; the store has none of its own.
 
 - **Transports.** See [network operations](docs/network-operations.md) for listeners,
-  address forms, TLS, RDMA and startup warnings. `shared_memory` is returned only
-  to a Unix-socket peer with the manager's uid and gid.
+  address forms, TLS, RDMA and startup warnings.
 - **The data channel.** A session without shared memory can open, resynchronise, look up, see
   level-5 candidates (the manager's own records), claim them and put into the manager's store,
   with the bytes on the data channel (`--listen-data`; section 7.5). An instance may be the source
@@ -782,12 +812,12 @@ owns sessions, hints, claims and fences. There is no second store wire service.
   and the manager relays its windows; two instances on other hosts, or one on each side, copy
   through the manager's staging. On a manager with no network listener `DATA_CHANNEL` is refused
   (`INVALID_CLAIM`;
-  `PutRefused{INVALID}` saying so). A remote instance has no pid, so the store gives it a
-  connection of its own (`RemoteHello`); it is told apart by its session, not watched, and no
-  window is ever leased to it.
-- **Lookup timing.** Lookups are answered on the manager's 10 ms clock, not inline, so a
-  burst beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once. Candidates
-  come from the index only; the manager never contacts a source to answer one.
+  `PutRefused{INVALID}` saying so). A remote instance has no pid, so its connection to the store
+  is opened with pid 0 (`StoreCommand::Hello`); it is told apart by its session, not watched, and
+  no window is ever leased to it.
+- **Lookup timing.** A lookup is queued, not answered inline. The pool actor answers queued
+  lookups, at most 64 per pass, whenever its event queue is empty and on its 10 ms clock, so a
+  burst on one session beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once.
 - **Manager-store entries.** The manager's own store appears in each scope's index as the
   manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe).
 - **Windows.** An instance-to-instance claim reserves one staging block for the whole export
@@ -829,12 +859,14 @@ is on the manager's host and rank 0 is in shared memory too, because window coor
 an agent only through rank 0) or `RANK_CHANNEL` (it has its own data channel per transfer, named
 in a `rank_channels` entry of `ClaimGranted`, `ExportRequest` or `PutAccept`; rank 0's own is the
 message's `channel`). A channel carries only that rank's slice: `Shape.length` is the slice's
-length, the frames are unchanged, and the channel is the stream carrier.
+length, the frames are those of section 7.5, and the channel is the stream carrier.
 
 Rank 0 and each peer use one persistent `RankLink` for control, copy jobs and
-completions. Losing that link stops the pool on that rank; completion still waits
-for every submitted copy to drain. The manager's `Rank` stream supplies attachment
-and fencing, and channel-mode copies use the per-transfer data connection above.
+completions. Losing that link turns the pool off for the whole instance (rank 0
+reports it disabled, and quarantines when a transfer was open on that rank);
+completion still waits for every submitted copy to drain. The manager's `Rank`
+stream supplies attachment and fencing, and channel-mode copies use the
+per-transfer data connection above.
 
 **13.1 Attachment.** `RankAttach{manager_incarnation, instance_id, rank0_nonce, rank,
 agent_nonce, rank_secret}`. The manager checks the incarnation (`RANK_STALE_MANAGER`),
@@ -857,9 +889,11 @@ is the rank's own `Done` to rank 0, and rank 0 releases nothing and reports noth
 rank's.
 
 **13.3 Drain-only attachments.** When rank 0's session ends its agents are not closed: they can
-be granted nothing, but their existing streams can attest and say goodbye. A new attachment
+be granted nothing, but their open streams can attest and say goodbye. A new attachment
 requires a live rank-0 session. Stream loss retains shared-window obligations until the
-process exits. After a manager restart all obligations are gone with the old regions.
+process exits. A restarted manager has no record of these obligations: it keeps them in
+memory only. Section 8.6 states how region files it reuses are held for the previous run's
+session processes.
 
 **13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
 checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and

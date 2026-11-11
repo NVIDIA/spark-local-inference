@@ -53,6 +53,7 @@ def _rank(rank, rendezvous):
     from ignition.components.dense_mla import PreparedDenseMLA
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import ContextShards, selection_slots
@@ -64,7 +65,7 @@ def _rank(rank, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=WORLD,
                             timeout=timedelta(minutes=10))
     candidate_runtime = head_runtime = None
-    graphs = []
+    graphs, compiled_forwards = [], []
     try:
         with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             logical_pages = MAX_VISIBLE // (128 * WORLD)
@@ -114,7 +115,7 @@ def _rank(rank, rendezvous):
                     name = f"{mode}{rows}"
                     selector = PreparedIndexSelection(index_queries.view(257, -1), weights, index_cache,
                         metadata, shards, context, buffers, start=start, end=end, mode=mode,
-                        session=session, name=name, workspace=arena, allocator=None, latent_cache=cache)
+                        session=session, name=name, workspace=arena, latent_cache=cache)
                     variant = dict(name=name, selector=selector, start=start, end=end, metadata=metadata)
                     if mode == "decode":
                         owners = torch.empty_like(selector.selected)
@@ -170,19 +171,34 @@ def _rank(rank, rendezvous):
                     for start, end in variant["bounds"]:
                         selector = variant["selections"][end - start]
                         positions, tables = metadata.positions[start:end], metadata.token_page_table[start:end]
-                        selected = selector(index_queries[start:end], weights[start:end], positions, tables)
+                        packed, local, scores, quantized, scales, scaled_weights = selector.prepare_local_result(
+                            index_queries[start:end], weights[start:end], positions, tables)
+                        selected = selector.exchange(packed, positions)
                         offset = start - variant["start"]
-                        for field in ("selected", "local", "scores"):
-                            variant["observed"][field][offset:offset + end - start].copy_(getattr(selector, field))
-                        for field in ("quantized", "scales", "scaled_weights"):
-                            variant["observed"][field][offset:offset + end - start].copy_(
-                                getattr(selector.indexer, field))
+                        for field, value in (("selected", selected), ("local", local), ("scores", scores),
+                                             ("quantized", quantized), ("scales", scales),
+                                             ("scaled_weights", scaled_weights)):
+                            variant["observed"][field][offset:offset + end - start].copy_(value)
                         if selector.mode == "decode":
                             selection_slots(selected, positions, tables, variant["owners"],
                                 variant["slots"], variant["counts"], shards, physical_pages, local=True)
                             variant["gather"](variant["query"].view(selected.shape[0], -1))
                             variant["attention"](variant["gathered"], variant["partial"])
                             variant["combine"](variant["partial"], variant["lse"])
+
+                def production(variant):
+                    metadata = variant["metadata"]
+                    for start, end in variant["bounds"]:
+                        selected = variant["selections"][end - start](index_queries[start:end], weights[start:end],
+                            metadata.positions[start:end], metadata.token_page_table[start:end])
+                        offset = start - variant["start"]
+                        variant["production_selected"][offset:offset + end - start].copy_(selected)
+
+                for variant in variants:
+                    variant["production_selected"] = torch.empty_like(variant["observed"]["selected"])
+                    compiled = compile_forward(lambda variant=variant: production(variant))
+                    compiled_forwards.append(compiled)
+                    variant["production"] = compiled
 
                 index_keys[:, 0] = _scores(tokens, False)
                 large.indexer.write_keys(index_keys, slots)
@@ -196,6 +212,13 @@ def _rank(rank, rendezvous):
                         forward(variant)
                     graphs.append(graph)
                     variant["graph"] = graph
+                    variant["production"]()
+                    torch.cuda.synchronize(device)
+                    production_graph = torch.cuda.CUDAGraph()
+                    with session.capture(), torch.cuda.graph(production_graph, stream=stream):
+                        variant["production"]()
+                    graphs.append(production_graph)
+                    variant["production_graph"] = production_graph
                 session.freeze()
                 for concentrated in (False, True):
                     index_keys[:, 0] = _scores(tokens, concentrated)
@@ -220,8 +243,6 @@ def _rank(rank, rendezvous):
                             variant = variants[index]
                             selector = variant["selector"]
                             arena.tensor.fill_(255)
-                            for operation in variant["selections"].values():
-                                operation.selected.fill_(-2)
                             for value in variant["observed"].values():
                                 value.fill_(-2)
                             if selector.mode == "decode":
@@ -232,12 +253,14 @@ def _rank(rank, rendezvous):
                             dist.barrier()
                             before = torch.cuda.memory_stats(device)
                             variant["graph"].replay()
+                            variant["production_graph"].replay()
                             torch.cuda.synchronize(device)
                             after = torch.cuda.memory_stats(device)
                             for field in ("allocation.all.allocated", "allocation.all.freed",
                                           "segment.all.allocated", "segment.all.freed"):
                                 assert before[field] == after[field], (variant["name"], field)
                             observed = variant["observed"]
+                            torch.testing.assert_close(variant["production_selected"], observed["selected"], rtol=0, atol=0)
                             chosen_rows = _check_selection(observed["selected"],
                                 variant["metadata"].positions[variant["start"]:variant["end"]], concentrated)
                             expected_query = torch.zeros_like(observed["quantized"], dtype=torch.float32)
@@ -276,6 +299,8 @@ def _rank(rank, rendezvous):
     finally:
         for graph in graphs:
             graph.reset()
+        for compiled in compiled_forwards:
+            compiled.retire_after_capture()
         if head_runtime is not None:
             head_runtime.close()
         if candidate_runtime is not None:

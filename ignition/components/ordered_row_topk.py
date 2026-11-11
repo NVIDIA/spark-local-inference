@@ -126,16 +126,35 @@ class PreparedOrderedRowTopK:
                                          session=session, name=name)
         self.plan = self.selection.plan
 
-    def __call__(self):
-        self.selection()
+    def functional(self, *, session):
+        self.selection.functional(session=session)
+        self.scores = self.lengths = self.indices = self.output_scores = self.output = None
+        self.cutoffs = self.greater = self.ties = None
+        return self
+
+    def __call__(self, scores=None, lengths=None, indices=None):
+        return self._run(scores, lengths, indices)[0]
+
+    def _run(self, scores=None, lengths=None, indices=None):
+        if scores is None:
+            scores, lengths, indices = self.scores, self.lengths, self.indices
+            output_scores, output = self.output_scores, self.output
+            cutoffs, greater, ties = self.cutoffs, self.greater, self.ties
+        else:
+            output_scores = torch.empty((self.rows, self.topk), dtype=torch.float32, device=scores.device)
+            output = torch.empty_like(output_scores, dtype=torch.int32)
+            cutoffs = torch.empty((self.rows,), dtype=torch.int32, device=scores.device)
+            greater = torch.empty((self.rows, self.tiles), dtype=torch.int32, device=scores.device)
+            ties = torch.empty_like(greater)
+        self.selection(scores, lengths, indices, output_scores, output)
         torch.library.wrap_triton(_cutoff)[(self.rows,)](
-            self.output_scores.view(torch.int32), self.lengths, self.cutoffs,
+            output_scores.view(torch.int32), lengths, cutoffs,
             K=self.topk, BLOCK=triton.next_power_of_2(self.topk), num_warps=4)
         torch.library.wrap_triton(_counts)[(self.rows, self.tiles)](
-            self.scores.view(torch.int32), self.lengths, self.cutoffs, self.greater, self.ties,
+            scores.view(torch.int32), lengths, cutoffs, greater, ties,
             WIDTH=self.width, K=self.topk, TILES=self.tiles, BLOCK=_TILE, num_warps=4)
         torch.library.wrap_triton(_emit)[(self.rows, self.tiles)](
-            self.scores.view(torch.int32), self.indices, self.lengths, self.cutoffs, self.greater, self.ties,
-            self.output_scores.view(torch.int32), self.output, WIDTH=self.width, K=self.topk,
+            scores.view(torch.int32), indices, lengths, cutoffs, greater, ties,
+            output_scores.view(torch.int32), output, WIDTH=self.width, K=self.topk,
             TILES=self.tiles, BLOCK=_TILE, COUNT_BLOCK=triton.next_power_of_2(self.tiles), num_warps=4)
-        return self.output
+        return output, output_scores

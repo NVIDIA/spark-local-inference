@@ -260,6 +260,17 @@ class GDNLayerRecords:
         return GDNRecords(self.delta[index], self.keys[index], self.decay[index])
 
 
+torch.utils._pytree.register_dataclass(GDNRecords,
+    serialized_type_name="ignition.components.gdn_recovery.GDNRecords")
+torch.utils._pytree.register_pytree_node(GDNLayerRecords,
+    lambda records: ([records.delta, records.keys, records.decay], records.layers),
+    lambda tensors, layers: GDNLayerRecords(tuple(layers), *tensors),
+    serialized_type_name="ignition.components.gdn_recovery.GDNLayerRecords",
+    to_dumpable_context=list, from_dumpable_context=tuple,
+    flatten_with_keys_fn=lambda records: ([(torch.utils._pytree.GetAttrKey(name), tensor)
+        for name, tensor in (("delta", records.delta), ("keys", records.keys), ("decay", records.decay))], records.layers))
+
+
 class PreparedRecoveredRecurrence:
     """One layer's verification over packed requests, recording instead of checkpointing.
 
@@ -273,7 +284,7 @@ class PreparedRecoveredRecurrence:
     """
 
     def __init__(self, *, mixed_qkv, a, b, A_log, dt_bias, state, metadata, output, records: GDNRecords | None,
-                 key_heads: int, value_heads: int, convolution=None):
+                 key_heads: int, value_heads: int, convolution=None, buffers=None):
         sequences = metadata.query_start_loc.numel() - 1
         width = metadata.state_indices.shape[1]
         record_width = width if records is None else records.delta.shape[2]
@@ -293,8 +304,12 @@ class PreparedRecoveredRecurrence:
         precomputed = records is not None and width > 1
         if convolution is not None and not precomputed:
             raise ValueError("fused GDN convolution requires multi-token verification records")
-        queries = torch.empty((sequences, key_heads, width, 128), device=state.device, dtype=torch.float32) if precomputed else state
-        beta = torch.empty((sequences, value_heads, width), device=state.device, dtype=torch.bfloat16) if precomputed else state
+        from ignition.preparation.scratch import bind_scratch
+
+        prepared = bind_scratch(dict(queries=((sequences, key_heads, width, 128), torch.float32),
+            beta=((sequences, value_heads, width), torch.bfloat16)), device=state.device,
+            workspace=buffers) if precomputed else {}
+        queries, beta = (prepared["queries"], prepared["beta"]) if precomputed else (state, state)
         self.prepare_args = None
         self.fused_convolution = convolution is not None
         if precomputed:
@@ -343,15 +358,79 @@ class PreparedRecoveredRecurrence:
         self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
 
-    def __call__(self):
-        if self.prepare_args is not None:
+    def functional(self, *, dynamic_metadata=False):
+        """Receive correction records from the enclosing round instead of retaining them."""
+        if self.args is None:
+            return self
+        (mixed, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
+         output, delta, keys, decay, queries, beta, _, _, _, state_stride, slot_stride) = self.args
+        self.persistent = (A_log, dt_bias, state, None if dynamic_metadata else starts,
+                           None if dynamic_metadata else slots, None if dynamic_metadata else num_seqs)
+        self.record_layout = (None if self.options["IN_PLACE"] else tuple(
+            (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype) for tensor in (delta, keys, decay)))
+        self.output_shape = tuple(output.shape)
+        self.recovery_shapes = (tuple(queries.shape), tuple(beta.shape)) if self.prepare_args is not None else None
+        self.state_strides = (state_stride, slot_stride)
+        self.convolution_operands = self.prepare_args[17:] if self.fused_convolution else None
+        if dynamic_metadata and self.convolution_operands is not None:
+            self.convolution_operands = (*self.convolution_operands[:2], None, None, None, None)
+        self.args = None
+        self.prepare_args = None
+        return self
+
+    def __call__(self, mixed_qkv=None, a=None, b=None, *, projected=None, records=None, metadata=None):
+        args, prepare_args = self.args, self.prepare_args
+        output = None
+        if args is None:
+            if mixed_qkv is None or a is None or b is None:
+                raise ValueError("functional GDN recovery requires QKV and gate operands")
+            A_log, dt_bias, state, starts, slots, num_seqs = self.persistent
+            if metadata is not None:
+                starts, slots, num_seqs = metadata.query_start_loc, metadata.state_indices[:, 0], metadata.num_seqs
+            if starts is None or slots is None or num_seqs is None:
+                raise ValueError("functional GDN recovery requires metadata at invocation")
+            if self.record_layout is None:
+                if records is not None:
+                    raise ValueError("in-place GDN recurrence does not produce correction records")
+                delta = keys = decay = state
+            else:
+                if records is None:
+                    raise ValueError("functional GDN verification requires correction records")
+                delta, keys, decay = records.delta, records.keys, records.decay
+                layout = tuple((tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+                               for tensor in (delta, keys, decay))
+                if layout != self.record_layout or any(tensor.device != state.device for tensor in (delta, keys, decay)):
+                    raise ValueError("GDN correction records differ from the prepared layout")
+            output = torch.empty(self.output_shape, dtype=torch.bfloat16, device=state.device)
+            queries, beta = (state, state)
+            if self.recovery_shapes is not None:
+                queries = torch.empty(self.recovery_shapes[0], dtype=torch.float32, device=state.device)
+                beta = torch.empty(self.recovery_shapes[1], dtype=torch.bfloat16, device=state.device)
+                prepare_args = (mixed_qkv, a, b, A_log, dt_bias, starts, slots, num_seqs,
+                                queries, keys, decay, beta, mixed_qkv.stride(0), a.stride(0),
+                                b.stride(0), self.state_strides[1])
+                if self.fused_convolution:
+                    if projected is None:
+                        raise ValueError("functional fused GDN recovery requires projected QKV")
+                    operands = self.convolution_operands
+                    if metadata is not None:
+                        operands = (*operands[:2], metadata.convolution_slots, metadata.fresh,
+                                    metadata.accepted_tokens, metadata.num_tokens)
+                    prepare_args += (projected, *operands)
+            args = (mixed_qkv, a, b, A_log, dt_bias, state, starts, slots, num_seqs,
+                    output, delta, keys, decay, queries, beta, mixed_qkv.stride(0), a.stride(0),
+                    b.stride(0), *self.state_strides)
+        elif records is not None:
+            raise ValueError("runtime GDN correction records require functional recovery")
+        if prepare_args is not None:
             if self.fused_convolution:
-                launch_triton(_prepare_convolved_inputs, self.prepare_compiled, self.prepare_args,
+                launch_triton(_prepare_convolved_inputs, self.prepare_compiled, prepare_args,
                               self.prepare_grid, **self.prepare_options)
             else:
-                launch_triton(_prepare_inputs, self.prepare_compiled, self.prepare_args,
+                launch_triton(_prepare_inputs, self.prepare_compiled, prepare_args,
                               self.prepare_grid, **self.prepare_options)
-        launch_triton(_verify, self.compiled, self.args, self.grid, **self.options)
+        launch_triton(_verify, self.compiled, args, self.grid, **self.options)
+        return output
 
 
 class PreparedGDNCommit:
@@ -373,9 +452,13 @@ class PreparedGDNCommit:
                 raise ValueError("GDN commit requires recurrent views of the state backing rows")
         if counts.shape != (metadata.query_start_loc.numel() - 1,) or counts.numel() > records.delta.shape[1]:
             raise ValueError("GDN commit requires a count and records per request")
+        self.layers = tuple(records.layers)
         layer_offsets = [states[layer].storage_offset() - floats.storage_offset() for layer in records.layers]
         state_alignment = math.gcd(4, floats.data_ptr() // 4, floats.stride(0), *layer_offsets)
-        offsets = torch.tensor(layer_offsets, dtype=torch.int64, device=backing.device)
+        from ignition.preparation.persistent import persistent_empty
+
+        offsets = persistent_empty((len(layer_offsets),), torch.int64, backing.device)
+        offsets.copy_(torch.tensor(layer_offsets, dtype=torch.int64))
         self.args = (floats, offsets, records.delta, records.keys, records.decay, metadata.state_indices[:, 0],
                      counts, metadata.num_seqs, floats.stride(0), metadata.state_indices.stride(0))
         self.options = {"ROWS_CAPACITY": records.delta.shape[1], "KEY_HEADS": key_heads, "VALUE_HEADS": value_heads,
@@ -384,5 +467,39 @@ class PreparedGDNCommit:
         self.compiled = warmup_triton(_commit.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
 
-    def __call__(self):
-        launch_triton(_commit, self.compiled, self.args, self.grid, **self.options)
+    def functional(self, *, session=None, dynamic_metadata=False):
+        """Keep state and layer indexing while consuming round-local records and counts."""
+        if self.args is None:
+            return self
+        state, offsets, delta, keys, decay, slots, counts, num_seqs, state_stride, slot_stride = self.args
+        self.persistent = (state, offsets, None if dynamic_metadata else slots,
+                           None if dynamic_metadata else num_seqs, state_stride, slot_stride)
+        self.record_layout = tuple((tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+                                   for tensor in (delta, keys, decay))
+        self.count_shape, self.count_dtype = tuple(counts.shape), counts.dtype
+        self.args = None
+        return self
+
+    def __call__(self, counts=None, *, records=None, metadata=None):
+        args = self.args
+        if args is None:
+            if counts is None or records is None:
+                raise ValueError("functional GDN commit requires accepted counts and correction records")
+            state, offsets, slots, num_seqs, state_stride, slot_stride = self.persistent
+            if metadata is not None:
+                slots, num_seqs = metadata.state_indices[:, 0], metadata.num_seqs
+            if slots is None or num_seqs is None:
+                raise ValueError("functional GDN commit requires metadata at invocation")
+            delta, keys, decay = records.delta, records.keys, records.decay
+            layout = tuple((tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+                           for tensor in (delta, keys, decay))
+            if (tuple(records.layers) != self.layers or layout != self.record_layout
+                    or any(tensor.device != state.device for tensor in (delta, keys, decay))):
+                raise ValueError("GDN correction records differ from the prepared commit layout")
+            if tuple(counts.shape) != self.count_shape:
+                raise ValueError("GDN accepted counts differ from the prepared request capacity")
+            counts = counts.to(device=state.device, dtype=self.count_dtype).contiguous()
+            args = (state, offsets, delta, keys, decay, slots, counts, num_seqs, state_stride, slot_stride)
+        elif counts is not None or records is not None:
+            raise ValueError("runtime GDN commit operands require functional execution")
+        launch_triton(_commit, self.compiled, args, self.grid, **self.options)

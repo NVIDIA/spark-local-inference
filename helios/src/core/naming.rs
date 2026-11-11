@@ -22,9 +22,8 @@ pub const GB202_DEVICES: [u32; 9] = [
     0x2b85, 0x2b87, 0x2b8c, 0x2bb1, 0x2bb2, 0x2bb3, 0x2bb4, 0x2bb5, 0x2bb9,
 ];
 
-/// GB10 device identifiers. `0x2e12` is the DGX Spark part; `0x2e03` is the
-/// RTX Spark N1X part, which NVML reports for the same SM121 platform.
-pub const GB10_DEVICES: [u32; 2] = [0x2e12, 0x2e03];
+/// GB10 and RTX Spark N1X device identifiers for the SM121 platform.
+pub const GB10_DEVICES: [u32; 5] = [0x2e02, 0x2e03, 0x2e06, 0x2e12, 0x2e2a];
 
 /// GB300 device identifiers. `0x31c3` is the SM103 GPU of DGX Station GB300.
 pub const GB300_DEVICES: [u32; 1] = [0x31c3];
@@ -172,7 +171,7 @@ mod tests {
 
     #[test]
     fn pci_ids_select_the_platform_identifier() {
-        for device in GB10_DEVICES {
+        for device in [0x2e02, 0x2e03, 0x2e06, 0x2e12, 0x2e2a] {
             assert_eq!(
                 platform_from_pci(device << 16 | 0x10de),
                 Some("gb10"),
@@ -189,6 +188,8 @@ mod tests {
         }
         assert_eq!(platform_from_pci(0x2bbc_1af4), None);
         assert_eq!(platform_from_pci(0x31c3_1af4), None);
+        assert_eq!(platform_from_pci(0x2e06_1af4), None);
+        assert_eq!(platform_from_pci(0x2e07_10de), None);
         assert_eq!(platform_from_pci(0x1e02_10de), None);
     }
 

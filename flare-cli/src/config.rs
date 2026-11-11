@@ -67,6 +67,9 @@ impl Configuration {
                         run.port = port.get();
                     }
                 }
+                if run.scheduler_checkpoint_extra_work_fraction.is_none() {
+                    run.scheduler_checkpoint_extra_work_fraction = self.server.scheduler_checkpoint_extra_work_fraction;
+                }
                 let serving = &mut run.serving;
                 if serving.memory_limit.is_none() {
                     serving.memory_limit = size(self.memory.reserve.as_deref(), "memory.reserve")?
@@ -185,6 +188,22 @@ mod tests {
         };
         config.apply_model(&mut run.serving, names).unwrap();
         (config, *run)
+    }
+
+    #[test]
+    fn checkpoint_extra_work_fraction_configuration_and_flag_precedence() {
+        let args = ["flare", "run", "model.safetensors"];
+        assert_eq!(configured("", &args, &[]).1.scheduler_checkpoint_extra_work_fraction, None);
+        for fraction in [0.0, 0.05, 1.0] {
+            let text = format!("[server]\nscheduler_checkpoint_extra_work_fraction={fraction}");
+            assert_eq!(configured(&text, &args, &[]).1.scheduler_checkpoint_extra_work_fraction, Some(fraction));
+            let explicit = ["flare", "run", "model.safetensors", "--scheduler-checkpoint-extra-work-fraction", "0"];
+            assert_eq!(configured(&text, &explicit, &[]).1.scheduler_checkpoint_extra_work_fraction, Some(0.0));
+        }
+        for invalid in ["-0.01", "1.01", "nan", "inf", "'0.05'", "true"] {
+            let text = format!("[server]\nscheduler_checkpoint_extra_work_fraction={invalid}");
+            assert!(Configuration::parse(&text).is_err());
+        }
     }
 
     #[test]

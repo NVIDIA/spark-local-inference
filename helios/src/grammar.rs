@@ -35,6 +35,8 @@ pub struct OutputEnvelope {
     pub tool_ends_reasoning: bool,
     pub tool_body_start: bool,
     pub response: Option<(&'static str, &'static str)>,
+    /// Optional protocol closure between the last output block and EOS.
+    pub message_close: Option<&'static str>,
 }
 
 struct CheckpointTokenizer {
@@ -238,6 +240,7 @@ impl GrammarCompiler {
         if envelope.reasoning_end.is_none()
             && envelope.tool.is_none()
             && envelope.response.is_none()
+            && envelope.message_close.is_none()
             && !envelope.tool_body_start
         {
             return self.compile(grammar);
@@ -279,25 +282,29 @@ impl GrammarCompiler {
         } else {
             "wrapped_answer"
         };
+        let ending = envelope.message_close.map_or_else(
+            || "ws".to_owned(),
+            |close| format!("ws ({})?", self.compound_marker(close)),
+        );
         if envelope.tool_body_start {
             if envelope.tool.is_none() {
                 return Err("tool-body output start requires tool syntax".into());
             }
-            rules.push_str("start: tool_after_open tools_suffix ws\n");
+            rules.push_str(&format!("start: tool_after_open tools_suffix {ending}\n"));
         } else if let Some(end) = envelope.reasoning_end {
             if let Some((open, _)) = envelope.tool.filter(|_| envelope.tool_ends_reasoning) {
                 rules.push_str(&self.delimited_region("reasoning_done", end, &[end, open]));
                 rules.push_str(&self.delimited_region("reasoning_tool", open, &[end, open]));
                 // Only the outer tool opener implicitly ends reasoning.
                 rules.push_str(&format!(
-                    "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws\n",
+                    "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) {ending}\n",
                 ));
             } else {
                 rules.push_str(&self.region("reasoning", end));
-                rules.push_str(&format!("start: reasoning ws {branches} ws\n"));
+                rules.push_str(&format!("start: reasoning ws {branches} {ending}\n"));
             }
         } else {
-            rules.push_str(&format!("start: ws {branches} ws\n"));
+            rules.push_str(&format!("start: ws {branches} {ending}\n"));
         }
         grammar.grammars[0].name = Some("answer".into());
         grammar
@@ -973,6 +980,7 @@ mod tests {
                 function: None,
                 tool_ends_reasoning: false,
                 response: None,
+                message_close: None,
                 tool_body_start: false,
             };
             for (text, expected) in [
@@ -1019,13 +1027,43 @@ mod tests {
                 function: None,
                 tool_ends_reasoning: false,
                 response: Some(("", "<|close|>response<|sep|>")),
+                message_close: Some("<|close|>message<|sep|>"),
                 tool_body_start: false,
             };
             for (body, expected) in [
                 (r#"{"ok":true}<|close|>response<|sep|>"#, true),
+                (
+                    r#"{"ok":true}<|close|>response<|sep|><|close|>message<|sep|>"#,
+                    true,
+                ),
+                (
+                    r#"{"ok":false}<|close|>response<|sep|><|close|>message<|sep|>"#,
+                    false,
+                ),
+                (
+                    r#"{"ok":true}<|close|>response<|sep|><|close|>message"#,
+                    false,
+                ),
+                (r#"{"ok":true}<|close|>message<|sep|>"#, false),
+                (
+                    r#"{"ok":true}<|close|>response<|sep|><|close|>message<|sep|>junk"#,
+                    false,
+                ),
+                (
+                    r#"{"ok":true}<|close|>response<|sep|><|close|>message<|sep|> "#,
+                    false,
+                ),
+                (
+                    r#"{"ok":true}<|close|>response<|sep|> <|close|>message<|sep|>"#,
+                    true,
+                ),
                 (r#"{"ok":false}<|close|>response<|sep|>"#, false),
                 (
                     "<|close|>response<|sep|><|open|>tools<|sep|>call<|close|>tools<|sep|>",
+                    true,
+                ),
+                (
+                    "<|close|>response<|sep|><|open|>tools<|sep|>call<|close|>tools<|sep|><|close|>message<|sep|>",
                     true,
                 ),
                 ("<|open|>tools<|sep|>call<|close|>tools<|sep|>", false),
@@ -1050,6 +1088,81 @@ mod tests {
     }
 
     #[test]
+    fn xtml_message_close_mask_matches_output_parser() {
+        use crate::model::contract::{ToolParser, ToolParserKind};
+        use crate::output::{
+            Event, Input, ModelOutput, OutputConfig, OutputPipeline, Termination,
+            tagged::{OutputConfig as TaggedConfig, OutputStart},
+        };
+
+        let markers = ["<|open|>", "<|close|>", "<|sep|>"];
+        let tokenizer = byte_tokenizer_with(&markers);
+        let controls: Vec<_> = markers
+            .iter()
+            .map(|marker| (tokenizer.token_to_id(marker).unwrap(), (*marker).to_owned()))
+            .collect();
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[256, 257], &controls).unwrap();
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = None;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::Xtml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        for start in [OutputStart::Content, OutputStart::Reasoning] {
+            for tools in [
+                vec![],
+                vec![json!({"type":"function","function":{"name":"lookup"}})],
+            ] {
+                let config = OutputConfig {
+                    syntax: syntax.clone(),
+                    control_tokens: controls.clone(),
+                    content: TaggedConfig {
+                        start,
+                        structured: true,
+                        tools,
+                    },
+                };
+                let envelope = OutputPipeline::grammar_envelope(&config).unwrap();
+                let mut parser = OutputPipeline::new(config);
+                let mut grammar = compiler
+                    .compile_json_schema_in(&json!({"const":{"ok":true}}), Some(&envelope))
+                    .unwrap();
+                let prefix = if start == OutputStart::Reasoning {
+                    "Plan.<|close|>think<|sep|><|open|>response<|sep|>"
+                } else {
+                    ""
+                };
+                let response = format!("{prefix}{{\"ok\":true}}<|close|>response<|sep|>");
+                let mut content = String::new();
+                for text in [response.as_str(), "<|close|>message<|sep|>"] {
+                    for &token in tokenizer.encode(text, false).unwrap().get_ids() {
+                        grammar.advance(token).unwrap();
+                        parser.push(Input::Token(token)).unwrap();
+                        let decoded = tokenizer.decode(&[token], false).unwrap();
+                        for event in parser.push(Input::Text(&decoded)).unwrap() {
+                            if let Event::Content(text) = event {
+                                content.push_str(&text);
+                            }
+                        }
+                    }
+                    if text == response {
+                        let close = tokenizer.token_to_id("<|close|>").unwrap();
+                        assert_ne!(grammar.mask()[close as usize / 32] & (1 << (close % 32)), 0);
+                    }
+                }
+                assert_eq!(content, r#"{"ok":true}"#);
+                let allowed: Vec<_> = (0..320)
+                    .filter(|id| grammar.mask()[id / 32] & (1 << (id % 32)) != 0)
+                    .collect();
+                assert_eq!(allowed, [256, 257]);
+                grammar.advance(256).unwrap();
+                assert!(parser.finish(Termination::Eos).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn qwen_envelope_preserves_implicit_reasoning_and_function_boundaries() {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let envelope = OutputEnvelope {
@@ -1059,6 +1172,7 @@ mod tests {
             function: Some(("<function=", "</function>")),
             tool_ends_reasoning: true,
             response: None,
+            message_close: None,
             tool_body_start: false,
         };
         for (text, accepted) in [
@@ -1118,6 +1232,7 @@ mod tests {
                 function: Some(("<function=", "</function>")),
                 tool_ends_reasoning,
                 response: None,
+                message_close: None,
                 tool_body_start: false,
             };
             for (text, accepted) in [
@@ -1162,6 +1277,7 @@ mod tests {
             function: Some(("<function=", "</function>")),
             tool_ends_reasoning: true,
             response: None,
+            message_close: None,
             tool_body_start: false,
         };
         let schema = json!({"const":7});
@@ -1225,6 +1341,7 @@ mod tests {
                 function: Some(("<function=", "</function>")),
                 tool_ends_reasoning: true,
                 response: None,
+                message_close: None,
                 tool_body_start: false,
             };
             let prefix = |pieces: &dyn Fn(&str) -> Vec<u32>| -> Vec<u32> {
@@ -1704,6 +1821,7 @@ mod tests {
                 tool_ends_reasoning: false,
                 tool_body_start: true,
                 response: None,
+                message_close: None,
             };
             let body = format!(
                 "\n<｜DSML｜{separator}invoke name=\"lookup\"></｜DSML｜{separator}invoke>{close}"
@@ -1752,7 +1870,7 @@ mod recipient_tests {
         let compiler=GrammarCompiler::new(&tokenizer,tokenizer.get_vocab_size(true),&[200001,200008],&controls).unwrap();
         let envelope=|start,tools:Vec<String>| OutputEnvelope {
             recipient:Some(RecipientEnvelope{start,tools}),reasoning_end:None,tool:None,function:None,
-            tool_ends_reasoning:false,tool_body_start:false,response:None,
+            tool_ends_reasoning:false,tool_body_start:false,response:None,message_close:None,
         };
         let answer=r#"{"ok":true}"#;
         let tool=" to=lookup<|message|><atem:function_calls><atem:invoke name=\"lookup\"><atem:parameter name=\"q\">café</atem:parameter></atem:invoke></atem:function_calls>";

@@ -15,7 +15,7 @@ import weakref
 import torch
 from b12x.preparation import CollectiveRequirement, PreparedCall
 
-from ignition.preparation.tuning import declare
+from ignition.preparation.tuning import declare, register_finalizer
 
 MAX_ROWS = 8
 _OWNERS = weakref.WeakValueDictionary()
@@ -67,12 +67,12 @@ class PreparedRouteGather:
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",
                                                           call=self.fused), runtime=runtime)
             requests.append(self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(**self.fused), output=latent, owners=(runtime, latent, weights, ids)),
+                run=lambda: state.run(**self.fused), output=latent, owners=(runtime,)),
                 collective=CollectiveRequirement(key=name, ranks=ranks)))
         else:
             self.logits = torch.zeros((rows, 896), dtype=torch.float32, device=latent.device)
             self.pair = dict(local_first=local_down, local_second=local_router, out_first=latent,
-                             out_second=self.logits, threads=512)
+                             out_second=self.logits, threads=512, row_blocks=2 if rows == 8 else 1)
             self.select = dict(router_logits=self.logits, correction_bias=correction_bias,
                                output_weights=weights, output_ids=ids)
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair",
@@ -80,32 +80,42 @@ class PreparedRouteGather:
             self.select_plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.kimi_topk16",
                                                                  call=self.select), runtime=runtime)
             requests.append(self.plan.request(name=name + "/gather", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(**self.pair), output=latent, owners=(runtime, latent, self.logits)),
+                run=lambda: state.run(**self.pair), output=latent, owners=(runtime,)),
                 collective=CollectiveRequirement(key=name + "/gather", ranks=ranks)))
             requests.append(self.select_plan.request(name=name + "/select", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(**self.select), output=weights, owners=(runtime, self.logits, weights, ids))))
+                run=lambda: state.run(**self.select), output=weights, owners=(runtime,))))
         declare(session, tuple(requests), coordinator=coordinator)
+        register_finalizer(session, self.release_examples)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self):
-        _route_gather(self.local_down, self.local_router, self.latent, self.weights, self.ids, self.handle)
-        return self.latent
+    def release_examples(self):
+        self.local_down = self.local_router = self.latent = self.weights = self.ids = None
+        self.fused = self.pair = self.select = self.logits = None
+
+    def __call__(self, local_down, local_router):
+        latent = torch.empty((self.rows, 3584), dtype=torch.bfloat16, device=local_down.device)
+        weights = torch.empty((self.rows, 16), dtype=torch.float32, device=local_down.device)
+        ids = torch.empty((self.rows, 16), dtype=torch.int32, device=local_down.device)
+        logits = torch.empty((0 if self.rows == 1 else self.rows, 896), dtype=torch.float32, device=local_down.device)
+        _route_gather(local_down, local_router, self.correction_bias, latent, weights, ids, logits, self.handle)
+        return latent, ids, weights
 
 
-@torch.library.custom_op("flare::kimi3_route_gather", mutates_args=("latent", "weights", "ids"))
-def _route_gather(local_down: torch.Tensor, local_router: torch.Tensor, latent: torch.Tensor,
-                  weights: torch.Tensor, ids: torch.Tensor, handle: int) -> None:
+@torch.library.custom_op("flare::kimi3_route_gather", mutates_args=("latent", "weights", "ids", "logits"))
+def _route_gather(local_down: torch.Tensor, local_router: torch.Tensor, correction: torch.Tensor,
+                  latent: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor,
+                  logits: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
     runtime = owner.runtime
     if owner.rows == 1:
-        runtime.all_gather_pair_kimi_topk(local_down, local_router, owner.correction_bias, latent, weights, ids,
-                                          plan=owner.plan)
+        runtime.all_gather_pair_kimi_topk(local_down, local_router, correction, latent, weights, ids,
+                                        plan=owner.plan)
         return
-    runtime.all_gather_pair(local_down, local_router, latent, owner.logits, plan=owner.plan, threads=512)
-    runtime.kimi_topk16(owner.logits, owner.correction_bias, weights, ids, plan=owner.select_plan)
+    runtime.all_gather_pair(local_down, local_router, latent, logits, plan=owner.plan, threads=512)
+    runtime.kimi_topk16(logits, correction, weights, ids, plan=owner.select_plan)
 
 
 @_route_gather.register_fake
-def _fake_route_gather(local_down, local_router, latent, weights, ids, handle):
+def _fake_route_gather(local_down, local_router, correction, latent, weights, ids, logits, handle):
     pass

@@ -22,7 +22,9 @@ CHECKS = [("Lifecycle", TEST, "LIFECYCLE_EDGE ", 14),
           ("Speculation", "scheduler::speculative_lifecycle_tests::scheduler_matches_speculative_accounting_model",
            "SPECULATION_EDGE ", 6),
           ("ResponseLifecycle", "server::runtime::phase_tests::response_lifecycle_tests::native_responses_match_lifecycle_model",
-           "RESPONSE_EDGE ", 28)]
+           "RESPONSE_EDGE ", 28),
+          ("CheckpointReservation", "scheduler::checkpoint_lifecycle_tests::",
+           "CHECKPOINT_RESERVATION_EDGE ", 15)]
 MODELS = [check[0] for check in CHECKS] + ["RankDispatch"]
 
 
@@ -73,7 +75,7 @@ def check_observations(output, directory, java, jar, module, prefix, width):
             "SPECIFICATION ObservedSpec\nINVARIANT Corresponds\n"
         )
         run(tlc(java, jar, directory, "Observed"), cwd=directory)
-    print(f"Checked {len(edges)} distinct Rust transitions against {module}.tla", flush=True)
+    print(f"Checked {len(edges)} observed Rust transitions against {module}.tla", flush=True)
 
 
 def tlc(java, jar, directory, module, config=None):
@@ -176,6 +178,9 @@ def main():
                  "Advance(st, ceiling) == ceiling", "PendingUsesPhysicalCapacity"),
                 ("ResponseLifecycle", "rows[r].group = group /\\ Owned(rows[r])",
                  "rows[r].group = group /\\ rows[r].producer = 1", "AdmissionRetained"),
+                ("CheckpointReservation", "before.rows[row].phase = Copying\n"
+                 "    /\\ before.rows[row].fence <= before.completed",
+                 "before.rows[row].phase = Copying", "OutstandingUseRetainsRow"),
             ]:
                 check_model_mutation(directory, args.java, jar, module, needle, replacement, invariant)
             check_mutations(cargo, ROOT / "helios/src/scheduler.rs", TEST, [

@@ -17,6 +17,7 @@ def test_support_forward_is_neither_compiled_nor_captured(monkeypatch):
     selected = lambda: calls.append("speculative")
     selected.prepare_capture = lambda: 0
     selected.retire_after_capture = lambda: None
+    selected.capture_allocation_sizes = ()
     support = lambda: calls.append("support")
     stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
 
@@ -83,6 +84,7 @@ def test_grouped_capture_compiles_one_representative_and_captures_each_owner(mon
     stream = SimpleNamespace(wait_stream=lambda value: None, synchronize=lambda: None)
     class Bound:
         cache_hit = False
+        capture_allocation_sizes = ()
         def __init__(self, owner):
             self.owner = owner
 

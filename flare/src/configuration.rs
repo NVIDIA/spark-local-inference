@@ -28,6 +28,7 @@ pub struct Server {
     pub port: Option<std::num::NonZeroU16>,
     pub api_key: Option<String>,
     pub thinking_token_budget: Option<std::num::NonZeroU32>,
+    pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -74,6 +75,10 @@ impl Configuration {
 
     pub fn parse(text: &str) -> Result<Self, Failure> {
         let configuration: Self = toml::from_str(text)?;
+        if configuration.server.scheduler_checkpoint_extra_work_fraction.is_some_and(|value|
+            !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err("server.scheduler_checkpoint_extra_work_fraction must be finite and between zero and one".into());
+        }
         size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
         size(
             nonempty(configuration.prefix_cache.memory.as_deref()),

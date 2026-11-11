@@ -25,11 +25,31 @@ class _Case:
 
 
 class _LayerTrial:
-    def __init__(self, layer):
-        self.layer = layer
+    def __init__(self, fixture, layer):
+        self.fixture, self.layer = fixture, layer
 
     def __call__(self):
-        self.layer()
+        f = self.fixture
+        indices = f.indices(f.metadata, replay_start=f.replay_start)
+        incoming, _, _, _ = self.layer(f.incoming, f.pre_mix, f.metadata, indices, f.selection)
+        f.output.copy_(incoming[0])
+
+
+class _LayerObservation:
+    def __init__(self, fixture, layer):
+        self.fixture, self.layer = fixture, layer
+
+    def __call__(self):
+        f = self.fixture
+        indices = f.indices(f.metadata, replay_start=f.replay_start)
+        *_, observations = self.layer._run(f.incoming, f.pre_mix, f.metadata, indices, f.selection)
+        for name, destination in f.observations.items():
+            source = observations[name]
+            if isinstance(destination, tuple):
+                for target, value in zip(destination, source, strict=True):
+                    target.copy_(value)
+            else:
+                destination.copy_(source)
 
 
 def _reference_quantize(source):
@@ -44,12 +64,14 @@ def _reference_quantize(source):
 
 
 class CatalogLayerFixture:
-    """Measure a catalog layer with its real shape, storage, and TP collectives.
+    """Measure a catalog layer with packed inputs, cache state, and TP collectives.
 
     Inputs use checkpoint embeddings, valid mHC seam values, and bounded packed
     cache history. Two cases exercise full and partial request occupancy. Each
     replay restores mutable history outside its measured interval; a third seed
-    checks the selected tuple. No collective counter is restored.
+    checks the selected tuple. Untimed observation graphs expose local numeric
+    intermediates; measured graphs retain only their final layer output. No
+    collective counter is restored.
     """
 
     def __init__(self, name, signature, decoder, layer_index):
@@ -58,6 +80,15 @@ class CatalogLayerFixture:
         self.layer = decoder.layers[layer_index]
         attention = self.layer.attention
         self.metadata, self.pool = self.layer.metadata, attention.pool
+        self.scratch = self.layer.scratch
+        self.indices, self.replay_start = attention.window_metadata, attention.replay_start
+        scratch = self.scratch
+        self.pre_mix = scratch.pre_mix
+        self.incoming = ((scratch.mlp_output, scratch.ffn_hc.residual, scratch.ffn_hc.post, scratch.ffn_hc.comb)
+                         if self.layer.carry else (scratch.residual,))
+        self.selection = (scratch.attention.selected, scratch.attention.candidates, scratch.attention.candidate_counts)
+        self.output = torch.empty_like(scratch.residual if self.layer.post is not None else scratch.mlp_output)
+        self.observations = None
         self.tokens = self.metadata.positions.numel()
         self.batch = self.metadata.starts.numel()
         self.width = self.metadata.max_query_tokens
@@ -113,10 +144,8 @@ class CatalogLayerFixture:
             torch.tensor(lengths, dtype=torch.int32, device=device),
             torch.arange(1, self.batch + 1, device=device), pages, tokens,
             torch.tensor([sum(length > 0 for length in lengths)], dtype=torch.int32, device=device))
-        attention = self.layer.attention
-        if attention.replay_start is not None:
-            attention.replay_start.zero_()
-        attention.window_metadata()
+        if self.replay_start is not None:
+            self.replay_start.zero_()
         return starts, lengths
 
     @staticmethod
@@ -158,7 +187,7 @@ class CatalogLayerFixture:
             last = min(first + min(self.tokens, 128), keys.shape[0])
             dsa.quantize_write_index_k_mxfp4(indexer.plan, keys[first:last],
                 index_k_cache=indexer.cache, slot_mapping=slots[first:last])
-        scratch = self.layer.scratch.attention
+        scratch = self.scratch.attention
         count = min(self.start // attention.ratio, scratch.candidates.shape[1])
         scratch.candidates.fill_(-1)
         scratch.candidates[:, :count] = torch.arange(count, dtype=torch.int32, device=device)
@@ -175,7 +204,7 @@ class CatalogLayerFixture:
         if self.cases:
             raise RuntimeError("joint tuning inputs are already initialized")
         layer, metadata = self.layer, self.metadata
-        scratch = layer.scratch
+        scratch = self.scratch
         cases = []
         for ordinal, seed in enumerate((*self.tune_seeds, self.holdout_seed)):
             starts, lengths = self._set_metadata(seed, partial=ordinal == 1)
@@ -192,13 +221,9 @@ class CatalogLayerFixture:
                 scratch.ffn_hc.comb.copy_(torch.eye(4, device=embedding.device))
                 incoming.extend((scratch.mlp_output, scratch.ffn_hc.residual,
                                  scratch.ffn_hc.post, scratch.ffn_hc.comb))
-            window_indices = layer.attention.window_metadata
-            geometry = [value for value in vars(window_indices).values() if isinstance(value, torch.Tensor)]
-            for shared in window_indices.ratios.values():
-                geometry.extend(value for value in vars(shared).values() if isinstance(value, torch.Tensor))
             cases.append(_Case(seed, self.window.clone(), self._snapshot((
                 *(getattr(metadata, name) for name in metadata.__dataclass_fields__),
-                *geometry, *incoming, *indices, layer.attention.replay_start)),
+                *incoming, *indices, self.replay_start)),
                 self._snapshot(readonly), starts, lengths))
         self.cases = tuple(cases)
 
@@ -208,25 +233,44 @@ class CatalogLayerFixture:
 
     def _check_layer(self, layer):
         reference = self.layer
-        if (layer.metadata is not self.metadata or layer.attention.pool is not self.pool
-                or layer.carry != reference.carry or layer.post is not reference.post
-                or layer.engram is not reference.engram or layer.boundary is not reference.boundary
+        if (layer.attention.pool is not self.pool or layer.carry != reference.carry
+                or layer.post is not reference.post or layer.engram is not reference.engram
+                or layer.boundary is not reference.boundary
                 or layer.attention.window_metadata is not reference.attention.window_metadata
                 or layer.attention_reduce.runtime is not reference.attention_reduce.runtime
-                or layer.mlp_reduce.runtime is not reference.mlp_reduce.runtime
-                or layer.scratch is not reference.scratch):
-            raise ValueError("joint tuning must retain the catalog layer's storage and execution context")
+                or layer.mlp_reduce.runtime is not reference.mlp_reduce.runtime):
+            raise ValueError("joint tuning must retain the catalog layer's cache and execution context")
 
     def trial_forward(self, layer):
         self._check_layer(layer)
-        return _LayerTrial(layer)
+        return _LayerTrial(self, layer)
+
+    def observation_forward(self, layer):
+        self._check_layer(layer)
+        if self.observations is None:
+            scratch, attention = self.scratch, layer.attention
+            self.observations = {
+                "attention_hc.normalized": torch.empty_like(scratch.attention_hc.normalized),
+                "attention.projected": torch.empty_like(scratch.attention.projected),
+                "attention.query_low": torch.empty_like(scratch.attention.query_low),
+                "attention.query": torch.empty_like(scratch.attention.query),
+                "attention.window_values": torch.empty_like(scratch.attention.window_values),
+                "attention.output": torch.empty_like(scratch.attention.output),
+                "router.ids": torch.empty_like(scratch.router.ids),
+                "output": torch.empty_like(self.output),
+            }
+            if attention.ratio:
+                self.observations["attention.selected"] = torch.empty_like(scratch.attention.selected)
+            qkv = attention.projections["qkv_a"]
+            self.observations["attention.qkv_encoded_bases"] = tuple(
+                torch.empty(shape, dtype=dtype, device=self.output.device) for shape, dtype in qkv.encoded_layout)
+            self.observations["attention.query_encoded_bases"] = tuple(
+                torch.empty(shape, dtype=dtype, device=self.output.device) for shape, dtype in attention.norm_quant.layouts[2:])
+        return _LayerObservation(self, layer)
 
     def _poison(self, layer):
-        if layer.attention.mode != "decode":
-            layer.attention.window_cache.fill_(0xA5)
-        layer.scratch.attention.query.fill_(float("nan"))
-        layer.scratch.attention.output.fill_(float("nan"))
-        layer.scratch.routed.fill_(float("nan"))
+        self.output.fill_(float("nan"))
+
 
     def _restore(self, case, layer):
         self.window.copy_(case.window)
@@ -234,47 +278,50 @@ class CatalogLayerFixture:
             target.copy_(saved)
         self.active_case = case
 
-    def validate_result(self, layer):
+    def validate_result(self, layer, *, window=None, readonly=None):
         case = self.active_case
         if case is None:
             raise RuntimeError("joint tuning has no active input case")
-        scratch = layer.scratch
-        output = scratch.residual if layer.post is not None else scratch.mlp_output
-        if not bool(torch.isfinite(output).all()) or not bool(torch.isfinite(scratch.attention.output).all()):
+        observations = self.observations
+        if (not bool(torch.isfinite(self.output).all())
+                or not bool(torch.isfinite(observations["attention.output"]).all())):
             raise AssertionError("joint tuning produced nonfinite layer output")
         expected = case.window.clone().view(self.batch, 128, 528)
         if layer.attention.mode in ("decode", "prefill"):
-            records = pack_deepseek_v41_cache_reference(scratch.attention.window_values,
+            records = pack_deepseek_v41_cache_reference(observations["attention.window_values"],
                 page_size=128, cache_kind="swa").view(-1, 528)[:self.tokens]
             offset = 0
             for row, (start, length) in enumerate(zip(case.starts, case.lengths, strict=True)):
                 for column in range(max(0, length - 128), length):
                     expected[row, (start + column) % 128].copy_(records[offset + column])
                 offset += length
-        if not torch.equal(self.window, expected.reshape_as(self.window)):
+        window = self.window if window is None else window
+        if not torch.equal(window, expected.reshape_as(window)):
             raise AssertionError("joint tuning changed cache history outside the layer's declared writes")
-        if any(not torch.equal(target, saved) for target, saved in case.readonly):
+        readonly = case.readonly if readonly is None else readonly
+        if any(not torch.equal(target, saved) for target, saved in readonly):
             raise AssertionError("joint tuning changed read-only compressed history")
         if layer.attention.ratio:
-            selected = scratch.attention.selected
+            selected = observations["attention.selected"]
             live = self.metadata.positions >= 0
             lengths = (self.metadata.positions[live] + 1) // layer.attention.ratio
             values = selected[live]
             if not bool(((values >= -1) & (values < lengths[:, None])).all()):
                 raise AssertionError("joint tuning selected an index outside the valid cache prefix")
-        ids = scratch.router.ids
+        ids = observations["router.ids"]
         if not bool(((ids >= 0) & (ids < layer.router.shape[1])).all()):
             raise AssertionError("joint tuning produced an invalid routed-expert ID")
 
     def validate_numeric(self, layer):
         """Check actual QKV and BF16-seam encoding outside the timed race."""
         from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+        from b12x.quantization import mxfp8
 
         self._check_layer(layer)
-        scratch = layer.scratch
-        source = scratch.attention_hc.normalized
+        observations = self.observations
+        source = observations["attention_hc.normalized"]
         projection = layer.attention.projections["qkv_a"]
-        encoded = projection.encoded
+        encoded = mxfp8.dense_rows_from_bases(*observations["attention.qkv_encoded_bases"])
         if encoded is None or projection.plan.query.allow_bf16_atomic_reduction:
             raise ValueError("contextual QKV requires prepared FP32-reduced MXFP8 rows")
         expected_values, expected_scales = _reference_quantize(source)
@@ -291,7 +338,7 @@ class CatalogLayerFixture:
         operations = source.shape[1] + slices
         u = operations * 2.0 ** -24
         error = (u / (1.0 - u)) * magnitude
-        actual = projection.output
+        actual = observations["attention.projected"]
         below = torch.nextafter(actual, torch.full_like(actual, -float("inf"))).double()
         above = torch.nextafter(actual, torch.full_like(actual, float("inf"))).double()
         error += .5 * torch.maximum(actual.double() - below,
@@ -299,17 +346,13 @@ class CatalogLayerFixture:
         deviation = (actual.double() - exact).abs()
         if not bool(torch.isfinite(actual).all()) or not bool((deviation <= error).all()):
             raise AssertionError("QKV exceeds FP32 accumulation and BF16 output rounding bounds")
-        q = projection.output[:, :1280].double()
+        q = actual[:, :1280].double()
         weight = layer.attention.weights["q_norm"].double()
         expected_query = (q * torch.rsqrt(q.square().mean(-1, keepdim=True)
                             + layer.attention.eps) * weight).bfloat16()
-        actual_query = scratch.attention.query_low
+        actual_query = observations["attention.query_low"]
         torch.testing.assert_close(actual_query, expected_query, rtol=2**-7, atol=0)
-        norm = layer.attention.norm_quant
-        query_rows = (norm.encoded if norm is not None
-                      else layer.attention.projections["q_b"].encoded)
-        if query_rows is None:
-            raise ValueError("contextual query expansion lacks prepared MXFP8 rows")
+        query_rows = mxfp8.dense_rows_from_bases(*observations["attention.query_encoded_bases"])
         expected_values, expected_scales = _reference_quantize(actual_query)
         if (not torch.equal(query_rows.values.view(torch.uint8),
                             expected_values.view(torch.uint8))
@@ -335,15 +378,28 @@ class CatalogLayerFixture:
         self._poison(layer)
         self._restore(self.cases[2], layer)
 
-    def validate_trial(self, layer):
-        self.validate_result(layer)
+    def validate_trial(self, layer, observation_graph):
+        case = self.active_case
+        if case is None:
+            raise RuntimeError("joint tuning has no active input case")
+        window = self.window.clone()
+        readonly = tuple((target.clone(), saved) for target, saved in case.readonly)
+        self._restore(case, layer)
+        observation_graph.replay()
+        torch.cuda.synchronize(self.output.device)
+        self.validate_result(layer, window=window, readonly=readonly)
         return self.validate_numeric(layer)
 
-    def prepared_call(self, name, graph, compiled, layer):
+    def prepared_call(self, name, graph, compiled, layer, observation_graph, observation_compiled):
         self._check_layer(layer)
         producers = tuple(partial(self._restore, case, layer) for case in self.cases[:2])
-        return PreparedCall(run=graph.replay,
-            output=layer.scratch.residual if layer.post is not None else layer.scratch.mlp_output,
+        return PreparedCall(run=graph.replay, output=self.output,
             reset=partial(self._poison, layer), produce=producers[0], benchmark_producers=producers,
-            validate=partial(self.validate_trial, layer), owners=(self, graph, compiled, layer),
+            validate=partial(self.validate_trial, layer, observation_graph),
+            owners=(self, graph, compiled, layer, observation_graph, observation_compiled),
             close=graph.reset, capture_safe=True)
+
+    def release_examples(self):
+        self.close()
+        self.scratch = self.metadata = self.replay_start = self.incoming = self.pre_mix = None
+        self.selection = self.output = self.observations = self.target_decoder = None

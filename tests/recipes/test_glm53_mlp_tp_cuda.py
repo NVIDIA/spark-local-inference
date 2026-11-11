@@ -76,11 +76,14 @@ def _rank(rank, world_size, rendezvous, snapshot, rows):
                                  session=session, name="shared", workspace=arena, swiglu_limit=10.0)
             shared_reduce = PreparedAllReduce(partial_output, output, runtime=runtime, session=session,
                                               coordinator=coordinator, name="shared.reduce")
+            for operation in (dense, shared, dense_reduce, shared_reduce):
+                operation.functional(session=session)
             session.tune()
+            arena.release_preparation()
 
             def forward():
-                dense_reduce(dense(source))
-                shared_reduce(shared(dense_output))
+                dense_output.copy_(dense_reduce(dense(source)))
+                output.copy_(shared_reduce(shared(dense_output)))
                 counter.add_(1)
 
             dist.barrier(group=group)

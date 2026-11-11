@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,18 @@ from ignition.reference.qwen38_quant import (
 
 CUDA = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                          reason="requires explicit GPU assignment and FLARE_RUN_CUDA_TESTS=1")
+
+
+@dataclass
+class VisionForward:
+    encoder: PreparedVision
+    pixels: torch.Tensor
+    metadata: VisionMetadata
+    output: torch.Tensor
+
+    def __call__(self):
+        self.output.copy_(self.encoder(self.pixels.to(torch.bfloat16), self.metadata))
+        return self.output
 
 
 def test_vision_geometry():
@@ -122,9 +135,8 @@ def _check_stages(prepared, reference, pixels, metadata):
         relative = float((actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12))
         errors.append((name, relative))
         assert relative < .03, errors
-    prepared.scratch.patches.copy_(pixels)
     hidden = reference.patch_embed(pixels)
-    compare("patch", prepared.patch_embed(prepared.scratch.patches), hidden)
+    compare("patch", prepared.patch_embed(pixels.to(torch.bfloat16)), hidden)
     rope = reference.rotary_pos_emb(hidden, metadata.position_ids)
     for index, (actual, expected) in enumerate(zip(prepared.module.blocks, reference.blocks, strict=True)):
         output = expected(hidden, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope)
@@ -158,9 +170,9 @@ def test_checkpoint_vision_native_replay(manifest, capacity, compiler, record_pr
     pixels = torch.zeros((capacity, 1176), dtype=torch.float32, device=device)
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         prepared = PreparedVision(module, scratch, metadata, weights, session=session)
+        prepared.functional(session=session)
         session.freeze()
-        def forward():
-            return prepared(pixels)
+        forward = VisionForward(prepared, pixels, metadata, scratch.output)
         if compiler == "trace":
             from ignition.preparation.compilation import compile_forward
             forward = compile_forward(forward)
@@ -170,11 +182,10 @@ def test_checkpoint_vision_native_replay(manifest, capacity, compiler, record_pr
             artifact = aot_forward(owner)
             forward = lambda: artifact(owner)
         elif compiler == "worker":
-            from functools import partial
             from ignition.preparation.aot import ForwardCache
             from ignition.preparation.execution import GraphSignature
             cache = ForwardCache(namespace={"vision": "glm53"}, device=device, root=tmp_path)
-            forward = cache.prepare_many({"vision": partial(prepared, pixels)},
+            forward = cache.prepare_many({"vision": forward},
                 {"vision": GraphSignature("vision", 1, capacity)})["vision"]
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
@@ -241,7 +252,6 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
     from ignition.components.sampling import DeviceRequestState
     from ignition.components.vision_state import PrefillVisionInputs, VisionState
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import overlay
     from ignition.recipes.glm53.batch import BatchInputs
     from ignition.recipes.glm53.vision_state import PreparedVisionGeneration, VisionInputs
 
@@ -251,8 +261,7 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
     module = _module(manifest)
     with DirectWeightLoader(manifest, device, prefixes=("model.visual.",)) as loader:
         weights = VisionWeights.load(module, loader)
-    # Poisoning the overlaid storage exercises the same scratch lifetime as text-to-vision transitions.
-    scratch, = overlay((VisionScratch.allocate(256, device),))
+    scratch = VisionScratch.allocate(256, device)
     metadata = VisionMetadata.allocate(256, 1, device)
     inputs = VisionInputs.allocate(device)
     requests = DeviceRequestState.allocate(device, vocab_size=154880, capacity=2)
@@ -268,9 +277,15 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
     state.feature_slot.zero_()
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         encoder = PreparedVision(module, scratch, metadata, weights, session=session)
+        encoder.functional(session=session)
         session.freeze()
         operation = PreparedVisionGeneration(encoder, inputs, state, completion, frame, sequence)
-        run = compile_forward(operation)
+        errors = torch.zeros(1, dtype=torch.int32, device=device)
+        def forward():
+            output, status = operation.forward()
+            scratch.output.copy_(output)
+            errors.copy_(status)
+        run = compile_forward(forward)
         run()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -297,13 +312,12 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
                 inputs.vision_cu_seqlens[1] = count
                 inputs.vision_feature_offset.fill_(offset)
                 requests.status[1] = 1
-                operation()
-                expected = scratch.output[:count // 4].clone()
+                expected = operation.forward()[0][:count // 4].clone()
                 state.count[1] = offset
                 state.arena[:, offset:].fill_(float("nan"))
                 scratch.patches.untyped_storage().fill_(0xFF)
                 replay()
-                assert operation.errors.item() == 0
+                assert errors.item() == 0
                 assert state.generation.tolist() == [0, 7]
                 assert state.count.tolist() == [0, offset + count // 4]
                 torch.testing.assert_close(state.arena[0, offset:offset + count // 4], expected, rtol=0, atol=0)
@@ -321,7 +335,7 @@ def test_generation_publishes_features_and_rejects_stale_uploads(manifest):
             before = state.arena.clone()
             requests.generation[1] = 8
             replay()
-            assert operation.errors.item() != 0
+            assert errors.item() != 0
             assert requests.status[1].item() == 1
             assert state.count.tolist() == [0, offset]
             torch.testing.assert_close(state.arena, before, rtol=0, atol=0, equal_nan=True)

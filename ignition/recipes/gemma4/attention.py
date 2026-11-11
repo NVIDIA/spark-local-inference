@@ -4,6 +4,7 @@
 """Gemma 4 sliding-window, full-context, and KV-shared paged attention."""
 
 import math
+from typing import NamedTuple
 import torch
 
 from ignition.components.collectives import PreparedAllReduce
@@ -11,6 +12,8 @@ from ignition.components.linear import QuantizedProjection, UnquantizedProjectio
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.persistent import persistent_copy
 
 
 def prepare_projection(source, weight, output, *, session, name, workspace=None):
@@ -39,6 +42,24 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
     return (x * cos[:, None, :]) + (rotated * sin[:, None, :])
 
 
+class CacheBindings(NamedTuple):
+    slots: torch.Tensor
+    lengths: torch.Tensor
+
+
+def cache_bindings(metadata):
+    from .config import PAGE_TOKENS
+
+    m = metadata
+    columns = (m.positions.clamp_min(0) // PAGE_TOKENS).clamp(max=m.token_page_table.shape[1] - 1)
+    rows = torch.arange(m.positions.numel(), device=m.positions.device)
+    pages = m.token_page_table[rows, columns]
+    slots = torch.where((m.positions >= 0) & (pages >= 0),
+        pages.long() * PAGE_TOKENS + m.positions.remainder(PAGE_TOKENS), -1)
+    lengths = torch.where(m.lengths > 0, (m.starts + m.lengths).int(), 0)
+    return CacheBindings(slots, lengths)
+
+
 class PreparedAttention:
     def __init__(
         self,
@@ -56,7 +77,7 @@ class PreparedAttention:
         session,
         name: str,
         workspace,
-        buffers,
+        examples,
         cache_metadata,
         unit_scale: torch.Tensor,
         k_descale: torch.Tensor,
@@ -80,16 +101,16 @@ class PreparedAttention:
             else batch * max(width, (32 // gqa_group) + 1, 2)
         )
 
-        def zeros(shape, dtype=torch.bfloat16):
-            return buffers.zeros(shape, dtype)
+        def zeros(role, shape, dtype=torch.bfloat16):
+            return declaration_tensor(examples, "attention." + role, shape, dtype, source.device)
 
         self.q_norm = weights["q_norm"]
-        self.q_raw = zeros((tokens, self.heads * self.dim))
-        self.q_full = zeros((q_cap, self.heads, self.dim))
+        self.q_raw = zeros("q_raw", (tokens, self.heads * self.dim))
+        self.q_full = zeros("q_full", (q_cap, self.heads, self.dim))
         self.q = self.q_full[:tokens]
-        self.attended = zeros((tokens, self.heads * self.dim))
-        self.partial_output = zeros((tokens, config.hidden))
-        self.output = zeros((tokens, config.hidden))
+        self.attended = zeros("attended", (tokens, self.heads * self.dim))
+        self.partial_output = zeros("partial_output", (tokens, config.hidden))
+        self.output = zeros("output", (tokens, config.hidden))
         self.q_proj = prepare_projection(
             source, weights["q_proj"], self.q_raw, session=session, name=name + ".q_proj", workspace=workspace
         )
@@ -114,13 +135,13 @@ class PreparedAttention:
         self.v_proj = None
         if not self.shared_kv:
             self.k_norm = weights["k_norm"]
-            self.k_raw = zeros((tokens, self.kv_heads * self.dim))
-            self.key = zeros((tokens, self.kv_heads, self.dim))
+            self.k_raw = zeros("k_raw", (tokens, self.kv_heads * self.dim))
+            self.key = zeros("key", (tokens, self.kv_heads, self.dim))
             self.k_proj = prepare_projection(
                 source, weights["k_proj"], self.k_raw, session=session, name=name + ".k_proj", workspace=workspace
             )
             if "v_proj" in weights:
-                self.v_raw = zeros((tokens, self.kv_heads * self.dim))
+                self.v_raw = zeros("v_raw", (tokens, self.kv_heads * self.dim))
                 self.v_proj = prepare_projection(
                     source, weights["v_proj"], self.v_raw, session=session, name=name + ".v_proj", workspace=workspace
                 )
@@ -131,7 +152,7 @@ class PreparedAttention:
             key_cache, value_cache = pool.attention(layer, config, shard=shard)
             self.writer = None
             if not self.shared_kv:
-                self.value = zeros((tokens, self.kv_heads, self.dim))
+                self.value = zeros("value", (tokens, self.kv_heads, self.dim))
                 self.writer = PreparedPagedKVWriter(
                     self.key,
                     self.value,
@@ -142,6 +163,7 @@ class PreparedAttention:
                     name=name + ".cache_write",
                     k_scale=unit_scale,
                     v_scale=unit_scale,
+                    caller_owned_placeholders=True,
                 )
             self.attention = PreparedPagedAttention(
                 self.q,
@@ -157,6 +179,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention",
                 workspace=workspace,
+                caller_owned_placeholders=True,
                 tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
@@ -167,8 +190,8 @@ class PreparedAttention:
             self.writer_v = None
             self.writer_k = None
             if not self.shared_kv:
-                self.value_lo = zeros((tokens, self.kv_heads, half_dim))
-                self.value_hi = zeros((tokens, self.kv_heads, half_dim))
+                self.value_lo = zeros("value_lo", (tokens, self.kv_heads, half_dim))
+                self.value_hi = zeros("value_hi", (tokens, self.kv_heads, half_dim))
                 self.writer_v = PreparedPagedKVWriter(
                     self.value_lo,
                     self.value_hi,
@@ -179,6 +202,7 @@ class PreparedAttention:
                     name=name + ".cache_write_v",
                     k_scale=unit_scale,
                     v_scale=unit_scale,
+                    caller_owned_placeholders=True,
                 )
                 self.writer_k = PreparedPagedKVWriter(
                     self.key,
@@ -190,9 +214,10 @@ class PreparedAttention:
                     name=name + ".cache_write_k",
                     k_scale=unit_scale,
                     v_scale=unit_scale,
+                    caller_owned_placeholders=True,
                 )
-            self.attended_lo_full = zeros((q_cap, self.heads, half_dim))
-            self.attended_hi_full = zeros((q_cap, self.heads, half_dim))
+            self.attended_lo_full = zeros("attended_lo_full", (q_cap, self.heads, half_dim))
+            self.attended_hi_full = zeros("attended_hi_full", (q_cap, self.heads, half_dim))
             self.attended_lo = self.attended_lo_full[:tokens]
             self.attended_hi = self.attended_hi_full[:tokens]
             self.attention_lo = PreparedPagedAttention(
@@ -209,6 +234,7 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention_lo",
                 workspace=workspace,
+                caller_owned_placeholders=True,
                 tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
@@ -227,48 +253,65 @@ class PreparedAttention:
                 session=session,
                 name=name + ".attention_hi",
                 workspace=workspace,
+                caller_owned_placeholders=True,
                 tuning_page_count=int(pool.memory_capacity[1].item()),
                 k_descale=k_descale,
                 v_descale=unit_scale,
             )
 
-    def __call__(self, source: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        tokens = source.shape[0]
-        self.q_proj(source)
-        q = rms_norm(self.q_raw.view(tokens, self.heads, self.dim), self.q_norm, self.eps)
-        self.q.copy_(apply_rotary_pos_emb(q, cos, sin))
+        self.q_cap = q_cap
+        for projection in (self.q_proj, self.o_proj, self.k_proj, self.v_proj):
+            if projection is not None:
+                projection.functional(session=session)
+        self.reduce.functional(session=session)
+        for field in ("writer", "writer_v", "writer_k"):
+            operation = getattr(self, field, None)
+            if operation is not None:
+                setattr(self, field, operation.functional())
+        for field in ("attention", "attention_lo", "attention_hi"):
+            operation = getattr(self, field, None)
+            if operation is not None:
+                setattr(self, field, operation.functional(session=session, page_table=None,
+                    cache_seqlens=None, cu_seqlens_q=None))
+        for field in ("q_raw", "q_full", "q", "attended", "partial_output", "output", "k_raw", "key",
+                      "v_raw", "value", "value_lo", "value_hi", "attended_lo_full", "attended_hi_full",
+                      "attended_lo", "attended_hi"):
+            if hasattr(self, field):
+                setattr(self, field, None)
 
+    def __call__(self, source, cos, sin, *, metadata, cache_metadata):
+        tokens = source.shape[0]
+        raw = self.q_proj(source)
+        q = rms_norm(raw.view(tokens, self.heads, self.dim), self.q_norm, self.eps)
+        query = apply_rotary_pos_emb(q, cos, sin)
         if not self.shared_kv:
-            self.k_proj(source)
-            if self.v_proj is not None:
-                self.v_proj(source)
-            k = rms_norm(self.k_raw.view(tokens, self.kv_heads, self.dim), self.k_norm, self.eps)
-            self.key.copy_(apply_rotary_pos_emb(k, cos, sin))
-            v = rms_norm_no_scale(self.v_raw.view(tokens, self.kv_heads, self.dim), self.eps)
+            k_raw = self.k_proj(source)
+            v_raw = k_raw if self.v_proj is None else self.v_proj(source)
+            k = rms_norm(k_raw.view(tokens, self.kv_heads, self.dim), self.k_norm, self.eps)
+            key = apply_rotary_pos_emb(k, cos, sin)
+            value = rms_norm_no_scale(v_raw.view(tokens, self.kv_heads, self.dim), self.eps)
             if self.is_sliding:
-                self.value.copy_(v)
-                self.writer()
+                self.writer(key, value, cache_metadata.slots)
             else:
                 half_dim = self.dim // 2
-                self.value_lo.copy_(v[:, :, :half_dim])
-                self.value_hi.copy_(v[:, :, half_dim:])
-                self.writer_v()
-                self.writer_k()
-
+                lo, hi = value[:, :, :half_dim].contiguous(), value[:, :, half_dim:].contiguous()
+                self.writer_v(lo, hi, cache_metadata.slots)
+                self.writer_k(key, hi, cache_metadata.slots)
+        arguments = dict(page_table=metadata.page_table, cache_seqlens=cache_metadata.lengths,
+                         cu_seqlens_q=metadata.query_start_loc)
         if self.is_sliding:
-            self.attention()
+            attended = self.attention(query, **arguments)
         else:
-            half_dim = self.dim // 2
-            self.attention_lo()
-            self.attention_hi()
-            out_view = self.attended.view(tokens, self.heads, self.dim)
-            out_view[:, :, :half_dim].copy_(self.attended_lo)
-            out_view[:, :, half_dim:].copy_(self.attended_hi)
-        return self.reduce(self.o_proj(self.attended))
+            full_query = torch.zeros((self.q_cap, self.heads, self.dim), dtype=query.dtype, device=query.device)
+            full_query[:tokens].copy_(query)
+            lo = self.attention_lo(full_query, **arguments)[:tokens]
+            hi = self.attention_hi(full_query, **arguments)[:tokens]
+            attended = torch.cat((lo, hi), dim=-1)
+        return self.reduce(self.o_proj(attended.reshape(tokens, -1)))
 
 
 def attention_descales(config, device):
     unit = torch.ones(1, dtype=torch.float32, device=device)
     sliding_descale = torch.tensor([math.sqrt(config.text["head_dim"])], dtype=torch.float32, device=device)
     full_descale = torch.tensor([math.sqrt(config.text["global_head_dim"])], dtype=torch.float32, device=device)
-    return unit, sliding_descale, full_descale
+    return tuple(persistent_copy(value) for value in (unit, sliding_descale, full_descale))

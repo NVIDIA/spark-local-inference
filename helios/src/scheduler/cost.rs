@@ -214,6 +214,12 @@ impl ActionCosts {
         self.entry(key).is_some_and(|estimate| estimate.fresh(self.now_ns, self.ttl_ns))
     }
 
+    pub fn fresh_duration(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
+        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        self.entry(key).filter(|estimate| estimate.fresh(self.now_ns, self.ttl_ns))
+            .map(|estimate| estimate.nanos)
+    }
+
     pub fn stale_keys(&self) -> impl Iterator<Item = Key> + '_ {
         self.entries.iter().filter(|(_, estimate)| estimate.nanos != 0
             && !estimate.fresh(self.now_ns, self.ttl_ns)).map(|(key, _)| *key)

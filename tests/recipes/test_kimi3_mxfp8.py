@@ -173,23 +173,20 @@ def test_shared_expert(weights, online, rows, compiled, overlap):
         session.register_scratch(arena)
         routed = (PreparedRoutedExperts(latent, w["experts"], ids, scores, routed_output,
             session=session, name="routed", workspace=arena) if overlap else None)
-        mlp = PreparedMLP(w["shared"], input_copy, session=session, name="shared", buffers={}, workspace=arena,
+        mlp = PreparedMLP(w["shared"], input_copy, session=session, name="shared", workspace=arena,
                           parallel_plans=(routed.plan,) if overlap else ())
         session.tune(show_progress=False)
-        if overlap and mlp.workspace.numel():
-            size = routed.plan.memory_requirements().scratch_nbytes
-            assert mlp.workspace.data_ptr() >= arena.tensor.data_ptr() + size
         reference_weights = {key: expanded(value) for key, value in w["shared"].items()}
 
         def forward():
             input_copy.copy_(source)
             if overlap:
-                mlp.start(input_copy)
+                pending = mlp.start(input_copy)
                 routed()
-                mlp.finish(input_copy, routed_output)
+                output = mlp.finish(pending, routed_output)
             else:
-                mlp(input_copy)
-            result.copy_(mlp.down.output)
+                output = mlp(input_copy)
+            result.copy_(output)
             arena.tensor.fill_(255)
             input_copy.zero_()
 

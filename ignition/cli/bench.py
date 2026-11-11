@@ -28,7 +28,7 @@ def _integers(text):
 
 def arguments(parser):
     options = parser.add_argument_group("GPU graph latency benchmark",
-        "Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark; --prefill also supports --no-mtp. "
+        "Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr; --prefill also supports --no-mtp. "
         "Measures complete captured graphs; excludes preparation, preceding context setup, "
         "state restoration, scheduling, and HTTP.")
     options.add_argument("--speculation-study", action="store_true",
@@ -143,8 +143,8 @@ def run(args):
     settings = Settings.from_args(args)
     configuration = Configuration.load(args.config)
     model = resolve_model(configuration, args.model or configuration.model or "qwen3.8-27b")
-    if model.recipe.name not in ("qwen38_dense", "kimi31"):
-        raise UsageError("ignition bench supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark")
+    if model.recipe.name not in ("qwen38_dense", "kimi31", "nemotron_h"):
+        raise UsageError("ignition bench supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr")
     if settings.speculation_study and model.recipe.name != "qwen38_dense":
         raise UsageError("--speculation-study requires Qwen3.8-27B DFlash2")
     from ignition.preparation.selection import BenchmarkSelection
@@ -265,6 +265,8 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
                 kernel_cache=configuration.directory("kernel_cache"), progress=progress, core_storage=storage)
         with prepared:
             root = getattr(prepared, "model", prepared)
+            details["operator_selections"] = dict(rank=root.memory_report["rank"],
+                selections=root.memory_report["tuning"]["selections"])
             tokenizer_asset = root.server_config["assets"]["tokenizer"]
             tokenizer = (Tokenizer.from_str(tokenizer_asset["text"]) if "text" in tokenizer_asset
                          else Tokenizer.from_file(tokenizer_asset["path"]))

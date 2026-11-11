@@ -216,8 +216,8 @@ class Plan:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
                 raise UsageError("benchmark selection requires explicit complete-round geometry")
-            if (self.recipe.name, self.world_size) not in (("qwen38_dense", 1), ("kimi31", 16)):
-                raise UsageError("benchmark graph preparation requires Qwen3.8-27B on one GPU or Kimi K3.1 Pro on sixteen GPUs")
+            if (self.recipe.name, self.world_size) not in (("qwen38_dense", 1), ("kimi31", 16), ("nemotron_h", 1)):
+                raise UsageError("benchmark graph preparation requires Qwen3.8-27B or Nemotron Bolt on one GPU, or Kimi K3.1 Pro on sixteen GPUs")
             if selection.speculation_study and self.recipe.name != "qwen38_dense":
                 raise UsageError("speculation studies require Qwen3.8-27B DFlash2")
             required_widths = (8,) if selection.speculation_study else selection.selected_verification_widths

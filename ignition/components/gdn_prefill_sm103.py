@@ -175,7 +175,55 @@ class PreparedGdnPrefill:
         self.chunked.run(self.q, self.k, self.v, self.g, self.beta, self.state, self.metadata.query_start_loc,
                          self.indices, self.output)
 
-    def __call__(self):
+    def functional(self, *, session, dynamic_metadata=False):
+        if getattr(self, "_functional_requested", False):
+            return self
+        self._functional_requested = True
+        self._dynamic_metadata = dynamic_metadata
+        self._functional_ready = False
+        self.output_shape = tuple(self.output.shape)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.mixed = self.a = self.b = self.output = None
+        self.sources = ()
+        self.q = self.k = self.v = self.g = self.beta = None
+        if self._dynamic_metadata:
+            self.metadata = self.indices = None
+            self.zero_args = (self.state, None, None, None, self.state.stride(0))
+        self._functional_ready = True
+
+    def __call__(self, mixed_qkv=None, a=None, b=None, *, metadata=None):
+        if getattr(self, "_functional_requested", False):
+            if not self._functional_ready:
+                raise RuntimeError("functional SM103 GDN requires completed preparation")
+            if mixed_qkv is None or a is None or b is None:
+                raise ValueError("functional SM103 GDN requires QKV and gate operands")
+            tokens = mixed_qkv.shape[0]
+            parts = mixed_qkv.split((self.key_heads * 128, self.key_heads * 128, self.value_heads * 128), dim=-1)
+            q, k, v = (torch.empty((tokens, heads, 128), dtype=torch.bfloat16, device=mixed_qkv.device)
+                       .copy_(part.view(tokens, heads, 128))
+                       for part, heads in zip(parts, (self.key_heads, self.key_heads, self.value_heads), strict=True))
+            softplus = F.softplus(a.float() + self.dt_bias.float(), threshold=20.0)
+            g = torch.empty((tokens, self.value_heads), dtype=torch.float32, device=mixed_qkv.device)
+            g.copy_(torch.exp(-torch.exp(self.A_log.float()) * softplus))
+            beta = torch.empty_like(g)
+            beta.copy_(torch.sigmoid(b.float()).to(torch.bfloat16).float())
+            output = torch.zeros(self.output_shape, dtype=torch.bfloat16, device=mixed_qkv.device)
+            if metadata is None:
+                metadata = self.metadata
+                zero_args, indices = self.zero_args, self.indices
+            else:
+                zero_args = (self.state, metadata.fresh, metadata.final_state_indices,
+                             metadata.num_seqs, self.state.stride(0))
+                indices = metadata.final_state_indices
+            if metadata is None:
+                raise ValueError("functional SM103 GDN requires metadata at invocation")
+            launch_triton(_zero_fresh_rows, self.zero_compiled, zero_args, self.zero_grid, BLOCK=_ZERO_BLOCK)
+            torch.ops.flare.sm103_gdn_prefill(q, k, v, g, beta, self.state,
+                metadata.query_start_loc, indices, output, self.plan._handle)
+            return output
         for target, source in zip((self.q, self.k, self.v), self.sources):
             target.copy_(source)
         # Gates as b12x's recurrence forms them: decay exp(-exp(A_log) softplus(a + dt_bias)) and the

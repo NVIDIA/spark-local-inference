@@ -15,7 +15,7 @@ from b12x.preparation import PreparationSession
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.minimax_m3.config import ModelConfig
 from ignition.recipes.minimax_m3.draft import (
     PREFIX, DraftConfig, DraftScratch, _Attention, _DraftLoader,
@@ -51,13 +51,12 @@ def test_checkpoint_draft_attention_constants_survive_catalog_scratch_reuse():
     history = {f"draft0.{role}": (torch.randn(3, d.window, 1, d.head_dim, device=device) * .2).to(torch.float8_e4m3fn)
                for role in ("key", "value")}
     pool = SimpleNamespace(reserved_region=history.__getitem__)
-    buffers, arena = GraphBufferPool(device), ScratchArena(device, overlap=False)
+    arena = ScratchArena(device, overlap=False)
     owners, graphs = [], []
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         for rows in (2, 1):
-            cursor = buffers.cursor()
             tokens = rows * d.block_size
-            scratch = DraftScratch.allocate(config, shard, tokens, tokens, device, buffers=cursor)
+            scratch = DraftScratch.allocate(config, shard, tokens, tokens, device)
             starts = torch.tensor([4094, 4103][:rows], device=device)
             metadata = SimpleNamespace(
                 starts=starts, lengths=torch.full((rows,), d.block_size, dtype=torch.int32, device=device),
@@ -68,30 +67,34 @@ def test_checkpoint_draft_attention_constants_survive_catalog_scratch_reuse():
             source = torch.randn(tokens, config.hidden, dtype=torch.bfloat16, device=device) * .1
             attention = _Attention(0, weights, config, shard, scratch, metadata, pool, block=d.block_size,
                 runtime=None, coordinator=None, session=session, name=f"draft.storage.{rows}",
-                workspace=arena, buffers=cursor)
-            compiled = compile_forward(lambda a=attention, x=source: a(x))
+                workspace=arena)
+            declarations = [getattr(scratch, name) for name in ("embedding", "qkv", "query", "key", "value",
+                "attended", "partial", "output", "window_key", "window_value")]
+            attention.s = attention.m = attention.key = attention.value = attention.lengths = None
+            output = torch.empty_like(scratch.output)
+            compiled = compile_forward(lambda a=attention, x=source, m=metadata, o=output: o.copy_(a(x, metadata=m)[0]))
             compiled()
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
                 compiled()
-            owners.append((attention, source, compiled, attention.pages.clone()))
+            owners.append((attention, output, compiled, attention.pages.clone(), declarations))
             graphs.append(graph)
         expected = []
-        for graph, (attention, _, _, _) in zip(graphs, owners):
+        for graph, (attention, _, _, _, _) in zip(graphs, owners):
             graph.replay()
-            expected.append(attention.s.output.clone())
+            expected.append(owners[len(expected)][1].clone())
         for fill in (0, 0x7f, 0):
-            for chunks in buffers.chunks.values():
-                for chunk in chunks:
-                    chunk.view(torch.uint8).fill_(fill)
-            for graph, (attention, _, _, pages), output in zip(graphs, owners, expected):
+            for *_, declarations in owners:
+                for tensor in declarations:
+                    tensor.view(torch.uint8).fill_(fill)
+            for graph, (attention, observed, _, pages, declarations), output in zip(graphs, owners, expected):
                 torch.testing.assert_close(attention.pages, pages, rtol=0, atol=0)
                 assert all(attention.pages.untyped_storage().data_ptr() != chunk.untyped_storage().data_ptr()
-                           for chunks in buffers.chunks.values() for chunk in chunks)
+                           for chunk in declarations)
                 before = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize()
                 assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-                torch.testing.assert_close(attention.s.output, output, rtol=0, atol=0)
+                torch.testing.assert_close(observed, output, rtol=0, atol=0)
         for graph in graphs:
             graph.reset()

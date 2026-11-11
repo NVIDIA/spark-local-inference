@@ -5,8 +5,8 @@ context and execution thread per rank. Each rank owns a fixed device arena,
 mapped host regions, modules, graphs, and replay streams. Peer buffers have
 the same addresses during preparation and serving.
 
-The [core design](runtime-core-design.md) defines serialization and
-loading. The [core design](core-design.md) defines model contracts and request
+The [runtime core design](runtime-core-design.md) defines serialization and
+loading. The [Flare core design](core-design.md) defines model contracts and request
 scheduling. Preparation uses Python rank processes; core serving uses
 Rust rank threads.
 
@@ -35,15 +35,20 @@ its signal and payload buffers stay alive until all ranks drain.
 
 ## 2. Address layout and preparation
 
-Every preparation process reserves every rank's device arena and host range.
-For rank `r`, each range spans 1 TiB:
+Every preparation process reserves every rank's device arena, and the
+allocator assigns each rank a disjoint host range and reports its base to
+Ignition. For rank `r`, each range spans 1 TiB:
 
 | Region | Base |
 |---|---|
-| Device | `0x0200_0000_0000 + r × 2^40` |
-| Mapped host | `0x0c00_0000_0000 + r × 2^40` |
+| Device | `0x0800_0000_0000 + r × 2^40` on Linux; `0x0400_0000_0000 + r × 2^40` on Windows |
+| Mapped host | `0x0c00_0000_0000 + r × 2^40` when every rank's device range ends at or below `0x0c00_0000_0000`; otherwise, on Linux, `0x2000_0000_0000 + r × 2^40` |
 
-The [preparation allocator](../heliopause/src/allocator.rs) serves these
+On Linux the device ranges of up to four ranks fit below the first host base;
+larger rank counts use the second. Initialization fails when the device and
+host ranges would overlap. The
+[preparation allocator](../heliopause/src/allocator.rs) defines these bases
+(`BASE`, `HOST_BASE`, `host_base`) and serves these
 disjoint arenas. Owners export VMM physical allocations as POSIX file
 descriptors. Peers import the handles, map them at the owner's recorded
 address, and grant their own device access. A preparation rank therefore
@@ -78,7 +83,11 @@ records. The coordinator retires the fence only when all ranks agree on
 request epochs, consumed-token counts, and status. Rank zero delivers
 sampled output.
 
-One coordinated step is outstanding at a time. A 120-second completion
+At most two coordinated steps are outstanding. A second step is admitted only
+after the first has been committed, and only when both are ordinary
+decode or complete speculative steps without grammar state; every other
+operation requires an empty window (`can_submit_pending` in
+`helios/src/execution/threaded/protocol.rs`). A 120-second completion
 deadline bounds stranded collectives. Input frames, completion frames, graph
 owners, and collective storage remain retained until every referencing
 rank finishes. Captured GPU collectives perform the reductions; host
@@ -88,20 +97,27 @@ channels carry control and completion information.
 
 [rank_group.py](../ignition/preparation/rank_group.py) starts one Python
 process per preparation rank and connects the ranks through Gloo. Each
-process owns its interpreter, tensors, and prepared kernels. Rank zero
-distributes compiled forwards; every rank binds local resources, warms the
+process owns its interpreter, tensors, and prepared kernels. Each forward
+variant compiles once, on a rank that selects it; ranks on one host share its
+forward cache directory, and ranks on other hosts receive the artifacts they
+lack ([tensor-parallel compilation](preparation-development.md#tensor-parallel-compilation)).
+Every rank binds local resources, warms the
 ordered catalog, and captures its graphs.
 
 Heliopause's qualification interface can replay these in-process graph
 bundles while their Python owners remain alive. The
 [process coordinator](../helios/src/execution/parallel.rs) uses Unix sockets
-for prepare, ready, commit, and completion messages. Its rank supervisor
+for prepare, ready, commit, and completion messages. Heliopause's
+[rank supervisor](../heliopause/src/processes.rs)
 terminates the group on peer failure or drain timeout. This diagnostic
 lifetime ends before Python resource owners are released.
 
-Production core loading reconstructs resources in Rust and uses rank
-threads. No Python interpreter, peer process, or control socket participates
-in request execution.
+Loading a core whose ranks share one host reconstructs resources in Rust and
+uses rank threads (`RankPeers::Threads` in `helios/src/execution/ranks.rs`).
+No Python interpreter, peer process, or control socket participates
+in request execution. Ranks on other hosts run in their own Helios processes
+and use the process coordinator over TCP control sockets
+(`RankPeers::Processes`); see [multi-host serving](multi-host.md).
 
 ## 5. Failure and shutdown
 
@@ -115,65 +131,26 @@ driver calls throughout checkpoint and restore. The
 [process-image constraints](runtime-core-design.md#7-process-images)
 apply to all contexts in the process.
 
-## 6. Driver probe measurements
+## 6. Driver behavior the design depends on
 
-`cr-probe p2p` from `~/projects/flare-research/probe`, driven by
-`scripts/cr-single.sh` with `SUBCOMMAND=p2p`, `GPU` set to the UUIDs of GPU 8
-and GPU 10, and `MODE=plugin` or `MODE=toggle`, once without and once with
-`PROBE_ARGS=--threads`; results under `results/p2p-plugin-084920`,
-`results/p2p-toggle-084927`, `results/p2p-threads-plugin-114431`, and
-`results/p2p-threads-toggle-114435`. One process retains the primary context
-of each device and enables legacy peer access in both directions. For each
-rank it reserves 64 GiB at `0x7000_0000_0000` (rank 0) or `0x7100_0000_0000`
-(rank 1) as the first address-space operation of that context, both honored;
-maps a 16 MiB VMM buffer and a 32 KiB partial-sum buffer owned by the rank's
-device with access descriptors for both devices; allocates a 16 MiB
-`cuMemAlloc` buffer reachable through peer access; loads the probe kernels as
-a library in that context; and creates a non-blocking stream and two timing
-events. Each rank's graph is a stream capture of four `fill_pattern` launches
-(1,024 blocks of 256 threads, 16 MiB each) into its own VMM buffer, its own
-`cuMemAlloc` buffer, the other rank's VMM buffer, and the other rank's
-`cuMemAlloc` buffer, each with a distinct seed. Twenty serialized rounds
-launch rank 0's graph and then rank 1's, each timed with events and
-synchronized, from one host thread that rebinds the context. Each of the four
-buffers is then checksummed with `checksum_region` (4,096 blocks of 256
-threads, order-independent 64-bit sum) once from the owning context and once
-from the peer context, and the first 64 words of rank 0's VMM buffer are
-compared against rank 1's seed, since rank 1's graph ran last. The process
-then writes `ready`, is checkpointed and restored externally, reads `go`,
-synchronizes both contexts, repeats the rounds and checksums, and finally
-captures a new graph on rank 0 that fills a fresh `cuMemAlloc` buffer
-allocated in rank 1's context, verifying its first 256 words.
+One process that holds a context per device, with each VMM mapping granted
+to both devices, has these properties on two GPUs:
 
-With `--threads`, each rank also has its own thread. The thread binds the
-rank's context once, launches the rank's graph twenty times concurrently with
-the other rank's thread before the serialized rounds, blocks on a channel
-receive through the checkpoint window, and after the restore launches twenty
-more times without rebinding its context before the serialized rounds repeat.
+- A buffer read from the peer context over PCIe has the same contents as
+  when it is read from its owning context.
+- A captured graph whose recorded pointers address storage on both devices
+  replays unchanged, both under serialized launches from one thread that
+  rebinds contexts and under concurrent launches from one thread per rank.
+  Concurrent launches by two rank threads, each graph writing 16 MiB to
+  buffers on both GPUs, lengthen each graph's replay by about 1.5 percent
+  over serialized launches.
+- After an external process checkpoint and restore, fixed addresses, buffer
+  contents, and graph replay are unchanged. Rank threads keep their context
+  bindings and launch without rebinding, and a graph captured after the
+  restore can address a buffer allocated in the peer context.
+- A rank thread blocked on a channel receive through the checkpoint window
+  satisfies the process-image thread rule.
+- No IPC handle or second process is required.
 
-All four probe configurations passed. In every run the VMM buffers sit at
-`0x7000_0000_0000` and `0x7100_0000_0000`, the device footprint is 710 MiB,
-the image is 1.5 GB, all eight checksums agree between the owning context and
-the peer context, and all agree before and after the restore.
-
-| Quantity | plugin | toggle | plugin, rank threads | toggle, rank threads |
-|---|---:|---:|---:|---:|
-| Serialized replay, median before → after | 0.6697 → 0.6708 ms | 0.6698 → 0.6700 ms | 0.6701 → 0.6695 ms | 0.6699 → 0.6699 ms |
-| Concurrent replay per rank thread, before → after | | | 0.6796, 0.6796 → 0.6791, 0.6797 ms | 0.6796, 0.6796 → 0.6796, 0.6796 ms |
-| First driver call after restore | 0.035 ms | 0.025 ms | 0.026 ms | 0.023 ms |
-| New cross-device graph after restore | passes | passes | passes | passes |
-| Checkpoint stages | dump 2.0 s, restore 2.7 s | lock 1.36, device-to-host 1.60, criu dump 0.17, criu restore 0.23, host-to-device 2.35, unlock 1.18 s | dump 1.08 s, restore 1.04 s | lock 0.47, device-to-host 0.63, criu dump 0.20, criu restore 0.16, host-to-device 1.09, unlock 0.35 s |
-
-Reading a buffer from the peer context over PCIe yields the same checksum as
-reading it from its owner, and a graph whose baked pointers cross the GPUs in
-both directions replays unchanged in the same process and after an external
-checkpoint and restore. Two rank threads launching concurrently, with both
-graphs writing both GPUs, add about 1.5 percent to each graph's replay over
-the serialized rounds. The threads' context bindings survive the checkpoint
-and restore: the second concurrent pass launches without rebinding and reports
-no error. Threads blocked on a channel receive during the window satisfy the
-thread rule. No IPC handle, job file, or second process is involved.
-
-The probe uses two GPUs and runs no spin-barrier collective. Four ranks, b12x
-collectives inside the graphs, and fixed-address import of a shareable handle
-in a second process are not covered by it.
+Not qualified: four ranks, graphs that contain b12x spin-barrier collectives,
+and fixed-address import of a shareable handle in a second process.

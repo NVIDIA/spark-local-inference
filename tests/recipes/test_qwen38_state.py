@@ -117,13 +117,25 @@ def test_partial_state_backing_initializes_and_resets_only_mapped_rows(monkeypat
 
     class Storage:
         def device_allocate(self, name, shape, dtype, *, group, maximum, units):
+            from types import SimpleNamespace
+
             assert name == "continuations" and group == "STATE_ROWS"
             assert shape == (4, layout.row_bytes) and maximum == 8 and units == 2
-            backing = torch.zeros(shape, dtype=dtype)
-            backing[2:].fill_(0xA5)
-            return backing
+            self.reserved = torch.zeros((maximum, layout.row_bytes), dtype=dtype)
+            self.reserved[2:].fill_(0xA5)
+            self.dynamic_regions = [SimpleNamespace(address=self.reserved.data_ptr(), maximum=maximum)]
+            return self.reserved[:4]
 
-    pool = HybridStatePool.allocate(4, "cpu", storage=Storage(), backed_slots=2)
+    storage = Storage()
+    from b12x.sequence._shared import disk_table
+    def tensor_from_pointer(address, *, shape, dtype, device, nbytes):
+        assert address == storage.reserved.data_ptr()
+        assert shape == storage.reserved.shape and dtype == storage.reserved.dtype
+        assert nbytes == storage.reserved.nbytes
+        return storage.reserved
+    monkeypatch.setattr(disk_table, "_tensor_from_pointer", tensor_from_pointer)
+    pool = HybridStatePool.allocate(4, "cpu", storage=storage, backed_slots=2)
+    assert pool.reserved_backing.data_ptr() == pool.backing.data_ptr()
     assert pool.backing.shape == (4, layout.row_bytes)
     assert pool.memory_capacity.tolist() == [2, 0]
     assert pool.gdn[0].recurrent.shape[0] == 4

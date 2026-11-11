@@ -202,7 +202,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
 
     rendezvous = SimpleNamespace(hosts=("rank0", "rank1", "rank2", "rank3"))
     plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="audit", tuning_replica=None,
-        native_dense_activations=True,
+        native_dense_activations=True, collective_tuning="static", collective_ladder=None, lock_gpu_clocks=False,
         image_concurrency=4, language_model_only=False, world_size=4, roce_ring=False,
         context=1048576, concurrency=4, prefill_chunk=4096, snapshots=4,
         costs=RECIPE.ranks[4], headroom_bytes=8 << 30, reserve_bytes=4 << 30,

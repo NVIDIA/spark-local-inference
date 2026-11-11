@@ -13,8 +13,9 @@ in source control, cores, or publisher profiles.
 ## Publish the verification key
 
 Upload the `publisher.json` that key creation wrote, unchanged, to the root of
-every repository named as an official source. Flare fetches it from the default
-branch on every online load and requires it to list the key under the publisher
+every repository named as an official source. Flare fetches
+`<official source>/resolve/main/publisher.json`, the root of the `main` branch,
+on every online load and requires it to list the key under the publisher
 namespace. The file is a list, so a rotated key stays valid
 by keeping the previous profile in it, and removing a profile revokes that key
 for every core it signed. A repository whose `publisher.json` omits the
@@ -71,7 +72,8 @@ in affected trust stores with `flare trust revoke FINGERPRINT`.
   --signing-key ~/.config/flare/signing/example-publisher/signing-key.pem
 ```
 
-The command prompts for the existing passphrase, then the replacement twice.
+The command prompts for the existing passphrase of an encrypted key, then the
+replacement twice; the replacement needs at least 16 UTF-8 bytes.
 It writes an encrypted temporary file with owner-only permissions beside the key,
 flushes it to disk, and atomically replaces the key file. The key and fingerprint
 stay the same; publisher profiles, Helios builds, and signed cores need no
@@ -101,7 +103,8 @@ The command does not upload anything. The three publishing values can instead co
 in the [configuration file](cli-design.md#signing-and-local-development); explicit
 flags take precedence. It locates `development-publisher.json` beside that config
 file. For a core prepared elsewhere, supply the original trusted public profile
-with `--development-publisher PATH`. The development private key is unnecessary.
+with `--development-publisher PATH`. That file must contain exactly one profile.
+The development private key is unnecessary.
 
 Signing a payload-format core verifies its source signatures and stored
 payloads, then signs its deployments and ranks under the production identity
@@ -114,8 +117,9 @@ frame bytes may change.
 The output uses the directory canonical form with readable companion names.
 Use `ignition convert --form packed` to produce a single-file core afterward.
 The payload format has no canonical size-sharded form or shard-size setting.
-The internal logical-resource core layout uses a separate signing path
-that writes content-addressed snapshot companions with a fixed 64 GiB file limit.
+`ignition sign` rejects logical-resource containers, which are cores that are not
+in the payload format; export the model again with Ignition to obtain a payload
+core.
 
 Invalid cores fail before publication, and existing destinations are never
 overwritten. Weight identities remain independent of executable resources.
@@ -126,8 +130,10 @@ it installs the payload in the output. A source companion that is already the
 payload's deterministic wrapper is hard-linked into the output on the same
 filesystem and hashed through the link; other payloads, and every payload on
 another filesystem, are copied and the written bytes hashed. Up to eight
-payloads install concurrently. Combining several source deployments first
-hashes their payloads with progress, because derivation planning reads them.
+payloads install concurrently. `ignition combine`, which merges the deployments
+of several cores signed under one namespace into one signed core
+([signing and local development](cli-design.md#signing-and-local-development)),
+first hashes their payloads with progress, because derivation planning reads them.
 Allow disk space for temporary decoded executable resources, and for copied
 payloads when the output is on another filesystem.
 Temporary files reside in a private directory beside the destination and are
