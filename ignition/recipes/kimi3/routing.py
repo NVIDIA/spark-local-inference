@@ -72,7 +72,7 @@ class PreparedRouteGather:
         else:
             self.logits = torch.zeros((rows, 896), dtype=torch.float32, device=latent.device)
             self.pair = dict(local_first=local_down, local_second=local_router, out_first=latent,
-                             out_second=self.logits, threads=512)
+                             out_second=self.logits, threads=512, row_blocks=2 if rows == 8 else 1)
             self.select = dict(router_logits=self.logits, correction_bias=correction_bias,
                                output_weights=weights, output_ids=ids)
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair",
