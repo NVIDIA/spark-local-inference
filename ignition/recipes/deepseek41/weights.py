@@ -5,6 +5,7 @@
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import torch
 
@@ -15,6 +16,23 @@ from ignition.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
 from .config import ModelConfig
+
+
+def attention_weight_extents(text, shard):
+    """Checkpoint row extents for the attention projections, per rank and replicated.
+
+    A tensor-parallel rank packs its share of the eight head blocks and eight output groups. A
+    row-sharded prefill rank instead owns every head and every output group, so `all_heads`,
+    `all_groups`, and `all_sink` name the wholesale extents it replicates beside the partitioned ones.
+    """
+    first, last = shard.padded_partition(8)
+    return SimpleNamespace(
+        heads=(first * 8 * text["head_dim"], last * 8 * text["head_dim"]),
+        groups=(first * text["o_lora_rank"], last * text["o_lora_rank"]),
+        sink=(first * 8, last * 8),
+        all_heads=(0, text["num_attention_heads"] * text["head_dim"]),
+        all_groups=(0, text["o_groups"] * text["o_lora_rank"]),
+        all_sink=(0, text["num_attention_heads"]))
 
 
 @dataclass(frozen=True)
@@ -78,11 +96,12 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False):
+             vocabulary_parallel_sampling=False, row_shard_attention=False):
         config = ModelConfig.load(manifest.metadata_path)
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
-                                 expert_scale_compression=expert_scale_compression) as loader:
+                                 expert_scale_compression=expert_scale_compression,
+                                 row_shard_attention=row_shard_attention) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -107,11 +126,14 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None):
+                 expert_scale_compression=None, row_shard_attention=False):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
+        # A row-sharded prefill computes every head and every output group on each rank, so it also
+        # loads the replicated projections; the partitioned ones still serve decode and the suffix.
+        self.row_shard_attention = row_shard_attention
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
@@ -135,17 +157,20 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         prefix = f"mtp.{layer}" if draft else f"layers.{layer}"
         text, shard = self.config.text, self.shard
         attn = prefix + ".attn"
-        first, last = shard.padded_partition(8)
-        heads = first * 8 * 512, last * 8 * 512
-        groups = first * 1024, last * 1024
+        extents = attention_weight_extents(text, shard)
         result = {
             "qkv_a": self.load_linear_group((attn + ".wq_a", attn + ".wkv")),
-            "q_b": self.load_linear_group((attn + ".wq_b",), row_ranges=(heads,), pad=True),
-            "output": self.load_attention_output(attn, groups, pad=True),
+            "q_b": self.load_linear_group((attn + ".wq_b",), row_ranges=(extents.heads,), pad=True),
+            "output": self.load_attention_output(attn, extents.groups, pad=True),
             "q_norm": self.load_tensor(attn + ".q_norm.weight"),
             "kv_norm": self.load_tensor(attn + ".kv_norm.weight"),
-            "sink": self.load_padded_tensor(attn + ".attn_sink", rows=(first * 8, last * 8)),
+            "sink": self.load_padded_tensor(attn + ".attn_sink", rows=extents.sink),
         }
+        if self.row_shard_attention and not draft:
+            result["q_b_full"] = self.load_linear_group((attn + ".wq_b",), pad=True,
+                row_ranges=(extents.all_heads,))
+            result["output_full"] = self.load_attention_output(attn, extents.all_groups, pad=True)
+            result["sink_full"] = self.load_padded_tensor(attn + ".attn_sink", rows=extents.all_sink)
         if not draft and layer in text["kv_source_layer_ids"]:
             ratio = text["compress_ratios"][layer]
             result["compressor"] = {
