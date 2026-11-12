@@ -21,6 +21,9 @@ use flare_helios::{
     runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
 
+/// The serving option that routes every peer over subnets every rank holds.
+pub const ROCE_SWITCH_ONLY: &str = "--roce-switch-only";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "flare",
@@ -854,6 +857,11 @@ pub struct ServingOptions {
     )]
     pub memory_limit: Option<MemoryLimit>,
 
+    /// Route RoCE rails and fabric transfers only over subnets every rank holds, as on a switch
+    /// alone, leaving direct cables between ranks unused.
+    #[arg(long, help_heading = "Multi-host options")]
+    pub roce_switch_only: bool,
+
     /// Maximum simultaneous requests [default: model/default configuration, then core setting].
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
@@ -1062,6 +1070,9 @@ impl ServingOptions {
             Shape::Mesh => {}
             Shape::Ring => options.push("--roce-ring".into()),
             Shape::Chain => options.push("--roce-chain".into()),
+        }
+        if self.roce_switch_only {
+            options.push(ROCE_SWITCH_ONLY.into());
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1756,6 +1767,21 @@ mod tests {
         let args = run(&["flare", "run", "model.safetensors", "--roce-ring"]);
         assert!(args.roce_ring);
         assert_eq!(args.rank_options(), vec!["--roce-ring"]);
+    }
+
+    #[test]
+    fn switch_only_flag_is_forwarded_to_every_agent_started_rank() {
+        let args = run(&["flare", "run", "model.safetensors", "--roce-switch-only"]);
+        assert!(args.serving.roce_switch_only);
+        assert_eq!(args.rank_options(), vec![ROCE_SWITCH_ONLY]);
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--roce-chain",
+            "--roce-switch-only",
+        ]);
+        assert_eq!(args.rank_options(), vec!["--roce-chain", ROCE_SWITCH_ONLY]);
     }
 
     #[test]

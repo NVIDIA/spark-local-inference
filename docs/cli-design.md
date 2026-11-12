@@ -154,7 +154,9 @@ address toward its first peer; an explicit `--rendezvous` overrides it.
 
 Serving core distribution uses 1..64 streams per peer, selected by rank
 zero's `--transfer-streams` (default 8). Direct and switched fabrics route to
-the peer; `--roce-ring` uses intermediate ranks. `--core-cache` selects the
+the peer; `--roce-ring` uses intermediate ranks. `--roce-switch-only` limits
+RDMA rails and fabric transfers to subnets every rank holds, leaving direct
+cables between ranks unused; peers follow rank zero's choice. `--core-cache` selects the
 receiving rank's prepared-model cache. `--model-cache` and `--package-cache`
 are accepted aliases. The default is `paths.core_cache`, otherwise
 `~/.cache/flare/cores`; an existing `~/.cache/flare/packages` directory is used

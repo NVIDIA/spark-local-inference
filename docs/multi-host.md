@@ -94,8 +94,32 @@ also listen on their fabric addresses. Flare does not configure interfaces,
 addresses, routes, switches, or firewalls.
 
 The serving ranks select up to two rails per peer from active devices. The
-core does not pin the physical fabric used during preparation. For direct
-cabling and neighbor forwarding, see [experimental rings](#experimental-rings).
+core does not pin the physical fabric used during preparation. On a switch,
+rail `h` uses device `h` on every rank. Hosts can also add direct cables beside
+the switch, for example DGX Sparks whose second port is cabled to one partner:
+each rank then reaches a cabled peer over the cable's devices and every other
+peer over the switch. The planner identifies a cable as an IPv4 subnet that only
+the two cabled ranks hold, so every cable needs subnets of its own, distinct from
+the switch's and from every other cable's. IPv4 link-local addresses
+(169.254.0.0/16) never identify a cable. Among equally verified links, a
+peer's two rails use devices behind different PCIe links: a DGX Spark's two
+ConnectX-7 functions behind one PCIe x4 link share its bandwidth, so a two-rank
+group on a cabled pair uses one function behind each link. Core distribution
+and Orbit prestaging connect each pair of ranks over the same devices as its RDMA
+rails.
+
+`--roce-switch-only` routes every peer over subnets every rank holds, as on the
+switch alone, for example to measure a switch-only baseline or to keep traffic
+off a faulty cable. With two ranks every subnet joins both, so the option cannot
+separate a cable from a switch. Peers started without it follow rank zero's
+choice for core distribution, and ranks that still disagree stop when the
+transport connects, naming the rank. Every rank's `Connect RoCE transport`
+startup phase lists each peer's local devices in rail order and marks a peer
+reached over a direct cable, for example
+`2 rails per peer: rank 0 roceP2p1s0f0,rocep1s0f0; rank 2 direct roceP2p1s0f1,rocep1s0f1; rank 3 roceP2p1s0f0,rocep1s0f0`,
+so a cable that is down or unaddressed appears as its partner routed without
+`direct`. For direct cabling and neighbor forwarding, see
+[experimental rings](#experimental-rings).
 
 ## Manual serving
 
