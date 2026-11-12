@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.prompt_logprobs import (
@@ -62,7 +63,7 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
-def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all"):
+def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all", context_parallel_size=None):
     """Scope kernel selections to target geometry, independently of attached drafts.
 
     The target-only descriptor retains its empty draft field. Each operator's
@@ -75,6 +76,8 @@ def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="a
         "contract": "kimi3.graph-inputs.v1"}
     if online_mxfp8_scope != "all":
         value["online_mxfp8_scope"] = online_mxfp8_scope
+    if context_parallel_size is not None and context_parallel_size != world_size:
+        value["context_parallel_size"] = context_parallel_size
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -114,6 +117,7 @@ class PreparationConfig:
     stream_overlap: bool = True
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
     context_parallel: bool = True
+    context_parallel_size: int = 16
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
     # Recipe-owned serving metadata travels with each rank's preparation configuration.
@@ -147,6 +151,8 @@ class PreparationConfig:
         object.__setattr__(self, "image_concurrency", images)
         if len(self.devices) != 16 or len(set(self.devices)) != 16 or any(d < 0 for d in self.devices):
             raise ValueError("Kimi K3 preparation requires sixteen distinct GPUs")
+        if self.context_parallel_size not in (8, 16):
+            raise ValueError("Kimi TP16 context parallelism requires DCP8 or DCP16")
         request_capacity(self.max_active)
         selection = self.benchmark_selection
         if selection is not None:
@@ -182,7 +188,7 @@ class PreparationConfig:
     @property
     def page_tokens(self):
         """Global positions per KV page: PAGE_TOKENS local records on each rank that shares the context."""
-        return PAGE_TOKENS * (len(self.devices) if self.context_parallel else 1)
+        return PAGE_TOKENS * (self.context_parallel_size if self.context_parallel else 1)
 
     @property
     def preparation_pages(self):
@@ -210,6 +216,12 @@ class PreparationConfig:
     @property
     def decode_tokens(self):
         return max((packed for _, _, packed in self.speculative_round_shapes), default=request_capacity(self.max_active))
+
+    @property
+    def dcp_reduction_elements(self):
+        """BF16 elements for staged signals and byte-exact selected-ID broadcasts."""
+        # Each of the 2048 selected int32 IDs expands to four BF16 byte values.
+        return max(8, self.decode_tokens * 2048 * 4)
 
     @property
     def decode_samples(self):
@@ -324,51 +336,66 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             heads=shard.world_size,
             head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
             ipc=core_storage.peer_storage) if shard.world_size > 1 else None)
+        dcp_group, dcp_rank, dcp_reduction, dcp_groups = group, rank, collective, ()
+        if config.context_parallel and config.context_parallel_size < shard.world_size:
+            # Every rank creates both contiguous groups in the same order. Each DCP8 group covers the
+            # whole context for its own TP16 head partition; the other group owns the remaining heads.
+            size = config.context_parallel_size
+            dcp_groups = tuple(dist.new_group(ranks=list(range(start, start + size)), backend=dist.get_backend(group))
+                               for start in range(0, shard.world_size, size))
+            for start, subgroup in zip(range(0, shard.world_size, size), dcp_groups, strict=True):
+                coordinator.register_group(tuple(range(start, start + size)), subgroup)
+            dcp_group = dcp_groups[rank // size]
+            dcp_rank = rank % size
+            # Full hidden activations use the TP16 runtime above. Hybrid DCP reductions carry only
+            # staged 1x8 signals and selected-ID bytes expanded to BF16, so avoid another hidden-sized channel.
+            dcp_reduction = create_all_reduce_runtime(dcp_group, device, collective_tuning=config.collective_tuning,
+                max_tokens=1, hidden_size=config.dcp_reduction_elements, ipc=core_storage.peer_storage)
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
 
-            extra = {}
+            extra = {"groups": dcp_groups}
             if weights.config.dsa is not None:
                 from ignition.recipes.kimi31.dcp import AttentionConstants, ContextParallel
 
                 extra["attention_constants"] = AttentionConstants.allocate(device, query_capacity=config.decode_tokens)
-                extra["candidates"] = create_head_exchange(group, device,
+                extra["candidates"] = create_head_exchange(dcp_group, device,
                     max_rows=max(min(config.prefill_chunk_size, 128), config.decode_tokens),
-                    heads=shard.world_size, head_dim=8192, ipc=core_storage.peer_storage)
+                    heads=config.context_parallel_size, head_dim=8192, ipc=core_storage.peer_storage)
                 if (drafting and config.compile_decoder and config.autotune_effort != "off"
                         and config.collective_tuning == "static"):
                     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
 
                     extra["candidate_owners"] = PCIeDCPTopKOwnerExchange.from_exchange_group(
-                        exchange_group=group, device=device, max_rows=config.draft_tokens + 1,
+                        exchange_group=dcp_group, device=device, max_rows=config.draft_tokens + 1,
                         topk=2048, stream_affine=False, ipc=core_storage.peer_storage)
-            # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
+            # Each DCP group gathers the TP16 head partition owned by that group and combines its partial outputs.
             heads = weights.config.text["num_attention_heads"]
-            context = ContextParallel(ContextShards.on(rank, shard.world_size, device),
-                heads=create_head_exchange(group, device, max_rows=max(config.decode_tokens, slots * config.draft_tokens),
-                                           heads=heads, head_dim=512,
-                                           query_head_dim=RECORD_BYTES, ipc=core_storage.peer_storage),
-                coordinator=coordinator, peers=pool.share_pages(core_storage, group), slab=None, **extra)
+            context = ContextParallel(ContextShards.on(dcp_rank, config.context_parallel_size, device),
+                heads=create_head_exchange(dcp_group, device, max_rows=max(config.decode_tokens, slots * config.draft_tokens),
+                                           heads=heads * config.context_parallel_size // shard.world_size,
+                                           head_dim=512, query_head_dim=RECORD_BYTES, ipc=core_storage.peer_storage),
+                coordinator=coordinator, peers=pool.share_pages(core_storage, dcp_group), slab=None, **extra)
             if weights.config.dsa is not None and config.prefill_chunk_size >= 4096:
                 from ignition.components.shared_pages import SharedPages
 
-                staging = SharedPages(group, device, config.context // shard.world_size * RECORD_BYTES,
+                staging = SharedPages(dcp_group, device, config.context // config.context_parallel_size * RECORD_BYTES,
                                       ipc=core_storage.peer_storage)
-                index_staging = SharedPages(group, device, config.context // shard.world_size * 132,
+                index_staging = SharedPages(dcp_group, device, config.context // config.context_parallel_size * 132,
                                             ipc=core_storage.peer_storage)
-                context = replace(context, staging=staging, stage_runtime=collective,
+                context = replace(context, staging=staging, stage_runtime=dcp_reduction,
                     stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
                     index_staging=index_staging,
                     index_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
-                    selections=create_head_exchange(group, device,
-                        max_rows=-(-config.prefill_chunk_size // shard.world_size),
-                        heads=shard.world_size, head_dim=4096, ipc=core_storage.peer_storage))
+                    selections=create_head_exchange(dcp_group, device,
+                        max_rows=-(-config.prefill_chunk_size // config.context_parallel_size),
+                        heads=config.context_parallel_size, head_dim=4096, ipc=core_storage.peer_storage))
             if getattr(context, "candidate_owners", None) is not None:
                 from ignition.recipes.kimi31.selection_tuning import CandidateSelectionTuning
 
                 context = replace(context, selection_tuning=CandidateSelectionTuning(
-                    context, collective, cache_root=config.kernel_cache))
+                    context, dcp_reduction, cache_root=config.kernel_cache))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
@@ -377,7 +404,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                                                      head_dim=-(-latent // 8) * 8, ipc=core_storage.peer_storage)
                                 for rows in sorted({min(8, max_tokens), channel_rows}))
         identity = target_tuning_identity(weights.config, headers, shard.world_size,
-            online_mxfp8_scope=config.online_mxfp8_scope)
+            online_mxfp8_scope=config.online_mxfp8_scope, context_parallel_size=config.context_parallel_size)
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,

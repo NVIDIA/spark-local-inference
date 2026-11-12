@@ -117,15 +117,16 @@ class PeerStorage(CudaRTLibrary):
             self.dynamic[region.address] = region
             self.owned[region.address] = region.extent
             payloads.append(self.cudaIpcGetMemHandleBytes(region.address))
-        ranks = [None] * self.storage.world
-        dist.all_gather_object(ranks, payloads, group=group)
-        addresses = [[region.address] * self.storage.world for region in regions]
-        for rank, payloads in enumerate(ranks):
+        global_ranks = dist.get_process_group_ranks(group)
+        gathered = [None] * len(global_ranks)
+        dist.all_gather_object(gathered, payloads, group=group)
+        addresses = [[region.address] * len(global_ranks) for region in regions]
+        for group_rank, (global_rank, payloads) in enumerate(zip(global_ranks, gathered, strict=True)):
             if len(payloads) != len(regions):
                 raise ValueError("ranks must share the same cache regions")
-            if rank != self.storage.rank:
+            if global_rank != self.storage.rank:
                 for index, payload in enumerate(payloads):
-                    addresses[index][rank] = self.cudaIpcOpenMemHandleBytes(payload)
+                    addresses[index][group_rank] = self.cudaIpcOpenMemHandleBytes(payload)
         return addresses
 
     def reset(self):

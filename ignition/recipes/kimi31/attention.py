@@ -56,8 +56,8 @@ class PreparedDSA(PreparedMLAProjection):
             workspace=workspace, buffers=buffers, latents=latents, coordinator=coordinator,
             context=context, peers=peers)
         self.shards = ContextShards() if context is None else context.shards
-        if self.shards.world != 16:
-            raise ValueError("Kimi K3.1 sparse attention requires sixteen context ranks")
+        if self.shards.world not in (8, 16):
+            raise ValueError("Kimi K3.1 sparse attention requires DCP8 or DCP16 context ranks")
         if index_cache.shape[0] != 2 * cache.shape[0]:
             raise ValueError("Kimi sparse index cache requires two 64-record subpages per latent page")
         self.indexer = PreparedDSAIndexer(weights, source, self.query_norm, metadata, index_cache, self.shards,

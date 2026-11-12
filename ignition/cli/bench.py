@@ -159,7 +159,8 @@ def run(args):
         args.mtp_draft_tokens = 7 if settings.speculation_study else settings.width - 1
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-        context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+        context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+        stream_overlap=stream_overlap(args, model),
         compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,

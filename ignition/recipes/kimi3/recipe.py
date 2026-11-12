@@ -48,6 +48,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
+        context_parallel_size=plan.context_parallel_size or plan.world_size,
         vision=not plan.language_model_only, sampling_defaults=recipe.sampling_defaults.as_dict(),
         frontend_template=str(Path(__file__).parent.parent / recipe.name / "assets" / "chat_template.jinja"),
         **drafting)
