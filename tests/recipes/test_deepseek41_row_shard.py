@@ -115,7 +115,7 @@ def _recording_layer(scratch, *, reseed=False):
     layer.mlp_reduce = _Recorder()
     layer.router_projection = _Recorder(scratch.router_logits)
     layer.router_source = (scratch.ffn_hc.normalized if shard is None else shard.ffn_hc.normalized)
-    layer.router_gather = None
+    layer.route_gather = None
     layer.router = _Recorder(SimpleNamespace(ids=torch.zeros(1, dtype=torch.int32), weights=torch.zeros(1),
                                              selected_logits=None))
     layer.experts = _Recorder(scratch.routed)

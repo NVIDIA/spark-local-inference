@@ -245,6 +245,7 @@ def test_row_shard_allocates_attention_and_full_row_gather_targets_only_when_ask
     plain = RowShard.allocate(2048, 2, 1, "cpu", candidate_tokens=16)
     assert (plain.rows, plain.start) == (1024, 1024) and plain.attention is None
     assert plain.window_values is None and plain.router_logits is None
+    assert plain.routes is None and plain.gathered_routes is None
 
     asked = RowShard.allocate(2048, 2, 1, "cpu", candidate_tokens=16, attention=True)
     assert (asked.rows, asked.start, asked.rows_index[0].item()) == (1024, 1024, 1024)
@@ -252,6 +253,11 @@ def test_row_shard_allocates_attention_and_full_row_gather_targets_only_when_ask
     # The KV latent target spans every row: it is what the gathered window write stores.
     assert asked.window_values.shape == (2048, 512)
     assert asked.router_logits.shape == (1024, 384) and asked.router_logits.dtype is torch.float32
+    # The router writes this rank's records in place and one gather spreads them over every row:
+    # six ID words then six FP32 weight words per row, which is 48 transport bytes.
+    assert asked.routes.words.shape == (1024, 12) and asked.routes.words.dtype is torch.int32
+    assert asked.routes.packed.shape == (1024, 24) and asked.routes.packed.dtype is torch.bfloat16
+    assert asked.gathered_routes.words.shape == (2048, 12)
 
     narrowed = asked.graph(1024)
     # A narrower graph gives every rank a shorter block, so rank 1 starts at 512, not at 1024.
@@ -261,6 +267,9 @@ def test_row_shard_allocates_attention_and_full_row_gather_targets_only_when_ask
     # The narrowed graph's index keys cover its own full rows, and its KV target all of them.
     assert narrowed.attention.index_keys.shape == (1024, 128)
     assert narrowed.window_values.shape == (1024, 512) and narrowed.router_logits.shape == (512, 384)
+    assert narrowed.routes.words.shape == (512, 12)
+    assert narrowed.routes.packed.shape == (512, 24)
+    assert narrowed.gathered_routes.words.shape == (1024, 12)
     assert asked.graph(1023) is None
 
 
@@ -287,22 +296,28 @@ def test_attention_shard_ready_requires_the_abi_and_the_shard_it_gathers(monkeyp
     runtime = _surfaces(monkeypatch, abi=abi)
     tokens = 1024
     shard = RowShard.allocate(tokens, 2, 0, "cpu", candidate_tokens=16, attention=ask)
-    scratch = SimpleNamespace(router_logits=torch.zeros(tokens, 384, dtype=torch.float32),
-                              attention=SimpleNamespace(selected=torch.zeros(tokens, 512, dtype=torch.int32)))
+    scratch = SimpleNamespace(attention=SimpleNamespace(
+        selected=torch.zeros(tokens, 512, dtype=torch.int32)))
     assert attention_shard_ready(scratch, shard, runtime) is ready
 
 
-def test_attention_shard_ready_rejects_a_gather_that_does_not_fit_the_pipe(monkeypatch):
+def test_attention_shard_ready_requires_the_route_record_gather(monkeypatch):
     from ignition.recipes.deepseek41.decoder import RowShard, attention_shard_ready
 
     shard = RowShard.allocate(1024, 2, 0, "cpu", candidate_tokens=16, attention=True)
-    scratch = SimpleNamespace(router_logits=torch.zeros(1024, 384, dtype=torch.float32),
-                              attention=SimpleNamespace(selected=torch.zeros(1024, 512, dtype=torch.int32)))
+    scratch = SimpleNamespace(attention=SimpleNamespace(
+        selected=torch.zeros(1024, 512, dtype=torch.int32)))
     # Every sharded row is gathered whole; the widest one decides whether the runtime serves it.
     runtime = _surfaces(monkeypatch)
     assert attention_shard_ready(scratch, shard, runtime) is True
     assert attention_shard_ready(scratch, shard, _surfaces(monkeypatch, pipe_bytes=1 << 12)) is False
     assert attention_shard_ready(scratch, shard, _surfaces(monkeypatch, abi=10)) is False
+    # A runtime that serves every other surface but not the route records falls back to full rows.
+    served = runtime.should_gather_shards
+    records = shard.routes.packed.shape[1]
+    runtime.should_gather_shards = lambda inp: inp.shape[1] != records
+    assert attention_shard_ready(scratch, shard, runtime) is False
+    runtime.should_gather_shards = served
     monkeypatch.setattr("ignition.components.collectives._roce", lambda runtime: False)
     assert attention_shard_ready(scratch, shard, runtime) is False
 
@@ -402,7 +417,8 @@ def _stub(*args, **kwargs):
     return SimpleNamespace(plan=object(), functional=lambda **options: None)
 
 
-def _full_row_layer(monkeypatch, scratch, metadata, *, index, selection_move, shard):
+def _full_row_layer(monkeypatch, scratch, metadata, *, index, selection_move=None, shard=None,
+                    row_shard=None, attention_shard=False):
     """`PreparedLayer` as the decoder builds the full-row layer that crosses back off the shard."""
     from ignition.recipes.deepseek41 import decoder
 
@@ -421,7 +437,26 @@ def _full_row_layer(monkeypatch, scratch, metadata, *, index, selection_move, sh
         SimpleNamespace(config=SimpleNamespace(text=text)), None,
         shard=SimpleNamespace(world_size=2), mode="prefill", runtime=None, coordinator=None,
         session=object(), name="layer", workspace=SimpleNamespace(overlap=False), carry=False,
-        defer_post=False, row_shard=None, attention_shard=False, selection_move=selection_move)
+        defer_post=False, row_shard=row_shard, attention_shard=attention_shard,
+        selection_move=selection_move)
+
+
+def test_a_sharded_layer_releases_route_declarations(monkeypatch):
+    """Route destinations belong to each forward, not the prepared layer."""
+    from ignition.recipes.deepseek41 import decoder
+
+    tokens, world = 1024, 2
+    scratch = decoder.Scratch.allocate(tokens, 8, world, "cpu", row_shard=SimpleNamespace(rank=1),
+                                       attention_shard=True)
+    shard = scratch.row_shard
+    metadata = SimpleNamespace(token_ids=torch.empty(tokens),
+                               live_counts=torch.tensor([tokens, 1], dtype=torch.int32))
+    layer = _full_row_layer(monkeypatch, scratch, metadata, index=0, shard=shard,
+                            row_shard=shard, attention_shard=True)
+    layer.release_examples()
+    assert layer.scratch is None
+    assert not hasattr(layer, "route_ids") and not hasattr(layer, "route_weights")
+    assert layer.row_shard.routes is None and layer.row_shard.gathered_routes is None
 
 
 @pytest.mark.parametrize("scored", [False, True])
@@ -478,6 +513,22 @@ class _Recorder:
         return self.value
 
 
+class _RouteRecords(_Recorder):
+    """Stand in for the route record gather: this rank's records land in its own row block."""
+
+    def __init__(self, shard):
+        super().__init__()
+        self.shard = shard
+
+    def __call__(self, source):
+        self.calls.append((source,))
+        # The gather allocates its destination inside the forward and publishes rank-major rows;
+        # the other ranks' blocks keep what the test pre-filled.
+        gathered = self.shard.gathered_routes.words.clone()
+        gathered[self.shard.start : self.shard.start + self.shard.rows] = source.view(torch.int32)
+        return gathered.view(torch.bfloat16)
+
+
 def _attention_layer(scratch):
     """`PreparedLayer` over recorders, for a layer that runs attention on its own rows."""
     from ignition.recipes.deepseek41 import decoder
@@ -500,9 +551,8 @@ def _attention_layer(scratch):
     layer.ffn_hc = _Recorder((ffn.residual, ffn.post, ffn.comb, ffn.normalized))
     layer.ffn_gather = _Recorder(scratch.ffn_hc.normalized)
     layer.router_projection = _Recorder(shard.router_logits)
-    layer.router_gather = _Recorder(scratch.router_logits)
-    layer.router = _Recorder(SimpleNamespace(ids=torch.zeros(1, dtype=torch.int32),
-                                             weights=torch.zeros(1), selected_logits=None))
+    layer.route_gather = _RouteRecords(shard)
+    layer.router = _Recorder(shard.routes.router_scratch(torch.zeros(shard.rows, 6)))
     layer.experts = _Recorder(scratch.routed)
     layer.shared = _Recorder(scratch.shared.output)
     layer.mlp_reduce = _Recorder(scratch.mlp_output)
@@ -527,8 +577,8 @@ def test_a_sharded_layer_needs_no_attention_gather_or_reduction():
     assert attended.shape == (shard.rows, 5120)
 
 
-def test_a_sharded_layer_projects_its_router_logits_and_gathers_them_to_every_row():
-    """Top-k reads one row at a time, so the shard projects its rows and one gather feeds the router."""
+def test_a_sharded_layer_routes_its_rows_and_gathers_the_records_to_every_row():
+    """Top-k reads one row at a time, so the shard routes its rows and one gather feeds the experts."""
     from ignition.recipes.deepseek41 import decoder
 
     scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1),
@@ -539,14 +589,96 @@ def test_a_sharded_layer_projects_its_router_logits_and_gathers_them_to_every_ro
                None, (torch.full((shard.rows, 512), -1, dtype=torch.int32), None, None))
     (router_source,) = layer.router_projection.calls[0]
     assert router_source.data_ptr() == shard.ffn_hc.normalized.data_ptr()
-    (logits,) = layer.router_gather.calls[0]
-    # The gather moves BF16 packs of the FP32 logits it was prepared over.
-    assert logits.dtype is torch.bfloat16 and logits.shape == (shard.rows, 768)
-    assert layer.router.calls[0][0].data_ptr() == scratch.router_logits.data_ptr()
-    # The routed experts keep every row.
+    # The shard routes the logits it projected, and the gather moves its records as BF16 packs.
+    assert layer.router.calls[0][0].data_ptr() == shard.router_logits.data_ptr()
+    (records,) = layer.route_gather.calls[0]
+    assert records.dtype is torch.bfloat16 and records.shape == shard.routes.packed.shape
+    assert records.data_ptr() != shard.routes.words.data_ptr()
+    # The routed experts keep every row and read the unpacked full-row route buffers.
     assert layer.experts.calls[0][0].data_ptr() == scratch.ffn_hc.normalized.data_ptr()
+    assert layer.experts.calls[0][1].data_ptr() != scratch.router.ids.data_ptr()
     (residual,) = layer.residual_gather.calls[0]
     assert residual.data_ptr() == shard.residual.data_ptr()
+
+
+def test_a_sharded_layer_gathers_the_routes_its_router_produced():
+    """The records the gather sends hold the routes this forward produced, not stale preparation data.
+
+    A functional router allocates its IDs and weights inside the traced forward. Packing must read
+    those outputs without using the declaration record as serving storage.
+    """
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1),
+                                       attention_shard=True)
+    shard = scratch.row_shard
+    layer, _ = _attention_layer(scratch)
+    ids = torch.randint(0, 384, (shard.rows, 6), dtype=torch.int32)
+    weights = torch.randn(shard.rows, 6)
+    layer.router = _Recorder(SimpleNamespace(ids=ids, weights=weights, selected_logits=None))
+    shard.routes.words.fill_(-999)
+    expected = shard.gathered_routes.words.clone()
+    expected[shard.start:shard.start + shard.rows, :6] = ids
+    expected[shard.start:shard.start + shard.rows, 6:] = weights.view(torch.int32)
+    layer._run((shard.residual,), shard.pre_mix,
+               SimpleNamespace(token_ids=torch.zeros(1024, dtype=torch.int64)), None,
+               (torch.full((shard.rows, 512), -1, dtype=torch.int32), None, None))
+    # The experts read the unpacked full-row buffers, which hold exactly this forward's routes.
+    assert torch.equal(layer.experts.calls[-1][1], expected[:, :6])
+    assert torch.equal(layer.experts.calls[-1][2], expected[:, 6:].view(torch.float32))
+    assert torch.all(shard.routes.words == -999)
+    first_ids, first_weights = layer.experts.calls[-1][1:3]
+    # Releasing and zeroing disposable declarations must not affect another invocation's routes.
+    layer.release_examples()
+    shard.routes.words.zero_()
+    scratch.router.ids.zero_()
+    scratch.router.weights.zero_()
+    ids.add_(1)
+    weights.mul_(2)
+    expected[shard.start:shard.start + shard.rows, :6] = ids
+    expected[shard.start:shard.start + shard.rows, 6:] = weights.view(torch.int32)
+    layer._run((shard.residual,), shard.pre_mix,
+               SimpleNamespace(token_ids=torch.zeros(1024, dtype=torch.int64)), None,
+               (torch.full((shard.rows, 512), -1, dtype=torch.int32), None, None))
+    assert torch.equal(layer.experts.calls[-1][1], expected[:, :6])
+    assert torch.equal(layer.experts.calls[-1][2], expected[:, 6:].view(torch.float32))
+    assert layer.experts.calls[-1][1].data_ptr() != first_ids.data_ptr()
+    assert layer.experts.calls[-1][2].data_ptr() != first_weights.data_ptr()
+    assert torch.count_nonzero(shard.routes.words) == 0
+    assert torch.count_nonzero(scratch.router.ids) == 0
+    assert torch.count_nonzero(scratch.router.weights) == 0
+
+
+def test_a_route_gather_unpacks_every_ranks_records_for_the_full_row_experts():
+    """The experts read the full-row route buffers, so the unpack covers every rank's record.
+
+    This layer produces its own block; the other blocks arrive from the other ranks' records, and
+    the layer must not leave the rows it does not own holding whatever the buffer had before.
+    """
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1),
+                                       attention_shard=True)
+    shard = scratch.row_shard
+    layer, _ = _attention_layer(scratch)
+    routes = shard.routes.router_scratch(torch.zeros(shard.rows, 6))
+    routes.ids.copy_(torch.randint(0, 384, (shard.rows, 6), dtype=torch.int32))
+    routes.weights.copy_(torch.randn(shard.rows, 6).mul(0.5))
+    # The other ranks' records fill the blocks this rank does not produce.
+    for other in (slice(0, shard.start), slice(shard.start + shard.rows, None)):
+        held = shard.gathered_routes.words[other]
+        held[:, :6].copy_(torch.randint(0, 384, (held.shape[0], 6), dtype=torch.int32))
+        held[:, 6:].view(torch.float32).copy_(torch.randn(held.shape[0], 6).mul(0.5))
+    expected = shard.gathered_routes.words.clone()
+    expected[shard.start : shard.start + shard.rows] = shard.routes.words
+    layer._run((shard.residual,), shard.pre_mix, SimpleNamespace(token_ids=torch.zeros(1024, dtype=torch.int64)),
+               None, (torch.full((shard.rows, 512), -1, dtype=torch.int32), None, None))
+    # The unpack writes the whole record, this rank's block included.
+    assert torch.equal(layer.experts.calls[-1][1], expected[:, :6])
+    assert torch.equal(layer.experts.calls[-1][2], expected[:, 6:].view(torch.float32))
+    owned = slice(shard.start, shard.start + shard.rows)
+    assert torch.equal(layer.experts.calls[-1][1][owned], routes.ids)
+    assert torch.equal(layer.experts.calls[-1][2][owned], routes.weights)
 
 
 def test_compressor_gathers_values_and_gates_through_the_view_they_were_prepared_from(monkeypatch):
@@ -601,6 +733,28 @@ def test_compiled_row_shard_forwards_read_no_rank_offset_as_a_python_integer():
     assert "full.index_select(0, rows_index)" in prepared
     assert "indices.window_indices[self" not in prepared
     assert "m.token_page_table[self" not in prepared
+
+
+def test_a_sharded_layer_unpacks_routes_after_its_scratch_is_released():
+    """Packing and unpacking allocate inside the forward after declaration release."""
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1),
+                                       attention_shard=True)
+    shard = scratch.row_shard
+    layer, _ = _attention_layer(scratch)
+    layer.release_examples()
+    assert layer.scratch is None
+    routes = shard.routes.router_scratch(torch.zeros(shard.rows, 6))
+    routes.ids.copy_(torch.randint(0, 384, (shard.rows, 6), dtype=torch.int32))
+    routes.weights.copy_(torch.randn(shard.rows, 6).mul(0.5))
+    expected = shard.gathered_routes.words.clone()
+    expected[shard.start:shard.start + shard.rows] = shard.routes.words
+    layer._run((shard.residual,), shard.pre_mix,
+               SimpleNamespace(token_ids=torch.zeros(1024, dtype=torch.int64)), None,
+               (torch.full((shard.rows, 512), -1, dtype=torch.int32), None, None))
+    assert torch.equal(layer.experts.calls[-1][1], expected[:, :6])
+    assert torch.equal(layer.experts.calls[-1][2], expected[:, 6:].view(torch.float32))
 
 
 class _Operand:

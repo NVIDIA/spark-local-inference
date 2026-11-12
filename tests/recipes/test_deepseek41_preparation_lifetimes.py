@@ -65,11 +65,14 @@ def _prepare_layer(monkeypatch, scratch, metadata, sharded):
 def test_layer_and_decoder_release_attention_examples(monkeypatch, sharded):
     scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu",
         row_shard=SimpleNamespace(rank=1) if sharded else None, attention_shard=sharded)
-    examples = [weakref.ref(scratch.ffn_hc.normalized)]
+    examples = [weakref.ref(scratch.ffn_hc.normalized), weakref.ref(scratch.router.ids),
+                weakref.ref(scratch.router.weights)]
     if sharded:
         examples += [weakref.ref(scratch.row_shard.window_values),
                      weakref.ref(scratch.row_shard.attention.window_values),
-                     weakref.ref(scratch.row_shard.router_logits)]
+                     weakref.ref(scratch.row_shard.router_logits),
+                     weakref.ref(scratch.row_shard.routes.words),
+                     weakref.ref(scratch.row_shard.gathered_routes.words)]
     metadata = SimpleNamespace(token_ids=torch.zeros(1024, dtype=torch.int64))
     layer = _prepare_layer(monkeypatch, scratch, metadata, sharded)
     prepared = object.__new__(decoder.PreparedDecoder)

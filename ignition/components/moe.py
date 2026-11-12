@@ -49,6 +49,61 @@ class RouterScratch:
         return RouterScratch(*(getattr(self, field)[:tokens] for field in self.__dataclass_fields__))
 
 
+ROUTE_PACK_BYTES = 16
+
+
+@dataclass(frozen=True)
+class RouteRecord:
+    """One row-interleaved record of selected expert IDs and FP32 route-weight bits.
+
+    A record holds `top_k` int32 expert IDs followed by the same number of FP32 weights, so six
+    routes occupy 48 bytes and divide into whole transport packs. A router writes the `ids` and
+    `weights` views of one record in place, a shard gather moves `packed` (a BF16 reinterpretation
+    that converts neither value), and `read` restores the contiguous route buffers a consumer
+    holds.
+    """
+
+    words: torch.Tensor
+
+    @classmethod
+    def allocate(cls, rows: int, top_k: int, device, *, buffers=None) -> RouteRecord:
+        if rows <= 0 or top_k <= 0 or 8 * top_k % ROUTE_PACK_BYTES:
+            raise ValueError("a route record needs positive rows and a row of whole 16-byte packs")
+        def zeros():
+            return (torch.zeros((rows, 2 * top_k), dtype=torch.int32, device=device) if buffers is None
+                    else buffers.zeros((rows, 2 * top_k), torch.int32))
+        return cls(zeros())
+
+    @property
+    def top_k(self) -> int:
+        return self.words.shape[1] // 2
+
+    @property
+    def packed(self) -> torch.Tensor:
+        """The records as the contiguous BF16 rows a shard gather moves."""
+        return self.words.view(torch.bfloat16)
+
+    def router_scratch(self, selected_logits: torch.Tensor) -> RouterScratch:
+        """The router outputs over this record's ID and weight words."""
+        return RouterScratch(selected_logits, self.words[:, :self.top_k],
+                             self.words[:, self.top_k:].view(torch.float32))
+
+    def rows(self, count: int) -> RouteRecord:
+        if type(count) is not int or not 0 < count <= self.words.shape[0]:
+            raise ValueError("route record rows exceed capacity")
+        return RouteRecord(self.words[:count])
+
+    def read(self, ids: torch.Tensor, weights: torch.Tensor) -> None:
+        """Copy the records into the contiguous route buffers a consumer reads."""
+        ids.copy_(self.words[:, :self.top_k])
+        weights.copy_(self.words[:, self.top_k:].view(torch.float32))
+
+    def write(self, ids: torch.Tensor, weights: torch.Tensor) -> None:
+        """Copy the routes a router produced into the records a gather sends."""
+        self.words[:, :self.top_k].copy_(ids)
+        self.words[:, self.top_k:].view(torch.float32).copy_(weights)
+
+
 class PreparedRouter:
     """Native top-k routing, FP32 weights, and descending-ID ties.
 
@@ -237,6 +292,8 @@ class PreparedRoutedExperts:
                 route_inputs["router_logits"] = torch.zeros_like(route_inputs["router_logits"])
                 route_inputs["selected_logits"] = torch.zeros_like(route_inputs["selected_logits"])
                 if "num_valid_tokens" in route_inputs:
+                    # The capture binding runs with the graph's full row count; the final binding
+                    # below carries the router's live count.
                     route_inputs["num_valid_tokens"] = torch.full_like(route_inputs["num_valid_tokens"], source.shape[0])
             binding = state.bind(a=source, topk_ids=torch.zeros_like(ids), topk_weights=torch.full_like(weights, 1 / ids.shape[1]),
                 output=output, scratch=scratch, input_scales_static=True, **precision, **route_inputs)

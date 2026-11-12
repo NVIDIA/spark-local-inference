@@ -17,7 +17,7 @@ from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
 from ignition.components.mlp import MLPScratch, PreparedMLP
-from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
+from ignition.components.moe import RouteRecord, RouterScratch, PreparedRouter, PreparedRoutedExperts
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.tuning import register_finalizer
@@ -55,10 +55,13 @@ class RowShard:
     attention_hc: MHCScratch
     ffn_hc: MHCScratch
     # Row-sharded attention: the shard's own attention scratch, the full-row KV latent the window
-    # writer stores, and the shard's router logits before they are gathered to every row.
+    # writer stores, the shard's router logits before its own top-k runs, and the route records
+    # that top-k writes and one gather spreads over every row.
     attention: AttentionScratch | None = None
     window_values: torch.Tensor | None = None
     router_logits: torch.Tensor | None = None
+    routes: RouteRecord | None = None
+    gathered_routes: RouteRecord | None = None
     # Every graph's `rows_index` is a view of this table, one segment per shard row count (see
     # `_row_table_layout`). One compiled forward binds every rank, and binding compares storage
     # offsets, so a segment sits at the same offset on every rank and only its contents, this rank's
@@ -67,7 +70,7 @@ class RowShard:
 
     @classmethod
     def allocate(cls, tokens, world, rank, device, *, candidate_tokens=None, attention=False,
-                 experts=384):
+                 experts=384, top_k=6):
         """This rank's shard declarations for a decoder of `tokens` rows, or None when rows do not divide."""
         if world < 2 or tokens % world or tokens // world % MHC_CALL_ROWS:
             return None
@@ -91,6 +94,8 @@ class RowShard:
                                               shard_rows=rows) if attention else None),
                    zeros(tokens, 512) if attention else None,
                    zeros(rows, experts, dtype=torch.float32) if attention else None,
+                   RouteRecord.allocate(rows, top_k, device) if attention else None,
+                   RouteRecord.allocate(tokens, top_k, device) if attention else None,
                    rows_table)
 
     def graph(self, tokens):
@@ -111,7 +116,10 @@ class RowShard:
                        attention_hc=self.attention_hc.rows(rows), ffn_hc=self.ffn_hc.rows(rows),
                        attention=None if self.attention is None else self.attention.rows(rows, tokens),
                        window_values=None if self.window_values is None else self.window_values[:tokens],
-                       router_logits=None if self.router_logits is None else self.router_logits[:rows])
+                       router_logits=None if self.router_logits is None else self.router_logits[:rows],
+                       routes=None if self.routes is None else self.routes.rows(rows),
+                       gathered_routes=None if self.gathered_routes is None
+                       else self.gathered_routes.rows(tokens))
 
 
 def _row_table_layout(rows):
@@ -143,15 +151,15 @@ def row_shard_ready(scratch, shard, runtime):
 def attention_shard_ready(scratch, shard, runtime):
     """True when a runtime serves the gathers row-sharded attention adds to the same scratch.
 
-    The KV latent, the router logits and the carried selection are gathered whole. A selected row is
-    the widest shard-row operand a shard gathers, so proving it proves the compressor's two input
-    projections, which are gathered whole at the same row width and no wider.
+    The KV latent, the selected route records and the carried selection are gathered whole. A
+    selected row is the widest shard-row operand a shard gathers, so proving it proves the
+    compressor's two input projections, which are gathered whole at the same row width and no
+    wider.
     """
     if shard is None or shard.attention is None:
         return False
     return (PreparedGatherShards.fits(runtime, shard.attention.window_values, shard.window_values)
-            and PreparedGatherShards.fits(runtime, shard.router_logits.view(torch.bfloat16),
-                                          scratch.router_logits.view(torch.bfloat16))
+            and PreparedGatherShards.fits(runtime, shard.routes.packed, shard.gathered_routes.packed)
             and PreparedGatherShards.fits(runtime, shard.attention.selected.view(torch.bfloat16),
                                           scratch.attention.selected.view(torch.bfloat16)))
 
@@ -312,7 +320,7 @@ class Scratch:
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
         shard = (None if row_shard is None else RowShard.allocate(tokens, world, row_shard.rank, device,
-            candidate_tokens=candidate_tokens, attention=attention_shard, experts=experts))
+            candidate_tokens=candidate_tokens, attention=attention_shard, experts=experts, top_k=top_k))
         residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
         pre_mix, attn_mix = zeros(tokens, 4, dtype=torch.float32), zeros(tokens, 4, dtype=torch.float32)
         attention_hc = MHCScratch.allocate(tokens, 5120, device)
@@ -449,16 +457,20 @@ class PreparedLayer:
         self.ffn_gather = None if row_shard is None else PreparedGatherShards(
             ffn_scratch.normalized, s.ffn_hc.normalized, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".ffn_gather")
-        # Top-k is row-local, so a shard projects the logits it owns and one gather hands the
-        # router every row. The routed experts keep all rows.
+        # Top-k is row-local, so a shard projects and routes the logits it owns and one gather
+        # hands every rank the selected routes for all rows. The MoE keeps all rows.
         router_source = ffn_scratch.normalized if attention_shard else s.ffn_hc.normalized
         router_logits = s.router_logits if not attention_shard else row_shard.router_logits
         self.router_projection = UnquantizedProjection(router_source, weights.experts.router, router_logits,
             session=session, name=name + ".router")
-        self.router_gather = None if not attention_shard else PreparedGatherShards(
-            router_logits.view(torch.bfloat16), s.router_logits.view(torch.bfloat16), runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".router_gather")
-        self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
+        self.route_gather = None if not attention_shard else PreparedGatherShards(
+            row_shard.routes.packed, row_shard.gathered_routes.packed, runtime=runtime,
+            coordinator=coordinator, session=session, name=name + ".route_gather")
+        # The shard router's FP32 selected logits reuse the full-row router's scratch, which no
+        # prepared call reads once the route records replace the gathered logits.
+        route_scratch = (s.router if not attention_shard
+                         else row_shard.routes.router_scratch(s.router.selected_logits[:row_shard.rows]))
+        self.router = PreparedRouter(router_logits, route_scratch, session=session, name=name + ".topk",
             score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
@@ -506,8 +518,8 @@ class PreparedLayer:
         if self.ffn_gather is not None:
             self.ffn_gather.functional(session=session)
         self.router_projection.functional(session=session)
-        if self.router_gather is not None:
-            self.router_gather.functional(session=session)
+        if self.route_gather is not None:
+            self.route_gather.functional(session=session)
         self.router.functional(session=session)
         self.experts.functional(session=session)
         if self.concurrent_shared is None:
@@ -528,7 +540,8 @@ class PreparedLayer:
         if self.row_shard is not None:
             self.row_shard = replace(self.row_shard, attention_output=None, mlp_output=None,
                 residual=None, pre_mix=None, attn_mix=None, attention_hc=None, ffn_hc=None,
-                attention=None, window_values=None, router_logits=None)
+                attention=None, window_values=None, router_logits=None,
+                routes=None, gathered_routes=None)
         if self.concurrent_shared is not None:
             self.shared = None
 
@@ -567,13 +580,26 @@ class PreparedLayer:
         if self.ffn_gather is not None:
             normalized = self.ffn_gather(normalized)
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
-        image_mask = metadata.token_ids >= 129280 if self.has_image_mask else None
+        image_mask = None
+        if self.has_image_mask:
+            # The router reads the image mask over the rows it routes, and a sharded router routes
+            # only this rank's block.
+            image_mask = (metadata.token_ids if not self.attention_shard
+                          else metadata.token_ids.index_select(0, shard.rows_index)) >= 129280
         router_logits = self.router_projection(router_source if self.attention_shard else normalized)
-        if self.router_gather is not None:
-            # The gather's surface moves BF16 packs of the FP32 logits it was prepared over.
-            router_logits = self.router_gather(router_logits.view(torch.bfloat16)).view(torch.float32)
         route = self.router(router_logits, image_mask=image_mask)
-        routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
+        route_ids, route_weights = route.ids, route.weights
+        if self.route_gather is not None:
+            # Pack live route outputs and unpack gathered words into forward-local storage.
+            # Explicit operands let compilation plan these temporaries with the expert inputs.
+            packed_routes = RouteRecord.allocate(route_ids.shape[0], route_ids.shape[1], route_ids.device)
+            packed_routes.write(route_ids, route_weights)
+            gathered = self.route_gather(packed_routes.packed)
+            shape = (normalized.shape[0], route_ids.shape[1])
+            route_ids = torch.empty(shape, dtype=route_ids.dtype, device=route_ids.device)
+            route_weights = torch.empty(shape, dtype=route_weights.dtype, device=route_weights.device)
+            RouteRecord(gathered.view(torch.int32)).read(route_ids, route_weights)
+        routed = self.experts(normalized, route_ids, route_weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
         shared = (self.shared(normalized) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(pending, routed))
@@ -589,7 +615,7 @@ class PreparedLayer:
             self.mix_gather(next_mix.view(torch.bfloat16), full_mix.view(torch.bfloat16))
             incoming, next_mix = (self.residual_gather(residual),), full_mix
         observations = {"attention." + key: value for key, value in observations.items()}
-        observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route.ids,
+        observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route_ids,
                              "output": incoming[0]})
         return incoming, next_mix, records, selection, observations
 
@@ -717,7 +743,8 @@ class PreparedDecoder:
         if self.row_shard is not None:
             self.row_shard = replace(self.row_shard, attention_output=None, mlp_output=None,
                 residual=None, pre_mix=None, attn_mix=None, attention_hc=None, ffn_hc=None,
-                attention=None, window_values=None, router_logits=None)
+                attention=None, window_values=None, router_logits=None,
+                routes=None, gathered_routes=None)
         self.auxiliary = self.safe_tokens = self.head_hidden = self.local_logits = None
 
     def __call__(self, metadata):

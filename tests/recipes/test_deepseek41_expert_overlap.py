@@ -68,6 +68,7 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     layer.attention_gather = layer.ffn_gather = None
     layer.residual_gather = layer.mix_gather = None
     layer.selection_move = layer.router_gather = None
+    layer.route_gather = None
     residual = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     metadata = SimpleNamespace(token_ids=torch.tensor([7, 129280, 9]))
     selection = (torch.zeros(3, 1, dtype=torch.int32), None, None)
