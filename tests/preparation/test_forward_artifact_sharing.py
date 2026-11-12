@@ -226,6 +226,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
         cache.compile_workers = None
         cache.lock_gpu_clocks = False
+        cache.compile_headroom_bytes = 8 << 30
         variant = "sample" if rank == 0 else "consume"
         functions = {name: _Forward(variant) for name in "abcd"}
         for forward in functions.values():
@@ -397,6 +398,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
         cache.compile_workers = None
         cache.lock_gpu_clocks = False
+        cache.compile_headroom_bytes = 8 << 30
         functions = {name: _Forward("shared") for name in "abcd"}
         signatures = {name: name for name in functions}
         for name, forward in functions.items():

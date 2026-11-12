@@ -41,6 +41,38 @@ def test_forward_compiler_uses_explicit_host_budget_without_eight_worker_cap(mon
     assert compile_pool.CompilePool("cuda:0", compile_workers=32, headroom_bytes=2 << 30).workers == 10
 
 
+@pytest.mark.parametrize("available,compile_headroom,workers", [
+    (12038 << 20, None, 0), (12038 << 20, 6 << 30, 1), (72 << 30, None, 1), (72 << 30, 4 << 30, 2)])
+def test_forward_compilers_leave_the_compile_headroom_free(monkeypatch, available, compile_headroom, workers):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (available, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: available)
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    if not workers:
+        # The default 8 GiB leaves 3.76 GiB, below the 4 GiB minimum for one integrated worker.
+        with pytest.raises(MemoryError, match="12038 MiB available host memory, 8192 MiB headroom"):
+            compile_pool.CompilePool("cuda:0", headroom_bytes=1 << 30, **options)
+        return
+    pool = compile_pool.CompilePool("cuda:0", headroom_bytes=1 << 30, **options)
+    assert (pool.workers, pool.options["compile_threads"]) == (workers, 1)
+
+
+def test_compile_headroom_is_validated(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (13 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 13 << 30)
+    for value in (-1, 1.5, None):
+        with pytest.raises(ValueError, match="compile_headroom_bytes"):
+            compile_pool.CompilePool("cuda:0", compile_headroom_bytes=value)
+        with pytest.raises(ValueError, match="compile_headroom_bytes"):
+            compile_pool.compiler_resources("cuda:0", compile_headroom_bytes=value)
+
+
 def test_metadata_preserves_tensor_aliases_and_offsets():
     storage = torch.empty(1024, dtype=torch.uint8)
     original = SimpleNamespace(storage=storage, part=storage.view(torch.float32)[16:48],
