@@ -1,12 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Synthetic Inkling 2 checkpoint configurations, stored tensors and rank shards."""
+"""Synthetic Inkling 2 checkpoints and the rounding bounds between four-rank and single-rank layers.
+
+A four-rank layer rounds each rank's attention and expert partial sums, and their
+convolutions, to BF16 before the cross-rank sum; the single-rank layer rounds the
+complete sums. With unit roundoff `u = 2^-8`, every rounding `fl(z)` differs from
+`z` by at most `u |fl(z)|`. Propagating each rounding through the linear output
+convolution gives an elementwise bound on the difference of the two outputs for
+layers that start from empty convolution histories. A 0.1% margin and a `2^-20`
+term per route magnitude cover the FP32 roundings of accumulators, route sums and
+convolutions.
+"""
 
 import torch
 
 from ignition.recipes.inkling2.config import ModelConfig
 from ignition.recipes.inkling2.weights import checkpoint_layout
+from ignition.reference.inkling2 import LayerWeights, short_convolution
+
+UNIT_ROUNDOFF = 2.0 ** -8
 
 
 def synthetic_config(layers=7, local=(0, 1, 2, 3, 4, 6), mxfp8=(5, 6), **text):
@@ -135,3 +148,42 @@ def synthetic_model(seed=0, world_size=4, **settings):
     generator = torch.Generator().manual_seed(seed)
     tensors = {name: random_tensor(placement, generator) for name, placement in sorted(layout.model.items())}
     return config, layout, tensors
+
+
+def layer_weights(layout, tensors, layer, rank=None, device=None):
+    """Whole (`rank=None`) or one rank's `LayerWeights` from stored tensors."""
+    values = {}
+    for role, placement in layout.layer(layer).items():
+        value = tensors[placement.name]
+        value = value if rank is None else shard(value, placement, rank)
+        values[role] = value if device is None else value.to(device)
+    return LayerWeights(**values)
+
+
+def convolution_magnitude(values, weight):
+    """`(sum_j |w_j| v[t - W + 1 + j] + v[t]) / sqrt(W + 1)` for nonnegative FP32 `values` from a zero history."""
+    return short_convolution(values.float(), weight.abs())[0]
+
+
+def _total(values):
+    return sum(value.float().abs() for value in values)
+
+
+def attention_bound(single, ranks, weights):
+    """Elementwise bound of |attention output (four ranks) - attention output (one rank)|."""
+    u = UNIT_ROUNDOFF
+    rounded = (_total([ranks.attention_output]) + _total([single.attention_output])
+               + _total(ranks.attention_convolved))
+    propagated = _total([single.attention[0].partial]) + _total(record.partial for record in ranks.attention)
+    return 1.001 * (u * rounded + convolution_magnitude(u * propagated, weights.attention_convolution)) + 1e-30
+
+
+def mlp_bound(single, ranks, weights):
+    """Elementwise bound of |expert output (four ranks) - expert output (one rank)| given equal expert inputs."""
+    u = UNIT_ROUNDOFF
+    rounded = _total([ranks.mlp_output]) + _total([single.mlp_output]) + _total(ranks.mlp_convolved)
+    routes = single.experts[0].routes.float().abs().sum(1) + sum(
+        record.routes.float().abs().sum(1) for record in ranks.experts)
+    propagated = _total([single.expert_partials[0]]) + _total(ranks.expert_partials) + routes
+    fp32 = 2.0 ** -20 * routes
+    return 1.001 * (u * rounded + convolution_magnitude(u * propagated + fp32, weights.mlp_convolution)) + 1e-30
