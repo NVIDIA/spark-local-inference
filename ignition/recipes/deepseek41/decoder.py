@@ -126,6 +126,29 @@ def row_shard_ready(scratch, shard, runtime):
             and PreparedChunkedGatherShards.fits(runtime, shard.residual, scratch.residual))
 
 
+def shard_schedule(layers, stop, sharded, aux_layers=()):
+    """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
+
+    Layers below `stop` that are not Engram layers keep this rank's rows. An Engram layer reads and
+    writes full rows, so it runs full-row, and the layers on either side of it change row dimension:
+    a layer that lands on the far side of such a change runs its own post, so the full-row residual
+    its consumer reads is complete, and the first sharded layer after a full-row run reseeds the
+    shard from the rows it owns.
+    """
+    def sharded_at(index):
+        return (sharded is not None and index < stop and index < len(layers)
+                and index not in aux_layers and layers[index].engram is None)
+    schedule = []
+    for index in range(len(layers)):
+        shard = sharded_at(index)
+        # Deferred post hands this layer's four streams to the next layer's attention mHC, which
+        # reads them only when both layers hold the same rows.
+        defer = (index + 1 < len(layers) and layers[index + 1].engram is None
+                 and index + 1 not in aux_layers and sharded_at(index + 1) == shard)
+        schedule.append((shard, defer, shard and index > 0 and not sharded_at(index - 1)))
+    return schedule
+
+
 @dataclass(frozen=True)
 class Scratch:
     """BF16 decoder activations and FP32 target vocabulary logits."""
@@ -435,16 +458,14 @@ class PreparedDecoder:
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
-        # Full-row layers before `stop` run row-sharded; the layer at `stop - 1` materializes every
-        # row again so the decoder suffix keeps its full-row boundary and replay gather.
+        # Layers below `stop` run row-sharded; the layer at `stop - 1` materializes every row again
+        # so the decoder suffix keeps its full-row boundary and replay gather.
         stop = (len(weights.layers) if self.packing is None else decoder_start) - 1
-        for index, layer in enumerate(weights.layers):
-            if layer.engram is not None or index in self.aux_layers:
-                stop = min(stop, index)
         self.row_shard = scratch.row_shard
         if (self.row_shard is None or mode != "prefill" or stop < 1
                 or not row_shard_ready(scratch, self.row_shard, runtime)):
             self.row_shard = None
+        schedule = shard_schedule(weights.layers, stop, self.row_shard, self.aux_layers)
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
@@ -484,12 +505,8 @@ class PreparedDecoder:
                         source_indices=self.window_metadata)
                     layer = replace(layer, attention={key: value for key, value in layer.attention.items()
                                                       if key not in ("compressor", "index_k", "index_norm")})
-            defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
-                     and index + 1 not in self.aux_layers)
-            sharded = self.row_shard if index < stop else None
-            if sharded is not None and index + 1 == stop:
-                # The following layer reads every row, so this layer runs its own post.
-                defer = False
+            sharded, defer, reseed = schedule[index]
+            sharded = self.row_shard if sharded else None
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -497,7 +514,7 @@ class PreparedDecoder:
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode,
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples, row_shard=sharded))
+                examples=examples, row_shard=sharded, reseed=reseed))
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",

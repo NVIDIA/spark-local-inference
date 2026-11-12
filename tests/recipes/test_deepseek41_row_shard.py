@@ -74,14 +74,16 @@ class _Recorder:
     """A stand-in for a prepared component that returns the surface the forward reads."""
 
     def __init__(self, value=None):
-        self.value, self.calls = value, []
+        self.value, self.calls, self.kwargs = value, [], {}
 
     def __call__(self, *args, **kwargs):
         self.calls.append(args)
+        self.kwargs = kwargs
         return self.value
 
     def _run(self, *args, **kwargs):
         self.calls.append(args)
+        self.kwargs = kwargs
         return self.value
 
 
@@ -90,13 +92,13 @@ def _metadata(tokens=1024):
                            positions=torch.arange(tokens))
 
 
-def _recording_layer(scratch):
+def _recording_layer(scratch, *, reseed=False):
     """A `PreparedLayer` whose `_run` calls recorders, so a test can read the operands it passes."""
     from ignition.recipes.deepseek41 import decoder
 
     shard = scratch.row_shard
     layer = object.__new__(decoder.PreparedLayer)
-    layer.scratch, layer.row_shard, layer.reseed = scratch, shard, False
+    layer.scratch, layer.row_shard, layer.reseed = scratch, shard, reseed
     layer.engram = layer.concurrent_shared = None
     layer.image_mask, layer.has_image_mask = None, False
     attended = shard.attention_output if shard is not None else scratch.attention_output
@@ -164,6 +166,28 @@ def test_a_sharded_forward_gathers_the_lagged_mix_through_its_bf16_view():
     assert full_mix.dtype is torch.float32 and full_mix.shape == (1024, 4)
     (residual,) = layer.residual_gather.calls[0]
     assert residual.data_ptr() == shard.residual.data_ptr()
+
+
+def test_a_resuming_shard_refills_from_the_rows_its_rank_owns():
+    """The full-row layers own the rows in between, so a resuming shard takes its own rows out.
+
+    Taking rows from zero instead would hand rank one another rank's state. Each 128-row block
+    of the full residual and lagged mix carries its own value, so the two differ.
+    """
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1))
+    shard = scratch.row_shard
+    blocks = (torch.arange(1024) // 128).to(torch.float32)
+    scratch.residual.copy_(blocks[:, None, None].expand(1024, 4, 5120))
+    scratch.pre_mix.copy_(blocks[:, None].expand(1024, 4))
+    layer = _recording_layer(scratch, reseed=True)
+    layer._run((scratch.residual,), scratch.pre_mix, _metadata(), None, None)
+    (refilled,) = layer.attention_hc.calls[0]
+    assert torch.equal(refilled, scratch.residual.index_select(0, shard.rows_index))
+    assert torch.equal(layer.attention_hc.kwargs["pre_mix"],
+                       scratch.pre_mix.index_select(0, shard.rows_index))
+    assert not torch.equal(refilled, scratch.residual[:shard.rows])
 
 
 @pytest.mark.parametrize("abi,pipe_bytes,ready", [
