@@ -70,6 +70,102 @@ def test_decoder_scratch_carries_a_row_shard_only_when_the_bootstrap_asks():
     assert asked.rows(512, 1).row_shard is None
 
 
+class _Recorder:
+    """A stand-in for a prepared component that returns the surface the forward reads."""
+
+    def __init__(self, value=None):
+        self.value, self.calls = value, []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        return self.value
+
+    def _run(self, *args, **kwargs):
+        self.calls.append(args)
+        return self.value
+
+
+def _metadata(tokens=1024):
+    return SimpleNamespace(token_ids=torch.zeros(tokens, dtype=torch.int64),
+                           positions=torch.arange(tokens))
+
+
+def _recording_layer(scratch):
+    """A `PreparedLayer` whose `_run` calls recorders, so a test can read the operands it passes."""
+    from ignition.recipes.deepseek41 import decoder
+
+    shard = scratch.row_shard
+    layer = object.__new__(decoder.PreparedLayer)
+    layer.scratch, layer.row_shard, layer.reseed = scratch, shard, False
+    layer.engram = layer.concurrent_shared = None
+    layer.image_mask, layer.has_image_mask = None, False
+    attended = shard.attention_output if shard is not None else scratch.attention_output
+    attention_branch = scratch.attention_hc if shard is None else shard.attention_hc
+    ffn_branch = scratch.ffn_hc if shard is None else shard.ffn_hc
+    layer.attention = _Recorder((attended, {}, None, {}))
+    layer.attention_hc = _Recorder((attention_branch.residual, attention_branch.post,
+                                    attention_branch.comb, attention_branch.normalized))
+    layer.ffn_hc = _Recorder((ffn_branch.residual, ffn_branch.post, ffn_branch.comb, ffn_branch.normalized))
+    layer.post = None if shard is None else _Recorder(shard.residual)
+    layer.shared = _Recorder(scratch.shared.output)
+    layer.attention_reduce = _Recorder(attended)
+    layer.mlp_reduce = _Recorder()
+    layer.router_projection = _Recorder(scratch.router_logits)
+    layer.router = _Recorder(SimpleNamespace(ids=torch.zeros(1, dtype=torch.int32), weights=torch.zeros(1),
+                                             selected_logits=None))
+    layer.experts = _Recorder(scratch.routed)
+    if shard is None:
+        layer.attention_gather = layer.ffn_gather = None
+        layer.residual_gather = layer.mix_gather = None
+    else:
+        layer.attention_gather, layer.ffn_gather = _Recorder(), _Recorder()
+        layer.residual_gather, layer.mix_gather = _Recorder(), _Recorder()
+    return layer
+
+
+@pytest.mark.parametrize("row_shard", [False, True])
+def test_the_forward_normalizes_the_ffn_from_the_attention_branch_state(row_shard):
+    """A prepared mHC rewrites the residual, post and comb surfaces it reads.
+
+    The feed-forward mHC must therefore take the attention branch's surfaces — the shard's copy
+    when the layer shards, the full scratch when it does not — which the attention mHC wrote on
+    this call. The feed-forward scratch still holds the previous layer's post until this call
+    writes it, so passing its surfaces normalizes a stale mix.
+    """
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu",
+        row_shard=SimpleNamespace(rank=1) if row_shard else None)
+    branch = scratch.attention_hc if scratch.row_shard is None else scratch.row_shard.attention_hc
+    output = scratch.attention_output if scratch.row_shard is None else scratch.row_shard.attention_output
+    residual_source = scratch.residual if scratch.row_shard is None else scratch.row_shard.residual
+    mix_source = scratch.pre_mix if scratch.row_shard is None else scratch.row_shard.pre_mix
+    layer = _recording_layer(scratch)
+    layer._run((residual_source,), mix_source, _metadata(), None, None)
+    attention_output, residual, post, comb = layer.ffn_hc.calls[0]
+    assert attention_output.data_ptr() == output.data_ptr()
+    for received, expected in zip((residual, post, comb),
+            (branch.residual, branch.post, branch.comb), strict=True):
+        assert received.data_ptr() == expected.data_ptr()
+
+
+def test_a_sharded_forward_gathers_the_lagged_mix_through_its_bf16_view():
+    """The mix gather was prepared over BF16 packs of the FP32 lagged mix, so it takes that view."""
+    from ignition.recipes.deepseek41 import decoder
+
+    scratch = decoder.Scratch.allocate(1024, 8, 2, "cpu", row_shard=SimpleNamespace(rank=1))
+    shard = scratch.row_shard
+    layer = _recording_layer(scratch)
+    _, full_mix, _, _, _ = layer._run((shard.residual,), shard.pre_mix, _metadata(), None, None)
+    mix, gathered = layer.mix_gather.calls[0]
+    assert mix.dtype is torch.bfloat16 and mix.shape == (shard.rows, 8)
+    assert mix.is_contiguous() and mix.stride() == (8, 1)
+    assert gathered.dtype is torch.bfloat16 and gathered.shape == (1024, 8)
+    assert full_mix.dtype is torch.float32 and full_mix.shape == (1024, 4)
+    (residual,) = layer.residual_gather.calls[0]
+    assert residual.data_ptr() == shard.residual.data_ptr()
+
+
 @pytest.mark.parametrize("abi,pipe_bytes,ready", [
     (11, 1 << 26, True), (10, 1 << 26, False), (11, 1 << 22, False)])
 def test_row_shard_ready_requires_the_abi_and_capacity_for_every_surface(monkeypatch, abi, pipe_bytes, ready):
