@@ -31,6 +31,7 @@ pub enum OutputPipeline {
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
     Recipient(super::recipient::RecipientOutput),
+    Tml(super::tml::TmlOutput),
     MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
     GemmaCall(TaggedOutput<super::gemma_call::GemmaCall>),
     Text(TaggedOutput<PlainText>),
@@ -57,6 +58,7 @@ macro_rules! dispatch {
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
             OutputPipeline::Recipient($parser) => $body,
+            OutputPipeline::Tml($parser) => $body,
             OutputPipeline::MiniMaxXml($parser) => $body,
             OutputPipeline::GemmaCall($parser) => $body,
             OutputPipeline::Text($parser) => $body,
@@ -73,6 +75,7 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
+            Some((ToolParserKind::TmlJson, _, _)) => Self::Tml(super::tml::TmlOutput::new(config.content, config.control_tokens)),
             Some((ToolParserKind::Atem, _, _)) => Self::Recipient(super::recipient::RecipientOutput::new(config.content, config.control_tokens)),
             Some((ToolParserKind::QwenCoder, 0, _)) => Self::CompactFunctionTags(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
@@ -106,10 +109,10 @@ impl OutputPipeline {
     }
 
     /// Whether the parser `new` selects gates reasoning delimiters by token identity.
-    /// XTML and recipient-header framing carry their own control tokens.
+    /// XTML, recipient-header, and content-header framing carry their own control tokens.
     pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
         match syntax.tools.as_ref().map(|t| t.kind) {
-            Some(ToolParserKind::Xtml | ToolParserKind::Atem) => false,
+            Some(ToolParserKind::Xtml | ToolParserKind::Atem | ToolParserKind::TmlJson) => false,
             Some(
                 ToolParserKind::Dsml
                 | ToolParserKind::QwenCoder
@@ -128,8 +131,9 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
-            Some((ToolParserKind::Atem, _, _)) => Some(crate::grammar::OutputEnvelope {
+            Some((kind @ (ToolParserKind::Atem | ToolParserKind::TmlJson), _, _)) => Some(crate::grammar::OutputEnvelope {
                 recipient: Some(crate::grammar::RecipientEnvelope {
+                    syntax: kind,
                     start: config.content.start,
                     tools: config.content.tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect(),
                 }), reasoning_end: None, tool: None, function: None,

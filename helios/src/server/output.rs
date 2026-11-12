@@ -562,6 +562,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn content_header_streams_reconstruct_the_collected_message() {
+        use crate::model::contract::{ReasoningParser, ReasoningParserKind, ToolParser, ToolParserKind};
+        use crate::output::{OutputPipeline, tagged::OutputStart};
+        let pieces = ["<|content_thinking|>", "Plan 世界", "<|end_message|>",
+            "<|message_model|>", "lookup", "<|content_invoke_tool_json|>",
+            r#"{"name":"lookup","args":{"q":"café","n":1}}"#,
+            r#"{"name":"lookup","args":{"q":"世界","n":2}}"#,
+            "<|content_text|>", "Answer & café"];
+        let frontend = frontend(&pieces);
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser { kind: ToolParserKind::TmlJson,
+            wrapping_newlines: 0, tag_separator: String::new() });
+        syntax.reasoning = Some(ReasoningParser { kind: ReasoningParserKind::ContentHeaders,
+            open: pieces[0].into(), close: pieces[2].into(), wrapping_newlines: 0, terminal_markers: vec![] });
+        let config = crate::output::OutputConfig { syntax,
+            control_tokens: [0,2,3,5,8].map(|id| (id, pieces[id as usize].into())).to_vec(),
+            content: OutputConfig { start: OutputStart::RecipientHeader, structured: false,
+                tools: vec![json!({"function":{"name":"lookup"}})] },
+        };
+        let mut streamed = Presentation::<OutputPipeline>::new(&frontend, &[99], config.clone(), "tml".into());
+        let mut collected = Presentation::<OutputPipeline>::new(&frontend, &[99], config, "tml".into());
+        let mut deltas = vec![];
+        for token in [0,1,2,3,4,5,6,2,3,4,5,7,2,3,8,9,2,99] {
+            deltas.extend(streamed.push(token).unwrap());
+            collected.push(token).unwrap();
+        }
+        deltas.extend(streamed.finish(Termination::Eos).unwrap());
+        collected.finish(Termination::Eos).unwrap();
+        assert_eq!(reconstruct(&deltas), collected.message());
+        assert_eq!(streamed.message()["reasoning_content"], "Plan 世界");
+        assert_eq!(streamed.message()["content"], "Answer & café");
+        assert_eq!(streamed.message()["tool_calls"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn json_and_stream_reconstruction_share_incremental_reasoning_and_multiple_calls() {
         let pieces = [
             "<thi",

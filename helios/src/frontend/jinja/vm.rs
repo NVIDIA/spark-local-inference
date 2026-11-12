@@ -861,6 +861,17 @@ fn filter<'a>(
             },
         ),
         "length" | "count" => Ok(Value::Int(v.len() as i64)),
+        "float" => {
+            let number = v.number().or_else(|| match &v {
+                Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+                _ => v.as_str().and_then(|s| s.trim().parse::<f64>().ok()),
+            });
+            Ok(number.map(Value::Float).unwrap_or_else(|| {
+                kw.iter().find(|(name, _)| *name == "default")
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| args.first().cloned()).unwrap_or(Value::Float(0.0))
+            }))
+        }
         "string" => Ok(if v.as_str().is_some() {
             v
         } else {

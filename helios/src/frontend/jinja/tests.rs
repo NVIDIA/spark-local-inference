@@ -66,6 +66,9 @@ fn expressions_and_python_methods_match_minijinja() {
         "1 if true else 2",
         "1 if false else 2 if true else 3",
         "s|trim",
+        "0.9|float",
+        "3|float",
+        "true|float",
         "s.strip()",
         "s.lstrip()",
         "s.rstrip()",
@@ -127,6 +130,17 @@ fn float_text_conversions_use_python_spelling() {
         template.render(context.as_object().unwrap(), &[]).unwrap().text,
         "1e-06 -0.0 1e+16 2.5 3.0|1e+16"
     );
+}
+
+#[test]
+fn float_filter_matches_jinja_conversion_and_failure_defaults() {
+    // Python Jinja's do_float accepts whitespace and returns the supplied
+    // default on conversion failure; MiniJinja instead errors on these inputs.
+    let template = CompiledTemplate::compile(
+        "{{ ' 0.7 '|float }}|{{ 'invalid'|float }}|{{ none|float(default=0.99) }}|{{ []|float(7) }}"
+    ).unwrap();
+    assert_eq!(template.render(json!({}).as_object().unwrap(), &[]).unwrap().text,
+        "0.7|0.0|0.99|7");
 }
 
 #[test]
