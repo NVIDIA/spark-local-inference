@@ -54,9 +54,10 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
             _project_out(bases[0], activation_scales, weights[index], weight_scales,
                          output, workspace, plans[index])
         elif scale_kinds[index] == 3:
+            from b12x.preparation.types import plan_from_handle
             from ignition.components.block_fp8 import _project
 
-            output.copy_(_project(value, weights[index], scales[index], plans[index]))
+            output.copy_(_project(value, weights[index], scales[index], plan_from_handle(plans[index])))
         else:
             packed_out_workspace(
                 value, weights[index], scales[index], gains[index], None, output,
