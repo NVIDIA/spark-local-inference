@@ -270,7 +270,7 @@ class PreparedStateTransfer:
                     raise ValueError("shifted draft pages require two saved pages per cache plane")
                 _check_tensor(cache, cache.shape, torch.uint8, device, name)
                 names.add(name)
-                trailing_groups[region.nbytes].append((cache.data_ptr(), region.offset))
+                trailing_groups[cache.shape[1]].append((cache.data_ptr(), region.offset))
         self.trailing_pointers = {size: _pointer_table(values, device) for size, values in trailing_groups.items()}
         self.pointers = {size: _pointer_table(values, device) for size, values in groups.items()}
         c = commands
