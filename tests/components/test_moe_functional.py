@@ -190,12 +190,12 @@ def test_integrated_expert_lowering_exposes_mutable_routes_and_scale_planes():
     assert all(node.target == torch.ops.aten.empty_strided.default for node in call.args[8])
 
 
-def test_block_fp8_lowering_exposes_quantization_output_and_workspace(monkeypatch):
-    monkeypatch.setattr(block_fp8, "plan_from_handle", lambda handle: SimpleNamespace(component_id="block_fp8"))
+def test_block_fp8_lowering_exposes_quantization_output_and_workspace():
+    plan = SimpleNamespace(component_id="block_fp8", handle=1)
     source = torch.ones((2, 128), dtype=torch.bfloat16)
     values, scales = torch.ones((128, 128), dtype=torch.float8_e4m3fn), torch.ones((1, 1))
     graph = make_fx(lambda source, values, scales:
-        block_fp8._project(source, values, scales, 1, workspace_nbytes=512),
+        block_fp8._project(source, values, scales, plan, workspace_nbytes=512),
         tracing_mode="fake")(source, values, scales)
     quantize = next(node for node in graph.graph.nodes
                     if node.target == torch.ops.flare.block_fp8_quantize_out.default)
