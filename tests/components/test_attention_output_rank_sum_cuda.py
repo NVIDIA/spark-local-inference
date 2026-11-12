@@ -31,9 +31,6 @@ BLOCK = 32
 # group sum while the four ranks still accumulate operands of different magnitudes.
 SCALE_BAND = (115, 119)
 REFERENCE_ROWS = 2048
-# b12x prepares a fused WO-B kernel for a projection of at most eight token rows and quantizes the
-# intermediate inside it; a wider plan materializes the MXFP8 intermediate that both paths share.
-FUSED_WO_B_MAX_ROWS = 8
 HEADER = (f"{'rows':>6}  {'input':9} {'A!=B':5} {'ulpAB':5} {'|A-B|/rms':10} "
           f"{'A/exact diff':12} {'ulp':5} {'rms':7} {'B/exact diff':12} {'ulp':5} {'rms':7} "
           f"{'budget':6}  intermediate")
@@ -163,7 +160,8 @@ def _row(rows, label, out_a, out_b, partials, exact, identical):
     return difference, budget, errors
 
 
-@pytest.mark.parametrize("rows", [1, 128, 4096, 16384])
+# A row-sharded prefill projection sees at least 512 rows (ignition/recipes/deepseek41/decoder.py:72).
+@pytest.mark.parametrize("rows", [128, 4096, 16384])
 @pytest.mark.parametrize("gained", [False, True], ids=["unit", "lognormal"])
 @torch.no_grad()
 def test_row_shard_group_sum_matches_partitioned_reduce(rows, gained):
@@ -194,31 +192,21 @@ def test_row_shard_group_sum_matches_partitioned_reduce(rows, gained):
         rank_bindings = [wo_projection.bind(operation.plan, scratch=operation.scratch,
             source_tgd=shards[rank], weights=partitioned[rank], out=outputs[rank + 1])
             for rank, operation in enumerate(ranked)]
-        if rows <= FUSED_WO_B_MAX_ROWS:
-            identical = "fused"
-        else:
-            # The quantized intermediate of each rank's groups is the wholesale projection's slice.
-            identical = []
-            for rank, binding in enumerate(rank_bindings):
-                columns = slice(rank * GROUPS_PER_RANK * RANK, (rank + 1) * GROUPS_PER_RANK * RANK)
-                blocks = slice(columns.start // BLOCK, columns.stop // BLOCK)
-                identical.append(torch.equal(
-                    whole_binding.tmp_q.values.contiguous().view(torch.uint8)[:, columns],
-                    binding.tmp_q.values.contiguous().view(torch.uint8)) and torch.equal(
-                    whole_binding.tmp_q.scale_rows.reshape(-1, GROUPS * RANK // BLOCK)[:, blocks],
-                    binding.tmp_q.scale_rows.reshape(-1, GROUPS_PER_RANK * RANK // BLOCK)))
-            identical = "identical" if all(identical) else "differs"
+        # The quantized intermediate of each rank's groups is the wholesale projection's slice.
+        identical = []
+        for rank, binding in enumerate(rank_bindings):
+            columns = slice(rank * GROUPS_PER_RANK * RANK, (rank + 1) * GROUPS_PER_RANK * RANK)
+            blocks = slice(columns.start // BLOCK, columns.stop // BLOCK)
+            identical.append(torch.equal(
+                whole_binding.tmp_q.values.contiguous().view(torch.uint8)[:, columns],
+                binding.tmp_q.values.contiguous().view(torch.uint8)) and torch.equal(
+                whole_binding.tmp_q.scale_rows.reshape(-1, GROUPS * RANK // BLOCK)[:, blocks],
+                binding.tmp_q.scale_rows.reshape(-1, GROUPS_PER_RANK * RANK // BLOCK)))
+        identical = "identical" if all(identical) else "differs"
         reduced = _reduce(partials)
         exact = _exact(source, wholesale.plan, full, device)
         difference, budget, errors = _row(rows, "lognormal" if gained else "unit", row_shard,
                                           reduced, partials, exact, identical)
-        if rows <= FUSED_WO_B_MAX_ROWS:
-            # A fused WO-B kernel quantizes the intermediate itself rather than through the pass both
-            # paths share, so an eight-group and a two-group projection no longer differ only by the
-            # reduction's rounding. The case measures that kernel selection instead, and the
-            # measurements above remain the record of it.
-            pytest.skip("plans of at most eight token rows run b12x's fused WO-B kernel, which does"
-                        " not use the shared intermediate quantization that both paths otherwise share")
         assert identical == "identical", f"rows={rows}: the quantized intermediate differs between paths"
         broken = difference > budget
         if bool(broken.any()):
