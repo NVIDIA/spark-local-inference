@@ -1499,112 +1499,12 @@ fn install_payload_bytes(
 
 /// Install one payload into a directory core, verifying the published bytes.
 fn install_directory_payload(root: &Path, payload: &PublishPayload) -> Result<(), crate::Error> {
-    if link_verified_companion(root, &payload.relative, payload)? {
+    let path = root.join(&payload.relative);
+    if container::link_companion(&payload.source, payload.id, &path, &payload.relative)? {
         return Ok(());
     }
     verify_payload_source(payload)?;
     write_verified_companion(root, &payload.relative, payload)
-}
-
-/// Hard-link a source file that is already this payload's deterministic
-/// companion wrapper, then hash the linked file. Returns false when the source
-/// is not that wrapper or the filesystem refuses the link, and the caller copies.
-#[cfg(target_os = "linux")]
-fn link_verified_companion(
-    directory: &Path,
-    relative: &str,
-    payload: &PublishPayload,
-) -> Result<bool, crate::Error> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileExt, MetadataExt};
-    use std::os::unix::io::AsRawFd;
-
-    let nbytes = payload.nbytes();
-    let prefix = container::companion_prefix(nbytes)?;
-    let source = payload.source.file();
-    let metadata = source
-        .metadata()
-        .map_err(|e| io("inspect payload source", e))?;
-    let wrapper_len = prefix.len() as u64 + nbytes;
-    if payload.source.offset() != prefix.len() as u64
-        || !metadata.is_file()
-        || metadata.len() != wrapper_len
-    {
-        return Ok(false);
-    }
-    let mut header = vec![0u8; prefix.len()];
-    source
-        .read_exact_at(&mut header, 0)
-        .map_err(|e| io("read payload wrapper", e))?;
-    if header != prefix {
-        return Ok(false);
-    }
-    let path = directory.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io("create payload directory", e))?;
-    }
-    // The descriptor link names the pinned file itself, not a path that could
-    // have been replaced since the source was opened.
-    let from = std::ffi::CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))
-        .map_err(|_| invalid("payload source descriptor path"))?;
-    let to = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| invalid(format!("payload path {relative:?} contains NUL")))?;
-    // SAFETY: Both arguments are NUL-terminated paths that outlive the call.
-    let status = unsafe {
-        libc::linkat(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::AT_SYMLINK_FOLLOW,
-        )
-    };
-    if status != 0 {
-        let error = std::io::Error::last_os_error();
-        // An existing destination is a publication conflict, as for a copy.
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(io("link companion", error));
-        }
-        return Ok(false);
-    }
-    let result = (|| -> Result<(), crate::Error> {
-        let linked = File::open(&path).map_err(|e| io("open linked companion", e))?;
-        let linked_metadata = linked
-            .metadata()
-            .map_err(|e| io("inspect linked companion", e))?;
-        if (linked_metadata.dev(), linked_metadata.ino()) != (metadata.dev(), metadata.ino()) {
-            return Err(invalid("linked companion is not the payload source file"));
-        }
-        // Verify the file published under this path, not the pre-link source reads.
-        let mut header = vec![0u8; prefix.len()];
-        linked
-            .read_exact_at(&mut header, 0)
-            .map_err(|e| io("read linked companion", e))?;
-        if header != prefix || linked_metadata.len() != wrapper_len {
-            return Err(invalid("linked companion is not the payload wrapper"));
-        }
-        let slice = Slice::new(std::sync::Arc::new(linked), prefix.len() as u64, nbytes)?;
-        if slice.digest()? != payload.id {
-            return Err(invalid(format!(
-                "payload {} bytes do not match the assigned identity",
-                payload.relative
-            )));
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&path);
-    }
-    result.map(|()| true)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn link_verified_companion(
-    _directory: &Path,
-    _relative: &str,
-    _payload: &PublishPayload,
-) -> Result<bool, crate::Error> {
-    Ok(false)
 }
 
 /// Stream one payload into its companion wrapper, then verify the bytes that
