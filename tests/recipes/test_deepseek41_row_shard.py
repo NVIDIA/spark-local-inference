@@ -99,6 +99,7 @@ def _recording_layer(scratch, *, reseed=False):
     shard = scratch.row_shard
     layer = object.__new__(decoder.PreparedLayer)
     layer.scratch, layer.row_shard, layer.reseed = scratch, shard, reseed
+    layer.attention_shard, layer.selection_move = False, None
     layer.engram = layer.concurrent_shared = None
     layer.image_mask, layer.has_image_mask = None, False
     attended = shard.attention_output if shard is not None else scratch.attention_output
@@ -113,6 +114,8 @@ def _recording_layer(scratch, *, reseed=False):
     layer.attention_reduce = _Recorder(attended)
     layer.mlp_reduce = _Recorder()
     layer.router_projection = _Recorder(scratch.router_logits)
+    layer.router_source = (scratch.ffn_hc.normalized if shard is None else shard.ffn_hc.normalized)
+    layer.router_gather = None
     layer.router = _Recorder(SimpleNamespace(ids=torch.zeros(1, dtype=torch.int32), weights=torch.zeros(1),
                                              selected_logits=None))
     layer.experts = _Recorder(scratch.routed)

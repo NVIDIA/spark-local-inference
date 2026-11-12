@@ -30,6 +30,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         joint_tuning=plan.joint_tuning, row_shard_prefill=plan.row_shard_prefill,
+        row_shard_attention=plan.row_shard_attention,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,

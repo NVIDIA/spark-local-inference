@@ -66,10 +66,11 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
     return PreparedDraft(*args, vocabulary_runtime=runtime, **kwargs)
 
 
-def _forward_factories(mla_compute_mode, *, vision,
+def _forward_factories(mla_compute_mode, *, vision, row_shard_attention=False,
                        draft_vocabulary_runtime=None, examples=None):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples,
+                    row_shard_attention=row_shard_attention),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
@@ -104,6 +105,9 @@ class PreparationConfig:
     # Prefill reductions keep each rank's contiguous row shard and gather the branch input that
     # every row's consumers read.
     row_shard_prefill: bool = False
+    # Row-sharded prefill also runs attention on the shard, with every head and output group
+    # replicated on every rank.
+    row_shard_attention: bool = False
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
@@ -349,7 +353,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    row_shard_attention=config.row_shard_attention)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -418,9 +423,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             candidate_tokens = min(candidate_tokens, 128)
         row_shard = shard if config.row_shard_prefill else None
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=candidate_tokens, row_shard=row_shard)
+            candidate_tokens=candidate_tokens, row_shard=row_shard,
+            attention_shard=config.row_shard_attention)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=config.prefill_chunk_size, row_shard=row_shard)
+            candidate_tokens=config.prefill_chunk_size, row_shard=row_shard,
+            attention_shard=config.row_shard_attention)
             if config.prompt_logprobs else None)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
         vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
@@ -436,7 +443,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
-            vision=vision_state,
+            vision=vision_state, row_shard_attention=config.row_shard_attention,
             draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
@@ -514,6 +521,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     if (config.row_shard_prefill and mode == "prefill" and decoder.row_shard is None
                             and progress is not None):
                         progress(f"{name}: row-sharded prefill falls back to full-row prefill for this capacity")
+                    elif (config.row_shard_attention and mode == "prefill" and not decoder.attention_shard
+                          and progress is not None):
+                        progress(f"{name}: row-sharded attention falls back to full-row attention;"
+                                 " the replicated attention weights stay resident")
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
                         context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
