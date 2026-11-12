@@ -1,0 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Inkling 2 checkpoint configuration and tensor-parallel weight placement."""
