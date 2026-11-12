@@ -53,6 +53,56 @@ def test_preparation_pages_and_tuning_identity_follow_dcp_size():
         PreparationConfig(context_parallel_size=4)
 
 
+@pytest.mark.parametrize("dcp_size", [None, 8, 16])
+def test_rebuild_manifest_preserves_context_group_size(monkeypatch, dcp_size):
+    from google.protobuf.json_format import ParseDict
+    from ignition.preparation import runtime_core_pb2 as proto
+    from ignition.preparation.rebuild_manifest import from_plan
+    from ignition.preparation import source_identity
+
+    monkeypatch.setattr(source_identity, "source_identity", lambda: "test-source-identity")
+    plan = planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(_gpu(index) for index in range(16)),
+        concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=dcp_size)
+    manifest = ParseDict(from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True),
+                         proto.RebuildManifest())
+    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
+    assert restored.context_parallel_size == (dcp_size or plan.world_size)
+    assert proto.RebuildManifest().context_parallel_size == 0
+
+
+@pytest.mark.parametrize("dcp_size", [8, 16])
+def test_benchmark_configuration_records_context_group_size(monkeypatch, tmp_path, dcp_size):
+    from tokenizers import Tokenizer, models
+    from ignition.bench import runner
+    from ignition.cli import bench
+    from ignition.preparation import core_storage, tuning_replicas
+
+    class Resource(SimpleNamespace):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    plan = planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(_gpu(index) for index in range(16)),
+        concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=dcp_size)
+    tokenizer = Tokenizer(models.WordLevel())
+    prepared = Resource(memory_report={"rank": 0, "tuning": {"selections": []}},
+        server_config={"assets": {"tokenizer": {"text": tokenizer.to_str()}}})
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(core_storage, "CoreStorage", lambda **kwargs: Resource(host_regions=[]))
+    monkeypatch.setattr(tuning_replicas, "prepare_recipe", lambda *args, **kwargs: prepared)
+    monkeypatch.setattr(runner, "run_benchmark", lambda *args, **kwargs: {"status": "complete", "cases": []})
+    model = SimpleNamespace(model_id="kimi-k3.1-pro", checkpoint=plan.checkpoint, recipe=RECIPE,
+                            snapshot=lambda directory: tmp_path)
+    configuration = SimpleNamespace(directory=lambda name: tmp_path)
+    settings = bench.Settings(batches=(1,), contexts=(0,), width=8, warmup=1, repetitions=1,
+                              seeds=(0,), prefill=True)
+    result = bench._measure(model, plan, configuration, settings, None, compile_forwards=True)
+    assert result["configuration"]["preparation"]["context_parallel_size"] == dcp_size
+
+
 def test_dcp8_reduction_capacity_covers_packed_selected_ids_not_hidden_activations():
     config = PreparationConfig(context_parallel_size=8, draft_checkpoint=Path("draft"),
         speculative_token_capacity=32, speculative_graph_budget=16)
@@ -77,7 +127,7 @@ def test_peer_regions_use_group_local_addresses(monkeypatch):
     peer = object.__new__(PeerStorage)
     peer.storage = SimpleNamespace(rank=8, world=16)
     peer.dynamic, peer.owned = {}, {}
-    peer.cudaIpcGetMemHandleBytes = lambda address: b"region"
+    peer.cudaIpcGetMemHandleBytes = lambda address, **kwargs: b"region"
     opened = []
     peer.cudaIpcOpenMemHandleBytes = lambda payload: opened.append(payload) or 999
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: list(range(8, 16)))

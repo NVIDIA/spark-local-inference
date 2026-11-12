@@ -206,7 +206,7 @@ class PreparedOrderedRowTopK:
             torch.library.wrap_triton(_radix_cutoff_counts)[(self.rows,)](
                 scores, indices, lengths, cutoffs, greater, ties, output_scores, output,
                 WIDTH=self.width, K=self.topk, TILES=self.tiles, BLOCK=_TILE,
-                ROW_BLOCK=triton.next_power_of_2(self.width), BITS=8, num_warps=16)
+                ROW_BLOCK=max(_TILE, triton.next_power_of_2(self.width)), BITS=8, num_warps=16)
         else:
             self.selection(scores, lengths, indices, output_scores, output)
             torch.library.wrap_triton(_cutoff)[(self.rows,)](

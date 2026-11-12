@@ -116,6 +116,8 @@ message RebuildManifest {
   bool force_moe_decode_a16 = 27;
   // Preparation-only online conversion group; omitted means all eligible projections.
   string online_mxfp8_scope = 30;
+  // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
+  uint32 context_parallel_size = 31;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

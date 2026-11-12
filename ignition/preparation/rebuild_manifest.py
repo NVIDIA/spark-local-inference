@@ -219,6 +219,7 @@ def from_plan(model, plan, *, compiled_forwards):
         local_checkpoint=model.directory is not None, tensor_parallel=plan.world_size,
         max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
         image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
+        context_parallel_size=(plan.context_parallel_size or plan.world_size) if plan.context_parallel else 0,
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, online_mxfp8_scope=plan.online_mxfp8_scope, language_model_only=plan.language_model_only,

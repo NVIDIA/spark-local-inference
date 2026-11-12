@@ -236,7 +236,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "verification_prefixes": settings.verification_prefixes, "logical_verification_width": settings.width,
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
-            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
+            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel", "context_parallel_size",
             "native_dense_activations", "force_moe_decode_a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
             "online_mxfp8", "online_mxfp8_scope", "language_model_only")}}

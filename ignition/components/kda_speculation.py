@@ -69,14 +69,14 @@ def _fake_record(reads, recurrent_state, output, corrections, keys_gates, scratc
 
 @torch.library.custom_op("flare::kda_record_fused",
                          mutates_args=("output", "corrections", "keys_gates", "convolution_state"))
-def _record_fused(reads: list[torch.Tensor], output: torch.Tensor, corrections: torch.Tensor,
+def _record_fused(reads: list[torch.Tensor], recurrent_state: torch.Tensor, output: torch.Tensor, corrections: torch.Tensor,
                   keys_gates: torch.Tensor, convolution_state: torch.Tensor, handle: int) -> None:
     """Run short convolution, recovery verification and output norm in one launch."""
-    _OWNERS[handle].run_fused(reads, output, corrections, keys_gates, convolution_state)
+    _OWNERS[handle].run_fused(reads, recurrent_state, output, corrections, keys_gates, convolution_state)
 
 
 @_record_fused.register_fake
-def _fake_record_fused(reads, output, corrections, keys_gates, convolution_state, handle):
+def _fake_record_fused(reads, recurrent_state, output, corrections, keys_gates, convolution_state, handle):
     pass
 
 

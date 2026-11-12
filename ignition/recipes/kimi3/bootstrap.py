@@ -337,6 +337,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
             ipc=core_storage.peer_storage) if shard.world_size > 1 else None)
         dcp_group, dcp_rank, dcp_reduction, dcp_groups = group, rank, collective, ()
+        dcp_ipc = core_storage.peer_storage
         if config.context_parallel and config.context_parallel_size < shard.world_size:
             # Every rank creates both contiguous groups in the same order. Each DCP8 group covers the
             # whole context for its own TP16 head partition; the other group owns the remaining heads.
@@ -347,10 +348,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 coordinator.register_group(tuple(range(start, start + size)), subgroup)
             dcp_group = dcp_groups[rank // size]
             dcp_rank = rank % size
+            dcp_ipc = core_storage.peer_storage.for_group(dcp_group)
             # Full hidden activations use the TP16 runtime above. Hybrid DCP reductions carry only
             # staged 1x8 signals and selected-ID bytes expanded to BF16, so avoid another hidden-sized channel.
             dcp_reduction = create_all_reduce_runtime(dcp_group, device, collective_tuning=config.collective_tuning,
-                max_tokens=1, hidden_size=config.dcp_reduction_elements, ipc=core_storage.peer_storage)
+                max_tokens=1, hidden_size=config.dcp_reduction_elements, ipc=dcp_ipc)
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
@@ -362,35 +364,35 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 extra["attention_constants"] = AttentionConstants.allocate(device, query_capacity=config.decode_tokens)
                 extra["candidates"] = create_head_exchange(dcp_group, device,
                     max_rows=max(min(config.prefill_chunk_size, 128), config.decode_tokens),
-                    heads=config.context_parallel_size, head_dim=8192, ipc=core_storage.peer_storage)
+                    heads=config.context_parallel_size, head_dim=8192, ipc=dcp_ipc)
                 if (drafting and config.compile_decoder and config.autotune_effort != "off"
                         and config.collective_tuning == "static"):
                     from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
 
                     extra["candidate_owners"] = PCIeDCPTopKOwnerExchange.from_exchange_group(
                         exchange_group=dcp_group, device=device, max_rows=config.draft_tokens + 1,
-                        topk=2048, stream_affine=False, ipc=core_storage.peer_storage)
+                        topk=2048, stream_affine=False, ipc=dcp_ipc)
             # Each DCP group gathers the TP16 head partition owned by that group and combines its partial outputs.
             heads = weights.config.text["num_attention_heads"]
             context = ContextParallel(ContextShards.on(dcp_rank, config.context_parallel_size, device),
                 heads=create_head_exchange(dcp_group, device, max_rows=max(config.decode_tokens, slots * config.draft_tokens),
                                            heads=heads * config.context_parallel_size // shard.world_size,
-                                           head_dim=512, query_head_dim=RECORD_BYTES, ipc=core_storage.peer_storage),
+                                           head_dim=512, query_head_dim=RECORD_BYTES, ipc=dcp_ipc),
                 coordinator=coordinator, peers=pool.share_pages(core_storage, dcp_group), slab=None, **extra)
             if weights.config.dsa is not None and config.prefill_chunk_size >= 4096:
                 from ignition.components.shared_pages import SharedPages
 
                 staging = SharedPages(dcp_group, device, config.context // config.context_parallel_size * RECORD_BYTES,
-                                      ipc=core_storage.peer_storage)
+                                      ipc=dcp_ipc)
                 index_staging = SharedPages(dcp_group, device, config.context // config.context_parallel_size * 132,
-                                            ipc=core_storage.peer_storage)
+                                            ipc=dcp_ipc)
                 context = replace(context, staging=staging, stage_runtime=dcp_reduction,
                     stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
                     index_staging=index_staging,
                     index_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4)),
                     selections=create_head_exchange(dcp_group, device,
                         max_rows=-(-config.prefill_chunk_size // config.context_parallel_size),
-                        heads=config.context_parallel_size, head_dim=4096, ipc=core_storage.peer_storage))
+                        heads=config.context_parallel_size, head_dim=4096, ipc=dcp_ipc))
             if getattr(context, "candidate_owners", None) is not None:
                 from ignition.recipes.kimi31.selection_tuning import CandidateSelectionTuning
 

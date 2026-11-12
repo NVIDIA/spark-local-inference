@@ -4,6 +4,7 @@
 """Symmetric VMM mappings for b12x collectives during rank preparation."""
 
 import ctypes as C
+from copy import copy
 import os
 import pickle
 
@@ -30,6 +31,7 @@ class PeerStorage(CudaRTLibrary):
     def __init__(self, storage):
         super().__init__()
         self.storage = storage
+        self._export_ranks = tuple(range(storage.world))
         self.owned = {}
         self.imported = {}
         self.imported_mappings = {}
@@ -51,10 +53,23 @@ class PeerStorage(CudaRTLibrary):
             raise self.storage.error
         del self.owned[pointer]
 
-    def cudaIpcGetMemHandleBytes(self, pointer):
+    def for_group(self, group):
+        """Share allocation ownership while exporting descriptors only to group members."""
+        import torch.distributed as dist
+
+        ranks = tuple(dist.get_process_group_ranks(group))
+        if (not ranks or self.storage.rank not in ranks or len(set(ranks)) != len(ranks)
+                or any(rank < 0 or rank >= self.storage.world for rank in ranks)):
+            raise ValueError("peer storage group must contain the local rank and valid global ranks")
+        scoped = copy(self)
+        scoped._export_ranks = ranks
+        return scoped
+
+    def cudaIpcGetMemHandleBytes(self, pointer, *, ranks=None):
         if DupFd is None:
             raise RuntimeError("peer storage requires POSIX descriptor passing")
         cuda = self.storage.cuda
+        ranks = self._export_ranks if ranks is None else tuple(ranks)
         region = self.dynamic.get(pointer)
         mappings = [(pointer, self.owned[pointer])] if region is None else region.mappings
         parts = []
@@ -67,7 +82,7 @@ class PeerStorage(CudaRTLibrary):
             finally:
                 cuda.call("cuMemRelease", physical)
             try:
-                descriptors = [None if rank == self.storage.rank else DupFd(descriptor.value)
+                descriptors = [None if rank == self.storage.rank or rank not in ranks else DupFd(descriptor.value)
                                for rank in range(self.storage.world)]
                 parts.append((address, size, descriptors))
             finally:
@@ -112,12 +127,12 @@ class PeerStorage(CudaRTLibrary):
         """Map every rank's backed cache prefixes, retaining their full virtual extents for export."""
         import torch.distributed as dist
 
+        global_ranks = dist.get_process_group_ranks(group)
         payloads = []
         for region in regions:
             self.dynamic[region.address] = region
             self.owned[region.address] = region.extent
-            payloads.append(self.cudaIpcGetMemHandleBytes(region.address))
-        global_ranks = dist.get_process_group_ranks(group)
+            payloads.append(self.cudaIpcGetMemHandleBytes(region.address, ranks=global_ranks))
         gathered = [None] * len(global_ranks)
         dist.all_gather_object(gathered, payloads, group=group)
         addresses = [[region.address] * len(global_ranks) for region in regions]

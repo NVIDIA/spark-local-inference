@@ -256,6 +256,38 @@ def test_underfull_widths_do_not_require_a_full_selection_budget(topk):
     validate_ordered_topk(*metadata_inputs(width=17, topk=topk))
 
 
+@pytest.mark.parametrize('width', [1, 64, 511, 512, 513])
+def test_radix_launch_has_complete_count_tiles_for_underfull_widths(monkeypatch, width):
+    from ignition.components import ordered_row_topk as component
+
+    operands = metadata_inputs(width=width, topk=512)
+    operation = object.__new__(component.PreparedOrderedRowTopK)
+    operation.rows, operation.width, operation.topk = 3, width, 512
+    operation.radix, operation.tiles = True, operands[6].shape[1]
+    (operation.scores, operation.lengths, operation.indices, operation.output_scores,
+     operation.output, operation.cutoffs, operation.greater, operation.ties) = operands
+    launches = []
+
+    class Launch:
+        def __init__(self, kernel):
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            return lambda *args, **metadata: launches.append((self.kernel, grid, args, metadata))
+
+    monkeypatch.setattr(torch.library, 'wrap_triton', Launch)
+    operation()
+    radix, emit = launches
+    assert radix[0] is component._radix_cutoff_counts
+    assert emit[0] is component._emit
+    metadata = radix[3]
+    assert metadata['ROW_BLOCK'] >= max(512, width)
+    assert metadata['BLOCK'] == 512
+    assert metadata['ROW_BLOCK'] % metadata['BLOCK'] == 0
+    assert metadata['ROW_BLOCK'] // metadata['BLOCK'] >= metadata['TILES']
+    assert operands[6].shape == operands[7].shape == (3, metadata['TILES'])
+
+
 def test_fake_tensor_alias_validation_uses_storage_identity():
     from torch._subclasses.fake_tensor import FakeTensorMode
     from ignition.components.ordered_row_topk import validate_ordered_topk

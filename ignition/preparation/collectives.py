@@ -236,20 +236,27 @@ class CollectivePreparation:
 
     def _remember_operation_ranks(self, states):
         """Record each operation's control group for final per-group selection checks."""
+        local_rank = self._global_rank()
+
+        def remember(key, ranks):
+            ranks = tuple(ranks)
+            if local_rank in ranks:
+                self.operation_ranks[key] = ranks
+
         for state in states:
             if type(state[0]) is bool:
                 for key, ranks in state[1]:
-                    self.operation_ranks[key] = tuple(ranks)
+                    remember(key, ranks)
                 if state[5] is not None and getattr(state[5], "key", None) is not None:
-                    self.operation_ranks[state[5].key] = tuple(state[5].ranks)
+                    remember(state[5].key, state[5].ranks)
                 for contribution in state[4]:
                     if getattr(contribution, "key", None) is not None and getattr(contribution, "ranks", None) is not None:
-                        self.operation_ranks[contribution.key] = tuple(contribution.ranks)
+                        remember(contribution.key, contribution.ranks)
             else:
                 for key, ranks in state[0]:
-                    self.operation_ranks[key] = tuple(ranks)
+                    remember(key, ranks)
                 if state[1] is not None and getattr(state[1], "key", None) is not None:
-                    self.operation_ranks[state[1].key] = tuple(state[1].ranks)
+                    remember(state[1].key, state[1].ranks)
 
     def _members(self, states, ranks):
         """Select only the local operation's control group from a TP-wide progress exchange."""
