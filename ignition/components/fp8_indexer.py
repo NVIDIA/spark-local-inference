@@ -91,7 +91,8 @@ class PreparedFP8Indexer:
         declare(session, (self.query_plan.request(name=name + ".query",
             prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*query_arguments))),))
         self.pages = pages
-        self.packed_pages = pages if mode == "prefill" else zeros("packed_pages", pages.shape, torch.int32)
+        self.packed_pages = (pages if mode == "prefill" or (pages.is_contiguous() and pages.dtype == torch.int32)
+                             else zeros("packed_pages", pages.shape, torch.int32))
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
             max_page_table_width=pages.shape[1], topk=topk, mode=mode,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)

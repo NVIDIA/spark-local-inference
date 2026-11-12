@@ -164,20 +164,23 @@ class PreparedDSA(PreparedMLAProjection):
             if self.history is not None:
                 part["gather"].peers = None
 
-    def __call__(self, source, metadata=None):
-        return self._run(source, metadata).output
+    def __call__(self, source, metadata=None, *, shared_index=None):
+        return self._run(source, metadata, shared_index=shared_index).output
 
-    def _run(self, source, metadata):
+    def _run(self, source, metadata, *, shared_index=None):
         if metadata is None:
             raise ValueError("sparse MLA execution requires invocation metadata")
         projected = self.project(source, metadata)
-        slots = self.shards.token_slots(metadata.positions, metadata.token_page_table)
+        slots = (self.shards.token_slots(metadata.positions, metadata.token_page_table)
+                 if shared_index is None else shared_index.slots)
         write_records(projected.latent, slots, self.cache.view(-1, RECORD_BYTES))
         pending = None
         if self.query_overlap is not None:
             quantized = projected.absorbed.float().clamp(-448., 448.).to(FP8)
             pending = self.query_overlap.start(quantized.view(source.shape[0], -1), dependencies=(self.cache,))
-        query, weights = self.indexer.project(source, projected.query_norm, metadata)
+        query, weights = (self.indexer.project(source, projected.query_norm, metadata)
+                          if shared_index is None else
+                          self.indexer.project(source, projected.query_norm, metadata, slots=slots))
         selected_all = None if self.indexer.sharded is None else self.indexer.sharded(query, weights, metadata)
         history = None
         if self.history is not None:
@@ -195,7 +198,10 @@ class PreparedDSA(PreparedMLAProjection):
                 selected = selected_all[start:end]
             else:
                 selector = part["selector"]
-                index = selector.prepare_local_result(query[start:end], weights[start:end], positions, tables)
+                index = (selector.prepare_local_result(query[start:end], weights[start:end], positions, tables)
+                         if shared_index is None else
+                         selector.prepare_local_result(query[start:end], weights[start:end], positions, tables,
+                                                       shared_index=shared_index))
                 packed = index[0]
                 if pending is not None:
                     gathered = self.query_overlap.finish(pending, packed)

@@ -277,6 +277,11 @@ class PreparedDecoder:
         config, source = weights.config, scratch.activations
         tokens, hidden = source.shape
         self.tokens, self.hidden = tokens, hidden
+        self.shared_index_type, self.index_shards = None, None
+        if mode in ("decode", "verify") and context is not None and "dsa" in config.layers:
+            from ignition.recipes.kimi31.indexer import SharedIndexMetadata
+
+            self.shared_index_type, self.index_shards = SharedIndexMetadata, context.shards
         self.sequences = metadata.starts.numel()
         self.verification_columns = 8 if mode == "verify" else 1
         examples = {} if examples is None else examples
@@ -362,6 +367,8 @@ class PreparedDecoder:
         d.final_state_indices.copy_(m.state_rows)
         d.num_tokens.copy_(m.live_counts[:1])
         d.num_seqs.copy_(m.live_counts[1:])
+        shared_index = (None if self.shared_index_type is None else
+                        self.shared_index_type.create(m, self.index_shards, self.tokens))
         records = None
         if self.replay is not None:
             records = KDARecords(self.record_layers,
@@ -390,6 +397,8 @@ class PreparedDecoder:
                 captured.copy_(residual.prefix)
             if self.weights.config.layers[index] == "kda":
                 attended = attention(hidden, d, records=None if records is None else records.layer(index))
+            elif self.weights.config.layers[index] == "dsa":
+                attended = attention(hidden, m, shared_index=shared_index)
             else:
                 attended = attention(hidden, m)
             attended = reduce(attended)
