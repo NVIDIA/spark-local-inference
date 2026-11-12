@@ -20,7 +20,10 @@ use crate::runtime_core::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
 /// The proxy ABI compiled into this runtime; cores record the one their kernels use.
-pub const PROXY_ABI: u32 = 11;
+pub const PROXY_ABI: u32 = 14;
+/// Reliable queue pairs per rail: FlashInfer's default (`DEFAULT_LANES`), which its Python transport
+/// uses unless `B12X_ROCE_LANES` is set. Cores record no lane count; every rank must use the same.
+const PROXY_LANES: c_int = 4;
 /// Control word 7 after a variable-length all-gather met a byte count it cannot send.
 const INVALID_VARLEN_COUNT: u32 = 1;
 
@@ -46,6 +49,7 @@ unsafe extern "C" {
         n_hca: c_int,
         gid_index: c_int,
         traffic_class: c_int,
+        n_lane: c_int,
         region: *mut c_void,
         region_bytes: u64,
         slot_bytes: u64,
@@ -75,9 +79,8 @@ fn failure(message: impl Into<String>) -> crate::Error {
 }
 
 fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
-    // ABI 10 changes startup-owned ring mailboxes and ABI 11 adds op kinds, not the captured
-    // kernel region.
-    // Older cores can use the new proxy, but all live peers must use its wire layout.
+    // Records carry this runtime's proxy ABI; all live peers must use its wire layout, which
+    // includes the queue-pair lane count.
     let size = unsafe { roce_blob_bytes() } as usize;
     if records.len() != world
         || records
@@ -119,10 +122,12 @@ impl RoceTransport {
     /// before `connect` returns.
     pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
-        // ABI 9, 10 and 11 have identical kernel-visible layouts. ABI 10's wider CPU ring
-        // window is allocated by this runtime at startup. ABI 11 adds the reduce-scatter and
-        // shard-gather op kinds, which cores recording ABI 9 or 10 never post.
-        if !matches!(spec.proxy_abi, 9 | 10 | 11) || abi != PROXY_ABI {
+        // ABI 9, 10, 11 and 14 have identical kernel-visible layouts: the same `roce_layout` and
+        // control words. ABI 10's wider CPU ring window is allocated by this runtime at startup.
+        // ABI 11 adds the reduce-scatter and shard-gather op kinds, which cores recording ABI 9 or
+        // 10 never post. ABI 14's queue-pair lanes and start-of-op credits live between the
+        // proxies. ABI 12 and 13 cores are not accepted.
+        if !matches!(spec.proxy_abi, 9 | 10 | 11 | 14) || abi != PROXY_ABI {
             return Err(failure(format!(
                 "core RoCE kernels use proxy ABI {}, this runtime provides {abi}",
                 spec.proxy_abi
@@ -191,6 +196,7 @@ impl RoceTransport {
                 pointers.len() as c_int,
                 topology.gid_index as c_int,
                 topology.traffic_class as c_int,
+                PROXY_LANES,
                 region,
                 spec.region_bytes,
                 spec.slot_bytes,
@@ -392,7 +398,7 @@ mod tests {
     #[test]
     fn compatible_core_abis_still_validate_the_captured_region() {
         let (region, spec, topology) = specification();
-        for abi in [8, 9, 10, 11, 12] {
+        for abi in [9, 10, 11, 12, 13, 14, 15] {
             let mut spec = spec.clone();
             spec.proxy_abi = abi;
             spec.ctrl_offset += 128;
@@ -402,7 +408,7 @@ mod tests {
                 .expect("invalid layout must fail")
                 .to_string();
             assert!(
-                error.contains(if matches!(abi, 9 | 10 | 11) {
+                error.contains(if matches!(abi, 9 | 10 | 11 | 14) {
                     "region differs"
                 } else {
                     "proxy ABI"
