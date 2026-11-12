@@ -80,8 +80,7 @@ def _workspace_bytes(plan):
             if p.policy.split_k_slices > 1 and not p.policy.split_k_atomic_bf16 else 0)
 
 
-def _project(source, values, scales, handle, *, workspace_nbytes=None):
-    plan = plan_from_handle(handle)
+def _project(source, values, scales, plan, *, workspace_nbytes=None):
     from .block_fp8_sm103 import COMPONENT
 
     quantized = torch.empty_like(source, dtype=torch.float8_e4m3fn)
@@ -93,7 +92,7 @@ def _project(source, values, scales, handle, *, workspace_nbytes=None):
     output = torch.empty((source.shape[0], values.shape[0]), dtype=torch.bfloat16, device=source.device)
     nbytes = _workspace_bytes(plan) if workspace_nbytes is None else workspace_nbytes
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=source.device)
-    _project_out(quantized, activation_scales, values, scales, output, workspace, handle)
+    _project_out(quantized, activation_scales, values, scales, output, workspace, plan.handle)
     return output
 
 
@@ -159,7 +158,7 @@ class BlockFP8Projection:
         return self
 
     def __call__(self, source):
-        result = _project(source, self.weight.values, self.weight.scales, self.plan.handle,
+        result = _project(source, self.weight.values, self.weight.scales, self.plan,
                           workspace_nbytes=self.workspace_nbytes)
         if self.output is None and self.output_layout is not None:
             shape, stride, dtype = self.output_layout
