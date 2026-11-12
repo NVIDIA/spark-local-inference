@@ -1440,11 +1440,13 @@ Extra captures use a request-local work allowance. Its prefill component is
 `scheduler_checkpoint_extra_work_fraction` times the estimated uncached prefill
 work, with a default fraction of 0.05. An extra endpoint charges the additional
 predicted prefill time caused by splitting its enclosing interval, plus its
-snapshot-copy time. Unknown or stale costs exclude extras without excluding the
-anchor. Productive completed decode earns the same fraction of measured decode
-time for a distinct terminal endpoint. A coincident prompt and terminal endpoint
-uses one capture. Mandatory conditioned-input state transfers do not consume this
-allowance. Preemption preserves the logical request's earned and spent allowance.
+snapshot-copy time. Prefill estimates retain measured costs after expiry, as
+ordinary dispatch does. Unknown prefill costs or unknown or stale snapshot-copy
+costs exclude extras without excluding the anchor. Productive completed decode
+earns the same fraction of measured decode time for a distinct terminal
+endpoint. A coincident prompt and terminal endpoint uses one capture. Mandatory
+conditioned-input state transfers do not consume this allowance. Preemption
+preserves the logical request's earned and spent allowance.
 
 Snapshot rows come from the global allocator, which accounts for their physical
 KV-page aliases. Selection checks a conservative feasible set of rows for the
