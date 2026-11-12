@@ -237,6 +237,52 @@ def test_row_shard_prefill_requires_deepseek_tp_and_survives_rebuild_serializati
                       row_shard_prefill=True)
 
 
+def test_row_shard_attention_requires_row_shard_prefill_and_survives_rebuild_serialization(monkeypatch):
+    """Both row-shard options travel through `plan` and `fit` beside an explicit MXFP8 scope."""
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    model = replace(SOLO, name="deepseek41")
+    gpus = (gpu(0, 95), gpu(1, 95))
+    settings = dict(selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                    online_mxfp8_scope="all", row_shard_prefill=True)
+    sharded = planning.plan(model, model.checkpoints[0], gpus, **settings)
+    attention = planning.plan(model, model.checkpoints[0], gpus, row_shard_attention=True, **settings)
+    assert not sharded.row_shard_attention
+    assert attention.row_shard_attention and attention.row_shard_prefill
+    assert attention.online_mxfp8_scope == "all"
+    assert attention.to_dict()["row_shard_attention"] is True
+    # Turning the flag off restores change 1's plan exactly.
+    assert replace(attention, row_shard_attention=False) == sharded
+    fitted = planning.fit(model, model.checkpoints[0], gpus, concurrency=4, reserve_bytes=0,
+                          speculation=DRAFTING, online_mxfp8_scope="all",
+                          row_shard_prefill=True, row_shard_attention=True)
+    assert fitted.row_shard_attention and fitted.row_shard_prefill
+    assert fitted.online_mxfp8_scope == "all"
+    for plan in (sharded, attention, fitted):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).row_shard_attention \
+            == plan.row_shard_attention
+    # Attention cannot join a shard that prefill never asked for.
+    with pytest.raises(UsageError, match="row-shard-prefill"):
+        planning.plan(model, model.checkpoints[0], gpus, row_shard_attention=True,
+                      **{name: value for name, value in settings.items() if name != "row_shard_prefill"})
+    # Attention shares the shard's refusal: three ranks size 72 heads against 64 replicated rows,
+    # and no SM103 export or serve has run with either flag.
+    three = recipe("deepseek41", 60, (3, 4), speculation=DRAFTING)
+    with pytest.raises(UsageError, match="TP3"):
+        planning.plan(three, three.checkpoints[0], (gpu(0, 95), gpu(1, 95), gpu(2, 95)),
+                      selected=(0, 1, 2), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True, row_shard_attention=True)
+    with pytest.raises(UsageError, match="SM103"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95, (10, 3)), gpu(1, 95, (10, 3))),
+                      selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True, row_shard_attention=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)

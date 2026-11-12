@@ -208,7 +208,7 @@ def _export_hosts(args):
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
-                   row_shard_prefill=args.row_shard_prefill)
+                   row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -276,7 +276,7 @@ def _prepare(args):
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
-                      row_shard_prefill=args.row_shard_prefill,
+                      row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -472,7 +472,7 @@ def debug_serve(args) -> int:
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
-                   row_shard_prefill=args.row_shard_prefill)
+                   row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
