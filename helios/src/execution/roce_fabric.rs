@@ -21,9 +21,10 @@
 //! two or more ranks joins all of them; otherwise per-peer pairing prefers the narrowest subnets,
 //! so a cabled partner is reached over its cable. IPv4 link-local subnets (169.254.0.0/16) count as
 //! world-wide, because hosts using link-local addressing share that subnet whether or not their
-//! ports are cabled together. Rails are ordered by breadth and then link address so both ends agree.
-//! Every rank plans over every rank's endpoints, including in ring and chain mode, so both ends of
-//! each link see the same breadths and choose the same devices.
+//! ports are cabled together; per-peer pairing uses a link-local pair only between LLDP neighbors.
+//! Rails are ordered by breadth and then link address so both ends agree. Every rank plans over every
+//! rank's endpoints, including in ring and chain mode, so both ends of each link see the same
+//! breadths and choose the same devices.
 //!
 //! Each endpoint also records its PCIe link (PCI domain:bus:device): a Spark's ConnectX-7 exposes
 //! each port as two functions, one behind each of its two PCIe x4 links, and the functions behind
@@ -239,7 +240,8 @@ pub enum Links {
     All,
     /// Only subnets every rank holds, between devices that are not LLDP neighbors, as if the fabric
     /// were a switch alone: direct cables carry no rails. With two ranks every subnet joins both,
-    /// so only LLDP identifies a cable.
+    /// so only LLDP identifies a cable. A device without a known subnet outside link-local space
+    /// carries no rails, since nothing shows that its link joins every rank.
     Shared,
 }
 
@@ -570,8 +572,14 @@ fn any_lldp_adjacency(endpoints: &[Vec<Endpoint>]) -> bool {
     })
 }
 
-/// Per IPv4 network, the number of ranks holding an address on it. A link-local network
-/// (169.254.0.0/16) counts as held by every rank, since sharing it does not imply a cable.
+/// Whether `network` lies in IPv4 link-local space (169.254.0.0/16). Hosts using link-local
+/// addressing share that subnet whether or not their ports are linked.
+fn link_local((address, prefix): (u32, u8)) -> bool {
+    prefix >= 16 && address & 0xffff_0000 == 0xa9fe_0000
+}
+
+/// Per IPv4 network, the number of ranks holding an address on it. A link-local network counts
+/// as held by every rank, since sharing it does not imply a cable.
 fn breadths(endpoints: &[Vec<Endpoint>]) -> std::collections::BTreeMap<(u32, u8), usize> {
     let world = endpoints.len();
     let mut counts = std::collections::BTreeMap::new();
@@ -582,8 +590,8 @@ fn breadths(endpoints: &[Vec<Endpoint>]) -> std::collections::BTreeMap<(u32, u8)
             *counts.entry(network).or_insert(0) += 1;
         }
     }
-    for ((address, prefix), count) in counts.iter_mut() {
-        if *prefix >= 16 && address & 0xffff_0000 == 0xa9fe_0000 {
+    for (network, count) in counts.iter_mut() {
+        if link_local(*network) {
             *count = world;
         }
     }
@@ -604,7 +612,8 @@ fn shared_links<'a>(devices: impl IntoIterator<Item = &'a Endpoint>) -> usize {
 /// rail devices share a PCIe link, no devices of two ranks are LLDP neighbors (a cable that
 /// per-peer pairing prefers or, with `Links::Shared`, avoids), and, when `links` admits direct
 /// cables, no subnet links some ranks but not all of them (a direct cable that per-peer pairing
-/// prefers).
+/// prefers). With `Links::Shared`, every rail device must also have a known address outside
+/// link-local space, so that each rail verifiably rides a subnet every rank holds.
 fn index_pairing_valid(
     endpoints: &[Vec<Endpoint>],
     rails: usize,
@@ -628,6 +637,15 @@ fn index_pairing_valid(
     if endpoints
         .iter()
         .any(|devices| shared_links(&devices[..rails]) != 0)
+    {
+        return false;
+    }
+    if links == Links::Shared
+        && endpoints.iter().any(|devices| {
+            devices[..rails]
+                .iter()
+                .any(|d| d.network().is_none_or(link_local))
+        })
     {
         return false;
     }
@@ -740,9 +758,9 @@ impl<'a> Planner<'a> {
         let (local, remote) = (&self.endpoints[rank], &self.endpoints[peer]);
         let world = self.endpoints.len();
         // Verified same-subnet links keyed by LLDP adjacency and subnet breadth (a cable precedes a
-        // switch), network and the link's two addresses, and same-index pairs without an IPv4 GID
-        // at either end, trusted in device order. Keys are symmetric. Links::Shared admits only
-        // subnets every rank holds between devices that are not LLDP neighbors.
+        // switch), network and the link's two addresses. Keys are symmetric. A link-local pair is
+        // a link only when its devices are LLDP neighbors. Links::Shared admits only subnets every
+        // rank holds between devices that are not LLDP neighbors.
         let mut candidates: Vec<(Key, u32, u32)> = Vec::new();
         for (l, x) in local.iter().enumerate() {
             for (r, y) in remote.iter().enumerate() {
@@ -752,6 +770,9 @@ impl<'a> Planner<'a> {
                 let network = x.network().unwrap();
                 let breadth = self.breadths[&network];
                 let adjacent = lldp_adjacent(x, y);
+                if link_local(network) && !adjacent {
+                    continue;
+                }
                 if self.links == Links::Shared && (breadth < world || adjacent) {
                     continue;
                 }
@@ -773,9 +794,13 @@ impl<'a> Planner<'a> {
                 ));
             }
         }
-        for h in 0..local.len().min(remote.len()) {
-            if local[h].ipv4.is_none() || remote[h].ipv4.is_none() {
-                candidates.push(((1, 1, 0, h as u64, 0, 0), h as u32, h as u32));
+        // Same-index pairs without an IPv4 GID at either end are trusted in device order. Their
+        // subnet is unknown, so Links::Shared cannot admit them.
+        if self.links == Links::All {
+            for h in 0..local.len().min(remote.len()) {
+                if local[h].ipv4.is_none() || remote[h].ipv4.is_none() {
+                    candidates.push(((1, 1, 0, h as u64, 0, 0), h as u32, h as u32));
+                }
             }
         }
         candidates.sort();
@@ -1680,5 +1705,97 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Four ranks on a switch (192.168.0.0/24 and 192.168.1.0/24, devices 0 and 1) whose device 2
+    /// holds a private cable subnet between ranks 0 and 2, which rules out index pairing, and
+    /// link-local addresses on unrelated ports of ranks 1 and 3.
+    fn switch_with_a_cable_and_link_local_ports() -> Vec<Vec<Endpoint>> {
+        let third = [
+            "10.9.0.1/24",
+            "169.254.7.1/16",
+            "10.9.0.3/24",
+            "169.254.9.4/16",
+        ];
+        (0..4)
+            .map(|rank| {
+                vec![
+                    endpoint("s0", &format!("192.168.0.{}/24", rank + 1)),
+                    endpoint("s1", &format!("192.168.1.{}/24", rank + 1)),
+                    endpoint("c", third[rank]),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn link_local_pairs_carry_rails_only_between_lldp_neighbors() {
+        let endpoints = switch_with_a_cable_and_link_local_ports();
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "unverified link-local");
+        assert_eq!(plans[1][3], vec![(0, 0), (1, 1)]);
+        assert_eq!(plans[0][2], vec![(2, 2), (0, 0)]);
+        // LLDP adjacency is positive evidence that the two link-local ports share a cable.
+        let mut adjacent = endpoints.clone();
+        adjacent[1][2].mac = Some("02:00:00:00:01:02".into());
+        adjacent[3][2].mac = Some("02:00:00:00:03:02".into());
+        adjacent[3][2].neighbors = vec!["02:00:00:00:01:02".into()];
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&adjacent, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "LLDP-adjacent link-local");
+        assert_eq!(plans[1][3], vec![(2, 2), (0, 0)]);
+        // Switch-only routing never uses either link-local pair or the private cable.
+        for rank in 0..4 {
+            for fabric in [&endpoints, &adjacent] {
+                let routes = plan_routes(fabric, rank, 2, Links::Shared).unwrap();
+                for (peer, links) in routes.iter().enumerate() {
+                    let expected = if peer == rank {
+                        vec![]
+                    } else {
+                        vec![(0, 0), (1, 1)]
+                    };
+                    assert_eq!(*links, expected, "switch-only rank {rank} to {peer}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_only_routing_rejects_links_whose_subnet_is_unknown() {
+        // Discovery leaves an address unknown when it cannot resolve the interface prefix.
+        let unaddressed = |rank: u8| Endpoint {
+            name: "a".into(),
+            mac: Some(format!("02:00:00:00:{rank:02x}:00")),
+            ..Default::default()
+        };
+        let mut cabled = vec![vec![unaddressed(0)], vec![unaddressed(1)]];
+        cabled[1][0].neighbors = vec!["02:00:00:00:00:00".into()];
+        assert_eq!(
+            plan_routes(&cabled, 0, 1, Links::All).unwrap()[1],
+            vec![(0, 0)]
+        );
+        let error = plan_routes(&cabled, 0, 1, Links::Shared)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0 of 1 RoCE rails"), "{error}");
+        // Without LLDP data the subnet is still unknown, so index pairing cannot admit it either.
+        let unknown = vec![vec![unaddressed(0)], vec![unaddressed(1)]];
+        assert!(plan_routes(&unknown, 0, 1, Links::Shared).is_err());
+        // A device with a known switch subnet still carries the rail.
+        let mixed: Vec<Vec<Endpoint>> = (0..2)
+            .map(|rank| {
+                vec![
+                    unaddressed(rank),
+                    endpoint("b", &format!("10.200.0.{}/24", rank + 11)),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            plan_routes(&mixed, 0, 1, Links::Shared).unwrap()[1],
+            vec![(1, 1)]
+        );
     }
 }
