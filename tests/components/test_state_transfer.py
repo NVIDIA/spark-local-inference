@@ -12,6 +12,36 @@ from triton.runtime.interpreter import InterpretedFunction
 from ignition.components.state_transfer import _copy_rows
 
 
+def test_shifted_draft_pages_copy_one_cache_page_per_part(monkeypatch):
+    """_copy_pages strides the cache and offsets the second saved page by one cache page."""
+    from types import SimpleNamespace
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from ignition.components.sampling import DeviceRequestState
+    from ignition.components.state import StateLayout
+    from ignition.components.state_transfer import PreparedStateTransfer, StateCommands
+
+    layout = StateLayout.from_specs([("target", (128,), torch.uint8), ("draft", (2, 128), torch.uint8),
+                                     ("consumed_tokens", (1,), torch.int64)])
+    monkeypatch.setattr("ignition.components.state_transfer._pointer_table",
+        lambda values, device: torch.empty((len(values), 2), dtype=torch.int64, device=device))
+    with FakeTensorMode():
+        device = torch.device("cuda:0")
+        consumed = torch.empty((8, 1), dtype=torch.int64, device=device)
+        pool = SimpleNamespace(layout=layout, region=lambda name: consumed,
+            backing=torch.empty((8, layout.row_bytes), dtype=torch.uint8, device=device),
+            memory_capacity=torch.empty(2, dtype=torch.int64, device=device))
+        tables = torch.zeros((4, 2), dtype=torch.int32, device=device)
+        pages = torch.empty((4, 128), dtype=torch.uint8, device=device)
+        transfer = PreparedStateTransfer(pool, StateCommands.allocate(device), tables,
+            pages=[("target", pages)], page_tokens=256,
+            state_rows=torch.zeros((4, 8), dtype=torch.int64, device=device),
+            requests=DeviceRequestState.allocate(device, vocab_size=128),
+            trailing_pages=[("draft", pages)], trailing_tables=tables)
+    assert list(transfer.trailing_pointers) == [128]
+
+
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an explicitly assigned CUDA device"))])
 def test_ordinary_state_copy_and_reset_leave_draft_regions_untouched(device):
