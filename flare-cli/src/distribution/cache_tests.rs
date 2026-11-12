@@ -39,7 +39,7 @@ fn transfer(files: &[PathBuf], specs: &[FileSpec], world: usize) -> Transfer {
         .map(|listener| listener.local_addr().unwrap().port())
         .collect();
     let topology =
-        Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); world], &ports, false).unwrap();
+        Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); world], &ports, false).unwrap();
     let relays = network
         .into_iter()
         .enumerate()
@@ -304,7 +304,7 @@ fn fixture_tps_signed(
         tensor_parallel: 2,
         expected_envelope,
         publisher,
-        topology: Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); 2], &[1, 2], false).unwrap(),
+        topology: Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); 2], &[1, 2], false).unwrap(),
         streams: 1,
         stage_only: true,
     };
@@ -793,7 +793,7 @@ fn selected_tp2_rank1_closure_excludes_other_deployments_and_ranks() {
         .iter()
         .map(|l| l.local_addr().unwrap().port())
         .collect();
-    let topology = Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); 2], &ports, false).unwrap();
+    let topology = Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); 2], &ports, false).unwrap();
     let mut listeners = network.into_iter();
     let relays = vec![
         Relay::start(
@@ -914,7 +914,7 @@ fn signed_legacy_cluster_custom_primary_distributes_a_sparse_rank_and_warms() {
         tensor_parallel: 2,
         expected_envelope: authorized.envelope_digest(),
         publisher,
-        topology: Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); 2], &[1, 2], false).unwrap(),
+        topology: Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); 2], &[1, 2], false).unwrap(),
         streams: 1,
         stage_only: true,
     };
@@ -929,7 +929,7 @@ fn signed_legacy_cluster_custom_primary_distributes_a_sparse_rank_and_warms() {
             .map(|listener| listener.local_addr().unwrap().port())
             .collect();
         let topology =
-            Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); 2], &ports, false).unwrap();
+            Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); 2], &ports, false).unwrap();
         let relays = network
             .into_iter()
             .enumerate()

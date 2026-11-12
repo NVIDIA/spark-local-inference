@@ -483,9 +483,10 @@ pub fn discover() -> Result<Fabric> {
 }
 
 /// Encode endpoints for the rendezvous exchange, one line per device: its name; `address/prefix`,
-/// or `-` without an IPv4 GID; then its PCIe link (domain:bus:device), its network device's MAC
-/// address and its comma-separated LLDP neighbor MAC addresses, each `-` when unknown, with
-/// trailing unknown fields omitted.
+/// or `-` without an IPv4 GID; its PCIe link (domain:bus:device); then its network device's MAC
+/// address and its comma-separated LLDP neighbor MAC addresses. Unknown fields are `-`, and
+/// unknown trailing fields after the PCIe link are omitted. Every line has at least three fields,
+/// so builds that read only a name and an address reject it instead of planning other rails.
 pub fn encode(endpoints: &[Endpoint]) -> Vec<u8> {
     endpoints
         .iter()
@@ -505,7 +506,7 @@ pub fn encode(endpoints: &[Endpoint]) -> Vec<u8> {
                     e.neighbors.join(",")
                 },
             ];
-            while fields.len() > 2 && fields.last().is_some_and(|f| f == "-") {
+            while fields.len() > 3 && fields.last().is_some_and(|f| f == "-") {
                 fields.pop();
             }
             format!("{}\n", fields.join(" "))
@@ -514,21 +515,32 @@ pub fn encode(endpoints: &[Endpoint]) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Decode one rank's endpoints. A line with only a name and an address comes from a build that
+/// plans rails without PCIe links or LLDP neighbors, which would choose other rails than this one,
+/// so it is rejected.
 pub fn decode(bytes: &[u8]) -> Result<Vec<Endpoint>> {
     let text = std::str::from_utf8(bytes).map_err(|_| failure("RoCE endpoints are not text"))?;
     text.lines()
         .map(|line| {
+            if line.split(' ').count() == 2 {
+                return Err(failure(
+                    "RoCE endpoint record has no PCIe link field: its rank runs a build that \
+                     plans rails from addresses alone, and every rank needs a build that records \
+                     PCIe links and LLDP neighbors",
+                ));
+            }
             let mut fields = line.split(' ');
-            let (Some(name), Some(address), link, mac, neighbors, None) = (
+            let (Some(name), Some(address), Some(link), mac, neighbors, None) = (
                 fields.next(),
                 fields.next(),
-                fields.next().filter(|f| *f != "-"),
+                fields.next(),
                 fields.next().filter(|f| *f != "-"),
                 fields.next().filter(|f| *f != "-"),
                 fields.next(),
             ) else {
                 return Err(failure("malformed RoCE endpoint"));
             };
+            let link = Some(link).filter(|f| *f != "-");
             if link.is_some_and(|link| link.matches(':').count() != 2) {
                 return Err(failure("malformed RoCE endpoint PCIe link"));
             }
@@ -1102,11 +1114,21 @@ mod tests {
             "rocep1s0f1 10.200.5.14/24 0000:01:00 4c:bb:47:2c:1e:a7 \
              4c:bb:47:7f:c3:c3,4c:bb:47:7f:c3:c7\ny - - 4c:bb:47:2c:1e:ab\n"
         );
+        // Every line carries the PCIe link field, which builds reading two fields reject; this
+        // build rejects their two-field lines in turn.
         assert_eq!(
-            decode(b"rocep1s0f0 10.200.1.11/24\n").unwrap(),
+            encode(&[endpoint("rocep1s0f0", "10.200.1.11/24")]),
+            b"rocep1s0f0 10.200.1.11/24 -\n"
+        );
+        assert_eq!(
+            decode(b"rocep1s0f0 10.200.1.11/24 -\n").unwrap(),
             vec![endpoint("rocep1s0f0", "10.200.1.11/24")]
         );
-        assert!(decode(b"rocep1s0f0 10.0.0.1/40\n").is_err());
+        let error = decode(b"rocep1s0f0 10.200.1.11/24\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no PCIe link field"), "{error}");
+        assert!(decode(b"rocep1s0f0 10.0.0.1/40 -\n").is_err());
         assert!(decode(b"rocep1s0f0 10.0.0.1/24 0000:01\n").is_err());
         assert!(decode(b"rocep1s0f0 10.0.0.1/24 0000:01:00 extra\n").is_err());
         assert!(decode(b"rocep1s0f0 10.0.0.1/24 - 4c:bb:47:2c:1e:a7 4c:bb\n").is_err());

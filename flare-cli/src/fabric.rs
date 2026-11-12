@@ -212,7 +212,7 @@ mod tests {
     fn paths_take_shortest_direction_and_clockwise_ties() {
         for world in 2..=16 {
             let records = (1..=world)
-                .map(|rank| format!("a 10.0.0.{rank}/24\n").into_bytes())
+                .map(|rank| format!("a 10.0.0.{rank}/24 -\n").into_bytes())
                 .collect::<Vec<_>>();
             let topology = Topology::plan(&records, &vec![29900; world], true).unwrap();
             for source in 0..world {
@@ -251,8 +251,8 @@ mod tests {
                 let host = 11 + rank;
                 let direct = if rank == 1 || rank == 2 { 2 } else { 4 };
                 format!(
-                    "roceP2p1s0f0 10.200.0.{host}/24\nroceP2p1s0f1 10.200.{direct}.{host}/24\n\
-                     rocep1s0f0 10.200.1.{host}/24\nrocep1s0f1 10.200.{}.{host}/24\n",
+                    "roceP2p1s0f0 10.200.0.{host}/24 -\nroceP2p1s0f1 10.200.{direct}.{host}/24 -\n\
+                     rocep1s0f0 10.200.1.{host}/24 -\nrocep1s0f1 10.200.{}.{host}/24 -\n",
                     direct + 1
                 )
                 .into_bytes()
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn switched_peers_connect_directly_and_ring_peers_relay() {
         let records = (1..=4)
-            .map(|r| format!("a 10.0.0.{r}/24\nb 10.0.1.{r}/24\n").into_bytes())
+            .map(|r| format!("a 10.0.0.{r}/24 -\nb 10.0.1.{r}/24 -\n").into_bytes())
             .collect::<Vec<_>>();
         for ring in [false, true] {
             let topology = Topology::plan(&records, &[29900; 4], ring).unwrap();
@@ -309,10 +309,10 @@ mod tests {
     #[test]
     fn physical_ring_counts_rails_per_neighbor() {
         let records = [
-            "a 10.0.0.1/24\nb 10.0.3.2/24\n",
-            "a 10.0.1.1/24\nb 10.0.0.2/24\n",
-            "a 10.0.2.1/24\nb 10.0.1.2/24\n",
-            "a 10.0.3.1/24\nb 10.0.2.2/24\n",
+            "a 10.0.0.1/24 -\nb 10.0.3.2/24 -\n",
+            "a 10.0.1.1/24 -\nb 10.0.0.2/24 -\n",
+            "a 10.0.2.1/24 -\nb 10.0.1.2/24 -\n",
+            "a 10.0.3.1/24 -\nb 10.0.2.2/24 -\n",
         ]
         .map(|s| s.as_bytes().to_vec());
         let topology = Topology::plan(&records, &[29900; 4], true).unwrap();
@@ -325,7 +325,7 @@ mod tests {
     fn chain_paths_walk_every_rank_between_the_ends() {
         for world in 2..=16 {
             let records = (1..=world)
-                .map(|rank| format!("a 10.0.0.{rank}/24\n").into_bytes())
+                .map(|rank| format!("a 10.0.0.{rank}/24 -\n").into_bytes())
                 .collect::<Vec<_>>();
             let topology =
                 Topology::plan_shape(&records, &vec![29900; world], false, true, false).unwrap();
@@ -351,10 +351,10 @@ mod tests {
     fn physical_chain_plans_without_a_closing_link() {
         // Ranks 0 and 3 share no subnet: a ring cannot close, a chain does not need to.
         let records = [
-            "a 10.0.0.1/24\n",
-            "a 10.0.1.1/24\nb 10.0.0.2/24\n",
-            "a 10.0.2.1/24\nb 10.0.1.2/24\n",
-            "b 10.0.2.2/24\n",
+            "a 10.0.0.1/24 -\n",
+            "a 10.0.1.1/24 -\nb 10.0.0.2/24 -\n",
+            "a 10.0.2.1/24 -\nb 10.0.1.2/24 -\n",
+            "b 10.0.2.2/24 -\n",
         ]
         .map(|s| s.as_bytes().to_vec());
         let topology = Topology::plan_shape(&records, &[29900; 4], false, true, false).unwrap();

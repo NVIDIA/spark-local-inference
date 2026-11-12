@@ -806,9 +806,12 @@ refuses an agent whose HELLO reports another version. Serving executables must
 also support the core's GPU architecture, prepared graph contract, and RoCE
 proxy ABI. A controller's CPU architecture does not select the serving build.
 
-Fabric TCP distribution requires agent protocol 6 on the controller and every
-agent, including relays. Updating only a serving executable does not update the
-resident agents that distribute cores.
+Fabric TCP distribution requires agent protocol 7 on the controller and every
+agent, including relays. In protocol 7, each RoCE endpoint in a FABRIC reply
+carries its PCIe link, MAC address and LLDP neighbors, and the controller plans
+transfer links with the same route planner as the ranks' RDMA rails. Updating
+only a serving executable does not update the resident agents that distribute
+cores.
 
 HELLO's optional `executable` path advertises support for using the installed
 agent binary in RUN. An agent that omits the field requires
@@ -818,7 +821,7 @@ also updates the default serving executable; restarting the agent stops its
 running ranks.
 
 HELLO's optional `download_progress` flag negotiates live DOWNLOAD progress
-within protocol 6. A controller sets it only when it can consume progress
+within one protocol version. A controller sets it only when it can consume progress
 frames; an agent sends DOWNLOAD_PROGRESS only to a controller that set it.
 A peer that omits the field exchanges DOWNLOAD as one request and one reply,
 with no progress frames.

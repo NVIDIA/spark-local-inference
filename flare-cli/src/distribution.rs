@@ -1432,7 +1432,7 @@ mod tests {
                 .map(|s| s.local_addr().unwrap().port())
                 .collect::<Vec<_>>();
             let topology =
-                Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); world], &ports, ring).unwrap();
+                Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); world], &ports, ring).unwrap();
             let relays = network
                 .into_iter()
                 .enumerate()
