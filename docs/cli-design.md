@@ -155,11 +155,14 @@ address toward its first peer; an explicit `--rendezvous` overrides it.
 Serving core distribution uses 1..64 streams per peer, selected by rank
 zero's `--transfer-streams` (default 8). Direct and switched fabrics route to
 the peer; `--roce-ring` uses intermediate ranks. `--roce-switch-only` limits
-RDMA rails and fabric transfers to subnets every rank holds between devices that
-are not LLDP neighbors, leaving direct cables between ranks unused; peers follow
-rank zero's choice. `--core-cache` selects the
-receiving rank's prepared-model cache. `--model-cache` and `--package-cache`
-are accepted aliases. The default is `paths.core_cache`, otherwise
+RDMA rails and fabric transfers to verified subnets every rank holds, between
+devices that are not LLDP neighbors. It leaves unused every cable that a subnet
+two ranks hold or LLDP identifies; a cable between two ranks that hold every
+subnet in common is excluded only when lldpd runs on one of its hosts. Devices
+without a known subnet carry no rails. Peers follow rank zero's choice.
+`--core-cache` selects the receiving rank's prepared-model cache.
+`--model-cache` and `--package-cache` are accepted aliases. The default is
+`paths.core_cache`, otherwise
 `~/.cache/flare/cores`; an existing `~/.cache/flare/packages` directory is used
 when the `cores` directory does not exist. Rank zero's
 `--stage-only` distributes and verifies cores without GPU loading, and exits

@@ -39,8 +39,12 @@
 //! advertise as their port IDs, read from `lldpctl` when lldpd runs on the host. LLDP frames do not
 //! cross a bridge, so two devices of different ranks that list each other are joined by a cable.
 //! Index pairing requires that no such pair exists, and per-peer pairing prefers links between LLDP
-//! neighbors after PCIe link separation and before breadth. A host without lldpd records no
-//! neighbors and is routed by breadth alone.
+//! neighbors after PCIe link separation and before breadth. One device listing the other suffices,
+//! so lldpd on one host of a cabled pair identifies its cable. Without LLDP data, a two-rank group
+//! on a cabled pair has no evidence of its cable: its rails take one device behind each PCIe link
+//! and then the lowest network and addresses, which is the switch only when the switch's subnets
+//! sort first. Routes and the `direct` marker describe the topology these records imply, not
+//! verified reachability.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -290,8 +294,9 @@ pub struct Topology {
     pub traffic_class: u32,
     pub rails: usize,
     pub routes: Vec<Vec<(u32, u32)>>,
-    /// Per peer, whether every rail rides a direct cable: devices that are LLDP neighbors, or, with
-    /// three or more ranks, a subnet held by fewer ranks than the world.
+    /// Per peer, whether every rail rides a direct cable as inferred from the endpoint records:
+    /// devices that are LLDP neighbors, or, with three or more ranks, a subnet held by fewer ranks
+    /// than the world. It does not verify that the cable carries traffic.
     pub direct: Vec<bool>,
     pub shape: Shape,
     pub links: Links,
