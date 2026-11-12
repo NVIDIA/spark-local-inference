@@ -94,13 +94,19 @@
     preparation through agents (PREPARE, `flare orbit prepare`), and
     reconciliation (`flare orbit apply`). See orbit-proposals.md.
 
-[ ] Restore preparation/serving RoCE proxy parity once FlashInfer main includes
-    the sequence-limit guard and protocol verification additions. The pinned
-    FlashInfer proxy (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c)
-    declares ABI 11; helios/native/roce_proxy.c implements ABI 10 and
-    helios/src/execution/roce.rs loads only cores recording ABI 9 or 10.
-    Confirm with a multi-host core prepared from the pin whether serving
-    rejects it. See roce-ring.md#protocol-model-and-runtime-checks.
+[ ] Validate native serving with RoCE proxy ABI 14 on DGX Sparks: run
+    FlashInfer's validate_roce_ring_native.py --scatter-gather with --skew-rank
+    and --consume-delay-ms over the mesh with and without --relay, the ring and
+    the chain, then serve a multi-host core prepared from the pinned FlashInfer
+    through flare run with the default lanes and relay, and compare RoCE
+    sequence-error and ACK-timeout counters before and after. See
+    roce-ring.md#validation-and-limits.
+
+[ ] Plan b12x ring and chain routes over every rank's endpoints, as
+    helios/src/execution/roce_fabric.rs does. FlashInfer's _routes.plan_routes
+    plans each rank over its neighbors only, so on four ranks in two cabled
+    pairs on a switch, --roce-chain preparation routes rank 0 to rank 1 over
+    the switch at rank 0 and over the cable at rank 1.
 
 [ ] Validate the unbuffered Windows core guard and parallel disk workers with
     complete DeepSeek Engram serving and with complete Qwen PLE serving;

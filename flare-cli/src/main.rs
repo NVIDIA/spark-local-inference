@@ -246,6 +246,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let routing = cluster::Routing {
         shape: cluster::Shape::from_flags(args.roce_ring, args.roce_chain),
         links: cluster::Links::from_switch_only(args.serving.roce_switch_only),
+        lanes: args
+            .serving
+            .roce_lanes
+            .map_or(cluster::DEFAULT_LANES, usize::from),
+        relay: !args.serving.roce_no_relay,
     };
     let rendezvous = args.rendezvous;
     // SAFETY: The trusted core owners remain live until every rank drains.

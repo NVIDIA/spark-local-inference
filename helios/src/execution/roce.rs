@@ -20,7 +20,7 @@ use crate::runtime_core::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
 /// The proxy ABI compiled into this runtime; cores record the one their kernels use.
-pub const PROXY_ABI: u32 = 11;
+pub const PROXY_ABI: u32 = 14;
 /// Control word 7 after a variable-length all-gather met a byte count it cannot send.
 const INVALID_VARLEN_COUNT: u32 = 1;
 
@@ -46,6 +46,7 @@ unsafe extern "C" {
         n_hca: c_int,
         gid_index: c_int,
         traffic_class: c_int,
+        n_lane: c_int,
         region: *mut c_void,
         region_bytes: u64,
         slot_bytes: u64,
@@ -64,6 +65,7 @@ unsafe extern "C" {
         routes: *const i32,
         n_rail: c_int,
     ) -> c_int;
+    fn roce_set_relay(c: *mut Context, plan: *const i32, n: c_int) -> c_int;
     fn roce_start(c: *mut Context) -> c_int;
     fn roce_failed(c: *mut Context) -> c_int;
     fn roce_error(c: *mut Context) -> *const c_char;
@@ -75,7 +77,8 @@ fn failure(message: impl Into<String>) -> crate::Error {
 }
 
 fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
-    // ABI 10 changes startup-owned ring mailboxes and ABI 11 adds op kinds, not the captured
+    // ABI 10 changes startup-owned ring mailboxes, ABI 11 adds op kinds, ABI 12 adds queue-pair
+    // lanes, ABI 13 the all-gather relay and ABI 14 start-of-op credits, none of them the captured
     // kernel region.
     // Older cores can use the new proxy, but all live peers must use its wire layout.
     let size = unsafe { roce_blob_bytes() } as usize;
@@ -119,10 +122,12 @@ impl RoceTransport {
     /// before `connect` returns.
     pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
-        // ABI 9, 10 and 11 have identical kernel-visible layouts. ABI 10's wider CPU ring
+        // ABI 9 through 14 have identical kernel-visible layouts. ABI 10's wider CPU ring
         // window is allocated by this runtime at startup. ABI 11 adds the reduce-scatter and
-        // shard-gather op kinds, which cores recording ABI 9 or 10 never post.
-        if !matches!(spec.proxy_abi, 9 | 10 | 11) || abi != PROXY_ABI {
+        // shard-gather op kinds, which cores recording ABI 9 or 10 never post. ABI 12's
+        // queue-pair lanes and ABI 13's all-gather relay change only the queue-pair records and
+        // startup calls; ABI 14's start-of-op credits use control words the kernels never touch.
+        if !(9..=14).contains(&spec.proxy_abi) || abi != PROXY_ABI {
             return Err(failure(format!(
                 "core RoCE kernels use proxy ABI {}, this runtime provides {abi}",
                 spec.proxy_abi
@@ -146,11 +151,19 @@ impl RoceTransport {
         if (topology.shape.relays() && !(2..=16).contains(&spec.world))
             || topology.routes.len() != spec.world
             || !(1..=super::roce_fabric::MAX_RAILS).contains(&topology.rails)
+            || !(1..=super::roce_fabric::MAX_LANES).contains(&topology.lanes)
+            || topology
+                .relay
+                .as_ref()
+                .is_some_and(|plan| plan.len() != 2 * spec.world || topology.shape != Shape::Mesh)
         {
             return Err(failure(format!(
-                "RoCE topology does not match the core's ranks: {} routes and {} rails for {} ranks",
+                "RoCE topology does not match the core's ranks: {} routes, {} rails, {} lanes \
+                 and a {}-entry relay plan for {} ranks",
                 topology.routes.len(),
                 topology.rails,
+                topology.lanes,
+                topology.relay.as_ref().map_or(0, Vec::len),
                 spec.world
             )));
         }
@@ -191,6 +204,7 @@ impl RoceTransport {
                 pointers.len() as c_int,
                 topology.gid_index as c_int,
                 topology.traffic_class as c_int,
+                topology.lanes as c_int,
                 region,
                 spec.region_bytes,
                 spec.slot_bytes,
@@ -280,6 +294,14 @@ impl RoceTransport {
         if status != 0 {
             return Err(failure(format!(
                 "RoCE queue-pair connect failed: {}",
+                self.proxy_error()
+            )));
+        }
+        if let Some(plan) = &self.topology.relay
+            && unsafe { roce_set_relay(self.context, plan.as_ptr(), plan.len() as c_int) } != 0
+        {
+            return Err(failure(format!(
+                "RoCE all-gather relay setup failed: {}",
                 self.proxy_error()
             )));
         }
@@ -377,6 +399,8 @@ mod tests {
             gid_index: 3,
             traffic_class: 0,
             rails: 2,
+            lanes: 4,
+            relay: None,
             routes: vec![vec![], vec![(0, 0), (1, 1)], vec![], vec![(0, 0), (1, 1)]],
             direct: vec![false; 4],
             shape: Shape::Ring,
@@ -394,7 +418,7 @@ mod tests {
     #[test]
     fn compatible_core_abis_still_validate_the_captured_region() {
         let (region, spec, topology) = specification();
-        for abi in [8, 9, 10, 11, 12] {
+        for abi in 8..=15 {
             let mut spec = spec.clone();
             spec.proxy_abi = abi;
             spec.ctrl_offset += 128;
@@ -404,7 +428,7 @@ mod tests {
                 .expect("invalid layout must fail")
                 .to_string();
             assert!(
-                error.contains(if matches!(abi, 9 | 10 | 11) {
+                error.contains(if (9..=14).contains(&abi) {
                     "region differs"
                 } else {
                     "proxy ABI"
@@ -442,7 +466,7 @@ mod tests {
     #[test]
     fn rejects_incompatible_core_and_routes_before_modifying_region() {
         let (region, spec, topology) = specification();
-        for case in 0..10 {
+        for case in 0..13 {
             let mut spec = spec.clone();
             let mut topology = topology.clone();
             match case {
@@ -458,6 +482,9 @@ mod tests {
                 7 => topology.routes[1].clear(),
                 8 => topology.routes[2] = vec![(0, 0), (1, 1)],
                 9 => topology.routes[3][1].0 = 2,
+                10 => topology.lanes = 0,
+                11 => topology.lanes = 5,
+                12 => topology.relay = Some(vec![-1; 8]),
                 _ => unreachable!(),
             }
             // SAFETY: Every case fails preflight before accessing or registering the region.

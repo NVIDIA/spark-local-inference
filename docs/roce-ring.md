@@ -146,6 +146,18 @@ publishing `pipe_done`. The GPU kernel waits for that sequence before advancing
 the epoch that permits the next operation to overwrite `pipe_send`. Receiving
 every peer's output alone does not release a rank's own send buffer.
 
+Pipelined reduce-scatter and shard-gather operations reuse one receive row and
+readiness flag per source, phase and chunk. Two transitions have no data
+dependency that keeps a fast rank from overwriting rows a slow peer is still
+reading: a reduce-scatter or two-shot after a reduce-scatter, and a shard gather
+after a two-shot or shard gather. For those transitions each proxy writes the
+operation's sequence number into its credit word in every peer's control record
+as it begins the operation, and holds the affected phase until every peer's
+credit has reached that operation. In ring and chain mode a credit for a rank
+that is not a neighbor travels as an empty mailbox packet through the ranks
+between. Other transitions are ordered by their data dependencies and exchange
+no credits.
+
 ## Preparation and serving
 
 Follow the [multi-host requirements](multi-host.md#requirements)
@@ -157,11 +169,12 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
 
-Preparation and serving use proxy ABI 11. Its proxy holds eight packets in flight per sender and
-rail in ring mailboxes that the runtime allocates at startup, and it serves the pipelined
-reduce-scatter and shard-gather operations. Cores recording proxy ABI 9 or 10 have the same
-captured region layout, so the runtime loads cores that record ABI 9, 10 or 11. The chain topology
-is a mode of this layout, and startup rejects any other proxy ABI before replay.
+Preparation and serving use proxy ABI 14. Its proxy holds eight packets in flight per sender and
+rail in ring mailboxes that the runtime allocates at startup, serves the pipelined reduce-scatter
+and shard-gather operations, and orders their receive-row reuse with start-of-op credits. Cores
+recording proxy ABI 9 through 13 have the same captured region layout, so the runtime loads cores
+that record ABI 9 through 14. The chain topology is a mode of this layout, and startup rejects any
+other proxy ABI before replay.
 
 ### Prepare across four hosts
 
@@ -246,7 +259,7 @@ Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a core prepared
 with the option. The serving flag chooses routing independently of the
-core's graph catalog. A core recording proxy ABI 9, 10 or 11 can use either transport
+core's graph catalog. A core recording proxy ABI 9 through 14 can use either transport
 without changing its captured addresses or collective algorithms. Preparation
 on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
 are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
@@ -338,7 +351,12 @@ python3 tests/experimental/b12x/comm/validate_roce_ring_native.py \
 
 Use ranks 1, 2, and 3 on the other hosts. Set `--hca-names` and `--gid-index`
 for the fabric; keep the other options identical. Add `--mesh` on every rank
-to validate direct routing, or `--ring-open` to validate a chain. GPU graph
+to validate direct routing, or `--ring-open` to validate a chain. `--lanes N`
+selects the queue pairs per rail (default 4), and with `--mesh`, `--relay`
+relays the all-gather through cable partners. `--scatter-gather` adds
+reduce-scatter and shard-gather operations in every order a model issues them;
+with `--skew-rank R`, `--consume-delay-ms D` makes rank R read peers' rows late,
+which exercises the start-of-op credits. GPU graph
 tests additionally exercise changing
 message sizes, buffer ownership, and proxy failures during replay. Recovery
 from a failed ring neighbor is unsupported; stop and restart all ranks together.
@@ -399,7 +417,7 @@ is unsupported; restarting the proxy thread alone does not reset the runtime.
 | Symptom | Check |
 | --- | --- |
 | `--roce-ring and --roce-chain require a multi-host core with 2..16 ranks` (Orbit) or `experimental RoCE ring requires 2..16 ranks` (serving rank) | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
-| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 or 10. |
+| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI outside 9 through 14. |
 | `RoCE rails have a link to rank ...` | Verify rank order, active ports, GIDs, and the IPv4 subnet shared by each neighbor pair. |
 | `rank R selected RoCE transport shape ... where this rank selected ...`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
 | Proxy error or collective timeout | Stop the ranks together and inspect the originating rank's error. There is no automatic rerouting around a failed neighbor. |

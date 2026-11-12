@@ -6,14 +6,18 @@
 
 //! Ranks of one model on separate hosts: rendezvous at rank zero and connect their RoCE transport.
 
-pub use flare_helios::execution::roce_fabric::{Links, Shape};
+pub use flare_helios::execution::roce_fabric::{DEFAULT_LANES, Links, MAX_LANES, Shape};
 use std::sync::Arc;
 
-/// How a rank's transport links to its peers: the shape, and which links may carry rails.
+/// How a rank's transport links to its peers: the shape, which links may carry rails, the queue
+/// pairs per rail, and whether a mesh whose ranks pair up over direct cables relays its two-shot
+/// all-gather through them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Routing {
     pub shape: Shape,
     pub links: Links,
+    pub lanes: usize,
+    pub relay: bool,
 }
 
 use flare_helios::{
@@ -84,7 +88,14 @@ fn open(
         .iter()
         .map(|bytes| roce_fabric::decode(bytes))
         .collect::<flare_helios::Result<Vec<_>>>()?;
-    let topology = fabric.topology(&endpoints, spec.rank, routing.shape, routing.links)?;
+    let topology = fabric.topology(
+        &endpoints,
+        spec.rank,
+        routing.shape,
+        routing.links,
+        routing.lanes,
+        routing.relay,
+    )?;
     // SAFETY: The core restored the region at its recorded address; owner outlives the
     // transport, and no graph runs before every rank connected.
     Ok(unsafe { RoceTransport::open(spec, &topology)? })
@@ -94,36 +105,50 @@ fn open(
 fn connected(transport: &RoceTransport) -> String {
     let topology = transport.topology();
     format!(
-        "{} rails per {}{}: {}",
+        "{} rails per {}, {} lanes{}{}: {}",
         topology.rails,
         match topology.shape {
             Shape::Mesh => "peer",
             Shape::Ring => "neighbor (experimental CPU relay ring)",
             Shape::Chain => "neighbor (experimental CPU relay chain)",
         },
+        topology.lanes,
         match topology.links {
             Links::All => "",
             Links::Shared => ", switch only",
+        },
+        if topology.relay.is_some() {
+            ", all-gather relayed over cables"
+        } else {
+            ""
         },
         topology.peer_routes().join("; ")
     )
 }
 
-/// The transport shape a rank was started with and the links it may route over, as the ranks
-/// exchange them before planning routes: `mesh`, `ring` or `chain`, followed by ` switch-only`
-/// when direct cables are excluded.
+/// The transport routing a rank was started with, as the ranks exchange it before planning
+/// routes: `mesh`, `ring` or `chain`, followed by ` switch-only` when direct cables are excluded,
+/// ` lanes=N` when a rail uses other than `DEFAULT_LANES` queue pairs, and ` no-relay` when the
+/// all-gather relay is off.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn shape_record(routing: Routing) -> Vec<u8> {
     let links = match routing.links {
         Links::All => "",
         Links::Shared => " switch-only",
     };
-    format!("{}{links}", routing.shape.name()).into_bytes()
+    let lanes = if routing.lanes == DEFAULT_LANES {
+        String::new()
+    } else {
+        format!(" lanes={}", routing.lanes)
+    };
+    let relay = if routing.relay { "" } else { " no-relay" };
+    format!("{}{links}{lanes}{relay}", routing.shape.name()).into_bytes()
 }
 
-/// Every rank must select the same shape and links: a chain rank plans no route to the far end
-/// that a ring rank would wait for, and a switch-only rank routes a cabled partner over the switch
-/// while the partner would wait on the cable.
+/// Every rank must select the same routing: a chain rank plans no route to the far end that a ring
+/// rank would wait for, a switch-only rank routes a cabled partner over the switch while the
+/// partner would wait on the cable, queue pairs connect lane to lane, and a rank that does not
+/// relay leaves the chunks a relaying peer expects it to forward unsent.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn agree_shape(records: &[Vec<u8>], routing: Routing) -> Result<(), Failure> {
     let local = shape_record(routing);
@@ -322,13 +347,22 @@ mod routing_tests {
         let mesh = Routing {
             shape: Shape::Mesh,
             links: Links::All,
+            lanes: DEFAULT_LANES,
+            relay: true,
         };
         let switched = Routing {
-            shape: Shape::Mesh,
             links: Links::Shared,
+            ..mesh
         };
         assert_eq!(shape_record(mesh), b"mesh");
         assert_eq!(shape_record(switched), b"mesh switch-only");
+        let single = Routing {
+            lanes: 1,
+            relay: false,
+            ..switched
+        };
+        assert_eq!(shape_record(single), b"mesh switch-only lanes=1 no-relay");
+        assert!(agree_shape(&[shape_record(mesh), shape_record(single)], mesh).is_err());
         assert!(agree_shape(&vec![shape_record(switched); 2], switched).is_ok());
         let error = agree_shape(&[shape_record(mesh), shape_record(switched)], mesh)
             .unwrap_err()

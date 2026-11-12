@@ -160,6 +160,10 @@ devices that are not LLDP neighbors. It leaves unused every cable that a subnet
 two ranks hold or LLDP identifies; a cable between two ranks that hold every
 subnet in common is excluded only when lldpd runs on one of its hosts. Devices
 without a known subnet carry no rails. Peers follow rank zero's choice.
+`--roce-lanes N` (1..4, default 4) selects the reliable queue pairs per rail, and
+`--roce-no-relay` turns off the all-gather relay through cable partners. Both
+are forwarded to agent-started ranks; ranks that select different values stop
+when the transport connects.
 `--core-cache` selects the receiving rank's prepared-model cache.
 `--model-cache` and `--package-cache` are accepted aliases. The default is
 `paths.core_cache`, otherwise

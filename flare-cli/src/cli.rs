@@ -862,6 +862,21 @@ pub struct ServingOptions {
     #[arg(long, help_heading = "Multi-host options")]
     pub roce_switch_only: bool,
 
+    /// Reliable queue pairs per RoCE rail; successive two-shot and variable-length chunks use
+    /// successive queue pairs [default: 4].
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u8).range(1..=4),
+        help_heading = "Multi-host options"
+    )]
+    pub roce_lanes: Option<u8>,
+
+    /// Send every two-shot all-gather chunk directly, instead of relaying chunks through cable
+    /// partners when the ranks pair up over direct cables.
+    #[arg(long, help_heading = "Multi-host options")]
+    pub roce_no_relay: bool,
+
     /// Maximum simultaneous requests [default: model/default configuration, then core setting].
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
@@ -1073,6 +1088,12 @@ impl ServingOptions {
         }
         if self.roce_switch_only {
             options.push(ROCE_SWITCH_ONLY.into());
+        }
+        if let Some(lanes) = self.roce_lanes {
+            options.extend(["--roce-lanes".into(), lanes.to_string()]);
+        }
+        if self.roce_no_relay {
+            options.push("--roce-no-relay".into());
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1782,6 +1803,34 @@ mod tests {
             "--roce-switch-only",
         ]);
         assert_eq!(args.rank_options(), vec!["--roce-chain", ROCE_SWITCH_ONLY]);
+    }
+
+    #[test]
+    fn lane_count_and_relay_choice_are_forwarded_to_every_agent_started_rank() {
+        let args = run(&["flare", "run", "model.safetensors"]);
+        assert_eq!(
+            (args.serving.roce_lanes, args.serving.roce_no_relay),
+            (None, false)
+        );
+        assert!(args.rank_options().is_empty());
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--roce-lanes",
+            "1",
+            "--roce-no-relay",
+        ]);
+        assert_eq!(
+            args.rank_options(),
+            vec!["--roce-lanes", "1", "--roce-no-relay"]
+        );
+        for lanes in ["0", "5"] {
+            assert!(
+                Cli::try_parse_from(["flare", "run", "model.safetensors", "--roce-lanes", lanes])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

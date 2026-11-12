@@ -129,12 +129,27 @@ choice for core distribution, and ranks that still disagree stop when the
 transport connects, naming the rank. Every rank's `Connect RoCE transport`
 startup phase lists each peer's local devices in rail order and marks a peer
 reached over a direct cable, for example
-`2 rails per peer: rank 0 roceP2p1s0f0,rocep1s0f0; rank 2 direct roceP2p1s0f1,rocep1s0f1; rank 3 roceP2p1s0f0,rocep1s0f0`,
+`2 rails per peer, 4 lanes, all-gather relayed over cables: rank 0 roceP2p1s0f0,rocep1s0f0; rank 2 direct roceP2p1s0f1,rocep1s0f1; rank 3 roceP2p1s0f0,rocep1s0f0`,
 so a cable that is down or unaddressed appears as its partner routed without
 `direct`. The marker reports the topology inferred from subnets and LLDP, not
 verified reachability; only a connected transport shows that the devices reach
 each other. For direct cabling and neighbor forwarding, see
 [experimental rings](#experimental-rings).
+
+Each rail is several reliable queue pairs (lanes), 4 unless `--roce-lanes N`
+selects 1 through 4; the proxy posts successive two-shot and variable-length
+chunks on successive lanes, which keeps both PCIe links of a DGX Spark busy
+when a cable carries traffic beside the switch. When the ranks of a mesh pair
+up over direct cables (each rank has exactly one peer reached over subnets only
+the two of them hold), the all-gather of two-shot reductions and shard gathers
+is relayed: a rank sends its reduced shard to its partner and to one rank of
+every other pair, which forwards it over its own cable to its partner. A
+ConnectX-7 splits each PCIe link evenly between its cable and switch functions;
+with two pairs the relay makes the two-shot traffic half cable and half switch
+instead of one third cable. Results are unchanged bit for bit.
+`--roce-no-relay` sends every all-gather chunk directly. Every rank must select
+the same lane count and relay choice; ranks that disagree stop when the
+transport connects, naming the rank.
 
 ## Manual serving
 

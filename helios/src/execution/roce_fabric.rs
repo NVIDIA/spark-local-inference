@@ -46,6 +46,13 @@
 //! and then the lowest network and addresses, which is the switch only when the switch's subnets
 //! sort first. Routes and the `direct` marker describe the topology these records imply, not
 //! verified reachability.
+//!
+//! Each rail is `lanes` reliable queue pairs; the proxy posts successive two-shot and
+//! variable-length chunks on successive lanes. When the ranks form pairs joined by direct cables,
+//! `relay_plan` relays the two-shot all-gather as b12x's `_routes.relay_plan` does: a rank's partner
+//! is its only peer whose rails all use subnets the two of them alone hold, each pair orders its
+//! ranks by rank number, and a rank sends its all-gather chunks to its partner and to the rank on
+//! its own side of every other pair, which forwards them over its cable to its partner.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -54,6 +61,10 @@ use crate::{ExecutionError, Failure, Result};
 
 /// Each peer is reached over at most this many devices.
 pub const MAX_RAILS: usize = 2;
+/// Each rail is at most this many reliable queue pairs (the proxy's `ROCE_MAX_LANES`).
+pub const MAX_LANES: usize = 4;
+/// Queue pairs per rail unless the serving options select another count.
+pub const DEFAULT_LANES: usize = 4;
 /// A rank opens at most this many devices.
 pub const MAX_DEVICES: usize = 4;
 /// b12x's default GID index: RoCEv2 over IPv4 on a DGX Spark.
@@ -294,6 +305,10 @@ pub struct Topology {
     pub gid_index: u32,
     pub traffic_class: u32,
     pub rails: usize,
+    /// Reliable queue pairs per rail, 1 through `MAX_LANES`.
+    pub lanes: usize,
+    /// The all-gather relay plan for `roce_set_relay` (see `relay_plan`), or `None`.
+    pub relay: Option<Vec<i32>>,
     pub routes: Vec<Vec<(u32, u32)>>,
     /// Per peer, whether every rail rides a direct cable as inferred from the endpoint records:
     /// devices that are LLDP neighbors, or, with three or more ranks, a subnet held by fewer ranks
@@ -914,6 +929,76 @@ fn direct_peers(endpoints: &[Vec<Endpoint>], rank: usize, routes: &[Vec<(u32, u3
         .collect()
 }
 
+/// Per rank, its only peer whose every rail uses a subnet the two of them alone hold, else `None`.
+/// With two ranks every subnet joins both, so no rank has a partner.
+pub fn partners(
+    endpoints: &[Vec<Endpoint>],
+    rails: usize,
+    links: Links,
+) -> Result<Vec<Option<usize>>> {
+    let world = endpoints.len();
+    if world < 3 {
+        return Ok(vec![None; world]);
+    }
+    let planner = Planner::new(endpoints, rails, links)?;
+    let breadths = breadths(endpoints);
+    (0..world)
+        .map(|rank| {
+            let mut direct = Vec::new();
+            for peer in (0..world).filter(|&p| p != rank) {
+                let rails = planner.peer(rank, peer)?;
+                if !rails.is_empty()
+                    && rails.iter().all(|&(local, _)| {
+                        endpoints[rank][local as usize]
+                            .network()
+                            .is_some_and(|network| breadths[&network] == 2)
+                    })
+                {
+                    direct.push(peer);
+                }
+            }
+            Ok((direct.len() == 1).then(|| direct[0]))
+        })
+        .collect()
+}
+
+/// The all-gather relay plan of `rank` (`2 * world` entries), or `None` unless the ranks form at
+/// least two pairs of mutual partners and no rank is left out. Entry `p` names the rank that
+/// forwards `rank`'s chunks to rank `p` (-1: sent directly); entry `world + s` the rank to which
+/// `rank` forwards rank `s`'s chunks (-1: none).
+pub fn relay_plan(
+    endpoints: &[Vec<Endpoint>],
+    rank: usize,
+    rails: usize,
+    links: Links,
+) -> Result<Option<Vec<i32>>> {
+    let world = endpoints.len();
+    let mates = partners(endpoints, rails, links)?;
+    if world < 4
+        || world % 2 != 0
+        || rank >= world
+        || mates
+            .iter()
+            .enumerate()
+            .any(|(r, m)| m.is_none_or(|m| mates[m] != Some(r)))
+    {
+        return Ok(None);
+    }
+    let mates: Vec<usize> = mates.into_iter().map(Option::unwrap).collect();
+    let side = |r: usize| r > mates[r];
+    let mut plan = vec![-1; 2 * world];
+    for peer in (0..world).filter(|&p| p != rank && p != mates[rank]) {
+        if side(peer) != side(rank) {
+            // Peer's partner is on our side and receives our chunks directly.
+            plan[peer] = mates[peer] as i32;
+        } else {
+            // Peer is on our side: we receive its chunks and pass them to our partner.
+            plan[world + peer] = mates[rank] as i32;
+        }
+    }
+    Ok(Some(plan))
+}
+
 /// The routes of `shape` for `rank`: a mesh routes to every rank; a ring or chain routes only to
 /// the ranks `shape` links, and the native proxy forwards writes to the others. The same plan works
 /// over a switch while keeping unlinked QPs unconnected. Routes are planned over every rank's
@@ -947,23 +1032,40 @@ pub fn plan_shape_routes(
 impl Fabric {
     /// The topology this rank opens for `shape` over `links`, from every rank's endpoints in rank
     /// order.
+    ///
+    /// Each rail is `lanes` queue pairs. With `relay`, a mesh whose ranks pair up over direct cables
+    /// relays its two-shot all-gather (`relay_plan`); any other fabric or shape sends directly.
     pub fn topology(
         &self,
         endpoints: &[Vec<Endpoint>],
         rank: usize,
         shape: Shape,
         links: Links,
+        lanes: usize,
+        relay: bool,
     ) -> Result<Topology> {
         if endpoints.get(rank) != Some(&self.endpoints) || endpoints.iter().any(Vec::is_empty) {
             return Err(failure("every rank needs at least one RoCE device"));
         }
+        if !(1..=MAX_LANES).contains(&lanes) {
+            return Err(failure(format!(
+                "RoCE lanes must be 1 through {MAX_LANES}, got {lanes}"
+            )));
+        }
         let rails = endpoints.iter().map(Vec::len).min().unwrap().min(MAX_RAILS);
         let routes = plan_shape_routes(endpoints, rank, rails, shape, links)?;
+        let relay = if relay && shape == Shape::Mesh {
+            relay_plan(endpoints, rank, rails, links)?
+        } else {
+            None
+        };
         Ok(Topology {
             hcas: self.endpoints.iter().map(|e| e.name.clone()).collect(),
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
             rails,
+            lanes,
+            relay,
             direct: direct_peers(endpoints, rank, &routes),
             routes,
             shape,
@@ -1197,9 +1299,6 @@ mod tests {
         );
     }
 
-    /// Four Sparks whose first port joins a switch (10.200.0.0/24 and 10.200.1.0/24) and whose
-    /// second port is cabled to one partner: ranks 1 and 2 over 10.200.2.0/24 and 10.200.3.0/24,
-    /// ranks 0 and 3 over 10.200.4.0/24 and 10.200.5.0/24. Devices are in discovery (name) order.
     /// A DGX Spark ConnectX-7 function: each PCIe x4 link carries one function of each port.
     fn spark(name: &str, address: &str) -> Endpoint {
         let link = if name.starts_with("roceP2") {
@@ -1213,6 +1312,9 @@ mod tests {
         }
     }
 
+    /// Four Sparks whose first port joins a switch (10.200.0.0/24 and 10.200.1.0/24) and whose
+    /// second port is cabled to one partner: ranks 1 and 2 over 10.200.2.0/24 and 10.200.3.0/24,
+    /// ranks 0 and 3 over 10.200.4.0/24 and 10.200.5.0/24. Devices are in discovery (name) order.
     fn switch_with_partner_cables() -> Vec<Vec<Endpoint>> {
         (0..4u32)
             .map(|rank| {
@@ -1433,14 +1535,17 @@ mod tests {
             traffic_class: 0,
             endpoints: pair[0].clone(),
         };
-        let topology = fabric.topology(&pair, 0, Shape::Mesh, Links::All).unwrap();
+        let topology = fabric
+            .topology(&pair, 0, Shape::Mesh, Links::All, DEFAULT_LANES, true)
+            .unwrap();
         assert_eq!(topology.direct, vec![false, true]);
         assert_eq!(
             topology.peer_routes(),
             vec!["rank 1 direct roceP2p1s0f1,rocep1s0f1"]
         );
+        assert_eq!(topology.relay, None);
         let switched = fabric
-            .topology(&pair, 0, Shape::Mesh, Links::Shared)
+            .topology(&pair, 0, Shape::Mesh, Links::Shared, DEFAULT_LANES, true)
             .unwrap();
         assert_eq!(
             switched.peer_routes(),
@@ -1481,10 +1586,18 @@ mod tests {
                         "{links:?} rank {rank}"
                     );
                     assert_eq!(
+                        relay_plan(&lldp, rank, 2, links).unwrap(),
+                        relay_plan(&endpoints, rank, 2, links).unwrap()
+                    );
+                    assert_eq!(
                         direct_peers(&lldp, rank, &routes),
                         direct_peers(&endpoints, rank, &routes)
                     );
                 }
+                assert_eq!(
+                    partners(&lldp, 2, links).unwrap(),
+                    partners(&endpoints, 2, links).unwrap()
+                );
             }
         }
     }
@@ -1548,9 +1661,15 @@ mod tests {
             endpoints: endpoints[1].clone(),
         };
         let topology = fabric
-            .topology(&endpoints, 1, Shape::Mesh, Links::All)
+            .topology(&endpoints, 1, Shape::Mesh, Links::All, DEFAULT_LANES, true)
             .unwrap();
         assert_eq!(topology.direct, vec![false, false, true, false]);
+        assert_eq!(topology.lanes, DEFAULT_LANES);
+        assert_eq!(
+            topology.relay,
+            relay_plan(&endpoints, 1, 2, Links::All).unwrap()
+        );
+        assert!(topology.relay.is_some());
         assert_eq!(
             topology.peer_routes(),
             vec![
@@ -1560,9 +1679,22 @@ mod tests {
             ]
         );
         let switched = fabric
-            .topology(&endpoints, 1, Shape::Mesh, Links::Shared)
+            .topology(&endpoints, 1, Shape::Mesh, Links::Shared, 1, true)
             .unwrap();
         assert_eq!(switched.direct, vec![false; 4]);
+        // Without cable routes no rank has a partner, so nothing is relayed.
+        assert_eq!((switched.lanes, switched.relay.as_ref()), (1, None));
+        let direct = fabric
+            .topology(&endpoints, 1, Shape::Mesh, Links::All, DEFAULT_LANES, false)
+            .unwrap();
+        assert_eq!(direct.relay, None);
+        for lanes in [0, MAX_LANES + 1] {
+            assert!(
+                fabric
+                    .topology(&endpoints, 1, Shape::Mesh, Links::All, lanes, true)
+                    .is_err()
+            );
+        }
         assert_eq!(switched.peer_routes()[1], "rank 2 roceP2p1s0f0,rocep1s0f0");
     }
 
@@ -1705,6 +1837,8 @@ mod tests {
                 0,
                 Shape::Mesh,
                 Links::All,
+                DEFAULT_LANES,
+                true,
             )
             .unwrap();
         assert_eq!(
@@ -1721,7 +1855,9 @@ mod tests {
                     &[fabric.endpoints.clone(), vec![]],
                     0,
                     Shape::Mesh,
-                    Links::All
+                    Links::All,
+                    DEFAULT_LANES,
+                    true,
                 )
                 .is_err()
         );
@@ -1939,5 +2075,100 @@ mod tests {
             bounded_output(std::process::Command::new("/nonexistent/lldpctl"), limit),
             None
         );
+    }
+
+    #[test]
+    fn the_relay_delivers_every_shard_once_and_forwards_only_over_cables() {
+        for (endpoints, mates) in [
+            (switch_with_partner_cables(), PARTNER.to_vec()),
+            (paired_switch(4), (0..8).map(|r| r ^ 1).collect()),
+        ] {
+            let world = endpoints.len();
+            let found = partners(&endpoints, 2, Links::All).unwrap();
+            assert_eq!(found, mates.iter().map(|&m| Some(m)).collect::<Vec<_>>());
+            let plans: Vec<Vec<i32>> = (0..world)
+                .map(|rank| {
+                    relay_plan(&endpoints, rank, 2, Links::All)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            // Per (source, receiver), every rank writing the source's chunks to the receiver.
+            let mut writers = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+            for source in 0..world {
+                for peer in (0..world).filter(|&p| p != source && plans[source][p] == -1) {
+                    writers.entry((source, peer)).or_default().push(source);
+                }
+            }
+            for forwarder in 0..world {
+                for source in 0..world {
+                    let target = plans[forwarder][world + source];
+                    if target >= 0 {
+                        assert_eq!(writers.get(&(source, forwarder)), Some(&vec![source]));
+                        assert_eq!(target as usize, mates[forwarder]);
+                        writers
+                            .entry((source, target as usize))
+                            .or_default()
+                            .push(forwarder);
+                    }
+                }
+            }
+            for source in 0..world {
+                for peer in (0..world).filter(|&p| p != source) {
+                    let writer = writers[&(source, peer)].as_slice();
+                    assert_eq!(writer.len(), 1, "{source} -> {peer}: {writer:?}");
+                    if writer[0] != source {
+                        assert_eq!(writer[0], mates[peer]);
+                        assert_eq!(plans[source][peer], writer[0] as i32);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_relay_puts_two_of_three_all_gather_shards_on_the_cable_with_two_pairs() {
+        let endpoints = switch_with_partner_cables();
+        for rank in 0..4 {
+            let plan = relay_plan(&endpoints, rank, 2, Links::All)
+                .unwrap()
+                .unwrap();
+            let mut sends: Vec<i32> = (0..4)
+                .filter(|&p| p != rank && plan[p] == -1)
+                .map(|p| p as i32)
+                .collect();
+            sends.extend(plan[4..].iter().copied().filter(|&t| t >= 0));
+            assert_eq!(sends.len(), 3, "rank {rank}: {plan:?}");
+            let cable = sends.iter().filter(|&&t| t == PARTNER[rank] as i32).count();
+            assert_eq!(cable, 2, "rank {rank}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn the_relay_needs_every_rank_in_a_cable_pair() {
+        let mut endpoints = switch_with_partner_cables();
+        assert!(
+            relay_plan(&endpoints, 0, 2, Links::Shared)
+                .unwrap()
+                .is_none()
+        );
+        endpoints[2].retain(|e| SWITCH_DEVICES.contains(&e.name.as_str()));
+        assert_eq!(
+            partners(&endpoints, 2, Links::All).unwrap(),
+            vec![Some(3), None, None, Some(0)]
+        );
+        for rank in 0..4 {
+            assert!(
+                relay_plan(&endpoints, rank, 2, Links::All)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let pair: Vec<_> = [0, 3]
+            .iter()
+            .map(|&r| switch_with_partner_cables()[r].clone())
+            .collect();
+        assert_eq!(partners(&pair, 2, Links::All).unwrap(), vec![None, None]);
+        assert!(relay_plan(&pair, 0, 2, Links::All).unwrap().is_none());
     }
 }
