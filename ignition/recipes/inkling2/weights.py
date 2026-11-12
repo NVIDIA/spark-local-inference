@@ -31,6 +31,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+import torch
+
+from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_empty, persistent_zeros
+
 from .config import DRAFT_FILE, EXPERT_ALIGNMENT, TEXT_PREFIX, VISION_PREFIX, VOCABULARY_ALIGNMENT, ModelConfig
 
 DTYPE_BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1}
@@ -345,3 +350,39 @@ def stored_tensors(entries: Iterable) -> dict[str, tuple[tuple[int, ...], str]]:
     return {entry.name: (tuple(entry.shape), entry.dtype) for entry in entries}
 
 
+_TORCH_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "F8_E4M3": torch.float8_e4m3fn, "U8": torch.uint8}
+
+
+class PlacedWeightLoader(DirectWeightLoader):
+    """Direct checkpoint reads of the indexed tensors `names`, as placed by `layout`.
+
+    Within the loader's context, `load(name, rank=r)` copies rank `r`'s extent of a
+    stored tensor to the device without converting its bytes, zero-filling the
+    vocabulary tail past the table; `rank=None` copies the whole stored tensor.
+    """
+
+    def __init__(self, manifest, device, *, layout: CheckpointLayout, names: Iterable[str], progress=None):
+        selected = frozenset(names)
+        unmapped = selected - layout.model.keys()
+        if unmapped:
+            raise ValueError(f"tensors outside the layout: {sorted(unmapped)[:4]}")
+        super().__init__(manifest, device, progress=progress)
+        self.layout, self.names = layout, selected
+
+    def _selected_names(self):
+        return set(self.names)
+
+    def load(self, name: str, *, rank: int | None = None) -> torch.Tensor:
+        self._require_open()
+        placement, source = self.layout.model[name], self._sources[name]
+        if tuple(source.shape) != placement.shape or source.dtype != _TORCH_DTYPES[placement.dtype]:
+            raise ValueError(f"{name}: stored {source.dtype} {tuple(source.shape)} differs from the layout")
+        if rank is None or placement.axis is None:
+            return self.load_tensor(name)
+        first, last = placement.rows(rank)
+        allocate = persistent_empty if last - first == placement.width else persistent_zeros
+        target = allocate(placement.local_shape, dtype=source.dtype, device=self.device)
+        if last > first:
+            self._copy(target.narrow(placement.axis, 0, last - first), source[placement.extent(rank)])
+        self._session.flush()
+        return target
