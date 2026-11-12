@@ -192,6 +192,12 @@ impl TensorParallelExecutor {
         self.pending.len()
     }
 
+    /// Park on rank zero's own running frame; peers' completions arrive over their sockets
+    /// and are polled by the caller as before. See [`GraphExecutor::park`].
+    pub fn park(&self) -> bool {
+        self.local.park()
+    }
+
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }
@@ -607,7 +613,13 @@ pub unsafe fn serve_rank(
                 if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
                     return Err(invalid("rank graph completion deadline expired"));
                 }
-                if active { std::thread::yield_now(); }
+                // A peer waiting only on its own running frame parks on it; a prepared frame waits
+                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
+                // the old loop's cooperative handoff after either.
+                if active {
+                    if prepared.is_none() { executor.park(); }
+                    std::thread::yield_now();
+                }
             }
         })();
         if let Err(error) = &result {
