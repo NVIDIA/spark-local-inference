@@ -316,6 +316,13 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
+RoCEnante collectives give up on a peer after about 20 s, which suits serving.
+While compiled forwards warm, the rank that compiled a forward meets its Triton
+kernels already built and its peer builds them on first use, so one rank can
+trail the other by minutes inside one forward. Preparation widens the wait to
+about ten minutes for compiled warmup only; captured graphs keep the 20 s wait,
+so serving still reports a lost peer promptly.
+
 For a physical ring, add `--roce-ring` to rank zero's `export` or `debug-serve` command;
 for hosts cabled as a chain with no link between the first and last rank, add
 `--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
