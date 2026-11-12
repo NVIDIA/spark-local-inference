@@ -283,24 +283,37 @@ def test_row_shard_attention_requires_row_shard_prefill_and_survives_rebuild_ser
                       row_shard_prefill=True, row_shard_attention=True)
 
 
-def test_row_shard_attention_charges_the_replicated_weights_to_the_plan():
-    """The plan counts the replicated attention extents, so page sizing leaves room for them."""
+def test_row_shard_attention_charges_only_the_layers_a_prefill_can_shard():
+    """The plan counts the replicated attention layers each prefill mode shards, not all 40."""
     from ignition.recipes import resolve
-    from ignition.recipes.deepseek41.config import replicated_attention_bytes
+    from ignition.recipes.deepseek41.config import replicated_layer_bytes
 
     model = resolve("deepseek-v4.1-flash")
+    speculation = model.recipe.speculation
     gpus = tuple(gpu(index, 95) for index in range(4))
-    settings = dict(selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0,
-                    speculation=model.recipe.speculation, row_shard_prefill=True)
-    sharded = planning.plan(model.recipe, model.checkpoint, gpus, **settings)
-    attention = planning.plan(model.recipe, model.checkpoint, gpus, row_shard_attention=True, **settings)
-    # Every backbone layer replicates 121.11 MB at TP4, and the rank keeps its partition, so the
-    # estimate grows by the whole replicated extent the loader holds.
-    assert replicated_attention_bytes(4) == 4_844_421_120
-    assert attention.weights_bytes - sharded.weights_bytes == replicated_attention_bytes(4)
-    # The pages are sized from what the weights leave, so the charge removes the 42,525 pages the
-    # copies would otherwise occupy.
-    assert sharded.pages - attention.pages == 42525
+    settings = dict(selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0, speculation=speculation,
+                    row_shard_prefill=True)
+
+    def plan(**modes):
+        return planning.plan(model.recipe, model.checkpoint, gpus, **{**settings, **modes})
+
+    plain = plan()
+    # A replicated layer holds 121.11 MB at TP4: the whole extent, not the part beyond the
+    # partition, because the rank keeps its own partition beside it.
+    per_layer = 121_110_528
+    assert replicated_layer_bytes(4) == per_layer
+    # The packed prefill stops at the decoder boundary, so 17 layers replicate: 0, 2-13, 15-18.
+    # Scored prefill replays no suffix, so --prompt-logprobs reaches 37. A draft-only plan builds no
+    # prefill graph without the draft, and those graphs are what shard a draft target layer, so its
+    # scored prefill replicates 35.
+    draft_only = replace(speculation, mtp_only=True)
+    for layers, modes in ((17, {}), (37, {"prompt_logprobs": True}),
+                          (17, {"speculation": draft_only}),
+                          (35, {"speculation": draft_only, "prompt_logprobs": True})):
+        assert (plan(row_shard_attention=True, **modes).weights_bytes - plain.weights_bytes
+                == layers * per_layer), modes
+    # Pages are sized from what the weights leave, so the charge removes the pages they occupy.
+    assert plan(row_shard_attention=True).pages < plain.pages
 
 
 def test_the_export_command_plans_the_replicated_attention_charge(tmp_path):
@@ -308,7 +321,7 @@ def test_the_export_command_plans_the_replicated_attention_charge(tmp_path):
     from ignition.cli import preparation
     from ignition.cli.config import Configuration
     from ignition.recipes import resolve
-    from ignition.recipes.deepseek41.config import replicated_attention_bytes
+    from ignition.recipes.deepseek41.config import replicated_attention_bytes, replicated_layer_bytes
 
     path = tmp_path / "flare.toml"
     path.write_text("")
@@ -323,9 +336,10 @@ def test_the_export_command_plans_the_replicated_attention_charge(tmp_path):
     attention = preparation.derive(configuration, model, host, row_shard_attention=True, **settings)
     assert sharded.row_shard_prefill and not sharded.row_shard_attention
     assert attention.row_shard_prefill and attention.row_shard_attention
-    # The 40 backbone layers replicate 121.11 MB each at TP4, and the rank keeps its partition
-    # beside them, so the estimate grows by the whole replicated extent the loader holds.
-    assert replicated_attention_bytes(4) == 4_844_421_120
+    # The 17 layers a packed prefill can shard replicate 121.11 MB each at TP4, and the rank keeps
+    # its partition beside them, so the estimate grows by the whole replicated extent the loader
+    # holds.
+    assert replicated_attention_bytes(4) == 17 * replicated_layer_bytes(4) == 2_058_878_976
     assert attention.weights_bytes - sharded.weights_bytes == replicated_attention_bytes(4)
     # Pages are sized from what the weights leave, so the charge takes back the pages they occupy,
     # less the partial page each of the two divisions rounds down on its own.

@@ -27,13 +27,37 @@ def test_attention_weight_extents_partition_per_rank_and_replicate_every_group()
     assert all(extent.all_sink == (0, 64) for extent in extents)
 
 
-def test_replicated_attention_weights_cost_the_documented_bytes_per_rank():
+def _checkpoint(**changes):
+    """The checkpoint's text and quantization blocks, with two Engram layers and three targets."""
+    from ignition.recipes.deepseek41.config import TEXT_GEOMETRY
+
+    return {"model_type": "deepseek_v41", "architectures": ["DeepseekV41ForCausalLM"],
+            "text_config": {**TEXT_GEOMETRY, "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+                "kv_source_layer_ids": [2, 8, 14, 20], "engram_layer_ids": [1, 14],
+                "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+                "candidate_source_layer_id": 20, "num_nextn_predict_layers": 3,
+                "dspark_block_size": 5, "dspark_noise_token_id": 128799,
+                "dspark_target_layer_ids": [37, 38, 39], "dspark_markov_rank": 256,
+                "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3, **changes},
+            "quantization_config": {"quant_method": "fp8", "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0", "expert_dtype": "fp4", "activation_scheme": "dynamic"}}
+
+
+def _model_config(**changes):
+    """The checkpoint config as the loader parses it, with `changes` replacing text entries."""
+    from ignition.recipes.deepseek41.config import ModelConfig
+
+    return ModelConfig.from_dict(_checkpoint(**changes))
+
+
+def test_replicated_attention_weights_charge_the_layers_a_prefill_can_shard():
     from ignition.components.parallel import TensorParallelShard
     from ignition.recipes.deepseek41.config import (TEXT_GEOMETRY, attention_weight_extents,
                                                     replicated_attention_bytes)
 
     text = TEXT_GEOMETRY
-    hidden, q_lora, layers = text["hidden_size"], text["q_lora_rank"], text["num_hidden_layers"]
+    config = _model_config()
+    hidden, q_lora = text["hidden_size"], text["q_lora_rank"]
     extent = attention_weight_extents(text, TensorParallelShard(0, 4))
     group_width = text["num_attention_heads"] * text["head_dim"] // text["o_groups"]
     extra_heads = extent.all_heads[1] - extent.all_heads[0] - extent.heads[1] + extent.heads[0]
@@ -41,22 +65,137 @@ def test_replicated_attention_weights_cost_the_documented_bytes_per_rank():
     # wq_b gains rows, wo_a gains group rows at the fixed 4096-wide group input, and wo_b gains
     # its group columns. MXFP8 holds one value byte per weight and one scale byte per 32 values.
     per_layer = extra_heads * q_lora + extra_groups * group_width + extra_groups * hidden
-    delta = per_layer * layers * (1 + 1 / 32)
-    assert 3.6e9 < delta < 3.7e9, delta
-    # The replication loads the whole extent on every rank, and the rank keeps its own partition
-    # beside it for decode, so resident weight grows by the whole 4.84 GB while 3.63 GB of it is
-    # material the rank never held.
     heads = text["num_attention_heads"] * text["head_dim"]
     groups = text["o_groups"] * text["o_lora_rank"]
-    replicated = (heads * q_lora + groups * group_width + groups * hidden) * layers * (1 + 1 / 32)
+    replicated = (heads * q_lora + groups * group_width + groups * hidden) * (1 + 1 / 32)
     partitioned = (extent.heads[1] - extent.heads[0]) * q_lora + (extent.groups[1] - extent.groups[0]) * (
         group_width + hidden)
-    assert 4.8e9 < replicated < 4.9e9, replicated
-    assert 120e6 < replicated / layers < 122e6, replicated / layers
-    assert abs(replicated - delta - partitioned * layers * (1 + 1 / 32)) < 1.0
-    # The plan charges the replicated extent for every layer, so `weights_bytes` grows by the whole
-    # 4.84 GB rather than by the 3.63 GB beyond the partition.
-    assert replicated_attention_bytes(4) == round(replicated) == 4_844_421_120
+    partitioned *= 1 + 1 / 32
+    assert 120e6 < replicated < 122e6, replicated
+    assert abs(replicated - per_layer * (1 + 1 / 32) - partitioned) < 1.0
+    # Only a layer some prepared prefill runs on the shard loads the replicated extent, and the
+    # rank keeps its own partition beside it for decode, so resident weight grows by the whole
+    # replicated extent while the difference is material the rank never held.
+    packed = len(config.shardable_attention_layers(config.prefill_stop(False)))
+    scored = len(config.shardable_attention_layers(config.prefill_stop(True)))
+    draft_only = len(config.shardable_attention_layers(config.prefill_stop(True), config.draft.target_layers))
+    assert (packed, scored, draft_only) == (17, 37, 35)
+    for layers, total, extra in ((packed, 2.06e9, 1.54e9), (scored, 4.48e9, 3.36e9)):
+        assert abs(layers * replicated - total) < 0.01e9, layers * replicated
+        assert abs(layers * (replicated - partitioned) - extra) < 0.01e9, layers * (replicated - partitioned)
+    # The plan charges exactly the layers the loader replicates in each prefill mode, so a mode
+    # that shards fewer layers also holds less replicated weight.
+    for layers, modes in ((packed, {}), (scored, {"prompt_logprobs": True}),
+                          (packed, {"mtp_only": True}),
+                          (draft_only, {"mtp_only": True, "prompt_logprobs": True})):
+        assert replicated_attention_bytes(4, **modes) == round(layers * replicated), modes
+
+
+def test_only_layers_a_prepared_prefill_can_shard_load_the_replicated_projection(monkeypatch):
+    """A layer no prepared prefill runs on the shard keeps only its partition.
+
+    The packed prefill stops at the decoder boundary, whose suffix a replay restores from full
+    rows, so 17 of the 40 backbone layers replicate. Scored prefill replays no suffix and stops
+    below the last layer, so 37 do. A draft-target layer runs full-row only in the graphs that load
+    the draft, and every plan that loads the draft prepares those graphs beside the ones without
+    it, so its target layers stay in the shardable set unless the plan builds draft graphs only.
+    """
+    from ignition.components import block_fp8_weights
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.recipes.deepseek41 import weights
+    from ignition.recipes.deepseek41.config import ModelConfig
+    from ignition.recipes.deepseek41.decoder import shard_schedule
+
+    config, targets = _model_config(), (37, 38, 39)
+    # The loader reads the checkpoint's config and hands manifest reads to its base class, whose
+    # tensor transfers this case replaces; construction and the load decisions stay the real ones.
+    monkeypatch.setattr(weights, "persistent_copy", lambda tensor: tensor)
+    monkeypatch.setattr(ModelConfig, "load", classmethod(lambda cls, snapshot: config))
+    monkeypatch.setattr(block_fp8_weights.BlockFP8WeightLoader, "__init__", lambda self, *a, **k: None)
+
+    class RecordingLoader(weights.DeepSeekWeightLoader):
+        """Substitute tensor reads with placeholders, keeping the load decisions."""
+
+        def _record(self, *request):
+            return torch.zeros((), dtype=torch.float32)
+
+        def load_linear_group(self, prefixes, **_):
+            return self._record(prefixes)
+
+        def load_linear(self, prefix, **_):
+            return self._record(prefix)
+
+        def load_linear_columns(self, prefix, column_ranges):
+            return self._record(prefix, column_ranges)
+
+        def load_tensor(self, name, **_):
+            return self._record(name)
+
+        def load_padded_tensor(self, name, **_):
+            return self._record(name)
+
+        def load_attention_output(self, prefix, groups, **_):
+            return self._record(prefix, groups)
+
+        def load_experts(self, prefixes, interval):
+            return self._record(prefixes)
+
+    def replicated(prompt_logprobs=False, *, dspark=True, mtp_only=False):
+        loader = RecordingLoader(SimpleNamespace(metadata_path=None), None, shard=TensorParallelShard(0, 4),
+                                 dspark=dspark, row_shard_attention=True, prompt_logprobs=prompt_logprobs,
+                                 mtp_only=mtp_only)
+        loaded = {index for index in range(config.layers)
+                  if {"q_b_full", "output_full", "sink_full"} <= set(loader.load_layer(index).attention)}
+        assert loaded == set(loader.shardable_layers)
+        return loaded
+
+    def scheduled(stop, aux=()):
+        return {index for index, entry in enumerate(shard_schedule(config, stop, object(), aux)) if entry[0]}
+
+    packed = replicated()
+    assert sorted(packed) == [0, *range(2, 14), *range(15, 19)]
+    # Neither mode's packed prefill reaches the draft target layers, so both schedules agree.
+    assert packed == scheduled(config.decoder_start - 1) == scheduled(config.decoder_start - 1, targets)
+    scored = replicated(True)
+    assert sorted(scored) == [index for index in range(39) if index not in (1, 14)]
+    assert scored == scheduled(config.layers - 1)
+    # The graphs that load the draft hold its target layers full-row, and the graphs without it do
+    # not, so the loader's set is the wider of the two.
+    assert scheduled(39, targets) == set(range(39)) - {1, 14, 37, 38}
+    assert packed < scheduled(39, targets) < scored
+    # A draft-only plan builds no prefill graph without the draft, so its scored prefill shards
+    # every layer below the three target layers and the loader stops replicating those three.
+    draft_only = replicated(True, mtp_only=True)
+    assert sorted(draft_only) == [index for index in range(37) if index not in (1, 14)]
+    assert draft_only == scheduled(config.layers - 1, targets) and draft_only < scored
+    # Without scored prefill the stop lies below every target layer, so the set does not change.
+    assert replicated(mtp_only=True) == packed
+
+
+def test_a_schedule_planning_did_not_qualify_still_loads_without_row_shard_attention(monkeypatch):
+    """Only a row-sharded attention load reads the schedule the plan sizes its charge from."""
+    from ignition.components import block_fp8_weights
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.recipes.deepseek41 import weights
+    from ignition.recipes.deepseek41.config import ModelConfig
+
+    # Another Engram set, another draft target set, and a checkpoint that declares no targets, which
+    # reads as an empty set.
+    for change in ({"engram_layer_ids": [1, 13]}, {"dspark_target_layer_ids": [36, 37, 38]},
+                   {"dspark_target_layer_ids": []}):
+        config = ModelConfig.from_dict(_checkpoint(**change))
+        assert config.layers == 40
+        monkeypatch.setattr(ModelConfig, "load", classmethod(lambda cls, snapshot: config))
+        monkeypatch.setattr(block_fp8_weights.BlockFP8WeightLoader, "__init__", lambda self, *a, **k: None)
+        # A plan without the option replicates no attention weights, so it loads this checkpoint.
+        plain = weights.DeepSeekWeightLoader(SimpleNamespace(metadata_path=None), None,
+                                             shard=TensorParallelShard(0, 4))
+        assert not plain.row_shard_attention
+        # The charge comes from `QUALIFIED_SCHEDULE` before the checkpoint is read, so the option
+        # refuses a schedule the plan did not size.
+        with pytest.raises(ValueError, match="row-sharded attention"):
+            weights.DeepSeekWeightLoader(SimpleNamespace(metadata_path=None), None,
+                                         shard=TensorParallelShard(0, 4), row_shard_attention=True)
 
 
 def _surfaces(monkeypatch, *, abi=11, pipe_bytes=1 << 26):
@@ -173,8 +312,10 @@ def _indexing_config(sources, candidate):
         index_source=lambda layer: next((i for i in reversed(sources) if i <= layer), None))
 
 
-def _scheduled_layers(engram=(1, 14)):
-    return [SimpleNamespace(engram=object() if index in engram else None) for index in range(40)]
+def _schedule_config(engram=(1, 14)):
+    from ignition.recipes.deepseek41.config import ModelConfig
+
+    return ModelConfig({"num_hidden_layers": 40, "engram_layer_ids": list(engram)}, {})
 
 
 def test_selection_moves_follow_the_row_transition_around_the_engram_layer():
@@ -188,7 +329,7 @@ def test_selection_moves_follow_the_row_transition_around_the_engram_layer():
     from ignition.recipes.deepseek41.decoder import SelectionMove, selection_moves, shard_schedule
 
     config = _indexing_config([2, 8, 14, 20, 24, 28, 32, 36], 20)
-    packed = selection_moves(config, shard_schedule(_scheduled_layers(), 18, object()), attention_shard=True)
+    packed = selection_moves(config, shard_schedule(_schedule_config(), 18, object()), attention_shard=True)
     # A source reads no carried selection, so layer 14 only writes its own, in full rows.
     assert all(move is None for move in packed[:15])
     assert packed[15] == SelectionMove(14, "full_to_shard")
@@ -196,7 +337,7 @@ def test_selection_moves_follow_the_row_transition_around_the_engram_layer():
     assert packed[18] == SelectionMove(14, "shard_to_full")
     assert all(move is None for move in packed[19:])
     # Attention sharding is the only thing that creates the two representations.
-    assert selection_moves(config, shard_schedule(_scheduled_layers(), 18, object()),
+    assert selection_moves(config, shard_schedule(_schedule_config(), 18, object()),
                            attention_shard=False) == (None,) * 40
 
 
@@ -205,7 +346,7 @@ def test_a_full_row_consumer_gathers_a_sharded_sources_selection():
     from ignition.recipes.deepseek41.decoder import SelectionMove, selection_moves, shard_schedule
 
     config = _indexing_config([2, 8, 14, 20, 24, 28, 32, 36], 20)
-    scored = selection_moves(config, shard_schedule(_scheduled_layers(), 39, object()), attention_shard=True)
+    scored = selection_moves(config, shard_schedule(_schedule_config(), 39, object()), attention_shard=True)
     assert scored[15] == SelectionMove(14, "full_to_shard")
     assert all(move is None for move in scored[16:39])
     assert scored[39] == SelectionMove(36, "shard_to_full")
@@ -285,17 +426,20 @@ def _full_row_layer(monkeypatch, scratch, metadata, *, index, selection_move, sh
 
 @pytest.mark.parametrize("scored", [False, True])
 def test_the_layer_that_crosses_back_to_full_rows_gathers_the_carried_selection(monkeypatch, scored):
-    """A full-row consumer gathers the selection through the decoder's carried shard.
+    """Packed V4.1 prefill stops at layer 19, which reads the selection layers 15-18 wrote on the shard.
 
-    Packed and scored schedules cross back to full rows after different index sources.
-    The consuming layer has no shard of its own, but its attention needs full-row selection.
+    `shard_schedule` leaves the layer at the stop, and the DSpark target layers a scored prefill
+    loads, on full rows, so `selection_moves` gives that layer a shard-to-full move. It runs no
+    shard of its own, so the move gathers through the decoder's shard into the full-row selection
+    its own attention reads.
     """
     from ignition.recipes.deepseek41 import decoder
 
-    config = _indexing_config([2, 8, 14, 20, 24, 28, 32, 36], 20)
-    crossing = 39 if scored else 18
-    schedule = decoder.shard_schedule(_scheduled_layers(), crossing, object())
+    config = _model_config()
+    stop = config.prefill_stop(scored)
+    schedule = decoder.shard_schedule(config, stop, object(), config.draft.target_layers)
     moves = decoder.selection_moves(config, schedule, attention_shard=True)
+    crossing = config.draft.target_layers[0] if scored else stop
     assert schedule[crossing][0] is False
     assert moves[crossing] == decoder.SelectionMove(14 if not scored else 36, "shard_to_full")
 

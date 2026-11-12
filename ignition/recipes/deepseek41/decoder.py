@@ -156,24 +156,25 @@ def attention_shard_ready(scratch, shard, runtime):
                                           scratch.attention.selected.view(torch.bfloat16)))
 
 
-def shard_schedule(layers, stop, sharded, aux_layers=()):
+def shard_schedule(config, stop, sharded, aux_layers=()):
     """Per-layer `(shard, defer, reseed)` for a prefill decoder whose shard exists.
 
-    Layers below `stop` that are not Engram layers keep this rank's rows. An Engram layer reads and
-    writes full rows, so it runs full-row, and the layers on either side of it change row dimension:
-    a layer that lands on the far side of such a change runs its own post, so the full-row residual
-    its consumer reads is complete, and the first sharded layer after a full-row run reseeds the
-    shard from the rows it owns.
+    The layers `config.shardable_attention_layers` names keep this rank's rows. An Engram layer
+    reads and writes full rows, so it runs full-row, and the layers on either side of it change row
+    dimension: a layer that lands on the far side of such a change runs its own post, so the
+    full-row residual its consumer reads is complete, and the first sharded layer after a full-row
+    run reseeds the shard from the rows it owns.
     """
+    shardable = set(config.shardable_attention_layers(stop, aux_layers))
+    engram = set(config.text["engram_layer_ids"])
     def sharded_at(index):
-        return (sharded is not None and index < stop and index < len(layers)
-                and index not in aux_layers and layers[index].engram is None)
+        return sharded is not None and index in shardable
     schedule = []
-    for index in range(len(layers)):
+    for index in range(config.layers):
         shard = sharded_at(index)
         # Deferred post hands this layer's four streams to the next layer's attention mHC, which
         # reads them only when both layers hold the same rows.
-        defer = (index + 1 < len(layers) and layers[index + 1].engram is None
+        defer = (index + 1 < config.layers and index + 1 not in engram
                  and index + 1 not in aux_layers and sharded_at(index + 1) == shard)
         schedule.append((shard, defer, shard and index > 0 and not sharded_at(index - 1)))
     return schedule
@@ -617,9 +618,9 @@ class PreparedDecoder:
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
-        # Layers below `stop` run row-sharded; the layer at `stop - 1` materializes every row again
-        # so the decoder suffix keeps its full-row boundary and replay gather.
-        stop = (len(weights.layers) if self.packing is None else decoder_start) - 1
+        # Layers below the prefill's stop run row-sharded; the layer at `stop - 1` materializes
+        # every row again so the decoder suffix keeps its full-row boundary and replay gather.
+        stop = weights.config.prefill_stop(self.packing is None)
         self.row_shard = scratch.row_shard
         if (self.row_shard is None or mode != "prefill" or stop < 1
                 or not row_shard_ready(scratch, self.row_shard, runtime)):
@@ -627,7 +628,7 @@ class PreparedDecoder:
         # Attention joins the shard only when the bootstrap asked and its gathers are served too.
         self.attention_shard = (self.row_shard is not None and mode == "prefill" and row_shard_attention
                                 and attention_shard_ready(scratch, self.row_shard, runtime))
-        schedule = shard_schedule(weights.layers, stop, self.row_shard, self.aux_layers)
+        schedule = shard_schedule(weights.config, stop, self.row_shard, self.aux_layers)
         moves = selection_moves(weights.config, schedule, attention_shard=self.attention_shard)
         self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
         self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)

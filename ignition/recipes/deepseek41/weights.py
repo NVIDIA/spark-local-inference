@@ -78,12 +78,14 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, row_shard_attention=False):
+             vocabulary_parallel_sampling=False, row_shard_attention=False, prompt_logprobs=False,
+             mtp_only=False):
         config = ModelConfig.load(manifest.metadata_path)
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression,
-                                 row_shard_attention=row_shard_attention) as loader:
+                                 row_shard_attention=row_shard_attention,
+                                 prompt_logprobs=prompt_logprobs, mtp_only=mtp_only) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -108,18 +110,34 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None, row_shard_attention=False):
+                 expert_scale_compression=None, row_shard_attention=False, prompt_logprobs=False,
+                 mtp_only=False):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
-        # A row-sharded prefill computes every head and every output group on each rank, so it also
-        # loads the replicated projections; the partitioned ones still serve decode and the suffix.
+        # A row-sharded prefill computes every head and every output group on each rank, so the
+        # layer also loads the replicated projections; the partitioned ones still serve decode,
+        # the suffix, and every layer no prepared prefill runs on the shard.
         self.row_shard_attention = row_shard_attention
+        self.mtp_only = mtp_only
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
+        if row_shard_attention:
+            self.config.require_planned_attention_schedule()
         self.shard = shard
+        self.shardable_layers = frozenset(self.config.shardable_attention_layers(
+            self.config.prefill_stop(prompt_logprobs), self._aux_layers()))
         self._expert_scale_scratch = {}
+
+    def _aux_layers(self):
+        """Draft target layers, which a prepared prefill leaves full-row when it holds the draft.
+
+        A plan that loads the draft also prepares every prefill graph without it, and those graphs
+        put the target layers on the shard, so the loader keeps them unless the plan builds draft
+        graphs only.
+        """
+        return self.config.draft.target_layers if self.dspark and self.mtp_only else ()
 
     def load_experts(self, prefixes, interval):
         text = self.config.text
@@ -148,7 +166,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             "kv_norm": self.load_tensor(attn + ".kv_norm.weight"),
             "sink": self.load_padded_tensor(attn + ".attn_sink", rows=extents.sink),
         }
-        if self.row_shard_attention and not draft:
+        if self.row_shard_attention and not draft and layer in self.shardable_layers:
             result["q_b_full"] = self.load_linear_group((attn + ".wq_b",), pad=True,
                 row_ranges=(extents.all_heads,))
             result["output_full"] = self.load_attention_output(attn, extents.all_groups, pad=True)
