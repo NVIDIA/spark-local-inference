@@ -120,28 +120,27 @@ fn parse_lldp(text: &str, netdevs: &[String]) -> std::collections::BTreeMap<Stri
     neighbors
 }
 
-/// LLDP neighbors of `netdevs` from lldpd (see `parse_lldp`); empty when lldpctl is missing, fails,
-/// or does not answer within two seconds.
+/// The standard output of `command` when it exits successfully within `limit`; None when it
+/// cannot start, fails, or is still running at the deadline, which covers both its output and
+/// its exit. A command still running at the deadline is killed and reaped.
 #[cfg(target_os = "linux")]
-fn lldp_neighbors(netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<String>> {
-    use std::process::{Command, Stdio};
-    if netdevs.is_empty() {
-        return Default::default();
-    }
-    let Ok(mut child) = Command::new("lldpctl")
-        .args(["-f", "keyvalue"])
-        .args(netdevs)
+fn bounded_output(
+    mut command: std::process::Command,
+    limit: std::time::Duration,
+) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + limit;
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return Default::default();
-    };
+        .ok()?;
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Default::default();
+        return None;
     };
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -149,14 +148,41 @@ fn lldp_neighbors(netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<
         let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
         let _ = send.send(text);
     });
-    let text = receive.recv_timeout(std::time::Duration::from_secs(2)).ok();
-    if text.is_none() {
+    let text = receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok();
+    let mut status = None;
+    if text.is_some() {
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    }
+    if status.is_none() {
         let _ = child.kill();
+        let _ = child.wait();
     }
-    match (text, child.wait()) {
-        (Some(text), Ok(status)) if status.success() => parse_lldp(&text, netdevs),
-        _ => Default::default(),
+    text.filter(|_| status.is_some_and(|s| s.success()))
+}
+
+/// LLDP neighbors of `netdevs` from lldpd (see `parse_lldp`); empty when lldpctl is missing, fails,
+/// or has not answered and exited within two seconds.
+#[cfg(target_os = "linux")]
+fn lldp_neighbors(netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<String>> {
+    if netdevs.is_empty() {
+        return Default::default();
     }
+    let mut command = std::process::Command::new("lldpctl");
+    command.args(["-f", "keyvalue"]).args(netdevs);
+    bounded_output(command, std::time::Duration::from_secs(2))
+        .map(|text| parse_lldp(&text, netdevs))
+        .unwrap_or_default()
 }
 
 impl Endpoint {
@@ -1796,6 +1822,35 @@ mod tests {
         assert_eq!(
             plan_routes(&mixed, 0, 1, Links::Shared).unwrap()[1],
             vec![(1, 1)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_is_bounded_by_one_deadline_for_its_output_and_exit() {
+        let shell = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        let limit = std::time::Duration::from_millis(300);
+        assert_eq!(
+            bounded_output(shell("echo listed"), limit).as_deref(),
+            Some("listed\n")
+        );
+        assert_eq!(bounded_output(shell("echo listed; exit 1"), limit), None);
+        // Closing standard output and staying alive, or holding it open, both meet the deadline.
+        for script in ["echo listed; exec >&-; sleep 10", "sleep 10"] {
+            let started = std::time::Instant::now();
+            assert_eq!(bounded_output(shell(script), limit), None, "{script}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{script}"
+            );
+        }
+        assert_eq!(
+            bounded_output(std::process::Command::new("/nonexistent/lldpctl"), limit),
+            None
         );
     }
 }
