@@ -8,6 +8,7 @@ from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+from .config import replicated_attention_bytes
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -71,4 +72,5 @@ RECIPE = Recipe(
     stream_overlap=True,
     ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4)}),
     plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4)}),
+    replicated_attention_bytes=replicated_attention_bytes,
 )

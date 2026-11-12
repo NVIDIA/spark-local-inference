@@ -65,13 +65,13 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         prefill_chunk=prefill_chunk, context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
-        online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
+        online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode,
+        row_shard_prefill=row_shard_prefill, row_shard_attention=row_shard_attention)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", force_moe_decode_a16).value,
                      joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
-                     row_shard_prefill=row_shard_prefill, row_shard_attention=row_shard_attention,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
 

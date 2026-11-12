@@ -11,9 +11,9 @@ import torch
 
 def test_attention_weight_extents_partition_per_rank_and_replicate_every_group():
     from ignition.components.parallel import TensorParallelShard
-    from ignition.recipes.deepseek41.weights import attention_weight_extents
+    from ignition.recipes.deepseek41.config import TEXT_GEOMETRY, attention_weight_extents
 
-    text = {"head_dim": 512, "num_attention_heads": 64, "o_groups": 8, "o_lora_rank": 1024}
+    text = TEXT_GEOMETRY
     extents = [attention_weight_extents(text, TensorParallelShard(rank, 4)) for rank in range(4)]
     # The tensor-parallel partition keeps 16 heads and 2 output groups per rank: disjoint and whole.
     assert [extent.heads for extent in extents] == [
@@ -29,10 +29,11 @@ def test_attention_weight_extents_partition_per_rank_and_replicate_every_group()
 
 def test_replicated_attention_weights_cost_the_documented_bytes_per_rank():
     from ignition.components.parallel import TensorParallelShard
-    from ignition.recipes.deepseek41.weights import attention_weight_extents
+    from ignition.recipes.deepseek41.config import (TEXT_GEOMETRY, attention_weight_extents,
+                                                    replicated_attention_bytes)
 
-    text = {"head_dim": 512, "num_attention_heads": 64, "o_groups": 8, "o_lora_rank": 1024}
-    hidden, q_lora, layers = 5120, 1280, 40
+    text = TEXT_GEOMETRY
+    hidden, q_lora, layers = text["hidden_size"], text["q_lora_rank"], text["num_hidden_layers"]
     extent = attention_weight_extents(text, TensorParallelShard(0, 4))
     group_width = text["num_attention_heads"] * text["head_dim"] // text["o_groups"]
     extra_heads = extent.all_heads[1] - extent.all_heads[0] - extent.heads[1] + extent.heads[0]
@@ -41,7 +42,21 @@ def test_replicated_attention_weights_cost_the_documented_bytes_per_rank():
     # its group columns. MXFP8 holds one value byte per weight and one scale byte per 32 values.
     per_layer = extra_heads * q_lora + extra_groups * group_width + extra_groups * hidden
     delta = per_layer * layers * (1 + 1 / 32)
-    assert 3.5e9 < delta < 3.8e9, delta
+    assert 3.6e9 < delta < 3.7e9, delta
+    # The replication loads the whole extent on every rank, and the rank keeps its own partition
+    # beside it for decode, so resident weight grows by the whole 4.84 GB while 3.63 GB of it is
+    # material the rank never held.
+    heads = text["num_attention_heads"] * text["head_dim"]
+    groups = text["o_groups"] * text["o_lora_rank"]
+    replicated = (heads * q_lora + groups * group_width + groups * hidden) * layers * (1 + 1 / 32)
+    partitioned = (extent.heads[1] - extent.heads[0]) * q_lora + (extent.groups[1] - extent.groups[0]) * (
+        group_width + hidden)
+    assert 4.8e9 < replicated < 4.9e9, replicated
+    assert 120e6 < replicated / layers < 122e6, replicated / layers
+    assert abs(replicated - delta - partitioned * layers * (1 + 1 / 32)) < 1.0
+    # The plan charges the replicated extent for every layer, so `weights_bytes` grows by the whole
+    # 4.84 GB rather than by the 3.63 GB beyond the partition.
+    assert replicated_attention_bytes(4) == round(replicated) == 4_844_421_120
 
 
 def _surfaces(monkeypatch, *, abi=11, pipe_bytes=1 << 26):

@@ -7,6 +7,9 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+
+from ignition.components.parallel import TensorParallelShard
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,52 @@ class DSparkConfig:
         return result
 
 
+# The geometry the DeepSeek V4.1 Flash checkpoint must declare. Weight-layout and memory tests read
+# these values instead of repeating them, so a geometry change fails the config check first.
+TEXT_GEOMETRY = {
+    "hidden_size": 5120, "num_hidden_layers": 40, "num_attention_heads": 64,
+    "num_key_value_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64,
+    "q_lora_rank": 1280, "o_lora_rank": 1024, "o_groups": 8,
+    "vocab_size": 129280, "moe_intermediate_size": 2304, "n_routed_experts": 384,
+    "n_shared_experts": 1, "num_experts_per_tok": 6, "scoring_func": "sqrtsoftplus",
+    "index_n_heads": 32, "index_head_dim": 128, "index_topk": 512,
+    "candidate_topk_blocks": 2048, "candidate_block_size": 8, "hc_mult": 4,
+    "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
+    "engram_head_dim": 256,
+}
+
+
+def attention_weight_extents(text, shard):
+    """Checkpoint row extents for the attention projections, per rank and replicated.
+
+    A tensor-parallel rank packs its share of the eight head blocks and eight output groups. A
+    row-sharded prefill rank instead owns every head and every output group, so `all_heads`,
+    `all_groups`, and `all_sink` name the wholesale extents it replicates beside the partitioned ones.
+    """
+    first, last = shard.padded_partition(8)
+    return SimpleNamespace(
+        heads=(first * 8 * text["head_dim"], last * 8 * text["head_dim"]),
+        groups=(first * text["o_lora_rank"], last * text["o_lora_rank"]),
+        sink=(first * 8, last * 8),
+        all_heads=(0, text["num_attention_heads"] * text["head_dim"]),
+        all_groups=(0, text["o_groups"] * text["o_lora_rank"]),
+        all_sink=(0, text["num_attention_heads"]))
+
+
+def replicated_attention_bytes(world_size):
+    """Device bytes per rank that row-sharded attention replicates beyond its partition.
+
+    Every backbone layer loads all `num_attention_heads` head rows of `wq_b` and all `o_groups`
+    output groups of `wo_a` and `wo_b` on every rank, at MXFP8 packing: one value byte per weight
+    and one scale byte per 32 values. The rank keeps its own partition beside them for decode.
+    """
+    text, extent = TEXT_GEOMETRY, attention_weight_extents(TEXT_GEOMETRY, TensorParallelShard(0, world_size))
+    group_width = text["num_attention_heads"] * text["head_dim"] // text["o_groups"]
+    values = ((extent.all_heads[1] - extent.all_heads[0]) * text["q_lora_rank"]
+              + (extent.all_groups[1] - extent.all_groups[0]) * (group_width + text["hidden_size"]))
+    return text["num_hidden_layers"] * -(-values * 33 // 32)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     text: dict
@@ -64,17 +113,7 @@ class ModelConfig:
                 or config.get("architectures") != ["DeepseekV41ForCausalLM"]):
             raise ValueError("DeepSeek V4.1 requires DeepseekV41ForCausalLM")
         text, quant = config["text_config"], config["quantization_config"]
-        for name, value in {
-            "hidden_size": 5120, "num_hidden_layers": 40, "num_attention_heads": 64,
-            "num_key_value_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64,
-            "q_lora_rank": 1280, "o_lora_rank": 1024, "o_groups": 8,
-            "vocab_size": 129280, "moe_intermediate_size": 2304, "n_routed_experts": 384,
-            "n_shared_experts": 1, "num_experts_per_tok": 6, "scoring_func": "sqrtsoftplus",
-            "index_n_heads": 32, "index_head_dim": 128, "index_topk": 512,
-            "candidate_topk_blocks": 2048, "candidate_block_size": 8, "hc_mult": 4,
-            "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
-            "engram_head_dim": 256,
-        }.items():
+        for name, value in TEXT_GEOMETRY.items():
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
         if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]

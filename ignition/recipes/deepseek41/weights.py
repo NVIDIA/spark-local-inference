@@ -5,7 +5,6 @@
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
 from dataclasses import dataclass, replace
-from types import SimpleNamespace
 
 import torch
 
@@ -15,24 +14,7 @@ from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
-from .config import ModelConfig
-
-
-def attention_weight_extents(text, shard):
-    """Checkpoint row extents for the attention projections, per rank and replicated.
-
-    A tensor-parallel rank packs its share of the eight head blocks and eight output groups. A
-    row-sharded prefill rank instead owns every head and every output group, so `all_heads`,
-    `all_groups`, and `all_sink` name the wholesale extents it replicates beside the partitioned ones.
-    """
-    first, last = shard.padded_partition(8)
-    return SimpleNamespace(
-        heads=(first * 8 * text["head_dim"], last * 8 * text["head_dim"]),
-        groups=(first * text["o_lora_rank"], last * text["o_lora_rank"]),
-        sink=(first * 8, last * 8),
-        all_heads=(0, text["num_attention_heads"] * text["head_dim"]),
-        all_groups=(0, text["o_groups"] * text["o_lora_rank"]),
-        all_sink=(0, text["num_attention_heads"]))
+from .config import ModelConfig, attention_weight_extents
 
 
 @dataclass(frozen=True)

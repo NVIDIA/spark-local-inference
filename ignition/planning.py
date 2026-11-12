@@ -496,7 +496,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression,
+                                     row_shard_attention=row_shard_attention), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
@@ -598,7 +599,11 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
         world_sizes = tuple(size for size in world_sizes if size != 3)
-    sizes = " or ".join(map(str, world_sizes))
+    # Three ranks have no per-rank block of the recipe's chunk, so a row-sharded plan has no
+    # three-rank size to select automatically or to offer in a capacity error. An explicit
+    # three-rank selection still reaches the plan's own refusal.
+    plan_sizes = tuple(size for size in world_sizes if size != 3) if row_shard_prefill else world_sizes
+    sizes = " or ".join(map(str, plan_sizes))
     supported = [gpu for gpu in gpus if gpu.supported]
     chosen = None
     if selected is not None:
@@ -616,7 +621,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         for gpu in chosen:
             if not gpu.supported:
                 raise CapacityError(f"GPU {gpu.index} ({gpu.name}) is not an {SUPPORTED_ARCHITECTURES} device")
-    elif len(supported) < world_sizes[0]:
+    elif len(supported) < plan_sizes[0]:
         raise CapacityError(f"{checkpoint.alias} needs {sizes} {SUPPORTED_ARCHITECTURES} GPUs; this host has {len(supported)}")
 
     def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
@@ -641,7 +646,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     def candidates(**settings):
         if chosen is not None:
             return [fitted(chosen, **settings)]
-        return [automatic(size, **settings) for size in world_sizes if size <= len(supported)]
+        return [automatic(size, **settings) for size in plan_sizes if size <= len(supported)]
 
     def attempt(**settings):
         return next((candidate for candidate in candidates(**settings) if candidate.fits), None)
@@ -668,7 +673,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if speculation is not None and attempt(speculation=None) is not None:
         options.append("--no-mtp")
     if chosen is not None:
-        for size in world_sizes:
+        for size in plan_sizes:
             if len(chosen) < size <= len(supported) and (larger := automatic(size)).fits:
                 options.append(f"--gpus {format_gpus(gpu.index for gpu in larger.gpus)}")
                 break

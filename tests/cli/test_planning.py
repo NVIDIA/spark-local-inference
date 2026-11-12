@@ -283,6 +283,60 @@ def test_row_shard_attention_requires_row_shard_prefill_and_survives_rebuild_ser
                       row_shard_prefill=True, row_shard_attention=True)
 
 
+def test_row_shard_attention_charges_the_replicated_weights_to_the_plan():
+    """The plan counts the replicated attention extents, so page sizing leaves room for them."""
+    from ignition.recipes import resolve
+    from ignition.recipes.deepseek41.config import replicated_attention_bytes
+
+    model = resolve("deepseek-v4.1-flash")
+    gpus = tuple(gpu(index, 95) for index in range(4))
+    settings = dict(selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0,
+                    speculation=model.recipe.speculation, row_shard_prefill=True)
+    sharded = planning.plan(model.recipe, model.checkpoint, gpus, **settings)
+    attention = planning.plan(model.recipe, model.checkpoint, gpus, row_shard_attention=True, **settings)
+    # Every backbone layer replicates 121.11 MB at TP4, and the rank keeps its partition, so the
+    # estimate grows by the whole replicated extent the loader holds.
+    assert replicated_attention_bytes(4) == 4_844_421_120
+    assert attention.weights_bytes - sharded.weights_bytes == replicated_attention_bytes(4)
+    # The pages are sized from what the weights leave, so the charge removes the 42,525 pages the
+    # copies would otherwise occupy.
+    assert sharded.pages - attention.pages == 42525
+
+
+def test_the_export_command_plans_the_replicated_attention_charge(tmp_path):
+    """The export path's own plan counts the replicated weights, not only a direct `planning.plan`."""
+    from ignition.cli import preparation
+    from ignition.cli.config import Configuration
+    from ignition.recipes import resolve
+    from ignition.recipes.deepseek41.config import replicated_attention_bytes
+
+    path = tmp_path / "flare.toml"
+    path.write_text("")
+    configuration = Configuration.load(path)
+    model = resolve("deepseek-v4.1-flash")
+    # Devote 256 GiB per GPU so the plan is sized to the supply, not to this host's free memory.
+    devices = tuple(replace(gpu(index, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for index in range(4))
+    settings = dict(gpus="0,1,2,3", speculation=model.recipe.speculation, row_shard_prefill=True,
+                    concurrency=configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency, None))
+    host = preparation.Host(devices, None)
+    sharded = preparation.derive(configuration, model, host, **settings)
+    attention = preparation.derive(configuration, model, host, row_shard_attention=True, **settings)
+    assert sharded.row_shard_prefill and not sharded.row_shard_attention
+    assert attention.row_shard_prefill and attention.row_shard_attention
+    # The 40 backbone layers replicate 121.11 MB each at TP4, and the rank keeps its partition
+    # beside them, so the estimate grows by the whole replicated extent the loader holds.
+    assert replicated_attention_bytes(4) == 4_844_421_120
+    assert attention.weights_bytes - sharded.weights_bytes == replicated_attention_bytes(4)
+    # Pages are sized from what the weights leave, so the charge takes back the pages they occupy,
+    # less the partial page each of the two divisions rounds down on its own.
+    occupied = replicated_attention_bytes(4) / sharded.costs.page_bytes
+    assert abs(sharded.pages - attention.pages - occupied) < 1
+    # The flags now reach `plan`, so its own checks refuse attention without prefill.
+    with pytest.raises(UsageError, match="row-shard-prefill"):
+        preparation.derive(configuration, model, host, **{**settings, "row_shard_prefill": False},
+                           row_shard_attention=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)
