@@ -113,7 +113,8 @@ class CandidateSelectionTuning:
                 numerical_policy=numerics, namespace=namespace, coordinator=coordinator,
                 compile_workers=session.requested_compile_workers,
                 autotune_effort=session.autotune_effort, collective_tuning="static",
-                headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
+                headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks,
+                compile_headroom_bytes=session.compile_headroom_bytes) as trials:
             fixtures = {rows: _Fixture(rows, self.context, self.reduction, trials)
                         for rows in sorted(self.selections)}
             trials.tune(show_progress=False)

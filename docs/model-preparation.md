@@ -257,6 +257,14 @@ start under the 2 GiB minimum host allowance plus integrated device storage.
 These allowances estimate compiler demand; actual peaks depend on the forward.
 Linux cgroup-v2 memory limits also constrain the available RAM used for admission.
 
+Admission leaves 8 GiB of system memory free beside compiler workers and
+tuning races; on unified-memory GPUs, the plan's preparation headroom applies
+instead when it is larger. `--compile-headroom SIZE`, or
+`[preparation] compile_headroom = "SIZE"`, selects another value, such as `6G`;
+the flag overrides the setting. A smaller headroom can admit more compiler
+workers and tuning jobs when memory is tight, but leaves less for the rest of
+the host. The plan and tuning report record the value.
+
 On integrated GPUs, kernel tuning is divided into memory-bounded jobs. The
 terminal dashboard shows the active job number and total job count, with a
 separate live display for each job. Redirecting output records plain kernel
