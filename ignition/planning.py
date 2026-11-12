@@ -190,6 +190,9 @@ class Plan:
     collective_tuning: str | None = None
     joint_tuning: bool = False
     shard_hyperconnections: bool = False
+    # Prefill replaces each tensor-parallel all-reduce with a reduce-scatter, an mHC on one row
+    # shard, and a shard gather when the RoCE runtime serves those surfaces.
+    row_shard_prefill: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     force_moe_decode_a16: bool = False
@@ -261,6 +264,20 @@ class Plan:
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
             if self.world_size < 2:
                 raise UsageError("--shard-hyperconnections requires tensor parallelism")
+        if self.row_shard_prefill:
+            if self.recipe.name != "deepseek41":
+                raise UsageError("--row-shard-prefill requires DeepSeek V4.1")
+            if self.world_size < 2:
+                raise UsageError("--row-shard-prefill requires tensor parallelism")
+            # Row-sharded prefill is qualified only on SM121 at TP4. The recipe's 4,096-row chunk
+            # has no per-rank block at three ranks, though a 6,144-row chunk would give one.
+            if self.world_size == 3:
+                raise UsageError("--row-shard-prefill has no TP3 row partition; select four GPUs")
+            # The collectives are architecture independent, but the projections and experts on
+            # SM103 are a different kernel path.
+            if any(gpu.capability == (10, 3) for gpu in self.gpus):
+                raise UsageError("--row-shard-prefill is not qualified on SM103;"
+                                 " select SM120 or SM121 GPUs")
         if self.joint_tuning:
             if self.recipe.name != "deepseek41":
                 raise UsageError("--joint-tuning requires DeepSeek V4.1")
@@ -376,6 +393,7 @@ class Plan:
             "collective_ladder": self.collective_ladder,
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
+            "row_shard_prefill": self.row_shard_prefill,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "force_moe_decode_a16": self.force_moe_decode_a16,
@@ -416,7 +434,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
-        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        language_model_only: bool = False, mla_compute_mode: str | None = None,
+        row_shard_prefill: bool = False) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -474,7 +493,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                mla_compute_mode=mla_compute_mode,
+                row_shard_prefill=row_shard_prefill, mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope,
@@ -532,7 +551,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+         language_model_only: bool = False, mla_compute_mode: str | None = None,
+         row_shard_prefill: bool = False) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -597,6 +617,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
+                   row_shard_prefill=row_shard_prefill,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)

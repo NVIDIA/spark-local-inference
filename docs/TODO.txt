@@ -461,3 +461,12 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Qualify row-sharded prefill at three ranks. The DeepSeek V4.1 recipe's
+    4,096-row chunk has no per-rank block at three ranks, though a 6,144-row
+    chunk would. Close when an export and native serve with --row-shard-prefill
+    complete at three ranks.
+
+[ ] Qualify row-sharded prefill on SM103, where its projections and experts run
+    a different kernel path from SM121. Close when an export and native serve
+    with --row-shard-prefill complete on SM103.

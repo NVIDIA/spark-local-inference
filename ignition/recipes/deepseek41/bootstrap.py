@@ -101,6 +101,9 @@ class PreparationConfig:
     autotune_effort: str = "default"
     joint_tuning: bool = False
     tuning_replica: TuningReplica | None = None
+    # Prefill reductions keep each rank's contiguous row shard and gather the branch input that
+    # every row's consumers read.
+    row_shard_prefill: bool = False
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
@@ -413,10 +416,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if (weights.config.decoder_start is not None
                 and weights.config.text["candidate_source_layer_id"] >= weights.config.decoder_start):
             candidate_tokens = min(candidate_tokens, 128)
+        row_shard = shard if config.row_shard_prefill else None
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=candidate_tokens)
+            candidate_tokens=candidate_tokens, row_shard=row_shard)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            candidate_tokens=config.prefill_chunk_size)
+            candidate_tokens=config.prefill_chunk_size, row_shard=row_shard)
             if config.prompt_logprobs else None)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
         vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
@@ -507,6 +511,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
                         )
+                    if (config.row_shard_prefill and mode == "prefill" and decoder.row_shard is None
+                            and progress is not None):
+                        progress(f"{name}: row-sharded prefill falls back to full-row prefill for this capacity")
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
                         context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
