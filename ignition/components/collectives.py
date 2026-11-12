@@ -288,6 +288,124 @@ class PreparedChunkedAllReduce:
         return output
 
 
+@torch.library.custom_op("flare::roce_reduce_scatter", mutates_args=("output",))
+def _reduce_scatter(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.reduce_scatter(source, out=output, plan=owner.plan)
+
+
+@_reduce_scatter.register_fake
+def _fake_reduce_scatter(source, output, handle):
+    pass
+
+
+@torch.library.custom_op("flare::roce_gather_shards", mutates_args=("output",))
+def _gather_shards(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.gather_shards(source, out=output, plan=owner.plan)
+
+
+@_gather_shards.register_fake
+def _fake_gather_shards(source, output, handle):
+    pass
+
+
+class PreparedReduceScatter:
+    """Reduce every rank's [rows, columns] partial sums and keep this rank's contiguous row shard.
+
+    Rank r's output holds rows [r * rows / world, (r + 1) * rows / world) of the
+    sum with the arithmetic of the runtime's two-shot all-reduce, so a
+    PreparedShardGather of every rank's output reproduces that all-reduce's
+    bits. Ranks on separate hosts reduce through RoCEnante's pipelined path,
+    whose eligibility `fits` reports. A component given no runtime serves one
+    rank: the output is the source, copied.
+    """
+
+    @staticmethod
+    def fits(runtime, source):
+        """True when every rank can reduce-scatter `source` through `runtime` (rank-uniform)."""
+        return runtime is None or (_roce(runtime) and runtime.should_reduce_scatter(source))
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        import torch.distributed as dist
+
+        self.runtime, self.output = runtime, output
+        self.single = runtime is None
+        if runtime is None:
+            if source.shape != output.shape or source.dtype != output.dtype:
+                raise ValueError("a single-rank reduce-scatter copies its source into a matching output")
+            return
+        if not _roce(runtime):
+            raise ValueError("reduce-scatter runs over RoCEnante")
+        if (source.ndim != 2 or source.dtype != torch.bfloat16 or not runtime.should_reduce_scatter(source)
+                or output.shape != (source.shape[0] // runtime.world_size, source.shape[1])
+                or output.dtype != source.dtype or not output.is_contiguous()):
+            raise ValueError("RoCE reduce-scatter requires a contiguous BF16 [rows, columns] source whose rows divide "
+                             "by the world size within the pipelined capacity, and a matching row-shard output")
+        self.plan = _roce_plan(runtime, coordinator, "AllReduce.reduce_scatter")
+        ranks = tuple(dist.get_process_group_ranks(runtime._group))
+        declare(session, (self.plan.request(name=name,
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: runtime._run_prepared_reduce_scatter(source, prepared=state, out=output),
+                output=output, owners=(runtime, source, output)),
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    def __call__(self, source):
+        if self.single:
+            self.output.copy_(source)
+            return self.output
+        _reduce_scatter(source, self.output, self.handle)
+        return self.output
+
+
+class PreparedShardGather:
+    """Gather every rank's [rows / world, columns] row shard into [rows, columns] in rank order.
+
+    The inverse of PreparedReduceScatter over the same pipelined RoCEnante path.
+    A component given no runtime serves one rank: the output is the source, copied.
+    """
+
+    @staticmethod
+    def fits(runtime, source):
+        """True when every rank can gather its shard `source` through `runtime` (rank-uniform)."""
+        return runtime is None or (_roce(runtime) and runtime.should_gather_shards(source))
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        import torch.distributed as dist
+
+        self.runtime, self.output = runtime, output
+        self.single = runtime is None
+        if runtime is None:
+            if source.shape != output.shape or source.dtype != output.dtype:
+                raise ValueError("a single-rank shard gather copies its source into a matching output")
+            return
+        if not _roce(runtime):
+            raise ValueError("shard gathers run over RoCEnante")
+        if (source.ndim != 2 or source.dtype != torch.bfloat16 or not runtime.should_gather_shards(source)
+                or output.shape != (source.shape[0] * runtime.world_size, source.shape[1])
+                or output.dtype != source.dtype or not output.is_contiguous()):
+            raise ValueError("RoCE shard gathers require a contiguous BF16 [rows, columns] shard within the pipelined "
+                             "capacity and a matching world-fold output")
+        self.plan = _roce_plan(runtime, coordinator, "AllReduce.gather_shards")
+        ranks = tuple(dist.get_process_group_ranks(runtime._group))
+        declare(session, (self.plan.request(name=name,
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: runtime._run_prepared_gather_shards(source, prepared=state, out=output),
+                output=output, owners=(runtime, source, output)),
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    def __call__(self, source):
+        if self.single:
+            self.output.copy_(source)
+            return self.output
+        _gather_shards(source, self.output, self.handle)
+        return self.output
+
+
 @dataclass(frozen=True)
 class WeightedGroupSource:
     """Ordered weighted groups with physical [rows, groups, hidden] storage.
