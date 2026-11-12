@@ -437,10 +437,7 @@ pub(super) fn render(
         .collect::<Result<Vec<_>>>()?;
     let mut token_ids = Vec::new();
     let mut offsets = Vec::new();
-    let plain = frontend
-        .ordinary_tokenizer
-        .as_ref()
-        .expect("DeepSeek plain tokenizer is initialized");
+    let plain = frontend.ordinary();
     let mut start = 0;
     let mut image_count = 0;
     for range in &rendered.special_ranges {

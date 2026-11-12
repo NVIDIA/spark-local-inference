@@ -134,13 +134,13 @@ fn jpeg_and_oriented_png_use_actual_checkpoint_request_preparation() {
             )
             .unwrap();
         let expanded = processor
-            .expand_prompt(&frontend, &rendered.text, &processed)
+            .expand_prompt(&frontend, &rendered.token_ids, &processed)
             .unwrap();
         assert_eq!(prepared.prompt.tokens, expanded.token_ids);
         assert_eq!(prepared.prompt.conditioning.len(), 1);
         let complete_message = frontend.render_chat(messages.as_array().unwrap(),
             json!({"add_generation_prompt":false}).as_object().unwrap()).unwrap();
-        let complete_message = processor.expand_prompt(&frontend, &complete_message.text,
+        let complete_message = processor.expand_prompt(&frontend, &complete_message.token_ids,
             &processed).unwrap();
         assert!(prepared.prompt.tokens.starts_with(&complete_message.token_ids));
         assert!(prepared.prompt.message_boundaries.contains(&complete_message.token_ids.len()));

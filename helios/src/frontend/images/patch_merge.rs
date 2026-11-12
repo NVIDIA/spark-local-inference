@@ -59,7 +59,7 @@ impl Processor {
     pub(super) fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         let image_ids = frontend.encode(&self.image_token, false)?;
@@ -71,26 +71,34 @@ impl Processor {
                 return Err("image envelope marker must encode one token".into());
             }
         }
-        if text.matches(&self.image_token).count() != images.geometry.len() {
+        let placeholder_count = prompt_token_ids
+            .iter()
+            .filter(|id| **id == *image_id)
+            .count();
+        if placeholder_count != images.geometry.len() {
             return Err("image placeholder count does not match input images".into());
         }
-        let mut parts = text.split(&self.image_token);
-        let mut expanded = parts.next().unwrap_or_default().to_owned();
-        for (part, geometry) in parts.zip(&images.geometry) {
-            expanded.push_str(&self.start_token);
-            for _ in 0..geometry.tokens {
-                expanded.push_str(&self.image_token);
+        let start_id = frontend.encode(&self.start_token, false)?[0];
+        let end_id = frontend.encode(&self.end_token, false)?[0];
+        let mut expanded_ids = Vec::new();
+        let mut image_index = 0usize;
+        for &id in prompt_token_ids {
+            if id == *image_id {
+                let tokens = images.geometry[image_index].tokens;
+                expanded_ids.push(start_id);
+                expanded_ids.extend(std::iter::repeat(*image_id).take(tokens));
+                expanded_ids.push(end_id);
+                image_index += 1;
+            } else {
+                expanded_ids.push(id);
             }
-            expanded.push_str(&self.end_token);
-            expanded.push_str(part);
         }
-        let token_ids = frontend.encode(&expanded, false)?;
+        let token_ids = expanded_ids;
         let mm_token_type_ids = token_ids
             .iter()
             .map(|id| i32::from(*id == *image_id))
             .collect();
         Ok(ImagePrompt {
-            text: expanded,
             position_ids: std::array::from_fn(|_| (0..token_ids.len() as i64).collect()),
             token_ids,
             mm_token_type_ids,

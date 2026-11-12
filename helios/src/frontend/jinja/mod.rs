@@ -45,6 +45,7 @@ pub enum Mark {
 pub struct RenderedTemplate {
     pub text: String,
     pub marks: Vec<Mark>,
+    pub runs: Vec<(usize, bool)>,
 }
 
 pub struct CompiledTemplate {
@@ -69,7 +70,17 @@ impl CompiledTemplate {
         context: &Map<String, Json>,
         hints: &[(usize, usize)],
     ) -> Result<RenderedTemplate> {
-        vm::render(self, context, hints)
+        use std::collections::HashSet;
+        self.render_with_trust(context, hints, &HashSet::new())
+    }
+
+    pub fn render_with_trust(
+        &self,
+        context: &Map<String, Json>,
+        hints: &[(usize, usize)],
+        trusted: &std::collections::HashSet<String>,
+    ) -> Result<RenderedTemplate> {
+        vm::render(self, context, hints, trusted)
     }
 
     pub fn annotation_spans(&self) -> &[std::ops::Range<usize>] {

@@ -212,7 +212,6 @@ impl ProcessedImages {
 }
 
 pub struct ImagePrompt {
-    pub text: String,
     pub token_ids: Vec<u32>,
     pub mm_token_type_ids: Vec<i32>,
     /// Text, temporal, height, and width position rows, each of length token_ids.len().
@@ -703,12 +702,16 @@ impl ImageProcessor {
     pub fn expand_prompt(
         &self,
         frontend: &Frontend,
-        text: &str,
+        prompt_token_ids: &[u32],
         images: &ProcessedImages,
     ) -> Result<ImagePrompt> {
         match &self.profile {
-            Profile::Qwen(profile) => profile.expand_prompt(frontend, text, images),
-            Profile::PatchMerge(profile) => profile.expand_prompt(frontend, text, images),
+            Profile::Qwen(profile) => {
+                profile.expand_prompt(frontend, prompt_token_ids, images)
+            }
+            Profile::PatchMerge(profile) => {
+                profile.expand_prompt(frontend, prompt_token_ids, images)
+            }
             Profile::DeepSeek4 | Profile::DeepseekRowMajor(_) => Err("DeepSeek image spans require its model contract".into()),
             Profile::MiMo(_) => Err("MiMo image expansion requires its model contract".into()),
             Profile::Moonvit => Err("MoonViT image expansion requires its model contract".into()),
