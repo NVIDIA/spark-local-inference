@@ -12,6 +12,7 @@
   "tml-renderers receives OpenAI Chat messages through chat.OpenAIMessage.from_openai_chat_dicts(messages, tools=tools) and renders with renderers.Inkling2().render_for_completion_with_effort(messages, effort).",
   "The tool declaration that the OpenAI bridge emits first is moved after the leading system messages, the order SGLang and tinker-cookbook use.",
   "Every prompt carries the effort message; an absent effort is 0.9. Named efforts map through the checkpoint chat template's table; enable_thinking=false, Responses reasoning.effort=none and Messages thinking.type=disabled select effort 0. tml-renderers has no named efforts, thinking switch or tool_choice.",
+  "Efforts above 0.99 are rejected, as SGLang's Inkling serving and the checkpoint template reject them; tml-renderers itself accepts efforts up to 1.",
   "Flare lowers developer instructions into one leading system message labeled 'System instructions:' and 'Developer instructions:' when any developer message is present.",
   "tool_choice=none removes the tool declaration; a named tool_choice declares only that tool; tool_choice=required appends Flare's required-tool instruction to the first system message, inserting one when absent.",
   "Flare's tool results carry no name; tml-renderers resolves each result's name from the most recent preceding call with its tool_call_id, as it does for an unnamed OpenAI tool message.",
@@ -3016,7 +3017,7 @@
    }
   },
   {
-   "name": "effort_low",
+   "name": "effort_minimal",
    "protocol": "responses",
    "body": {
     "input": "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901 café\r\n end  ",

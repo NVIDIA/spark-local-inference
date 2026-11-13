@@ -689,13 +689,14 @@ effort, and larger budgets to maximum effort; explicit `output_config.effort` wi
 Messages budgets above the 32-bit output limit are accepted and never trigger a cut.
 Responses and Anthropic named effort settings
 (`reasoning.effort` and `output_config.effort`) accept named levels and map into
-the same neutral levels. They do not accept numeric scores. The frontend resolves
+the same neutral levels. They do not accept numeric scores. `minimal` is its own
+level; prompt formats without it render `low`. The frontend resolves
 those levels against the effort vocabulary accepted by the prepared template: for example Qwen uses
 `low/medium/xhigh`. Native DeepSeek V4 and V4.1 prompt encoders accept
 `low/high/xhigh/max` and default to thinking enabled and high effort.
 The native TMLv0 encoder accepts `none` (0), `minimal` (0.1), `low` (0.2),
 `medium` (0.7), `high` (0.9), `xhigh` and `max` (0.99), or a JSON number from
-0 through 0.99, and defaults to 0.9. Disabling thinking (`enable_thinking=false`,
+0 through 0.99, and defaults to 0.9; Responses `minimal` selects 0.1. Disabling thinking (`enable_thinking=false`,
 Responses `reasoning.effort` `none`, or Messages `thinking.type` `disabled`)
 selects effort 0 and takes precedence over any effort level.
 DeepSeek V4 rejects numeric effort. DeepSeek V4.1 additionally accepts a JSON

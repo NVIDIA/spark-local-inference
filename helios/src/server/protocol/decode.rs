@@ -488,7 +488,8 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
                     .insert("enable_thinking".into(), false.into());
                 None
             }
-            Some("minimal" | "low") => Some(Effort::Low),
+            Some("minimal") => Some(Effort::Minimal),
+            Some("low") => Some(Effort::Low),
             Some("medium" | "high") => Some(Effort::High),
             Some("xhigh" | "max") => Some(Effort::Max),
             _ => return Err("unsupported reasoning effort".into()),
@@ -1771,6 +1772,31 @@ mod native_prompt_tests {
             );
             assert!(prepared.prompt.reasoning_cut.is_none());
             assert_eq!(prepared.prompt.max_new_tokens, 32);
+        }
+    }
+
+    #[test]
+    fn minimal_effort_renders_low_where_the_prompt_format_has_no_minimal_level() {
+        let template = "{% for m in messages %}{{ m.content }}{% mark %}{% endfor %}effort={{ reasoning_effort }}";
+        for encoder in [PromptEncoder::Jinja, PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, mut config) = renderer(encoder, Some(template), TemplateEncoding::Text);
+            config.contract.frontend.rejected_tokens.clear();
+            let render = |effort: &str| {
+                let decoded = decode(Protocol::Responses,
+                    json!({"input":"Hello","reasoning":{"effort":effort}}), false).unwrap();
+                assert_eq!(decoded.request.options.effort,
+                    Some(if effort == "minimal" { Effort::Minimal } else { Effort::Low }));
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                )
+                .unwrap()
+                .rendered_prompt
+            };
+            let low = render("low");
+            assert_eq!(render("minimal"), low, "{encoder:?}");
+            if encoder == PromptEncoder::Jinja {
+                assert!(low.ends_with("effort=low"));
+            }
         }
     }
 

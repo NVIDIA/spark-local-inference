@@ -108,6 +108,8 @@ pub enum Constraint {
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Effort {
+    /// Below low. Prompt formats without a minimal level render low effort.
+    Minimal,
     Low,
     High,
     Max,

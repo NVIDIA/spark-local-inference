@@ -26,6 +26,10 @@ const EFFORTS: [(&str, f64); 7] = [
     ("max", 0.99),
 ];
 const DEFAULT_EFFORT: f64 = 0.9;
+/// tml-renderers accepts efforts up to 1, but SGLang's Inkling serving rejects
+/// efforts above 0.99 (`parse_reasoning_effort` in
+/// python/sglang/srt/entrypoints/openai/serving_inkling.py at 237ba6b), as the
+/// checkpoint chat template does; 0.99 is also its `xhigh` and `max` level.
 const MAX_EFFORT: f64 = 0.99;
 const EFFORT_ERROR: &str =
     "reasoning_effort must be none, minimal, low, medium, high, xhigh, max, or a number from 0 through 0.99";

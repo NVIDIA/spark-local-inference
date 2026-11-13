@@ -383,6 +383,7 @@ pub(super) fn template_inputs<'a>(
         if let Some(effort) = opts.effort {
             use super::inference::Effort;
             let candidates: &[&str] = match effort {
+                Effort::Minimal => &["minimal", "low"],
                 Effort::Low => &["low"],
                 Effort::High => &["high", "medium"],
                 Effort::Max => &["max", "xhigh", "high", "medium"],

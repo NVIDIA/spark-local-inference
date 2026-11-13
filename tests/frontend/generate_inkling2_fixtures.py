@@ -59,6 +59,8 @@ CONVENTIONS = [
     "Every prompt carries the effort message; an absent effort is 0.9. Named efforts map through the checkpoint "
     "chat template's table; enable_thinking=false, Responses reasoning.effort=none and Messages thinking.type=disabled "
     "select effort 0. tml-renderers has no named efforts, thinking switch or tool_choice.",
+    "Efforts above 0.99 are rejected, as SGLang's Inkling serving and the checkpoint template reject them; "
+    "tml-renderers itself accepts efforts up to 1.",
     "Flare lowers developer instructions into one leading system message labeled 'System instructions:' and "
     "'Developer instructions:' when any developer message is present.",
     "tool_choice=none removes the tool declaration; a named tool_choice declares only that tool; tool_choice=required "
@@ -209,7 +211,7 @@ equivalents.extend([
     {"name": "effort_none", "protocol": "messages", "body": {"max_tokens": 16, "messages": HELLO,
                                                            "thinking": {"type": "disabled"}}},
     {"name": "effort_low", "protocol": "responses", "body": {"input": TEXT, "reasoning": {"effort": "low"}}},
-    {"name": "effort_low", "protocol": "responses", "body": {"input": TEXT, "reasoning": {"effort": "minimal"}}},
+    {"name": "effort_minimal", "protocol": "responses", "body": {"input": TEXT, "reasoning": {"effort": "minimal"}}},
     {"name": "effort_high", "protocol": "responses", "body": {"input": TEXT, "reasoning": {"effort": "medium"}}},
     {"name": "effort_max", "protocol": "responses", "body": {"input": TEXT, "reasoning": {"effort": "xhigh"}}},
     {"name": "effort_high", "protocol": "messages", "body": {"max_tokens": 16, "messages": HELLO,
