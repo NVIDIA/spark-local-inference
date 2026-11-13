@@ -8,6 +8,7 @@ from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+from .config import replicated_attention_bytes
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -29,7 +30,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
-        joint_tuning=plan.joint_tuning,
+        joint_tuning=plan.joint_tuning, row_shard_prefill=plan.row_shard_prefill,
+        row_shard_attention=plan.row_shard_attention,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
@@ -70,4 +72,5 @@ RECIPE = Recipe(
     stream_overlap=True,
     ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4)}),
     plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4)}),
+    replicated_attention_bytes=replicated_attention_bytes,
 )

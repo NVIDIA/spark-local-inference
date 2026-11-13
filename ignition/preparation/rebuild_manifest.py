@@ -234,6 +234,10 @@ def from_plan(model, plan, *, compiled_forwards):
         result['force_moe_decode_a16'] = True
     if plan.shard_hyperconnections:
         result['shard_hyperconnections'] = True
+    if plan.row_shard_prefill:
+        result['row_shard_prefill'] = True
+    if plan.row_shard_attention:
+        result['row_shard_attention'] = True
     if plan.joint_tuning:
         result['joint_tuning'] = True
     if (s := plan.speculation) is not None:

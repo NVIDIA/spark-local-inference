@@ -214,6 +214,10 @@ class Recipe:
     namespace. Export writes locally; it does not upload or select a signing identity.
     `b12x_environment` holds the b12x settings the recipe prepares with. b12x reads them
     only from its environment, so Ignition sets them for the preparing process.
+    `replicated_attention_bytes(world_size, prompt_logprobs, mtp_only)` gives the device
+    weights a row-sharded attention plan loads beside each rank's partition, from the
+    plan's prefill kinds, which `weights_bytes` adds to the estimate so capacity sizing
+    counts them.
     """
 
     name: str
@@ -251,6 +255,9 @@ class Recipe:
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
+    # Device weights a row-sharded attention plan replicates per rank, from the checkpoint
+    # geometry, the tensor-parallel size, and the plan's scored and draft-only prefill kinds.
+    replicated_attention_bytes: Callable[..., int] | None = None
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes, serving_modes
@@ -298,8 +305,13 @@ class Recipe:
         return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
-                      expert_scale_compression: str | None = None) -> int:
-        """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion."""
+                      expert_scale_compression: str | None = None, *, row_shard_attention: bool = False,
+                      prompt_logprobs: bool = False, mtp_only: bool = False) -> int:
+        """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion.
+
+        A row-sharded attention plan holds every replicated attention extent beside the partition
+        the estimate already charges, so `replicated_attention_bytes` adds those copies.
+        """
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
@@ -307,8 +319,11 @@ class Recipe:
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:
             draft_bytes = method.draft_bytes
+        replicated = (self.replicated_attention_bytes(world_size, prompt_logprobs=prompt_logprobs,
+                                                      mtp_only=mtp_only)
+                      if row_shard_attention and self.replicated_attention_bytes is not None else 0)
         return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
-                   + (draft_bytes if learned else 0)) // world_size)
+                   + (draft_bytes if learned else 0)) // world_size) + replicated
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""

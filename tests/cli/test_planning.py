@@ -195,6 +195,162 @@ def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypat
         replace(joint, autotune_effort="off")
 
 
+def test_row_shard_prefill_requires_deepseek_tp_and_survives_rebuild_serialization(monkeypatch):
+    """The option travels through `plan` and `fit` beside an explicit MXFP8 scope."""
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    model = replace(SOLO, name="deepseek41")
+    gpus = (gpu(0, 95), gpu(1, 95))
+    settings = dict(selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                    online_mxfp8_scope="all")
+    ordinary = planning.plan(model, model.checkpoints[0], gpus, **settings)
+    sharded = planning.plan(model, model.checkpoints[0], gpus, row_shard_prefill=True, **settings)
+    assert not ordinary.row_shard_prefill and ordinary.online_mxfp8_scope == "all"
+    assert sharded.row_shard_prefill and sharded.online_mxfp8_scope == "all"
+    assert sharded.to_dict()["row_shard_prefill"] is True
+    # Turning the flag off restores the plan the same arguments produce without it.
+    assert replace(sharded, row_shard_prefill=False) == ordinary
+    fitted = planning.fit(model, model.checkpoints[0], gpus, concurrency=4, reserve_bytes=0,
+                          speculation=DRAFTING, online_mxfp8_scope="all", row_shard_prefill=True)
+    assert fitted.row_shard_prefill and fitted.online_mxfp8_scope == "all"
+    for plan in (ordinary, sharded, fitted):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).row_shard_prefill == plan.row_shard_prefill
+    with pytest.raises(UsageError, match="DeepSeek V4.1"):
+        planning.plan(SOLO, SOLO.checkpoints[0], gpus, row_shard_prefill=True, **settings)
+    with pytest.raises(UsageError, match="tensor parallelism"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95),), selected=(0,), concurrency=4,
+                      reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True)
+    # Three ranks have no per-rank block at the recipe's chunk, and no SM103 run exists.
+    three = recipe("deepseek41", 60, (3, 4), speculation=DRAFTING)
+    with pytest.raises(UsageError, match="TP3"):
+        planning.plan(three, three.checkpoints[0], (gpu(0, 95), gpu(1, 95), gpu(2, 95)),
+                      selected=(0, 1, 2), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True)
+    with pytest.raises(UsageError, match="SM103"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95, (10, 3)), gpu(1, 95, (10, 3))),
+                      selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True)
+
+
+def test_row_shard_attention_requires_row_shard_prefill_and_survives_rebuild_serialization(monkeypatch):
+    """Both row-shard options travel through `plan` and `fit` beside an explicit MXFP8 scope."""
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    model = replace(SOLO, name="deepseek41")
+    gpus = (gpu(0, 95), gpu(1, 95))
+    settings = dict(selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                    online_mxfp8_scope="all", row_shard_prefill=True)
+    sharded = planning.plan(model, model.checkpoints[0], gpus, **settings)
+    attention = planning.plan(model, model.checkpoints[0], gpus, row_shard_attention=True, **settings)
+    assert not sharded.row_shard_attention
+    assert attention.row_shard_attention and attention.row_shard_prefill
+    assert attention.online_mxfp8_scope == "all"
+    assert attention.to_dict()["row_shard_attention"] is True
+    # Turning the flag off restores change 1's plan exactly.
+    assert replace(attention, row_shard_attention=False) == sharded
+    fitted = planning.fit(model, model.checkpoints[0], gpus, concurrency=4, reserve_bytes=0,
+                          speculation=DRAFTING, online_mxfp8_scope="all",
+                          row_shard_prefill=True, row_shard_attention=True)
+    assert fitted.row_shard_attention and fitted.row_shard_prefill
+    assert fitted.online_mxfp8_scope == "all"
+    for plan in (sharded, attention, fitted):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).row_shard_attention \
+            == plan.row_shard_attention
+    # Attention cannot join a shard that prefill never asked for.
+    with pytest.raises(UsageError, match="row-shard-prefill"):
+        planning.plan(model, model.checkpoints[0], gpus, row_shard_attention=True,
+                      **{name: value for name, value in settings.items() if name != "row_shard_prefill"})
+    # Attention shares the shard's refusal: three ranks size 72 heads against 64 replicated rows,
+    # and no SM103 export or serve has run with either flag.
+    three = recipe("deepseek41", 60, (3, 4), speculation=DRAFTING)
+    with pytest.raises(UsageError, match="TP3"):
+        planning.plan(three, three.checkpoints[0], (gpu(0, 95), gpu(1, 95), gpu(2, 95)),
+                      selected=(0, 1, 2), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True, row_shard_attention=True)
+    with pytest.raises(UsageError, match="SM103"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95, (10, 3)), gpu(1, 95, (10, 3))),
+                      selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True, row_shard_attention=True)
+
+
+def test_row_shard_attention_charges_only_the_layers_a_prefill_can_shard():
+    """The plan counts the replicated attention layers each prefill mode shards, not all 40."""
+    from ignition.recipes import resolve
+    from ignition.recipes.deepseek41.config import replicated_layer_bytes
+
+    model = resolve("deepseek-v4.1-flash")
+    speculation = model.recipe.speculation
+    gpus = tuple(gpu(index, 95) for index in range(4))
+    settings = dict(selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0, speculation=speculation,
+                    row_shard_prefill=True)
+
+    def plan(**modes):
+        return planning.plan(model.recipe, model.checkpoint, gpus, **{**settings, **modes})
+
+    plain = plan()
+    # A replicated layer holds 121.11 MB at TP4: the whole extent, not the part beyond the
+    # partition, because the rank keeps its own partition beside it.
+    per_layer = 121_110_528
+    assert replicated_layer_bytes(4) == per_layer
+    # The packed prefill stops at the decoder boundary, so 17 layers replicate: 0, 2-13, 15-18.
+    # Scored prefill replays no suffix, so --prompt-logprobs reaches 37. A draft-only plan builds no
+    # prefill graph without the draft, and those graphs are what shard a draft target layer, so its
+    # scored prefill replicates 35.
+    draft_only = replace(speculation, mtp_only=True)
+    for layers, modes in ((17, {}), (37, {"prompt_logprobs": True}),
+                          (17, {"speculation": draft_only}),
+                          (35, {"speculation": draft_only, "prompt_logprobs": True})):
+        assert (plan(row_shard_attention=True, **modes).weights_bytes - plain.weights_bytes
+                == layers * per_layer), modes
+    # Pages are sized from what the weights leave, so the charge removes the pages they occupy.
+    assert plan(row_shard_attention=True).pages < plain.pages
+
+
+def test_the_export_command_plans_the_replicated_attention_charge(tmp_path):
+    """The export path's own plan counts the replicated weights, not only a direct `planning.plan`."""
+    from ignition.cli import preparation
+    from ignition.cli.config import Configuration
+    from ignition.recipes import resolve
+    from ignition.recipes.deepseek41.config import replicated_attention_bytes, replicated_layer_bytes
+
+    path = tmp_path / "flare.toml"
+    path.write_text("")
+    configuration = Configuration.load(path)
+    model = resolve("deepseek-v4.1-flash")
+    # Devote 256 GiB per GPU so the plan is sized to the supply, not to this host's free memory.
+    devices = tuple(replace(gpu(index, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for index in range(4))
+    settings = dict(gpus="0,1,2,3", speculation=model.recipe.speculation, row_shard_prefill=True,
+                    concurrency=configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency, None))
+    host = preparation.Host(devices, None)
+    sharded = preparation.derive(configuration, model, host, **settings)
+    attention = preparation.derive(configuration, model, host, row_shard_attention=True, **settings)
+    assert sharded.row_shard_prefill and not sharded.row_shard_attention
+    assert attention.row_shard_prefill and attention.row_shard_attention
+    # The 17 layers a packed prefill can shard replicate 121.11 MB each at TP4, and the rank keeps
+    # its partition beside them, so the estimate grows by the whole replicated extent the loader
+    # holds.
+    assert replicated_attention_bytes(4) == 17 * replicated_layer_bytes(4) == 2_058_878_976
+    assert attention.weights_bytes - sharded.weights_bytes == replicated_attention_bytes(4)
+    # Pages are sized from what the weights leave, so the charge takes back the pages they occupy,
+    # less the partial page each of the two divisions rounds down on its own.
+    occupied = replicated_attention_bytes(4) / sharded.costs.page_bytes
+    assert abs(sharded.pages - attention.pages - occupied) < 1
+    # The flags now reach `plan`, so its own checks refuse attention without prefill.
+    with pytest.raises(UsageError, match="row-shard-prefill"):
+        preparation.derive(configuration, model, host, **{**settings, "row_shard_prefill": False},
+                           row_shard_attention=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)
