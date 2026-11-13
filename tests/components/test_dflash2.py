@@ -9,10 +9,9 @@ import copy
 import pytest
 import torch
 
-from ignition.components.dflash2 import DraftScratch
+from ignition.components.dflash2 import DraftScratch, _draft_templates
 from ignition.components.dflash2_geometry import DraftAttentionGeometry
 from ignition.components.parallel import TensorParallelShard
-from ignition.preparation.scratch import GraphBufferPool
 
 
 @pytest.mark.parametrize('world', [1, 2, 4, 8])
@@ -20,20 +19,28 @@ def test_non_square_attention_scratch_and_proposal_views(world):
     config = SimpleNamespace(block_size=8,
         text=dict(hidden_size=5120, intermediate_size=12288, vocab_size=128),
         attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
-    buffers = GraphBufferPool('meta').cursor()
-    scratch = DraftScratch.allocate(config, TensorParallelShard(0, world), 32, 'meta', buffers=buffers)
-    assert scratch.embedding.shape == (32, 5120)
-    assert scratch.local_embedding.shape == (32, 5120 // world)
-    assert scratch.query.shape == scratch.attended.shape == (32, 32 // world, 128)
-    assert scratch.key.shape == scratch.value.shape == (32, 8 // world, 128)
-    assert scratch.qkv.shape == (32, 6144 // world)
-    assert scratch.partial.shape == scratch.output.shape == (32, 5120)
+    shard = TensorParallelShard(0, world)
+    scratch = DraftScratch.allocate(config, shard, 32, 'meta')
+    templates = _draft_templates(config, shard, scratch, 'meta')
+    assert scratch.logit_shape == (32, 128)
+    assert templates.embedding.shape == (32, 5120)
+    assert templates.local_embedding.shape == (32, 5120 // world)
+    assert templates.query.shape == templates.attended.shape == (32, 32 // world, 128)
+    assert templates.key.shape == templates.value.shape == (32, 8 // world, 128)
+    assert templates.qkv.shape == (32, 6144 // world)
+    assert templates.partial.shape == templates.output.shape == (32, 5120)
+    assert templates.window_key.shape == (68, 128, 8 // world, 128)
+    assert templates.window_value.shape == (68, 128, 8 // world, 128)
+    assert templates.local_logits.shape == (32, 128 if world == 1 else 64)
+    assert templates.local_logits.dtype == torch.bfloat16
     view = scratch.rows(8, 8)
-    assert view.query.shape == (8, 32 // world, 128)
-    assert view.embedding.shape == (8, 5120)
-    assert view.window_key is scratch.window_key
-    assert view.convolution is scratch.convolution
-    assert view.selectors is scratch.selectors
+    view_templates = _draft_templates(config, shard, view, 'meta')
+    assert view.logit_shape == (8, 128)
+    assert view_templates.query.shape == (8, 32 // world, 128)
+    assert view_templates.embedding.shape == (8, 5120)
+    assert view_templates.window_key.shape == (17, 128, 8 // world, 128)
+    assert view_templates.convolution["before"].shape == (8, 5120)
+    assert scratch.scratch_tensors() == view.scratch_tensors() == ()
     with pytest.raises(ValueError, match='complete proposal blocks'):
         scratch.rows(7, 7)
 
@@ -43,14 +50,18 @@ def test_effective_block_preserves_checkpoint_and_scratch_fields(width):
     config = SimpleNamespace(block_size=8,
         text=dict(hidden_size=5120, intermediate_size=17408, vocab_size=128),
         attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
-    scratch = DraftScratch.allocate(config, TensorParallelShard(0, 1), width, "meta",
-                                   buffers=GraphBufferPool("meta").cursor(), block_size=width)
+    shard = TensorParallelShard(0, 1)
+    scratch = DraftScratch.allocate(config, shard, width, "meta", block_size=width)
     view = scratch.rows(width, width)
+    templates = _draft_templates(config, shard, view, "meta")
     assert config.block_size == 8
     assert view.block_size == width
-    assert view.query.shape == (width, 32, 128)
-    assert view.window_key.shape[0] == 17
-    assert all(not isinstance(value, int) for value in view.scratch_tensors())
+    assert templates.query.shape == (width, 32, 128)
+    assert templates.window_key.shape[0] == 17
+    assert templates.mlp.intermediate.shape == (width, 17408)
+    assert templates.local_logits.shape == (width, 128)
+    assert templates.gathered_logits.dtype == torch.bfloat16
+    assert view.scratch_tensors() == ()
 
 
 @pytest.mark.parametrize("model", ["dense", "flash"])
@@ -73,9 +84,13 @@ def test_checkpoint_geometry_drives_shared_context_storage(model, world):
     regions = dict((name, (shape, dtype)) for name, shape, dtype in draft_context_specs(config, shard))
     assert set(regions) == {f"draft{i}.{part}" for i in range(5) for part in ("key", "value")}
     assert set(regions.values()) == {((2048, 8 // world, 128), torch.float8_e4m3fn)}
-    scratch = DraftScratch.allocate(config, shard, 8, "meta", buffers=GraphBufferPool("meta").cursor())
-    assert scratch.embedding.shape == (8, hidden)
-    assert scratch.query.shape == (8, 32 // world, 128)
+    scratch = DraftScratch.allocate(config, shard, 8, "meta")
+    templates = _draft_templates(config, shard, scratch, "meta")
+    assert scratch.hidden_size == hidden
+    assert templates.embedding.shape == (8, hidden)
+    assert templates.query.shape == (8, 32 // world, 128)
+    assert templates.local_embedding.shape == (8, hidden // world)
+    assert templates.qkv.shape == (8, 6144 // world)
     with pytest.raises(ValueError, match="does not match the target"):
         DFlash2Config.from_dict(text, target_hidden=hidden, target_vocabulary=248320,
             target_layers=layers + 1, expected=profile)

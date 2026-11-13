@@ -18,7 +18,7 @@ pub const RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
 pub const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
 pub const TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
 const CALL_CLOSE: &str = "<|close|>call<|sep|>";
-const MESSAGE_CLOSE: &str = "<|close|>message<|sep|>";
+pub(crate) const MESSAGE_CLOSE: &str = "<|close|>message<|sep|>";
 
 #[derive(Clone, Copy)]
 enum Channel {

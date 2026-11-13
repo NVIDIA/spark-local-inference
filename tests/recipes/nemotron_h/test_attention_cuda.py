@@ -25,11 +25,10 @@ def test_checkpoint_paged_attention(width, mode, batch, packed, autotune, kv_dty
     from b12x.preparation import PreparationSession
     from b12x.testing.q8_0_reference import dequantize_blocks
     from ignition.components.paged_batch import Metadata
-    from ignition.components.paged_attention import PagedAttentionMetadata
     from ignition.components.parallel import TensorParallelShard
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.attention import PreparedAttention
     from ignition.recipes.nemotron_h.weights import NemotronWeightLoader
     from ignition.reference.qwen38_quant import CheckpointTensors
@@ -62,16 +61,14 @@ def test_checkpoint_paged_attention(width, mode, batch, packed, autotune, kv_dty
     live = torch.tensor([batch], device="cuda", dtype=torch.int32)
     m.set(starts, lengths, rows, tables, ids, live)
     with PreparationSession(device="cuda:0", autotune=autotune) as session:
-        arena, buffers = ScratchArena("cuda:0"), GraphBufferPool("cuda:0")
-        cursor = buffers.cursor()
-        cache_metadata = PagedAttentionMetadata(m, page_tokens=128, buffers=cursor)
+        arena = ScratchArena("cuda:0")
         block = PreparedAttention(weights, source, m, key, value, config, mode=mode,
-            session=session, name="attention", workspace=arena, buffers=cursor, cache_metadata=cache_metadata,
+            session=session, name="attention", workspace=arena,
             key_scale=scale, value_scale=scale)
+        block.functional(session=session)
         arena.finalize()
         def operation():
-            cache_metadata()
-            return block(source)
+            return block(source, m, key, value)
         forward = compile_forward(operation)
         forward()
         session.freeze()

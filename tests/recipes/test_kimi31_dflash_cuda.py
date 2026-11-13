@@ -28,7 +28,7 @@ def test_windowed_mla_checkpoint_and_replay(quantized):
     from ignition.components.paged_batch import Metadata
     from ignition.components.parallel import TensorParallelShard
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import DSparkConfig, ModelConfig
     from ignition.recipes.kimi31.dflash import DraftAttention, DraftScratch, PreparedContext
@@ -60,8 +60,8 @@ def test_windowed_mla_checkpoint_and_replay(quantized):
     torch.manual_seed(621)
     auxiliary = (torch.randn((rows,6*7168),device=device)*.2).bfloat16()
     source = (torch.randn((block,7168),device=device)*.2).bfloat16()
-    buffer_pool, attention_buffers = GraphBufferPool(device), GraphBufferPool(device)
-    scratch = DraftScratch.allocate(config,shard,block,block,device,buffer_pool)
+    scratch = DraftScratch.allocate(config,shard,block,block,device)
+    output = torch.empty_like(source)
     eps = config.draft.text["rms_norm_eps"]
     def norm(x,w):
         return (x.float()*torch.rsqrt(x.float().square().mean(-1,keepdim=True)+eps)).bfloat16()*w
@@ -70,9 +70,9 @@ def test_windowed_mla_checkpoint_and_replay(quantized):
         arena = ScratchArena(device)
         session.register_scratch(arena)
         context = PreparedContext(weights,auxiliary,context_metadata,pool,session=session,name="context",workspace=arena,
-            runtime=None,coordinator=None,latent_runtime=None,buffers=GraphBufferPool(device))
+            runtime=None,coordinator=None,latent_runtime=None)
         attention = DraftAttention(0,draft.layers[0],source,config.draft,shard,scratch,m,pool,runtime=None,
-            coordinator=None,session=session,name="attention",workspace=arena,buffers=attention_buffers.cursor(),latent_runtime=None)
+            coordinator=None,session=session,name="attention",workspace=arena,latent_runtime=None)
         session.tune(show_progress=False)
         def set_position(start):
             context_metadata.starts.fill_(start)
@@ -80,10 +80,10 @@ def test_windowed_mla_checkpoint_and_replay(quantized):
             m.starts.fill_(start+rows)
             m.positions.copy_(torch.arange(start+rows,start+rows+block,device=device))
         set_position(0)
-        context(auxiliary,context_metadata.lengths)
-        attention(source)
-        compiled_context = compile_forward(lambda: context(auxiliary,context_metadata.lengths))
-        compiled_attention = compile_forward(lambda: attention(source))
+        context(auxiliary,context_metadata.lengths,context_metadata)
+        output.copy_(attention(source,m))
+        compiled_context = compile_forward(lambda: context(auxiliary,context_metadata.lengths,context_metadata))
+        compiled_attention = compile_forward(lambda: output.copy_(attention(source,m)))
         compiled_context()
         compiled_attention()
         graphs = []
@@ -114,7 +114,7 @@ def test_windowed_mla_checkpoint_and_replay(quantized):
             error_feedback = (before[1,indices].float()-expected_feedback[-1024:]).norm()/expected_feedback[-1024:].norm()
             assert float(error_feedback)<.015
             graphs[1].replay()
-            actual = scratch.output.clone()
+            actual = output.clone()
             torch.cuda.synchronize()
             torch.testing.assert_close(before.view(torch.uint8),rings["draft0.latent"].view(torch.uint8),rtol=0,atol=0)
             projected = torch.nn.functional.linear(source,bf16_weight(w["latent_gate"]))

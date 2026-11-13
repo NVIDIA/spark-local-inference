@@ -241,7 +241,7 @@ def test_nvfp4_reciprocal_globals_and_token_outer_scales_preserve_packed_tp_slic
     loader = DirectWeightLoader(SimpleNamespace(), "cpu")
     loader._session = SimpleNamespace(flush=lambda: None)
     monkeypatch.setattr(loader, "_copy", lambda destination, source: destination.copy_(source))
-    monkeypatch.setattr(reference, "swizzle_block_scale", lambda value: value)
+    monkeypatch.setattr(reference, "swizzle_block_scale", lambda value, *, allocate=None: value)
     monkeypatch.setattr(moe, "plan_weights", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(moe, "prepare_weights", lambda **kwargs: SimpleNamespace(**kwargs))
     for index, projection in enumerate(("w1", "w3", "w2")):

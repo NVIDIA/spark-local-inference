@@ -28,6 +28,7 @@ pub struct Settings {
     pub trust_store: Option<PathBuf>,
     pub publisher_keys: Vec<PathBuf>,
     pub thinking_token_budget: Option<u32>,
+    pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
     pub prefix_cache: PrefixCacheOffload,
     pub model_concurrency: std::collections::HashMap<String, usize>,
 }
@@ -61,6 +62,16 @@ mod tests {
         assert!(settings.runtime.prefix_cache_disk_enabled);
         assert_eq!(settings.load_options(&[]).unwrap().prefix_cache.disk, Some(PathBuf::from("user/prefix")));
     }
+    #[test]
+    fn checkpoint_extra_work_fraction_reaches_application_settings() {
+        for fraction in [None, Some(0.0), Some(0.25), Some(1.0)] {
+            let text = fraction.map(|value| format!("[server]\nscheduler_checkpoint_extra_work_fraction={value}")).unwrap_or_default();
+            let configuration = Configuration::parse(&text).unwrap();
+            let settings = Settings::resolve(configuration, Path::new("user"), Path::new("config.toml")).unwrap();
+            assert_eq!(settings.scheduler_checkpoint_extra_work_fraction, fraction);
+        }
+    }
+
     #[test]
     fn conflicting_alias_defaults_are_rejected() {
         let config = Configuration::parse(
@@ -168,6 +179,7 @@ impl Settings {
             trust_store: None,
             publisher_keys: Vec::new(),
             thinking_token_budget,
+            scheduler_checkpoint_extra_work_fraction: configuration.server.scheduler_checkpoint_extra_work_fraction,
             prefix_cache,
             model_concurrency,
         })

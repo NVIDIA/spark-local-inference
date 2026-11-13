@@ -30,7 +30,8 @@ manifest lookup and diagnostics. Preserve the harness's full integer domains,
 dtype cases, and empty/nonempty geometry inputs.
 
 Supply `--java` or `--target-dir` when needed. Read every TLA+ result with pstack's
-`statechart` skill. For a failure, identify the violated operation or invariant
+`statechart` skill; it and `maintain-formal-verification-skill` are not stored
+in this repository. For a failure, identify the violated operation or invariant
 and replay counterexamples through the covered production scheduler, cache,
 transfer coordinator, or rank protocol methods. Correct a
 modeling error from the implementation's actual behavior. Preserve a valid

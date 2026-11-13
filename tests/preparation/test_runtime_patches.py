@@ -75,25 +75,27 @@ def test_apply_is_idempotent_and_keeps_dependency_sources_unchanged():
         from pathlib import Path
         import torch
         from torch._dynamo import output_graph, symbolic_convert
-        from torch._inductor import scheduler, pattern_matcher
+        from torch._inductor import memory, scheduler, pattern_matcher
         from torch._inductor.fx_passes import post_grad
         from torch._inductor.runtime import static_triton_launcher, triton_heuristics
         from triton.runtime import build
         from ignition import runtime_patches
 
-        modules = (output_graph, symbolic_convert, scheduler, pattern_matcher, post_grad,
+        modules = (output_graph, symbolic_convert, memory, scheduler, pattern_matcher, post_grad,
                    static_triton_launcher, triton_heuristics, build)
         before = {Path(module.__file__): Path(module.__file__).read_bytes() for module in modules}
         generic_matcher = pattern_matcher.PatternMatcherPass.apply
         torch.compiler.config.cache_key_tag = "caller-tag"
         runtime_patches.apply()
-        targets = (post_grad.decompose_auto_functionalized, scheduler.BaseSchedulerNode.decide_inplace_update,
+        targets = (memory.assign_memory_planning_info_for_scheduler_nodes,
+                   post_grad.decompose_auto_functionalized, scheduler.BaseSchedulerNode.decide_inplace_update,
                    output_graph.OutputGraph.check_event_record_after_input_mutation,
                    output_graph.OutputGraph.check_input_mutation_on_current_stream)
         expected_tag = "caller-tag;" + runtime_patches.identity()
         assert torch.compiler.config.cache_key_tag == expected_tag
         runtime_patches.apply()
-        assert targets == (post_grad.decompose_auto_functionalized, scheduler.BaseSchedulerNode.decide_inplace_update,
+        assert targets == (memory.assign_memory_planning_info_for_scheduler_nodes,
+                           post_grad.decompose_auto_functionalized, scheduler.BaseSchedulerNode.decide_inplace_update,
                            output_graph.OutputGraph.check_event_record_after_input_mutation,
                            output_graph.OutputGraph.check_input_mutation_on_current_stream)
         assert torch.compiler.config.cache_key_tag == expected_tag

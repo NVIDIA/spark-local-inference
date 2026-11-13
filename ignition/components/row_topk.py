@@ -3,9 +3,10 @@
 
 """Prepared row selection with caller-supplied integer candidate IDs."""
 
+import torch
 from b12x.preparation import PreparedCall
 
-from ignition.preparation.tuning import declare
+from ignition.preparation.tuning import declare, register_finalizer
 
 
 class PreparedRowTopK:
@@ -21,8 +22,16 @@ class PreparedRowTopK:
             PreparedCall(run=lambda: state.run(*self.arguments), output=output_indices,
                          owners=self.arguments)),))
 
-    def __call__(self):
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.arguments = self.output = None
+
+    def __call__(self, scores=None, lengths=None, indices=None, output_scores=None, output_indices=None):
         from b12x.attention import row_topk
 
-        row_topk.topk(self.plan, *self.arguments)
-        return self.output
+        arguments = self.arguments if scores is None else (scores, lengths, indices, output_scores, output_indices)
+        row_topk.topk(self.plan, *arguments)
+        return arguments[-1]

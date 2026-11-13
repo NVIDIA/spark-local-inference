@@ -91,6 +91,7 @@ mod tests {
         assert_eq!(model.metadata.context_tokens, None);
         assert_eq!(model.metadata.parameter_count, None);
         assert_eq!(model.metadata.revision_bytes, None);
+        assert!(model.metadata.revision_updated_at.is_empty());
         assert!(model.metadata.hardware.is_empty());
         assert_eq!(model.metadata.author, "local-inference-lab");
         assert_eq!(model.metadata.base_model, DISPLAY_MODEL);
@@ -107,6 +108,8 @@ mod tests {
                 license: "declared-license".into(),
                 context_tokens: Some(262144),
                 revision_bytes: Some(123),
+                revision_updated_at: "2026-11-05T18:06:29Z".into(),
+                build_target_match: Some(false),
                 ..Default::default()
             },
             ..Default::default()
@@ -123,6 +126,8 @@ mod tests {
         assert_eq!(merged[0].metadata.license, "declared-license");
         assert_eq!(merged[0].metadata.context_tokens, Some(262144));
         assert_eq!(merged[0].metadata.revision_bytes, Some(123));
+        assert_eq!(merged[0].metadata.revision_updated_at, "2026-11-05T18:06:29Z");
+        assert_eq!(merged[0].metadata.build_target_match, Some(false));
         assert_eq!(merged[1].name, "other model");
     }
 }

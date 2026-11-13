@@ -19,7 +19,8 @@ from ignition.preparation.compilation import compile_forward
 from ignition.preparation.qwen38 import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
-from ignition.recipes.qwen38.moe import PreparedQwenMoe, QwenMoeWeights
+from ignition.recipes.qwen38.moe import PreparedQwenMoe, QwenMoeWeights, QwenMoeScratch
+from tests.recipes.test_qwen38_moe_cuda import observe_moe
 from ignition.recipes.qwen38.weights import QwenWeightLoader, allocate_expert_scale_scratch
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -82,19 +83,17 @@ def test_shared_routed_composition_and_arena_reuse(weights, rows, overlap, compi
         session.register_scratch(arena)
         moe = PreparedQwenMoe(input_copy, weights, session=session, name="overlap",
                               workspace=arena, projection_workspace=arena)
+        moe.functional(session=session)
         session.tune()
-        session.freeze()
+        arena.release_preparation()
+        readback = QwenMoeScratch.allocate(rows, source.device)
+        observe_moe(moe, readback)
         assert (moe.concurrent_shared is not None) == (overlap and rows <= 256)
-        if moe.concurrent_shared is not None:
-            routed_bytes = moe.experts.plan.memory_requirements().scratch_nbytes
-            assert moe.experts.scratch.data_ptr() + routed_bytes <= moe.concurrent_shared.workspace.data_ptr()
 
         def forward():
             input_copy.copy_(source)
-            moe(input_copy)
-            output_copy.copy_(moe.output)
-            shared_copy.copy_(moe.shared.finish())
-            arena.tensor.fill_(255)
+            output_copy.copy_(moe(input_copy))
+            shared_copy.copy_(readback.shared.output)
             input_copy.zero_()
 
         call = compile_forward(forward) if compiled else forward
@@ -104,6 +103,7 @@ def test_shared_routed_composition_and_arena_reuse(weights, rows, overlap, compi
         with torch.cuda.graph(graph):
             call()
         graph.instantiate()
+        session.freeze()
         raw = cuda.CUgraph(graph.raw_cuda_graph())
         status, _, _, _, count = cuda.cuGraphGetEdges(raw)
         assert status == cuda.CUresult.CUDA_SUCCESS
@@ -118,12 +118,10 @@ def test_shared_routed_composition_and_arena_reuse(weights, rows, overlap, compi
         for _ in range(3):
             source.normal_(std=.1)
             input_copy.copy_(source)
-            moe.shared(input_copy)
-            expected_shared = moe.shared.output.clone()
-            moe.router_projection(input_copy)
-            moe.routing(moe.router_logits)
-            moe.experts()
-            expected = moe.routed_output + expected_shared
+            projected, gate = moe.shared.project_runtime(input_copy)
+            expected_shared = moe.shared.finish_runtime(projected, gate)
+            selected = moe.routing(moe.router_projection(input_copy))
+            expected = moe.experts(input_copy, selected.ids, selected.weights) + expected_shared
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()
@@ -197,16 +195,20 @@ def test_aot_shared_expert_order_rebinds_without_recompilation(weights, tmp_path
         session.register_scratch(arena)
         moe = PreparedQwenMoe(source, weights, session=session, name="overlap",
                               workspace=arena, projection_workspace=arena)
+        moe.functional(session=session)
         session.tune()
-        session.freeze()
+        arena.release_preparation()
+        readback = QwenMoeScratch.allocate(1, source.device)
+        observe_moe(moe, readback)
         assert moe.concurrent_shared is not None
         moe.concurrent_shared.defer_launch = False
 
         def forward():
-            moe(source)
-            output.copy_(moe.output)
-            shared.copy_(moe.shared.finish())
-            arena.tensor.fill_(255)
+            output.copy_(moe(source))
+            shared.copy_(readback.shared.output)
+
+        forward()
+        session.freeze()
 
         artifact = aot.aot_forward(forward)
         artifact(forward)
@@ -231,12 +233,10 @@ def test_aot_shared_expert_order_rebinds_without_recompilation(weights, tmp_path
                 restored(forward)
             for _ in range(2):
                 source.normal_(std=.1)
-                moe.shared(source)
-                expected_shared = moe.shared.output.clone()
-                moe.router_projection(source)
-                moe.routing(moe.router_logits)
-                moe.experts()
-                expected = moe.routed_output + expected_shared
+                projected, gate = moe.shared.project_runtime(source)
+                expected_shared = moe.shared.finish_runtime(projected, gate)
+                selected = moe.routing(moe.router_projection(source))
+                expected = moe.experts(source, selected.ids, selected.weights) + expected_shared
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize()

@@ -82,11 +82,33 @@ class PreparedMLP:
         declare(session, (self.activation_plan.request(
             name=f"{name}.swiglu", prepare_call=lambda state: PreparedCall(
                 run=lambda: state.launch(gate_up, gate_up, intermediate),
-                owners=(gate_up, intermediate),
             ),
         ),))
+        self._functional_layout = None
+
+    def functional(self, *, session):
+        """Run the prepared MLP with compiler-local projection and activation outputs."""
+        if self._functional_layout is None:
+            self._functional_layout = (
+                tuple(self.gate_up.shape), self.gate_up.stride(), self.gate_up.dtype,
+                tuple(self.intermediate.shape), self.intermediate.stride(), self.intermediate.dtype,
+                tuple(self.output.shape), self.output.stride(), self.output.dtype,
+            )
+            self.up_projection.functional(session=session)
+            self.down_projection.functional(session=session)
+            self.gate_up = self.intermediate = self.output = None
+        return self
 
     def __call__(self, source):
+        if self._functional_layout is not None:
+            _, _, _, intermediate_shape, intermediate_stride, intermediate_dtype, _, _, _ = self._functional_layout
+            gate_up = self.up_projection(source)
+            intermediate = torch.empty_strided(intermediate_shape, intermediate_stride, dtype=intermediate_dtype,
+                                               device=source.device)
+            hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
+                                      round_silu=self.round_silu, out=intermediate,
+                                      plan=self.activation_plan)
+            return self.down_projection(intermediate)
         self.up_projection(source)
         hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
                                   round_silu=self.round_silu, out=self.intermediate,
@@ -122,8 +144,22 @@ class PreparedUngatedMLP:
             declare(session, (self.activation_plan.request(name=name + ".relu2", prepare_call=lambda state:
                 PreparedCall(run=lambda: state.launch(projected, projected, intermediate))),))
 
+    def functional(self, *, session):
+        """Keep the prepared arithmetic while allocating intermediate storage locally."""
+        if self.intermediate is not None:
+            self.intermediate_layout = (tuple(self.intermediate.shape), self.intermediate.stride(),
+                                        self.intermediate.dtype)
+            self.up_projection.functional(session=session)
+            self.down_projection.functional(session=session)
+            self.intermediate = None
+        return self
+
     def __call__(self, source):
         value = self.up_projection(source)
-        self.intermediate.copy_(torch.relu(value).square() if self.activation == "relu2"
-                                else torch.nn.functional.silu(value))
-        return self.down_projection(self.intermediate)
+        intermediate = self.intermediate
+        if intermediate is None:
+            shape, stride, dtype = self.intermediate_layout
+            intermediate = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        intermediate.copy_(torch.relu(value).square() if self.activation == "relu2"
+                           else torch.nn.functional.silu(value))
+        return self.down_projection(intermediate)

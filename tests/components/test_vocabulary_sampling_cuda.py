@@ -434,3 +434,60 @@ def test_width_one_replays_target_only_with_empty_draft_storage():
             assert (verification.output.survival == -1).all()
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize('fp8', [False, True])
+def test_functional_distributions_and_verification_return_local_replay_values(fp8):
+    from ignition.preparation.compilation import compile_forward
+
+    proposal = fixture(batch=4, depth=3, vocab=1024, fp8=fp8)
+    proposal()
+    p = torch.full((4, 4, 1024), 1 / 1024, device='cuda')
+    verification = verifier(proposal, p)
+    verification()
+    expected_q = proposal.probabilities.clone()
+    expected_valid = proposal.valid.clone()
+    expected_tokens = proposal.tokens.clone()
+    expected = {name: getattr(verification.output, name).clone()
+                for name in verification.output.__dataclass_fields__}
+    logits, candidates, pending = proposal.logits, proposal.candidates, proposal.pending
+    seeds, offsets = proposal.seeds, proposal.offsets
+    target_valid = verification.target_valid
+    proposal.functional(session=None)
+    verification.functional(session=None)
+    output_q = torch.empty_like(expected_q)
+    output_valid = torch.empty_like(expected_valid)
+    output_tokens = torch.empty_like(expected_tokens)
+    actual = {name: torch.empty_like(value) for name, value in expected.items()}
+
+    def forward():
+        q, valid, tokens = proposal.run(logits, candidates, pending=pending, seeds=seeds, offsets=offsets)
+        accepted = verification.run(q, tokens, p, valid, target_valid)
+        output_q.copy_(q)
+        output_valid.copy_(valid)
+        output_tokens.copy_(tokens)
+        for name in actual:
+            actual[name].copy_(getattr(accepted, name))
+
+    compiled = compile_forward(forward)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for _ in range(3):
+        output_q.fill_(float('nan'))
+        output_tokens.fill_(-99)
+        before = torch.cuda.memory_stats()
+        graph.replay()
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+        for key in ('allocation.all.allocated', 'allocation.all.freed',
+                    'segment.all.allocated', 'segment.all.freed'):
+            assert before[key] == after[key]
+        torch.testing.assert_close(output_q, expected_q, rtol=0, atol=0)
+        assert torch.equal(output_valid, expected_valid)
+        assert torch.equal(output_tokens, expected_tokens)
+        for name, value in expected.items():
+            torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+    assert proposal.scratch is None and verification.scratch is None
+    graph.reset()

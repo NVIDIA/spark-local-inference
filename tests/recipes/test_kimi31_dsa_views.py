@@ -21,18 +21,12 @@ def _assert_geometry(actual, expected):
     assert actual._version == expected._version
 
 
-class _OffsetAllocator:
-    def zeros(self, shape, dtype):
-        return torch.zeros((shape[0] + 2, *shape[1:]), dtype=dtype)[1:-1]
-
-
-@pytest.mark.parametrize("allocator", [None, _OffsetAllocator()])
-def test_shared_buffers_retain_equal_prefix_views(allocator):
+def test_shared_buffers_retain_equal_prefix_views():
     values = {}
-    first = indexer.SharedBuffers(values, "cpu", allocator)
+    first = indexer.SharedBuffers(values, "cpu")
     capacity = first.buffer("scores", (128, 8), torch.float32)
     partial = first.buffer("scores", (65, 8), torch.float32)
-    second = indexer.SharedBuffers(values, "cpu", allocator)
+    second = indexer.SharedBuffers(values, "cpu")
     assert second.buffer("scores", (128, 8), torch.float32) is capacity
     assert second.buffer("scores", (65, 8), torch.float32) is partial
     _assert_geometry(partial, capacity[:65])
@@ -63,7 +57,7 @@ def test_shared_buffers_growth_does_not_reuse_prior_storage_views():
 
 def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometry(monkeypatch):
     def operation(*args, **kwargs):
-        return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
+        return SimpleNamespace(args=args, kwargs=kwargs, plan=object(), functional=lambda **options: None)
 
     from ignition.components import candidate_selection
 
@@ -88,14 +82,15 @@ def test_equal_selection_stages_reuse_owners_and_preserve_representative_geometr
     assert prepared.bounds == ((0, 128), (128, 256), (256, 257))
     assert tuple(prepared.selections) == (128, 1)
     full, tail = prepared.selections[128], prepared.selections[1]
-    _assert_geometry(tail.lengths, full.lengths[:1])
+    _assert_geometry(tail.indexer.args[4], full.indexer.args[4][:1])
     for part, (start, end) in ((full, (0, 128)), (tail, (256, 257))):
-        _assert_geometry(part.indexer.args[0], prepared.query[start:end].view(end - start, 32, 128))
-        _assert_geometry(part.indexer.args[1], prepared.head_weights[start:end])
-        _assert_geometry(part.indexer.args[3], part.pages.expand(end - start, -1))
+        _assert_geometry(part.indexer.args[0], prepared.projections[0].args[2][start:end].view(end - start, 32, 128))
+        _assert_geometry(part.indexer.args[1], prepared.projections[2].args[2][start:end])
+        _assert_geometry(part.indexer.args[3], part.indexer.args[3][:1].expand(end - start, -1))
         assert part.indexer.args[5] is None
-        assert part.indexer.args[6] is part.local
-        assert part.indexer.kwargs["scores"] is part.scores
+        assert part.local is part.scores is None
+        assert part.indexer.args[6].shape == (end - start, 2048)
+        assert part.indexer.kwargs["scores"].shape == (end - start, 2048)
     assert full.indexer.plan is not tail.indexer.plan
     assert full.merge.fold.plan is not tail.merge.fold.plan
 
@@ -141,9 +136,10 @@ def test_selected_attention_reuses_only_identical_record_and_constant_views(monk
         return SimpleNamespace(bounds=bounds, selections={2: object(), 1: object()}, sharded=None)
 
     def operation(*args, **kwargs):
-        return SimpleNamespace(args=args, kwargs=kwargs, plan=object())
+        return SimpleNamespace(args=args, kwargs=kwargs, plan=object(), functional=lambda **options: None)
 
     monkeypatch.setattr(attention.PreparedMLAProjection, "__init__", projection)
+    monkeypatch.setattr(attention.PreparedMLAProjection, "functional", lambda self, **kwargs: self)
     monkeypatch.setattr(attention, "PreparedDSAIndexer", selection)
     monkeypatch.setattr(attention, "PreparedDenseMLA", operation)
     monkeypatch.setattr(attention, "PreparedPeerRecordGather", operation)

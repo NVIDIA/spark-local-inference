@@ -12,7 +12,8 @@ and `--eager` execution, is for fault diagnosis only. Its preparation resources,
 cache backing, and loading lifecycle differ from core serving, so its timings
 cannot establish apples-to-apples serving performance.
 
-`ignition bench` supports Qwen3.8-27B DFlash2 and Kimi K3.1 Pro DSpark. It measures complete prepared speculative graph rounds
+`ignition bench` supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and
+Nemotron Bolt LiLiCorr. It measures complete prepared speculative graph rounds
 or, with `--prefill --prefill-chunk-size N`, exact prefill chunk graphs
 for kernel and model iteration without export or HTTP. It uses real tokenized
 contexts, restores complete state outside CUDA event timing, and records raw
@@ -41,8 +42,8 @@ timelines with operator and layer attribution, kernel counts, summed kernel
 durations, and graph elapsed time. Host graph-launch traces alone cannot
 attribute GPU work.
 
-Verify improvements through an exported `.safetensors` core loaded by
-`flare run --embedding-table-storage ram`, including Helios's asynchronous
+Verify improvements through an exported core loaded by
+`flare run CORE --embedding-table-storage ram`, including Helios's asynchronous
 row delivery. Measure disk delivery separately when it is the deployment
 configuration. For matching batch and verification width, graph rounds per
 second are the change in `flare_speculative_rounds_total` divided by the
@@ -55,7 +56,7 @@ and use kernel traces or component measurements to attribute gaps before checkin
 gains through the actual Helios service. Record raw measurements with their
 configuration, rerun noisy comparisons, and retain workload regressions. The
 single-token weight-traffic estimate is a bandwidth bound; the minimal replay
-harness supplies the measured floor.
+harness in `qualify/replay_floor.py` supplies the measured floor.
 
 Verify allocation stability and scratch/input lifetime under repeated
 native replay, including poisoning reusable storage after its last permitted use.
@@ -153,68 +154,88 @@ capacities through 4,096-token prefill.
 
 ## Cross-model scratch planning
 
-Review scratch lifetimes across every supported recipe and shared component,
-including Qwen, GLM, DeepSeek, MiMo, Kimi, Step, and Nemotron.
+Use the complete prepared graph catalog when diagnosing fixed device memory.
+The relevant result is available cache capacity and graph latency from an
+exported core under the intended serving configuration. `ignition debug-serve`
+can isolate a fault, but its memory and timing include preparation resources.
+
+1. Establish a baseline with the same checkpoint, GPU, tensor-parallel width,
+   concurrency, prefill chunks, and speculative capacities that the change will
+   target. Record retained weights, explicit cache and request state, graph-pool
+   storage, operator workspaces, allocator inactive blocks and padding, available
+   cache capacity, and complete graph time. Distinguish physical backing from
+   reserved virtual address space and preparation-only allocations from serving
+   allocations.
+2. Trace the largest excess allocation to its owner and last consumer. Inspect
+   the compiled schedule and stream joins when a lifetime is unclear. Check
+   whether the bytes are useful live data, a constructor-retained example, an
+   opaque operator allocation, a graph-local tensor, or allocator fragmentation.
+   Compare the measured allocation with the largest required live overlap before
+   changing a pool size.
+3. Put graph-local activations, metadata, outputs, and workspaces in the prepared
+   forward. Pass their tensors to b12x operators and expose reads, mutations,
+   aliases, and side-stream dependencies. Let Inductor plan reuse within the
+   forward and let serialized graph variants share the CUDA graph pool. Keep
+   immutable model tensors in `CoreStorage` persistent destinations and keep
+   cache, request, completion, and transport state in explicit storage. Retire
+   declaration examples and tuning workspace before compilation. A second manual
+   temporary planner needs a demonstrated lifetime or compiler constraint.
+4. Re-export the full catalog and validate native replay at the affected shapes,
+   including alternating graph variants, inactive rows, speculative rollback,
+   vision transitions, and tensor-parallel joins where supported. Zero or poison
+   disposable preparation storage before replay; every graph must write scratch
+   before reading it. Check numerical references, repeated-replay allocation
+   stability, fixed memory, available cache capacity, and graph latency. Keep a
+   resource reduction when latency is equal within measurement noise; investigate
+   any remaining gap by owner rather than assuming Inductor planned it away.
+
+Review temporary lifetimes across every supported recipe and shared component.
 Measure prepared fixed memory and available KV capacity before changing each
-recipe. Inspect attention, rotary, activation, expert, and vision temporaries
-for caller-owned outputs and shared storage across sequential graph variants.
-Keep persistent state and overlapping branches disjoint; include stream joins
-and image feature consumption when determining lifetimes.
+recipe. Activations, metadata, sampling intermediates, expanded scales, and
+operator workspaces belong inside the compiled forward. Expose their reads,
+writes, and aliases to Inductor. Follow [serving temporary lifetimes](preparation-development.md#serving-temporaries-and-concurrent-lifetimes).
 
-Size speculative score, count, probability, and retained draft buffers from
-the actual prepared (batch, verification-width) catalog. Independent maxima
-for batch and width can describe a shape that no graph uses. Inspect both
-oversized shared workspaces and separate allocations retained by serialized
-graph variants or proposal steps; keep simultaneously live distributions
-disjoint.
+Constructors may use ordinary declaration examples to select plans. Inspect
+component fields, closures, prepared argument tuples, priming owners, and library
+caches for references that keep those examples alive after tuning. Release them
+and retire preparation workspace before compilation. Shared declaration examples
+need distinct semantic roles for simultaneously live operands.
 
-Vision working buffers and mutable validation metadata use graph-buffer cursors;
-request-owned image features and upload inputs retain independent storage.
-Speculative graphs allocate filtering and retained-probability buffers for their
-actual batch and width, sharing backing across serialized variants. Proposal and
-target stages execute within one graph; retained proposal values remain disjoint
-from target scratch until verification consumes them. Graph-buffer cursors reuse
-available space in earlier chunks without moving existing views.
-Proposal filtering, target filtering, and verification reuse sequential-stage
-intermediates. Target probabilities and validity retain separate storage through
-verification, as do retained draft probabilities.
+Size speculative scores, counts, probabilities, and retained proposals from the
+actual prepared batch and verification width. Independent maxima can describe a
+shape that no graph uses. Keep proposal probabilities, target probabilities,
+validity, and correction records live through their final verification or commit
+consumer. Inductor can reuse their storage afterward.
 
-Qwen, DeepSeek V4, MiMo, Nemotron, and Step vision encoders reuse storage across
-attention, feedforward, and merger stages. Qwen also reuses patch staging and
-consumed QKV storage. Kimi reuses its fused-projection workspace across these
-stages. Residuals, shared projection outputs, metadata, and live projection
-operands stay disjoint. Qwen validates FP32 upload pixels before sanitizing them
-directly into the encoder's BF16 patch buffer.
+Persistent cache history, snapshots, request state, native inputs, completion
+frames, transport buffers, and request-owned image features retain explicit
+storage. Write escaping values there before a graph completes. Serialized graph
+variants share one CUDA graph pool only after every auxiliary branch joins.
+Carry each branch's source, outputs, encoded planes, and workspace through an
+explicit pending record, and expose the join's main-stream dependency.
 
-Cursors for sequential stages reuse storage beyond the buffers retained
-throughout a forward. Qwen's GDN, QSA, PLE, MoE, and hyperconnection temporaries share this
-storage. Block inputs, outputs, residuals, and injection coefficients remain
-disjoint from these temporaries. Target and MTP share a pool. Prefill retains the
-target residual until feedback packing; MTP feedback reuses normalized-activation
-storage and is consumed before the mixer overwrites it. Verification residuals
-and acceptance state retain independent storage. GDN's chunked-prefill operands are
-allocated only for the SM103 execution path that consumes them.
-DeepSeek V4, MiMo, and Step share attention and FFN intermediates. Concurrent
-shared/routed expert branches allocate from one cursor to retain disjoint views.
-DeepSeek V4.1 shares activation storage across text, draft, and vision graphs.
-Prefill layers commit window state before reusing private buffers; sequential
-indexer batches reuse packed queries and scales. The bounded decoder suffix
-gathers into destinations disjoint from the full prefill. Candidate rows follow
-the suffix capacity when hierarchical selection starts after that boundary.
-Verification compressor values and gates remain separate through acceptance.
-GLM's mHC carry and Kimi's named private buffers still require a stage-lifetime
-review. Nemotron reuses a cursor across serialized heterogeneous blocks.
-DeepSeek V4.1, MiMo, and Kimi draft-context projections retain dedicated
-intermediate tensors;
-review their consumption and history updates before sharing decoder storage.
+Preserve model-specific retention constraints. Qwen image validation precedes
+active metadata construction; prefill retains target residuals until feedback
+absorption. Recurrent correction records and verification compressor values
+remain live through accepted-state commit. DeepSeek's bounded decoder suffix
+uses destinations disjoint from the full prefill; candidate capacities follow
+that suffix geometry. Layer histories must be committed before their source
+intermediates can be reused. Vision upload pixels retain their declared
+precision and validation before conversion into encoder activations.
 
-Allocated scratch bytes are an upper bound, not a measurement of simultaneously
-live values. Typed chunk rounding, tensor views, graph-created temporaries,
-operator workspaces, retained speculative results, and upload storage all affect
-the allocation total. Derive a live-memory peak from read/write lifetimes and
-stream dependencies before describing an allocation inventory as that peak.
+Step, Muse, and MiMo retain caller-owned graph-buffer paths. Their
+buffer cursors may reuse storage only after the last consumer and must
+keep concurrent expert branches and draft-context values disjoint.
+Tensor-parallel ranks must bind equivalent layouts, including storage
+reserved for designated-rank sampling.
 
-Use the shared scratch planner where the lifetime contract fits. Validate
-numerical correctness, allocation stability, and native replay across decode,
-chunked prefill, vision, and supported speculative capacities. Record fixed
-memory, KV capacity, and complete graph latency before and after each change.
+An allocation inventory is not the exact live-memory peak. Account separately
+for graph-private pools, persistent storage, opaque library allocations,
+alignment, and allocator slack. Derive overlapping lifetimes from the compiled
+schedule and stream dependencies. Preserve graph-wide synchronization workspace
+through its final consumer.
+
+Validate numerical correctness, allocation stability, and native replay across
+decode, chunked prefill, vision, and supported speculative capacities. Alternate
+graph variants and poison disposable declaration buffers. Record fixed memory,
+KV capacity, and complete graph latency before and after performance changes.

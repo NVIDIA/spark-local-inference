@@ -194,7 +194,8 @@ def _export_hosts(args):
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
@@ -277,7 +278,8 @@ def _prepare(args):
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                      context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                      context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
@@ -457,7 +459,8 @@ def debug_serve(args) -> int:
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
@@ -476,6 +479,7 @@ def debug_serve(args) -> int:
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options["thinking_token_budget"] = configuration.get("server.thinking_token_budget").value
+    options["scheduler_checkpoint_extra_work_fraction"] = configuration.get("server.scheduler_checkpoint_extra_work_fraction").value
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     if args.history_drafts is not None:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):

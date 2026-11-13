@@ -1343,6 +1343,11 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
     incoming.prompt.message_boundaries = vec![10];
     sender.send(vec![incoming]).unwrap();
     let mut worker = fixture.worker(receiver);
+    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let handle = worker.active[0].as_ref().unwrap().request;
     advance(&mut worker, GraphKind::Init, 1, None);
@@ -1437,7 +1442,6 @@ fn ignored_eos_at_the_output_limit_finishes_for_length() {
     advance(&mut worker, GraphKind::Prefill, 2, Some(5));
     advance(&mut worker, GraphKind::Snapshot, 3, None);
     advance(&mut worker, GraphKind::Decode, 4, Some(5));
-    advance(&mut worker, GraphKind::Snapshot, 5, None);
     assert!(worker.publish().unwrap());
     let mut finished = Vec::new();
     while let Ok(event) = generation.events.try_recv() {
@@ -1841,7 +1845,6 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
             });
             worker.complete(GraphKind::Speculative, frame).unwrap();
         }
-        advance(&mut worker, GraphKind::Snapshot, 9, None);
         worker.publish().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
         let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
@@ -3264,14 +3267,20 @@ fn exercise_text_preemption(
     let (sender, receiver) = mpsc::channel();
     let (mut first, mut first_generation) = fixture.incoming_for(vec![0; 60], budget, data(60));
     let (mut second, mut second_generation) = fixture.incoming_for(vec![2; 60], budget, data(60));
+    first.prompt.message_boundaries = vec![32];
+    second.prompt.message_boundaries = vec![32];
     first.prompt.reasoning_cut = reasoning_cut.clone();
     second.prompt.reasoning_cut = reasoning_cut.clone();
     sender.send(vec![first, second]).unwrap();
     let mut worker = fixture.worker_for(receiver);
+    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     assert_eq!(worker.active.iter().flatten().count(), 2);
     assert_eq!(worker.scheduler.free_page_count(), 2);
-    let older = worker.active[0].as_ref().unwrap().request;
     let mut sequence = 0;
     let mut emitted = [vec![], vec![]];
     while worker.parked.is_empty() {
@@ -3292,7 +3301,8 @@ fn exercise_text_preemption(
             }
             _ => None,
         };
-        let frame = completion(&worker, &step, sequence, sample);
+        let mut frame = completion(&worker, &step, sequence, sample);
+        frame.timing.gpu_ns[0] = Some(if step.kind == GraphKind::Snapshot { 10 } else { 1000 });
         worker.complete(step.kind, frame).unwrap();
         worker.publish().unwrap();
         for (index, generation) in [&mut first_generation, &mut second_generation]
@@ -3324,6 +3334,10 @@ fn exercise_text_preemption(
     );
     let index = usize::from(incoming.prompt.tokens[0] == 2);
     let decoded_sequence = parked.carried.decoded_sequence;
+    let checkpoint_accounting = parked.checkpoint_accounting.clone();
+    assert!(checkpoint_accounting.initial_prefill_ns.is_some());
+    assert!(checkpoint_accounting.productive_decode_ns > 0);
+    assert!(checkpoint_accounting.extra_spent_ns > 0);
     assert_ne!(decoded_sequence, Default::default());
     let history_len = incoming.prompt.tokens.len();
     assert_eq!(history_len, 60 + parked.carried.generated_tokens as usize);
@@ -3344,7 +3358,9 @@ fn exercise_text_preemption(
     if let Some(indices) = metadata.vision_token_indices {
         assert_eq!(indices, &vec![-1; history_len]);
     }
-    worker.retire(&[older]).unwrap();
+    let running = worker.active.iter().flatten().map(|active| active.request).collect::<Vec<_>>();
+    assert_eq!(running.len(), 1);
+    worker.retire(&running).unwrap();
     if evict_checkpoint {
         let pressure = worker
             .scheduler
@@ -3366,6 +3382,11 @@ fn exercise_text_preemption(
     let resumed = worker.active.iter().flatten().next().unwrap().request;
     let live = worker.scheduler.request(resumed).unwrap();
     assert_eq!(live.decoded_sequence, decoded_sequence);
+    let resumed_accounting = live.checkpoint_accounting();
+    assert_eq!(resumed_accounting.demand_epoch, checkpoint_accounting.demand_epoch);
+    assert_eq!(resumed_accounting.initial_prefill_ns, checkpoint_accounting.initial_prefill_ns);
+    assert_eq!(resumed_accounting.productive_decode_ns, checkpoint_accounting.productive_decode_ns);
+    assert_eq!(resumed_accounting.extra_spent_ns, checkpoint_accounting.extra_spent_ns);
     if evict_checkpoint {
         assert!(live.consumed_tokens < history_len as u64 - 1);
     } else {
@@ -5559,4 +5580,82 @@ fn publication_losses_classify_oversize_and_copy_failure() {
         );
         assert_eq!(pins(&worker, id), 0);
     }
+}
+
+
+#[test]
+fn local_copyout_defers_without_a_pin_until_pending_admission_headroom_returns() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.push_back(flare_selene::StoreOutcome::Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 150], 4);
+    worker.pending.push_back(incoming);
+    assert!(worker.service_store().unwrap());
+    assert!(fake_store(&mut worker).stored.is_empty());
+    assert_eq!(pins(&worker, id), 0);
+    assert_eq!(worker.deferred_copyouts, [id]);
+    assert_eq!(fixture.metrics.copyout_headroom_deferrals.load(Ordering::Relaxed), 1);
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fixture.metrics.copyout_headroom_deferrals.load(Ordering::Relaxed), 1);
+    worker.pending.clear();
+    assert!(worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    assert_eq!(pins(&worker, id), 1);
+    assert!(worker.deferred_copyouts.is_empty());
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+}
+
+#[test]
+fn local_copyout_discards_an_evicted_unpinned_deferral() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker.attach_store(Some(Box::new(FakeStore::new(None))));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 150], 4);
+    worker.pending.push_back(incoming);
+    worker.service_store().unwrap();
+    assert_eq!(worker.deferred_copyouts, [id]);
+    let _ = worker.admit().unwrap();
+    assert!(worker.scheduler.cache().checkpoint(id).is_err());
+    worker.service_store().unwrap();
+    assert!(worker.deferred_copyouts.is_empty());
+    assert!(fake_store(&mut worker).stored.is_empty());
+}
+
+
+#[test]
+fn local_copyout_rechecks_headroom_after_each_queued_pin() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([flare_selene::StoreOutcome::Queued; 2]);
+    worker.attach_store(Some(Box::new(store)));
+    let first = unpinned_checkpoint(&mut worker, 0, 64);
+    let second = unpinned_checkpoint(&mut worker, 1, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 70], 1);
+    worker.pending.push_back(incoming);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    assert_eq!(fake_store(&mut worker).stored[0].id, first);
+    assert_eq!(pins(&worker, first), 1);
+    assert_eq!(pins(&worker, second), 0);
+    assert_eq!(worker.deferred_copyouts, [second]);
+    complete_store(&mut worker, first, true);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).stored.len(), 2);
+    assert_eq!(pins(&worker, second), 1);
 }

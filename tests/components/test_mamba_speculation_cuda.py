@@ -23,7 +23,7 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, prime, heads, gr
     from ignition.components.mamba_speculation import PreparedMambaReplay, PreparedMambaVerification
     from ignition.components.state import StateLayout, StateStorage
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
 
     torch.manual_seed(901)
     dim, n, ring, layers, batch = 64, 128, 16, 2, 3
@@ -50,9 +50,10 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, prime, heads, gr
     graphs, operands, replayers = {}, {}, {}
     with PreparationSession(device="cuda:0", autotune=autotune, prime=prime) as session:
         for width in range(8, 0, -1):
-            replay = PreparedMambaReplay(pool.backing, layout, regions, A, rows, lengths,
-                ring_region=layout.region("ring"), count_region=layout.region("pending"), ring_length=ring,
-                buffers=GraphBufferPool("cuda:0", chunk_bytes=256).cursor())
+            replay = PreparedMambaReplay(pool.backing, layout, regions, A,
+                ring_region=layout.region("ring"), count_region=layout.region("pending"), ring_length=ring)
+            ring_start = torch.zeros(pool.backing.shape[0], dtype=torch.int32, device="cuda")
+            pending_count = torch.zeros_like(ring_start)
             records, updates, arguments = [], [], []
             cu = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
             for layer in range(layers):
@@ -69,19 +70,22 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, prime, heads, gr
                     out=torch.zeros((tokens, heads, dim), device="cuda", dtype=torch.bfloat16))
                 record = tuple(pool.region(f"{layer}.{field}") for field in ("x", "b", "dt"))
                 update = (PreparedMambaUpdate(args, session=session, name=f"decode{layer}") if width == 1 else
-                    PreparedMambaVerification(args, record, replay.ring_start, replay.pending_count, rows,
+                    PreparedMambaVerification(args, record, ring_start, pending_count, rows,
                         width=width, session=session, workspace=workspace, name=f"verify{width}.{layer}"))
                 updates.append(update)
                 arguments.append(args)
                 records.append(record)
             workspace.finalize()
 
-            def forward(replay=replay, updates=tuple(updates), width=width):
-                replay.prepare(width=width)
-                for update in updates:
-                    update()
+            def forward(replay=replay, updates=tuple(updates), arguments=tuple(arguments),
+                        records=tuple(records), width=width):
+                ring_start, pending_count = replay.prepare(rows, lengths, width=width)
+                for update, args, record in zip(updates, arguments, records, strict=True):
+                    output = (update(args) if width == 1 else
+                              update(args, record, ring_start, pending_count, rows))
+                    args["out"].copy_(output)
                 if width > 1:
-                    replay.commit(accepted, width=width)
+                    replay.commit(accepted, rows, lengths, ring_start, pending_count, width=width)
 
             forward = compile_forward(forward)
             forward()
@@ -143,7 +147,7 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, prime, heads, gr
                 assert (actual - target).norm() / target.norm() < .012
                 torch.testing.assert_close(actual, target, rtol=.04, atol=.04)
         lengths.fill_(1)
-        flush = compile_forward(lambda: replayers[1].prepare(width=1))
+        flush = compile_forward(lambda: replayers[1].prepare(rows, lengths, width=1))
         flush()
         for layer, state in enumerate(states):
             for slot in rows.cpu().tolist():

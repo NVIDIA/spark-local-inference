@@ -14,6 +14,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import IndexedCheckpoint
+from ignition.preparation.persistent import persistent_cat, allocated_tensor_bytes
 
 if TYPE_CHECKING:
     import torch
@@ -81,7 +82,7 @@ class ModelWeights:
         if torch.cuda.get_device_capability(device) not in SUPPORTED_CAPABILITIES:
             raise ValueError(f"GLM prepared execution requires {SUPPORTED_ARCHITECTURES}")
         tree = create_model_tree(manifest.snapshot)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         layers = []
         with GlmWeightLoader(manifest, device, shard=shard,
                              progress=progress if shard.rank == 0 else None,
@@ -113,7 +114,7 @@ class ModelWeights:
                                     progress_label="Load vision weights") as loader:
                 vision = VisionWeights.load(tree.model.visual, loader)
         torch.cuda.synchronize(device)
-        return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, head, draft, vision)
+        return cls(tree, shard, tuple(layers), scales, allocated_tensor_bytes(device) - before, head, draft, vision)
 
 
 class GlmWeightLoader(DirectWeightLoader):
@@ -186,8 +187,6 @@ class GlmWeightLoader(DirectWeightLoader):
         return result
 
     def _load_kda(self, prefix):
-        import torch
-
         channels = self.shard.partition(8192, alignment=128)
         heads = self.shard.partition(64)
         result = {name: self._projection(f"{prefix}.{name}", rows=channels)
@@ -200,9 +199,9 @@ class GlmWeightLoader(DirectWeightLoader):
         result["A_log"] = self.load_tensor(f"{prefix}.A_log", extent=slice(*heads))
         result["dt_bias"] = self.load_tensor(f"{prefix}.dt_bias", extent=slice(*channels))
         result["o_norm.weight"] = self.load_tensor(f"{prefix}.o_norm.weight")
-        result["conv1d.weight"] = torch.cat([
+        result["conv1d.weight"] = persistent_cat([
             self.load_tensor(f"{prefix}.{name}_conv1d.weight",
-                             extent=slice(*channels)) for name in ("q", "k", "v")
+                             extent=slice(*channels), temporary=True) for name in ("q", "k", "v")
         ]).squeeze(1)
         return result
 
@@ -271,10 +270,12 @@ class GlmWeightLoader(DirectWeightLoader):
                 "enorm", "hnorm", "eh_proj", "input_layernorm", "post_attention_layernorm", "shared_head.norm")})
 
     def load_residual(self, layer):
+        import torch
+
         prefix = self._layer(layer)
         # mHC parameters execute in FP32; converting once lets every prepared graph variant share them.
-        return {name: self.load_tensor(f"{prefix}.{name}").float() if name.startswith("hc_")
-                else self.load_tensor(f"{prefix}.{name}") for name in (
+        return {name: self.load_tensor(f"{prefix}.{name}", dtype=torch.float32 if name.startswith("hc_") else None)
+                for name in (
             "input_layernorm.weight", "post_attention_layernorm.weight",
             "hc_attn_base", "hc_attn_fn", "hc_attn_scale", "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale")}
 

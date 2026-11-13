@@ -15,21 +15,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.recipes.kimi31_attention_observations import (
+    AttentionForward, AttentionTail, allocate_observations, poison_observations,
+)
+
 pytestmark = pytest.mark.skipif(os.environ.get('FLARE_RUN_TP_CUDA_TESTS') != '1',
                                reason='requires sixteen explicitly assigned GPUs')
-
-
-class AttentionForward:
-    def __init__(self, operation, source):
-        self.operation, self.source = operation, source
-        self.output = torch.empty_like(source)
-
-    def __call__(self):
-        self.output.copy_(self.operation(self.source))
-        # The gather's input may be overwritten once its join has completed.
-        self.operation.parts[1]['quantized'].zero_()
-        return self.output
-
 
 
 def _graph_nodes(graph):
@@ -90,58 +81,6 @@ def _check_collective_edges(graph, query_functions, candidate_functions, *, over
                 kernels=kernels, edges=edges, query_before_candidates=overlap)
 
 
-
-class RecordedAttentionTail:
-    """Replay the original compiled attention/output nodes with recorded selection inputs."""
-
-    def __init__(self, graph, candidate_functions):
-        from cuda.bindings import driver
-
-        kernels, edges = _graph_nodes(graph)
-        roots = [node for node, value in kernels.items() if value['symbol'] == '_selection_slots']
-        assert len(roots) == 1, 'recorded selection boundary is ambiguous'
-        successors = {}
-        for parent, child in edges:
-            successors.setdefault(parent, []).append(child)
-        retained, pending = set(), roots.copy()
-        while pending:
-            node = pending.pop()
-            if node not in retained:
-                retained.add(node)
-                pending.extend(successors.get(node, ()))
-        retained_kernels = [value for node, value in kernels.items() if node in retained]
-        assert not any(value['function'] in candidate_functions for value in retained_kernels)
-        assert not any('DSAFusedIndexerKernel' in value['symbol'] for value in retained_kernels)
-        self.kernel_symbols = [value['symbol'] for value in retained_kernels]
-        raw = driver.CUgraph(graph.raw_cuda_graph())
-        status, self.graph = driver.cuGraphClone(raw)
-        assert status == driver.CUresult.CUDA_SUCCESS
-        status, _, count = driver.cuGraphGetNodes(raw)
-        assert status == driver.CUresult.CUDA_SUCCESS
-        status, nodes, _ = driver.cuGraphGetNodes(raw, count)
-        assert status == driver.CUresult.CUDA_SUCCESS
-        for node in nodes:
-            if int(node) not in retained:
-                status, clone = driver.cuGraphNodeFindInClone(node, self.graph)
-                assert status == driver.CUresult.CUDA_SUCCESS
-                status, = driver.cuGraphDestroyNode(clone)
-                assert status == driver.CUresult.CUDA_SUCCESS
-        status, self.executable = driver.cuGraphInstantiate(self.graph, 0)
-        assert status == driver.CUresult.CUDA_SUCCESS
-
-    def replay(self):
-        from cuda.bindings import driver
-
-        status, = driver.cuGraphLaunch(self.executable, driver.CUstream(torch.cuda.current_stream().cuda_stream))
-        assert status == driver.CUresult.CUDA_SUCCESS
-
-    def close(self):
-        from cuda.bindings import driver
-
-        assert driver.cuGraphExecDestroy(self.executable)[0] == driver.CUresult.CUDA_SUCCESS
-        assert driver.cuGraphDestroy(self.graph)[0] == driver.CUresult.CUDA_SUCCESS
-
-
 def _rank(rank, directory, history_capacity, implementation, measure_latency):
     import torch.distributed as dist
     from cuda.bindings import driver
@@ -171,6 +110,7 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
     graphs = {}
     compiled = {}
     tails = {}
+    tail_compiled = {}
     runtimes = []
     session = None
     try:
@@ -228,7 +168,6 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
             assert operation.query_overlap is not None
             serial = copy(operation)
             serial.query_overlap = None
-            forwards = {'serial': AttentionForward(serial, source), 'overlap': AttentionForward(operation, source)}
             session.tune(show_progress=False)
             assert operation.parts[1]['gather'].plan.memory_requirements().scratch_nbytes == 0
             local_positions = torch.arange(pages * 128, device=device, dtype=torch.int64)
@@ -240,37 +179,31 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
             part = operation.parts[1]
             selector = part['selector']
             merge = selector.merge
-            outputs = (part['gathered'], part['partial'], part['lse'], selector.local, selector.scores,
-                       merge.packed, merge.gathered, selector.selected, merge.selected_scores,
-                       merge.planar, merge.owner.packed, merge.owner.selected_ids,
-                       part['owners'], part['slots'], part['counts'], operation.attended)
+            observations = allocate_observations(operation._run(source, metadata))
+            forwards = {name: AttentionForward(prepared, source, metadata, observations=observations)
+                        for name, prepared in (('serial', serial), ('overlap', operation))}
+            production = {name: AttentionForward(prepared, source, metadata)
+                          for name, prepared in (('serial', serial), ('overlap', operation))}
+            observed = observations.last_stage
+            packed, local_ids, local_scores, index_query, index_scales, index_weights = observed.index
 
             def restore():
                 cache.copy_(saved_cache)
                 index_cache.copy_(saved_index)
                 arena.tensor.fill_(0xA5)
-                for value in outputs:
-                    value.view(torch.uint8).fill_(0xff)
-                for forward in forwards.values():
+                poison_observations(observations)
+                for forward in (*forwards.values(), *production.values()):
                     forward.output.fill_(float('nan'))
 
             def snapshot(output):
-                values = dict(output=output, gathered_query=part['gathered'], selected_ids=selector.selected,
-                    physical_slots=part['slots'], counts=part['counts'], latent_cache=cache, index_cache=index_cache,
-                    local_ids=selector.local, local_scores=selector.scores,
-                    index_query=selector.indexer.quantized, index_query_scales=selector.indexer.scales,
-                    index_query_weights=selector.indexer.scaled_weights)
+                values = dict(output=output, gathered_query=observed.gathered, selected_ids=observed.selected,
+                    physical_slots=observed.slots, counts=observed.counts, latent_cache=cache, index_cache=index_cache,
+                    local_ids=local_ids, local_scores=local_scores,
+                    index_query=index_query, index_query_scales=index_scales,
+                    index_query_weights=index_weights)
                 return {name: value.view(torch.uint8).clone() for name, value in values.items()}
 
-            eager_tail_output = torch.empty_like(source)
-            def eager_tail():
-                from ignition.recipes.kimi31.dcp import selection_slots
-
-                selection_slots(selector.selected, metadata.positions, metadata.token_page_table, part['owners'], part['slots'],
-                    part['counts'], operation.shards, cache.shape[0], local=True)
-                part['attention'](part['gathered'], part['partial'])
-                part['combine'](part['partial'], part['lse'])
-                eager_tail_output.copy_(operation.finish())
+            eager_tail = AttentionTail(operation, observations, metadata)
 
             def check(actual, expected, stage, visible, step, tail=None):
                 differences = []
@@ -301,11 +234,11 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                 # Selection permits arbitrary order and arbitrary cutoff-tie membership.
                 # Each returned ID must attain the exact FP32 kth score of this invocation.
                 candidates = [None] * 16
-                dist.all_gather_object(candidates, (selector.local[0].cpu(), selector.scores[0].cpu()))
+                dist.all_gather_object(candidates, (local_ids[0].cpu(), local_scores[0].cpu()))
                 ids = torch.cat([torch.where(local >= 0, local * 16 + owner, -1)
                                  for owner, (local, _) in enumerate(candidates)])
                 scores = torch.cat([values for _, values in candidates])
-                chosen = selector.selected[0].cpu()
+                chosen = observed.selected[0].cpu()
                 valid = ids >= 0
                 live_scores, live_ids = scores[valid], ids[valid]
                 assert torch.isfinite(live_scores).all()
@@ -322,24 +255,22 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                 agreed = [None] * 16
                 dist.all_gather_object(agreed, chosen)
                 assert all(torch.equal(value, agreed[0]) for value in agreed)
-                # The forward deliberately overwrites its query-gather source. Reconstruct
-                # it from the unchanged absorbed query and verify against this invocation's
-                # own gathered shard before replaying a serial tail that may gather again.
-                recorded_query = operation.absorbed.float().clamp(-448., 448.).to(part['quantized'].dtype)
+                # Query storage may be reused after its join; the recorded gather must
+                # still contain this invocation's absorbed query.
+                assert not observed.quantized.view(torch.uint8).count_nonzero()
+                recorded_query = observations.projected.absorbed.float().clamp(-448., 448.).to(observed.quantized.dtype)
                 same('recorded_query_source', recorded_query.view(torch.uint8),
-                     part['gathered'][:, rank * 6:(rank + 1) * 6].contiguous().view(torch.uint8))
-                part['quantized'].copy_(recorded_query)
+                     observed.gathered.view(1, 96, RECORD_BYTES)[:, rank * 6:(rank + 1) * 6].contiguous().view(torch.uint8))
                 if tail is None:
-                    eager_tail()
-                    replayed_output = eager_tail_output
+                    replayed_output = eager_tail()
                 else:
                     tails[tail].replay()
-                    replayed_output = forwards[tail].output
+                    replayed_output = tail_forwards[tail].output
                 torch.cuda.synchronize(device)
                 for name, value in snapshot(replayed_output).items():
                     same('recorded_tail_' + name, value, actual[name])
                 record = dict(rank=rank, stage=stage, visible=visible, step=step, same_selection_order=same_order,
-                              exact_recorded_order_tail=True, differences=differences)
+                              exact_recorded_selection_tail=True, differences=differences)
                 with (directory / f'rank-{rank}-checks.jsonl').open('a') as log:
                     log.write(json.dumps(record) + '\n')
                 peers = [None] * 16
@@ -349,10 +280,11 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
             # Capture each exact prepared call to identify its CUfunction handles in
             # the complete graph. No kernel-name substring substitutes for this mapping.
             collective_functions = {}
-            transport = ((lambda: merge.gather(merge.packed.view(torch.bfloat16).view(1, -1)))
-                         if implementation == 'replicated' else (lambda: merge.owner.transport()))
+            transport = ((lambda: merge.gather(packed.view(torch.bfloat16).view(1, -1)))
+                         if implementation == 'replicated' else
+                         (lambda: merge.owner.transport(packed[1:].view(torch.int32), packed[:1])))
             for name, launch in (
-                    ('query', lambda: part['gather'](part['quantized'].view(1, -1))),
+                    ('query', lambda: part['gather'](observed.quantized.view(1, -1))),
                     ('candidate', transport)):
                 launch()
                 torch.cuda.synchronize(device)
@@ -364,27 +296,34 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                 collective_functions[name] = {entry['function'] for entry in kernels.values()}
                 probe.reset()
 
-            # Both forwards retain exactly the same tuned operators and channel owners.
-            signatures = {name: GraphSignature('decode', 1, 1) for name in forwards}
-            graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
+            functions = {**forwards, **{name + '-production': forward for name, forward in production.items()}}
+            signatures = {name: GraphSignature('decode', 1, 1) for name in functions}
+            graphs, compiled = capture_forwards(functions, signatures, session=session, device=device,
                 stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(),
                 coordinator=coordinator, cache_root=directory / 'compiled', retain_graphs=True,
-                retain_forwards=True,
-                before_run=lambda name: restore())
+                retain_forwards=True, before_run=lambda name: restore())
+            tail_forwards = {name: AttentionTail(operation, observations, metadata) for name in forwards}
+            tail_graphs, tail_compiled = capture_forwards(tail_forwards, signatures={
+                name: GraphSignature('decode', 1, 1) for name in tail_forwards}, session=session,
+                device=device, stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(),
+                coordinator=coordinator, cache_root=directory / 'tails', retain_forwards=True)
+            tails.update(tail_graphs)
             session.freeze()
-            for name, graph in graphs.items():
+            for name in production:
+                graph = graphs[name + '-production']
                 status, = driver.cuGraphDebugDotPrint(driver.CUgraph(graph.raw_cuda_graph()),
                     str(directory / f'rank-{rank}-{name}.dot').encode(), 1)
                 assert status == driver.CUresult.CUDA_SUCCESS
                 dag = _check_collective_edges(graph, collective_functions['query'],
                                               collective_functions['candidate'], overlap=name == 'overlap')
                 (directory / f'rank-{rank}-{name}-dag.json').write_text(json.dumps(dag) + '\n')
-                tails[name] = RecordedAttentionTail(graph, collective_functions['candidate'])
-                (directory / f'rank-{rank}-{name}-tail.json').write_text(json.dumps(tails[name].kernel_symbols) + '\n')
 
             rebound = copy(forwards['overlap'])
             rebound.source = source.clone()
             rebound.output = torch.empty_like(source)
+            production_rebound = copy(production['overlap'])
+            production_rebound.source = rebound.source
+            production_rebound.output = torch.empty_like(source)
             contexts = tuple(value for value in (0, 17, 2051, 16384, 65536) if value <= history_capacity)
             contexts += (history_capacity, 17)
             for step, visible in enumerate(contexts):
@@ -413,13 +352,37 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                     for key in ('allocation.all.allocated', 'allocation.all.freed', 'segment.all.allocated'):
                         assert before[key] == after[key], (name, key)
                     check(snapshot(forwards[name].output), expected, name + '-compiled-queued', visible, step, tail=name)
+                    for captured in (False, True):
+                        restore()
+                        before = torch.cuda.memory_stats(device)
+                        if captured:
+                            for _ in range(3):
+                                graphs[name + '-production'].replay()
+                        else:
+                            production[name]()
+                        torch.cuda.synchronize(device)
+                        after = torch.cuda.memory_stats(device)
+                        if captured:
+                            for key in ('allocation.all.allocated', 'allocation.all.freed', 'segment.all.allocated'):
+                                assert before[key] == after[key], (name, key)
+                        torch.testing.assert_close(cache.view(torch.uint8), expected['latent_cache'], rtol=0, atol=0)
+                        torch.testing.assert_close(index_cache, expected['index_cache'], rtol=0, atol=0)
+                        torch.testing.assert_close(production[name].output.view(torch.uint8), expected['output'],
+                                                   rtol=0, atol=0)
                     dist.barrier()
                 restore()
                 compiled['overlap'].artifact(rebound)
                 torch.cuda.synchronize(device)
                 check(snapshot(rebound.output), expected, 'overlap-rebound', visible, step, tail='overlap')
+                cache.copy_(saved_cache)
+                index_cache.copy_(saved_index)
+                compiled['overlap-production'].artifact(production_rebound)
+                torch.cuda.synchronize(device)
+                torch.testing.assert_close(production_rebound.output.view(torch.uint8), expected['output'], rtol=0, atol=0)
+                torch.testing.assert_close(cache.view(torch.uint8), expected['latent_cache'], rtol=0, atol=0)
+                torch.testing.assert_close(index_cache, expected['index_cache'], rtol=0, atol=0)
                 agreed = [None] * 16
-                dist.all_gather_object(agreed, selector.selected.cpu())
+                dist.all_gather_object(agreed, observed.selected.cpu())
                 assert all(torch.equal(value, agreed[0]) for value in agreed)
             print(f'rank {rank}: correctness and captured dependency checks passed', flush=True)
             if not measure_latency:
@@ -433,13 +396,13 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                     for name in ('serial', 'overlap', 'overlap', 'serial'):
                         restore()
                         for _ in range(5):
-                            graphs[name].replay()
+                            graphs[name + '-production'].replay()
                         torch.cuda.synchronize(device)
                         dist.barrier()
                         begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         begin.record()
                         for _ in range(repetitions):
-                            graphs[name].replay()
+                            graphs[name + '-production'].replay()
                         end.record()
                         end.synchronize()
                         elapsed = begin.elapsed_time(end) * 1000 / repetitions
@@ -453,15 +416,15 @@ def _rank(rank, directory, history_capacity, implementation, measure_latency):
                     print(f'context {visible}: complete component maximum-rank medians us {summary}', flush=True)
             if rank == 0:
                 (directory / 'component-timings.json').write_text(json.dumps(dict(
-                    boundary='CUDA events around repeated complete compiled DSA graphs; each sample uses the maximum of 16 rank-local intervals',
+                    boundary='CUDA events around repeated uninstrumented complete compiled DSA graphs; each sample uses the maximum of 16 rank-local intervals',
                     prepared_history_capacity=history_capacity, correctness_contexts=[0, 17, 2051, 16384, 65536, history_capacity, 17],
                     repetitions=repetitions, sampling_order='ABBA, five blocks per context', samples=samples), indent=2) + '\n')
     finally:
         for tail in tails.values():
-            tail.close()
+            tail.reset()
         for graph in graphs.values():
             graph.reset()
-        for forward in compiled.values():
+        for forward in (*compiled.values(), *tail_compiled.values()):
             forward.retire_after_capture()
         if session is not None:
             session.close()

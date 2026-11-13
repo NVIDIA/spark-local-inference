@@ -8,8 +8,6 @@ from dataclasses import fields, is_dataclass
 
 import torch
 
-from ignition.preparation.scratch import GraphBufferPool, GraphBuffers
-
 
 def storage_ranges(values):
     """Deduplicate backing storage for explicitly declared scratch tensor trees."""
@@ -28,10 +26,6 @@ def storage_ranges(values):
         elif is_dataclass(value):
             for field in fields(value):
                 visit(getattr(value, field.name))
-        elif isinstance(value, GraphBufferPool):
-            visit(value.chunks)
-        elif isinstance(value, GraphBuffers):
-            visit(value.pool)
         elif isinstance(value, dict):
             for child in value.values():
                 visit(child)

@@ -98,13 +98,10 @@ fn buffer_depths(ranks: usize, available: u64, capture: bool) -> Result<(usize, 
     } else {
         0
     };
-    let usable = total
-        .checked_sub(reserved)
-        .ok_or("insufficient host memory for capture transfer buffers")?;
-    let slots = ((usable / ranks as u64 / CAPACITY as u64) as usize).min(128 / ranks);
-    if slots == 0 {
-        return Err("insufficient available RAM for an 8 MiB export buffer per rank".into());
-    }
+    let usable = total.saturating_sub(reserved);
+    let slots = ((usable / ranks as u64 / CAPACITY as u64) as usize)
+        .min(128 / ranks)
+        .max(1);
     let scratch = if slots > 1 {
         (slots / 4).max(1).min(8)
     } else {
@@ -1057,6 +1054,15 @@ mod tests {
     }
     #[test]
     fn direct_tail_reads_and_writes_preserve_exact_length() {
+        check_tail_transfer(buffer_depths(1, 64 << 30, false).unwrap());
+    }
+    #[test]
+    fn one_buffer_without_scratch_transfers_exact_unaligned_tails() {
+        let depths = buffer_depths(16, 0, true).unwrap();
+        assert_eq!(depths, (1, 0));
+        check_tail_transfer(depths);
+    }
+    fn check_tail_transfer((depth, read_depth): (usize, usize)) {
         let path = temp();
         let file = OpenOptions::new()
             .create_new(true)
@@ -1064,7 +1070,10 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let budget = IoBudget::for_ranks(1).unwrap();
+        let mut budget = IoBudget::for_ranks(1).unwrap();
+        let inner = Arc::get_mut(&mut budget).unwrap();
+        inner.depth = depth;
+        inner.read_depth = read_depth;
         let size = BLOCK as u64 + 37;
         budget
             .write(&file, 0, size, |offset, bytes| {
@@ -1236,7 +1245,10 @@ mod tests {
         })).unwrap();
         let available = 1u64 << 30;
         assert_eq!(request.local_rank_count().unwrap(), 3);
-        assert!(buffer_depths(request.local_rank_count().unwrap(), available, true).is_err());
+        assert_eq!(
+            buffer_depths(request.local_rank_count().unwrap(), available, true).unwrap(),
+            (1, 0)
+        );
         request.local_ranks = Some(1);
         let local = request.local_rank_count().unwrap();
         let (main, scratch) = buffer_depths(local, available, true).unwrap();
@@ -1246,6 +1258,23 @@ mod tests {
             request.local_ranks = Some(invalid);
             assert!(request.local_rank_count().is_err());
         }
+    }
+    #[test]
+    fn transfer_concurrency_keeps_one_buffer_when_host_memory_is_low() {
+        for available in [0, 1 << 20] {
+            for ranks in [1, 16, 128, 129] {
+                for capture in [false, true] {
+                    assert_eq!(buffer_depths(ranks, available, capture).unwrap(), (1, 0));
+                }
+            }
+        }
+        for available in [8 << 30, 10 << 30] {
+            assert_eq!(buffer_depths(16, available, true).unwrap(), (1, 0));
+        }
+        assert_eq!(buffer_depths(129, u64::MAX, false).unwrap(), (1, 0));
+        assert_eq!(buffer_depths(16, 16 << 30, true).unwrap(), (2, 1));
+        assert!(buffer_depths(0, u64::MAX, false).is_err());
+        assert!(buffer_depths(usize::MAX, u64::MAX, true).is_err());
     }
     #[test]
     fn unaligned_bulk_uses_reserved_direct_scratch_with_one_output_slot() {

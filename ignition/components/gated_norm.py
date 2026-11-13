@@ -92,8 +92,9 @@ class PreparedGatedRMSNorm:
     sigmoid activation. ``round_normalized`` instead matches a module that rounds
     the normalized values to its BF16 input dtype before weighting them, as
     Qwen's gated norms do. Rows at or after the device live count become zeros.
-    Inputs and output are caller-owned storage with contiguous rows; the gate
-    may be a column slice of a wider row. The output may feed a projection directly.
+    Bound calls use caller-owned storage with contiguous rows; the gate may be
+    a column slice of a wider row. Functional calls accept runtime operands and
+    allocate their output inside the traced forward.
     ``norm_before_gate=False`` gates in FP32 before computing the variance.
     A [heads, dim] weight gives each group separate affine parameters. Passing a
     preparation session declares compilation and tuning with the model's batch.
@@ -141,10 +142,39 @@ class PreparedGatedRMSNorm:
 
             self.plan = declare_norm(self.args, self.options, session=session, name=name)
 
-    def __call__(self):
+    def functional(self, *, session=None, dynamic_live=False):
+        if self.args is None:
+            return self
+        hidden, gate, self.weight, output, self.live, _ = self.args[:6]
+        if dynamic_live:
+            self.live = None
+        self.output_shape = tuple(hidden.shape)
+        self.output_dtype = hidden.dtype
+        self.writes_output = output is not None
+        self.encoded = len(self.args) > 6
+        self.args = None
+        return self
+
+    def __call__(self, hidden=None, gate=None, *, encoded_bases=None, live=None):
+        args = self.args
+        output = None
+        if args is None:
+            if hidden is None or gate is None:
+                raise ValueError("functional gated norm requires hidden and gate operands")
+            output = (torch.empty(self.output_shape, dtype=self.output_dtype, device=hidden.device)
+                      if self.writes_output else None)
+            live = self.live if live is None else live
+            if live is None:
+                raise ValueError("functional gated norm requires a live count")
+            args = (hidden, gate, self.weight, output, live, gate.stride(0))
+            if self.encoded:
+                if encoded_bases is None:
+                    raise ValueError("functional encoded gated norm requires destination bases")
+                args += tuple(encoded_bases)
         if self.plan is None:
-            launch_triton(self.kernel, self.compiled, self.args, self.grid, **self.options)
+            launch_triton(self.kernel, self.compiled, args, self.grid, **self.options)
         else:
             from .gated_norm_preparation import execute
 
-            execute(*self.args[:5], self.plan.handle)
+            execute(*args[:5], self.plan.handle)
+        return output

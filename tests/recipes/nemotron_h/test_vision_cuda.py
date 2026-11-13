@@ -58,15 +58,31 @@ def models():
     return weights, reference
 
 
-def set_inputs(encoder, pixels):
+class VisionForward:
+    def __init__(self, encoder, capacity, device):
+        from ignition.recipes.nemotron_h.vision import PIXEL_WIDTH
+
+        self.encoder = encoder
+        self.patches = torch.zeros((capacity, PIXEL_WIDTH),
+                                  dtype=encoder.inputs.vision_pixel_values.dtype, device=device)
+        self.indices = torch.zeros((capacity, 4), dtype=torch.int64, device=device)
+        self.weights = torch.zeros((capacity, 4), dtype=torch.float32, device=device)
+        self.merge = torch.zeros((capacity // 4, 4), dtype=torch.int64, device=device)
+        self.cu = torch.zeros((2,), dtype=torch.int32, device=device)
+
+    def __call__(self):
+        return self.encoder(self.patches, self.indices, self.weights, self.merge, self.cu)
+
+
+def set_inputs(forward, pixels):
     from ignition.recipes.nemotron_h.vision import REGISTER_TOKENS
 
     _, _, height, width = pixels.shape
     h, w = height // 16, width // 16
     n = h * w
     packed = pixels.reshape(3, h, 16, w, 16).permute(1, 3, 0, 2, 4).reshape(n, 768)
-    encoder.scratch.patches.zero_()
-    encoder.scratch.patches[:n].copy_(packed)
+    forward.patches.zero_()
+    forward.patches[:n].copy_(packed)
     positions = torch.stack(torch.meshgrid(torch.arange(h, device="cuda"), torch.arange(w, device="cuda"), indexing="ij"), -1).reshape(-1, 2)
     source = (128. / max(h, w) * (positions.float() + .5) - .5).clamp_min(0)
     lo = source.long()
@@ -75,15 +91,14 @@ def set_inputs(encoder, pixels):
     y, x = lo.unbind(-1)
     yy, xx = hi.unbind(-1)
     fy, fx = frac.unbind(-1)
-    encoder.interpolation_indices.zero_()
-    encoder.interpolation_weights.zero_()
-    encoder.interpolation_indices[:n].copy_(torch.stack((y * 128 + x, y * 128 + xx, yy * 128 + x, yy * 128 + xx), -1))
-    encoder.interpolation_weights[:n].copy_(torch.stack(((1 - fy) * (1 - fx), (1 - fy) * fx, fy * (1 - fx), fy * fx), -1))
+    forward.indices.zero_()
+    forward.weights.zero_()
+    forward.indices[:n].copy_(torch.stack((y * 128 + x, y * 128 + xx, yy * 128 + x, yy * 128 + xx), -1))
+    forward.weights[:n].copy_(torch.stack(((1 - fy) * (1 - fx), (1 - fy) * fx, fy * (1 - fx), fy * fx), -1))
     merge = torch.arange(n, device="cuda").reshape(h, w).reshape(h // 2, 2, w // 2, 2).permute(0, 2, 1, 3).reshape(-1, 4)
-    encoder.merge_indices.zero_()
-    encoder.merge_indices[:n // 4].copy_(merge)
-    encoder.cu.copy_(torch.tensor([0, n + REGISTER_TOKENS], device="cuda", dtype=torch.int32))
-    encoder.num_features.fill_(n // 4)
+    forward.merge.zero_()
+    forward.merge[:n // 4].copy_(merge)
+    forward.cu.copy_(torch.tensor([0, n + REGISTER_TOKENS], device="cuda", dtype=torch.int32))
     return n // 4
 
 
@@ -107,7 +122,7 @@ def reference_project(weights, features, h, w):
 def test_checkpoint_image_encoder_compiled_replay(models, capacity, grids, tmp_path):
     from b12x.preparation import PreparationSession
     from ignition.preparation.compile_pool import CompilePool
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.vision import PreparedVision, VisionInputs, VisionScratch
 
     weights, reference = models
@@ -116,35 +131,31 @@ def test_checkpoint_image_encoder_compiled_replay(models, capacity, grids, tmp_p
     expected = [reference_project(weights, reference(x).features[0], x.shape[-2] // 16, x.shape[-1] // 16) for x in pixels]
     with PreparationSession(device="cuda:0", autotune=False) as session:
         arena = ScratchArena("cuda:0")
-        pool = GraphBufferPool("cuda:0", chunk_bytes=2 << 20)
-        buffers = pool.cursor()
-        encoder = PreparedVision(weights, VisionScratch.allocate(capacity, "cuda:0", buffers=buffers), VisionInputs.allocate("cuda:0"),
-                                 session=session, workspace=arena, name="radio", buffers=buffers)
+        encoder = PreparedVision(weights, VisionScratch.allocate(capacity, "cuda:0"), VisionInputs.allocate("cuda:0"),
+                                 session=session, workspace=arena, name="radio")
         arena.finalize()
+        forward = VisionForward(encoder, capacity, "cuda:0")
         artifact_path = tmp_path / "radio.bin"
         with CompilePool(pixels[0].device) as compiler:
-            compiler.submit(encoder, artifact_path).result()
+            compiler.submit(forward, artifact_path).result()
         with artifact_path.open("rb") as file:
             artifact = torch.compiler.load_compiled_function(file)
-        run = lambda: artifact(encoder)
-        set_inputs(encoder, pixels[0])
+        run = lambda: artifact(forward)
+        set_inputs(forward, pixels[0])
         run()
         session.freeze()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            run()
+            output = run()
         for index in (0, 1, 0):
-            for chunks in pool.chunks.values():
-                for tensor in chunks:
-                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
-            count = set_inputs(encoder, pixels[index])
+            count = set_inputs(forward, pixels[index])
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             for _ in range(3):
                 graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-            actual = encoder.scratch.output[:count].float()
+            actual = output[:count].float()
             target = expected[index].float()
             error = actual - target
             assert error.norm() / target.norm() < .025

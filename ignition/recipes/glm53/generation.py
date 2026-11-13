@@ -4,12 +4,24 @@
 
 """Compose a GLM rank's text forward, request consumption, and completion."""
 
+import torch
+from dataclasses import dataclass
+
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
 
 from .batch import PreparedBatch
 from .stack import PreparedDecoder
+from .state import DecoderMetadata
+
+
+@dataclass(frozen=True)
+class GenerationOutput:
+    metadata: DecoderMetadata
+    hidden: torch.Tensor
+    logits: torch.Tensor
+    feedback: torch.Tensor | None
 
 
 class PreparedGeneration:
@@ -26,7 +38,9 @@ class PreparedGeneration:
         if decoder.state is not pool.decoder:
             raise ValueError("GLM generation requires the decoder's continuation pool")
         self.decoder, self.batch, self.pool = decoder, batch, pool
-        self.validation = PreparedAllReduce(batch.validation_input, batch.validation_sum,
+        validation = torch.empty((1, max(8, 2 * batch.capacity)), dtype=torch.bfloat16,
+                                 device=decoder.metadata.token_ids.device)
+        self.validation = PreparedAllReduce(validation, torch.empty_like(validation),
             runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.validation")
         b, rows = batch.inputs, batch.rows
         arguments = (batch.requests, b.row_slot_ids[:rows], b.row_generations[:rows], b.live_rows,
@@ -36,6 +50,10 @@ class PreparedGeneration:
         self.completion.prepare()
         self.completion.prepare_broadcast(runtime=decoder.lm_head.gather.runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
+        self.validation.functional(session=session)
+        self.completion.functional(session=session)
+        self.batch.functional()
+        self.decoder.functional(session=session)
         self.compilation_variant = "sample"
 
     def rebind_pages(self, pages):
@@ -43,9 +61,14 @@ class PreparedGeneration:
         self.batch.pages = self.pool.memory_capacity[1:]
 
     def __call__(self):
-        self.batch.begin(self.validation(self.batch.validate()))
-        self.decoder()
-        save_hidden(self.decoder.scratch.hidden, self.pool.last_hidden,
-                    self.batch.metadata.recurrent.convolution_slots, self.batch.token_state.active)
-        self.batch.finish()
-        self.completion()
+        self.forward()
+
+    def forward(self):
+        validation_input, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation_input), present)
+        hidden, logits, feedback, _ = self.decoder(metadata)
+        save_hidden(hidden, self.pool.last_hidden, metadata.recurrent.convolution_slots,
+                    metadata.recurrent.convolution_slots >= 0)
+        self.batch.finish(metadata)
+        self.completion.run(logits)
+        return GenerationOutput(metadata, hidden, logits, feedback)

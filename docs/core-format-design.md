@@ -1,8 +1,12 @@
 # Payload-based model cores and the Flare model cache
 
-This document specifies the core format and cache contract.
-[Runtime cores](runtime-core-design.md) describes the implemented format;
-[TODO.txt](TODO.txt) tracks implementation. Payload format version 2 is current.
+This document specifies the core format and cache contract. Helios implements
+the format, conversion, and cache in `helios/src/core/`; `helios/src/runtime_core/`
+loads cores for serving. [Runtime cores](runtime-core-design.md) describes
+export and loading; [TODO.txt](TODO.txt) tracks unfinished work, including
+full-model qualification of tensor-parallel resharding. Export, conversion, and
+signing write payload format version 2 (`FORMAT_VERSION` in
+`helios/src/core/schema.rs`).
 
 The format separates immutable payload bytes, authenticated execution metadata,
 and physical container placement. Weight identity depends on prepared weight
@@ -12,10 +16,10 @@ deployments. Acquisition produces a ready directory in the Flare model cache;
 serving loads its selected deployment without resharding or Python execution.
 
 The model artifact is called a **core** in public commands, APIs, and source
-names. This terminology does not change the binary format. Existing field
-numbers, signatures, authentication domains, and stored payload bytes retain
-their meanings, so previously exported cores need neither re-export nor
-re-signing. Compatibility readers retain required historical format markers.
+names. Serialized field numbers, signature domains, and format markers belong
+to the binary format and are independent of that name. Some contain the word
+`package`, such as the signature domain `flare-package-signature-v5`; they keep
+their spelling so that every signed core loads without re-export or re-signing.
 
 ## Canonical forms
 
@@ -23,15 +27,17 @@ The **first canonical form** is one self-contained `.safetensors` file. The
 **second canonical form** is a directory containing `model.safetensors` and
 readably named companion `.safetensors` files. The Flare model cache always uses
 the second form.
-These form names describe physical organization. Legacy directory entries retain
-their legacy signed schema as specified under loading and compatibility.
+These form names describe physical organization. A legacy core is a signed
+logical-resource container (`ProtectedIndex` envelope version 4 or 6, which the
+code names `CoreFormat::Legacy`); its directory entries use the signed schema
+specified under [loading and compatibility](#loading-and-compatibility).
 
 Both forms use the same metadata, payloads, signatures, and location schema.
 Packing and unpacking change only container placement and safetensors headers.
 They require neither a signing key nor a GPU. A size-sharded arrangement is
 representable, but is not a canonical form. Directory export does not split or
-merge layers according to a size threshold. The packed form has no inherited
-64 GB shard limit; lengths and offsets use checked 64-bit arithmetic.
+merge layers according to a size threshold. The packed form has no shard size
+limit; lengths and offsets use checked 64-bit arithmetic.
 
 Commands accept a directory core as either its directory or its
 `model.safetensors` primary. A primary with external payload locations is
@@ -82,33 +88,37 @@ layers. Aliased storage is stored once within the captured ownership catalog.
 Tuning-dependent layouts occupy separate payloads. TP-specific files exist only
 for byte-distinct layouts required by selected deployments.
 
-Offloaded DeepSeek Engram and Qwen PLE tables remain separate from ordinary
+Offloaded DeepSeek Engram and Qwen PLE tables are stored separately from ordinary
 weight groups. Each full table uses `weights/engram-<index>-weights.safetensors`
 and `weights/engram-<index>-scales.safetensors`, with checkpoint row ordering
 independent of TP size. Every host receives the full table; local ranks share
 its reader and row cache. Disk backing requires only bounded staging and row
-cache memory. DeepSeek retains its TP-sharded projection and reduction, while
-its graph requests use canonical full-table row IDs on every rank. Existing
-cores with partition-local table rows retain their recorded execution layout.
+cache memory. DeepSeek's projection and reduction are TP-sharded, while
+its graph requests use canonical full-table row IDs on every rank. A core
+whose tables record partition-local rows executes with that recorded layout.
+A table recorded with rank-owned row partitions (`EngramTable.shards`) stores
+each partition's planes as
+`deployments/<deployment>/engram-<index>-shard-<position>-weights.safetensors`
+and the matching `-scales` file.
 
 Hardware names in deployment IDs and cache-entry names use device identifiers
 such as `gb202` and `gb10`, producing names such as `gb202-tp1` and `gb10-tp2`.
 Device identity comes from the target hardware, not from an SM-version-to-name
-guess. Numeric SM architecture requirements remain in compatibility metadata;
+guess. Numeric SM architecture requirements are recorded in compatibility metadata;
 loaders validate that metadata independently of descriptive names.
 Payload exports record the captured device name in the signed core's
 `hardware_identity`. Cluster deployment IDs may be arbitrary identifiers.
-Cores exported without a device name remain usable; when their authenticated
+Cores without a recorded device name are usable; when their authenticated
 metadata cannot identify the device, acquisition uses an
 `unknown-device-tp<N>-<UTC minute>` cache label. The downloader never substitutes
 its local GPU's name for the core's target.
 
 Every core file in this tree is a valid safetensors container. There are no
 raw `.bin` companions and no root JSON index. The one primary contains the
-deployment catalog, including every rank and its graph catalog. Existing
-`publisher.json` identity discovery may accompany a published repository as
+deployment catalog, including every rank and its graph catalog. A
+`publisher.json` identity file may accompany a published repository as
 described in [signing](signing.md); it is not a core index or required to
-address payloads. Trust and namespace acceptance remain external to container
+address payloads. Trust and namespace acceptance are external to container
 placement, including when importing a standalone packed file.
 
 ### Packed form
@@ -120,7 +130,7 @@ model.safetensors
   flare.derivations                 # Optional.
   frontend.tokenizer
   frontend.chat-template
-  weights.embedding
+  weights.misc
   weights.layer-000
   weights.layer-001
   ...
@@ -153,11 +163,16 @@ the caller explicitly requests a subset.
 ## Per-file schema
 
 Safetensors supplies framing and offsets. Protobuf supplies typed metadata.
-Header metadata identifies the format version; it is an untrusted dispatch hint
-checked against the authenticated format version. Parsers reject duplicate
+The safetensors header metadata key `format` holds `flare-payload` for these
+cores; it is an untrusted dispatch hint that selects the payload reader, which
+then requires the authenticated format version. Parsers reject duplicate
 entries, invalid extents, overlapping tensor storage, unsupported types, integer
 overflow, and metadata beyond explicit limits before allocating from them.
-Metadata retains a 128 MiB per-tensor limit; bulk payloads do not share that limit.
+Metadata has a 128 MiB per-tensor limit; bulk payloads do not share that limit.
+The header is padded so that tensor data begins on a 4,096-byte file boundary,
+and each payload tensor begins on a 4,096-byte offset within that data. The
+writer fills the gaps with tensors whose names carry the reserved prefix
+`align.`; readers reject an unaligned payload tensor.
 
 | File | Tensor | Contents |
 | --- | --- | --- |
@@ -180,7 +195,10 @@ still contains exactly one payload tensor.
 
 ### Semantic records
 
-The following records define the schema responsibilities. Byte counts, offsets,
+The following records define the schema responsibilities.
+`helios/proto/core.proto` declares them in the Protobuf package `flare.core` and
+takes execution, contract, and frontend types from
+`helios/proto/runtime_core.proto`. Byte counts, offsets,
 and extents are unsigned 64-bit values with checked conversions at every host
 and CUDA API boundary. Identifiers have explicit namespaces; display names are
 not substitutes for identifiers.
@@ -190,18 +208,21 @@ not substitutes for identifiers.
 | `CoreBody` | Format version, core identity, publisher identity, shared frontend contract and payload descriptors, deployment IDs and commitments to their serialized bodies. |
 | `DeploymentBody` | Deployment ID, target architecture, TP topology, prepared contract and capacities, rank IDs and commitments to their serialized bodies. |
 | `RankBody` | Rank ID, context and address reservations, allocations, initializers, modules, functions, graph catalog, events, peer/transport bindings, referenced payload descriptors, and optional prepared-weight catalog. |
-| `Payload` | Content ID equal to SHA-256 of exact stored bytes and byte length. Conflicting lengths for one ID are rejected. |
-| `PayloadSlice` | Payload ID, byte offset within the payload tensor, byte length, and use role: weights, tuned weights, initial state, kernels, graphs, or frontend. |
-| `Allocation` | ID, memory kind, recorded address, byte length, alignment, declared runtime sizing, and supported typed relocations. |
-| `Initializer` | Allocation ID, destination offset, source `PayloadSlice`. |
+| `PayloadDescriptor` | Content ID equal to SHA-256 of exact stored bytes and byte length. Conflicting lengths for one ID are rejected. |
+| `PayloadSlice` | Payload ID, byte offset within the payload tensor, and byte length. |
+| `PayloadUse` | One `PayloadSlice` and its use role: weights, tuned weights, initial state, kernels, graphs, or frontend. |
+| `Allocation` | Name, memory kind, recorded address, byte length, alignment, declared runtime sizing, and supported typed relocations. |
+| `Initializer` | Allocation name, destination offset, source `PayloadUse`. |
 | `ExecutableResource` | Preassigned resource ID, kind, stored compressed `PayloadSlice`, signed decoded length, 4 MiB chunk metadata, and compressed chunk commitments. |
 | `Module` / `Function` | Cubin resource reference; module reference, symbol, parameter layout and launch attributes. |
-| `Graph` | Operation and capacity selectors, typed input bindings, compressed graph resource reference. Graph bytes encode nodes, edges, parameters, and dependencies. |
+| `Graph` | Graph name, instantiation flags, compressed graph resource reference, node and edge counts, and function dependencies. Graph bytes encode nodes, edges, parameters, and dependencies. The rank's `flare.runtime.Execution` record carries each graph's operation kind, capacities, and input bindings. |
 | `PreparedWeightView` | Semantic tensor name, stable group, dtype, shape, strides, allocation/view binding, source tensor identities and logical ranges, concatenation order, padding/fills, typed packing parameters and locality tile, and quantization statistic domain. |
 
 Payload descriptors are authenticated wherever consumed, with equality enforced
 across shared and rank bodies. Each body is signed over its exact serialized
-bytes with a versioned domain separator. Parent commitments bind child bodies;
+bytes with a versioned domain separator. The separator is the literal
+`flare-package-signature-v5` in `helios/src/core/protection.rs`; changing its
+spelling would invalidate every existing signature. Parent commitments bind child bodies;
 verification must not parse and reserialize before checking a signature. A rank
 can authenticate its execution closure without reading another rank's payloads.
 Metadata and its signatures are not members of their own payload digest catalog.
@@ -225,12 +246,12 @@ byte comparison remains required even when these declarations agree.
 Rank metadata stores a prepared weight catalog inline in `prepared_weights`
 or as one zstd level-3 frame in `compressed_prepared_weights`. The compressed
 form includes its decoded byte length; both forms together are invalid.
-Exporters use compression when it reduces the encoded size. Readers retain
-support for inline catalogs. Rank signatures authenticate compressed bytes
+Exporters use compression when it reduces the encoded size. Readers accept
+both forms. Rank signatures authenticate compressed bytes
 before catalog decoding. Decoding requires an exact length, a window no larger
 than 8 MiB, and one complete frame without trailing bytes. Reconstructing a
 rank's inline metadata must fit within 128 MiB; selected ranks together must
-fit within 512 MiB. The signed envelope retains its 128 MiB limit. Keyless
+fit within 512 MiB. The signed envelope limit is 128 MiB. Keyless
 container conversion preserves compressed catalogs without decoding them.
 Verification checks the size bounds for all selected ranks before decoding
 any catalog. Consumers decode one catalog at a time; verified rank records
@@ -299,7 +320,7 @@ The format preserves the prepared model contract, graph dependencies, peer
 bindings, cache geometry, and frontend semantics described in
 [the model contract](../helios/model-contract.md) and
 [the execution manifest](../helios/manifest.md). It does not introduce a graph
-operation family or model-specific native policy. Fixed virtual addresses remain
+operation family or model-specific native policy. Fixed virtual addresses are
 supported for opaque captured resources; complete model relocation is not a
 prerequisite for stable disk payloads.
 
@@ -342,7 +363,7 @@ existing payloads; cutting one payload into different payloads changes identity.
 
 Packing and unpacking preserve signed bodies, signatures, and stored executable
 bytes exactly. They validate their inputs and final closure. Identity promotion
-through `ignition sign` remains a signing operation and is not equivalent to
+through `ignition sign` is a signing operation and is not equivalent to
 container conversion.
 
 The exporter preserves kernel and global symbol names in cubins and their
@@ -364,13 +385,13 @@ passed to `authorize` equals the signed publisher namespace exactly. It is not
 key material.
 
 Downloads and locally materialized payloads are hashed against their signed
-content IDs before installation. Cached loading retains the optional full weight
+content IDs before installation. Cached loading offers an optional full weight
 scan: `--verify-weights` hashes allocation initializers and shared or rank-sharded
 embedding-table planes. Ordinary loading validates their signed descriptors and
 physical bounds without hashing their contents. The full scan hashes actual
 payload bytes, not digest lists. A signed
 digest without a byte scan is not evidence that local weight bytes were checked.
-Executable authentication remains mandatory. A consumer using only a slice of a
+Executable authentication is mandatory. A consumer using only a slice of a
 payload may need the whole payload for full digest verification; download planning
 and progress account for those extra bytes. Full verification hashes each
 distinct referenced payload once, even when many initializers consume its slices.
@@ -509,19 +530,19 @@ primary in either canonical form.
 
 ### Combining independently prepared deployments
 
-The Rust combiner consumes independently exported deployments and their prepared
+The Rust combiner (`combine` in `helios/src/core/conversion.rs`, invoked by
+`ignition combine`) consumes independently exported deployments and their prepared
 weight catalogs. It checks compatible model/checkpoint and hardware identities,
 matches semantic owners, intersects logical source regions, and proposes byte
-relations from the declared packing and padding. Each deployment retains its own
+relations from the declared packing and padding. Each deployment records its own
 preparer source revision, and those revisions may differ; declared checkpoint,
 recipe, and preparation semantics must agree. Engram vocabulary, table encoding
 geometry, and hash methods, orders, multipliers, and primes must agree.
-TP-specific plane partitions and hash row offsets remain per deployment with
-that deployment's own payloads retained. Shared tables still require exact
-equality.
+TP-specific plane partitions and hash row offsets are per deployment and keep
+that deployment's own payloads. Shared tables require exact equality.
 The combiner compares every candidate against the independently
 exported target bytes. Only exact equality permits sharing or a derivation;
-unsupported relations retain the exported bytes.
+unsupported relations store the exported bytes.
 
 Constructing a core catalog or replacing a rank's initializer bindings with
 canonical slices changes signed semantics and requires signing the affected
@@ -532,29 +553,31 @@ Its report distinguishes directly shared, locally derivable, and independently
 stored bytes, including reasons for failed sharing candidates.
 
 Tiled W4A16, QMMA, and IQ2 weight producers describe aligned encoded tiles;
-shard-dependent scales require independent bytes. Focused GPU tests compare
-independently prepared TP1 and TP2 owners, including MXFP4-CSF gate/up rotation
-and both compressed-scale and expanded-scale NVFP4-CSF preparation. Nemotron
-Bolt's IQ2 metadata also
-passes complete TP1 export and native text, streaming, prefix-reuse, and
-concurrent-request tests. A signed fixture containing W4A16 owners,
-scales, and globals passes export, combination, keyless packed/directory
-conversion, and cache materialization with exact initializer and global bytes.
-Conversion preserves signed bodies and stored executable frames. All fixture weight bytes are copied from
-canonical payloads; only scales and global scalars occupy exception payloads.
-The piece mappings account for different shard-local FC1 row rotations.
-Full-model qualification covers TP1 only; no full-model TP2 reshard has been
-qualified.
+shard-dependent scales require independent bytes. Piece mappings account for
+different shard-local FC1 row rotations.
 
-Native rank distribution passes cold and warm staging between two ARM hosts
-over CX7 with a signed TP2/TP4 fixture. The receiving host stores only its
-selected TP2 rank and shared payloads, and the warm run reuses the verified
-cache entry. This fixture exercises transport and publication without GPU
-loading; its synthetic graphs do not qualify model execution.
+Qualification:
+
+- **Producer mappings.** Qualified by GPU byte comparison of independently
+  prepared TP1 and TP2 owners for tiled W4A16, QMMA, and IQ2, including
+  MXFP4-CSF gate/up rotation and compressed-scale and expanded-scale NVFP4-CSF
+  preparation.
+- **Derived materialization.** Qualified byte for byte on a signed fixture of
+  W4A16 owners, scales, and globals through export, combination, keyless
+  packed/directory conversion, and cache materialization. In that fixture
+  weights copy from canonical payloads, and only scales and global scalars
+  occupy exception payloads.
+- **Rank distribution.** Transport and publication are qualified with a signed
+  TP2/TP4 fixture between two ARM hosts over CX7, cold and with a verified cache
+  entry already present; the receiving host stores only its selected rank and
+  the shared payloads. The fixture's synthetic graphs do not qualify model
+  execution or GPU loading.
+- **Full models.** Qualified at TP1 only, including Nemotron Bolt IQ2 catalogs
+  through export and native serving. Not qualified: full-model TP2 resharding.
 
 ### Download behavior
 
-`flare download --tp N` selects a prepared deployment and completes all fetching,
+`flare download --tensor-parallel N` selects a prepared deployment and completes all fetching,
 resharding, verification, and cache installation before reporting it ready.
 `flare run` may invoke the same acquisition path for a remote or incomplete
 source, but reports that work as download/acquisition before native model loading.
@@ -605,10 +628,13 @@ apply to the complete acquire-and-ready path, including verification and writes.
 ## One Rust-owned model cache
 
 The configured `paths.core_cache`, default `~/.cache/flare/cores`, owns
-prepared model storage. Hugging Face remains an acquisition source; its checkpoint
-cache is not mutated into a prepared-model cache. Existing Ignition export and
-Flare/Orbit prepared-core storage converge on this one implementation. Native
-executable caches with distinct purposes remain separate.
+prepared model storage. Hugging Face is an acquisition source; its checkpoint
+cache is not mutated into a prepared-model cache. Ignition export, Flare
+acquisition, and Orbit rank distribution store prepared cores through this one
+implementation, `helios/src/core/cache.rs`. Designed, not implemented: Orbit
+rank files in this cache. The Orbit agent stores received rank files in a
+separate per-rank range store, `flare-cli/src/core_cache.rs`. Native
+executable caches with distinct purposes are separate stores.
 
 ```text
 ~/.cache/flare/cores/
@@ -657,8 +683,8 @@ revision, resolved commit, filename, deployment selection, and the SHA-256 of th
 exact signed envelope authenticated during acquisition. A branch resolves its
 last successfully acquired commit; an unavailable deployment must not select an
 older commit implicitly. Offline resolution verifies the selected entry without
-reading or importing the Hugging Face cache. The original four-field source
-record remains readable but has no expected envelope and is rejected offline
+reading or importing the Hugging Face cache. A four-field source record, which
+has no expected envelope, is readable but is rejected offline
 until an online acquisition refreshes it; a record whose entry envelope differs
 is rejected before the default changes. Source references do not retain entries
 against eviction; a missing entry requires acquisition again.
@@ -748,14 +774,14 @@ removed only by an explicit cache removal. Abandoned staging trees are reclaimed
 by collection. Download entry naming uses the same scheme.
 
 `--no-weights` export requires the stable and tuned weight payloads it names to
-exist in the cache. It still prepares the checkpoint and reads captured storage
+exist in the cache. It prepares the checkpoint and reads captured storage
 to establish exact content identity; missing or changed weight data fails before
 entry publication, with the missing groups named.
 Initial-state payloads are not weights: a graph or capacity change may produce
 new state bytes, which such an export writes normally while the weight payloads
 reuse their cached objects. The export avoids temporary allocation files and
 duplicate weight writes and does not trigger download or TP materialization.
-Changed graphs, compressed executable resources, and initial state may still
+Changed graphs, compressed executable resources, and initial state may
 produce additional payloads.
 
 ### Ownership and integration
@@ -779,49 +805,52 @@ Ignition passes prepared resources, semantic declarations, destinations, and
 export options to Heliopause. Heliopause chooses temporary paths, manages rank
 files, checks destination conflicts, and cleans up failed exports. These rules
 apply to explicit destinations and cache-only exports.
-Configured export staging remains temporary workspace; it is not an independent
+Configured export staging is temporary workspace; it is not an independent
 persistent model store.
 
 ## Loading and compatibility
 
 The loader resolves the selected signed rank metadata, validates allocations and
 initializers, pins all required files, and schedules contiguous payload slices
-through bounded pinned staging and asynchronous upload. Preserve the implemented
-process-wide staging bound across ranks; adding ranks must not multiply it.
+through bounded pinned staging and asynchronous upload. The staging bound is
+process-wide; adding ranks must not multiply it.
 Preflight the open-file limit against the selected closure. Coalescing adjacent
 reads may improve throughput without changing initializer semantics or handle
 lifetimes. GPU storage and resource owners outlive all queued work.
 
 Format version dispatch is explicit. Payload format version 2 identifies the
 executable representation written by export, conversion, and signing.
-Legacy readers accept `ProtectedIndex` envelope 6. Absent Protobuf fields use
-their declared defaults.
+Legacy readers accept `ProtectedIndex` envelope versions 4 and 6. Absent
+Protobuf fields use their declared defaults.
 
-Legacy cache entries also use a primary-plus-companions directory, retaining the
+Legacy cache entries also use a primary-plus-companions directory, with the
 legacy primary's authenticated semantics and accepted companion encoding. Their
 compatibility reader does not pretend those signatures authenticate payload-based
 metadata. Legacy immutable companions use container-digest keys under
 `blobs/legacy/`; payload-format companions use payload-digest keys under `blobs/`.
 Both use the same Rust publication, hardlink, lease, and reclamation facilities.
-Legacy cores remain readable and servable; conversion and signing accept
+Legacy cores are readable and servable; conversion and signing accept
 only payload-format cores.
-Legacy companions remain direct siblings of the primary under the exact
+Legacy companions are direct siblings of the primary under the exact
 container-digest basenames expected by the legacy layout. They are not moved into
 the payload format's `weights/` or `deployments/` subdirectories.
 
-Existing export and download cache contents can be read and imported through
-the appropriate reader. Import verifies or reconstructs the payload identities
-needed by this cache before publishing an entry. It must preserve existing model
-files, user configuration, and active leases; no automatic destructive cache
-reset is part of adoption. Removing duplicate internal cache machinery follows
-migration of its actual export, Hub, local-core, and Orbit consumers.
+Export and download cache contents in either format are read and imported
+through the matching reader. Import verifies or reconstructs the payload
+identities needed by this cache before publishing an entry. It must preserve
+model files, user configuration, and active leases, and it never resets a cache
+destructively.
 
 ## Implementation dependencies and validation
 
-Implement the shared semantic schema, payload reader/writer, and compatibility
-reader before wiring consumers to the format. Add pack/unpack and authentication
-using the same primitives. Implement immutable cache publication and leases before
-moving Heliopause export, Flare acquisition, or Orbit onto it. Stable owner
+`helios/src/core/` implements the shared semantic schema (`schema.rs`), the
+payload container reader and writer (`container.rs`, `reader.rs`), body
+authentication (`protection.rs`), pack, unpack, promotion, and combination
+(`conversion.rs`), derivations and their inverses (`derivation.rs`,
+`inverse.rs`), and immutable cache publication, leases, and collection
+(`cache.rs`). `helios/src/runtime_core/` contains the compatibility reader for
+legacy cores. Heliopause export and Flare acquisition publish through
+that cache. Stable owner
 extraction enables useful weight reuse; independently prepared TP catalogs and
 verified derivations then enable download-time resharding. CLI reporting and
 cache eviction must use the same shared lifecycle.

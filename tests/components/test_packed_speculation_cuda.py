@@ -5,7 +5,7 @@
 
 The model-free fixture substitutes only proposal tokens and causal confidence.
 Request validation, direct tensor handoff, target filtering, stochastic verification,
-commit, and graph-buffer allocation use the shared production components.
+commit, and prefix allocation use the shared production components.
 """
 
 import os
@@ -19,11 +19,11 @@ from ignition.components.collectives import PreparedAllReduce
 from ignition.components.packed_speculation import PreparedPackedSpeculativeRound
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.parallel import TensorParallelShard
-from ignition.components.parallel_draft import PreparedParallelDraftRound
+from ignition.components.parallel_draft import DraftProposalState, PreparedParallelDraftRound
 from ignition.components.sampling import DeviceRequestState, RequestAdmission
 from ignition.components.speculation import (PreparedSpeculativeCommit, PreparedSpeculativeDistributions,
                                              PreparedStochasticVerification, SpeculativeRngState)
-from ignition.preparation.scratch import GraphBufferPool
+from tests.tensor_examples import TensorExamples
 from ignition.preparation.compilation import compile_forward
 from tests.components.causal_prefix_oracle import allocate
 from tests.components.completion_support import completion_outputs
@@ -37,8 +37,18 @@ class _Confidence:
         self.values = torch.full((batch, depth), .75, device=device)
         self.output = torch.empty_like(self.values)
 
-    def __call__(self):
+    def __call__(self, proposal=None):
         self.output.copy_(self.values)
+        return self.output
+
+
+class _AllocationObservation:
+    def __init__(self, operation, output):
+        self.operation, self.output = operation, output
+
+    def __call__(self, confidence, *operands):
+        self.output.copy_(confidence)
+        return self.operation(confidence, *operands)
 
 
 class _ProposalBackbone:
@@ -52,19 +62,21 @@ class _ProposalBackbone:
         self.base_offset = cursor.zeros((4,), torch.int64)
         self.candidates = cursor.zeros((4, depth + 1), torch.int64)
         self.drafts = cursor.zeros((4, depth), torch.int64)
-        self.probabilities = cursor.zeros((4, depth, 256), torch.float32)
+        self.probability_shape = (4, depth, 256)
+        self.probabilities = cursor.zeros(self.probability_shape, torch.float32)
         self.valid = cursor.zeros((4, depth), torch.bool)
         self.validator = PreparedBatch(owner.inputs, owner.requests, Metadata.allocate(4, 4, 2, "cuda"),
             mode="decode", shard=owner.weights.shard, pool=owner.pool, verification_width=depth + 1)
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=owner.collectives["runtime"], coordinator=owner.collectives["coordinator"],
-            session=owner.session, name="test.proposal.validation")
+            session=owner.session, name="test.proposal.validation").functional(session=owner.session)
 
-    def propose(self, advance_rng=True, observer=None, allowed=None):
+    def propose(self, advance_rng=True, allowed=None, *, probabilities):
         o = self.owner
-        self.validator.begin(self.validation(self.validator.validate()))
+        validation, present = self.validator.validate()
+        metadata = self.validator.begin(self.validation(validation), present=present)
         safe = o.inputs.row_slot_ids.long().clamp(0, 3)
-        self.active.copy_(self.validator.token_state.active.bool())
+        self.active.copy_(metadata.lengths > 0)
         if allowed is not None:
             self.active.logical_and_(allowed)
         self.before.copy_(o.requests.consumed_tokens[safe])
@@ -74,16 +86,25 @@ class _ProposalBackbone:
             self.drafts[:, position].fill_(5 + position)
             self.valid[:, position].copy_(self.active & (position < o.inputs.query_lengths - 1))
         self.candidates[:, 1:].copy_(self.drafts)
-        self.probabilities.zero_()
-        self.probabilities.scatter_(2, self.drafts[:, :, None], 1.)
+        probabilities.zero_()
+        probabilities.scatter_(2, self.drafts[:, :, None], 1.)
+        self.probabilities.copy_(probabilities)
+        proposal = DraftProposalState(self.before, self.active, self.candidates, self.drafts,
+            self.valid, self.base_offset, metadata)
         if advance_rng:
-            self.commit_draft_rng()
+            self.commit_draft_rng(proposal=proposal)
+        return proposal
 
     commit_draft_rng = PreparedParallelDraftRound.commit_draft_rng
 
 
 class _VerificationTarget(SimpleNamespace):
-    def verify(self, proposal_valid):
+    def verify(self, proposal_valid, *, probabilities=None, proposal=None):
+        if proposal is not None:
+            self.active.copy_(proposal.active)
+            for name in ("before", "base_offset", "candidates", "drafts", "valid"):
+                getattr(self, name).copy_(getattr(proposal, name))
+            self.probabilities.copy_(probabilities)
         self.distributions()
         self.stochastic()
         self.stochastic.output.valid.logical_and_(proposal_valid)
@@ -100,19 +121,29 @@ class _ForwardScratch:
 class _DeterministicDecoder:
     def __init__(self, scratch, metadata):
         self.scratch, self.metadata, self.auxiliary = scratch, metadata, None
+        self.logit_shape, self.logit_dtype = tuple(scratch.logits.shape), scratch.logits.dtype
+        self.hidden_shape = tuple(scratch.hidden.shape)
+        self.observed_hidden = torch.empty_like(scratch.hidden)
         self.logits = torch.full_like(scratch.logits, -torch.inf)
         columns = torch.arange(self.logits.shape[0], device="cuda") % metadata.max_query_tokens + 5
         self.logits.scatter_(1, columns[:, None], 8.)
 
-    def __call__(self):
-        self.scratch.logits.copy_(self.logits)
-        self.scratch.hidden.fill_(1.)
+    def __call__(self, metadata):
+        hidden = torch.ones(self.hidden_shape, device=self.logits.device)
+        self.observed_hidden.copy_(hidden)
+        return hidden, self.logits.clone(), None, None
 
-    def commit(self, counts):
+    def release_outputs(self):
+        self.scratch = None
+
+    def commit(self, counts, records=None, metadata=None):
         pass
 
 
 class _Context:
+    def functional(self):
+        return self
+
     def __call__(self, *args):
         pass
 
@@ -121,8 +152,13 @@ def _decoder_factory(weights, tables, scratch, metadata, pool, **kwargs):
     return _DeterministicDecoder(scratch, metadata)
 
 
+class _DeterministicDraft(_DeterministicDecoder):
+    def __call__(self, metadata):
+        return self.logits.clone(), None
+
+
 def _draft_factory(weights, scratch, metadata, pool, **kwargs):
-    return _DeterministicDecoder(scratch, metadata)
+    return _DeterministicDraft(scratch, metadata)
 
 
 def _context_factory(*args, **kwargs):
@@ -154,15 +190,14 @@ def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadca
         offset=torch.tensor([8, 12, 16, 20], device=device), generation=state.generation.clone(),
         weights=SimpleNamespace(shard=TensorParallelShard(rank, world),
             draft=SimpleNamespace(confidence_head=None)),
-        pool=SimpleNamespace(memory_capacity=torch.tensor([16, 16], device=device)),
+        pool=SimpleNamespace(backing=torch.empty(1, device=device), memory_capacity=torch.tensor([16, 16], device=device)),
         collectives=dict(runtime=runtime, vocabulary_runtime=broadcast, coordinator=coordinator), session=session)
-    pool = GraphBufferPool(device, chunk_bytes=1 << 20)
-    cursor = pool.cursor()
+    pool = TensorExamples(device)
+    cursor = pool
     source = _ProposalBackbone(owner, depth, cursor)
     confidence = _Confidence(batch, depth, device)
     confidence_output = torch.empty((2, batch, width - 1), device=device)
-    target_cursor = pool.cursor()
-    target_cursor.join(cursor)
+    target_cursor = pool
     target = _VerificationTarget(owner=owner, batch=batch, width=width, target_token_capacity=token_capacity,
         buffers=target_cursor, active=target_cursor.zeros((batch,), torch.bool),
         before=target_cursor.zeros((batch,), torch.int64), base_offset=target_cursor.zeros((batch,), torch.int64),
@@ -189,7 +224,9 @@ def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadca
     from unittest.mock import patch
     with patch("ignition.components.packed_speculation.PreparedDraftConfidence", return_value=confidence):
         operation = PreparedPackedSpeculativeRound(source, target, prefix_limits, confidence_output,
-                                                  name="test.packed", buffers=pool.cursor())
+                                                  name="test.packed")
+    operation.confidence = torch.empty((batch, depth), device=device)
+    operation.allocator = _AllocationObservation(operation.allocator, operation.confidence)
     return SimpleNamespace(**locals())
 
 
@@ -281,7 +318,7 @@ def test_captured_packed_round_matches_prefix_oracle_state_rng_and_poison(depth,
                 safe = inputs.row_slot_ids.long().clamp(0, 3)
                 finished = (inputs.row_generations == state.generation[safe]) & (state.status[safe] == 2)
                 submitted = ((f.source.rows < inputs.live_rows) & ~finished).tolist()
-                f.source.propose(True, f.confidence)
+                f.source.propose(True, probabilities=f.source.probabilities)
                 f.confidence()
                 lengths, admitted = allocate(f.confidence.output.tolist(), inputs.row_slot_ids.tolist(),
                     submitted, f.source.active.tolist(), f.prefix_limits.tolist(), token_capacity, 4)
@@ -408,7 +445,7 @@ def test_native_packed_signature_prefix_upload_and_terminal_feedback(survival):
             # Native transport owns the submission sequence and active frame.
             actual_records[:, 1] = expected_records[:, 1]
             assert torch.equal(actual_records, expected_records)
-            assert completion.proposal_confidence == [[.75] * 3 + [0.] * 4] * 4
+            assert completion.proposal_confidence == [[.75] * 3 + [0.] * (f.owner.completion.token_capacity - 4)] * 4
             if survival:
                 assert torch.equal(torch.tensor(completion.speculative_survival), expected_survival)
                 for record, row in zip(completion.records, completion.speculative_survival, strict=True):
@@ -527,7 +564,9 @@ def test_native_two_rounds_preserve_frames_lengths_and_terminal_state():
                 fences, completions, expected, strict=True):
             assert completion.fence == fence
             assert torch.equal(torch.tensor(completion.records), records)
-            assert torch.equal(torch.tensor(completion.proposal_confidence), confidence)
+            padded_confidence = torch.nn.functional.pad(confidence,
+                (0, f.owner.completion.token_capacity - 1 - confidence.shape[1]))
+            assert torch.equal(torch.tensor(completion.proposal_confidence), padded_confidence)
             assert torch.equal(torch.tensor(completion.speculative_survival), survival)
             assert lengths.sum().item() <= 12
         for actual, reference in zip(snapshot(), expected_final, strict=True):
@@ -573,10 +612,19 @@ def test_compiled_parallel_draft_ragged_target_matches_rectangle_state():
 
     expected = None
     for capacity in (8, 3):
-        buffers = GraphBufferPool(o.pool.backing.device, chunk_bytes=1 << 20)
         operation = PreparedParallelDraftRound(o, 2, 4, f"test.parallel{capacity}",
-            target_token_capacity=capacity, buffers=buffers.cursor())
+            target_token_capacity=capacity)
         operation.prepare()
+        observed_tokens = torch.empty(capacity, dtype=torch.int64, device="cuda")
+        observed_count = torch.empty(2, dtype=torch.int32, device="cuda")
+        verify = operation.verify
+        def observe_verify(proposal_valid=None, *, probabilities, proposal):
+            result = verify(proposal_valid, probabilities=probabilities, proposal=proposal)
+            metadata, _, committed = result
+            observed_tokens.copy_(metadata.token_ids)
+            observed_count.copy_(committed.emitted_count)
+            return result
+        operation.verify = observe_verify
         compiled = compile_forward(operation)
         restore()
         graph = torch.cuda.CUDAGraph()
@@ -589,9 +637,9 @@ def test_compiled_parallel_draft_ragged_target_matches_rectangle_state():
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-            assert operation.metadata.token_ids.numel() == capacity
-            assert operation.decoder.scratch.hidden.shape == (8, 4)
-            assert operation.operations[-1].emitted_count.tolist() == [2, 1]
+            assert observed_tokens.numel() == capacity
+            assert operation.decoder.observed_hidden.shape == (8, 4)
+            assert observed_count.tolist() == [2, 1]
             actual = snapshot()
             if expected is None:
                 expected = actual
@@ -603,7 +651,7 @@ def test_compiled_parallel_draft_ragged_target_matches_rectangle_state():
                 o.inputs.query_lengths.copy_(torch.tensor([3, 1, 0, 0], dtype=torch.int32, device="cuda"))
                 graph.replay()
                 torch.cuda.synchronize()
-                assert operation.operations[-1].emitted_count.eq(0).all()
+                assert observed_count.eq(0).all()
                 assert f.state.status[[3, 0]].eq(3).all()
                 assert f.state.error_code[[3, 0]].eq(32).all()
                 for name, value in initial_state.items():
@@ -810,7 +858,7 @@ def _tp_rank(rank, rendezvous, sockets):
                             if completion is None:
                                 time.sleep(.001)
                         assert completion.fence == fence
-                        assert completion.proposal_confidence == [[.25 * scale] * 3 + [0.] * 4] * 2 + [[0.] * 7] * 2
+                        assert completion.proposal_confidence == [[.25 * scale] * 3 + [0.] * (f.owner.completion.token_capacity - 4)] * 2 + [[0.] * (f.owner.completion.token_capacity - 1)] * 2
                         for row, slot in enumerate(slots[:2]):
                             record = completion.records[slot]
                             assert record[1] == fence
@@ -836,8 +884,8 @@ def _tp_rank(rank, rendezvous, sockets):
                         if completion is None:
                             time.sleep(.001)
                     assert completion.fence == fence
-                    assert completion.proposal_confidence == ([[.25] * 3 + [0.] * 4] * live
-                                                               + [[0.] * 7] * (4 - live))
+                    assert completion.proposal_confidence == ([[.25] * 3 + [0.] * (f.owner.completion.token_capacity - 4)] * live
+                                                               + [[0.] * (f.owner.completion.token_capacity - 1)] * (4 - live))
                     assert completion.speculative_survival is not None
                     if case == "rank2_nan":
                         assert all(row[5:7] == [3, 6] for row in completion.records)
@@ -1031,9 +1079,8 @@ def _ordinary_generation_rank(rank, rendezvous):
             frame = torch.zeros(1, dtype=torch.int32, device=device)
             sequence = torch.ones(1, dtype=torch.int64, device=device)
             initial = {name: value.clone() for name, value in vars(state).items()}
-            buffers = GraphBufferPool(device, chunk_bytes=1 << 20)
             operation = PreparedGeneration(decoder, batch, outputs, frame, sequence, runtime=runtime,
-                coordinator=coordinator, session=session, name="ordinary", workspace=None, buffers=buffers.cursor())
+                coordinator=coordinator, session=session, name="ordinary", workspace=None)
             session.tune(show_progress=False)
             compiled = compile_forward(operation)
             compiled()

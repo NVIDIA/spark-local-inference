@@ -308,7 +308,6 @@ class PreparedVisionHandoff:
         submission_sequence,
         *,
         pixels,
-        buffers=None,
     ):
         device = features.arena.device
         if device.type != "cuda" or output.ndim != 2 or output.shape[1] != WIDTH:
@@ -362,10 +361,9 @@ class PreparedVisionHandoff:
             requests,
             output,
         )
-        self.metadata = VisionMetadata.allocate(capacity, 1, device, buffers=buffers)
+        self.metadata = VisionMetadata.allocate(capacity, 1, device)
         def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
+            return torch.zeros(shape, dtype=dtype, device=device)
         self.pixels = pixels
         self.errors = zeros((1,), torch.int32)
         self._prepared = False
@@ -466,18 +464,46 @@ class PreparedVisionHandoff:
             for kernel, args, grid in self._kernels)
         self._prepared = True
 
+    def functional(self):
+        self.capacity = self.pixels.shape[0]
+        values = {"errors": self.errors, "pixels": self.pixels, "output": self.output,
+                  **{name: getattr(self.metadata, name) for name in self.metadata.__dataclass_fields__}}
+        self._dynamic_calls = []
+        for call in self._calls:
+            slots = {index: name for index, value in enumerate(call.args)
+                     for name, candidate in values.items() if value is candidate}
+            args = tuple(None if index in slots else value for index, value in enumerate(call.args))
+            self._dynamic_calls.append((call.kernel, call.compiled, args, call.grid, call.options, slots))
+            call.args = ()
+        self._kernels = self._calls = None
+        self.output = self.pixels = self.metadata = self.errors = None
+        return self
+
+    def _run_dynamic(self, index, values):
+        from ignition.preparation.triton import launch_triton
+
+        kernel, compiled, args, grid, options, slots = self._dynamic_calls[index]
+        args = tuple(values[slots[i]] if i in slots else value for i, value in enumerate(args))
+        launch_triton(kernel, compiled, args, grid, **options)
+
     def begin(self):
         if not self._prepared:
             raise RuntimeError("vision handoff prepare() must complete before capture")
-        self.errors.zero_()
-        self._calls[0]()
-        self._calls[1]()
+        device = self.features.arena.device
+        metadata = VisionMetadata.allocate(self.capacity, 1, device)
+        values = {"errors": torch.zeros((1,), dtype=torch.int32, device=device),
+                  "pixels": torch.empty((self.capacity, 1536), dtype=torch.bfloat16, device=device),
+                  **{name: getattr(metadata, name) for name in metadata.__dataclass_fields__}}
+        self._run_dynamic(0, values)
+        self._run_dynamic(1, values)
+        return values, metadata
 
-    def finish(self):
+    def finish(self, values, output):
         if not self._prepared:
             raise RuntimeError("vision handoff prepare() must complete before capture")
-        for call in self._calls[2:]:
-            call()
+        values["output"] = output
+        for index in range(2, len(self._dynamic_calls)):
+            self._run_dynamic(index, values)
 
 
 class PreparedVisionGeneration:
@@ -485,9 +511,9 @@ class PreparedVisionGeneration:
         self.handoff, self.encoder = handoff, encoder
 
     def __call__(self):
-        self.handoff.begin()
-        self.encoder(self.handoff.pixels)
-        self.handoff.finish()
+        values, metadata = self.handoff.begin()
+        output = self.encoder(values["pixels"], metadata)
+        self.handoff.finish(values, output)
 
 
 @triton.jit
@@ -599,7 +625,7 @@ class PreparedEmbeddingInjection:
     """Validate one packed prefill request before decoder-state gathering.
 
     Call ``prepare()`` before capture. Record ``validate()`` before
-    ``PreparedDecoderState.begin()``, then ``inject()`` after token embedding and
+    ``PreparedDecoderState.begin_runtime()``, then ``inject()`` after token embedding and
     before hyperconnection broadcast. Invalid visual indices set the matching
     running request's error status, which the subsequent gather excludes from
     every model-state update. Stale generations leave reused slots unchanged.
@@ -693,19 +719,48 @@ class PreparedEmbeddingInjection:
         self._inject = _compile(_inject, self._inject_args, self._grid)
         self._prepared = True
 
-    def validate(self):
-        if not self._prepared:
-            raise RuntimeError(
-                "vision injection prepare() must complete before capture"
-            )
-        self._validate()
+    def functional(self, *, dynamic_inputs=False):
+        validate_slots = {11} | (set(range(5)) if dynamic_inputs else set())
+        inject_slots = {0, 12} | (set(range(2, 7)) if dynamic_inputs else set())
+        self._runtime_validate_args = tuple(None if index in validate_slots else value
+                                            for index, value in enumerate(self._validate_args))
+        self._runtime_inject_args = tuple(None if index in inject_slots else value
+                                          for index, value in enumerate(self._inject_args))
+        self.dynamic_inputs = dynamic_inputs
+        self._validate_args = self._inject_args = None
+        self._validate.args = self._inject.args = ()
+        self.errors = self.embedding = None
+        return self
 
-    def inject(self):
+    def validate(self, inputs=None):
         if not self._prepared:
-            raise RuntimeError(
-                "vision injection prepare() must complete before capture"
-            )
-        self._inject()
+            raise RuntimeError("vision injection prepare() must complete before capture")
+        from ignition.preparation.triton import launch_triton
+        errors = torch.empty((1,), dtype=torch.int32, device=self.features.arena.device)
+        args = list(self._runtime_validate_args)
+        args[11] = errors
+        if self.dynamic_inputs:
+            if inputs is None:
+                raise ValueError("vision injection requires runtime role inputs")
+            args[:5] = (inputs.vision_token_indices, inputs.row_slot_ids, inputs.row_generations,
+                        inputs.query_lengths, inputs.live_rows)
+        launch_triton(self._validate.kernel, self._validate.compiled, tuple(args), self._validate.grid,
+                      **self._validate.options)
+        return errors
+
+    def inject(self, embedding, errors, inputs=None):
+        if not self._prepared:
+            raise RuntimeError("vision injection prepare() must complete before capture")
+        from ignition.preparation.triton import launch_triton
+        args = list(self._runtime_inject_args)
+        args[0], args[12] = embedding, errors
+        if self.dynamic_inputs:
+            if inputs is None:
+                raise ValueError("vision injection requires runtime role inputs")
+            args[2:7] = (inputs.vision_token_indices, inputs.row_slot_ids, inputs.row_generations,
+                         inputs.query_lengths, inputs.live_rows)
+        launch_triton(self._inject.kernel, self._inject.compiled, tuple(args), self._inject.grid,
+                      **self._inject.options)
 
 
 __all__ = [

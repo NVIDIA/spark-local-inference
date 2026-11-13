@@ -12,8 +12,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @pytest.mark.parametrize("rows", [8, 16, 32, 64])
 @pytest.mark.parametrize("down_mode", ["auto", "a16", "quantized"])
+@pytest.mark.parametrize("checkpoint", ["qwen3.8-27b-qad", "hybrid"])
 @torch.no_grad()
-def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, monkeypatch):
+def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, checkpoint, monkeypatch):
     from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 
@@ -21,13 +22,18 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
     from ignition.components.weights import DirectWeightLoader
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
+    from tests.tensor_examples import TensorExamples
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes import resolve
     from ignition.recipes.qwen38_dense.config import ModelConfig, TEXT_PREFIX
     from ignition.recipes.qwen38_dense.decoder import GroupedMLP, Projection
 
-    snapshot = resolve("qwen3.8-27b-qad").snapshot(Path.home() / ".cache/huggingface/hub")
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
+    snapshot = (Path(os.environ.get("FLARE_QWEN38_DENSE_CHECKPOINT",
+        "/home/luke/models/Qwen3.8-27B-NVIDIA-NVFP4-QAD-MXFP8")) if checkpoint == "hybrid"
+        else resolve(checkpoint).snapshot(hub))
+    assert (snapshot / "config.json").is_file()
     manifest = inspect_indexed_checkpoint(snapshot)
     config = ModelConfig.load(snapshot)
     names = tuple(f"{TEXT_PREFIX}.layers.0.mlp.{field}" for field in ("gate_proj", "up_proj", "down_proj"))
@@ -37,12 +43,11 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
     with torch.device("meta"):
         canonical = Qwen3_5MLP(Qwen3_5TextConfig.from_dict(config.text), config.text["intermediate_size"])
     device, width, intermediate = torch.device("cuda:0"), config.hidden, config.text["intermediate_size"]
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
+    pool = TensorExamples(device)
+    buffers = pool
     guard_before = buffers.zeros((1024,), torch.bfloat16)
     source = buffers.zeros((rows, width), torch.bfloat16)
     packed = buffers.zeros((rows, 2 * intermediate), torch.bfloat16)
-    hidden = buffers.zeros((rows, intermediate), torch.bfloat16)
     output = buffers.zeros((rows, width), torch.bfloat16)
     gate, up = (buffers.zeros((rows, intermediate), torch.bfloat16) for _ in range(2))
     reference_hidden = buffers.zeros((rows, intermediate), torch.bfloat16)
@@ -71,11 +76,11 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
             return original_plan(query, **kwargs)
 
         monkeypatch.setattr(blockscaled, "plan", plan)
-    with RecordedPreparationSession(device=device, checkpoint="qad-grouped-target-mlp",
+    with RecordedPreparationSession(device=device, checkpoint=checkpoint + "-grouped-target-mlp",
             workload_schema="canonical-swiglu", numerical_policy="auto", autotune_effort="off",
             native_dense_activations=down_mode != "a16") as session:
         session.register_scratch(arena)
-        operation = GroupedMLP(canonical, source, combined, separate[2], packed, hidden, output,
+        operation = GroupedMLP(canonical, source, combined, separate[2], packed, None, output,
                               session=session, name="grouped", workspace=arena)
         for field, weight, x, y in zip(("gate_proj", "up_proj", "down_proj"), separate,
                 (source, source, reference_hidden), (gate, up, reference_output), strict=True):
@@ -84,7 +89,8 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
         session.tune(show_progress=False)
 
         def run():
-            operation(source)
+            packed.copy_(operation.gate_up(source))
+            output.copy_(operation(source))
             canonical(source)
 
         compiled = compile_forward(run)
@@ -111,11 +117,83 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
             assert torch.all(guard_before == 17) and torch.all(guard_after == -19)
             assert torch.all(output[-1] == 0) and torch.all(reference_output[-1] == 0)
             assert operation.down_source_is_gate_up
-            assert torch.all(hidden == 0)
+            assert operation.gate_up.output is None and operation.down.output is None
+            assert not hasattr(operation, "intermediate")
             for actual, expected in ((packed, torch.cat((gate, up), -1)), (output, reference_output)):
                 a, b = actual.float(), expected.float()
                 assert torch.isfinite(a).all()
                 relative = float((a-b).norm() / b.norm().clamp_min(1e-12))
                 cosine = float(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0))
                 assert relative <= .005 and cosine >= .9999, (rows, factor, relative, cosine)
+        graph.reset()
+
+
+@pytest.mark.parametrize("rows", [8, 64])
+@torch.no_grad()
+def test_bf16_down_projection_uses_intermediate_through_pooled_replay(rows):
+    from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
+
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from tests.tensor_examples import TensorExamples
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.qwen38_dense.decoder import GroupedMLP
+
+    device, width, intermediate = torch.device("cuda:0"), 256, 512
+    canonical = Qwen3_5MLP(Qwen3_5TextConfig(hidden_size=width, hidden_act="silu"), intermediate).to(
+        device=device, dtype=torch.bfloat16).eval()
+    combined = torch.cat((canonical.gate_proj.weight, canonical.up_proj.weight))
+    pool = TensorExamples(device)
+    buffers = pool
+    guard_before = buffers.zeros((1024,), torch.bfloat16)
+    source = buffers.zeros((rows, width), torch.bfloat16)
+    packed = buffers.zeros((rows, 2 * intermediate), torch.bfloat16)
+    hidden = buffers.zeros((rows, intermediate), torch.bfloat16)
+    output = buffers.zeros((rows, width), torch.bfloat16)
+    reference_output = buffers.zeros((rows, width), torch.bfloat16)
+    guard_after = buffers.zeros((1024,), torch.bfloat16)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="bf16-grouped-target-mlp",
+            workload_schema="canonical-swiglu", numerical_policy="auto", autotune_effort="off") as session:
+        session.register_scratch(arena)
+        operation = GroupedMLP(canonical, source, combined, canonical.down_proj.weight, packed, hidden, output,
+                              session=session, name="grouped", workspace=arena)
+
+        def run():
+            output.copy_(operation(source))
+            reference_output.copy_(canonical(source))
+
+        session.tune(show_progress=False)
+        compiled = compile_forward(run)
+        source.normal_()
+        compiled()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        session.freeze()
+        for factor in (.5, 1., 1.5):
+            source.normal_(0, factor)
+            source[-1].zero_()
+            guard_before.fill_(17)
+            guard_after.fill_(-19)
+            output.fill_(float("nan"))
+            reference_output.fill_(float("nan"))
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_stats()
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for key in ("allocation.all.allocated", "allocation.all.freed", "segment.all.allocated", "segment.all.freed"):
+                assert before[key] == after[key]
+            assert torch.all(guard_before == 17) and torch.all(guard_after == -19)
+            assert torch.all(output[-1] == 0) and torch.all(reference_output[-1] == 0)
+            assert not operation.down_source_is_gate_up
+            assert operation.gate_up.output is None and operation.down.output is None
+            assert not hasattr(operation, "intermediate")
+            a, b = output.float(), reference_output.float()
+            assert torch.isfinite(a).all()
+            relative = float((a-b).norm() / b.norm().clamp_min(1e-12))
+            cosine = float(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0))
+            assert relative <= .005 and cosine >= .9999, (rows, factor, relative, cosine)
         graph.reset()

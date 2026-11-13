@@ -205,7 +205,7 @@ def _offsets(query):
     if query.resident:
         return None, None, 256
     if query.expanded:
-        return None, None, query.out_features * query.in_features * 2
+        return None, None, triton.cdiv(query.out_features * query.in_features * 2, 256) * 256
     values = query.rows * query.padded_in_features
     scales = triton.cdiv(query.rows, 128) * triton.cdiv(query.padded_in_features // 32, 4) * 512
     scale_start = triton.cdiv(values, 256) * 256
@@ -214,7 +214,9 @@ def _offsets(query):
 
 
 def workspace_bytes(query) -> int:
-    return _offsets(query)[2]
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+
+    return _offsets(query)[2] + (0 if query.mode == "fp4" else DEFAULT_WORKSPACE_SIZE)
 
 
 @triton.jit
@@ -380,12 +382,13 @@ class PreparedPackedProjection:
                         raise ValueError("resident expansion belongs to a different weight")
                     expanded = self.expanded
                 else:
-                    expanded = workspace[: self.required_workspace].view(torch.bfloat16)
+                    expanded = workspace[: q.out_features * q.in_features * 2].view(torch.bfloat16)
                     expanded = expanded.view(q.out_features, q.in_features)
                     operands = ((values, scale_bytes, global_scale, expanded) if nvfp4
                                 else (values.view(torch.uint8), scale_bytes, expanded))
                     self.programs["expand"][_expand_grid(q)](*operands, *_expand_constants(q))
-                mm_bf16(source_2d, expanded.T, out=out_2d, backend=self.backend)
+                mm_bf16(source_2d, expanded.T, out=out_2d, backend=self.backend,
+                        workspace_buffer=workspace[_offsets(q)[2]:])
                 return out
             scale_start, alpha_start, _ = _offsets(q)
             packed_values = workspace[: rows * stored_k].view(torch.float8_e4m3fn)
@@ -402,9 +405,7 @@ class PreparedPackedProjection:
             else:
                 self.programs["quantize"][_quantize_grid(q, rows)](
                     source, packed_values, packed_scales, alpha, alpha, alpha, rows, *_quantize_constants(q))
-            from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, _get_cache_buf
-
-            workspace_buffer = _get_cache_buf("mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, self.device)
+            workspace_buffer = workspace[_offsets(q)[2]:]
             self.runner(inputs=[packed_values.view(rows, stored_k), values.T, packed_scales, scale_bytes,
                                 torch.bfloat16, out_2d, workspace_buffer], tactic=self.tactic)
             return out
@@ -571,7 +572,7 @@ class PreparedDenseProjection:
     def __init__(self, backend):
         self.backend = backend
 
-    def run(self, source, weight, out, bias=None):
+    def run(self, source, weight, out, bias=None, workspace=None):
         from flashinfer.gemm import mm_bf16
 
         if bias is not None:
@@ -579,7 +580,7 @@ class PreparedDenseProjection:
         rows = source.numel() // source.shape[-1]
         if rows:
             mm_bf16(source.view(rows, -1), weight.T, out=out.view(rows, -1), out_dtype=out.dtype,
-                    backend=self.backend)
+                    backend=self.backend, workspace_buffer=workspace)
         return out
 
 
@@ -603,7 +604,10 @@ def bf16_out(source, weight, out, plan_handle):
     """Run a prepared BF16 projection by its plan handle: FlashInfer's GEMM on SM103, b12x's GEMV elsewhere."""
     plan = plan_from_handle(plan_handle)
     if plan.component_id == DENSE_COMPONENT:
-        require_prepared(plan, DENSE_COMPONENT, source.device).run(source, weight, out=out)
+        from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+
+        workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=source.device)
+        _dense_out_workspace(source, weight, out, workspace, plan_handle)
         return
     torch.ops.b12x.bf16_gemv_small_n_out(source, weight, out, plan_handle, None)
 
@@ -615,4 +619,16 @@ def _dense_out(source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, pl
 
 @_dense_out.register_fake
 def _fake_dense_out(source, weight, out, plan_handle):
+    pass
+
+
+@torch.library.custom_op("flare::sm103_dense_out_workspace", mutates_args=("out", "workspace"))
+def _dense_out_workspace(source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
+                          workspace: torch.Tensor, plan_handle: int) -> None:
+    require_prepared(plan_from_handle(plan_handle), DENSE_COMPONENT, source.device).run(
+        source, weight, out=out, workspace=workspace)
+
+
+@_dense_out_workspace.register_fake
+def _fake_dense_out_workspace(source, weight, out, workspace, plan_handle):
     pass

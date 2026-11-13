@@ -133,7 +133,7 @@ impl OutputPipeline {
                     start: config.content.start,
                     tools: config.content.tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect(),
                 }), reasoning_end: None, tool: None, function: None,
-                tool_ends_reasoning: false, response: None, tool_body_start: false,
+                tool_ends_reasoning: false, response: None, message_close: None, tool_body_start: false,
             }),
             Some((ToolParserKind::QwenCoder, 0, _)) => {
                 TaggedOutput::<super::chatml::FunctionTags<false>>::grammar_envelope(
@@ -166,6 +166,7 @@ impl OutputPipeline {
                 function: None,
                 tool_ends_reasoning: false,
                 response: Some(("", super::xtml::RESPONSE_CLOSE)),
+                message_close: Some(super::xtml::MESSAGE_CLOSE),
                 tool_body_start: false,
             }),
             Some((ToolParserKind::MiniMaxXml, _, _)) => {
@@ -182,6 +183,7 @@ impl OutputPipeline {
                 function: None,
                 tool_ends_reasoning: false,
                 response: None,
+                message_close: None,
                 tool_body_start: false,
             }),
         }?;

@@ -23,6 +23,17 @@ from .sampling import DeviceRequestState
 from .state import HybridStatePool
 
 
+@dataclass
+class DecoderRuntime:
+    gdn: object
+    qsa: object
+    ple: object
+    values: dict
+    inputs: object
+    injection_errors: object = None
+    capture_metadata: object = None
+
+
 def compile_kernel(kernel, args, grid):
     return prepare_triton(kernel, args, grid, num_warps=4)
 
@@ -279,20 +290,92 @@ class PreparedDecoderState:
                 (residual, saved, self.qsa.rope_positions, rope, self.inputs.row_slot_ids, self.token_state.active,
                  self.gdn.query_start_loc, self.inputs.request_state_rows, saved.stride(0), rope.stride(0), 1024, self.requests.capacity), (self.rows, 10, 1))
 
-    def begin(self):
-        self._validate()
-        self.token_state.gather()
-        self.qsa.request_ids.fill_(-1)
-        self.qsa.query_positions.fill_(-1)
-        self.qsa.rope_positions.fill_(-1)
-        self.qsa.slot_mapping.fill_(-1)
-        self._metadata()
-
-    def finish(self):
-        self._hidden()
+    def functional(self, *, dynamic_inputs=False):
+        if self.gdn is None:
+            return self
+        examples = {f"gdn.{name}": getattr(self.gdn, name) for name in self.gdn.__dataclass_fields__}
+        examples.update({f"qsa.{name}": getattr(self.qsa, name) for name in self.qsa.__dataclass_fields__})
+        examples.update({name: getattr(self.token_state, name)
+                         for name in ("pending_tokens", "positions", "history", "active")})
+        if dynamic_inputs:
+            examples.update({f"input.{name}": getattr(self.inputs, name) for name in
+                ("row_slot_ids", "row_generations", "live_rows", "query_lengths", "token_ids", "prefill_positions")})
+        examples.update(hidden=self._hidden.args[0], sample=self._hidden.args[3])
         if self._residual is not None:
-            self._residual()
-        self.token_state.consume()
+            examples["residual"] = self._residual.args[0]
+        def detach(call):
+            if call is None:
+                return None
+            slots = {index: name for index, value in enumerate(call.args)
+                     for name, example in examples.items() if value is not None and value is example}
+            args = tuple(None if index in slots else value for index, value in enumerate(call.args))
+            call.args = ()
+            return call.kernel, call.compiled, args, call.grid, call.options, slots
+        self._runtime_metadata = detach(self._metadata)
+        self._runtime_hidden = detach(self._hidden)
+        self._runtime_residual = detach(self._residual)
+        self._runtime_validate = detach(self._validate) if dynamic_inputs else None
+        self.token_state.functional(dynamic_inputs=dynamic_inputs)
+        if dynamic_inputs:
+            self.inputs = None
+        self.gdn = self.qsa = self.ple = None
+        return self
+
+    @staticmethod
+    def _launch_runtime(call, values):
+        from ignition.preparation.triton import launch_triton
+        kernel, compiled, args, grid, options, slots = call
+        args = tuple(values[slots[index]] if index in slots else value for index, value in enumerate(args))
+        launch_triton(kernel, compiled, args, grid, **options)
+
+    def begin_runtime(self, inputs=None):
+        inputs = self.inputs if inputs is None else inputs
+        if inputs is None:
+            raise ValueError("functional decoder state requires runtime role inputs")
+        input_values = {f"input.{name}": getattr(inputs, name) for name in
+            ("row_slot_ids", "row_generations", "live_rows", "query_lengths", "token_ids", "prefill_positions")}
+        if self._runtime_validate is None:
+            self._validate()
+            pending, positions, history, active = self.token_state.gather()
+        else:
+            self._launch_runtime(self._runtime_validate, input_values)
+            pending, positions, history, active = self.token_state.gather(inputs.row_slot_ids[:self.rows],
+                inputs.row_generations[:self.rows], inputs.live_rows)
+        device = inputs.token_ids.device
+        gdn = DeltaMetadata.allocate(self.rows, device)
+        q = QSAMetadata.allocate(tokens=self.tokens, batch=self.rows,
+            context=inputs.page_tables.shape[1] * 64, device=device)
+        qsa = QSAMetadata(q.main_block_table, q.main_block_table, q.raw_state_slot_ids,
+            q.request_ids, q.query_positions, q.rope_positions, q.sequence_lengths,
+            gdn.query_start_loc, gdn.accepted_tokens, q.is_prefilling, q.slot_mapping)
+        qsa.request_ids.fill_(-1)
+        qsa.query_positions.fill_(-1)
+        qsa.rope_positions.fill_(-1)
+        qsa.slot_mapping.fill_(-1)
+        ple = PLEMetadata(inputs.token_ids[:self.tokens], gdn.query_start_loc, history,
+            gdn.convolution_slots, gdn.fresh, gdn.accepted_tokens, gdn.num_seqs, gdn.num_tokens)
+        values = {f"gdn.{name}": getattr(gdn, name) for name in gdn.__dataclass_fields__}
+        values.update({f"qsa.{name}": getattr(qsa, name) for name in qsa.__dataclass_fields__})
+        values.update(pending_tokens=pending, positions=positions, history=history, active=active)
+        values.update(input_values)
+        self._launch_runtime(self._runtime_metadata, values)
+        return DecoderRuntime(gdn, qsa, ple, values, inputs)
+
+    def finish_runtime(self, runtime, hidden, residual):
+        sample = torch.empty((self.rows, 2560), dtype=hidden.dtype, device=hidden.device)
+        values = {**runtime.values, "hidden": hidden, "sample": sample, "residual": residual}
+        self._launch_runtime(self._runtime_hidden, values)
+        if self._runtime_residual is not None:
+            self._launch_runtime(self._runtime_residual, values)
+        inputs = runtime.inputs
+        if self._runtime_validate is None:
+            self.token_state.consume(inputs.token_ids[:self.tokens], runtime.gdn.query_start_loc)
+        else:
+            self.token_state.consume(inputs.token_ids[:self.tokens], runtime.gdn.query_start_loc,
+                row_slot_ids=inputs.row_slot_ids[:self.rows], row_generations=inputs.row_generations[:self.rows],
+                live_rows=inputs.live_rows)
+        return sample
+
 
 
 class PreparedResume:
@@ -327,7 +410,22 @@ class PreparedResume:
         self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
             coordinator=coordinator, name=name + ".sampling")
 
+    def functional(self, *, session):
+        self.hidden_layout = (tuple(self.sample_hidden.shape), tuple(self.sample_hidden.stride()), self.sample_hidden.dtype)
+        args = list(self._gather.args)
+        args[1] = None
+        self._gather.args = tuple(args)
+        self.sample_hidden = None
+        self.projection.functional(session=session)
+        self.sampler.functional(session=session)
+        return self
+
     def __call__(self):
-        self._gather()
-        self.projection(self.sample_hidden)
-        self.sampler()
+        from ignition.preparation.triton import launch_triton
+        shape, stride, dtype = self.hidden_layout
+        hidden = torch.empty_strided(shape, stride, dtype=dtype, device=self.sampler.state.generation.device)
+        args = list(self._gather.args)
+        args[1] = hidden
+        launch_triton(self._gather.kernel, self._gather.compiled, tuple(args), self._gather.grid,
+                      **self._gather.options)
+        self.sampler.run(self.projection(hidden))

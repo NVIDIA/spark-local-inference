@@ -49,7 +49,7 @@ from ignition.preparation.qwen38 import (
     MODEL_ID,
     REVISION,
 )
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena, bind_scratch
+from ignition.preparation.scratch import ScratchArena
 from ignition.progress import phase
 
 from .recipe import RECIPE
@@ -319,7 +319,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     mtp_weights = None
     has_mtp = config.mtp and config.speculative_method == "mtp"
     has_dflash = config.mtp and config.speculative_method == "dflash2"
-    draft_config = draft_weights = draft_head = None
+    draft_config = draft_weights = draft_head = draft_embedding = None
     if has_mtp:
         from .mtp_weights import MTPWeights
 
@@ -334,6 +334,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         draft_config = load_draft_config(config.draft_snapshot)
         draft_weights = DraftWeights.load(config.draft_snapshot, draft_config, device, shard,
                                           progress=progress, online_mxfp8=config.online_mxfp8)
+        from .dflash import draft_embedding as rank_draft_embedding
+
+        draft_embedding = rank_draft_embedding(weights.tree.model.language_model.embed_tokens.weight, shard)
         if config.draft_head_quantization is not None:
             from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 
@@ -398,13 +401,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 storage=state.backing, restore=state.reset_for_preparation,
             )
             requests = DeviceRequestState.allocate(device, capacity=slots)
-            from ignition.components.sampling import PreparedSampling
-
-            sampling_workspace = bind_scratch(PreparedSampling.scratch_layout(slots, requests.vocab_size), device=device)
+            sampling_workspace = None
             inputs = DecoderInputs.allocate(device, context=config.context, tokens=config.token_capacity, capacity=slots)
-            graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
             scratch = DecoderScratch.allocate(config.token_capacity, device, sample_rows=sample_rows,
-                world_size=shard.world_size, buffers=graph_buffers.cursor(),
+                world_size=shard.world_size,
                 hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320)
             workspaces = ScratchArena(device, overlap=config.stream_overlap)
             rotary = RotaryTables.allocate(weights.tree.config.text_config, config.context, device)
@@ -436,7 +436,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 if has_dflash:
                     from .dflash import SpeculativePreparation
                     draft_options = dict(draft_weights=draft_weights, draft_config=draft_config, draft_head=draft_head,
-                                         gather_runtime=hidden_gather_collective)
+                                         draft_embedding=draft_embedding, gather_runtime=hidden_gather_collective)
                 else:
                     from .speculative_model import SpeculativePreparation
                     draft_options = dict(mtp_weights=mtp_weights)
@@ -446,7 +446,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     rotary=rotary, cache=cache, table=table, session=session, completion=completion,
                     frame=frame, sequence=sequence, context=config.context,
                     prefill_capacity=config.token_capacity, max_cache_pages=planned_pages,
-                    sampling_workspace=sampling_workspace, graph_buffers=graph_buffers,
+                    sampling_workspace=sampling_workspace,
                     verification_width=max(config.speculative_widths), **collectives)
                 buffers.update(speculation.buffers())
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
@@ -469,10 +469,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
 
             vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
             for capacity in (16384, 4096, 1024, 256):
-                cursor = graph_buffers.cursor()
-                s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device, buffers=cursor)
+                s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device)
                 handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion, frame, sequence,
-                                               pixels=s.patches, buffers=cursor)
+                                               pixels=s.patches)
                 handoff.prepare()
                 with torch.device("meta"):
                     module = Qwen4ExpVisionModel(weights.tree.config.vision_config)
@@ -480,6 +479,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 encoder = PreparedVision(module, s, handoff.metadata, weights.vision, session=session,
                     name=f"vision{capacity}", projection_workspace=workspaces,
                     attention_workspace=workspaces)
+                handoff.functional()
+                encoder.functional(session=session)
                 add(f"vision{capacity}", PreparedVisionGeneration(handoff, encoder), "vision", 1, capacity, vision_fields)
                 owners.extend((handoff, encoder))
 
@@ -507,7 +508,15 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                             embedding_injection=injection, max_cache_pages=planned_pages,
                             sampling_workspace=sampling_workspace,
                             scoring=scoring if kind == "scored_prefill" else None, **collectives)
-                        forward = speculation.prefill(decoder, name) if enabled else decoder
+                        if enabled:
+                            forward = speculation.prefill(decoder, name)
+                            if has_mtp:
+                                forward.functional(session=session)
+                        else:
+                            from .decoder import PreparedDecoderForward
+                            decoder.functional(session=session)
+                            decoder.release_outputs()
+                            forward = PreparedDecoderForward(decoder)
                         add(name, forward, kind, rows,
                             capacity if mode == "prefill" else 1,
                             forward_fields, enabled=enabled)
@@ -521,6 +530,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     name = f"speculative{batch}x{width}"
                     operation = speculation.round(batch, width, name)
                     operation.prepare()
+                    if not has_dflash:
+                        operation.functional(session=session)
                     add(name, operation, "speculative", batch, width, fields, enabled=True)
                 decoders.extend(speculation.decoders)
                 owners.append(speculation)
@@ -542,6 +553,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     name = f"mixed{batch}x{width}p{prefill}" + ("" if enabled else "-no-mtp")
                     operation = PreparedMixedRound(mixed_owner, batch, width, prefill, name,
                         scratch=mixed_scratch, features=features, enabled=enabled)
+                    operation.functional(session=session)
                     fields = (*inputs.buffers(), "sampling_grammar_mask",
                               *(speculation.buffers() if enabled else ()))
                     add(name, operation, "mixed", batch, width, fields, enabled=enabled, prefill_capacity=prefill)
@@ -561,6 +573,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                         session=session, name=name, vocabulary_runtime=vocabulary_collective,
                         local_logits=None if scratch.local_logits is None else scratch.local_logits[:capacity],
                         coordinator=coordinator, sampling_workspace=sampling_workspace)
+                    resume.functional(session=session)
                     forward = speculation.resume(resume) if enabled else resume
                     add(name, forward, "resume", capacity, 1, forward_fields, enabled=enabled)
                     owners.append(resume)
@@ -575,9 +588,19 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                             fields += ("page_tables", *(("draft_page_tables",) if enabled and has_mtp else ()))
                         add(f"{mode}{capacity}" + suffix, maintenance, mode, capacity, 1, fields, enabled=enabled)
                         owners.append(maintenance)
+        if speculation is not None:
+            speculation.release_examples()
+        if config.mixed_shapes and speculation is None:
+            mixed_owner.scratch = mixed_owner.sampling_workspace = None
         session.register_scratch(workspaces)
         with phase(progress, "Prepare and tune kernels") as stage, transient:
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
+        workspaces.release_preparation()
+        scratch = s = None
+        vision_scratch.clear()
+        if config.mixed_shapes:
+            owners.remove(mixed_scratch)
+            mixed_scratch = None
         report(f"selected prepared kernels: {tuning['selection_counts']}")
         stream = torch.cuda.Stream(device=device)
         graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
@@ -679,17 +702,13 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             server_config.update(speculative_widths=config.speculative_widths,
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
                 speculative_fixed_width=config.speculative_fixed_width)
-        resources = (scoring, weights, table, session, state, requests, inputs, scratch, workspaces, rotary,
-            cache, final_cache, admission, transfer, features, vision_inputs, vision_scratch, graph_buffers,
+        resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
+            cache, final_cache, admission, transfer, features, vision_inputs,
             functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, vocabulary_collective, hidden_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
-        export_zero_ranges = disposable_ranges(cache=final_cache, scratch=scratch, workspaces=workspaces,
-            vision_scratch=vision_scratch, decoders=decoders, owners=owners, speculation=speculation)
-        from ignition.preparation.disposable import storage_ranges
-
-        export_zero_ranges = (*export_zero_ranges, *storage_ranges(graph_buffers.chunks))
+        export_zero_ranges = disposable_ranges(cache=final_cache)
         return PreparedModel(rebuild_weights=declare_weights({'weights': weights, 'mtp': mtp_weights, 'draft': draft_weights, 'draft_head': draft_head}, components={
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',

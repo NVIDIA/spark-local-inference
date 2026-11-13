@@ -400,18 +400,21 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["cache"] == Configuration.load(config).directory("core_cache")
 
 
+@pytest.mark.parametrize("fraction", [None, 0.0, 0.25])
 @pytest.mark.parametrize("budget", [None, 1536])
-def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch, budget):
+def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch, budget, fraction):
     port = free_port()
     config = tmp_path / "config.toml"
     config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n'
-                      + ("" if budget is None else f"thinking_token_budget = {budget}\n"))
+                      + ("" if budget is None else f"thinking_token_budget = {budget}\n")
+                      + ("" if fraction is None else f"scheduler_checkpoint_extra_work_fraction = {fraction}\n"))
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
     assert calls[0][0] == f"127.0.0.1:{port}"
     assert calls[0][1]["api_key"] == "secret"
     assert calls[0][1]["thinking_token_budget"] == budget
+    assert calls[0][1]["scheduler_checkpoint_extra_work_fraction"] == (0.05 if fraction is None else fraction)
     assert host["exports"] == 0
 
 

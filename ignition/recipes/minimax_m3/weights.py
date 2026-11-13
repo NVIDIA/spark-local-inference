@@ -10,6 +10,7 @@ from functools import cached_property
 import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights
+from ignition.preparation.persistent import persistent_empty, persistent_zeros, allocated_tensor_bytes
 
 from .config import ModelConfig, TEXT_PREFIX
 
@@ -45,7 +46,7 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, core_storage=None,
              expert_scale_compression=None, dspark=False, vision=True):
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         loading = nullcontext if core_storage is None else core_storage.transient
         with loading(), MiniMaxWeightLoader(manifest, device, shard=shard, progress=progress,
                                           expert_scale_compression=expert_scale_compression) as loader:
@@ -57,7 +58,7 @@ class ModelWeights:
             source = loader._sources["language_model.lm_head.weight"]
             if source.dtype != torch.bfloat16 or source.shape != (config.vocabulary, config.hidden):
                 raise ValueError("MiniMax M3 vocabulary head must retain its BF16 checkpoint storage")
-            head = torch.zeros((width, config.hidden), dtype=torch.bfloat16, device=device)
+            head = persistent_zeros((width, config.hidden), dtype=torch.bfloat16, device=device)
             loader._copy(head[:last - first], source[first:last])
             loader._session.flush()
             layers = tuple(loader.load_layer(index) for index in range(config.layers))
@@ -74,7 +75,7 @@ class ModelWeights:
 
                 vision_weights = VisionWeights.load(manifest, device, shard=shard, progress=progress)
         return cls(config, shard, embedding, norm, head, layers,
-                   torch.cuda.memory_allocated(device) - before, draft_weights, vision_weights)
+                   allocated_tensor_bytes(device) - before, draft_weights, vision_weights)
 
 
 class MiniMaxWeightLoader(DirectWeightLoader):
@@ -104,14 +105,14 @@ class MiniMaxWeightLoader(DirectWeightLoader):
             raise ValueError(f"{name}: expected a {width}-element BF16 normalization parameter")
         return self.load_tensor(name)
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, temporary=False):
         prefixes = tuple(prefixes)
         formats = {self.config.projection_format(prefix) for prefix in prefixes}
         if len(formats) != 1 or "nvfp4" in formats:
             raise ValueError("MiniMax M3 projection fusion requires compatible BF16 or MXFP8 storage")
         if formats == {"mxfp8"}:
             return super().load_linear_group(prefixes, row_ranges=row_ranges, column_range=column_range,
-                                            scale_name="weight_scale_inv")
+                                            scale_name="weight_scale_inv", temporary=temporary)
         ranges = (None,) * len(prefixes) if row_ranges is None else row_ranges
         values = []
         for prefix, rows in zip(prefixes, ranges, strict=True):
@@ -122,7 +123,8 @@ class MiniMaxWeightLoader(DirectWeightLoader):
                                  slice(*(column_range or (0, source.shape[1])))])
         if any(value.shape[1] != values[0].shape[1] for value in values):
             raise ValueError("fused MiniMax M3 projections must share an input width")
-        result = torch.empty((sum(value.shape[0] for value in values), values[0].shape[1]),
+        allocate = torch.empty if temporary else persistent_empty
+        result = allocate((sum(value.shape[0] for value in values), values[0].shape[1]),
                              dtype=torch.bfloat16, device=self.device)
         offset = 0
         for value in values:

@@ -22,6 +22,7 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    pub checkpoint_extra_work_fraction: f64,
 }
 
 impl Default for PolicyConfig {
@@ -35,6 +36,7 @@ impl Default for PolicyConfig {
             terminal_age_price: 1.0,
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
+            checkpoint_extra_work_fraction: 0.05,
             adaptive_verification_alpha: 1.0,
         }
     }
@@ -202,6 +204,10 @@ impl RequestScheduler {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("scheduling policy must be configured before admission".into());
         }
+        if !policy.checkpoint_extra_work_fraction.is_finite()
+            || !(0.0..=1.0).contains(&policy.checkpoint_extra_work_fraction) {
+            return Err("checkpoint extra work fraction must be finite and within 0..=1".into());
+        }
         if !policy.adaptive_verification_alpha.is_finite() || policy.adaptive_verification_alpha <= 0.0 {
             return Err("adaptive verification alpha must be finite and greater than zero".into());
         }
@@ -322,10 +328,7 @@ impl RequestScheduler {
 
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
-        let mut end = request
-            .message_boundaries
-            .get(request.message_boundaries.partition_point(|&n| n <= start))
-            .copied()
+        let mut end = self.checkpoint_cut(request)
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
@@ -1085,6 +1088,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn select_plan(&self) -> Option<ScheduledPlan> {
+        let _checkpoint_selections = self.checkpoint_planning_scope();
         if self.submissions.len() >= 2 || self.submissions.values().any(|s| s.requires_feedback) {
             return None;
         }
@@ -1150,7 +1154,8 @@ impl RequestScheduler {
         let plan = self.materialize(candidate, log_scale, origin);
         // A winning feedback operation drains the queue instead of yielding to
         // lower-value work that would keep its execution window occupied.
-        if self.plan_requires_feedback(&plan) && !self.submissions.is_empty() {
+        if self.checkpoint_anchor_waiting(&plan.checkpoint_plans)
+            || (self.plan_requires_feedback(&plan) && !self.submissions.is_empty()) {
             return None;
         }
         Some(plan)
@@ -1192,6 +1197,7 @@ impl RequestScheduler {
             });
         }
         let mut plan = ScheduledPlan {
+            checkpoint_plans: Vec::new(),
             origin,
             selected_cost: self.selected_cost(candidate.cost_key()),
             owner: self.plan_owner.clone(),
@@ -1214,6 +1220,7 @@ impl RequestScheduler {
                 requires_feedback: candidate.feedback,
             },
         };
+        plan.checkpoint_plans = self.plan_checkpoints(&plan.step);
         plan.step.requires_feedback = self.plan_requires_feedback(&plan);
         plan
     }
@@ -1224,6 +1231,7 @@ impl RequestScheduler {
         kind: GraphKind,
         request: Option<RequestHandle>,
     ) -> ScheduledPlan {
+        let _checkpoint_selections = self.checkpoint_planning_scope();
         let (values, age_price, scale) = self.lane_values(0);
         let mask = self
             .slots

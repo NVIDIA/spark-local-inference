@@ -38,7 +38,7 @@ from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import virtual_device_memory, release_unused
 from ignition.preparation.frontend import PromptEncoder, prepare_frontend
 from ignition.preparation.model import PreparedModel
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
@@ -66,13 +66,12 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
     return PreparedDraft(*args, vocabulary_runtime=runtime, **kwargs)
 
 
-def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision,
-                       draft_vocabulary_runtime=None):
+def _forward_factories(mla_compute_mode, *, vision,
+                       draft_vocabulary_runtime=None, examples=None):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, window_staging=window_staging, suffix_scratch=suffix_scratch,
-                    vision=vision, mla_compute_mode=mla_compute_mode),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
-                    mla_compute_mode=mla_compute_mode))
+                    mla_compute_mode=mla_compute_mode, examples=examples))
 
 
 def _can_race_contextual_plans(config, signatures, device):
@@ -243,13 +242,12 @@ class PreparationConfig:
         return max(self.speculative_widths) if self.dspark else 1
 
 
-def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buffers,
+def _prepare_speculation_catalog(config, speculation, *, add, buffers,
                                  forward_inputs, host_allocate, device):
     if speculation is None:
         return None
     from ignition.components.parallel_draft import PreparedParallelDraftRound
 
-    speculation.sampling_buffers = graph_buffers
     confidence = None
     if config.draft_tokens:
         from ignition.components.capacity import proposal_shapes
@@ -269,27 +267,24 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
                 continue
             name = f"proposal{batch}x{depth + 1}"
             source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
-                buffers=graph_buffers.cursor(), proposal_only=True)
+                proposal_only=True)
             source.prepare()
             proposals[batch] = source
     for batch, _ in reversed(config.speculative_shapes):
         name = f"speculative{batch}x1"
-        forward = PreparedParallelDraftRound(speculation, batch, 1, name,
-            buffers=graph_buffers.cursor())
+        forward = PreparedParallelDraftRound(speculation, batch, 1, name)
         forward.prepare()
         add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
     for batch, packed_tokens in sorted(config.packed_speculative_shapes,
             key=lambda shape: (shape[1], shape[0]), reverse=True):
         logical_width = max(config.speculative_widths)
         target_name = f"verification{batch}x{logical_width}-tokens{packed_tokens}"
-        target_buffers = graph_buffers.cursor()
-        target_buffers.join(proposals[batch].buffers)
         target = PreparedParallelDraftRound(speculation, batch, logical_width, target_name,
-            generate_proposals=False, buffers=target_buffers, target_token_capacity=packed_tokens)
+            generate_proposals=False, target_token_capacity=packed_tokens)
         target.prepare()
         name = f"packed-speculative{batch}x{logical_width}-drafts{config.draft_tokens}-tokens{packed_tokens}"
         forward = PreparedPackedSpeculativeRound(proposals[batch], target, prefix_limits, confidence.device_view,
-            name=name, buffers=graph_buffers.cursor())
+            name=name)
         add(name, forward, "speculative", batch, logical_width, packed_inputs,
             enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
     return confidence
@@ -411,27 +406,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
         session.__enter__()
         session.register_benchmark_resource("continuations", pool, restore=pool.clear_for_preparation)
-        scratch_pool = core_storage.scratch_pool()
-        arena = ScratchArena(device, overlap=config.stream_overlap, allocation_pool=scratch_pool.pool)
+        arena = ScratchArena(device, overlap=config.stream_overlap)
         session.register_scratch(arena)
-        graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20, allocation_pool=scratch_pool.pool)
-        activation_buffers = GraphBufferPool(device, chunk_bytes=2 << 20, allocation_pool=scratch_pool.pool)
+        examples = {}
         candidate_tokens = config.prefill_chunk_size
         if (weights.config.decoder_start is not None
                 and weights.config.text["candidate_source_layer_id"] >= weights.config.decoder_start):
             candidate_tokens = min(candidate_tokens, 128)
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=candidate_tokens)
+            candidate_tokens=candidate_tokens)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=config.prefill_chunk_size)
+            candidate_tokens=config.prefill_chunk_size)
             if config.prompt_logprobs else None)
-        # The suffix boundary gathers from the full prefill into disjoint destinations.
-        suffix_storage = Scratch.allocate(128, 1, shard.world_size, device, buffers=prefill_storage.buffers)
-        decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device,
-            buffers=activation_buffers.cursor())
-        window_staging = (decoder_storage.buffers.zeros(
-            (len(weights.layers), slots, (128 + max(config.speculative_widths)) * 528), torch.uint8)
-            if config.dspark else None)
+        decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
         vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))
@@ -445,8 +432,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
-            window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective)
+            vision=vision_state,
+            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -467,7 +454,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
-                buffers=activation_buffers.cursor(),
                 forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
                     draft_factory, PreparedMarkov))
 
@@ -506,8 +492,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 for capacity in capacities:
                     rows = 1 if mode == "prefill" else capacity
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    cursor = graph_buffers.cursor()
-                    metadata[name] = Metadata.allocate(capacity, rows, blocks, device, buffers=cursor)
+                    metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decoder_storage
                     if kind == "scored_prefill":
                         storage = scored_storage
@@ -521,23 +506,22 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
                         input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
-                        buffers=cursor)
+                        )
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT, buffers=cursor)
+                        context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
-            graph_buffers=graph_buffers, forward_inputs=forward_inputs,
+            forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
-                cursor = activation_buffers.cursor()
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120, buffers=cursor)
+                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                    session=session, workspace=arena, name=name, buffers=cursor)
-                add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor),
+                    session=session, workspace=arena, name=name)
+                add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence),
                     "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
@@ -548,7 +532,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
                     coordinator=coordinator, session=session, name=name, logits_dtype=torch.float32,
-                    buffers=graph_buffers.cursor())
+                    workspace=arena)
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix
@@ -565,7 +549,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                  f"{torch.cuda.mem_get_info(device)[0] >> 20} MiB free")
         progress(f"Graph operand allocation by operation: {catalog_bytes}")
     def materialize():
-        scratch_pool.materialize()
         if feature_pool is not None:
             feature_pool.materialize()
         pool.clear_for_preparation()
@@ -577,7 +560,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if _can_race_contextual_plans(config, signatures, device):
             from .contextual_selection import CatalogContextualSelection
 
-            contextual = CatalogContextualSelection(forwards, signatures, arena=arena,
+            contextual = CatalogContextualSelection(forwards, signatures,
                 coordinator=coordinator, collective=collective, device=device,
                 graph_pool=core_storage.graph_pool.id, cache_root=config.kernel_cache,
                 compile_decoder=config.compile_decoder, warmup_storage=core_storage,
@@ -594,19 +577,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             else:
                 progress(summary)
         stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
-        arena.allocation_pool = graph_buffers.allocation_pool = activation_buffers.allocation_pool = None
-        scratch_pool.retire()
-        if config.compile_decoder:
-            scratch_pool.release_backing()
-            if progress is not None:
-                progress(f"released {sum(size for _, size in scratch_pool.unbacked) >> 20} MiB of scratch for compilation")
+        if speculation is not None:
+            speculation.release_examples()
+        metadata.clear()
+        scratch.clear()
+        examples.clear()
+        vision_storage = None
+        prefill_storage = decoder_storage = scored_storage = storage = decoder = batch = None
+        arena.release_preparation()
+        release_unused()
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
             compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
     finally:
-        scratch_pool.materialize()
         if feature_pool is not None:
             feature_pool.materialize()
     session.freeze()
@@ -661,11 +646,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             packed_speculative_shapes=config.packed_speculative_shapes,
             speculative_graph_budget=config.speculative_graph_budget,
             packed_speculative_graphs=len(config.packed_speculative_shapes))
-    disposable = [activation_buffers, arena.tensor, metadata, tables.buffers(), graph_buffers]
+    disposable = [tables.buffers()]
     if vision_state is not None:
-        disposable.extend((vision_storage, vision_state.arena))
-    if speculation is not None:
-        disposable.append(speculation.draft_scratch)
+        disposable.append(vision_state.arena)
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):
             forward = forward.forward
@@ -678,11 +661,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         export_events=tables.events(),
         embedding_catalog=tables.resident_catalog(),
         core_data=tables if rank == 0 else None,
-        resources=(scoring, scored_storage, weights, tables, pool, requests, inputs, admission, commands, arena, forwards,
-            prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
+        resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
+            compiled, stream, graph_pool, session,
             collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
-            vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
-            scratch_pool, feature_pool),
+            vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
             (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:

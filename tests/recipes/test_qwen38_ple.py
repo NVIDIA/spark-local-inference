@@ -248,8 +248,8 @@ def _metadata(metadata, tokens, caches, *, fresh):
             )
 
 
-def _stage_checkpoint_rows(table, lookup):
-    lookup.publish()
+def _stage_checkpoint_rows(table, lookup, metadata):
+    lookup.publish(metadata)
     ids = lookup.ids.cpu().flatten().tolist()
     for destination, sources, row_bytes in ((table.weights, table.sources[0], 80),
                                             (table.scales, table.sources[1], 10)):
@@ -277,7 +277,6 @@ def test_full_checkpoint_ple_native_graph_continuity(
     from b12x.preparation import PreparationSession
 
     from ignition.preparation.graphs import PreparedGraphBundle
-    from ignition.preparation.scratch import GraphBufferPool
 
     module, projections, table = cuda_components
     device = torch.device("cuda", 0)
@@ -286,9 +285,8 @@ def test_full_checkpoint_ple_native_graph_continuity(
         "prefill": torch.zeros((32, 10240), dtype=torch.bfloat16, device=device),
         "decode": torch.zeros((3, 10240), dtype=torch.bfloat16, device=device),
     }
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
     scratch = {
-        name: PLEScratch.allocate(source.shape[0], device, buffers=buffers.cursor())
+        name: PLEScratch.allocate(source.shape[0], device)
         for name, source in sources.items()
     }
     metadata = {
@@ -313,17 +311,22 @@ def test_full_checkpoint_ple_native_graph_continuity(
             )
             for name, source in sources.items()
         }
-        for name, adapter in adapters.items():
-            adapter.embedding_lookup.publish()
-            adapter(sources[name])
+        for adapter in adapters.values():
+            adapter.functional(session=session)
+        def execute(name):
+            adapter = adapters[name]
+            adapter.embedding_lookup.publish(metadata[name])
+            scratch[name].embedding.copy_(adapter.embedding_lookup(sources[name], metadata[name]))
+            scratch[name].output.copy_(adapter(sources[name], metadata[name]))
+        for name in adapters:
+            execute(name)
         torch.cuda.synchronize()
         session.freeze()
         pool = torch.cuda.graph_pool_handle()
         graphs = {name: torch.cuda.CUDAGraph() for name in sources}
         for name, graph in graphs.items():
             with torch.cuda.graph(graph, pool=pool):
-                adapters[name].embedding_lookup.publish()
-                adapters[name](sources[name])
+                execute(name)
         bundle = PreparedGraphBundle(
             device=0,
             graphs=graphs,
@@ -382,9 +385,9 @@ def test_full_checkpoint_ple_native_graph_continuity(
                         )[0]
                     )
                     start += length
-                _stage_checkpoint_rows(table, adapters[mode].embedding_lookup)
-                for chunks in buffers.chunks.values():
-                    for tensor in chunks:
+                _stage_checkpoint_rows(table, adapters[mode].embedding_lookup, metadata[mode])
+                for example in scratch.values():
+                    for tensor in vars(example).values():
                         tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
                 torch.cuda.synchronize()
                 allocated = torch.cuda.memory_stats()["allocation.all.allocated"]

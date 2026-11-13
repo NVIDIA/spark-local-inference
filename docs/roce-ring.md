@@ -3,12 +3,13 @@
 Flare's experimental `--roce-ring` option connects each tensor-parallel rank to
 its neighbors in rank order. A native CPU proxy forwards transfers addressed to
 other ranks through those neighbors. The transport supports 2 through 16 ranks;
-each model recipe still determines which tensor-parallel sizes it can prepare.
-GLM-5.3 Flash, Qwen3.8 Flash, and DeepSeek V4 Flash prepare multi-host TP2 and TP4 cores.
+each model recipe determines which tensor-parallel sizes it can prepare,
+and the multi-host preparation rendezvous admits two, three, or four ranks.
+GLM-5.3 Flash, DeepSeek V4 Flash, and Qwen3.8 Flash prepare multi-host TP2 and TP4 cores.
 
 Ring routing applies to RoCEnante's one-shot reductions, two-shot reductions,
-and variable-length gathers. The collective algorithms and arithmetic remain
-in the prepared GPU programs. Routing, registered relay buffers, and RDMA
+and variable-length gathers. The collective algorithms and arithmetic belong
+to the prepared GPU programs. Routing, registered relay buffers, and RDMA
 progress belong to the native transport. Serving has no Python callback,
 runtime compilation, or steady-state GPU allocation.
 
@@ -18,8 +19,8 @@ mode connects to the peer rank; `--roce-ring` and `--roce-chain` select neighbor
 relays. Preparation
 owns one native transfer helper per rank and needs no Orbit agents. Serving
 owns its core receiver and relay, whether ranks start manually, through
-`flare run --hosts`, or through Orbit. Agent-based prestaging uses the existing
-agent sessions and authorization. See
+`flare run --hosts`, or through Orbit. Agent-based prestaging uses
+authenticated agent sessions and signed grants. See
 [checkpoint range reads](multi-host.md) and
 [core transfers](orbit.md#core-transfers-through-fabric-interfaces).
 
@@ -103,9 +104,11 @@ publish readiness words; the proxy posts RDMA writes and publishes the flags
 that receiving kernels wait for. The proxy performs transport work, not the
 model's reductions.
 
-Ring mode also allocates about 2.01 MiB of registered host memory per rank at
-startup. This fixed-capacity region contains relay mailboxes, acknowledgment
-words, and outgoing descriptors for up to 16 origins and two rails. It is
+Ring mode also allocates registered host memory on each rank at startup, sized
+for the group: about 1.004 MiB per rank in the group, so 4.02 MiB on each rank
+of a four-rank group and 16.06 MiB at sixteen ranks. This region contains
+eight relay mailboxes, acknowledgment words, and outgoing descriptors for every
+origin rank and each of two rails. It is
 separate from captured graph storage and the core's collective region.
 Relay payloads occupy at most 64 KiB per packet.
 
@@ -122,8 +125,9 @@ A transfer from rank 0 to rank 2 through rank 1 proceeds as follows:
    The last relay waits for its send completion, then acknowledges the packet
    to the preceding hop. Longer paths pass acknowledgments back through each
    relay to the origin.
-4. Rank 0 waits for that acknowledgment before submitting its next packet on
-   the same rail. Relay buffers and outgoing descriptors remain live until
+4. Rank 0 keeps at most eight packets in flight on a rail: it reuses a mailbox
+   slot only after the acknowledgment of the packet that last used that slot
+   returns. Relay buffers and outgoing descriptors remain live until
    downstream acknowledgment permits reuse.
 
 The acknowledgment protects data still being read by a NIC. Receiving GPU
@@ -161,12 +165,14 @@ is a mode of this layout, and startup rejects any other proxy ABI before replay.
 
 ### Prepare across four hosts
 
-On `maxwell`, choose an available rendezvous port. Export publishes to its model
-cache; replace `CACHE_ENTRY` with the printed path to create a standalone core:
+On `maxwell`, choose an available rendezvous port. `--rendezvous` and
+`ignition join` take an IPv4 address and port, not a host name; this example
+uses `10.200.0.12` as `maxwell`'s preparation address. Export publishes to its
+model cache; replace `CACHE_ENTRY` with the printed path to create a standalone core:
 
 ```sh
 .venv/bin/ignition export glm-5.3-flash --gpus 0 --ranks 4 \
-  --rendezvous maxwell:29630 --roce-ring --transfer-streams 8 \
+  --rendezvous 10.200.0.12:29630 --roce-ring --transfer-streams 8 \
   --max-concurrency 4 --verbose
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-ring-tp4.safetensors
 ```
@@ -175,13 +181,13 @@ Run the corresponding command on each peer from its checkout root:
 
 ```sh
 # ampere: rank 1
-.venv/bin/ignition join maxwell:29630 --rank 1 --ranks 4
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 4
 
 # faraday: rank 2
-.venv/bin/ignition join maxwell:29630 --rank 2 --ranks 4
+.venv/bin/ignition join 10.200.0.12:29630 --rank 2 --ranks 4
 
 # hertz: rank 3
-.venv/bin/ignition join maxwell:29630 --rank 3 --ranks 4
+.venv/bin/ignition join 10.200.0.12:29630 --rank 3 --ranks 4
 ```
 
 Rank zero sends the `--roce-ring` setting to peers. The plan records `roce_ring`.
@@ -206,7 +212,7 @@ On rank zero, start the complete core with `flare run CORE --rank 0
 --rendezvous maxwell:29800 --roce-ring`. On each peer, start `flare run --rank R
 --rendezvous maxwell:29800`. Peers receive missing shards through CX7; no agent
 or route credentials are required. Core signatures and publisher acceptance
-still apply. The source and every relay remain available until all ranks have
+apply. The source and every relay stay available until all ranks have
 verified their received data.
 
 With paired peer agents, `flare run CORE --hosts ampere,faraday,hertz
@@ -233,8 +239,9 @@ flare orbit run maxwell:/data/flare-runtime/glm53-ring-tp4.safetensors \
 The example binds HTTP to loopback on rank zero, so access it on Maxwell or
 select a reachable bind with `--host`. It uses each node's installed agent
 executable unless an explicit override is supplied. The grant carries
-`--roce-ring` to every rank. If starting ranks manually, pass
-it to every rank along with the usual rank and rendezvous options.
+`--roce-ring` to every rank. When starting ranks manually, pass it on rank
+zero; serving bootstrap sends the routing mode to the peers, and a peer that
+selects a mode rank zero did not select fails.
 Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a core prepared
@@ -243,8 +250,9 @@ core's graph catalog. A core recording proxy ABI 9, 10 or 11 can use either tran
 without changing its captured addresses or collective algorithms. Preparation
 on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
 are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
-neighbor transport for collectives, but its checkpoint loading and preparation
-export use the preparation rendezvous rather than the agent transfers below.
+neighbor transport for collectives, and its checkpoint loading and preparation
+export follow the chain routes through the rank-owned helpers, as
+[chains](#chains) describes.
 
 ## TCP data distribution
 
@@ -254,12 +262,12 @@ forwards through neighbors. Every hop binds its local fabric address and checks
 the expected peer interfaces. Failed fabric channels abort the operation without
 falling back to management interfaces or changing host routes.
 
-Orbit agent prestaging includes rank order, identities, and endpoints in its
-existing signed grant and retains encrypted sessions. Serving ranks exchange
+Orbit agent prestaging carries rank order, identities, and endpoints in its
+signed grant and transfers through encrypted agent sessions. Serving ranks exchange
 endpoints over rendezvous and transfer plain TCP bytes, with core signature
 and stored-data verification. Manual preparation exchanges
 endpoints through its rendezvous and authenticates checkpoint/export frames
-with its existing shared token, without encryption or signed routes. The
+with the shared preparation token, without encryption or signed routes. The
 transport supports the dedicated fabric used to cluster Sparks in home and
 small-office deployments.
 
@@ -314,7 +322,9 @@ runtime core. Native socket tests also cover direct and ring paths, stream
 failures, and worker cancellation.
 
 FlashInfer provides a CPU-driven validator for the native RDMA proxy at
-`tests/experimental/b12x/comm/validate_roce_ring_native.py`. It runs without a
+`tests/experimental/b12x/comm/validate_roce_ring_native.py` in the
+[FlashInfer repository](https://github.com/local-inference-lab/flashinfer);
+this repository holds no copy. It runs without a
 CUDA context and checks mixed one-shot, two-shot, and variable-length transfers,
 including empty contributions, unequal shards, delayed senders, and buffer
 reuse. From a FlashInfer checkout at the revision pinned in `uv.lock`, run one
@@ -328,13 +338,16 @@ python3 tests/experimental/b12x/comm/validate_roce_ring_native.py \
 
 Use ranks 1, 2, and 3 on the other hosts. Set `--hca-names` and `--gid-index`
 for the fabric; keep the other options identical. Add `--mesh` on every rank
-to validate direct routing. GPU graph tests additionally exercise changing
+to validate direct routing, or `--ring-open` to validate a chain. GPU graph
+tests additionally exercise changing
 message sizes, buffer ownership, and proxy failures during replay. Recovery
 from a failed ring neighbor is unsupported; stop and restart all ranks together.
 
-Four DGX Sparks in a physical ring running Flare revision `0a91856` completed
-GLM-5.3 Flash TP4 preparation, export, and native inference. Checkpoint and export
-payloads used fabric TCP links. Signed-core checks and coordinated shutdown passed.
+Ring transport is experimental. Qualified: GLM-5.3 Flash TP4 on four DGX
+Sparks cabled as a physical ring, covering preparation, export, native serving,
+fabric TCP checkpoint and export transfer, signed-core verification, and
+coordinated shutdown. Not qualified: other recipes, other rank counts,
+`--roce-chain`, and x86_64 hosts.
 
 ## Protocol model and runtime checks
 
@@ -385,10 +398,10 @@ is unsupported; restarting the proxy thread alone does not reset the runtime.
 
 | Symptom | Check |
 | --- | --- |
-| `--roce-ring requires a multi-host core with 2..16 ranks` | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
-| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores using a different proxy ABI. |
+| `--roce-ring and --roce-chain require a multi-host core with 2..16 ranks` (Orbit) or `experimental RoCE ring requires 2..16 ranks` (serving rank) | Use a multi-host core with a supported rank count. The flag does not add model sharding geometries. |
+| `core RoCE kernels use proxy ABI ...` | Align the preparation dependency and native executable; re-export cores recording a proxy ABI other than 9 or 10. |
 | `RoCE rails have a link to rank ...` | Verify rank order, active ports, GIDs, and the IPv4 subnet shared by each neighbor pair. |
-| `ranks disagree on experimental ring transport` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
+| `rank R selected RoCE transport shape ... where this rank selected ...`, or `rank zero did not select --roce-ring` | Select `--roce-ring` on rank zero and use matching binaries; serving bootstrap passes its routing mode to peers. |
 | Proxy error or collective timeout | Stop the ranks together and inspect the originating rank's error. There is no automatic rerouting around a failed neighbor. |
 
 The transport reports failed waits and RDMA errors through Helios's shared
@@ -402,11 +415,11 @@ failed collective as a completed model step.
 | [Fabric discovery and route planning](../helios/src/execution/roce_fabric.rs) | Finds host devices and builds symmetric neighbor routes. |
 | [Native transport owner](../helios/src/execution/roce.rs) | Validates the core ABI and layout, registers its region, enables the ring, and retains transport resources. |
 | [RDMA proxy](../helios/native/roce_proxy.c) | Posts direct and relayed writes, progresses mailboxes and acknowledgments, and releases two-shot send buffers. |
-| [Serving distribution](../flare/src/distribution.rs) | Receives and verifies rank cores before handing rendezvous sockets to serving. |
+| [Serving distribution](../flare-cli/src/distribution.rs) | Receives and verifies rank cores before handing rendezvous sockets to serving. |
 | [Cluster startup](../flare-cli/src/cluster.rs) | Exchanges endpoints and connection records before native replay. |
 | [Collective preparation](../ignition/preparation/collectives.py) | Passes the routing choice to b12x and retains the transport through export. |
 | [Agent fabric transfers](../flare-cli/src/orbit/agent.rs) | Streams core ranges through authenticated direct or relayed fabric connections. |
-| [Fabric TCP planning](../flare/src/fabric.rs) | Selects direct peer links and ring paths for ranks and agents. |
-| [Rank channels](../flare/src/fabric_transport.rs) | Owns native preparation and serving listeners and relays. |
+| [Fabric TCP planning](../flare-cli/src/fabric.rs) | Selects direct peer links and ring paths for ranks and agents. |
+| [Rank channels](../flare-cli/src/fabric_transport.rs) | Owns native preparation and serving listeners and relays. |
 | [Preparation transfer coordination](../ignition/preparation/host_ranks.py) | Distributes checkpoint ranges and receives, verifies, and publishes peer exports. |
 | [CLI reference](cli-design.md#experimental-roce-ring-configuration) | Defines how preparation and native serving expose the option. |

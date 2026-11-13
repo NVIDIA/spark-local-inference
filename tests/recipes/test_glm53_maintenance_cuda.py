@@ -67,9 +67,10 @@ def _run(rank, world, rendezvous=None):
                     local = LocalMaintenance(mode, requests, transfer, slots, epochs, count, completion_outputs(records), frame, sequence,
                                               world_size=1, admission_buffers=admission)
                     local.prepare()
+                    local.functional()
                     def call(local=local):
-                        local.validation_sum.copy_(local.validate())
-                        local.apply()
+                        validation, errors = local.validate()
+                        local.apply(validation, admission_errors=errors)
                     operations[mode] = call
             if world > 1:
                 session.tune()

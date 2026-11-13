@@ -8,6 +8,8 @@ from dataclasses import dataclass, fields
 
 import torch
 from b12x.sequence import gdn_decode, kda_prefill, short_conv
+from b12x.sequence.gdn_decode._kernels import _gdn_decode_op as kda_decode_out
+from b12x.sequence.kda_prefill._ops import _run as kda_prefill_out
 
 from ignition.components import sm103
 from ignition.components.kda_speculation import KDARecords, _record, register_recording
@@ -18,6 +20,7 @@ from ignition.components.recurrent import (
     DeltaMetadata,
     DeltaState,
     prepare_sequence_binding,
+    run_short_conv,
 )
 
 
@@ -94,6 +97,8 @@ class PreparedGlmKDA:
         if records is not None and mode != "decode":
             raise ValueError("KDA verification records belong to decode rounds")
         self.module, self.weights, self.scratch = module, weights, scratch
+        self.arena = workspace
+        self.recording = records is not None
         self.records = self.verification = None
         self.state, self.metadata, self.mode = state, metadata, mode
         module.o_norm.weight = torch.nn.Parameter(weights["o_norm.weight"], requires_grad=False)
@@ -171,6 +176,7 @@ class PreparedGlmKDA:
                 self.records = records
                 self.handle = register_recording(self)
             self.recurrent_plan = gdn_decode.plan(caps, invocation=gdn_decode.invocation_from_tensors(caps, **args))
+            self.record_scratch_bytes = sum(spec.nbytes for spec in self.recurrent_plan.scratch_specs())
             public_bind, bind_method = gdn_decode.bind_kda, "bind_kda"
         else:
             caps = kda_prefill.Caps(device=self.device, max_tokens=self.tokens, max_seqs=self.sequences,
@@ -193,29 +199,94 @@ class PreparedGlmKDA:
                 scratch.gated.view(self.tokens, self.heads, 128), metadata.num_tokens,
                 eps=module.o_norm.variance_epsilon)
 
-    def __call__(self, source):
-        s, p = self.scratch, self.projections
+    def functional(self, *, session):
         if self.gate_overlap is not None:
-            self.gate_overlap.start(source)
-        p["input_proj"](source)
-        if self.tokens > 1:
-            s.forget_input.copy_(s.projected_input[:, -128:])
-        p["f_b_proj"](s.forget_input)
-        if self.gate_overlap is None:
-            p["g_b_proj"](p["g_a_proj"](source))
-        else:
-            self.gate_overlap.finish(source, s.raw_g)
-        short_conv.run(self.conv_binding)
+            self.gate_overlap.functional(session=session)
+        for projection in self.projections.values():
+            projection.functional(session=session)
         if self.verification is not None:
-            self.verification()
-            self.output_norm()
-        elif self.mode == "decode" and self.records is not None:
-            m = self.metadata
-            _record([s.convolved_qkv, s.raw_g, s.raw_beta, s.z, self.state.recurrent, m.query_start_loc,
-                     m.state_indices, m.num_seqs, m.num_tokens], s.gated, *self.records, self.handle)
-        elif self.mode == "decode":
-            gdn_decode.run_kda(self.recurrence, **self.options)
+            self.verification.functional()
+            self.output_norm.functional(session=session, dynamic_live=True)
+        elif self.mode == "prefill":
+            self.output_norm.functional(session=session, dynamic_live=True)
+        self.scratch = self.metadata = self.records = None
+        self.arena.register_preparation_release(self._release_bindings)
+        return self
+
+    def _release_bindings(self):
+        self.conv_binding = self.recurrence = self.arena = None
+
+    def __call__(self, source, metadata, *, records=None):
+        if self.recording and records is None:
+            raise ValueError("recording KDA execution requires invocation-local records")
+        tokens = source.shape[0]
+        scratch = KDAScratch.allocate(tokens, self.heads, source.device)
+        pending = None if self.gate_overlap is None else self.gate_overlap.start(source)
+        projected = self.projections["input_proj"](source)
+        projected_qkv = projected[:, :3 * self.width]
+        forget_input = projected[:, -128:]
+        if tokens > 1:
+            scratch.forget_input.copy_(forget_input)
+            forget_input = scratch.forget_input
+        raw_g = self.projections["f_b_proj"](forget_input)
+        if self.gate_overlap is None:
+            gate_input = self.projections["g_a_proj"](source)
+            z = self.projections["g_b_proj"](gate_input)
         else:
-            kda_prefill.run(self.recurrence, **self.options)
-            self.output_norm()
-        return p["o_proj"](s.gated)
+            z = self.gate_overlap.finish(pending, raw_g)
+        conv_args = dict(x=projected_qkv, conv_weight=self.weights["conv1d.weight"],
+            query_start_loc=metadata.query_start_loc, state_slot_ids=metadata.convolution_slots,
+            state_is_fresh=metadata.fresh, num_accepted_tokens=metadata.accepted_tokens,
+            num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens,
+            conv_state=self.state.convolution, out=scratch.convolved_qkv)
+        conv_scratch = torch.empty(self.conv_plan.scratch_specs()[0].nbytes,
+                                   dtype=torch.uint8, device=source.device)
+        run_short_conv(self.conv_plan, scratch=conv_scratch, **conv_args)
+        raw_g = raw_g.view(tokens, self.heads, 128)
+        z = z.view(tokens, self.heads, 128)
+        raw_beta = projected[:, 3 * self.width:3 * self.width + self.heads]
+        gated = scratch.gated.view(tokens, self.heads, 128)
+        if self.verification is not None:
+            recurrence = scratch.recurrence.view(tokens, self.heads, 128)
+            self.verification(mixed_qkv=scratch.convolved_qkv, raw_g=raw_g, raw_beta=raw_beta,
+                A_log=self.weights["A_log"], dt_bias=self.weights["dt_bias"].view(self.heads, 128),
+                state=self.state.recurrent, metadata=metadata, output=recurrence, records=records)
+            gated = self.output_norm(recurrence, z, live=metadata.num_tokens)
+        elif self.mode == "decode" and self.recording:
+            record_scratch = torch.empty((self.record_scratch_bytes,), dtype=torch.uint8, device=self.device)
+            _record([scratch.convolved_qkv, raw_g, raw_beta, z, self.weights["A_log"],
+                     self.weights["dt_bias"].view(self.heads, 128), self.module.o_norm.weight,
+                     metadata.query_start_loc, metadata.accepted_tokens, metadata.state_indices,
+                     metadata.num_seqs, metadata.num_tokens], self.state.recurrent, gated,
+                    *records, record_scratch, self.handle)
+        elif self.mode == "decode":
+            kda_decode_out(scratch.convolved_qkv, raw_g, raw_beta, z, self.weights["A_log"],
+                self.weights["dt_bias"].view(self.heads, 128), self.module.o_norm.weight,
+                self.state.recurrent, metadata.query_start_loc, metadata.accepted_tokens,
+                metadata.state_indices, metadata.num_seqs, metadata.num_tokens, gated,
+                self.module.layer_norm_epsilon, 128 ** -.5, -5.0, self.recurrent_plan.handle)
+        else:
+            recurrence_scratch = torch.empty(self.recurrent_plan.scratch_specs()[0].nbytes,
+                                             dtype=torch.uint8, device=source.device)
+            q, k, v = (value.view(tokens, self.heads, 128)
+                       for value in scratch.convolved_qkv.split(self.width, dim=-1))
+            recurrence = scratch.recurrence.view(tokens, self.heads, 128)
+            kda_prefill_out([q, k, v, raw_g, raw_beta, self.weights["A_log"],
+                self.weights["dt_bias"].view(self.heads, 128), metadata.query_start_loc,
+                metadata.initial_state_indices, metadata.final_state_indices,
+                metadata.checkpoint_state_indices, metadata.checkpoint_offsets, metadata.num_seqs,
+                metadata.num_tokens], recurrence_scratch, self.state.recurrent, recurrence,
+                self.recurrent_plan.handle, -5.0, None, 1e-6, None, None)
+            gated = self.output_norm(recurrence, z, live=metadata.num_tokens)
+        return self.projections["o_proj"](gated.reshape(tokens, -1))
+
+    def run_recorded(self, reads, recurrent_state, output, corrections, keys_gates, scratch):
+        (mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, query_start_loc,
+         num_accepted_tokens, state_indices, num_seqs, num_tokens) = reads
+        binding = gdn_decode.bind_kda(self.recurrent_plan, scratch=scratch,
+            mixed_qkv=mixed_qkv, raw_g=raw_g, raw_beta=raw_beta, z=z, A_log=A_log,
+            dt_bias=dt_bias, norm_weight=norm_weight, recurrent_state=recurrent_state,
+            query_start_loc=query_start_loc, num_accepted_tokens=num_accepted_tokens,
+            state_indices=state_indices, num_seqs=num_seqs, num_tokens=num_tokens,
+            output=output, correction_cache=corrections, kg_cache=keys_gates)
+        gdn_decode.run_kda(binding, lower_bound=-5.0, eps=self.module.layer_norm_epsilon)

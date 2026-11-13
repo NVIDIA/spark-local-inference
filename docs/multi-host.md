@@ -49,8 +49,8 @@ x86_64, install the libibverbs development package and build with
 `cargo build --release --locked --manifest-path flare-cli/Cargo.toml --features roce`.
 The resulting executable requires libibverbs at runtime. Default x86_64 builds
 do not link it and reject multi-host serving before loading GPU resources.
-Staging (`--stage-only`) does not need RoCE. x86_64 RoCE serving has been
-tested functionally only (Soft-RoCE).
+Staging (`--stage-only`) does not need RoCE. Not qualified: x86_64 RoCE serving
+on RDMA hardware; its coverage is functional, over Soft-RoCE.
 The separate `rdma` feature enables the prefix pool's data channel.
 
 ### Prefix cache pool
@@ -89,7 +89,7 @@ relays non-neighbor data through the ring, and `--roce-chain` along a chain. Ser
 on the dedicated cluster fabric, with core signature verification and
 publisher acceptance before GPU loading. It requires no route keys or agents.
 Model collectives use RDMA. Agent-based prestaging with `orbit push` uses the
-agents' existing authenticated sessions and signed grants; those agents must
+agents' authenticated sessions and signed grants; those agents must
 also listen on their fabric addresses. Flare does not configure interfaces,
 addresses, routes, switches, or firewalls.
 
@@ -119,9 +119,9 @@ Flare verifies that its export matches rank zero's.
 Received files contain only the rank's required ranges. Flare verifies their
 stored data, reuses verified cache entries, and keeps relays alive until every
 rank has finished receiving. `--core-cache PATH` selects a receiver's cache
-root; `--model-cache` and `--package-cache` remain accepted aliases.
-The default is `paths.core_cache`, otherwise `~/.cache/flare/cores`, with an
-existing `~/.cache/flare/packages` directory used when `cores` is absent.
+root; `--model-cache` and `--package-cache` are accepted aliases.
+The default is `paths.core_cache`, otherwise `~/.cache/flare/cores`; when
+`cores` is absent and `~/.cache/flare/packages` exists, `packages` is used.
 `--stage-only` on rank zero distributes and
 verifies cores, then exits all ranks before GPU loading. Manual ranks apply
 normal publisher trust independently; unattended first use requires the exact
@@ -142,8 +142,9 @@ agent, cluster definition, or saved group. Peer processes use the executable
 running their agents. The default rendezvous is the head node's address toward
 the first peer on port 29800; `--rendezvous HOST:PORT` overrides it.
 
-Pairing shares the node registry and controller key with Orbit, so existing
-pairings work in both modes. `--agents-file PATH` and `--controller-key PATH`
+Pairing shares the node registry and controller key with Orbit, so a pairing
+made by either command works in both modes. `--agents-file PATH` and
+`--controller-key PATH`
 select those files when their default paths are unsuitable. The local process
 forwards peer output and owns the launch lifetime; after local serving drains,
 it waits for peer exits. Use Orbit for detached groups.
@@ -239,13 +240,17 @@ Replace `ORG/MODEL` with the core repository. If the revision contains several
 primary files, select the multi-host core with `--filename FILE`. `gb10` selects the Spark hardware revision even from
 a controller without a GPU. Without an explicit revision, Orbit infers one
 from available candidate GPUs and refuses ambiguous mixed hardware.
-`--offline` and `--cache-dir` apply to the downloading node; `--token-file`
+`--filename` and `--offline` apply on the downloading node, which uses its own
+configured model cache and download transport cache; the controller's
+`--cache-dir` and `--core-cache` paths are not sent. `--token-file`
 is read on the controller and its token travels through the encrypted session.
 To download on a particular source host before launching, run `flare download`
-there and pass its returned primary path as `NODE:/absolute/path`.
+there. It prints the Flare model-cache entry directory; pass the primary inside
+it, `model.safetensors` for a payload-format entry, as `NODE:/absolute/path`.
 
-Downloads reuse the Hugging Face cache. Keep the primary and its companion
-filenames and symlink targets intact. To inspect the core's rank count and
+A downloaded core is an entry of that node's Flare model cache. Keep the
+primary, its companion files, and symlink targets intact. To inspect the
+core's rank count and
 hardware contract on the source host, run `flare inspect PRIMARY --plain`.
 
 ### Checkpoint and core storage
@@ -257,13 +262,15 @@ hardware contract on the source host, run `flare inspect PRIMARY --plain`.
 | Serving core | Complete core on serving rank zero; an external source may also retain a complete copy | Required rank payloads and shared data |
 | Serving executable | Installed agent binary by default | Installed agent binary by default |
 
-Exports put metadata in the primary and all payloads in subsequent files bounded
-by the `64G` shard limit. Identical payloads share storage through hardlinks.
-Snapshot exports and legacy sparse cores have different allocation patterns;
-see [core caching](orbit.md#core-caching).
+`ignition export` publishes a directory core in the model cache: the primary
+`model.safetensors` holds the signed metadata, and payloads are companion files
+hardlinked to content-addressed objects, so identical payloads share storage.
+No size threshold splits payloads. `ignition convert --form packed` writes one
+standalone file. Directory, packed, and sparse rank copies have different
+allocation patterns; see [core caching](orbit.md#core-caching).
 
-Budget the checkpoint, previously retained blobs, missing payloads from a new
-export, and temporary staging. Deduplication reduces repeated writes but does
+Budget disk space for the checkpoint, cached payload objects, the payloads an
+export adds, and temporary staging. Deduplication reduces repeated writes but does
 not eliminate preparation memory or all disk reads. `--no-weights` requires
 matching cached payloads. Output and core cache must be on the same filesystem
 for hardlinks; if `/data` is a separate mount, configure `[paths] core_cache`
@@ -366,7 +373,7 @@ flare orbit run maxwell:/data/flare-runtime/glm53-spark-tp2.safetensors \
 ```
 
 `--dry-run` prints placement without starting ranks or saving a persistent group.
-It still reads the core metadata, verifies its signatures, and queries nodes.
+It reads the core metadata, verifies its signatures, and queries nodes.
 The core fixes the rank count; the candidate list needs enough eligible nodes.
 `--nodes maxwell,hertz` supplies an ordered list directly.
 
@@ -453,8 +460,8 @@ flare orbit stop glm53 --cluster sparks
 flare orbit run --name glm53 --detach
 ```
 
-Stop any existing `glm53` run before creating the saved group. Persistent
-means the controller retains the launch definition; it does not automatically
+Stop any running `glm53` group before creating the saved group. Persistent
+means the controller keeps the launch definition; it does not automatically
 restart ranks after failure or reboot. `flare orbit rm glm53` removes a stopped
 saved group and its retained history. Removing an exact launch ID keeps the
 saved definition. Neither operation deletes model data. See
@@ -466,9 +473,9 @@ Stop groups before replacing their agents. Update Flare on each host, then run
 `/usr/bin/flare agent install` for a Debian installation, or the equivalent
 command from the selected source build. This updates the executable used for
 both the agent and default serving, and restarts the service. Preserve a custom
-listener by passing `--listen IP:PORT` again. Existing node keys, authorized
-controllers, and caches remain; re-pairing is unnecessary unless the node was
-reset.
+listener by passing `--listen IP:PORT` again. The installer preserves node
+keys, authorized controllers, and caches; re-pairing is unnecessary unless the
+node was reset.
 
 APT upgrades alone do not replace the agent's private executable copy or restart
 its service. The systemd service may restart a failed agent, but agents do not
@@ -501,6 +508,8 @@ not retry it automatically.
 
 `--roce-ring` connects neighbors in selected rank order and uses native CPU relays
 for other destinations. Transport supports 2 through 16 ranks, subject to each
-recipe's supported sizes. Four-Spark transport checks pass; physical ring cabling
-and full-model ring serving remain unqualified. `--roce-chain` uses the same relays
-over a chain with open ends. See [RoCE ring transport](roce-ring.md).
+recipe's supported sizes; the multi-host preparation rendezvous admits two,
+three, or four ranks. `--roce-chain` uses the same relays over a chain with
+open ends. Qualified: GLM-5.3 Flash TP4 on four DGX Sparks cabled as a physical
+ring. Not qualified: other recipes, other rank counts, `--roce-chain`, and
+x86_64 hosts. See [RoCE ring transport](roce-ring.md#validation-and-limits).

@@ -16,6 +16,7 @@ ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 WORKDIR /src
 COPY flare/ flare/
+COPY flare-cli/ flare-cli/
 COPY helios/ helios/
 COPY eos/ eos/
 COPY selene/ selene/

@@ -9,9 +9,13 @@ from flashinfer import sampling
 from flashinfer.utils import device_support_pdl
 
 
+def probability_filter_workspace_size(rows, vocabulary):
+    return sampling._top_p_renorm_workspace_size(rows, vocabulary, True)
+
+
 def probability_filter_workspace(rows, vocabulary, device):
     """Reserve FlashInfer's deterministic top-p workspace before graph capture."""
-    return torch.empty(sampling._top_p_renorm_workspace_size(rows, vocabulary, True),
+    return torch.empty(probability_filter_workspace_size(rows, vocabulary),
                        dtype=torch.uint8, device=device)
 
 

@@ -48,6 +48,46 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class ObservedExperts:
+    def __init__(self, operation, output):
+        self.operation, self.output = operation, output
+
+    def __getattr__(self, name):
+        return getattr(self.operation, name)
+
+    def __call__(self, *args, **kwargs):
+        output = self.operation(*args, **kwargs)
+        self.output.copy_(output)
+        return output
+
+
+def observe_moe(moe, readback):
+    projection, routing = moe.router_projection, moe.routing
+    finish = moe.shared.finish_runtime
+
+    def project(source):
+        logits = projection(source)
+        readback.router_logits.copy_(logits)
+        return logits
+
+    def route(logits):
+        selected = routing(logits)
+        readback.router.ids.copy_(selected.ids)
+        readback.router.weights.copy_(selected.weights)
+        return selected
+
+    def finish_shared(projected, gate, routed=None):
+        output = finish(projected, gate, routed)
+        readback.shared.projected.copy_(projected)
+        readback.shared.gate_logits.copy_(gate)
+        readback.shared.output.copy_(finish(projected, gate))
+        return output
+
+    moe.router_projection, moe.routing = project, route
+    moe.experts = ObservedExperts(moe.experts, readback.routed_output)
+    moe.shared.finish_runtime = finish_shared
+
+
 @pytest.fixture(scope="module")
 def manifest():
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -73,18 +113,25 @@ def _assert_values(actual, expected):
     return metrics
 
 
+def expert_state(experts):
+    state = require_prepared(experts.plan, experts.plan.contract.component_id)
+    if hasattr(state, "for_tokens"):
+        state = state.for_tokens(experts.output_layout[0][0], **experts.precision)
+    return state
+
+
 def _quant_scale_math(experts):
-    binding = experts.binding
-    if binding.implementation == "micro":
+    state = expert_state(experts)
+    if state.scratch.launch_plan.implementation == "micro":
         return "micro"
-    assert binding.implementation == "dynamic"
-    return "dynamic_fast" if binding.fast_math else "dynamic_precise"
+    assert state.scratch.launch_plan.implementation == "dynamic"
+    return "dynamic_fast" if state.scratch.caps.w4a16_fast_math else "dynamic_precise"
 
 
 @torch.no_grad()
 @pytest.mark.parametrize("combine_routed", [False, True])
-@pytest.mark.parametrize("pooled", [False, True])
-def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed, pooled):
+@pytest.mark.parametrize("shared_storage", [False, True])
+def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed, shared_storage):
     from ignition.preparation.compilation import compile_forward
 
     gates = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
@@ -92,21 +139,19 @@ def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed, pooled):
     projected = torch.randn(gates.shape[0], 16, device="cuda", dtype=torch.bfloat16,
                             generator=torch.Generator(device="cuda").manual_seed(581))
     output = torch.empty_like(projected)
-    shared = SimpleNamespace(gate_logits=gates, projected=projected, output=output)
     routed = torch.randn_like(projected) if combine_routed else None
     combined = torch.empty_like(projected)
-    if pooled:
-        from ignition.preparation.scratch import GraphBufferPool
-
-        buffers = GraphBufferPool("cuda:0", chunk_bytes=8 << 20).cursor()
-        def store(value):
-            return buffers.zeros(value.shape, value.dtype).copy_(value)
-        shared.projected, shared.gate_logits, shared.output = map(store, (projected, gates, output))
-        combined = store(combined)
-        routed = None if routed is None else store(routed)
+    if shared_storage:
+        tensors = [projected, gates, output, combined] + ([] if routed is None else [routed])
+        backing = torch.cat([value.reshape(-1) for value in tensors])
+        views = [part.view_as(value) for part, value in
+                 zip(backing.split([value.numel() for value in tensors]), tensors, strict=True)]
+        projected, gates, output, combined = views[:4]
+        routed = None if routed is None else views[4]
 
     def finish():
-        return PreparedSharedExpert.finish(shared, routed, out=combined)
+        combined.copy_(PreparedSharedExpert.finish_runtime(projected, gates, routed))
+        return combined
 
     expected = projected * torch.sigmoid(gates)
     if routed is not None:
@@ -139,7 +184,10 @@ def test_actual_router_and_shared_expert_graph(manifest, tokens, world, compiled
         shared = PreparedSharedExpert(source, weights, session=session, name=f"shared:{tokens}")
         router = UnquantizedProjection(source, router_weight, logits, session=session, name=f"router:{tokens}")
         routing = PreparedRouter(logits, route, session=session, name=f"route:{tokens}")
-        session.freeze()
+        shared.functional(session=session)
+        router.functional(session=session)
+        routing.functional(session=session)
+        output = torch.empty_like(source)
 
         def project(values, name, projection):
             decoded = decode_mxfp8(*reference_weights[name])
@@ -152,9 +200,13 @@ def test_actual_router_and_shared_expert_graph(manifest, tokens, world, compiled
             return (inputs @ decoded.T).to(torch.bfloat16)
 
         def run():
-            shared(source)
-            router(source)
-            routing(logits)
+            projected, gate = shared.project_runtime(source)
+            output.copy_(shared.finish_runtime(projected, gate))
+            values = router(source)
+            selected = routing(values)
+            logits.copy_(values)
+            route.ids.copy_(selected.ids)
+            route.weights.copy_(selected.weights)
 
         run()
         if compiled:
@@ -166,11 +218,12 @@ def test_actual_router_and_shared_expert_graph(manifest, tokens, world, compiled
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
+        session.freeze()
         generator = torch.Generator().manual_seed(804)
         for iteration in range(2):
             cpu_source = (torch.randn((tokens, 2560), generator=generator) * .2).to(torch.bfloat16)
             source.copy_(cpu_source)
-            shared.output.fill_(float("nan"))
+            output.fill_(float("nan"))
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()
@@ -181,7 +234,7 @@ def test_actual_router_and_shared_expert_graph(manifest, tokens, world, compiled
             projected = project(intermediate, "down_proj", shared.down_projection)
             shared_gate = torch.sigmoid(F.linear(cpu_source, reference_gate))
             expected = projected * shared_gate
-            metrics = _assert_values(shared.output, expected)
+            metrics = _assert_values(output, expected)
             expected_ids = logits.shape[-1] - 1 - torch.argsort(
                 logits.flip(-1), dim=-1, descending=True, stable=True)[:, :10]
             expected_weights = torch.softmax(logits.float().gather(1, expected_ids), dim=-1)
@@ -194,7 +247,10 @@ def test_actual_router_and_shared_expert_graph(manifest, tokens, world, compiled
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 16])
-def test_actual_two_expert_component_reduction_graph(manifest, tokens):
+@pytest.mark.parametrize("compiled", [False, True])
+def test_actual_two_expert_component_reduction_graph(manifest, tokens, compiled):
+    from ignition.preparation.compilation import compile_forward
+
     ids = (0, 511)
     prefix = f"{TEXT_PREFIX}.layers.0.mlp.experts"
     scratch = allocate_expert_scale_scratch("cuda:0", 2)
@@ -207,15 +263,31 @@ def test_actual_two_expert_component_reduction_graph(manifest, tokens):
     logits = torch.zeros((tokens, 2), dtype=torch.bfloat16, device="cuda")
     route = RouterScratch.allocate(tokens, source.device, experts=2, top_k=2)
     output = torch.empty_like(source)
+    arena = ScratchArena(source.device)
     with torch.inference_mode(), PreparationSession(device=source.device, autotune=False, compile_workers=0) as session:
         routing = PreparedRouter(logits, route, session=session, name=f"two_experts:{tokens}.route")
         prepared = PreparedRoutedExperts(source, experts, route.ids, route.weights, output,
-                                        session=session, name=f"two_experts:{tokens}")
+                                        session=session, name=f"two_experts:{tokens}", workspace=arena)
+        quant_scale_math = _quant_scale_math(prepared)
+        prepared.functional(session=session)
+        routing.functional(session=session)
+        arena.finalize()
+        arena.freeze()
+        arena.release_preparation()
+        assert prepared.binding is prepared.scratch is None
         session.freeze()
+
+        def forward():
+            selected = routing(logits)
+            output.copy_(prepared(source, selected.ids, selected.weights))
+            route.ids.copy_(selected.ids)
+            route.weights.copy_(selected.weights)
+
+        run = compile_forward(forward) if compiled else forward
+        run()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            routing(logits)
-            prepared()
+            run()
         generator = torch.Generator().manual_seed(63)
         for iteration in range(2):
             cpu_source = (torch.randn((tokens, 2560), generator=generator) * .1).to(torch.bfloat16)
@@ -233,7 +305,7 @@ def test_actual_two_expert_component_reduction_graph(manifest, tokens):
             canonical_sum = torch.zeros_like(cpu_source)
             for expert in range(2):
                 down = nvfp4_expert_reference(cpu_source, *projections[expert],
-                    quant_scale_math=_quant_scale_math(prepared)).down
+                    quant_scale_math=quant_scale_math).down
                 route_index = (cpu_ids == expert).to(torch.int64).argmax(-1, keepdim=True)
                 probability = cpu_weights.gather(1, route_index)
                 native_sum += down * probability
@@ -300,64 +372,67 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
         assert workspace.nbytes == workspace_bytes
         assert repeated.output.data_ptr() == prepared.output.data_ptr() == moe_scratch.output.data_ptr()
         assert repeated.shared.gate_up.data_ptr() == prepared.shared.gate_up.data_ptr()
+        prepared.functional(session=session)
+        repeated.functional(session=session)
         if shard.world_size == 1:
             workspace.finalize()
             workspace.freeze()
         else:
             session.tune()
             if not scale_scratch:
-                assert prepared.experts.binding.implementation == "dynamic"
-                assert repeated.experts.binding.implementation == "dynamic"
-        assert prepared.experts.scratch.data_ptr() == repeated.experts.scratch.data_ptr() == workspace.tensor.data_ptr()
-        for operator in (prepared, repeated):
-            for projection in (operator.shared.up_projection, operator.shared.down_projection):
-                assert projection.workspace.data_ptr() == workspace.tensor.data_ptr()
+                assert expert_state(prepared.experts).scratch.launch_plan.implementation == "dynamic"
+                assert expert_state(repeated.experts).scratch.launch_plan.implementation == "dynamic"
+        declaration_workspace = workspace.tensor
+        workspace.release_preparation()
+        declaration_workspace.fill_(0x7F)
+        if prepared.experts.scale_plan is not None:
+            assert prepared.experts.scale_plan._prepared.owners == (workspace,)
+        readback = QwenMoeScratch.allocate(tokens, source.device, intermediate=640 // shard.world_size)
+        repeated_readback = QwenMoeScratch.allocate(tokens, source.device, intermediate=640 // shard.world_size)
+        observe_moe(prepared, readback)
+        observe_moe(repeated, repeated_readback)
         first_output = torch.empty_like(source)
         first_shared = torch.empty_like(source)
-        if shard.world_size > 1:
-            prepared(source)
-            repeated(source)
-            torch.cuda.synchronize()
-        session.freeze()
-        prepared(source)
+        readback.output.copy_(prepared(source))
+        repeated_readback.output.copy_(repeated(source))
+        torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            workspace.tensor.fill_(0xA5)
-            prepared(source)
-            first_output.copy_(prepared.output)
-            first_shared.copy_(prepared.shared.finish())
-            workspace.tensor.fill_(0x5A)
-            repeated(source)
-            repeated.shared.finish()
+            readback.output.copy_(prepared(source))
+            first_output.copy_(readback.output)
+            first_shared.copy_(readback.shared.output)
+            repeated_readback.output.copy_(repeated(source))
+        session.freeze()
         bundle = PreparedGraphBundle(device=0, graphs={"qwen_moe": graph},
-            buffers={"source": source, "output": prepared.output},
-            resources=(weights, prepared, repeated, session, scale_scratch, moe_scratch, workspace, first_output))
+            buffers={"source": source, "output": readback.output},
+            resources=(weights, prepared, repeated, session, scale_scratch, readback, repeated_readback, workspace, first_output))
         worker = bundle.start_worker()
         resources.callback(worker.close)
         generator = torch.Generator().manual_seed(1681)
         for iteration in range(2):
             cpu_source = (torch.randn((tokens, 2560), generator=generator) * .1).to(torch.bfloat16)
             source.copy_(cpu_source)
+            declaration_workspace.fill_(0x7F)
             for buffer in scale_scratch:
                 buffer.view(torch.uint8).fill_(0x7F)
-            prepared.output.fill_(float("nan"))
+            readback.output.fill_(float("nan"))
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             ticket = worker.submit(0)
             completion = worker.poll(timeout_ms=30000)
             assert completion is not None and completion.ticket == ticket and completion.error is None
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-            torch.testing.assert_close(first_shared, repeated.shared.output, rtol=0, atol=0)
-            cpu_ids = prepared.router.ids.cpu()
-            cpu_probabilities = prepared.router.weights.cpu()
+            torch.testing.assert_close(first_shared, repeated_readback.shared.output, rtol=0, atol=0)
+            cpu_ids = readback.router.ids.cpu()
+            cpu_probabilities = readback.router.weights.cpu()
             canonical_logits = F.linear(source, weights.router)
-            torch.testing.assert_close(prepared.router_logits, canonical_logits, rtol=.01, atol=.001)
+            torch.testing.assert_close(readback.router_logits, canonical_logits, rtol=.01, atol=.001)
             canonical_ids = 511 - torch.argsort(
-                prepared.router_logits.flip(-1), dim=-1, descending=True, stable=True)[:, :10]
-            assert torch.equal(prepared.router.ids, canonical_ids)
+                readback.router_logits.flip(-1), dim=-1, descending=True, stable=True)[:, :10]
+            assert torch.equal(readback.router.ids, canonical_ids)
             canonical_probabilities = torch.softmax(
-                prepared.router_logits.float().gather(1, canonical_ids), dim=-1)
-            torch.testing.assert_close(prepared.router.weights, canonical_probabilities, rtol=2e-6, atol=1e-7)
+                readback.router_logits.float().gather(1, canonical_ids), dim=-1)
+            torch.testing.assert_close(readback.router.weights, canonical_probabilities, rtol=2e-6, atol=1e-7)
             native_sum = torch.zeros_like(cpu_source, dtype=torch.float32)
             canonical_sum = torch.zeros_like(cpu_source)
             with CheckpointTensors(manifest, byte_budget=512 << 20) as reader:
@@ -392,9 +467,9 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
             shared *= torch.sigmoid(F.linear(cpu_source, shared_gate))
             expected_native = native_sum.to(torch.bfloat16) + shared
             expected_canonical = canonical_sum + shared
-            metrics = _assert_values(prepared.output, expected_native)
+            metrics = _assert_values(readback.output, expected_native)
             _assert_values(first_output, expected_native)
-            canonical_metrics = _metrics(prepared.output, expected_canonical)
+            canonical_metrics = _metrics(readback.output, expected_canonical)
             assert canonical_metrics["relative_l2_error"] < .015, canonical_metrics
             print(json.dumps({"component": "actual_layer0_512_experts_top10", "tokens": tokens,
                               "tp_rank": shard.rank, "tp_size": shard.world_size,
@@ -432,16 +507,18 @@ def test_actual_packed_a16_decode_and_calibrated_a4_prefill_graphs(manifest):
             operator = PreparedQwenMoe(source, weights, session=session, name=f"packed_precision.{name}",
                                        prefill=prefill)
             cases[name] = SimpleNamespace(source=source, operator=operator, prefill=prefill)
-        session.freeze()
         for case in cases.values():
             operator, source = case.operator, case.source
             assert operator.experts.binding.experts is experts._impl
             assert (operator.experts.binding.a4_prefill_launches is not None) is case.prefill
             assert operator.experts.plan.query.a4_prefill is case.prefill
             assert experts._impl.representation_for("w4a16") is representation
+            operator.functional(session=session)
+            case.readback = QwenMoeScratch.allocate(source.shape[0], source.device)
+            observe_moe(operator, case.readback)
 
-            def run(operator=operator, source=source):
-                operator(source)
+            def run(operator=operator, source=source, readback=case.readback):
+                readback.output.copy_(operator(source))
 
             run()
             case.run = compile_forward(run)
@@ -450,19 +527,20 @@ def test_actual_packed_a16_decode_and_calibrated_a4_prefill_graphs(manifest):
             case.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(case.graph):
                 case.run()
+        session.freeze()
         for name in ("decode", "verify", "prefill", "verify", "decode", "prefill"):
             case = cases[name]
             cpu_source = (torch.randn(case.source.shape, generator=generator) * .1).to(torch.bfloat16)
             case.source.copy_(cpu_source)
-            case.operator.routed_output.fill_(float("nan"))
+            case.readback.routed_output.fill_(float("nan"))
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             case.graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-            assert torch.isfinite(case.operator.output).all()
+            assert torch.isfinite(case.readback.output).all()
             rows = min(3, len(cpu_source))
-            ids, probabilities = case.operator.router.ids[:rows].cpu(), case.operator.router.weights[:rows].cpu()
+            ids, probabilities = case.readback.router.ids[:rows].cpu(), case.readback.router.weights[:rows].cpu()
             expected = torch.zeros((rows, 2560), dtype=torch.float64)
             with CheckpointTensors(manifest, byte_budget=128 << 20) as reader:
                 for expert in ids.unique(sorted=True).tolist():
@@ -483,7 +561,7 @@ def test_actual_packed_a16_decode_and_calibrated_a4_prefill_graphs(manifest):
                         intermediate = (F.silu(gate_output) * up_output).to(torch.bfloat16)
                     projected = nvfp4_linear_reference(intermediate, down).to(torch.bfloat16)
                     expected[selected] += projected.double() * probabilities[selected, slots, None].double()
-            actual = case.operator.routed_output[:rows].double().cpu()
+            actual = case.readback.routed_output[:rows].double().cpu()
             relative = ((actual - expected).norm() / expected.norm()).item()
             assert relative < (.004 if case.prefill else .008), (name, relative)
             print(json.dumps({"component": "actual_layer0_packed_precision_512_experts_top10",

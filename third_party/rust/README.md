@@ -1,6 +1,6 @@
 # Native Rust dependency licenses
 
-Generated from the locked `flare/Cargo.toml` dependency graph. Python and
+Generated from the locked `flare-cli/Cargo.toml` dependency graph. Python and
 Heliopause are preparation/build-only and are not part of this binary release.
 
 This inventory includes runtime dependencies and build/proc-macro tools,

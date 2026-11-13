@@ -23,8 +23,9 @@ docker run --rm flare:local run --help
 
 The build context includes the Rust serving sources, Protobuf schema, and embedded
 chat templates.
-Cargo uses `flare/Cargo.lock`. The build installs a C/C++ toolchain, CMake,
-NASM, and `protoc`; these remain in the build stage. BuildKit caches Cargo
+Cargo builds the `flare` binary from `flare-cli/Cargo.toml` with
+`flare-cli/Cargo.lock`. The build installs a C/C++ toolchain, CMake,
+NASM, and `protoc` in the build stage only. BuildKit caches Cargo
 downloads and compilation output across builds.
 
 Linux AMD64 and ARM64 use the same Dockerfile. Build on the target architecture
@@ -51,9 +52,10 @@ docker run --rm --name flare \
 ```
 
 The image runs as UID/GID `10001:10001`; mounted files and parent directories
-must be readable by that user. Alternatively, pass Docker
-`--user "$(id -u):$(id -g)"` and an explicit `--trust-store` path to use the host
-file owner's identity. Mount only runtime files, including public keys;
+must be readable by that user. Flare resolves its home directory from the
+image's user database at startup and exits with `cannot resolve home directory`
+when its UID has no entry there, so Docker `--user` with a UID the image does
+not define cannot run it. Mount only runtime files, including public keys;
 private signing keys are preparation inputs. For first-use approval, add `-it`
 and mount a writable trust directory separately. Pass its `trust.toml` path with
 `--trust-store` so acceptance survives container removal. Unattended approval
@@ -74,24 +76,28 @@ native replay to drain within the configured stop timeout.
 
 ## Downloading cores
 
-Mount a writable directory as the Hub cache to reuse downloads across containers.
-The directory must be owned by UID/GID `10001:10001`, or run with its owner's
-identity through Docker's `--user` flag. For example:
+`flare download` installs a core in the Flare model cache, which `--core-cache`
+selects, and prints the cache entry's path. The download transport cache is a
+`transport` directory beneath the model cache unless `--cache-dir` names another
+parent. Mount a writable directory as the model cache to keep cores across
+containers. The directory must be writable by UID/GID `10001:10001`. For example:
 
 ```sh
-mkdir -p "$HOME/.cache/huggingface/hub"
-docker run --rm --user "$(id -u):$(id -g)" \
-  --mount "type=bind,src=$HOME/.cache/huggingface/hub,dst=/cache" \
+mkdir -p "$HOME/flare-cores"
+sudo chown 10001:10001 "$HOME/flare-cores"
+docker run --rm \
+  --mount "type=bind,src=$HOME/flare-cores,dst=/cores" \
   flare:local download ORG/MODEL \
-  --revision gb202 --cache-dir /cache
+  --revision gb202 --core-cache /cores
 ```
 
 `ORG/MODEL` is a repository placeholder. An explicit revision permits downloading
 without exposing GPUs. For automatic selection, expose the intended host GPUs
 with Docker's `--gpus` and select their container-local indices with Flare's
 `--gpus`. `flare run ORG/NAME` accepts the same download options, then loads the
-cached core. Mount a persistent trust directory and pass `--trust-store` when
-running with a host UID absent from the image's user database. Private repositories
+cached core. Mount a persistent, writable trust directory and pass
+`--trust-store` so publisher acceptance survives container removal. Private
+repositories
 add `--token-file` pointing to a separately mounted token file. See
 [published cores](cli-design.md#downloading-published-cores) for revision,
 filename selection, and offline behavior.

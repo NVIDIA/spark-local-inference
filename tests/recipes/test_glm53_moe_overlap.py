@@ -81,27 +81,32 @@ def test_autotuned_shared_routed_graph(expert_partition, rows, compiled, overlap
     with PreparationSession(device="cuda:0", autotune=True, compile_workers=0) as session:
         moe = PreparedGlmMoe(module, input_copy, weights, scratch, session=session,
                              name="overlap", workspace=arena)
-        arena.freeze()
+        moe.functional(session=session)
         arena.finalize()
+        arena.freeze()
+        arena.release_preparation()
         session.freeze()
         concurrent = moe.concurrent_shared
         assert (concurrent is not None) is overlap
         if overlap:
             concurrent.defer_launch = defer_launch
-            routed_bytes = moe.experts.plan.memory_requirements().scratch_nbytes
-            if concurrent.workspace.numel():
-                assert moe.experts.scratch.data_ptr() + routed_bytes <= concurrent.workspace.data_ptr()
-            else:
-                assert all(p.plan.memory_requirements().scratch_nbytes == 0 for p in concurrent.projections)
+            finish = concurrent.finish
+            def observe_finish(pending, routed):
+                result = finish(pending, routed)
+                shared_copy.copy_(result)
+                return result
+            concurrent.finish = observe_finish
         else:
-            assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 0
+            shared = moe.shared
+            def observe_shared(source):
+                result = shared(source)
+                shared_copy.copy_(result)
+                return result
+            moe.shared = observe_shared
 
         def forward():
             input_copy.copy_(source)
-            moe(input_copy)
-            output_copy.copy_(moe.output)
-            shared_copy.copy_(moe.shared.output)
-            arena.tensor.fill_(255)
+            output_copy.copy_(moe(input_copy))
             input_copy.zero_()
 
         call = compile_forward(forward) if compiled else forward
@@ -117,9 +122,8 @@ def test_autotuned_shared_routed_graph(expert_partition, rows, compiled, overlap
             source.normal_(std=.1)
             input_copy.copy_(source)
             expected_shared = moe.shared(input_copy).clone()
-            moe.router_projection(input_copy)
-            moe.routing(scratch.router_logits)
-            expected = moe.experts() + expected_shared
+            routes = moe.routing(moe.router_projection(input_copy))
+            expected = moe.experts(input_copy, routes.ids, routes.weights) + expected_shared
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()
