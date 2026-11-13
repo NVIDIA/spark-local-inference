@@ -813,6 +813,34 @@ Use two or four available GPUs for preparation and serving:
   --gpus 0,1,2,3
 ```
 
+The 160 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two or four hosts, one rank per host, reducing through
+RoCEnante over their ConnectX-7 ports. One runtime carries the hidden and
+prefill reductions, the vocabulary gathers, the DSpark Markov gather, and the
+sampling broadcasts. Multi-host export requires the checkpoint in rank zero's
+hub cache at the declared revision; it does not download. On rank zero, whose
+preparation address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export deepseek-v4-flash --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek4-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+Four Sparks use `--ranks 4` and join peer ranks 1 through 3. Serve through
+`flare orbit run spark1:/data/flare-runtime/deepseek4-spark-tp2.safetensors --cluster sparks`,
+following the [multi-host guide](multi-host.md) for preparation authentication
+and rank placement. On GB10, a TP2 core with sixteen concurrent requests
+and 8192-token chunks allocates 85.3 GiB per rank and, at the default 4 GiB
+reserve, 14.4 GiB of KV cache. Image requests and four-Spark TP4 have not
+been run on GB10.
+
 V4 uses 256-token logical pages containing 64 C4 latent records with an FP8
 retrieval index, or two C128 latent records with dense history attention. Each latent page
 stores FP8/BF16 payloads followed by its own scale footer. Continuation rows
