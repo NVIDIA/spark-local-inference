@@ -662,6 +662,40 @@ the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and
 requires at least 8,192 cached tokens per active request.
 
+The number of physical allocation handles and device mappings is also a driver
+resource constraint. Linux UVM duplicates external mappings into a shared RM
+client whose automatic handle range is 524,288 entries (`RS_UNIQUE_HANDLE_RANGE`
+in NVIDIA drivers
+[580.105.08](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.105.08/src/nvidia/inc/libraries/resserv/rs_client.h)
+and [615.71.10](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.10/src/nvidia/generated/g_rs_client_nvoc.h)).
+Exhaustion returns `NV_ERR_INSUFFICIENT_RESOURCES`, which CUDA can expose as
+`CUDA_ERROR_OUT_OF_MEMORY` despite free framebuffer memory. Combining access
+calls alone does not remove the underlying allocation and mapping objects.
+
+The native cache layout reduces those objects without reducing KV pages or
+snapshot rows. It first permutes the backing-plane assignment of chunks with
+identical bytes per page, byte offset within the plane, and mapped length. Their
+row positions and logical page coverage stay the same. It then reorders whole chunks inside an
+uninterrupted interval of one snapshot row, merging adjacent spans of the same
+KV plane into one backing allocation and one alias mapping. Only complete chunks
+wholly contained in one row are reordered or merged; spans crossing row boundaries
+and partial mappings keep their row positions and lengths.
+
+These transformations preserve every plane's byte coverage, physical byte
+count, snapshot address and stride, and the exact set of KV pages conflicting
+with each snapshot. The scheduler consumes the same exclusion ranges. Reader
+permissions remain allocation-specific. The layout uses ordinary CUDA VMM
+allocations at the recorded core addresses and requires no core re-export,
+additional framebuffer reserve, allocation retry, or reduced cache capacity.
+
+Native startup and C1/C4 generation with 32K prefill are qualified for Kimi K3.1
+Pro TP16 cores using DCP8 and DCP16 on sixteen RTX PRO 6000 Blackwell GPUs with
+NVIDIA driver 615.71.10, with default memory sizing and explicit reserves of
+zero and 1 GiB. KV and snapshot capacities match the physical-memory plan in
+all six configurations. CPU layout tests compare every row's exact conflict
+set and complete byte coverage; GPU tests preserve snapshot bytes while released
+KV pages are overwritten. These checks do not constitute model-quality evaluation.
+
 Immutable snapshot capacity is bounded by borrowable KV backing and the prepared
 virtual extent. At load, CUDA virtual mappings expose the same allocation chunks
 through the page planes and the snapshot part of the continuation range. Small
@@ -787,9 +821,34 @@ Collective signals and generation-tagged payloads are reset after all ranks
 drain. Imported mappings are recorded as peer dependencies and stored only in
 the owning rank's bundle.
 
-Helios checks that rank allocations do not overlap, creates every device
-context, loads rank storage, and grants the declared peer access through
-`cuMemSetAccess` before loading modules and instantiating execution state.
+Helios checks that rank allocations do not overlap and creates every device
+context before mapping storage. Each mapping receives one `cuMemSetAccess`
+grant containing its owner and the ranks whose bundles import that allocation
+as peer memory. The signed reader declaration must include these ranks but may
+contain unused ranks; cores with all-rank reader declarations therefore retain
+compatibility without granting access outside the actual import group. Static
+mappings receive access during allocation. Runtime-sized cache mappings receive
+access after backing is mapped, before zeroing or graph use. Continuation aliases
+have their own access permissions, independent of the KV plane they borrow.
+
+For shared cache allocations, startup logs each reader GPU's `cuMemGetInfo_v2`
+free bytes before and after its mapping grants, the signed used-byte delta,
+owner, address, backed size, backing mapping count, and reader rank/device pairs.
+Physical backing is already allocated at the first sample; no cache backing is
+allocated between these samples. These observations include driver access state
+and may include other processes' memory activity. They do not measure transient
+peaks inside a driver call or establish a safe planning reserve. Remote KV bytes are
+not charged as duplicated physical storage. A failed grant reports the exact
+mapping range and readers while retaining the CUDA status.
+
+Cache backing and access grants are attempted once. Allocation and access errors
+abort startup with their original CUDA status; the loader does not reduce cache
+capacity and retry. Capacities are published only after all ranks have mapped
+and granted their cache. The fixed model and communication buffers are allocated
+before cache sizing. Access to the runtime-sized cache itself follows its
+physical mapping, so its mapping resources must fit alongside the chosen backing.
+CUDA free bytes do not describe every driver resource limit.
+
 Address reservations are established before allocation. Allocation, payload
 loading, kernel loading, and execution preparation each run concurrently across
 ranks, joining all rank threads between stages. Loading retains a process-wide

@@ -874,6 +874,23 @@ impl NativeModel {
                 "ranks agreed on a cache capacity this rank cannot back",
             ));
         }
+        unsafe {
+            self.allocate_cache_capacity(
+                cores, progress, &contract, rows, pages, execution, &limiting,
+            )
+        }
+    }
+
+    unsafe fn allocate_cache_capacity(
+        &mut self,
+        cores: &mut [Core],
+        progress: &StartupProgress,
+        contract: &crate::model::PreparedContract,
+        rows: u64,
+        pages: u64,
+        execution: u64,
+        limiting: &str,
+    ) -> Result<()> {
         let snapshots = rows - execution;
         // Scheduler page ids count the model contract's tokens per page, which
         // exceeds the physical page when pages are sharded across ranks.
@@ -887,8 +904,7 @@ impl NativeModel {
             .zip(&geometry)
             .map(|(core, geometry)| {
                 let alignment = |name: &str| {
-                    core
-                        .allocations
+                    core.allocations
                         .iter()
                         .find(|a| a.name == name)
                         .unwrap()
@@ -927,7 +943,7 @@ impl NativeModel {
         for core in cores.iter_mut() {
             gpu_bytes += bytes(core, 0, rows - snapshots)? + bytes(core, 1, pages)?;
             for allocation in &mut core.allocations {
-                if let Some(sizing) = allocation.sizing.take() {
+                if let Some(sizing) = allocation.sizing.as_ref() {
                     let units = if sizing.capacity == 0 { rows } else { pages };
                     allocation.nbytes =
                         (units * sizing.unit_bytes).div_ceil(allocation.alignment as u64) as usize
@@ -968,15 +984,31 @@ impl NativeModel {
             }
         }
         let phase = progress.phase("Allocate cache", Some(gpu_bytes));
+        let contexts: Vec<_> = self.ranks.iter().map(|rank| rank.context).collect();
         for (((rank, core), geometry), layout) in self
             .ranks
             .iter_mut()
-            .zip(cores)
-            .zip(geometry)
-            .zip(layouts)
+            .zip(cores.iter())
+            .zip(&geometry)
+            .zip(&layouts)
         {
             unsafe {
-                rank.allocate_shared_cache(core, &geometry, &layout)?;
+                rank.allocate_shared_cache(
+                    core,
+                    geometry,
+                    layout,
+                    &contexts,
+                    progress.is_enabled(),
+                )?;
+            }
+        }
+        // Publish capacities only after every rank has mapped and granted its cache.
+        for ((rank, core), geometry) in self.ranks.iter_mut().zip(cores.iter_mut()).zip(geometry) {
+            unsafe {
+                rank.driver.check(
+                    "cuCtxSetCurrent",
+                    (rank.driver.context_set)(rank.context),
+                )?;
                 rank.cache = Some(geometry);
                 let binding = core
                     .execution
@@ -998,6 +1030,11 @@ impl NativeModel {
                     (rank.driver.upload)(address, values.as_ptr().cast(), 16),
                 )?;
                 rank.execution = core.execution.clone();
+            }
+        }
+        for core in cores {
+            for allocation in &mut core.allocations {
+                allocation.sizing = None;
             }
         }
         self.server_config["state_rows"] = (rows - 1).into();
