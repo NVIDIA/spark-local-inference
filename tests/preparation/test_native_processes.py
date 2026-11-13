@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Process-level checks for native rank failure containment and parent lifetime."""
 
 import json
@@ -156,4 +159,100 @@ with flare_heliopause.CliSignals():
     finally:
         if process.poll() is None or not all(terminated(pid) for pid in peers):
             os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
+PEER_CLEANUP = r'''
+import atexit, os, sys, time
+from contextlib import nullcontext
+from types import SimpleNamespace
+import torch
+from ignition.preparation import rank_group
+
+# Controlled owners isolate process lifecycle; this test does not execute CUDA.
+mode, failure = sys.argv[1:]
+def cleanup(name):
+    print(name, flush=True)
+    if name == failure:
+        raise RuntimeError(f"cleanup failed: {name}")
+
+class Model:
+    memory_report = {}
+    def manifest(self):
+        return {}
+    def close(self):
+        cleanup("model-close")
+    def __del__(self):
+        print("terminal-destructor", flush=True)
+        time.sleep(60)
+
+class Region:
+    def __init__(self, name):
+        self.name = name
+    def close(self):
+        cleanup(self.name)
+
+class Storage:
+    def __init__(self, **kwargs):
+        self.host_regions = [Region("host-0-close"), Region("host-1-close")]
+    def __enter__(self):
+        return self
+    def __exit__(self, *error):
+        return False
+
+class Control:
+    def send(self, value):
+        assert value == ("tuning_complete" if mode == "tuning" else {})
+    def recv(self):
+        return "close"
+    def close(self):
+        cleanup("control-close")
+
+rank_group.dist = SimpleNamespace(
+    init_process_group=lambda *args, **kwargs: None,
+    group=SimpleNamespace(WORLD=object()),
+    destroy_process_group=lambda: cleanup("distributed-close"),
+)
+torch.cuda.set_device = lambda device: None
+sys.modules["ignition.preparation.module_images"] = SimpleNamespace(ModuleImages=nullcontext)
+sys.modules["ignition.preparation.core_storage"] = SimpleNamespace(CoreStorage=Storage)
+connection = SimpleNamespace(close=lambda: cleanup("connection-close"))
+def prepare(*args, **kwargs):
+    if mode == "tuning":
+        def terminal_destructor():
+            print("terminal-destructor", flush=True)
+            time.sleep(60)
+        atexit.register(terminal_destructor)
+        raise rank_group.TuningComplete()
+    return Model()
+rank_group._peer(os.getppid(), None, SimpleNamespace(devices=(0, 1)), 1,
+    "unused", connection, Control(), prepare, True, True)
+print("peer-returned", flush=True)
+'''
+
+
+@pytest.mark.parametrize("mode,failure", [
+    ("model", "success"), ("model", "model-close"), ("model", "host-0-close"),
+    ("model", "host-1-close"), ("model", "distributed-close"), ("tuning", "success"),
+])
+def test_preparation_peer_exits_only_after_explicit_cleanup(mode, failure):
+    process = subprocess.Popen([sys.executable, "-u", "-c", PEER_CLEANUP, mode, failure], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        output, error = process.communicate(timeout=10)
+        expected = ["control-close", "connection-close", "model-close", "host-0-close",
+                    "host-1-close", "distributed-close"]
+        if mode == "tuning":
+            expected = ["control-close", "connection-close", "distributed-close"]
+        if failure != "success":
+            expected = expected[:expected.index(failure) + 1]
+            assert process.returncode == 1, (output, error)
+            assert f"cleanup failed: {failure}" in error
+        else:
+            assert process.returncode == 0, (output, error)
+            assert error == ""
+        assert output.splitlines() == expected
+    finally:
+        if process.poll() is None:
+            process.kill()
         process.wait(timeout=5)

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate GLM5Next image preprocessing fixtures from the canonical processor."""
 
 import argparse

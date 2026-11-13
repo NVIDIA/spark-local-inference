@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Scalar capacity metadata does not hide disposable tensor backing."""
 import pytest
 import torch
 from ignition.components.paged_batch import Metadata
 from ignition.preparation.disposable import storage_ranges
-from ignition.preparation.scratch import GraphBufferPool
 
 
 def test_scalar_capacities_preserve_every_metadata_tensor_range():
@@ -17,11 +20,8 @@ def test_scalar_capacities_preserve_every_metadata_tensor_range():
         storage_ranges((metadata, object()))
 
 
-def test_pool_cursors_include_unreferenced_padding_and_deduplicate_backing():
-    pool = GraphBufferPool("cpu", chunk_bytes=512)
-    cursor = pool.cursor()
-    tensor = cursor.zeros((3,), torch.float32)
-    sibling = cursor.fork()
-    sibling.zeros((1,), torch.int64)
-    assert storage_ranges((cursor, sibling, tensor)) == storage_ranges(pool)
-    assert sum(size for _, size in storage_ranges(cursor)) == 1024
+def test_tensor_views_include_unused_backing_and_deduplicate_aliases():
+    backing = torch.zeros(128, dtype=torch.float32)
+    first, second = backing[:3], backing[64:65]
+    assert storage_ranges((first, {"second": second, "repeated": first})) == (
+        (backing.data_ptr(), backing.nbytes),)

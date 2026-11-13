@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Physical memory attribution conserves bytes across aliases and virtual capacities."""
 
 from io import StringIO
@@ -114,15 +117,23 @@ def test_overlapping_views_bound_claims_and_preserve_first_owner():
     assert not any(row['category'] == 'Unknown storage' for row in rows)
 
 
-def test_inventory_separates_physical_cache_host_peers_and_package_alignment(monkeypatch):
+@pytest.mark.parametrize('integrated', [False, True])
+def test_inventory_separates_physical_cache_host_peers_and_core_alignment(monkeypatch, integrated):
     import flare_heliopause
     import torch
-    from ignition.preparation import memory_inventory
-    from ignition.preparation.runtime_package import Allocation
+    from ignition.preparation import host_memory, memory_inventory
+    from ignition.preparation.runtime_core import Allocation
 
     monkeypatch.setattr(flare_heliopause, 'memory_inventory', lambda: dict(
         device=0, total_bytes=10000, free_bytes=8000, mappings=[(100, 300)]))
-    monkeypatch.setattr(torch.cuda, 'memory_snapshot', lambda: [])
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(is_integrated=integrated))
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (8000, 10000))
+    monkeypatch.setattr(host_memory, 'os', SimpleNamespace(name='posix'))
+    monkeypatch.setattr(host_memory, 'available_bytes', lambda: 9000)
+    def snapshot(*, include_traces):
+        assert include_traces is False
+        return []
+    monkeypatch.setattr(torch.cuda, 'memory_snapshot', snapshot)
     monkeypatch.setattr(torch.cuda, 'memory_allocated', lambda device: 300)
     monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda device: 300)
     monkeypatch.setattr(memory_inventory, 'owner_claims', lambda prepared: [
@@ -133,17 +144,21 @@ def test_inventory_separates_physical_cache_host_peers_and_package_alignment(mon
             address=1000, nbytes=200, extent=1 << 40, name='KV')],
         peer_storage=SimpleNamespace(owned={300: 100}, imported_mappings={9000: [(9000, 500)]}),
         host_regions=[SimpleNamespace(extent=4000, closed=False)])
-    package = SimpleNamespace(allocations=[Allocation('fixed', 100, 300),
+    core = SimpleNamespace(allocations=[Allocation('fixed', 100, 300),
         Allocation('external', 500, 100), Allocation('cache', 1000, 1 << 40, sizing={'capacity': 'KV'}),
         Allocation('peer', 9000, 500, memory='peer'), Allocation('host', 10000, 4000, memory='mapped_host')],
         module_globals=[(700, 10, 'kernel.constant')],
         export_counts={'kernels': 1, 'modules': 1, 'cubin_bytes': 3})
-    report = collect_inventory(prepared, storage, package, external=[(520, 20)])
-    assert report['fixed_package_bytes'] == 400
+    report = collect_inventory(prepared, storage, core, external=[(520, 20)])
+    assert report['fixed_core_bytes'] == 400
     assert report['cache_backing_bytes'] == 200
-    assert report['package_padding_bytes'] == 80
+    assert report['core_padding_bytes'] == 80
     assert report['tracked_physical_bytes'] == 530
-    assert report['device_unattributed_bytes'] == 1470
+    assert report['total_bytes'] == 10000
+    assert report['free_bytes'] == (9000 if integrated else 8000)
+    assert report['device_used_bytes'] == (1000 if integrated else 2000)
+    assert report['device_unattributed_bytes'] == (470 if integrated else 1470)
+    assert report['shared_system_memory'] == integrated
     assert sum(row['nbytes'] for row in report['entries']) == 330
     assert sum(row['nbytes'] for row in report['preparation_entries']) == 200
     assert report['mapped_host_bytes'] == 4000
@@ -155,6 +170,15 @@ def test_inventory_separates_physical_cache_host_peers_and_package_alignment(mon
     assert 'Weights / numeric constants' in text and 'Preparation cache backing' in text
     assert 'other processes' in text
     assert 'not resident VRAM' in text
+    if integrated:
+        assert 'shared system memory: 1,000 B used, 8.79 KiB available' in text
+        assert 'Shared system usage minus tracked GPU storage: 470 B' in text
+        assert 'includes host allocations and other processes' in text
+        assert 'not process VRAM usage' in text
+    else:
+        assert 'Rank 0 / CUDA 0: 1.95 KiB used, 7.81 KiB free' in text
+        assert 'Device usage minus tracked physical storage: 1.44 KiB' in text
+        assert 'shared system memory' not in text
 
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned CUDA device')
@@ -169,9 +193,9 @@ from types import SimpleNamespace
 import torch
 import flare_heliopause
 from ignition.preparation.memory_inventory import collect_inventory, owner_claims
-from ignition.preparation.package_storage import PackageStorage
-from ignition.preparation.runtime_package import Allocation
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.core_storage import CoreStorage
+from ignition.preparation.runtime_core import Allocation
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 # A dataclass retained through a closure exercises owners outside Ignition modules.
@@ -180,12 +204,12 @@ class Forward:
     hidden: torch.Tensor
 
 torch.cuda.set_device(0)
-with PackageStorage() as storage:
+with CoreStorage() as storage:
     weight = torch.ones(1024, device='cuda')
     record_numeric_tensor(weight)
-    pool = GraphBufferPool('cuda:0', chunk_bytes=4096)
-    prefill = Forward(pool.cursor().zeros(1024, torch.float32))
-    decode = Forward(pool.cursor().zeros(8, torch.float32))
+    backing = torch.zeros(1024, device='cuda:0')
+    prefill = Forward(backing)
+    decode = Forward(backing[:8])
     def forward(owner=prefill):
         return owner.hidden
     arena = ScratchArena('cuda:0')
@@ -193,17 +217,17 @@ with PackageStorage() as storage:
     cache = storage.device_allocate('KV', (1 << 20, 256), torch.uint8,
                                     group='kv_pages', maximum=1 << 20, units=4)
     region, = storage.dynamic_regions
-    prepared = SimpleNamespace(resources=(weight, pool, forward, decode, arena),
+    prepared = SimpleNamespace(resources=(weight, forward, decode, arena),
         buffers={'cache': cache}, device=0, export_zero_ranges=(), graphs={'prefill': None, 'decode': None})
     allocations = [Allocation(str(i), a.address, a.nbytes) for i, a in enumerate(storage.mappings.values())]
     allocations.append(Allocation('KV', region.address, region.extent, sizing={'capacity': 'kv_pages'}))
-    package = SimpleNamespace(allocations=allocations, module_globals=[],
+    core = SimpleNamespace(allocations=allocations, module_globals=[],
         export_counts={'kernels': 0, 'modules': 0, 'cubin_bytes': 0})
-    report = collect_inventory(prepared, storage, package)
+    report = collect_inventory(prepared, storage, core)
     def size(category, field='entries'):
         return sum(row['nbytes'] for row in report[field] if row['category'] == category)
     assert size('Weights / numeric constants') == weight.nbytes
-    assert size('Graph scratch pools') == pool.nbytes == 4096
+    assert size('Other owned tensors') == backing.nbytes == 4096
     assert size('Operator scratch') == arena.nbytes == 512
     assert size('Preparation cache backing', 'preparation_entries') == region.nbytes < region.extent
     assert report['tracked_physical_bytes'] == sum(size for _, size in flare_heliopause.memory_inventory()['mappings']) + region.nbytes

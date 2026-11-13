@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Expected serial continuation value, composed without joint outcome branches.
 
 /// Expected isolated work and waiting, with times measured in milliseconds.

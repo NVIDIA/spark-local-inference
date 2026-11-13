@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Nonpreemptive execution, hidden EOS, and sampled acceptance outcomes."""
 
 from dataclasses import dataclass, field

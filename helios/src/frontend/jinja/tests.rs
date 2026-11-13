@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
 use serde_json::json;
 
@@ -232,23 +238,23 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
     let sources = [
         (
             "qwen",
-            include_str!("../../../../ignition/recipes/qwen38/assets/chat_template.jinja"),
+            &crate::template_fixtures::template("qwen38", "chat_template")[..],
         ),
         (
             "step",
-            include_str!("../../../../ignition/recipes/step5/assets/chat_template.jinja"),
+            &crate::template_fixtures::template("step5", "chat_template")[..],
         ),
         (
             "glm",
-            include_str!("../../../../ignition/recipes/glm53/assets/chat_template.jinja"),
+            &crate::template_fixtures::template("glm53", "chat_template")[..],
         ),
         (
             "mimo",
-            include_str!("../../../../ignition/recipes/mimo_v2/assets/chat_template.jinja"),
+            &crate::template_fixtures::template("mimo_v2", "chat_template")[..],
         ),
         (
             "nemotron",
-            include_str!("../../../../ignition/recipes/nemotron_h/assets/chat_template.jinja"),
+            &crate::template_fixtures::template("nemotron_h", "chat_template")[..],
         ),
         (
             "kimi",
@@ -256,13 +262,11 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
         ),
         (
             "gemma",
-            include_str!("../../../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
+            &crate::template_fixtures::template("gemma4", "chat_template.google")[..],
         ),
         (
             "gemma-e2b-e4b",
-            include_str!(
-                "../../../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"
-            ),
+            &crate::template_fixtures::template("gemma4", "chat_template.google-e2b-e4b")[..],
         ),
     ];
     let user = json!({"role":"user","content":"  café 世界 👋 a\u{301}\r\n<|im_end|>  "});
@@ -406,9 +410,7 @@ fn qwen_content_macro_keeps_hints_only_when_its_result_is_emitted() {
         {"type":"text","text":"  Earlier history.\n"},
         {"type":"text","text":"Newest action."}]}],
         "enable_thinking":false,"add_generation_prompt":true});
-    let template = CompiledTemplate::compile(include_str!(
-        "../../../../ignition/recipes/qwen38/assets/chat_template.jinja"
-    ))
+    let template = CompiledTemplate::compile(&crate::template_fixtures::template("qwen38", "chat_template")[..])
     .unwrap();
     let plain = template.render(context.as_object().unwrap(), &[]).unwrap();
     let marked = template
@@ -421,4 +423,56 @@ fn qwen_content_macro_keeps_hints_only_when_its_result_is_emitted() {
         .filter(|mark| matches!(mark, Mark::Hint(_)))
         .collect();
     assert_eq!(hints, [Mark::Hint(plain.text.find("Newest action.").unwrap())]);
+}
+
+#[test]
+fn huggingface_generation_annotations_preserve_text_and_message_marks() {
+    let rendered = CompiledTemplate::compile("A{% generation %}{{ text }}{% endgeneration %}{% mark %}B")
+        .unwrap().render(json!({"text":"café 世界"}).as_object().unwrap(), &[]).unwrap();
+    assert_eq!(rendered.text, "Acafé 世界B");
+    assert_eq!(rendered.marks, vec![super::Mark::Byte("Acafé 世界".len())]);
+}
+
+#[test]
+fn boolean_identity_tests_accept_bare_and_parenthesized_arguments() {
+    compare("{{ a is sameas false }} {{ b is not sameas false }} {{ a is sameas(false) }}",
+        json!({"a":false,"b":true}));
+}
+
+#[test]
+fn strftime_now_is_defined_and_uses_local_calendar_time() {
+    let source = "{% if strftime_now is defined %}{{ strftime_now('%Y-%m-%d') }}{% endif %}";
+    let rendered = CompiledTemplate::compile(source).unwrap().render(&serde_json::Map::new(), &[]).unwrap();
+    assert_eq!(rendered.text.len(), 10);
+    assert_eq!(&rendered.text[4..5], "-");
+    assert_eq!(&rendered.text[7..8], "-");
+}
+
+#[test]
+fn literal_replacement_maps_hints_and_drops_cuts_inside_replaced_spans() {
+    for (first, second, expected) in [("a", "bc", None), ("abc", "tail", Some(1)), ("café", "abc", Some(5))] {
+        let context=json!({"messages":[{"content":[{"type":"text","text":first},{"type":"text","text":second}]}]});
+        let template=CompiledTemplate::compile("{% set body %}{{ messages[0].content[0].text }}{{ messages[0].content[1].text }}{% endset %}{{ body|replace('abc','X') }}").unwrap();
+        let rendered=template.render(context.as_object().unwrap(), &[(0,1)]).unwrap();
+        assert_eq!(rendered.text,format!("{first}{second}").replace("abc","X"));
+        assert_eq!(rendered.marks,expected.map(super::Mark::Hint).into_iter().collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn json_object_members_preserves_literals_order_and_duplicate_keys() {
+    let source = r#" {"z":1e2,"a":[1,  2],"z":-0,"obj":{ "b" : false },"s":"café\n\u4e16","nil":null} "#;
+    let template = CompiledTemplate::compile("{{ json_object_members(source) | tojson(ensure_ascii=false) }}").unwrap();
+    let context = json!({"source": source});
+    let rendered = template.render(context.as_object().unwrap(), &[]).unwrap();
+    let members: Json = serde_json::from_str(&rendered.text).unwrap();
+    assert_eq!(members, json!([
+        ["z",100.0,"1e2"], ["a",[1,2],"[1,  2]"], ["z",-0.0,"-0"],
+        ["obj",{"b":false},"{ \"b\" : false }"], ["s","café\n世",r#""café\n\u4e16""#], ["nil",null,"null"]
+    ]));
+    for source in ["[]", "null", "1", "{", "{\"x\":1} trailing", "{\"x\":}"] {
+        let context = json!({"source":source});
+        assert!(template.render(context.as_object().unwrap(), &[]).is_err(), "{source}");
+    }
+    assert!(CompiledTemplate::compile("{{ json_object_members([]) }}").unwrap().render(&Map::new(), &[]).is_err());
 }

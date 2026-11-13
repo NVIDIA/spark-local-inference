@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Dynamic score branches preserve exact arithmetic through compiled native replay."""
 
 import os

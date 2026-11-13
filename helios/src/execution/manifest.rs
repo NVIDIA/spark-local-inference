@@ -1,10 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::collections::{HashMap, HashSet};
 
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
-pub const ABI_VERSION: u32 = 4;
-pub const VECTOR_RECORD_FIELDS: usize = 24;
-pub const MAX_OUTPUT_TOKENS: usize = 8;
+pub const ABI_VERSION: u32 = 6;
+pub const COMPLETION_METADATA_FIELDS: usize = 16;
+pub const DEFAULT_COMPLETION_TOKEN_CAPACITY: usize = 8;
+
+pub fn resolve_completion_token_capacity(value: u32) -> usize {
+    if value == 0 { DEFAULT_COMPLETION_TOKEN_CAPACITY } else { value as usize }
+}
 pub const REQUEST_LANES: usize = 64;
 pub const MAX_TOP_LOGPROBS: usize = 20;
 pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
@@ -153,6 +163,22 @@ pub struct InputBinding {
     pub nbytes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-core"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-core"), serde(deny_unknown_fields))]
+pub struct TunedBinding {
+    pub buffer: String,
+    pub tuning_graph: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuningGraphDescriptor {
+    pub name: String,
+    pub handle: usize,
+    pub outputs: Vec<String>,
+    pub status_buffer: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphDescriptor {
     /// Confidence prefixes produced per request in the completion frame.
@@ -172,6 +198,7 @@ pub struct GraphDescriptor {
     /// Zero denotes an indeterminate duration.
     pub estimated_duration_ns: u64,
     pub input_bindings: Vec<InputBinding>,
+    pub tuned_bindings: Vec<TunedBinding>,
 }
 
 impl GraphDescriptor {
@@ -208,21 +235,72 @@ pub struct ExecutionManifest {
     /// Present when this rank's graphs launch collectives over a transport between hosts.
     pub collectives: Option<CollectiveHealth>,
     /// This rank's prefix checkpoint storage, present after cache allocation.
-    pub cache: Option<crate::offload::CacheGeometry>,
+    pub cache: Option<flare_selene::CacheGeometry>,
     /// Host prefix store resources shared by every rank, present when configured.
     pub offload: Option<crate::offload::Binding>,
     pub abi_version: u32,
+    pub completion_token_capacity: usize,
     pub context: usize,
     pub device: i32,
     pub max_active: usize,
     pub input_frame_bytes: usize,
     pub buffers: Vec<BufferDescriptor>,
     pub graphs: Vec<GraphDescriptor>,
+    pub tuning_graphs: Vec<TuningGraphDescriptor>,
 }
 
 impl ExecutionManifest {
+    fn validate_tuning(&self) -> Result<()> {
+        let host_inputs: HashSet<_> = self.graphs.iter().flat_map(|graph|
+            graph.input_bindings.iter().map(|binding| binding.buffer_name.as_str())).collect();
+        let mut names: HashSet<&str> = self.graphs.iter().map(|graph| graph.name.as_str()).collect();
+        let mut producers = HashMap::new();
+        let mut statuses = HashSet::new();
+        for graph in &self.tuning_graphs {
+            if graph.name.is_empty() || !names.insert(&graph.name) || graph.outputs.is_empty() {
+                return Err("tuning graphs require unique names and persistent outputs".into());
+            }
+            let status = self.buffer(&graph.status_buffer)?;
+            if status.dtype != Dtype::Int32 || status.shape != [1] || status.strides != [1]
+                || !statuses.insert(graph.status_buffer.as_str()) {
+                return Err("tuning status requires a unique int32[1] buffer".into());
+            }
+            for output in &graph.outputs {
+                self.buffer(output)?;
+                if producers.insert(output.as_str(), graph.name.as_str()).is_some() {
+                    return Err("tuning outputs require exactly one producer".into());
+                }
+            }
+        }
+        for name in producers.keys().chain(statuses.iter()) {
+            if host_inputs.contains(name) || matches!(*name, "completion_records" | "completion_logprobs" | "prompt_logprobs" | "proposal_confidence" | "completion_speculative_survival" | "readiness_timestamps") {
+                return Err("tuning storage cannot overlap request transport storage".into());
+            }
+        }
+        if statuses.iter().any(|name| producers.contains_key(name)) {
+            return Err("tuning status cannot also be a tuning output".into());
+        }
+        for graph in &self.graphs {
+            let mut bindings = HashSet::new();
+            for binding in &graph.tuned_bindings {
+                if !bindings.insert(&binding.buffer)
+                    || producers.get(binding.buffer.as_str()) != Some(&binding.tuning_graph.as_str()) {
+                    return Err("tuned bindings must name their exact persistent output producer".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn referenced_tuning_graphs(&self) -> Vec<usize> {
+        let referenced: HashSet<_> = self.graphs.iter().flat_map(|graph|
+            graph.tuned_bindings.iter().map(|binding| binding.tuning_graph.as_str())).collect();
+        self.tuning_graphs.iter().enumerate().filter_map(|(index, graph)|
+            referenced.contains(graph.name.as_str()).then_some(index)).collect()
+    }
+
     pub fn completion_fields(&self) -> usize {
-        VECTOR_RECORD_FIELDS
+        COMPLETION_METADATA_FIELDS + self.completion_token_capacity
     }
 
     pub fn request_capacity(&self) -> usize {
@@ -262,7 +340,7 @@ impl ExecutionManifest {
             (None, None) if ids.is_none() && counts.is_none() => Ok(0),
             (Some(output), Some(flags)) => {
                 let fields = output.shape.last().copied().unwrap_or(0);
-                let expected = [2, self.request_capacity(), MAX_OUTPUT_TOKENS, fields];
+                let expected = [2, self.request_capacity(), self.completion_token_capacity, fields];
                 if fields < LOGPROB_PAIR_FIELDS * 2
                     || fields
                         > if ids.is_some() {
@@ -349,11 +427,10 @@ impl ExecutionManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.abi_version != ABI_VERSION {
-            return Err(Error::execution(
-                ExecutionError::Manifest,
-                "unsupported execution ABI version; re-export the model package",
-            ));
+        if self.completion_token_capacity == 0 || self.completion_token_capacity > u32::MAX as usize
+            || self.completion_token_capacity.checked_add(COMPLETION_METADATA_FIELDS)
+                .and_then(|n| n.checked_mul(8 * REQUEST_LANES * 2)).is_none() {
+            return Err("invalid completion token capacity".into());
         }
         if !(1..=REQUEST_LANES).contains(&self.max_active) {
             return Err(Error::execution(
@@ -373,7 +450,8 @@ impl ExecutionManifest {
         GraphBundle {
             context: self.context,
             device: self.device,
-            graph_execs: self.graphs.iter().map(|graph| graph.handle).collect(),
+            graph_execs: self.graphs.iter().map(|graph| graph.handle)
+                .chain(self.tuning_graphs.iter().map(|graph| graph.handle)).collect(),
             buffers: self
                 .buffers
                 .iter()
@@ -457,15 +535,15 @@ impl ExecutionManifest {
         let logprobs = self.max_top_logprobs()? != 0;
         self.prompt_logprob_capacity()?;
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
-            if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
-                || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI4 and two float32 frames of seven prefixes per request slot".into());
+            if buffer.dtype != Dtype::Float32
+                || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1] {
+                return Err("completion_speculative_survival requires two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
             if buffer.dtype != Dtype::Float32 || buffer.shape.len() != 3
                 || buffer.shape[0] != 2 || buffer.shape[1] != self.request_capacity()
-                || !(1..MAX_OUTPUT_TOKENS).contains(&buffer.shape[2]) {
+                || !(1..self.completion_token_capacity).contains(&buffer.shape[2]) {
                 return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
             }
         }
@@ -477,13 +555,14 @@ impl ExecutionManifest {
                 return Err("readiness timestamps require two contiguous int64 frames of three timestamps per interval".into());
             }
         }
+        self.validate_tuning()?;
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
         for graph in &self.graphs {
             if graph.kind == GraphKind::Speculative {
                 if graph.packed_token_capacity < graph.batch_capacity
                     || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)
-                    || graph.draft_tokens > 7
+                    || graph.draft_tokens > self.completion_token_capacity - 1
                     || (graph.token_capacity == 1 && graph.draft_tokens != 0) {
                     return Err("speculative B/D/W/P geometry is invalid".into());
                 }
@@ -499,7 +578,7 @@ impl ExecutionManifest {
                     || confidence.shape[0] != 2
                     || confidence.shape[1] != self.request_capacity()
                     || confidence.shape[2] < graph.confidence_width
-                    || confidence.shape[2] > MAX_OUTPUT_TOKENS - 1 {
+                    || confidence.shape[2] > self.completion_token_capacity - 1 {
                     return Err("confidence output requires [2, request_slots, draft_capacity] float32 frames".into());
                 }
             }
@@ -511,10 +590,9 @@ impl ExecutionManifest {
             }
             let valid = match graph.kind {
                 GraphKind::Mixed => {
-                    self.abi_version == ABI_VERSION
-                        && BATCH_CAPACITIES.contains(&graph.batch_capacity)
+                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && (2..=self.request_capacity()).contains(&graph.batch_capacity)
-                        && (1..=8).contains(&graph.token_capacity)
+                        && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                         && graph.prefill_capacity >= 64
                         && graph.prefill_capacity.is_multiple_of(64)
                         && graph.packed_tokens() <= i32::MAX as usize
@@ -524,10 +602,9 @@ impl ExecutionManifest {
                             .is_some()
                 }
                 GraphKind::Speculative => {
-                    self.abi_version == ABI_VERSION
-                        && BATCH_CAPACITIES.contains(&graph.batch_capacity)
+                    BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
-                        && (1..=8).contains(&graph.token_capacity)
+                        && (1..=self.completion_token_capacity).contains(&graph.token_capacity)
                 }
                 GraphKind::Prefill | GraphKind::ScoredPrefill => {
                     graph.batch_capacity == 1

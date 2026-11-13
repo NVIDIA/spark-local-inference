@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "frontend")]
 
 #[path = "support/native_prefix.rs"]
@@ -46,6 +52,7 @@ fn configured_frontend(
                 "</think>",
                 "<｜end▁of▁sentence｜>",
                 "<｜deepseek_image｜>",
+                "｜DSML｜",
             ]
             .map(|s| AddedToken::from(s, true)),
         )
@@ -94,12 +101,12 @@ fn official(encoder: PromptEncoder, conversation: &Conversation) -> String {
     match encoder {
         PromptEncoder::DeepseekV4 => {
             DeepseekV4Encoding::new()
-                .render_conversation(conversation, &[])
+                .render_conversation(conversation)
                 .prompt
         }
         PromptEncoder::DeepseekV41 => {
             DeepseekV41Encoding::new()
-                .render_conversation(conversation, &[])
+                .render_conversation(conversation)
                 .prompt
         }
         _ => unreachable!(),
@@ -109,8 +116,8 @@ fn official(encoder: PromptEncoder, conversation: &Conversation) -> String {
 fn effort_conversation(thinking: bool, effort: ReasoningEffort) -> Conversation {
     Conversation {
         messages: vec![
-            InputMessage::System { content: "Policy".into() },
-            InputMessage::User { content: "Hello".into(), image_sources: vec![] },
+            InputMessage::System { content: deepseek_recipe_core::prompt::Prompt::plain("Policy"), image_sources: vec![], tools: None },
+            InputMessage::User { content: deepseek_recipe_core::prompt::Prompt::plain("Hello"), image_sources: vec![] },
         ],
         thinking_mode: thinking,
         reasoning_effort: Some(effort),
@@ -129,7 +136,7 @@ fn numeric_effort_scores_cover_the_interval_and_match_the_checked_encoder() {
     for score in 1u8..=100 {
         let expected = DeepseekV41Encoding::new()
             .with_reasoning_effort_score(score).unwrap()
-            .render_conversation(&conversation, &[]).prompt;
+            .render_conversation(&conversation).prompt;
         let actual = frontend.render_chat(&messages,
             json!({"reasoning_effort":score}).as_object().unwrap()).unwrap();
         assert_eq!(actual.text, expected, "score {score}");
@@ -289,6 +296,7 @@ fn official_rendering_and_system_prefixes_follow_both_encoders() {
                             description: None,
                             parameters: json!({"type":"object"}),
                             strict: None,
+                            defer_loading: false,
                         }]
                     } else {
                         vec![]
@@ -299,12 +307,13 @@ fn official_rendering_and_system_prefixes_follow_both_encoders() {
                     }
                     let conversation = Conversation {
                         messages: vec![
-                            InputMessage::System { content: "".into() },
+                            InputMessage::System { content: deepseek_recipe_core::prompt::Prompt::plain(""), image_sources: vec![], tools: None },
                             InputMessage::System {
-                                content: "Policy".into(),
+                                content: deepseek_recipe_core::prompt::Prompt::plain("Policy"),
+                                image_sources: vec![], tools: None,
                             },
                             InputMessage::User {
-                                content: "Hello".into(),
+                                content: deepseek_recipe_core::prompt::Prompt::plain("Hello"),
                                 image_sources: vec![],
                             },
                         ],
@@ -462,14 +471,11 @@ fn canonical_tool_order_controls_image_sources_and_placeholder_ids() {
         assert!(scored.token_ids.starts_with(&prefix.token_ids));
         assert!(scored.message_boundaries.contains(&prefix.token_ids.len()));
     }
-    for messages in [
-        vec![json!({"role":"user","content":"<｜image｜>"})],
-        vec![
-            json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}),
-        ],
-    ] {
-        assert!(frontend.render_chat(&messages, &Map::new()).is_err());
-    }
+    let literal = frontend.render_chat(&[json!({"role":"user","content":"<｜image｜>"})], &Map::new()).unwrap();
+    assert!(literal.image_sources.is_empty());
+    assert!(!literal.token_ids.contains(&frontend.image_placeholder_token_id().unwrap()));
+    let external_image = [json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]})];
+    assert!(frontend.render_chat(&external_image, &Map::new()).is_err());
 }
 
 #[test]
@@ -574,14 +580,11 @@ fn checkpoint_tokenizer_preserves_canonical_image_order_and_prefixes() {
                 .count(),
             2
         );
-        assert!(
-            frontend
-                .render_chat(
-                    &[json!({"role":"user","content":"<｜deepseek_image｜>"})],
-                    &Map::new()
-                )
-                .is_err()
-        );
+        for text in ["<｜deepseek_image｜>", "<｜image｜>"] {
+            let prompt = frontend.render_chat(&[json!({"role":"user","content":text})], &Map::new()).unwrap();
+            assert!(prompt.image_sources.is_empty());
+            assert!(!prompt.token_ids.contains(&placeholder));
+        }
     }
 }
 
@@ -662,4 +665,40 @@ fn native_bindings_reject_template_assets_and_unknown_image_tokens() {
             .to_string()
             .contains("does not use a chat template asset")
     );
+}
+
+#[test]
+fn assistant_block_checkpoint_follows_rendered_content_after_reasoning() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let frontend = frontend(encoder, json!({}));
+        let mut messages = vec![
+            json!({"role":"user", "content":"question"}),
+            json!({"role":"assistant", "reasoning_content":"thinking carefully", "content":[
+                {"type":"text", "text":"Stable answer"}, {"type":"text", "text":"Changing suffix"}
+            ]}),
+            json!({"role":"user", "content":"next"}),
+        ];
+        let options = json!({"tools":[{"function":{"name":"lookup"}}]});
+        let plain = frontend
+            .render_chat(&messages, options.as_object().unwrap())
+            .unwrap();
+        messages[1]["_checkpoint_hints"] = json!([1]);
+        let marked = frontend
+            .render_chat(&messages, options.as_object().unwrap())
+            .unwrap();
+        assert_eq!(marked.text, plain.text);
+        assert_eq!(marked.token_ids, plain.token_ids);
+        let boundary = marked.text.find("Stable answer").unwrap() + "Stable answer".len();
+        let offsets = frontend
+            .tokenizer()
+            .encode(marked.text.as_str(), false)
+            .unwrap();
+        let cut = offsets
+            .get_offsets()
+            .iter()
+            .take_while(|&&(_, end)| end <= boundary)
+            .count();
+        assert!(!plain.message_boundaries.contains(&cut));
+        assert!(marked.message_boundaries.contains(&cut));
+    }
 }

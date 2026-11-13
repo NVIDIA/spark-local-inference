@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise production constructor wiring without loading weights or CUDA programs."""
 
 import importlib
@@ -87,6 +91,7 @@ class RecordingSession:
     def __init__(self, **kwargs):
         self.requests = {}
         self.finalizers = []
+        self.context_plans = {}
         self.arena = None
         self.closed = False
         self.resources = {}
@@ -100,6 +105,11 @@ class RecordingSession:
             assert request.name not in self.requests
             self.memory[request.name] = request.plan.memory_requirements()
             self.requests[request.name] = request
+
+    def register_context_plan(self, name, plan, bind):
+        assert self.requests[name].plan is plan
+        assert name not in self.context_plans and callable(bind)
+        self.context_plans[name] = (plan, bind)
 
     def register_finalizer(self, callback):
         self.finalizers.append(callback)
@@ -136,7 +146,7 @@ def checkpoint():
 
 
 def _install_boundaries(monkeypatch, checkpoint):
-    from b12x.gemm._shared.wo_mxfp8 import MXFP8Rows
+    from b12x.quantization import mxfp8
     from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight
     from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
     from b12x.preparation import device
@@ -336,14 +346,11 @@ def _install_boundaries(monkeypatch, checkpoint):
                 n,
             )
         return MXFP8LinearWeight(
-            MXFP8Rows(
-                values.reshape(n, k, 1),
-                scales.reshape(1, n, -1),
-                torch.empty(
-                    (32, 4, (n + 127) // 128, 4, (k + 127) // 128, 1),
-                    dtype=torch.uint8,
-                    device=values.device,
-                ),
+            mxfp8.dense_rows_from_bases(
+                values.reshape(n, k),
+                scales.view(torch.uint8).reshape(1, n, k // 32),
+                torch.empty(mxfp8.dense_rows_storage_shapes(n, k)[2],
+                    dtype=torch.uint8, device=values.device),
             ),
             k,
             k,
@@ -576,6 +583,7 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     ):
         bootstrap.prepare_model(checkpoint[0].snapshot, config)
     assert session.closed
+    assert session.context_plans
     modes = 1 if proposal == "ordinary" else 2
     expected = {
         "vision": 4,
@@ -621,12 +629,13 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     assert len(constructors["PreparedGDN"]) == 36 * len(decoders)
     assert len(constructors["PreparedPLE"]) == len(decoders)
     for decoder, args in decoders:
+        assert decoder.scratch is None
         assert len(decoder.layers) == 48
         assert args["workspaces"] is session.arena
         assert args["completion"].records.shape == (
             2,
             config.request_capacity,
-            24,
+            16 + config.completion_token_capacity,
         )
         assert args["completion"].records.dtype == torch.int64
         pool = args["state"].pool
@@ -636,11 +645,11 @@ def test_prepare_model_constructs_real_catalog_on_meta(
         assert pool.backing.shape[0] == (
             1 + config.request_capacity + pool.layout.snapshot_capacity(config.snapshot_budget_bytes)
         )
-        assert decoder.scratch.residual.dtype == torch.bfloat16
-        assert decoder.scratch.logits.dtype == torch.bfloat16
+        assert args["scratch"].residual.dtype == torch.bfloat16
+        assert args["scratch"].logits.dtype == torch.bfloat16
         assert pool.layout.speculative_tokens == (0 if proposal == "ordinary" else 7)
-        assert decoder.scratch.residual.shape == (args["state"].tokens, 10240)
-        assert decoder.scratch.logits.shape == (
+        assert args["scratch"].residual.shape == (args["state"].tokens, 10240)
+        assert args["scratch"].logits.shape == (
             (args["state"].tokens if decoder.verification else args["state"].rows),
             248320,
         )
@@ -679,6 +688,15 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     )
     assert all(memory.scratch_nbytes >= 0 for memory in session.memory.values())
 
+
+
+def test_mixed_catalog_constructs_on_meta(monkeypatch, checkpoint):
+    session, signatures, _ = _install_boundaries(monkeypatch, checkpoint)
+    config = bootstrap.PreparationConfig(max_active=4, mtp=True, mixed_prefill=True)
+    with FakeTensorMode(allow_non_fake_inputs=True), MetadataValues(), pytest.raises(ConstructionComplete):
+        bootstrap.prepare_model(checkpoint[0].snapshot, config)
+    assert session.closed
+    assert sum(signature.kind == "mixed" for signature in signatures) == len(config.mixed_shapes)
 
 def test_recording_metadata_preserves_values_and_rejects_unknown_scalars():
     with FakeTensorMode(), MetadataValues():

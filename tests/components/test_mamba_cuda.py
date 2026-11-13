@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Mamba preparation, graph replay, and state mutation against an FP32 recurrence."""
 
 import os
@@ -56,6 +59,7 @@ def reference(args):
 def test_prepared_mamba_matches_recurrence_and_replays(mode, lengths, dtype):
     from b12x.preparation import PreparationSession
     from ignition.components.mamba import PreparedMambaScan, PreparedMambaUpdate
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.scratch import ScratchArena
 
     args = operands(lengths, dtype=dtype)
@@ -68,10 +72,14 @@ def test_prepared_mamba_matches_recurrence_and_replays(mode, lengths, dtype):
         else:
             operator = PreparedMambaUpdate(args, session=session, name="update")
         arena.finalize()
+        def forward():
+            args["out"].copy_(operator(args))
+        forward = compile_forward(forward)
+        forward()
         args["recurrent_state"].copy_(original)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            operator()
+            forward()
         gc.collect()
         torch.cuda.synchronize()
         allocated = torch.cuda.memory_allocated()

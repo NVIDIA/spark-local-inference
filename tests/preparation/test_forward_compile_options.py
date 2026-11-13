@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Explicit compilation policies retain their cache, backend and restore identity."""
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
+from inspect import signature
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
@@ -8,14 +13,38 @@ import sys
 import pytest
 import torch
 
-from ignition.preparation import aot, compile_pool
+from ignition.preparation import aot, compile_pool, inductor_tuning
+
+
+class _Selections(inductor_tuning.InductorSelections):
+    """Compilation-policy fixtures contain no generated GPU kernels."""
+
+    def register(self, bound):
+        self.forwards[id(bound)] = SimpleNamespace(_tuning_frozen=False), None, {}
+
+    def freeze(self, bound):
+        pass
+
+
+def _loaded_backend():
+    from torch._dynamo.guards import GuardManagerWrapper
+
+    backend = aot.StorageBackend.__new__(aot.StorageBackend)
+    backend.artifact = SimpleNamespace(_flare_graph=object())
+    backend._serialized_artifact = b"portable backend"
+    return SimpleNamespace(compiled_fn=backend, signature=signature(lambda forward: None),
+        runtime_env=SimpleNamespace(closure=()), guards_state=b"portable guards",
+        guard_manager=GuardManagerWrapper(root=SimpleNamespace(check=lambda arguments: True)))
 
 
 @pytest.fixture
 def caches(monkeypatch, tmp_path):
-    package = tmp_path / 'ignition' / 'preparation'
-    package.mkdir(parents=True)
-    backend = package / 'aot.py'
+    aot.runtime_patches.apply()
+    monkeypatch.setattr(inductor_tuning, 'InductorSelections', _Selections)
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: SimpleNamespace(synchronize=lambda: None))
+    core = tmp_path / 'ignition' / 'preparation'
+    core.mkdir(parents=True)
+    backend = core / 'aot.py'
     backend.write_text('backend = 1\n')
     kernels = tmp_path / 'flashinfer'
     kernels.mkdir()
@@ -44,6 +73,13 @@ def test_explicit_options_are_an_immutable_snapshot_and_part_of_cache_identity(c
         prepared.options['compile_threads'] = 1
     assert caches(options=dict(prepared.options, compile_threads=1)).root == prepared.root
     assert caches(options=dict(baseline)).root == ordinary.root
+
+
+def test_runtime_patch_identity_invalidates_forward_artifacts(caches, monkeypatch):
+    with torch.compiler.config.patch(cache_key_tag=torch.compiler.config.cache_key_tag):
+        ordinary = caches()
+        monkeypatch.setattr(aot.runtime_patches, 'identity', lambda: 'different-runtime-patches')
+        assert caches().root != ordinary.root
 
 
 def test_aot_forward_snapshots_explicit_options_for_its_backend(monkeypatch):
@@ -120,8 +156,10 @@ def test_prepare_and_binding_rebuild_retain_instance_options(caches, monkeypatch
     cache = caches(options=dict(aot._OPTIONS, max_autotune=False))
     observed = []
     class Artifact:
+        _artifacts = _loaded_backend()
         def __call__(self, owner):
             return owner
+        fn = __call__
         def save_compiled_function(self, path):
             Path(path).write_bytes(b'compiled')
     def compile(owner, *, options):
@@ -131,10 +169,9 @@ def test_prepare_and_binding_rebuild_retain_instance_options(caches, monkeypatch
     owner = SimpleNamespace()
     bound, path = cache._prepare(owner, name='ordinary', signature=('prefill', 1, 1))
     cache._warm(bound, path, name='ordinary')
-    class Mismatch:
-        def __call__(self, owner):
-            raise aot.BindingMismatch('rebuild')
-    cache._warm(aot.BoundForward(Mismatch(), owner, True), tmp_path / 'rebuilt.bin', name='ordinary')
+    monkeypatch.setattr(cache, '_load', lambda *args, **kwargs: None)
+    bound, path = cache._prepare(owner, name='ordinary', signature=('prefill', 1, 1))
+    cache._warm(bound, path, name='ordinary')
     assert observed == [dict(cache.options)] * 2
     assert observed[0]['max_autotune'] is False
 
@@ -155,8 +192,12 @@ def test_prepare_many_passes_snapshot_and_preserves_warmup_scope(caches, monkeyp
             result.set_result(None)
             return result
     class Artifact:
+        _artifacts = _loaded_backend()
         def __call__(self, owner):
             executed.append('execute')
+        fn = __call__
+        def save_compiled_function(self, path):
+            Path(path).write_bytes(b'compiled')
     @contextmanager
     def warmup():
         executed.append('enter')
@@ -168,7 +209,7 @@ def test_prepare_many_passes_snapshot_and_preserves_warmup_scope(caches, monkeyp
         lambda cache, owner, path, **kwargs: aot.BoundForward(Artifact(), owner, True))
     cache.prepare_many({'example': object()}, {'example': ('prefill', 1, 1)}, warmup=warmup)
     assert policies == [dict(cache.options)]
-    assert executed == ['enter', 'execute', 'exit']
+    assert executed == ['enter', 'execute', 'exit'] * 2
 
 
 def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(caches, monkeypatch, tmp_path):
@@ -190,8 +231,10 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
         def __call__(self, owner):
             raise aot.BindingMismatch('another catalog layout')
     class Artifact:
+        _artifacts = _loaded_backend()
         def __call__(self, owner):
             executed.append('execute')
+        fn = __call__
         def save_compiled_function(self, path):
             Path(path).write_bytes(b'recompiled')
     def compile(owner, *, options):
@@ -200,6 +243,8 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
     paths = {}
     def load(cache, owner, path, **kwargs):
         paths['example'] = path
+        if kwargs.get('required', False):
+            raise aot.BindingMismatch('another catalog layout')
         return aot.BoundForward(Stale(), owner, True)
     monkeypatch.setattr(compile_pool, 'CompilePool', Pool)
     monkeypatch.setattr(aot, '_guard_code_cache', lambda path: nullcontext())
@@ -208,6 +253,6 @@ def test_prepare_many_recompiles_a_materialized_forward_that_no_longer_binds(cac
     monkeypatch.setattr(aot.ForwardCache, '_path', lambda cache, owner, *, name, signature: tmp_path / f'{name}.bin')
     result = cache.prepare_many({'example': object()}, {'example': ('prefill', 1, 1)}, materialize=lambda: None)
     assert compiled == [dict(cache.options)]
-    assert executed == ['execute']
+    assert executed == ['execute'] * 2
     assert result['example'].cache_hit is False
     assert (tmp_path / 'example.bin').read_bytes() == b'recompiled'

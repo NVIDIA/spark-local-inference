@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Device metadata and exact consumed endpoints through native replay."""
 
 import os
@@ -40,13 +43,24 @@ def test_native_metadata_exact_endpoints_and_terminal_guards(compile_forward):
     metadata.prepare_hidden(hidden, sample[:1])
     decode.prepare_hidden(hidden[:4], sample)
 
+    prefill_gdn, prefill_qsa = metadata.gdn, metadata.qsa
+    decode_gdn, decode_qsa = decode.gdn, decode.qsa
+    metadata.functional()
+    decode.functional()
+
     def prefill():
-        metadata.begin()
-        metadata.finish()
+        runtime = metadata.begin_runtime()
+        sample[:1].copy_(metadata.finish_runtime(runtime, hidden, source))
+        for name in ("checkpoint_offsets", "initial_state_indices", "final_state_indices"):
+            getattr(prefill_gdn, name).copy_(getattr(runtime.gdn, name))
+        prefill_qsa.slot_mapping.copy_(runtime.qsa.slot_mapping)
+        prefill_qsa.request_ids.copy_(runtime.qsa.request_ids)
 
     def step():
-        decode.begin()
-        decode.finish()
+        runtime = decode.begin_runtime()
+        sample.copy_(decode.finish_runtime(runtime, hidden[:4], source[:4]))
+        decode_qsa.rope_positions.copy_(runtime.qsa.rope_positions)
+        decode_gdn.num_tokens.copy_(runtime.gdn.num_tokens)
 
     graphs = {}
     compiled_calls = []
@@ -89,14 +103,14 @@ def test_native_metadata_exact_endpoints_and_terminal_guards(compile_forward):
         inputs.page_tables[2].copy_(torch.tensor([5, 3, 1, 7], dtype=torch.int32, device=device))
         pool.rope_delta[3] = 17
         replay(0)
-        assert metadata.gdn.checkpoint_offsets.tolist() == [0]
-        assert metadata.gdn.initial_state_indices.tolist() == [0]
-        assert metadata.gdn.final_state_indices.tolist() == [3]
+        assert prefill_gdn.checkpoint_offsets.tolist() == [0]
+        assert prefill_gdn.initial_state_indices.tolist() == [0]
+        assert prefill_gdn.final_state_indices.tolist() == [3]
         assert pool.consumed_tokens[3].item() == 65
         assert pool.ple_history[3].tolist() == [63, 64]
         assert pool.last_hidden[3, 0].item() == 64
-        assert metadata.qsa.slot_mapping[:65].tolist() == list(range(320, 384)) + [192]
-        assert (metadata.qsa.request_ids[65:] == -1).all()
+        assert prefill_qsa.slot_mapping[:65].tolist() == list(range(320, 384)) + [192]
+        assert (prefill_qsa.request_ids[65:] == -1).all()
 
         # Consume the pending token at its exact position.
         requests.consumed_tokens[2] = 63
@@ -104,7 +118,7 @@ def test_native_metadata_exact_endpoints_and_terminal_guards(compile_forward):
         pool.gdn[0].recurrent[3].fill_(.25)
         replay(1)
         assert inputs.token_ids[0].item() == 901
-        assert decode.qsa.rope_positions[0].tolist() == [80, 80, 80]
+        assert decode_qsa.rope_positions[0].tolist() == [80, 80, 80]
         assert requests.consumed_tokens[2].item() == 64
 
         # Replaying decode without a new sample rejects before any model write.
@@ -112,7 +126,7 @@ def test_native_metadata_exact_endpoints_and_terminal_guards(compile_forward):
         replay(1)
         assert requests.status[2].item() == 3
         assert requests.error_code[2].item() == 32
-        assert decode.gdn.num_tokens.item() == 0
+        assert decode_gdn.num_tokens.item() == 0
         assert torch.equal(before_state, pool.backing)
 
         requests.admit(2, RequestAdmission(12, 9), list(range(65)), consumed_tokens=65)
@@ -122,8 +136,8 @@ def test_native_metadata_exact_endpoints_and_terminal_guards(compile_forward):
         replay(0)
         assert requests.error_code[2].item() == 0
         assert requests.consumed_tokens[2].item() == 130
-        assert metadata.gdn.initial_state_indices.tolist() == [3]
-        assert metadata.gdn.checkpoint_offsets.tolist() == [0]
+        assert prefill_gdn.initial_state_indices.tolist() == [3]
+        assert prefill_gdn.checkpoint_offsets.tolist() == [0]
     finally:
         worker.close()
         for graph in graphs.values():

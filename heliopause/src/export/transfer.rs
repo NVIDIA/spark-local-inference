@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Authenticated preparation-rank export handoff over established fabric streams.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +24,7 @@ use super::{RankOutput, Result, invalid};
 
 const BLOCK_BYTES: usize = 4 << 20;
 const METADATA_BYTES: usize = 256 << 20;
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 const EXPORT_IDLE_TIMEOUT_MS: i32 = 2 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy)]
@@ -494,6 +500,9 @@ pub(crate) fn cache_payload_sources(output: &RankOutput) -> Result<Vec<(PathBuf,
         if group.payload_id.is_empty() {
             continue;
         }
+        if weight.cached.iter().any(|payload| payload.id == group.payload_id && payload.nbytes == group.nbytes) {
+            continue;
+        }
         let id: [u8; 32] = group
             .payload_id
             .as_slice()
@@ -714,10 +723,10 @@ impl ReceiveProgress {
 /// transport container digest only proves what this transfer carried.
 fn verify_cached_payload(
     cache: &Path,
-    id: helios_core::package::PayloadId,
+    id: helios_core::core::PayloadId,
     length: u64,
-) -> Result<helios_core::package::cache::PayloadObject> {
-    let root = helios_core::package::cache::Root::open(cache)?;
+) -> Result<helios_core::core::cache::PayloadObject> {
+    let root = helios_core::core::cache::Root::open(cache)?;
     let object = root
         .payload(id)?
         .ok_or_else(|| invalid("cached payload object disappeared"))?;
@@ -737,13 +746,13 @@ fn verify_cached_payload(
 /// corrupt or mislabelled object never enters the cache.
 fn install_payload_object(
     cache: &Path,
-    id: helios_core::package::PayloadId,
+    id: helios_core::core::PayloadId,
     length: u64,
     partial: &Path,
-) -> Result<helios_core::package::cache::PayloadObject> {
-    let root = helios_core::package::cache::Root::open(cache)?;
-    let container = helios_core::package::container::Container::open(partial)?;
-    let slice = container.tensor(helios_core::package::container::COMPANION_TENSOR)?;
+) -> Result<helios_core::core::cache::PayloadObject> {
+    let root = helios_core::core::cache::Root::open(cache)?;
+    let container = helios_core::core::container::Container::open(partial)?;
+    let slice = container.tensor(helios_core::core::container::COMPANION_TENSOR)?;
     if slice.len() != length {
         return Err(invalid(
             "received payload object length differs from its declared group",
@@ -787,7 +796,7 @@ fn receive_rank(
             .checked_add(part.source.nbytes)
             .ok_or_else(|| invalid("rank export payload length overflow"))?;
     }
-    super::package::validate_index(&manifest.output.index, logical_end)?;
+    super::core::validate_index(&manifest.output.index, logical_end)?;
     fs::create_dir_all(
         request
             .destination
@@ -795,7 +804,7 @@ fn receive_rank(
             .ok_or_else(|| invalid("rank export destination has no parent"))?,
     )?;
     let store = super::blob::BlobStore::new(cache, budget.clone())?;
-    let installed: std::sync::Mutex<Vec<helios_core::package::cache::PayloadObject>> =
+    let installed: std::sync::Mutex<Vec<helios_core::core::cache::PayloadObject>> =
         std::sync::Mutex::new(Vec::new());
     let progress = helios_core::startup::StartupProgress::silent();
     let cache_phase = progress.phase("Verify rank export cache", None);
@@ -805,7 +814,9 @@ fn receive_rank(
     let mut requested = Vec::new();
     // Declared cache payload identities, parsed before any path is formed.
     let mut declared_objects: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    let mut declared_weights = BTreeSet::new();
     if let Some(sources) = manifest.output.weight_payload.as_ref() {
+        declared_weights.extend(sources.groups.iter().map(|group| group.payload_id.clone()));
         for group in sources
             .groups
             .iter()
@@ -840,7 +851,7 @@ fn receive_rank(
         let Some(hex) = &info.payload else {
             continue;
         };
-        let id = helios_core::package::PayloadId::parse(hex)
+        let id = helios_core::core::PayloadId::parse(hex)
             .map_err(|_| invalid("rank export payload identity is invalid"))?;
         let Some(length) = declared_objects.get(id.as_bytes()) else {
             return Err(invalid("rank export carries an undeclared payload object"));
@@ -851,7 +862,28 @@ fn receive_rank(
         let _ = name;
         object_sources.insert(*id.as_bytes(), info);
     }
-    if object_sources.len() != declared_objects.len() {
+    let mut cached_objects = BTreeSet::new();
+    if let Some(sources) = manifest.output.weight_payload.as_ref() {
+        for descriptor in &sources.cached {
+            let id: [u8; 32] = descriptor.id.as_slice().try_into()
+                .map_err(|_| invalid("cached rank payload identity is not 32 bytes"))?;
+            if declared_objects.get(&id) != Some(&descriptor.nbytes) || object_sources.contains_key(&id) {
+                return Err(invalid("cached rank payload differs from its declared group"));
+            }
+            if cached_objects.insert(id) {
+                let root = helios_core::core::cache::Root::open(cache)?;
+                let object = root.payload(helios_core::core::PayloadId::from_bytes(id))?
+                    .ok_or_else(|| invalid("reused payload object disappeared"))?;
+                if object.length() != descriptor.nbytes {
+                    return Err(invalid("reused payload object has the wrong length"));
+                }
+                installed.lock().map_err(|_| invalid("payload lease lock poisoned"))?.push(object);
+                cached_bytes += descriptor.nbytes;
+                cached_files += 1;
+            }
+        }
+    }
+    if object_sources.len() + cached_objects.len() != declared_objects.len() {
         return Err(invalid(
             "declared payload objects are missing from the rank export inventory",
         ));
@@ -901,7 +933,7 @@ fn receive_rank(
         if target.try_exists()? {
             let _transaction = FileTransaction::acquire(FileDirection::Receive, 3)?;
             if let Some(hex) = &info.payload {
-                let id = helios_core::package::PayloadId::parse(hex)?;
+                let id = helios_core::core::PayloadId::parse(hex)?;
                 let length = declared_objects[id.as_bytes()];
                 let object = verify_cached_payload(cache, id, length)?;
                 installed
@@ -915,7 +947,7 @@ fn receive_rank(
             cached_files += 1;
             cache_phase.advance(info.size);
             cache_phase.detail(format!(
-                "{cached_files} cached files, {cached_bytes} bytes verified"
+                "{cached_files} cached files, {cached_bytes} bytes available"
             ));
         } else {
             if info.blob && no_weights {
@@ -923,7 +955,8 @@ fn receive_rank(
                     "--no-weights requires the peer stored-data blob in the coordinator cache",
                 ));
             }
-            if info.payload.is_some() && no_weights {
+            if info.payload.as_ref().is_some_and(|hex| no_weights &&
+                helios_core::core::PayloadId::parse(hex).is_ok_and(|id| declared_weights.contains(id.as_bytes().as_slice()))) {
                 return Err(invalid(
                     "--no-weights requires the peer payload object in the coordinator cache",
                 ));
@@ -944,7 +977,7 @@ fn receive_rank(
         }
     }
     cache_phase.finish(format!(
-        "{cached_files} cached files, {cached_bytes} bytes verified"
+        "{cached_files} cached files, {cached_bytes} bytes available"
     ));
     send_control(
         &mut control,
@@ -1006,7 +1039,7 @@ fn receive_rank(
                     })?;
                 }
                 if info.payload.is_some() {
-                    let id = helios_core::package::PayloadId::parse(
+                    let id = helios_core::core::PayloadId::parse(
                         info.payload.as_deref().unwrap_or_default(),
                     )?;
                     let object = install_payload_object(
@@ -1046,7 +1079,7 @@ fn receive_rank(
     );
     {
         let _transaction = FileTransaction::acquire(FileDirection::Receive, 1)?;
-        super::package::write_sources(&request.destination, &manifest.output)?;
+        super::core::write_sources(&request.destination, &manifest.output)?;
     }
     let seconds = started.elapsed().as_secs_f64();
     let size: u64 = requested.iter().map(|n| manifest.files[n].size).sum();
@@ -1378,12 +1411,12 @@ mod tests {
     fn cache_backed_output(
         directory: &Directory,
         payload: &[u8],
-    ) -> (RankOutput, helios_core::package::PayloadId) {
+    ) -> (RankOutput, helios_core::core::PayloadId) {
         let sender_cache = directory.0.join("sender-cache");
-        let root = helios_core::package::cache::Root::open(&sender_cache).unwrap();
+        let root = helios_core::core::cache::Root::open(&sender_cache).unwrap();
         let raw = directory.0.join("group.payload");
         fs::write(&raw, payload).unwrap();
-        let slice = helios_core::package::container::Slice::new(
+        let slice = helios_core::core::container::Slice::new(
             std::sync::Arc::new(fs::File::open(&raw).unwrap()),
             0,
             payload.len() as u64,
@@ -1395,6 +1428,8 @@ mod tests {
         fs::write(&staged, b"rank-resource").unwrap();
         let mut output = output(staged.clone(), 13);
         output.weight_payload = Some(crate::export::WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![crate::export::WeightPayloadGroup {
                 name: "layer-000".into(),
                 storage: "stable".into(),
@@ -1425,7 +1460,7 @@ mod tests {
         assert_eq!(groups.groups.len(), 2, "a declared group was dropped");
         assert_eq!(groups.groups[0].payload_id, id.as_bytes().to_vec());
         assert_eq!(groups.groups[1].payload_id, id.as_bytes().to_vec());
-        let store = helios_core::package::cache::Root::open(&directory.0.join("cache")).unwrap();
+        let store = helios_core::core::cache::Root::open(&directory.0.join("cache")).unwrap();
         assert!(store.payload(id).unwrap().is_some());
         assert_eq!(received.leases.0.len(), 1, "one object per unique identity");
     }
@@ -1437,7 +1472,7 @@ mod tests {
         let (source, id) = cache_backed_output(&directory, &payload);
         let mut received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
         let cache = directory.0.join("cache");
-        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&cache).unwrap();
         let stage = crate::export::binding::NativeExportStage::for_test(
             Some(cache.clone()),
             false,
@@ -1477,7 +1512,7 @@ mod tests {
         let (source, id) = cache_backed_output(&directory, &payload);
         let mut received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
         let cache = directory.0.join("cache");
-        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&cache).unwrap();
 
         // The binding moves leases into the retained stage before the outputs drop.
         let retained = std::mem::take(&mut received.leases);
@@ -1504,7 +1539,7 @@ mod tests {
         let cold = roundtrip_with_cache(&directory, "rank-cold.json", &source, false).unwrap();
         let warm = roundtrip_with_cache(&directory, "rank-warm.json", &source, true).unwrap();
         let cache = directory.0.join("cache");
-        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&cache).unwrap();
 
         // Both receiver outputs hold live leases for the warm-hit object.
         assert_eq!(warm.leases.0.len(), 1);
@@ -1526,14 +1561,58 @@ mod tests {
         let received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
         assert_eq!(received.inventory["test"], true);
         let receiver_cache = directory.0.join("cache");
-        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&receiver_cache).unwrap();
         assert!(store.payload(id).unwrap().is_some(), "payload object missing");
 
         // A second transfer with --no-weights reuses the object already present.
         let received = roundtrip_with_cache(&directory, "rank2.json", &source, true).unwrap();
         assert_eq!(received.inventory["test"], true);
-        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&receiver_cache).unwrap();
         assert!(store.payload(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn reused_weight_references_need_no_sender_object() {
+        let directory = Directory::new();
+        let bytes = vec![0x61; 512];
+        let (mut source, id) = cache_backed_output(&directory, &bytes);
+        let received = roundtrip_with_cache(&directory, "seed.json", &source, false).unwrap();
+        source.weight_payload.as_mut().unwrap().cached =
+            vec![helios_core::core::schema::wire::PayloadDescriptor {
+                id: id.as_bytes().to_vec(),
+                nbytes: bytes.len() as u64,
+            }];
+        source.payload_leases = Default::default();
+        assert!(cache_payload_sources(&source).unwrap().is_empty());
+        let watched = vec![received.leases.0[0].path().to_path_buf()];
+        let transfer = || roundtrip_with_cache(&directory, "reused.json", &source, true);
+        #[cfg(unix)]
+        let (reused, bytes_read) = helios_core::core::container::count_payload_reads(&watched, transfer);
+        #[cfg(not(unix))]
+        let reused = transfer();
+        let reused = reused.unwrap();
+        #[cfg(unix)]
+        assert_eq!(bytes_read, 0, "cached weight transfer references must not read payload bytes");
+        assert_eq!(reused.leases.0.len(), 1);
+        assert_eq!(reused.leases.0[0].id(), id);
+        drop(received);
+        drop(reused);
+        let root = helios_core::core::cache::Root::open(directory.0.join("cache")).unwrap();
+        let path = root.payload(id).unwrap().unwrap().path().to_path_buf();
+        fs::remove_file(path).unwrap();
+        assert!(roundtrip_with_cache(&directory, "missing.json", &source, true).is_err());
+    }
+    #[test]
+    fn cache_only_weights_allow_fresh_initial_state_from_peers() {
+        let directory = Directory::new();
+        let bytes = vec![0x71; 128];
+        let (mut source, id) = cache_backed_output(&directory, &bytes);
+        let weights = source.weight_payload.as_mut().unwrap();
+        weights.initial_state = weights.groups.pop().unwrap();
+        weights.initial_state.name = "initial-state".into();
+        weights.initial_state.storage = "state".into();
+        let received = roundtrip_with_cache(&directory, "fresh-state.json", &source, true).unwrap();
+        assert_eq!(received.leases.0[0].id(), id);
     }
 
     #[test]
@@ -1571,11 +1650,11 @@ mod tests {
             "{error}"
         );
         let receiver_cache = directory.0.join("cache");
-        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&receiver_cache).unwrap();
         assert!(store.payload(id).unwrap().is_none());
 
         // Corrupting the sender object is detected before it can be adopted.
-        let sender_cache = object_path.parent().unwrap().parent().unwrap().to_path_buf();
+        let _sender_cache = object_path.parent().unwrap().parent().unwrap().to_path_buf();
         let mut permissions = fs::metadata(&object_path).unwrap().permissions();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1588,7 +1667,7 @@ mod tests {
         fs::write(&object_path, &bytes).unwrap();
         let fresh = Directory::new();
         assert!(roundtrip_with_cache(&fresh, "rank3.json", &source, false).is_err());
-        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        let store = helios_core::core::cache::Root::open(&receiver_cache).unwrap();
         assert!(store.payload(id).unwrap().is_none());
     }
 

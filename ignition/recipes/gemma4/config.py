@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Structural checkpoint configuration for the Gemma 4 model family."""
 
 from dataclasses import dataclass

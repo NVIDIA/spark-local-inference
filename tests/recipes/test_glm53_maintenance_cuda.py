@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Captured GLM admission and immutable continuation agreement on TP2/TP4."""
 
 import os
@@ -44,7 +48,7 @@ def _run(rank, world, rendezvous=None):
         inputs, commands = BatchInputs.allocate(1, 3, device), StateCommands.allocate(device)
         inputs.request_state_rows[:, 0] = torch.tensor([6, 3, 1, 4], device=device)
         admission = AdmissionBuffers.allocate(device, vocab_size=154880)
-        records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+        records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.ones(1, dtype=torch.int64, device=device)
         operations = {}
@@ -60,12 +64,13 @@ def _run(rank, world, rendezvous=None):
                         pages=pool.partial_pages(), page_tokens=256, state_rows=inputs.request_state_rows, requests=requests)
                     slots, epochs, count = (inputs.row_slot_ids, inputs.row_generations, inputs.live_rows) if mode == "snapshot" else (
                         admission.admission_slots, admission.admission_generations, admission.admission_count)
-                    local = LocalMaintenance(mode, requests, transfer, slots, epochs, count, records, frame, sequence,
+                    local = LocalMaintenance(mode, requests, transfer, slots, epochs, count, completion_outputs(records), frame, sequence,
                                               world_size=1, admission_buffers=admission)
                     local.prepare()
+                    local.functional()
                     def call(local=local):
-                        local.validation_sum.copy_(local.validate())
-                        local.apply()
+                        validation, errors = local.validate()
+                        local.apply(validation, admission_errors=errors)
                     operations[mode] = call
             if world > 1:
                 session.tune()

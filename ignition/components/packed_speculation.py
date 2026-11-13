@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """One captured proposal, bounded causal allocation, and target commit.
 
 The host supplies immutable per-request prefix ceilings and reserves their cache
@@ -5,6 +8,8 @@ extents before submission. Only the admitted lengths are device-owned; the
 cohort, physical target capacity, page tables, and request epochs cannot change
 inside the round.
 """
+
+from dataclasses import replace
 
 import torch
 
@@ -16,18 +21,18 @@ from .split_draft import PreparedDraftConfidence
 class PreparedPackedSpeculativeRound:
     """Compose proposal and target tensors within one captured round."""
 
-    def __init__(self, source, target, prefix_limits, confidence_output, *, name, buffers=None):
+    def __init__(self, source, target, prefix_limits, confidence_output, *, name):
         s, t = source, target
         if (s.batch != t.batch or s.owner.inputs is not t.owner.inputs
                 or s.owner.requests is not t.owner.requests or not 1 < s.width <= t.width):
             raise ValueError("packed rounds require matching proposal and target inputs")
         o, b = s.owner, s.batch
         if (prefix_limits.shape != (o.requests.capacity,) or prefix_limits.dtype != torch.int32
-                or prefix_limits.device != s.active.device or not prefix_limits.is_contiguous()):
+                or prefix_limits.device != o.pool.backing.device or not prefix_limits.is_contiguous()):
             raise ValueError("prefix limits must be contiguous int32 values for every request lane")
         if (confidence_output.ndim != 3 or confidence_output.shape[0] != 2
                 or confidence_output.shape[1] != o.requests.capacity or confidence_output.shape[2] < s.width - 1
-                or confidence_output.dtype != torch.float32 or confidence_output.device != s.active.device
+                or confidence_output.dtype != torch.float32 or confidence_output.device != o.pool.backing.device
                 or not confidence_output.is_contiguous()):
             raise ValueError("confidence output requires two contiguous FP32 request frames covering draft depth")
         query_lengths = o.inputs.query_lengths[:b]
@@ -37,85 +42,58 @@ class PreparedPackedSpeculativeRound:
             raise ValueError("host prefix limits must not overlap device-owned query lengths")
         self.source, self.target, self.prefix_limits = s, t, prefix_limits
         self.confidence_output = confidence_output
-        self.buffers = buffers
-        if buffers is not None:
-            # These values span proposal and target execution. Start beyond both
-            # complete sampling workspaces, rather than aliasing either cursor.
-            buffers.join(*(cursor for cursor in (s.buffers, t.buffers) if cursor is not None))
-        def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=s.active.device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.confidence_head = PreparedDraftConfidence(s, o.weights.draft.confidence_head,
-            zeros((b, s.width - 1), torch.float32), buffers=buffers,
+        device = o.pool.backing.device
+        confidence = torch.empty((b, s.width - 1), dtype=torch.float32, device=device)
+        self.confidence_head = PreparedDraftConfidence(s, o.weights.draft.confidence_head, confidence,
             name=name + ".confidence_head", bias=getattr(o.weights.draft, "confidence_bias", None))
-        self.rows = s.rows
-        self.submitted = zeros((b,), torch.bool)
-        self.source_valid = zeros((b,), torch.bool)
-        self.admitted = zeros((b,), torch.bool)
-        self.slots = zeros((b,), torch.int64)
-        self.confidence = zeros((b, s.width - 1), torch.float32)
-        self.validation_input = zeros(tuple(s.validator.validation_input.shape), s.validator.validation_input.dtype)
-        self.validation_sum = zeros(tuple(self.validation_input.shape), self.validation_input.dtype)
-        self.world = o.weights.shard.world_size
-        self.validation = PreparedAllReduce(self.validation_input, self.validation_sum,
+        validation_input = torch.empty((2, o.requests.capacity), dtype=torch.bfloat16, device=device)
+        self.validation_shape = tuple(validation_input.shape)
+        self.validation = PreparedAllReduce(validation_input, torch.empty_like(validation_input),
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
-            session=o.session, name=name + ".allocation_validation")
-        self.allocator = PreparedCausalPrefixAllocation(
-            self.confidence, self.slots, self.submitted, self.source_valid, prefix_limits[:b],
-            o.inputs.query_lengths[:b], self.admitted, token_capacity=t.target_token_capacity,
-            request_capacity=o.requests.capacity)
+            session=o.session, name=name + ".allocation_validation").functional(session=o.session)
+        self.world = o.weights.shard.world_size
+        slots = torch.empty((b,), dtype=torch.int64, device=device)
+        submitted, source_valid, admitted = (torch.empty((b,), dtype=torch.bool, device=device) for _ in range(3))
+        self.allocator = PreparedCausalPrefixAllocation(confidence, slots, submitted, source_valid,
+            prefix_limits[:b], query_lengths, admitted, token_capacity=t.target_token_capacity,
+            request_capacity=o.requests.capacity).functional()
         runtime = getattr(o, "result_runtime", None)
         if runtime is None:
             runtime = o.collectives["vocabulary_runtime"]
-        self.broadcast = PreparedBroadcast((self.confidence,), runtime=runtime,
-            session=o.session, coordinator=o.collectives["coordinator"], name=name + ".confidence", buffers=buffers)
+        self.broadcast = PreparedBroadcast((confidence,), runtime=runtime, session=o.session,
+            coordinator=o.collectives["coordinator"], name=name + ".confidence").functional(session=o.session)
 
     def __call__(self):
         s, t = self.source, self.target
-        o = s.owner
-        b = s.batch
-        slots = o.inputs.row_slot_ids[:b]
-        safe = slots.long().clamp(0, o.requests.capacity - 1)
-        self.slots.copy_(slots)
+        o, batch = s.owner, s.batch
+        slots = o.inputs.row_slot_ids[:batch].long()
+        safe = slots.clamp(0, o.requests.capacity - 1)
         finished = ((slots >= 0) & (slots < o.requests.capacity)
-            & (o.inputs.row_generations[:b] == o.requests.generation[safe]) & (o.requests.status[safe] == 2))
-        self.submitted.copy_((self.rows < o.inputs.live_rows) & ~finished)
-        # The existing proposal validator must see the host-reserved ceiling.
-        # Allocation replaces this scratch only after proposal generation.
-        o.inputs.query_lengths[:b].copy_(self.prefix_limits[:b])
-        s.propose(False, self.confidence_head)
-        # Sampling has consumed this captured block even if confidence
-        # validation subsequently fails. Never reuse its draft draw reservation.
-        s.commit_draft_rng()
-        self.confidence_head()
-        self.confidence.copy_(self.confidence_head.output)
-        self.source_valid.copy_(s.active
-            & torch.isfinite(self.confidence).all(1)
-            & (self.confidence >= 0).all(1) & (self.confidence <= 1).all(1))
-        self.broadcast()
-        self.confidence.masked_fill_(~self.submitted[:, None], 0.)
+            & (o.inputs.row_generations[:batch] == o.requests.generation[safe]) & (o.requests.status[safe] == 2))
+        submitted = (torch.arange(batch, device=slots.device) < o.inputs.live_rows) & ~finished
+        o.inputs.query_lengths[:batch].copy_(self.prefix_limits[:batch])
+        probabilities = torch.empty(s.probability_shape, dtype=torch.float32, device=slots.device)
+        proposal = s.propose(advance_rng=False, probabilities=probabilities)
+        s.commit_draft_rng(proposal=proposal)
+        confidence = self.confidence_head(proposal)
+        source_valid = (proposal.active & torch.isfinite(confidence).all(1)
+                        & (confidence >= 0).all(1) & (confidence <= 1).all(1))
+        self.broadcast((confidence,))
+        confidence = confidence.masked_fill(~submitted[:, None], 0.)
         self.confidence_output.index_copy_(0, o.frame.to(torch.int64),
-            torch.nn.functional.pad(self.confidence, (0, self.confidence_output.shape[2] - self.confidence.shape[1],
-                                                     0, self.confidence_output.shape[1] - b)).unsqueeze(0))
-        self.allocator()
-        # Rank-zero confidence determines every prefix, but a validation failure
-        # on any rank suppresses commit everywhere. Collectives execute even for
-        # rejected cohorts so no peer can leave another inside a target collective.
-        self.validation_input.zero_()
-        self.validation_input[0, :b].copy_(self.admitted)
-        agreement = self.validation(self.validation_input)
-        cohort_valid = (~self.submitted | (agreement[0, :b] == self.world)).all()
-        self.admitted.logical_and_(cohort_valid)
-        o.inputs.query_lengths[:b].copy_(torch.where(self.admitted, o.inputs.query_lengths[:b], 0))
-        s.active.logical_and_(self.admitted)
-        for source, destination in ((s.before, t.before), (s.base_offset, t.base_offset),
-                (s.candidates, t.candidates), (s.drafts, t.drafts),
-                (s.probabilities, t.probabilities), (s.valid, t.valid)):
-            if destination.numel():
-                if destination.ndim > 1:
-                    destination.zero_()
-                    destination[:, :source.shape[1]].copy_(source)
-                else:
-                    destination.copy_(source)
-        t.active.copy_(s.active)
-        t.verify(self.admitted)
+            torch.nn.functional.pad(confidence, (0, self.confidence_output.shape[2] - confidence.shape[1],
+                0, self.confidence_output.shape[1] - batch)).unsqueeze(0))
+        admitted = self.allocator(confidence, slots, submitted, source_valid,
+            self.prefix_limits[:batch], o.inputs.query_lengths[:batch])
+        validation = torch.zeros(self.validation_shape, dtype=torch.bfloat16, device=slots.device)
+        validation[0, :batch].copy_(admitted)
+        agreement = self.validation(validation)
+        admitted = admitted & (~submitted | (agreement[0, :batch] == self.world)).all()
+        o.inputs.query_lengths[:batch].copy_(torch.where(admitted, o.inputs.query_lengths[:batch], 0))
+        pad = t.width - s.width
+        proposal = replace(proposal, active=proposal.active & admitted,
+            candidates=torch.nn.functional.pad(proposal.candidates, (0, pad)),
+            drafts=torch.nn.functional.pad(proposal.drafts, (0, pad)),
+            valid=torch.nn.functional.pad(proposal.valid, (0, pad)))
+        probabilities = torch.nn.functional.pad(probabilities, (0, 0, 0, pad))
+        return t.verify(admitted, probabilities=probabilities, proposal=proposal)

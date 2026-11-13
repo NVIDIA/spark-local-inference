@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Wrapped fixed Triton launches retain their actual prepared launch config."""
 
 from types import SimpleNamespace
@@ -154,9 +158,10 @@ def test_real_storage_serde_preserves_launch_options_and_dynamic_leaf_positions(
         leaves, tree, operands, [])
     signature = (((32,), (1,), 0, torch.float32, torch.device("cuda:0"), 0),)
     owner = SimpleNamespace(artifact=SimpleNamespace(serialize=lambda: b"inner artifact"),
-        inputs=[], invocations=[call], signature=signature, _serialized_artifact=None)
+        inputs=[], invocations=[call], signature=signature, _serialized_artifact=None, _tuning_frozen=False)
     payload = aot.StorageBackend.serialize_compile_artifacts(owner)
-    _, _, stored, _ = pickle.loads(payload)
+    _, _, stored, _, frozen = pickle.loads(payload)
+    assert frozen is False
     name, restored_leaves, restored_tree, restored_operands, restored_integers = stored[0]
     assert name[1] == (__name__, "_copy_launch")
     assert list(name[2].items()) == list(dict(constants, **traced.configs[0].all_kwargs()).items())
@@ -168,7 +173,7 @@ def test_real_storage_serde_preserves_launch_options_and_dynamic_leaf_positions(
     assert all(restored_leaves[position] is None for position in positions)
     assert constants == dict(N=32, enable_fp_fusion=False)
 
-    monkeypatch.setattr(aot, "_load_inductor", lambda artifact, device: (object(), None))
+    monkeypatch.setattr(aot, "_load_inductor", lambda artifact, device, *, frozen: (object(), None))
     restored = aot.StorageBackend.deserialize_compile_artifacts(payload)
     actual_launches = []
     monkeypatch.setattr(_copy_launch, "run",

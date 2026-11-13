@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Host- or graph-produced n-gram requests and asynchronous compact-row delivery.
 
 mod cache;
@@ -12,8 +18,9 @@ use crate::{
 #[cfg(unix)]
 pub use prepared::{PlaneSource, PreparedTables, SourceSegment, TableSource};
 pub(crate) use reader::Plane;
+#[cfg(feature = "server")]
+use std::fmt::Write;
 use std::{
-    fmt::Write,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -42,6 +49,7 @@ pub(crate) struct Stats {
 }
 
 impl Stats {
+    #[cfg(feature = "server")]
     pub(crate) fn render(&self, text: &mut String) {
         for (name, kind, help, counter) in [
             (
@@ -457,6 +465,7 @@ impl Shared {
         }))
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn stats(&self) -> Arc<Stats> {
         self.stats.clone()
     }

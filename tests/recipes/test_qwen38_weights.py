@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import os
@@ -101,3 +104,10 @@ def test_actual_layer_scales(manifest):
         assert scale_vectors[0].unique().numel() > 1
         assert scale_vectors[3].unique().numel() > 1
         assert scale_vectors[2].shape == (512,)
+
+
+def test_calibrated_experts_reject_missing_activation_scale():
+    sources = _scalars()
+    del sources[f"{TEXT_PREFIX}.layers.0.mlp.experts.5.down_proj.input_scale"]
+    with pytest.raises(ValueError, match="input_scale is required for calibrated NVFP4 activations"):
+        _expert_scale_vectors(sources, 0, (3, 5))

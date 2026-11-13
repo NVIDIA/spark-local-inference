@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM KDA state continuation through compiled graphs and native replay."""
 
 import os
@@ -96,15 +100,17 @@ def test_actual_kda_native_prefill_and_decode(world, tokens, decode_capacity, ov
             operators[mode] = PreparedGlmKDA(module, weights, source, scratch[mode], state, metadata[mode],
                 mode=mode, session=session, name=f"kda.{mode}", workspace=arena, checkpoint_export=mode == "prefill")
             assert (operators[mode].gate_overlap is not None) is overlap
+        for operator in operators.values():
+            operator.functional(session=session)
         session.tune()
+        arena.release_preparation()
         try:
             for mode, operator in operators.items():
                 source = inputs[mode]
 
-                def forward(operator=operator, source=source, active=working[mode]):
+                def forward(operator=operator, source=source, active=working[mode], meta=metadata[mode], out=scratch[mode].output):
                     active.copy_(source)
-                    operator(active)
-                    arena.tensor.fill_(255)
+                    out.copy_(operator(active, meta))
                     active.zero_()
 
                 compiled[mode] = compile_forward(forward)
@@ -120,7 +126,7 @@ def test_actual_kda_native_prefill_and_decode(world, tokens, decode_capacity, ov
             session.freeze()
             control = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                        "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                       "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device=device)}
+                       "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64, device=device)}
             bundle = PreparedExecution(device=0, graphs=graphs, buffers=control,
                 signatures={"prefill": GraphSignature("prefill", 1, prefill_capacity),
                             "decode": GraphSignature("decode", decode_capacity, 1)},
@@ -143,7 +149,7 @@ def test_actual_kda_native_prefill_and_decode(world, tokens, decode_capacity, ov
                 meta.num_tokens.fill_(count)
                 initial = (state.convolution.clone(), state.recurrent.clone())
                 for _ in range(repetitions):
-                    operators[mode](source)
+                    scratch[mode].output.copy_(operators[mode](source, meta))
                 expected = (scratch[mode].output.clone(), state.convolution.clone(), state.recurrent.clone())
                 state.convolution.copy_(initial[0])
                 state.recurrent.copy_(initial[1])

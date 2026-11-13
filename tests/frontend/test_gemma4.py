@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare prepared Gemma prompts and token IDs with Google's pinned templates."""
 
 import hashlib
@@ -41,7 +45,7 @@ def test_native_gemma_prompts_match_google(checkpoint, tmp_path):
     asset = chat_template_asset(ModelConfig.load(source).hidden)
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copyfile(source / name, tmp_path / name)
-    shutil.copyfile(asset["path"], tmp_path / "chat_template.jinja")
+    (tmp_path / "chat_template.jinja").write_text(asset["text"])
     fixtures = dict(cases=[], encode_cases=[], decode_cases=[], assets={})
     for path in tmp_path.iterdir():
         fixtures["assets"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()

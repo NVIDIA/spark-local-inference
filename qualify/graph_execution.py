@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare Python and Rust replay of the exact same prepared Qwen graph catalog."""
 
 from __future__ import annotations
@@ -414,9 +417,28 @@ class MutableReset:
                 sampler(prefix + ".sampler", owner.sampler)
         self.pristine_request = {field.name: getattr(requests, field.name).cpu().clone() for field in fields(requests)}
 
-    def reset(self):
-        if self.model.consumed:
+    def _require_idle_executor(self, executor):
+        if (executor is None or executor is not self.model.runtime or executor.outstanding != 0):
+            raise RuntimeError("qualification reset requires the model's idle native executor")
+
+    def retain_startup_bindings(self, executor):
+        """Preserve finalized tuning bytes without changing pristine sibling views."""
+        self._require_idle_executor(executor)
+        for tuner in self.model.tuning_graphs.values():
+            for field in (*tuner.outputs, tuner.status_buffer):
+                tensor = self.model.buffers[field]
+                if not tensor.is_contiguous():
+                    raise ValueError("qualification tuning buffers must be contiguous")
+                storage = tensor.untyped_storage()
+                _, raw, pristine = self.storage[storage.data_ptr()]
+                offset = tensor.data_ptr() - storage.data_ptr()
+                pristine[offset:offset + tensor.nbytes].copy_(raw[offset:offset + tensor.nbytes].cpu())
+
+    def reset(self, *, executor=None):
+        if self.model.consumed and executor is None:
             raise RuntimeError("Python reset is forbidden after native ownership handoff")
+        if executor is not None:
+            self._require_idle_executor(executor)
         self.state.backing.fill_(0x3D)
         self.state.backing[0].zero_()
         for _, device, pristine in self.storage.values():
@@ -730,7 +752,7 @@ class Scenario:
         self.extended_prefills()
         if self.next_page + 1 >= self.model.memory_report["pages"]:
             raise ValueError("prepared KV pool cannot cover scripted private pages and canaries")
-        if set(command["graph"] for group in self.groups for command in group) != set(self.model.graphs):
+        if set(command["graph"] for group in self.groups for command in group) != set(self.model.serving_graphs):
             raise ValueError("scenario must execute every prepared graph variant")
         if not any(len(group) == 2 for group in self.groups):
             raise ValueError("scenario requires two-frame execution")
@@ -769,7 +791,7 @@ class Scenario:
 def run_comparison(model, state, requests, scratch, cache, reset, scenario, evidence, progress):
     import torch
 
-    graph_indices = {name: index for index, name in enumerate(model.graphs)}
+    graph_indices = {graph["name"]: index for index, graph in enumerate(model.manifest()["graphs"])}
     tracked_rows = [*range(14), state.backing.shape[0] - 1]
     tracked_pages = scenario.next_page + 1
     if len(state.layout.regions) < 77 or state.backing.shape[0] <= 14:
@@ -800,8 +822,6 @@ def run_comparison(model, state, requests, scratch, cache, reset, scenario, evid
     sequence_sources = {command["sequence"]: torch.tensor([command["sequence"]], dtype=torch.int64)
         for group in scenario.groups for command in group}
     python_stream = torch.cuda.Stream(device=model.device)
-    reset_hashes = reset.hashes()
-    evidence.value["reset"]["python"] = reset_hashes
 
     def allocated():
         statistics = torch.cuda.memory_stats(model.device)
@@ -904,9 +924,16 @@ def run_comparison(model, state, requests, scratch, cache, reset, scenario, evid
 
     executor = None
     try:
+        executor = model.start_executor()
+        model.runtime = executor
+        reset.retain_startup_bindings(executor)
+        reset.reset(executor=executor)
+        reset_hashes = reset.hashes()
+        evidence.value["reset"]["python"] = reset_hashes
         for side in ("python", "native"):
             if side == "native":
-                reset.reset()
+                python_stream.synchronize()
+                reset.reset(executor=executor)
                 native_reset = reset.hashes()
                 evidence.value["reset"]["native"] = native_reset
                 evidence.check("identical_initial_storage_bytes", native_reset == reset_hashes)
@@ -914,9 +941,15 @@ def run_comparison(model, state, requests, scratch, cache, reset, scenario, evid
                     raise RuntimeError("model reset did not reproduce the Python baseline's initial bytes")
                 evidence.check("same_graph_handles_and_buffer_addresses", model.manifest() == evidence.value["manifest"])
                 if model.manifest() != evidence.value["manifest"]:
-                    raise RuntimeError("graph or buffer identity changed before handoff")
-                executor = model.start_executor()
-                model.runtime = executor
+                    raise RuntimeError("graph or buffer identity changed between comparison sides")
+            referenced = {binding["tuning_graph"] for graph in model.manifest()["graphs"]
+                          for binding in graph.get("tuned_bindings", ())}
+            for name in referenced:
+                tuner = model.tuning_graphs[name]
+                status = int(model.buffers[tuner.status_buffer].item())
+                evidence.check(f"{side}.startup.{name}.status", status == 0, status=status)
+                if status != 0:
+                    raise RuntimeError(f"{side} startup tuning graph {name!r} failed: {status}")
             reference = {}
             readback(side, "initial")
             previous_stage = "initial"

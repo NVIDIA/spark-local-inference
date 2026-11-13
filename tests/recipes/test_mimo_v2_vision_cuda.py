@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Pooled MiMo image scratch preserves compiled encoder and publication results."""
 
 import json
@@ -18,7 +22,7 @@ from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
-from ignition.recipes.mimo_v2.vision import FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch
+from ignition.recipes.mimo_v2.vision import FEATURES, PreparedVision, VisionInputs, VisionScratch
 from ignition.recipes.mimo_v2.vision_state import PreparedVisionGeneration
 from ignition.recipes.mimo_v2.vision_weights import VisionWeights
 
@@ -63,18 +67,18 @@ def test_pooled_encoder_publication_matches_unpooled_after_poisoning(weights, ca
     requests = DeviceRequestState.allocate(device, vocab_size=config["vocab_size"], capacity=2)
     requests.generation[0], requests.status[0] = 7, 1
     batch = BatchInputs.allocate(capacity, 1, device, capacity=2)
-    records = torch.zeros((2, 2, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 2, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     graphs, owners, states = {}, [], []
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         for pooled in (False, True):
             buffers = pool.cursor() if pooled else None
-            scratch = VisionScratch.allocate(capacity, weights.shard, device, buffers=buffers)
+            scratch = VisionScratch.allocate(capacity, weights.shard, device, hidden=config["hidden_size"], buffers=buffers)
             encoder = PreparedVision(weights, scratch, inputs, runtime=None, coordinator=None,
                 session=session, workspace=arena, name=f"vision-{pooled}", buffers=buffers)
             state = VisionState(batch, PrefillVisionInputs.allocate(capacity, device), requests,
-                image_token=config["image_token_id"], features=FEATURES, hidden=HIDDEN)
+                image_token=config["image_token_id"], features=FEATURES, hidden=config["hidden_size"])
             state.feature_slot.fill_(0)
             operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, buffers=buffers)
             states.append(state)

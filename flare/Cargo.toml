@@ -6,32 +6,40 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[features]
+# Multi-host collectives on Linux x86_64; links libibverbs.
+roce = ["flare-helios/roce"]
+# The prefix cache pool's data channel may use RDMA when its manager offers it (experimental).
+rdma = ["flare-helios/rdma"]
+
 [profile.release]
 strip = "symbols"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-clap = { version = "4.6", features = ["derive"] }
-flare-helios = { path = "../helios", features = ["runtime-package", "server"] }
+log = "0.4"
+ring = "0.17.14"
+flare-helios = { path = "../helios", features = ["runtime-core", "server"] }
 libc = "0.2.189"
 serde_json = "1.0"
 sha2 = "0.10.9"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 # Fetches each publisher's key file from its official source; TLS features unify with hf-hub's.
 ureq = "3"
+# Parses the untrusted Retry-After date form without arithmetic of our own.
+httpdate = "1"
+# Resolves untrusted redirect targets with a standards-compliant URL join.
+url = "2"
 libloading = "0.8.9"
-# Fleet control signs grants and encrypts agent sessions with the ring Helios already links.
-ring = "0.17.14"
-socket2 = "0.6"
 tempfile = "3"
 
 [dev-dependencies]
 prost = "0.14"
 
-# DGX Spark and Grace hosts serve multi-host packages over RoCEnante, which links libibverbs.
+# DGX Spark and Grace hosts serve multi-host cores over RoCEnante, which links libibverbs.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
-flare-helios = { path = "../helios", features = ["runtime-package", "server", "roce"] }
+flare-helios = { path = "../helios", features = ["runtime-core", "server", "roce"] }
 # sha2 0.10 gates ARM SHA-256 instructions behind its asm feature.
 sha2 = { version = "0.10.9", features = ["asm"] }
 

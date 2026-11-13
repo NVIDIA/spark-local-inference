@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared perception encoder with canonical transformer blocks and strided convolutions."""
 
 from dataclasses import dataclass

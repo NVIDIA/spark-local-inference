@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Recorded Qwen GDN verification and commit against b12x's per-token checkpointing decode."""
 
 import os
@@ -44,17 +48,17 @@ def _reference(tensors, columns):
     gdn_decode.run(gdn_decode.bind(plan, **tensors), eps=1e-6)
 
 
-def _backing(initial):
+def _backing(initial, prefix=4096, padding=8192):
     # Recurrent state as a pool would hold it: one region of a wider byte row per slot.
     slots = initial.shape[0]
     region = initial[0].numel() * 4
-    backing = torch.zeros((slots, region + 8192), dtype=torch.uint8, device=initial.device)
-    state = backing[:, 4096:4096 + region].view(torch.float32).view_as(initial)
+    backing = torch.zeros((slots, region + padding), dtype=torch.uint8, device=initial.device)
+    state = backing[:, prefix:prefix + region].view(torch.float32).view_as(initial)
     state.copy_(initial)
     return backing, state
 
 
-def _case(lengths):
+def _case(lengths, packed_inputs=False):
     """Random packed verification inputs and b12x's checkpointed decode of them."""
     from ignition.components.recurrent import DeltaMetadata
 
@@ -63,9 +67,14 @@ def _case(lengths):
     slots = 1 + rows * columns
     mixed = (torch.randn((tokens, 2 * KEY_HEADS * 128 + VALUE_HEADS * 128), generator=generator,
                          device="cuda") * 0.5).bfloat16()
-    ba = torch.randn((tokens, 2 * VALUE_HEADS), generator=generator, device="cuda").bfloat16()
+    if packed_inputs:
+        projected = torch.randn((tokens, 16480), generator=generator, device="cuda").bfloat16()
+        ba = projected[:, 16384:]
+        z = projected[:, 10240:16384].view(tokens, VALUE_HEADS, 128)
+    else:
+        ba = torch.randn((tokens, 2 * VALUE_HEADS), generator=generator, device="cuda").bfloat16()
+        z = torch.randn((tokens, VALUE_HEADS, 128), generator=generator, device="cuda").bfloat16()
     a, b = ba[:, VALUE_HEADS:], ba[:, :VALUE_HEADS]
-    z = torch.randn((tokens, VALUE_HEADS, 128), generator=generator, device="cuda").bfloat16()
     a_log = torch.rand(VALUE_HEADS, generator=generator, device="cuda") * 0.5
     dt_bias = torch.randn(VALUE_HEADS, generator=generator, device="cuda") * 0.1
     weight = (1 + 0.2 * torch.randn(128, generator=generator, device="cuda")).bfloat16()
@@ -107,21 +116,28 @@ def _recurrence(case, state, records):
     return gated.view_as(case["expected"])
 
 
-@pytest.mark.parametrize(("lengths", "accepted"), [((4,), (3,)), ((6, 6, 0, 6), (1, 6, 0, 2)), ((5, 2), (5, 1))])
-def test_recorded_verification_and_commit_match_checkpointing_decode(lengths, accepted):
+@pytest.mark.parametrize(("lengths", "accepted"), [
+    ((4,), (3,)), ((6, 6, 0, 6), (1, 6, 0, 2)), ((5, 2), (5, 1)),
+    *[((8,), (accepted,)) for accepted in range(1, 9)],
+])
+@pytest.mark.parametrize(("prefix", "padding", "alignment"), [(4096, 8192, 4), (4100, 8192, 1), (4096, 8196, 1)])
+@pytest.mark.parametrize("packed_inputs", [False, True])
+def test_recorded_verification_and_commit_match_checkpointing_decode(lengths, accepted, prefix, padding, alignment, packed_inputs):
     from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
 
-    case = _case(lengths)
+    case = _case(lengths, packed_inputs)
     initial, metadata, model_slots = case["initial"], case["metadata"], case["model_slots"]
     expected, reference_state, slots = case["expected"], case["reference_state"], case["slots"]
-    backing, state = _backing(initial)
+    backing, state = _backing(initial, prefix, padding)
     stacked = GDNLayerRecords.allocate((3,), slots, torch.device("cuda"), key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
     gated = _recurrence(case, state, stacked[3])
     # Verification leaves committed state untouched.
     assert torch.equal(state, initial)
     counts = torch.tensor(accepted, dtype=torch.int32, device="cuda")
-    PreparedGDNCommit(backing, {3: state}, stacked, metadata, counts, key_heads=KEY_HEADS,
-                      value_heads=VALUE_HEADS)()
+    commit = PreparedGDNCommit(backing, {3: state}, stacked, metadata, counts, key_heads=KEY_HEADS,
+                               value_heads=VALUE_HEADS)
+    assert commit.options["STATE_ALIGNMENT"] == alignment
+    commit()
 
     torch.testing.assert_close(gated, expected, rtol=2**-6, atol=2e-2)
     assert (gated == expected).float().mean() > 0.99
@@ -163,13 +179,186 @@ def test_compilation_sees_every_recovery_store():
         return set(get_mutated_tensors(kernel_side_table.add_kernel(kernel),
                                        kernel_side_table.add_constant_args(constants), kwargs, {}))
 
-    geometry = {"KEY_HEADS": KEY_HEADS, "VALUE_HEADS": VALUE_HEADS, "WINDOW": 8, "ROWS": 16}
-    for in_place, stores in ((False, {"Output", "Delta", "Keys", "Decay"}), (True, {"Output", "State"})):
+    geometry = {"KEY_HEADS": KEY_HEADS, "VALUE_HEADS": VALUE_HEADS, "WINDOW": 8, "RECORD_WIDTH": 8, "ROWS": 16}
+    for in_place, precomputed, stores in ((False, False, {"Output", "Delta", "Keys", "Decay"}),
+                                         (False, True, {"Output", "Delta"}),
+                                         (True, False, {"Output", "State"})):
         verify = mutated(gdn_recovery._verify, ("Mixed", "A", "B", "ALog", "DtBias", "State", "Starts", "Slots",
-            "NumSeqs", "Output", "Delta", "Keys", "Decay"), {**geometry, "SCALE": 0.1, "mixed_stride": 1,
-            "a_stride": 1, "b_stride": 1, "state_stride": 1, "slot_stride": 1, "IN_PLACE": in_place})
+            "NumSeqs", "Output", "Delta", "Keys", "Decay", "Queries", "Beta"), {**geometry, "SCALE": 0.1, "mixed_stride": 1,
+            "a_stride": 1, "b_stride": 1, "state_stride": 1, "slot_stride": 1, "IN_PLACE": in_place, "PRECOMPUTED": precomputed})
         assert verify == stores
+    prepare = mutated(gdn_recovery._prepare_inputs,
+        ("Mixed", "A", "B", "ALog", "DtBias", "Starts", "Slots", "NumSeqs", "Queries", "Keys", "Decay", "Beta"),
+        {"KEY_HEADS": KEY_HEADS, "VALUE_HEADS": VALUE_HEADS, "WINDOW": 8, "RECORD_WIDTH": 8,
+         "GROUP": 4, "SCALE": 0.1, "mixed_stride": 1, "a_stride": 1, "b_stride": 1, "slot_stride": 1})
+    assert prepare == {"Queries", "Keys", "Decay", "Beta"}
     commit = mutated(gdn_recovery._commit, ("State", "LayerOffsets", "Delta", "KeyRecords", "Decay", "Slots",
-        "Counts", "NumSeqs"), {**geometry, "ROWS_CAPACITY": 3, "state_stride": 1, "slot_stride": 1})
+        "Counts", "NumSeqs"), {**geometry, "ROWS_CAPACITY": 3, "state_stride": 1, "slot_stride": 1, "STATE_ALIGNMENT": 1})
     # The analysis may conservatively report every operand; it must include the state backing.
     assert "State" in commit
+
+
+@pytest.mark.parametrize("width", [13, 16])
+def test_wide_recovery_all_prefixes_with_poisoned_record_tail(width):
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+    from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit, PreparedRecoveredRecurrence
+    from ignition.components.recurrent import DeltaMetadata
+
+    base = _case((8,))
+    mixed, a, b, z = (torch.cat((base[name], base[name]), dim=0)[:width].contiguous()
+                       for name in ("mixed", "a", "b", "z"))
+    second_state = base["reference_state"].clone()
+    second_state[1].copy_(base["reference_state"][8])
+    tail = width - 8
+    tail_metadata = DeltaMetadata.allocate(1, torch.device("cuda"), verification_columns=8)
+    tail_metadata.query_start_loc.copy_(torch.tensor([0, tail], dtype=torch.int32, device="cuda"))
+    tail_metadata.state_indices[0].copy_(torch.arange(1, 9, device="cuda"))
+    tail_metadata.num_seqs.fill_(1)
+    tail_metadata.num_tokens.fill_(tail)
+    tail_output = torch.empty((tail, VALUE_HEADS, 128), dtype=torch.bfloat16, device="cuda")
+    _reference(dict(mixed_qkv=mixed[8:], a=a[8:], b=b[8:], A_log=base["a_log"],
+        dt_bias=base["dt_bias"], recurrent_state=second_state, z=z[8:], norm_weight=base["weight"],
+        query_start_loc=tail_metadata.query_start_loc, num_accepted_tokens=tail_metadata.accepted_tokens,
+        state_indices=tail_metadata.state_indices, num_seqs=tail_metadata.num_seqs,
+        num_tokens=tail_metadata.num_tokens, output=tail_output), 8)
+    expected = torch.cat((base["expected"], tail_output))
+    expected_states = torch.cat((base["reference_state"][1:9], second_state[1:tail + 1]))
+    metadata = DeltaMetadata.allocate(1, torch.device("cuda"), verification_columns=width)
+    metadata.query_start_loc.copy_(torch.tensor([0, width], dtype=torch.int32, device="cuda"))
+    metadata.state_indices[:, 0].fill_(1)
+    metadata.num_seqs.fill_(1)
+    metadata.num_tokens.fill_(width)
+    backing, state = _backing(base["initial"])
+    records = GDNLayerRecords.allocate((3,), 1, torch.device("cuda"),
+                                       key_heads=KEY_HEADS, value_heads=VALUE_HEADS, width=16)
+    recurrence = torch.empty((width, VALUE_HEADS * 128), dtype=torch.bfloat16, device="cuda")
+    gated = torch.empty_like(recurrence)
+    verify = PreparedRecoveredRecurrence(mixed_qkv=mixed, a=a, b=b, A_log=base["a_log"],
+        dt_bias=base["dt_bias"], state=state, metadata=metadata, output=recurrence,
+        records=records[3], key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
+    norm = PreparedGatedRMSNorm(recurrence.view(width, VALUE_HEADS, 128), z, base["weight"],
+        gated.view(width, VALUE_HEADS, 128), metadata.num_tokens, eps=1e-6, round_normalized=True)
+    counts = torch.ones(1, dtype=torch.int32, device="cuda")
+    commit = PreparedGDNCommit(backing, {3: state}, records, metadata, counts,
+                               key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
+    verify(); norm(); commit()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        verify(); norm(); commit()
+    for accepted in range(width + 1):
+        state.copy_(base["initial"])
+        counts.fill_(accepted)
+        for tensor in (records.delta, records.keys, records.decay, gated):
+            tensor.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        torch.testing.assert_close(gated.view_as(expected), expected, rtol=2**-6, atol=2e-2)
+        reference = base["initial"][1] if accepted == 0 else expected_states[accepted - 1]
+        torch.testing.assert_close(state[1], reference, rtol=1e-5, atol=1e-6)
+        if width < 16:
+            assert torch.isnan(records.delta[..., width:, :]).all()
+            assert torch.isnan(records.keys[..., width:, :]).all()
+            assert torch.isnan(records.decay[..., width:]).all()
+    graph.reset()
+
+
+def test_reused_graph_width_transitions_preserve_recurrent_history():
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+    from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit, PreparedRecoveredRecurrence
+    from ignition.components.recurrent import DeltaMetadata
+
+    base = _case((8,), packed_inputs=True)
+    device = torch.device("cuda")
+    backing, state = _backing(base["initial"])
+    mixed = torch.empty((16, 10240), device=device, dtype=torch.bfloat16)
+    projected = torch.empty((16, 16480), device=device, dtype=torch.bfloat16)
+    a, b = projected[:, 16432:], projected[:, 16384:16432]
+    z = projected[:, 10240:16384].view(16, VALUE_HEADS, 128)
+    output = torch.empty((16, VALUE_HEADS, 128), device=device, dtype=torch.bfloat16)
+    records = GDNLayerRecords.allocate((3,), 1, device, key_heads=KEY_HEADS, value_heads=VALUE_HEADS, width=16)
+    counts = torch.ones(1, device=device, dtype=torch.int32)
+    variants = {}
+    mixed.normal_(std=0.5)
+    projected.normal_()
+    for width in (1, 8, 16):
+        metadata = DeltaMetadata.allocate(1, device, verification_columns=width)
+        metadata.query_start_loc[1].fill_(width)
+        metadata.state_indices[:, 0].fill_(1)
+        metadata.num_seqs.fill_(1)
+        metadata.num_tokens.fill_(width)
+        recurrence = torch.empty((16, VALUE_HEADS * 128), device=device, dtype=torch.bfloat16)
+        verify = PreparedRecoveredRecurrence(mixed_qkv=mixed, a=a, b=b, A_log=base["a_log"],
+            dt_bias=base["dt_bias"], state=state, metadata=metadata, output=recurrence,
+            records=None if width == 1 else records[3], key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
+        norm = PreparedGatedRMSNorm(recurrence.view_as(output), z, base["weight"], output,
+                                   metadata.num_tokens, eps=1e-6, round_normalized=True)
+        commit = None if width == 1 else PreparedGDNCommit(backing, {3: state}, records, metadata, counts,
+                                                          key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
+        verify(); norm()
+        if commit is not None:
+            commit()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            verify(); norm()
+            if commit is not None:
+                commit()
+        variants[width] = (metadata, graph, verify, norm, commit)
+    state.copy_(base["initial"])
+    reference_state = base["initial"].clone()
+    reference_metadata = DeltaMetadata.allocate(1, device, verification_columns=8)
+    reference_metadata.state_indices[0].copy_(torch.arange(1, 9, device=device))
+    reference_metadata.num_seqs.fill_(1)
+    for width, length, accepted in ((1, 1, 1), (16, 16, 7), (8, 3, 2), (1, 0, 0),
+                                     (8, 8, 8), (16, 5, 0), (1, 1, 1), (16, 16, 16)):
+        mixed.normal_(std=0.5)
+        projected.normal_()
+        before = state.clone()
+        reference_state[1].copy_(state[1])
+        expected_chunks, checkpoints = [], []
+        for start in range(0, length, 8):
+            count = min(8, length - start)
+            reference_metadata.query_start_loc[1].fill_(count)
+            reference_metadata.num_tokens.fill_(count)
+            expected = torch.empty((count, VALUE_HEADS, 128), device=device, dtype=torch.bfloat16)
+            _reference(dict(mixed_qkv=mixed[start:start + count], a=a[start:start + count],
+                b=b[start:start + count], A_log=base["a_log"], dt_bias=base["dt_bias"],
+                recurrent_state=reference_state, z=z[start:start + count], norm_weight=base["weight"],
+                query_start_loc=reference_metadata.query_start_loc,
+                num_accepted_tokens=reference_metadata.accepted_tokens,
+                state_indices=reference_metadata.state_indices, num_seqs=reference_metadata.num_seqs,
+                num_tokens=reference_metadata.num_tokens, output=expected), 8)
+            expected_chunks.append(expected)
+            checkpoints.extend(reference_state[1:count + 1].clone().unbind())
+            reference_state[1].copy_(reference_state[count])
+        metadata, graph, _, norm, _ = variants[width]
+        recurrence = norm.args[0]
+        metadata.query_start_loc[1].fill_(length)
+        metadata.num_seqs.fill_(int(length > 0))
+        metadata.num_tokens.fill_(length)
+        counts.fill_(accepted)
+        for tensor in (recurrence, output, records.delta, records.keys, records.decay):
+            tensor.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        assert torch.equal(state[0], before[0])
+        assert torch.equal(state[2:], before[2:])
+        expected_state = checkpoints[accepted - 1] if accepted else before[1]
+        torch.testing.assert_close(state[1], expected_state, rtol=1e-5, atol=1e-6)
+        if length:
+            expected = torch.cat(expected_chunks)
+            torch.testing.assert_close(output[:length], expected, rtol=2**-6, atol=2e-2)
+            assert (output[:length] == expected).float().mean() > 0.99
+        assert torch.isnan(recurrence[length:]).all()
+        assert torch.equal(output[length:], torch.zeros_like(output[length:]))
+        if width > 1:
+            assert torch.isnan(records.delta[..., length:, :]).all()
+            assert torch.isnan(records.keys[..., length:, :]).all()
+            assert torch.isnan(records.decay[..., length:]).all()
+    for _, graph, *_ in variants.values():
+        graph.reset()

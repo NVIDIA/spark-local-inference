@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Routed experts survive the pickling that carries forward metadata to compiler workers."""
 
 import pickle

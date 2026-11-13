@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM patch uploads and generation-scoped image feature publication."""
 
 from dataclasses import dataclass
@@ -38,13 +41,16 @@ class VisionInputs:
 class PreparedVisionGeneration:
     def __init__(self, encoder, inputs, state, completion, frame, sequence):
         self.encoder, self.inputs, self.state = encoder, inputs, state
-        self.errors = torch.zeros(1, dtype=torch.int32, device=completion.records.device)
         self.publish = PreparedFeaturePublication(state, inputs, completion, frame, sequence)
 
     def __call__(self):
+        self.forward()
+
+    def forward(self):
         e, i, s = self.encoder, self.inputs, self.state
-        r, m = s.requests, e.metadata
-        capacity = e.scratch.patches.shape[0]
+        from .vision import VisionMetadata
+
+        r, capacity = s.requests, e.capacity
         slot = i.vision_slot.long().clamp(0, r.capacity - 1)
         count, offset = i.vision_num_patches, i.vision_feature_offset
         features = count // 4
@@ -59,13 +65,12 @@ class PreparedVisionGeneration:
         pixels, positions = i.vision_pixel_values[:capacity], i.vision_position_ids[:capacity]
         valid &= (~live[:, None] | torch.isfinite(pixels)).all()
         valid &= (~live[:, None] | ((positions >= 0) & (positions < capacity))).all()
-        self.errors.copy_(~valid)
-        e.scratch.patches.copy_(torch.where(valid & live[:, None], pixels, 0))
-        m.position_ids.copy_(torch.where(valid & live[:, None], positions, 0))
-        m.cu_seqlens.copy_(torch.where(valid, i.vision_cu_seqlens, 0))
-        m.num_patches.copy_(torch.where(valid, count, 0))
-        output = e(e.scratch.patches)
+        errors = (~valid).to(torch.int32)
+        m = VisionMetadata(torch.where(valid & live[:, None], positions, 0),
+            torch.where(valid, i.vision_cu_seqlens, 0), torch.where(valid, count, 0))
+        output = e(torch.where(valid & live[:, None], pixels, 0).to(torch.bfloat16), m)
         feature_live = torch.arange(capacity // 4, device=count.device) < features
         finite = (~feature_live[:, None] | torch.isfinite(output)).all()
-        self.errors.copy_(self.errors | (~finite).int() * 64)
-        self.publish(output, m.num_patches // 4, self.errors)
+        errors = errors | (~finite).int() * 64
+        self.publish(output, m.num_patches // 4, errors)
+        return output, errors

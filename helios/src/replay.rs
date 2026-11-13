@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};

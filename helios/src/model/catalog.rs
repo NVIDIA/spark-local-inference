@@ -1,9 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Shared validation and selection for every prepared model's graph catalog.
 
 use crate::{
     Result,
     execution::{
-        BATCH_CAPACITIES, ExecutionManifest, GraphKind, ABI_VERSION, SamplingMode,
+        BATCH_CAPACITIES, ExecutionManifest, GraphKind, SamplingMode,
     },
     model::ModelConfig,
     scheduler::speculation,
@@ -64,6 +70,10 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         return Err("invalid prepared model configuration".into());
     }
     speculation::validate_widths(&config.speculative_widths)?;
+    if config.completion_token_capacity != manifest.completion_token_capacity
+        || config.speculative_widths.iter().any(|&width| width > manifest.completion_token_capacity) {
+        return Err("model widths exceed the declared completion capacity".into());
+    }
     if !config.speculative_widths.is_empty() && config.speculative_token_capacity == 0 {
         return Err("speculative token capacity must be positive".into());
     }
@@ -79,8 +89,6 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         if config.speculative_proposal_source == speculation::ProposalSource::Copy {
             return Err("copy proposal source requires speculative graphs".into());
         }
-    } else if manifest.abi_version != ABI_VERSION {
-        return Err("speculative catalog requires ABI4".into());
     }
     for graph in &manifest.graphs {
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)
@@ -243,7 +251,7 @@ pub fn select_shape_with_drafts(
             }
             GraphKind::Speculative => {
                 config.speculative_widths.contains(&tokens)
-                    && drafts <= 7
+                    && drafts < config.completion_token_capacity
                     && packed >= batch && packed <= batch.saturating_mul(tokens)
                     && (tokens == 1 || packed <= config.speculative_token_capacity)
             }

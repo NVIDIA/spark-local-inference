@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Structural checkpoint configuration for the Qwen3.5 dense architecture."""
 
 from dataclasses import dataclass
@@ -16,6 +19,7 @@ PAGE_TOKENS = 128
 class ModelConfig:
     text: dict
     quantization: dict
+    draft: object = None
 
     @classmethod
     def load(cls, snapshot):
@@ -60,3 +64,14 @@ class ModelConfig:
     @property
     def vocabulary(self):
         return self.text["vocab_size"]
+
+    @property
+    def pack_gdn_inputs(self):
+        from ignition.preparation.quantization import linear_format
+
+        names = tuple(f"{TEXT_PREFIX}.layers.{index}.linear_attn.in_proj_{part}"
+                      for index, kind in enumerate(self.layers) if kind == "linear_attention"
+                      for part in ("qkv", "z", "b", "a"))
+        return bool(names) and all(name in self.quantization
+                                   and linear_format(self.quantization, name) == "mxfp8"
+                                   for name in names)

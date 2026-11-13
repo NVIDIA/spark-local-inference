@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Reproduce the b12x dense MXFP8 GEMM stage-reuse race (local-inference-lab/flashinfer#16) on SM120/SM121.
 
 The GEMM's producer warp refills a reclaimed shared-memory stage with TMA (async proxy) once the

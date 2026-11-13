@@ -1,10 +1,12 @@
-"""Identify explicitly declared disposable backing storage for package export."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Identify explicitly declared disposable backing storage for core export."""
 
 from dataclasses import fields, is_dataclass
 
 import torch
-
-from ignition.preparation.scratch import GraphBufferPool, GraphBuffers
 
 
 def storage_ranges(values):
@@ -24,10 +26,6 @@ def storage_ranges(values):
         elif is_dataclass(value):
             for field in fields(value):
                 visit(getattr(value, field.name))
-        elif isinstance(value, GraphBufferPool):
-            visit(value.chunks)
-        elif isinstance(value, GraphBuffers):
-            visit(value.pool)
         elif isinstance(value, dict):
             for child in value.values():
                 visit(child)

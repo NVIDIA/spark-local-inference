@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """V4 footer-aware window transfers and orthogonal index rotation."""
 
 import os
@@ -16,7 +20,6 @@ pytestmark = pytest.mark.skipif(
 
 @torch.no_grad()
 def test_compressed_indices_expand_both_c128_records_across_page_boundaries():
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.deepseek4.attention import AttentionIndices
 
     device = torch.device("cuda", 0)
@@ -24,12 +27,14 @@ def test_compressed_indices_expand_both_c128_records_across_page_boundaries():
     metadata.page_table.copy_(torch.tensor([[3, 1]], device=device))
     metadata.state_rows.fill_(1)
     metadata.positions.copy_(torch.tensor([127, 128, 255, 256, 511, -1], device=device))
-    buffers = GraphBufferPool(device)
-    indices = AttentionIndices(metadata, mode="verify", tokens=6, visible=None, buffers=buffers.cursor())
-    c4, c128 = indices.compressed(4), indices.compressed(128)
+    indices = AttentionIndices(metadata, mode="verify", tokens=6, visible=None)
+    indices.compressed(4)
+    indices.compressed(128)
     dense = torch.empty((6, 4), dtype=torch.int32, device=device)
     indices.dense_pages(dense)
-    indices()
+    indices.functional()
+    packet = indices(metadata)
+    c4, c128, dense = packet.ratios[4], packet.ratios[128], packet.dense
     assert c4.slots.tolist() == [223, 224, 255, 64, 127, -1]
     assert c128.slots.tolist() == [6, 7, 7, 2, 3, -1]
     assert c128.lengths.tolist() == [1, 1, 2, 2, 4, 0]
@@ -44,7 +49,6 @@ def test_draft_attention_modes_preserve_noncausal_visibility_and_request_isolati
 
     from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.deepseek4.attention import AttentionIndices
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -63,21 +67,21 @@ def test_draft_attention_modes_preserve_noncausal_visibility_and_request_isolati
     metadata.positions[:2 * block].copy_(
         (metadata.starts[:2, None] + torch.arange(block, device=device)).flatten()
     )
-    buffers = GraphBufferPool(device)
-    indices = AttentionIndices(metadata, mode="draft", tokens=rows * block, visible=None, buffers=buffers.cursor())
+    indices = AttentionIndices(metadata, mode="draft", tokens=rows * block, visible=None)
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         writer = PreparedCompressedCacheWriter(values, cache, slots, page_size=span, kind="swa",
             cache_format="deepseek_v4", session=session, name="draft_write")
         outputs = {mode: torch.empty_like(query) for mode in ("extend", "decode")}
         attentions = [PreparedCompressedMLA(query, cache, indices.window_indices, indices.window_lengths,
             sink, output, window_page_size=span, mode=mode, cache_format="deepseek_v4", session=session,
-            name=mode, workspace=None) for mode, output in outputs.items()]
+            name=mode, workspace=None).functional(session=session) for mode, output in outputs.items()]
+        indices.functional()
 
         def forward():
-            indices()
+            packet = indices(metadata)
             writer(values)
-            for attention in attentions:
-                attention()
+            for attention, output in zip(attentions, outputs.values(), strict=True):
+                output.copy_(attention(query, packet.window_indices, packet.window_lengths))
 
         compiled = compile_forward(forward)
         compiled()
@@ -89,8 +93,9 @@ def test_draft_attention_modes_preserve_noncausal_visibility_and_request_isolati
             for output in outputs.values():
                 output.fill_(float("nan"))
             graph.replay()
-            expected = compressed_sparse_mla_reference(query, cache, indices.window_indices,
-                indices.window_lengths, sm_scale=512**-0.5, attn_sink=sink, swa_page_size=span,
+            packet = indices(metadata)
+            expected = compressed_sparse_mla_reference(query, cache, packet.window_indices,
+                packet.window_lengths, sm_scale=512**-0.5, attn_sink=sink, swa_page_size=span,
                 cache_format="deepseek_v4")
             for output in outputs.values():
                 torch.testing.assert_close(output.float(), expected.float(), atol=0.012, rtol=0.08)
@@ -272,7 +277,7 @@ def test_checkpoint_attention_alternates_prefill_decode_and_rejected_verificatio
     from ignition.components.rotary import CompressedRotary as Rotary
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.deepseek4.attention import AttentionScratch, PreparedAttention
     from ignition.recipes.deepseek4.config import REVISION
     from ignition.recipes.deepseek4.pool import ContinuationPool
@@ -296,7 +301,6 @@ def test_checkpoint_attention_alternates_prefill_decode_and_rejected_verificatio
     pool = ContinuationPool.allocate(config, 3, 4, device)
     arena, rotary = ScratchArena(device, overlap=overlap), Rotary(config, device)
     # The three graphs share their private buffers, as serving graphs on one rank do.
-    buffers = GraphBufferPool(device)
     source = torch.randn((256, 4096), dtype=torch.bfloat16, device=device)
     variants = {}
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
@@ -319,16 +323,16 @@ def test_checkpoint_attention_alternates_prefill_decode_and_rejected_verificatio
                 session=session,
                 name=mode,
                 workspace=arena,
-                buffers=buffers.cursor(),
             )
             if not overlap:
                 assert attention.concurrent_compression is None
                 assert attention.concurrent_index is None
 
-            def forward(attention=attention, inputs=inputs, mode=mode, counts=counts):
-                attention(inputs)
+            def forward(attention=attention, inputs=inputs, mode=mode, counts=counts, metadata=metadata, scratch=scratch):
+                output, records = attention(inputs, metadata)
+                scratch.output.copy_(output)
                 if mode == "verify":
-                    attention.commit(counts)
+                    attention.commit(counts, records, metadata)
 
             pending.append((mode, inputs, metadata, scratch, counts, forward))
         arena.finalize()
@@ -358,10 +362,6 @@ def test_checkpoint_attention_alternates_prefill_decode_and_rejected_verificatio
             m.live_counts.copy_(torch.tensor([size, 1], device=device))
             counts.fill_(accepted)
             arena.tensor.fill_(0x7F if row == 1 else 0x33)
-            # Every launch must rewrite its private buffers before reading them.
-            for chunks in buffers.chunks.values():
-                for chunk in chunks:
-                    chunk.view(torch.uint8).fill_(0x5A if row == 1 else 0xC3)
             graph.replay()
             return scratch.output[:size].clone()
 

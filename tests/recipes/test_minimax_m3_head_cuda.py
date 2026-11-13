@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Sampled target normalization with shared activation storage and checkpoint gains."""
 
 import json
@@ -16,7 +19,6 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VL
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.rms_norm import PreparedIndexedRMSNorm
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.minimax_m3.config import ModelConfig, TEXT_PREFIX
 from ignition.recipes.minimax_m3.decoder import PreparedDecoder, Scratch
@@ -31,9 +33,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1" or
 def test_sampled_normalization_reads_residual_rows_with_disjoint_output(samples):
     config = ModelConfig.load(CHECKPOINT)
     device = torch.device("cuda:0")
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    scratch = Scratch.allocate(config, TensorParallelShard(0, 4), 4096, samples, device,
-                               buffers=pool.cursor())
+    scratch = Scratch.allocate(config, TensorParallelShard(0, 4), 4096, samples, device)
     name = TEXT_PREFIX + ".norm.weight"
     index = json.loads((CHECKPOINT / "model.safetensors.index.json").read_text())
     with safe_open(CHECKPOINT / index["weight_map"][name], framework="pt", device="cpu") as file:
@@ -47,18 +47,17 @@ def test_sampled_normalization_reads_residual_rows_with_disjoint_output(samples)
     with RecordedPreparationSession(device=device, checkpoint="minimax-head",
             workload_schema="minimax-head", numerical_policy="default", compile_workers=1) as session:
         decoder.norm = PreparedIndexedRMSNorm(scratch.residual, indices, weight, scratch.hidden,
-            eps=config.text["rms_norm_eps"], zero_centered=True, session=session, name="head_norm")
+            eps=config.text["rms_norm_eps"], zero_centered=True, session=session, name="head_norm").functional()
         session.tune()
-        forward = compile_forward(decoder.normalize_head)
+        forward = compile_forward(lambda: scratch.hidden.copy_(decoder.norm(scratch.residual, indices)))
         forward()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             forward()
         session.freeze()
         for shift in (0, 113, 511):
-            for chunks in pool.chunks.values():
-                for chunk in chunks:
-                    chunk.view(torch.uint8).fill_(0xFF)
+            scratch.residual.view(torch.uint8).fill_(0xFF)
+            scratch.hidden.view(torch.uint8).fill_(0xFF)
             scratch.residual.normal_(std=.2)
             indices.copy_((torch.linspace(0, 4095, samples, device=device).long() + shift) % 4096)
             if shift == 113 and samples > 1:

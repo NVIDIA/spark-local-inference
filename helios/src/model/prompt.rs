@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Prepared frontend syntax and image layouts construct shared request data.
 
 use crate::{
@@ -168,6 +174,33 @@ pub(crate) fn validate_conditioned_inputs(
     Ok(())
 }
 
+/// Reasoning delimiters that the tokenizer encodes as one token which decodes back
+/// to the delimiter, for output parsers that gate on token identity. Generated text
+/// spells them in ordinary pieces when it mentions them, so only the token delimits.
+/// Grammars and output parsers must share one derivation.
+pub fn reasoning_delimiter_tokens(
+    frontend: &Frontend,
+    syntax: &super::contract::FrontendContract,
+) -> Result<Vec<(u32, String)>> {
+    let Some(reasoning) = syntax
+        .reasoning
+        .as_ref()
+        .filter(|_| crate::output::OutputPipeline::gates_reasoning_tokens(syntax))
+    else {
+        return Ok(vec![]);
+    };
+    let mut tokens = Vec::new();
+    for marker in [&reasoning.open, &reasoning.close] {
+        if let [id] = frontend.encode(marker, false)?[..] {
+            if frontend.decode(&[id], false)? == *marker {
+                tokens.push((id, marker.clone()));
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+/// `delimiters` comes from `reasoning_delimiter_tokens` for this frontend and contract.
 pub fn prepare_output(
     config: &ModelConfig,
     frontend: &Frontend,
@@ -175,6 +208,7 @@ pub fn prepare_output(
     messages: &[Value],
     options: &Map<String, Value>,
     structured: bool,
+    delimiters: &[(u32, String)],
 ) -> Result<crate::output::OutputConfig> {
     let syntax = &config.contract.frontend;
     let effective = |name: &str| {
@@ -242,17 +276,19 @@ pub fn prepare_output(
     if !tools.is_empty() && syntax.tools.is_none() {
         return Err("tool parsing is not prepared".into());
     }
-    let control_tokens = if syntax
+    let mut control_tokens = if syntax
         .tools
         .as_ref()
-        .is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Xtml)
+        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem))
     {
-        ["<|open|>", "<|close|>", "<|sep|>"]
-            .into_iter()
+        let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
+            vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+        } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
+        markers.into_iter()
             .map(|marker| {
                 let ids = frontend.encode(marker, false)?;
                 if ids.len() != 1 {
-                    return Err("XTML delimiters must each occupy one tokenizer token".into());
+                    return Err("output envelope delimiters must each occupy one tokenizer token".into());
                 }
                 Ok((ids[0], marker.to_owned()))
             })
@@ -260,7 +296,32 @@ pub fn prepare_output(
     } else {
         vec![]
     };
-    let start = if !tools.is_empty()
+    if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
+        let tokenizer = frontend.tokenizer();
+        for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,
+                      deepseek_recipe_core::special_tokens::SpecialToken::Dsml] {
+            let name = token.default_str();
+            if let Some(&id) = tokenizer.get_added_vocabulary().get_vocab().get(name) {
+                if !delimiters.iter().any(|(existing, _)| *existing == id) {
+                    control_tokens.push((id, name.to_owned()));
+                }
+            }
+        }
+    }
+    control_tokens.extend_from_slice(delimiters);
+    let recipient = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::Atem);
+    if recipient {
+        reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
+    }
+    let start = if recipient && !open_assistant {
+        crate::output::tagged::OutputStart::RecipientFrame
+    } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
+        crate::output::tagged::OutputStart::RecipientHeader
+    } else if recipient && prefix.is_some_and(|p| {
+        p.starts_with(" to=") && ![" to=self<|message|>", " to=user<|message|>", " to=commentary<|message|>"].iter().any(|m|p.starts_with(m))
+    }) {
+        crate::output::tagged::OutputStart::ToolBody
+    } else if !tools.is_empty()
         && syntax.tools.as_ref().is_some_and(|tool| {
             tool.kind == super::contract::ToolParserKind::Dsml
                 && prefix.is_some_and(|suffix| {
@@ -495,6 +556,7 @@ mod tests {
                 &[json!({"role":"assistant", "content":literal})],
                 json!({"continue_final_message":true}).as_object().unwrap(),
                 false,
+                &[],
             )
             .unwrap();
             assert_eq!(
@@ -503,6 +565,154 @@ mod tests {
                 "{literal}"
             );
         }
+    }
+
+    /// ASCII byte tokens 0..128, then `added` as non-special tokens from 128.
+    fn ascii_frontend(added: &[&str]) -> Frontend {
+        let vocab: tokenizers::models::bpe::Vocab = (0..128)
+            .map(|id| ((id as u8 as char).to_string(), id))
+            .collect();
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer
+            .add_tokens(
+                added
+                    .iter()
+                    .map(|text| tokenizers::AddedToken::from(*text, false))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        tokenizer_frontend(&tokenizer)
+    }
+
+    fn tokenizer_frontend(tokenizer: &tokenizers::Tokenizer) -> Frontend {
+        use crate::frontend::{Asset, FrontendAssets};
+        use sha2::{Digest, Sha256};
+        static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "flare-ascii-frontend-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let asset = |name: &str, bytes: &[u8]| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            Asset {
+                range: None,
+                path,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }
+        };
+        let frontend = Frontend::load(
+            FrontendAssets {
+                tokenizer: asset(
+                    "tokenizer.json",
+                    tokenizer.to_string(false).unwrap().as_bytes(),
+                ),
+                tokens: Default::default(),
+                chat_template: Some(asset(
+                    "chat_template.jinja",
+                    b"{% mark %}{{ messages[0].content }}",
+                )),
+            },
+            Map::new(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        frontend
+    }
+
+    #[test]
+    fn single_token_reasoning_delimiters_gate_generated_output() {
+        use crate::output::{Event, Input, OutputPipeline, Termination};
+        let mut config = super::super::tests::config();
+        config.contract.frontend = serde_json::from_str::<crate::model::PreparedContract>(
+            include_str!("../../tests/support/contracts/qwen38.json"),
+        )
+        .unwrap()
+        .frontend;
+        let rendered = RenderedPrompt {
+            message_boundaries: Vec::new(),
+            image_sources: vec![],
+            image_checkpoint_hints: vec![],
+            text: format!("{}<think>\n", config.contract.frontend.assistant_marker),
+            token_ids: vec![],
+        };
+        let options = json!({"add_generation_prompt":true});
+        let prepare = |frontend: &Frontend| {
+            prepare_output(
+                &config,
+                frontend,
+                &rendered,
+                &[],
+                options.as_object().unwrap(),
+                false,
+                &reasoning_delimiter_tokens(frontend, &config.contract.frontend).unwrap(),
+            )
+            .unwrap()
+        };
+        assert!(prepare(&ascii_frontend(&[])).control_tokens.is_empty());
+        let frontend = ascii_frontend(&["<think>", "</think>"]);
+        let output = prepare(&frontend);
+        assert_eq!(
+            output.content.start,
+            crate::output::tagged::OutputStart::Reasoning
+        );
+        assert_eq!(
+            output.control_tokens,
+            [(128, "<think>".to_owned()), (129, "</think>".to_owned())]
+        );
+        let unknown = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let unknown = tokenizer_frontend(&tokenizers::Tokenizer::new(unknown));
+        assert_eq!(unknown.encode("</think>", false).unwrap(), [0]);
+        assert!(prepare(&unknown).control_tokens.is_empty());
+        let mut dsml = config.contract.frontend.clone();
+        dsml.tools = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/deepseek41.json"
+        ))
+        .unwrap()
+        .frontend
+        .tools;
+        assert_eq!(reasoning_delimiter_tokens(&frontend, &dsml).unwrap(),
+            [(128, "<think>".to_owned()), (129, "</think>".to_owned())]);
+        let spelled = |text: &str| text.bytes().map(u32::from).collect::<Vec<_>>();
+        let tokens = [
+            spelled("Quote </think> here.\n"),
+            vec![129],
+            spelled("\n\nWrite <think> too."),
+        ]
+        .concat();
+        let mut parser = OutputPipeline::new(output);
+        let mut events = Vec::new();
+        for token in tokens {
+            events.extend(parser.push(Input::Token(token)).unwrap());
+            events.extend(
+                parser
+                    .push(Input::Text(&frontend.decode(&[token], false).unwrap()))
+                    .unwrap(),
+            );
+        }
+        events.extend(parser.finish(Termination::Eos).unwrap());
+        let text = |reasoning: bool| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Reasoning(text) if reasoning => Some(text.as_str()),
+                    Event::Content(text) if !reasoning => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(text(true), "Quote </think> here.");
+        assert_eq!(text(false), "Write <think> too.");
     }
 
     #[test]
@@ -544,6 +754,7 @@ mod tests {
                 case["messages"].as_array().unwrap(),
                 case["options"].as_object().unwrap(),
                 false,
+                &[],
             )
             .unwrap();
             assert_eq!(
@@ -579,7 +790,8 @@ mod tests {
                         &rendered,
                         &messages,
                         options.as_object().unwrap(),
-                        false
+                        false,
+                        &[],
                     )
                     .unwrap()
                     .content
@@ -602,7 +814,8 @@ mod tests {
                 &rendered,
                 &messages,
                 json!({"continue_final_message":true}).as_object().unwrap(),
-                false
+                false,
+                &[],
             )
             .unwrap()
             .content
@@ -653,6 +866,7 @@ mod tests {
                     &[json!({"role":"user","content":"Hello"})],
                     options.as_object().unwrap(),
                     true,
+                    &[],
                 )
                 .unwrap();
                 assert_eq!(output.content.start, expected, "{suffix}");
@@ -712,6 +926,7 @@ mod tests {
                 &[json!({"role":"user","content":"Hi"})],
                 json!({"add_generation_prompt":true}).as_object().unwrap(),
                 false,
+                &[],
             )
             .unwrap();
             assert_eq!(output.content.start, expected, "{text}");

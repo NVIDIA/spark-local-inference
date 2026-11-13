@@ -1,15 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepare Step-5's ChatML template for inference without training-span annotations."""
 
 import json
 from pathlib import Path
-
-from tokenizers import Tokenizer
 
 from ignition.preparation.frontend import prepare_frontend as _prepare_frontend
 from ignition.preparation.frontend import annotated_template_asset, tokenizer_settings
 
 
 def prepare_frontend(snapshot, *, eos_token_ids):
+    from tokenizers import Tokenizer
+
     snapshot = Path(snapshot)
     settings = tokenizer_settings(json.loads((snapshot / "tokenizer_config.json").read_text()))
     tokenizer = Tokenizer.from_file(str(snapshot / "tokenizer.json"))
@@ -24,7 +27,7 @@ def prepare_frontend(snapshot, *, eos_token_ids):
 
 
 def inference_template(snapshot):
-    return Path(template_asset(snapshot)["path"]).read_text()
+    return template_asset(snapshot)["text"]
 
 
 def template_asset(snapshot):
@@ -33,7 +36,7 @@ def template_asset(snapshot):
     if source.count(opening) != 1 or source.count(closing) != 1:
         raise ValueError("Step-5 chat template must contain one assistant generation span")
     source = source.replace(opening, b"{%- if true %}").replace(closing, b"{%- endif %}")
-    return annotated_template_asset(source, Path(__file__).with_name("assets") / "chat_template.jinja")
+    return annotated_template_asset(source, Path(__file__).with_name("assets") / "chat_template.patch.json")
 
 
 def runtime_assets(snapshot):

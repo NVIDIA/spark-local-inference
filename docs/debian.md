@@ -6,11 +6,11 @@ for the installed system's architecture. The ARM64 build includes RoCE support
 for DGX Spark. The package contains serving, host-agent, and Orbit commands.
 Ignition, Python, model weights,
 and the CUDA toolkit are separate preparation inputs. Serving uses the NVIDIA
-driver installed by DGX OS and a model package matching the GPU architecture and
+driver installed by DGX OS and a model core matching the GPU architecture and
 tensor-parallel size.
 
 The Debian package name distinguishes the inference server from Ubuntu's `flare`
-game package. The command remains `flare`.
+game package. The command is `flare`.
 
 ## Install
 
@@ -32,8 +32,9 @@ the executable to `~/.local/lib/flare-agent/flare`. Orbit uses that copy for bot
 the agent and default serving; `orbit run --executable PATH` selects an uploaded
 override. After a Debian package upgrade, stop the groups that agent serves and
 rerun `/usr/bin/flare agent install` to update the copy and restart the service.
-Pass `--listen IP:PORT` again if the listener was customized. Existing identities
-and caches remain. Restart saved groups explicitly; agent startup does not
+Pass `--listen IP:PORT` again if the listener was customized. The installer
+preserves identities and caches. Restart saved groups explicitly; agent
+startup does not
 restore them. Check `command -v flare` when another installed executable might
 take precedence over `/usr/bin/flare`.
 

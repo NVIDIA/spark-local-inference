@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Model licenses read from checkpoint model cards for the acceptance disclosure."""
 
 from ignition.preparation.model_card import model_license

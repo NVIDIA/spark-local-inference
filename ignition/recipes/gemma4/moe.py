@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Gemma 4 routed GeGLU MoE with BF16 and NVFP4 expert execution."""
 
 import math
@@ -9,7 +13,7 @@ from ignition.components.collectives import PreparedAllReduce
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.triton import prepare_triton
 
-from .attention import prepare_projection, rms_norm, rms_norm_no_scale
+from .attention import declaration_tensor, prepare_projection, rms_norm, rms_norm_no_scale
 from .weights import BF16ExpertsWeight, NVFP4ExpertsWeight
 
 BLOCK_M = 16
@@ -17,93 +21,10 @@ BLOCK_N = 64
 BLOCK_K = 64
 
 
-@triton.jit
-def _init_bins_kernel(
-    expert_counts,
-    tile_expert_ids,
-    sorted_pair_ids,
-    NUM_EXPERTS: tl.constexpr,
-    MAX_TILES: tl.constexpr,
-    MAX_PADDED_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    tl.store(sorted_pair_ids + offsets, -1, mask=offsets < MAX_PADDED_ROWS)
-    tl.store(tile_expert_ids + offsets, -1, mask=offsets < MAX_TILES)
-    tl.store(expert_counts + offsets, 0, mask=offsets < NUM_EXPERTS)
-
-
-@triton.jit
-def _count_routes_kernel(
-    top_k_index,
-    num_valid_tokens,
-    expert_counts,
-    pair_ranks,
-    TOP_K: tl.constexpr,
-    TOTAL_PAIRS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    pair_ids = pid * BLOCK + tl.arange(0, BLOCK)
-    valid_tokens = tl.load(num_valid_tokens).to(tl.int32)
-    valid_pairs = valid_tokens * TOP_K
-    mask = (pair_ids < TOTAL_PAIRS) & (pair_ids < valid_pairs)
-    expert = tl.load(top_k_index + pair_ids, mask=mask, other=0).to(tl.int32)
-    ranks = tl.atomic_add(expert_counts + expert, 1, mask=mask)
-    tl.store(pair_ranks + pair_ids, ranks, mask=mask)
-
-
-@triton.jit
-def _scan_experts_kernel(
-    expert_counts,
-    expert_tile_starts,
-    expert_tile_counts,
-    NUM_EXPERTS: tl.constexpr,
-    TILE_M: tl.constexpr,
-):
-    experts = tl.arange(0, NUM_EXPERTS)
-    counts = tl.load(expert_counts + experts).to(tl.int32)
-    tiles = (counts + TILE_M - 1) // TILE_M
-    starts = tl.cumsum(tiles, axis=0) - tiles
-    tl.store(expert_tile_starts + experts, starts)
-    tl.store(expert_tile_counts + experts, tiles)
-
-
-@triton.jit
-def _scatter_routes_kernel(
-    top_k_index,
-    num_valid_tokens,
-    pair_ranks,
-    expert_tile_starts,
-    sorted_pair_ids,
-    tile_expert_ids,
-    TOP_K: tl.constexpr,
-    TOTAL_PAIRS: tl.constexpr,
-    TILE_M: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    pair_ids = pid * BLOCK + tl.arange(0, BLOCK)
-    valid_tokens = tl.load(num_valid_tokens).to(tl.int32)
-    valid_pairs = valid_tokens * TOP_K
-    mask = (pair_ids < TOTAL_PAIRS) & (pair_ids < valid_pairs)
-    expert = tl.load(top_k_index + pair_ids, mask=mask, other=0).to(tl.int32)
-    rank = tl.load(pair_ranks + pair_ids, mask=mask, other=0).to(tl.int32)
-    tile_start = tl.load(expert_tile_starts + expert, mask=mask, other=0).to(tl.int32)
-    dest = tile_start * TILE_M + rank
-    tl.store(sorted_pair_ids + dest, pair_ids, mask=mask)
-    tile_idx = tile_start + (rank // TILE_M)
-    tl.store(tile_expert_ids + tile_idx, expert, mask=mask)
-
-
-@triton.jit
-def _gelu_tanh(x):
-    c = 0.7978845608028654
-    k = 0.044715
-    inner = c * (x + k * x * x * x)
-    return 0.5 * x * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
-
+from ignition.components.bf16_experts import (
+    _init_bins_kernel, _count_routes_kernel, _scan_experts_kernel, _scatter_routes_kernel,
+    _moe_bf16_stage1_kernel, _moe_bf16_stage2_kernel, _gelu_tanh,
+)
 
 @triton.jit
 def _dequant_e2m1(nibble):
@@ -116,121 +37,6 @@ def _dequant_e2m1(nibble):
         tl.where(mag == 5, 3.0, tl.where(mag == 6, 4.0, 6.0)),
     )
     return val * sign
-
-
-@triton.jit
-def _moe_bf16_stage1_kernel(
-    source,
-    gate_up_proj,
-    sorted_pair_ids,
-    tile_expert_ids,
-    intermediate,
-    TOP_K: tl.constexpr,
-    HIDDEN: tl.constexpr,
-    INTER: tl.constexpr,
-    TILE_M: tl.constexpr,
-    TILE_N: tl.constexpr,
-    TILE_K: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    n_id = tl.program_id(1)
-    expert = tl.load(tile_expert_ids + tile_id).to(tl.int64)
-    if expert < 0:
-        return
-    m_offs = tl.arange(0, TILE_M)
-    n_offs = n_id * TILE_N + tl.arange(0, TILE_N)
-    n_mask = n_offs < INTER
-    pairs = tl.load(sorted_pair_ids + tile_id * TILE_M + m_offs).to(tl.int64)
-    m_mask = pairs >= 0
-    tokens = tl.where(m_mask, pairs // TOP_K, 0)
-
-    gate_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    up_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    expert_base = gate_up_proj + expert * (2 * INTER) * HIDDEN
-
-    for k_start in range(0, HIDDEN, TILE_K):
-        k_offs = k_start + tl.arange(0, TILE_K)
-        k_mask = k_offs < HIDDEN
-        x_tile = tl.load(
-            source + tokens[:, None] * HIDDEN + k_offs[None, :],
-            mask=m_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        w_gate = tl.load(
-            expert_base + n_offs[None, :] * HIDDEN + k_offs[:, None],
-            mask=k_mask[:, None] & n_mask[None, :],
-            other=0.0,
-        )
-        w_up = tl.load(
-            expert_base + (INTER + n_offs)[None, :] * HIDDEN + k_offs[:, None],
-            mask=k_mask[:, None] & n_mask[None, :],
-            other=0.0,
-        )
-        gate_acc += tl.dot(x_tile, w_gate)
-        up_acc += tl.dot(x_tile, w_up)
-
-    gate_val = _gelu_tanh(gate_acc.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
-    up_val = up_acc.to(tl.bfloat16).to(tl.float32)
-    out = (gate_val * up_val).to(tl.bfloat16)
-    safe_pairs = tl.where(m_mask, pairs, 0)
-    tl.store(
-        intermediate + safe_pairs[:, None] * INTER + n_offs[None, :],
-        out,
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
-
-
-@triton.jit
-def _moe_bf16_stage2_kernel(
-    intermediate,
-    down_proj,
-    top_k_weights,
-    sorted_pair_ids,
-    tile_expert_ids,
-    routed_out,
-    HIDDEN: tl.constexpr,
-    INTER: tl.constexpr,
-    TILE_M: tl.constexpr,
-    TILE_N: tl.constexpr,
-    TILE_K: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    n_id = tl.program_id(1)
-    expert = tl.load(tile_expert_ids + tile_id).to(tl.int64)
-    if expert < 0:
-        return
-    m_offs = tl.arange(0, TILE_M)
-    n_offs = n_id * TILE_N + tl.arange(0, TILE_N)
-    n_mask = n_offs < HIDDEN
-    pairs = tl.load(sorted_pair_ids + tile_id * TILE_M + m_offs).to(tl.int64)
-    m_mask = pairs >= 0
-    safe_pairs = tl.where(m_mask, pairs, 0)
-
-    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    expert_base = down_proj + expert * HIDDEN * INTER
-
-    for k_start in range(0, INTER, TILE_K):
-        k_offs = k_start + tl.arange(0, TILE_K)
-        k_mask = k_offs < INTER
-        x_tile = tl.load(
-            intermediate + safe_pairs[:, None] * INTER + k_offs[None, :],
-            mask=m_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        w_down = tl.load(
-            expert_base + n_offs[None, :] * INTER + k_offs[:, None],
-            mask=k_mask[:, None] & n_mask[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(x_tile, w_down)
-
-    weights = tl.load(top_k_weights + safe_pairs, mask=m_mask, other=0.0).to(tl.float32)
-    out = (acc.to(tl.bfloat16).to(tl.float32) * weights[:, None]).to(tl.bfloat16)
-    tl.store(
-        routed_out + safe_pairs[:, None] * HIDDEN + n_offs[None, :],
-        out,
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
 
 
 @triton.jit
@@ -502,7 +308,7 @@ class PreparedMoE:
         session,
         name: str,
         workspace,
-        buffers,
+        examples,
     ):
         self.config = config
         self.eps = config.rms_norm_eps
@@ -522,11 +328,11 @@ class PreparedMoE:
         max_tiles = min(total_pairs, triton.cdiv(total_pairs, BLOCK_M) + self.num_experts)
         max_padded_rows = max_tiles * BLOCK_M
 
-        def zeros(shape, dtype=torch.bfloat16):
-            return buffers.zeros(shape, dtype)
+        def zeros(role, shape, dtype=torch.bfloat16):
+            return declaration_tensor(examples, "moe." + role, shape, dtype, source.device)
 
-        self.router_input = zeros((tokens, self.hidden))
-        self.router_logits = zeros((tokens, self.num_experts))
+        self.router_input = zeros("router_input", (tokens, self.hidden))
+        self.router_logits = zeros("router_logits", (tokens, self.num_experts))
         self.router_proj = prepare_projection(
             self.router_input,
             weights["router_proj"],
@@ -535,19 +341,19 @@ class PreparedMoE:
             name=name + ".router_proj",
             workspace=workspace,
         )
-        self.moe_input = zeros((tokens, self.hidden))
-        self.top_k_index = zeros((total_pairs,), torch.int32)
-        self.top_k_weights = zeros((total_pairs,), torch.float32)
-        self.expert_counts = zeros((self.num_experts,), torch.int32)
-        self.expert_tile_starts = zeros((self.num_experts,), torch.int32)
-        self.expert_tile_counts = zeros((self.num_experts,), torch.int32)
-        self.pair_ranks = zeros((total_pairs,), torch.int32)
-        self.sorted_pair_ids = zeros((max_padded_rows,), torch.int32)
-        self.tile_expert_ids = zeros((max_tiles,), torch.int32)
-        self.intermediate = zeros((total_pairs, self.inter))
-        self.routed_out = zeros((total_pairs, self.hidden))
-        self.partial_out = zeros((tokens, self.hidden))
-        self.reduced_out = zeros((tokens, self.hidden))
+        self.moe_input = zeros("moe_input", (tokens, self.hidden))
+        self.top_k_index = zeros("top_k_index", (total_pairs,), torch.int32)
+        self.top_k_weights = zeros("top_k_weights", (total_pairs,), torch.float32)
+        self.expert_counts = zeros("expert_counts", (self.num_experts,), torch.int32)
+        self.expert_tile_starts = zeros("expert_tile_starts", (self.num_experts,), torch.int32)
+        self.expert_tile_counts = zeros("expert_tile_counts", (self.num_experts,), torch.int32)
+        self.pair_ranks = zeros("pair_ranks", (total_pairs,), torch.int32)
+        self.sorted_pair_ids = zeros("sorted_pair_ids", (max_padded_rows,), torch.int32)
+        self.tile_expert_ids = zeros("tile_expert_ids", (max_tiles,), torch.int32)
+        self.intermediate = zeros("intermediate", (total_pairs, self.inter))
+        self.routed_out = zeros("routed_out", (total_pairs, self.hidden))
+        self.partial_out = zeros("partial_out", (tokens, self.hidden))
+        self.reduced_out = zeros("reduced_out", (tokens, self.hidden))
         self.reduce = PreparedAllReduce(
             self.partial_out,
             self.reduced_out,
@@ -696,26 +502,45 @@ class PreparedMoE:
                 num_warps=4,
             )
 
-    def __call__(self, residual: torch.Tensor) -> torch.Tensor:
-        tokens = residual.shape[0]
+    def functional(self, *, session):
+        names = ("router_input", "router_logits", "moe_input", "top_k_index", "top_k_weights",
+                 "expert_counts", "expert_tile_starts", "expert_tile_counts", "pair_ranks",
+                 "sorted_pair_ids", "tile_expert_ids", "intermediate", "routed_out", "partial_out", "reduced_out")
+        self.layout = {name: (tuple(getattr(self, name).shape), getattr(self, name).dtype) for name in names}
+        slots = {id(getattr(self, name)): name for name in names}
+        slots[id(self.num_valid_tokens)] = "num_valid_tokens"
+        for operation in (self.init_bins, self.count_routes, self.scan_experts, self.scatter_routes,
+                          self.stage1, self.stage2):
+            operation.scratch_slots = tuple((i, slots[id(value)]) for i, value in enumerate(operation.args)
+                                            if id(value) in slots)
+            indices = {i for i, _ in operation.scratch_slots}
+            operation.args = tuple(None if i in indices else value for i, value in enumerate(operation.args))
+        self.router_proj.functional(session=session)
+        self.reduce.functional(session=session)
+        for name in (*names, "num_valid_tokens"):
+            setattr(self, name, None)
+        return self
+
+    def __call__(self, residual, *, num_valid_tokens):
+        from ignition.preparation.triton import launch_triton
+
+        scratch = {name: torch.zeros(shape, dtype=dtype, device=residual.device)
+                   for name, (shape, dtype) in self.layout.items()}
+        scratch["num_valid_tokens"] = num_valid_tokens
         r_in = rms_norm_no_scale(residual, self.eps) * self.router_scale * self.root_scale
-        self.router_input.copy_(r_in)
-        self.router_proj(self.router_input)
-        probs = torch.softmax(self.router_logits.float(), dim=-1)
-        top_k_weights, top_k_index = torch.topk(probs, k=self.top_k, dim=-1)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_weights * self.per_expert_scale[top_k_index]
-        self.top_k_index.copy_(top_k_index.reshape(-1).to(torch.int32))
-        self.top_k_weights.copy_(top_k_weights.reshape(-1).to(torch.float32))
-        self.moe_input.copy_(rms_norm(residual, self.pre_norm, self.eps))
-
-        self.init_bins()
-        self.count_routes()
-        self.scan_experts()
-        self.scatter_routes()
-        self.stage1()
-        self.stage2()
-
-        self.partial_out.copy_(self.routed_out.view(tokens, self.top_k, self.hidden).sum(dim=1))
-        reduced = self.reduce(self.partial_out)
-        return rms_norm(reduced, self.post_norm, self.eps)
+        logits = self.router_proj(r_in)
+        probs = torch.softmax(logits.float(), dim=-1)
+        weights, indices = torch.topk(probs, k=self.top_k, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.per_expert_scale[indices]
+        scratch["top_k_index"].copy_(indices.reshape(-1).to(torch.int32))
+        scratch["top_k_weights"].copy_(weights.reshape(-1).to(torch.float32))
+        scratch["moe_input"].copy_(rms_norm(residual, self.pre_norm, self.eps))
+        for operation in (self.init_bins, self.count_routes, self.scan_experts, self.scatter_routes,
+                          self.stage1, self.stage2):
+            args = list(operation.args)
+            for index, name in operation.scratch_slots:
+                args[index] = scratch[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        partial = scratch["routed_out"].view(residual.shape[0], self.top_k, self.hidden).sum(dim=1)
+        return rms_norm(self.reduce(partial), self.post_norm, self.eps)

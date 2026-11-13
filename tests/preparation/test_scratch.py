@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """CPU ownership and address-stability contracts for serialized operator scratch."""
 
 import weakref
@@ -8,13 +12,71 @@ import torch
 from b12x._lib.scratch import ScratchBufferSpec, scratch_tensor
 from b12x.preparation import PreparationSession
 
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena, bind_scratch, planned_scratch, scratch_storage
+from ignition.preparation.scratch import (
+    GraphBufferPool, ScratchArena, bind_scratch, buffer_rows, planned_scratch, scratch_storage,
+)
 from ignition.preparation.tuning import register_finalizer
 
 
 def spec(nbytes, *, dtype=torch.uint8, shape=None, device="cpu"):
     return ScratchBufferSpec(name="workspace", shape=(nbytes,) if shape is None else shape,
                              dtype=dtype, device=torch.device(device))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_named_row_views_reuse_identity_and_preserve_contents_and_geometry(dtype):
+    backing = torch.arange(60, dtype=dtype).reshape(6, 10)[:, 1:9:2]
+    values = {"source": backing}
+    full = buffer_rows(values, "source", 6)
+    prefix = buffer_rows(values, "source", 3)
+    assert full is not backing
+    assert buffer_rows(values, "source", 6) is full
+    assert buffer_rows(values, "source", 3) is prefix
+    assert prefix.shape == (3, 4)
+    assert prefix.dtype == dtype
+    assert prefix.stride() == backing.stride()
+    assert prefix.storage_offset() == backing.storage_offset()
+    assert prefix.untyped_storage()._cdata == backing.untyped_storage()._cdata
+    expected = backing.clone()
+    expected[:3].add_(2)
+    before = backing._version
+    prefix.add_(2)
+    assert backing._version == full._version == prefix._version == before + 1
+    assert torch.equal(buffer_rows(values, "source", 6), expected)
+
+
+@pytest.mark.parametrize("replacement_rows", [4, 8])
+def test_named_row_views_follow_source_replacement_and_retain_previous_storage(replacement_rows):
+    backing = torch.full((4, 3), 7, dtype=torch.int32)
+    values = {"source": backing}
+    original = buffer_rows(values, "source", 2)
+    replacement = torch.full((replacement_rows, 3), 11, dtype=torch.int32)
+    values["source"] = replacement
+    rebound = buffer_rows(values, "source", 2)
+    assert rebound is buffer_rows(values, "source", 2)
+    assert rebound is not original
+    assert rebound.shape == original.shape == (2, 3)
+    assert rebound.untyped_storage()._cdata == replacement.untyped_storage()._cdata
+    assert original.untyped_storage()._cdata == backing.untyped_storage()._cdata
+    rebound.fill_(13)
+    assert (replacement[:2] == 13).all()
+    assert (replacement[2:] == 11).all()
+    assert (original == 7).all() and (backing == 7).all()
+
+
+def test_named_row_views_keep_names_distinct_and_remain_exportable_scratch():
+    from ignition.preparation.disposable import storage_ranges
+
+    backing = torch.zeros((4, 3))
+    values = {"first": backing, "second": backing}
+    first = buffer_rows(values, "first", 2)
+    second = buffer_rows(values, "second", 2)
+    assert first is not second
+    assert first is buffer_rows(values, "first", 2)
+    assert second is buffer_rows(values, "second", 2)
+    assert first.untyped_storage()._cdata == second.untyped_storage()._cdata
+    storage = backing.untyped_storage()
+    assert storage_ranges(values) == ((storage.data_ptr(), storage.nbytes()),)
 
 
 def test_named_operands_share_capacity_across_shapes_without_overlapping_within_a_call():
@@ -39,53 +101,6 @@ def test_named_operands_share_capacity_across_shapes_without_overlapping_within_
         bind_scratch(dict(scores=((1,), torch.int32)), device="cpu", workspace=workspace)
 
 
-def test_graph_cursor_reuses_space_skipped_by_larger_buffers_without_moving_live_views():
-    pool = GraphBufferPool("cpu", chunk_bytes=512)
-    first = pool.cursor()
-    small = first.zeros((129,), torch.uint8)
-    large = first.zeros((768,), torch.uint8)
-    tail = first.zeros((256,), torch.uint8)
-    assert pool.nbytes == 1280
-    assert tail.data_ptr() == small.data_ptr() + 256
-    for value, tensor in enumerate((small, large, tail), 1):
-        tensor.fill_(value)
-    for value, tensor in enumerate((small, large, tail), 1):
-        assert torch.all(tensor == value)
-    pointers = tuple(t.data_ptr() for t in (small, large, tail))
-    second = pool.cursor()
-    wide = second.zeros((768,), torch.uint8)
-    narrow = second.zeros((512,), torch.uint8)
-    assert pool.nbytes == 1280
-    assert wide.data_ptr() == large.data_ptr() and narrow.data_ptr() == small.data_ptr()
-    assert tuple(t.data_ptr() for t in (small, large, tail)) == pointers
-    wide.fill_(17)
-    narrow.fill_(23)
-    assert torch.all(large == 17) and torch.all(small == 23) and torch.all(tail == 23)
-
-
-def test_sequential_stage_cursors_preserve_live_values_and_concurrent_branches():
-    pool = GraphBufferPool("cpu", chunk_bytes=1024)
-    graph = pool.cursor()
-    live = graph.full(256, 7, torch.uint8)
-    attention, experts = graph.fork(), graph.fork()
-    attended = attention.zeros(512, torch.uint8)
-    shared = experts.zeros(256, torch.uint8)
-    routed = experts.zeros(512, torch.uint8)
-    assert attended.data_ptr() == shared.data_ptr()
-    assert routed.data_ptr() == shared.data_ptr() + 256
-    graph.join(attention, experts)
-    retained = graph.full(256, 11, torch.uint8)
-    attended.fill_(13)
-    assert torch.all(live == 7) and torch.all(retained == 11)
-    shared.fill_(17)
-    routed.fill_(19)
-    assert torch.all(shared == 17) and torch.all(routed == 19)
-    assert torch.all(live == 7) and torch.all(retained == 11)
-    assert pool.nbytes == 2048
-    with pytest.raises(ValueError, match="share a pool"):
-        graph.join(GraphBufferPool("cpu").cursor())
-
-
 def test_rank_scratch_finalization_preserves_shared_offsets(monkeypatch):
     import torch.distributed as dist
 
@@ -104,6 +119,32 @@ def test_rank_scratch_finalization_preserves_shared_offsets(monkeypatch):
     assert owner.side.storage_offset() == 512
     assert owner.main.untyped_storage()._cdata == owner.side.untyped_storage()._cdata == arena.tensor.untyped_storage()._cdata
     assert arena.nbytes == 1024
+
+
+def test_trial_binding_replaces_parallel_plans_and_retains_finalizers():
+    arena = ScratchArena("cpu")
+    class Plan:
+        def __init__(self, size):
+            self.size = size
+
+        def memory_requirements(self):
+            return SimpleNamespace(scratch_nbytes=self.size)
+
+    original, replacement, side = Plan(128), Plan(384), Plan(256)
+    arena.register_parallel(original, side)
+    arena.reserve(1024)
+    bound = []
+    arena.register_finalizer(lambda: bound.append(arena.views(((64,), torch.uint8))[0]))
+    arena.finalize(retain=True)
+    assert len(bound) == 1 and bound[0].data_ptr() == arena.tensor.data_ptr()
+    arena.replace_parallel_plans({original: replacement})
+    assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 768
+    arena.finalize()
+    assert len(bound) == 2 and bound[1].data_ptr() == bound[0].data_ptr()
+    assert arena._finalizers == []
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="frozen"):
+        arena.replace_parallel_plans({replacement: original})
 
 
 def test_arena_owns_one_aligned_highwater_storage_across_operator_specs():
@@ -131,6 +172,106 @@ def test_arena_owns_one_aligned_highwater_storage_across_operator_specs():
         assert view.shape == (requirement,)
         assert scratch_tensor(view, (spec(requirement),), owner="test").data_ptr() == second.data_ptr()
     assert arena.nbytes == 512
+
+
+def test_preparation_release_drops_backing_after_binding_finalization():
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    backing = weakref.ref(arena.tensor)
+    bound_sizes = []
+    arena.register_finalizer(lambda: bound_sizes.append(arena.nbytes))
+    arena.freeze()
+    arena.finalize()
+    assert bound_sizes == [1024]
+    arena.release_preparation()
+    assert backing() is None
+    assert arena.nbytes == 0 and arena.device == torch.device("cpu")
+    empty = arena.tensor
+    arena.release_preparation()
+    assert arena.tensor is empty
+
+
+def test_preparation_release_rejects_unfinished_binding_without_dropping_storage():
+    arena = ScratchArena("cpu")
+    backing = arena.reserve(256)
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    arena.register_finalizer(lambda: None)
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    assert arena.tensor is backing and arena.nbytes == 256
+    arena.finalize()
+    arena.release_preparation()
+    assert arena.nbytes == 0
+
+
+def test_declaration_owners_release_after_all_bindings_with_backing_alive():
+    arena = ScratchArena("cpu")
+    arena.reserve(512)
+    events = []
+    arena.register_finalizer(lambda: events.append(("binding", arena.nbytes)))
+    arena.register_preparation_release(lambda: events.append(("owner", arena.nbytes)))
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    assert events == []
+    arena.finalize()
+    arena.release_preparation()
+    arena.release_preparation()
+    assert events == [("binding", 512), ("owner", 512)]
+    assert arena.nbytes == 0
+
+
+def test_failed_declaration_release_preserves_backing_and_can_retry():
+    arena = ScratchArena("cpu")
+    backing = arena.reserve(256)
+    attempts = []
+
+    def release():
+        attempts.append(arena.nbytes)
+        if len(attempts) == 1:
+            raise RuntimeError("declaration owner is still in use")
+
+    arena.register_preparation_release(release)
+    arena.freeze()
+    arena.finalize()
+    with pytest.raises(RuntimeError, match="owner is still in use"):
+        arena.release_preparation()
+    assert arena.tensor is backing
+    arena.release_preparation()
+    assert attempts == [256, 256]
+    assert arena.nbytes == 0
+
+
+def test_preparation_release_registration_rejects_invalid_and_retired_owners():
+    arena = ScratchArena("cpu")
+    with pytest.raises(TypeError, match="must be callable"):
+        arena.register_preparation_release(None)
+    arena.freeze()
+    arena.finalize()
+    arena.release_preparation()
+    with pytest.raises(RuntimeError, match="storage has been released"):
+        arena.register_preparation_release(lambda: None)
+
+
+@pytest.mark.parametrize("operation", [
+    lambda arena: arena.reserve(0),
+    lambda arena: arena.reserve(256),
+    lambda arena: arena.views(((0,), torch.uint8)),
+    lambda arena: arena.trim(0),
+    lambda arena: arena.finalize(),
+    lambda arena: arena.auxiliary_stream,
+])
+def test_released_arena_rejects_storage_and_binding_reuse(operation):
+    arena = ScratchArena("cpu")
+    arena.reserve(256)
+    arena.freeze()
+    arena.finalize()
+    arena.release_preparation()
+    with pytest.raises(RuntimeError, match="storage has been released"):
+        operation(arena)
+    assert arena.nbytes == 0
 
 
 def test_serial_arena_admits_no_auxiliary_stream_or_concurrent_plans():
@@ -377,6 +518,36 @@ def test_trim_to_zero_releases_arena_owner_without_invalidating_existing_views()
     arena.trim(0)
     assert arena.nbytes == 0 and view.eq(11).all()
     assert view.data_ptr() == pointer and view.untyped_storage().nbytes() == 256
+
+
+def test_trim_releases_unshared_candidate_before_selected_allocation(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def inspect(size, **kwargs):
+        if size == 512:
+            assert original() is None
+            assert arena.nbytes == 0
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", inspect)
+    arena.trim(257)
+    assert arena.nbytes == 512
+
+
+def test_trim_allocation_failure_leaves_empty_unfrozen_storage(monkeypatch):
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    original = weakref.ref(arena.tensor)
+    allocate = torch.empty
+    def fail(size, **kwargs):
+        if size == 512:
+            raise torch.OutOfMemoryError("selected allocation unavailable")
+        return allocate(size, **kwargs)
+    monkeypatch.setattr(torch, "empty", fail)
+    with pytest.raises(torch.OutOfMemoryError, match="selected allocation"):
+        arena.trim(257)
+    assert original() is None and arena.nbytes == 0 and not arena.frozen
 
 
 @pytest.mark.parametrize("nbytes", [-1, True, False, 1.5, "256", None, 257])

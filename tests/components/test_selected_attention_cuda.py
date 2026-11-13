@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared sparse GQA and region selection retain capture-stable b12x programs."""
 
 import os
@@ -34,10 +37,11 @@ def check_graph(operation, output, arena, expected, **tolerance):
     torch.testing.assert_close(output, expected, **tolerance)
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("tokens", [3, 129])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_prepared_selected_attention(tokens, gated, kv_dtype):
+def test_prepared_selected_attention(tokens, gated, kv_dtype, functional):
     torch.manual_seed(92)
     device = torch.device("cuda:0")
     q = torch.randn(tokens, 8, 192, device=device, dtype=torch.bfloat16)
@@ -69,6 +73,11 @@ def test_prepared_selected_attention(tokens, gated, kv_dtype):
         session.freeze()
         arena.finalize()
         arena.freeze()
+        if functional:
+            attention = operation.functional(session=session)
+            arena.release_preparation()
+            def operation():
+                return output.copy_(attention(q, pages, requests, positions, selected, output_gate=gate))
         check_graph(operation, output, arena, expected, rtol=.02, atol=.004)
 
 

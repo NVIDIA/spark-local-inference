@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Recipe presets and retained CLI controls for packed GPU prefix selection."""
 
 from dataclasses import replace
@@ -30,7 +33,7 @@ def test_layout_selection_is_not_a_cli_argument():
     assert not hasattr(args, "draft_prefix_selection")
 
 
-@pytest.mark.parametrize("command", ("export", "serve"))
+@pytest.mark.parametrize("command", ("export", "debug-serve"))
 @pytest.mark.parametrize("flags", [
     ("--packed-verification",), ("--packed-verification=true",),
     ("--draft-prefix-selection", "cpu"), ("--draft-prefix-selection=gpu",),

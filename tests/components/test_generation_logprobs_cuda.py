@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """The prepared reduction reads raw logits and only the committed positions."""
 import os
 
@@ -12,7 +16,7 @@ def test_raw_reduction_ties_frames_and_replay(vocab, dtype):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.logprobs import PreparedLogprobs
     device = 'cuda'
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     logits = torch.randn((2, 3, vocab), device=device, dtype=dtype)
     # More than twenty equal maxima exercises the cutoff's ID ordering.
     logits[0, :, :32] = 20
@@ -75,7 +79,7 @@ def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled, co
     from ignition.components.completion import CompletionOutputs
     from ignition.components.sampling import DeviceRequestState, PreparedSampling, RequestAdmission
     from ignition.preparation.compilation import compile_forward
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='cuda')
+    outputs = CompletionOutputs.allocate((2, 4, 32), device='cuda')
     state = DeviceRequestState.allocate('cuda', vocab_size=4096)
     state.admit(2, RequestAdmission(9, 42, top_k=1, temperature=.3, top_p=.9,
         min_p=.1, repetition_penalty=1.8, presence_penalty=2, frequency_penalty=.5), [1, 2, 2])
@@ -108,7 +112,7 @@ def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled, co
         _assert_entry(outputs.logprobs[0, 2, 0], logits[0], 32, ids=ids or None)
 
 
-@pytest.mark.parametrize('width', [1, 3, 8])
+@pytest.mark.parametrize('width', [1, 3, 8, 13, 16, 32])
 @pytest.mark.parametrize('compiled', [False, True])
 @pytest.mark.parametrize('count', [0, 21])
 def test_speculative_logprobs_follow_committed_target_positions_and_token_limits(width, compiled, count):
@@ -119,7 +123,7 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
     device = 'cuda'
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     for slot in range(4):
-        state.admit(slot, RequestAdmission(9, 10, max_new_tokens=20), [1, 2], consumed_tokens=2)
+        state.admit(slot, RequestAdmission(9, 10, max_new_tokens=max(20, width + 1)), [1, 2], consumed_tokens=2)
         state.pending_token[slot] = 10
         state.generated_tokens[slot] = 1
     state.max_new_tokens[1] = 2
@@ -134,7 +138,7 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
     epochs = torch.tensor([9, 9, 8, 9], dtype=torch.int64, device=device)
     live = torch.tensor([3], dtype=torch.int32, device=device)
     limits = torch.tensor([width, 1, width, width], dtype=torch.int32, device=device)
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 16 + max(width, 8)), device=device)
     outputs.requested.fill_(1)
     ids = list(reversed(range(count)))
     outputs.token_id_counts.fill_(count)
@@ -179,7 +183,7 @@ def test_subtraction_rounding_ties_choose_lowest_ids_even_at_cutoff():
     from ignition.components.completion import CompletionOutputs
     from ignition.components.logprobs import PreparedLogprobs
     device = 'cuda'
-    outputs = CompletionOutputs.allocate((2, 1, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 1, 32), device=device)
     outputs.requested.fill_(1)
     record = outputs.records[0, 0]
     record[0], record[4], record[5], record[8], record[15] = 9, 3, 1, 1, 1
@@ -207,7 +211,7 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
     from ignition.components.sampling import DeviceRequestState, PreparedSampling, RequestAdmission
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     device = 'cuda'
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     for slot in (0, 2):
         state.admit(slot, RequestAdmission(9, 42, max_new_tokens=1000, top_k=1), [1])
@@ -221,7 +225,7 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
     from dataclasses import replace
     mapping = None
     if mapped:
-        shape = outputs.logprobs.shape if legacy_width is None else (2, 4, 8, 2 + 2 * legacy_width)
+        shape = outputs.logprobs.shape if legacy_width is None else (2, 4, 16, 2 + 2 * legacy_width)
         mapping = MappedHostAllocation(shape, torch.int32, torch.device('cuda', 0))
         mapping.device_view.zero_()
     if legacy_width is None:
@@ -230,7 +234,7 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
         legacy = None
     else:
         legacy = mapping.device_view if mapping is not None else torch.empty(
-            (2, 4, 8, 2 + 2 * legacy_width), dtype=torch.int32, device=device)
+            (2, 4, 16, 2 + 2 * legacy_width), dtype=torch.int32, device=device)
     sampler = PreparedSampling(logits, state, slots, epochs, live, outputs, frame, sequence)
     sampler.prepare()
     graph = torch.cuda.CUDAGraph()
@@ -301,9 +305,8 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
 def test_mixed_output_merge_preserves_the_inactive_frame_during_capture(compiled):
     from ignition.components.completion import CompletionOutputs
     from ignition.preparation.compilation import compile_forward
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='cuda')
-    cursor = outputs.private_storage.cursor()
-    prompt, decode = outputs.private(cursor), outputs.private(cursor)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device='cuda')
+    prompt, decode = outputs.private(), outputs.private()
     prompt.records.fill_(11)
     prompt.logprobs.fill_(12)
     prompt.speculative_survival.fill_(.875)
@@ -355,7 +358,7 @@ def _tp_logprob_rank(rank, world, sockets):
                 peer.close()
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     state.admit(2, RequestAdmission(9, 42, top_k=1, max_new_tokens=100), [1])
     logits = -torch.arange(4096, dtype=torch.float32, device=device)[None, :]
@@ -454,7 +457,7 @@ def test_packed_columns_beyond_a_short_request_never_read_another_requests_logit
     epochs = torch.tensor([9, 9], device=device)
     live = torch.tensor([2], dtype=torch.int32, device=device)
     limits = torch.tensor([1, 3], dtype=torch.int32, device=device)
-    outputs = CompletionOutputs.allocate((2, 2, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 2, 32), device=device)
     outputs.requested.fill_(1)
     frame = torch.tensor([0], dtype=torch.int32, device=device)
     sequence = torch.tensor([1], device=device)
@@ -480,14 +483,12 @@ def test_packed_columns_beyond_a_short_request_never_read_another_requests_logit
 
 @pytest.mark.parametrize('compiled', [False, True])
 @pytest.mark.parametrize('count', [0, 128])
-def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits(compiled, count):
+def test_verification_reports_raw_target_logits_with_local_filtering_scratch(compiled, count):
     from ignition.components.completion import CompletionOutputs
-    from ignition.components.parallel_draft import prepare_sampling_scratch
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
     from ignition.components.speculation import (PreparedSpeculativeDistributions,
         PreparedStochasticVerification, PreparedSpeculativeCommit, SpeculativeRngState)
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool
     device = 'cuda'
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     state.admit(2, RequestAdmission(9, 42, top_k=1, max_new_tokens=20), [1, 2], consumed_tokens=2)
@@ -500,18 +501,15 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     slots = torch.tensor([2], dtype=torch.int32, device=device)
     epochs = torch.tensor([9], dtype=torch.int64, device=device)
     live = torch.tensor([1], dtype=torch.int32, device=device)
-    pool = GraphBufferPool(device)
-    scratch = prepare_sampling_scratch(1, 3, 4096, device, buffers=pool.cursor(), proposal=False)
-    target = PreparedSpeculativeDistributions(raw, state, slots, epochs, live, drafts, workspace=scratch['target'])
+    target = PreparedSpeculativeDistributions(raw, state, slots, epochs, live, drafts)
     target.prepare()
     probabilities = torch.zeros((1, 2, 4096), device=device)
     probabilities.scatter_(2, drafts[:, :, None], 1)
     rng = SpeculativeRngState.allocate(device)
     verify = PreparedStochasticVerification(probabilities, drafts, target.probabilities,
-        state, slots, epochs, live, rng=rng, target_valid=target.valid, workspace=scratch['verify'])
+        state, slots, epochs, live, rng=rng, target_valid=target.valid)
     verify.prepare()
-    assert target.scores.data_ptr() == verify.safe_draft_probs.data_ptr()
-    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 32), device=device)
     outputs.requested[2] = 1
     ids = list(reversed(range(count)))
     outputs.token_id_counts[2] = count
@@ -521,11 +519,19 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
         outputs, frame, sequence, logits=raw, rng=rng)
     commit.prepare()
+    target.functional()
+    verify.functional()
+    commit.functional()
     restore = _snapshot(state)
     def forward():
-        target()
-        verify()
-        commit()
+        target_scratch = {name: torch.empty(shape, dtype=dtype, device=raw.device)
+                          for name, (shape, dtype) in target.layout.items()}
+        verify_scratch = {name: torch.empty(shape, dtype=dtype, device=raw.device)
+                          for name, (shape, dtype) in verify.layout.items()}
+        target.run(target_scratch, raw, candidates=drafts)
+        acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
+            target_scratch["valid"], drafts=drafts, draft_valid=torch.ones_like(drafts, dtype=torch.bool), disjoint=True)
+        commit(raw, acceptance=acceptance, inputs=inputs)
     call = compile_forward(forward) if compiled else forward
     restore()
     graph = torch.cuda.CUDAGraph()
@@ -549,7 +555,7 @@ def test_explicit_ids_replay_changing_widths_against_fp64(dtype):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.logprobs import PreparedLogprobs
     device = 'cuda'
-    outputs = CompletionOutputs.allocate((2, 2, 24), device=device)
+    outputs = CompletionOutputs.allocate((2, 2, 32), device=device)
     logits = torch.randn((2, 3, 4096), device=device, dtype=dtype) * 8
     slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
     epochs = torch.tensor([9, 10], device=device)

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Coordinated CUDA ranks sharing one process address space.
 
 use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
@@ -11,6 +17,10 @@ use std::{
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 const HANDOFF_POLL: Duration = Duration::from_micros(500);
+
+mod protocol;
+#[cfg(test)]
+mod protocol_tests;
 
 // Prepare/commit and completion/prepare exchanges are brief. Poll that interval
 // before parking a rank, while retaining blocking waits for idle serving.
@@ -54,12 +64,16 @@ impl Step {
     }
 }
 enum Command {
+    Tune(usize),
+    FinishStartup,
     Prepare(Arc<Step>),
     Commit(Fence, usize),
     Drain,
 }
 enum Reply {
     Initialized,
+    Tuned(usize, Result<()>),
+    Started,
     Ready(Fence, usize),
     Complete(FrameCompletion),
     Drained,
@@ -111,7 +125,7 @@ impl ThreadedExecutor {
                 return Err(invalid("rank graph I/O schemas differ"));
             }
         }
-        let local = unsafe { GraphExecutor::new(manifest)? };
+        let local = unsafe { GraphExecutor::new_unstarted(manifest)? };
         let mut result = Self {
             local,
             peers: Vec::new(),
@@ -125,7 +139,7 @@ impl ThreadedExecutor {
             let thread = thread::Builder::new()
                 .name(format!("flare-rank-{}", index + 1))
                 .spawn(move || {
-                    let mut executor = match unsafe { GraphExecutor::new(manifest) } {
+                    let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
                         Ok(executor) => executor,
                         Err(error) => {
                             let _ = replies.send(Err(error.clone()));
@@ -174,8 +188,78 @@ impl ThreadedExecutor {
             }
             result.peers.push(peer);
         }
+        let startup = (|| -> Result<()> {
+            for index in result.local.manifest().referenced_tuning_graphs() {
+                for (sent, peer) in result.peers.iter().enumerate() {
+                    if let Err(error) = peer.send(Command::Tune(index)) {
+                        if sent != 0 {
+                            eprintln!("startup rank dispatch failed with unconfirmed CUDA work: {error}; terminating the CUDA process");
+                            std::process::abort();
+                        }
+                        return Err(error);
+                    }
+                }
+                let mut failure = result.local.run_tuning_graph(index).err();
+                for peer in &result.peers {
+                    match peer.receive() {
+                        Ok(Reply::Tuned(value, status)) if value == index => {
+                            if let Err(error) = status { failure.get_or_insert(error); }
+                        }
+                        reply => {
+                            let message = reply.err().map_or_else(|| "rank tuning completion identity differs".to_string(), |error| error.to_string());
+                            eprintln!("startup rank completion is unconfirmed: {message}; terminating the CUDA process");
+                            std::process::abort();
+                        }
+                    }
+                }
+                if let Some(error) = failure { return Err(error); }
+            }
+            for peer in &result.peers { peer.send(Command::FinishStartup)?; }
+            result.local.finish_startup()?;
+            for peer in &result.peers {
+                if !matches!(peer.receive()?, Reply::Started) {
+                    return Err(invalid("rank startup did not complete"));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = startup {
+            // Every issued tuning command has a completed acknowledgement here.
+            let sent: Vec<_> = result.peers.iter().map(|peer| peer.send(Command::Drain).is_ok()).collect();
+            for (peer, sent) in result.peers.iter_mut().zip(sent) {
+                if sent {
+                    loop {
+                        match peer.receive() {
+                            Ok(Reply::Drained) => break,
+                            Ok(Reply::Started) => continue,
+                            reply => {
+                                eprintln!("startup rank cleanup was not confirmed: {:?}; terminating the CUDA process", reply.err());
+                                std::process::abort();
+                            }
+                        }
+                    }
+                }
+                if let Some(thread) = peer.thread.take() {
+                    match thread.join() {
+                        Ok(shutdown) if shutdown.drained => {}
+                        _ => {
+                            eprintln!("startup rank thread did not confirm drain; terminating the CUDA process");
+                            std::process::abort();
+                        }
+                    }
+                }
+            }
+            let shutdown = result.local.close();
+            if !shutdown.drained {
+                eprintln!("startup coordinator cleanup did not drain; terminating the CUDA process");
+                std::process::abort();
+            }
+            result.shutdown = Some(shutdown);
+            return Err(error);
+        }
         Ok(result)
     }
+    #[cfg(feature = "server")]
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }
@@ -185,12 +269,7 @@ impl ThreadedExecutor {
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
-            && self.pending.len() < 2
-            && self.pending.back().is_none_or(|frame| frame.committed)
-            && (!grammar || self.pending.is_empty())
-            && !self.pending.iter().any(|frame| frame.step.grammar || !matches!(
-                self.local.manifest().graphs[frame.step.graph].kind,
-                super::GraphKind::Decode | super::GraphKind::Speculative))
+            && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
     pub fn next_fence(&self) -> Result<Fence> {
@@ -256,11 +335,7 @@ impl ThreadedExecutor {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
         if let Some(completion) = self.local.poll()? {
-            let frame = self.pending.iter_mut().find(|frame| frame.step.fence == completion.fence)
-                .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
-            if frame.completions[0].replace(completion).is_some() {
-                return Err(invalid("duplicate rank-zero completion"));
-            }
+            protocol::record_local_completion(&mut self.pending, completion)?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             loop {
@@ -271,22 +346,10 @@ impl ThreadedExecutor {
                 };
                 match reply {
                     Reply::Ready(fence, graph) => {
-                        let frame = self.pending.iter_mut().find(|f| f.step.fence == fence)
-                            .ok_or_else(|| invalid("unexpected rank readiness fence"))?;
-                        if frame.step.graph != graph || frame.ready[index] || frame.committed {
-                            return Err(invalid("rank readiness identity or state differs"));
-                        }
-                        frame.ready[index] = true;
+                        protocol::record_ready(&mut self.pending, index, fence, graph)?;
                     }
                     Reply::Complete(completion) => {
-                        let expected = self.pending.iter_mut()
-                            .find(|f| f.completions[index + 1].is_none())
-                            .ok_or_else(|| invalid("unexpected rank completion"))?;
-                        if !expected.committed || expected.step.fence != completion.fence
-                            || expected.step.graph != completion.graph_index {
-                            return Err(invalid("rank completion order or identity differs"));
-                        }
-                        expected.completions[index + 1] = Some(completion);
+                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
                     }
                     _ => return Err(invalid("unexpected rank thread reply")),
                 }
@@ -294,24 +357,19 @@ impl ThreadedExecutor {
         }
         for frame in &mut self.pending {
             if frame.committed { continue; }
-            if !frame.ready.iter().all(|ready| *ready) { break; }
+            if !protocol::ready_to_commit(frame) { break; }
             let uploads = frame.step.uploads();
             if self.local.validate_submission(frame.step.graph, &uploads, frame.step.grammar)?
                 != Some(frame.step.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
-            for peer in &self.peers {
-                peer.send(Command::Commit(frame.step.fence, frame.step.graph))?;
-            }
+            protocol::dispatch_commit(&self.peers, frame.step.fence, frame.step.graph)?;
             if self.local.submit(frame.step.graph, &uploads, frame.step.grammar)? != Some(frame.step.fence) {
                 return Err(invalid("rank-zero fence changed after validation"));
             }
             frame.committed = true;
         }
-        if !self.pending.front().is_some_and(|frame| frame.completions.iter().all(Option::is_some)) {
-            return Ok(None);
-        }
-        let mut frame = self.pending.pop_front().unwrap();
+        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else { return Ok(None); };
         let mut root = frame.completions[0].take().unwrap();
         for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
             let completion = completion.unwrap();
@@ -398,6 +456,14 @@ fn rank_loop(
             }
         };
         match command {
+            Some(Command::Tune(index)) => {
+                let status = executor.run_tuning_graph(index);
+                send(Reply::Tuned(index, status))?;
+            }
+            Some(Command::FinishStartup) => {
+                executor.finish_startup()?;
+                send(Reply::Started)?;
+            }
             Some(Command::Prepare(step)) => {
                 if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
                 if executor.validate_submission(step.graph, &step.uploads(), step.grammar)? != Some(step.fence) {
@@ -459,10 +525,13 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
         (Some(_), None) | (None, Some(_)) => return false,
         _ => {}
     }
-    a.abi_version == b.abi_version
+    a.completion_token_capacity == b.completion_token_capacity
         && a.max_active == b.max_active
         && a.input_frame_bytes == b.input_frame_bytes
         && a.buffers.len() == b.buffers.len()
+        && a.tuning_graphs.len() == b.tuning_graphs.len()
+        && a.tuning_graphs.iter().zip(&b.tuning_graphs).all(|(a, b)|
+            a.name == b.name && a.outputs == b.outputs && a.status_buffer == b.status_buffer)
         && a.graphs.len() == b.graphs.len()
         && a.buffers.iter().zip(&b.buffers).all(|(a, b)| {
             a.name == b.name
@@ -481,6 +550,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
                 && a.confidence_width == b.confidence_width
                 && a.packed_token_capacity == b.packed_token_capacity
                 && a.prefill_capacity == b.prefill_capacity
+                && a.tuned_bindings == b.tuned_bindings
                 && a.input_bindings.len() == b.input_bindings.len()
                 && a.input_bindings
                     .iter()
@@ -496,6 +566,16 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_layout_uses_completion_geometry_instead_of_abi_labels() {
+        let a = super::super::tests::manifest();
+        let mut b = a.clone();
+        b.abi_version = 5;
+        assert!(same_layout(&a, &b));
+        b.completion_token_capacity += 1;
+        assert!(!same_layout(&a, &b));
+    }
 
     #[test]
     fn handoff_receive_preserves_queued_messages_and_disconnects() {
@@ -520,6 +600,24 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
+    fn startup_tuning_layout_compares_producers_and_consumers() {
+        let root = super::super::tests::tuning_manifest();
+        let mut peer = root.clone();
+        peer.tuning_graphs[0].handle += 32;
+        assert!(same_layout(&root, &peer));
+        for mutation in 0..4 {
+            let mut peer = root.clone();
+            match mutation {
+                0 => peer.tuning_graphs[0].name.push('x'),
+                1 => peer.tuning_graphs[0].outputs[0].push('x'),
+                2 => peer.tuning_graphs[0].status_buffer.push('x'),
+                _ => peer.graphs[0].tuned_bindings[0].buffer.push('x'),
+            }
+            assert!(!same_layout(&root, &peer), "mutation {mutation}");
+        }
+    }
+
+    #[test]
     fn rank_layout_compares_bindings_but_not_cuda_addresses() {
         let root = super::super::tests::manifest();
         let mut peer = root.clone();
@@ -543,7 +641,7 @@ mod tests {
         peer = root.clone();
         peer.graphs[0].prefill_capacity = 64;
         assert!(!same_layout(&root, &peer));
-        let geometry = crate::offload::geometry::tests::geometry(64, &[("k", 8192)], 4096);
+        let geometry = flare_selene::testing::geometry(64, &[("k", 8192)], 4096);
         peer = root.clone();
         peer.cache = Some(geometry.clone());
         assert!(!same_layout(&root, &peer));
@@ -634,12 +732,12 @@ mod tests {
             };
             root.abi_version = super::super::ABI_VERSION;
             let records = root.buffers.iter_mut().find(|b| b.name == "completion_records").unwrap();
-            records.nbytes = 2 * 4 * 24 * 8;
-            records.shape = vec![2, 4, 24];
-            records.strides = vec![4 * 24, 24, 1];
+            records.nbytes = 2 * 4 * 32 * 8;
+            records.shape = vec![2, 4, 32];
+            records.strides = vec![4 * 32, 32, 1];
             root.buffers.push(BufferDescriptor {
-                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 5 * 4,
-                dtype: Dtype::Float32, shape: vec![2, 4, 5], strides: vec![20, 5, 1],
+                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 15 * 4,
+                dtype: Dtype::Float32, shape: vec![2, 4, 15], strides: vec![60, 15, 1],
             });
             root.buffers.push(BufferDescriptor {
                 name: "prefill_row".into(), address: 0x40000, nbytes: 4,
@@ -710,6 +808,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 #[path = "threaded/cuda_tests.rs"]
 mod cuda_tests;

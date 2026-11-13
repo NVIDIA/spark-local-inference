@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native TP4 row delivery shares RAM tables and needs no source files during replay."""
 
 import os
@@ -26,7 +30,7 @@ def _rank(rank, sockets, root):
     from ignition.components.ngram_delivery import publish_requests
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.execution import GraphSignature, PreparedExecution
-    from ignition.preparation.runtime_package import FileSource
+    from ignition.preparation.runtime_core import FileSource
     from ignition.recipes.deepseek41.engram import Tables
 
     peers = []
@@ -58,7 +62,7 @@ def _rank(rank, sockets, root):
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     mailbox = MappedHostAllocation((4 * 24 + 1,), torch.int64, device)
     mailbox.host_view.zero_()
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     worker = graph = None
     try:
         with PreparationSession(device=device, autotune=False, compile_workers=2) as session, ExitStack() as native:

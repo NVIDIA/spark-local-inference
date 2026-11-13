@@ -1,0 +1,745 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+package flare.runtime;
+
+// Signed bodies retain their exact wire bytes for verification. What every rank shares is signed
+// once and each rank's resources separately, so a host serving one rank verifies it alone.
+message ProtectedIndex {
+  uint32 version = 1;
+  bytes core_id = 2;
+  bytes signer = 3;
+  // Kinds 1 to 3 in order: PublisherMetadata, the shared supporting ResourceCatalog, and the
+  // shared StoredData.
+  repeated SignedGroup groups = 4;
+  // Kind 4, one per rank in rank order: that rank's RankProtection.
+  repeated SignedGroup ranks = 5;
+}
+message SignedGroup { uint32 kind = 1; bytes body = 2; bytes signature = 3; }
+message PublisherMetadata {
+  // What every rank shares; each rank's bundle is in its RankProtection, so `ranks` is empty.
+  ModelIndex index = 1;
+  string namespace = 2;
+  string official_source = 3;
+  repeated bytes group_hashes = 4;
+  bool development = 5;
+  uint32 ranks = 6;
+  // The license governing use of the model, whose terms acceptance agrees to; absent in cores
+  // exported before it was recorded.
+  License license = 7;
+}
+// A license named for the acceptance prompt and linked for reading; the link may be empty.
+message License { string name = 1; string link = 2; }
+message ResourceCatalog { repeated ProtectedResource resources = 1; }
+message ProtectedResource {
+  uint64 offset = 1;
+  uint64 stored_bytes = 2;
+  uint64 plain_bytes = 3;
+  repeated bytes sha256 = 4;
+}
+// Stored allocation or table bytes, including alignment padding, hashed in part order.
+message StoredData {
+  uint64 nbytes = 1;
+  bytes sha256 = 2;
+  uint64 offset = 3;
+  // Empty retains the primary-file range above. Otherwise hashes the concatenated parts.
+  repeated Span parts = 4;
+}
+// One rank's bundle, its compressed executables, its supporting resources and its stored data.
+message RankProtection {
+  uint32 rank = 1;
+  BundleIndex bundle = 2;
+  ResourceCatalog executables = 3;
+  ResourceCatalog support = 4;
+  StoredData data = 5;
+}
+
+message ModelIndex {
+  // Version 4 uses only the primary payload; version 5 permits companion data files.
+  uint32 version = 1;
+  repeated BundleIndex ranks = 2;
+  repeated PeerMemory peer_memory = 3;
+  reserved 4;
+  repeated Asset assets = 5;
+  Engram engram = 6;
+  DefaultSamplingParameters sampling_defaults = 7;
+  FrontendSettings frontend = 8;
+  // Present when the ranks run on separate hosts: the file holds every rank, and each host
+  // loads the one it serves.
+  Cluster cluster = 9;
+  ServingContract contract = 10;
+  // Preparation-only metadata. Absence means no rebuild description was recorded;
+  // serving uses contract and rank bundles regardless of this field's version.
+  RebuildManifest rebuild = 11;
+}
+
+// Identifies the preparation inputs without embedding source code or checkpoint config files.
+// A compatible Ignition importer is required to prepare graphs from stored weight views.
+message RebuildManifest {
+  uint32 version = 1;
+  string recipe = 2;
+  string source_identity = 3;
+  string checkpoint_repository = 4;
+  string checkpoint_revision = 5;
+  uint32 tensor_parallel = 6;
+  uint64 max_concurrency = 7;
+  uint64 prefill_chunk = 8;
+  uint64 image_concurrency = 9;
+  bool context_parallel = 10;
+  bool stream_overlap = 11;
+  bool mixed_prefill = 12;
+  optional string expert_scale_compression = 13;
+  string mla_compute_mode = 14;
+  bool roce_ring = 15;
+  bool online_mxfp8 = 16;
+  bool language_model_only = 17;
+  RebuildSpeculation speculation = 18;
+  bool compiled_forwards = 19;
+  uint64 reserve_bytes = 20;
+  // Local checkpoint overrides have no asserted upstream revision.
+  bool local_checkpoint = 21;
+  // Neighbor relays over a chain in rank order; exclusive with roce_ring.
+  bool roce_chain = 22;
+  // Preparation-only joint attention-plan selection across the captured text shapes.
+  bool joint_tuning = 23;
+  // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
+  bool shard_hyperconnections = 24;
+  // Preparation-time collective selection policy: static or runtime.
+  string collective_tuning = 25;
+  // Preparation-only offline geometry and runtime profile recommendations.
+  string collective_ladder_json = 26;
+  // Preparation-only routed W4A16 decode/verification with calibrated A4 prefill.
+  bool force_moe_decode_a16 = 27;
+  // Preparation-only online conversion group; omitted means all eligible projections.
+  string online_mxfp8_scope = 30;
+  // Preparation context group size; zero/absent retains full-TP context sharding when enabled.
+  uint32 context_parallel_size = 31;
+}
+message RebuildSpeculation {
+  uint32 draft_tokens = 1;
+  bool adaptive = 2;
+  string proposal_source = 3;
+  bool history_drafts = 4;
+  uint64 token_capacity = 5;
+  bool packed_verification = 6;
+  string draft_prefix_selection = 7;
+  optional string draft_head_quantization = 8;
+  optional string markov_head_quantization = 9;
+  optional uint64 graph_budget = 10;
+  // Preparation arithmetic and communication choice; serving replays captured graphs.
+  bool vocabulary_parallel_sampling = 11;
+  // Preparation-only learned proposal method; serving replays captured graphs.
+  string method = 12;
+  // Preparation-only omission of ordinary graphs; width-one draft-state rounds remain.
+  bool mtp_only = 13;
+}
+// Views of retained prepared weight storage, with no additional payload copies.
+// Names are paths in the recipe's weight objects, not original checkpoint keys.
+message RebuildWeights {
+  uint32 version = 1;
+  repeated RebuildTensor tensors = 2;
+  // Weight-object tensors omitted from stored fixed allocations cannot be reused.
+  repeated string unavailable = 3;
+}
+message RebuildTensor {
+  string name = 1;
+  string dtype = 2;
+  uint32 element_bytes = 3;
+  repeated uint64 shape = 4;
+  repeated uint64 stride = 5;
+  // Python type owning the view describes its prepared packing contract; inert text,
+  // never an import target. Interpretation requires matching preparation code.
+  string layout_type = 6;
+  Reference storage = 7;
+}
+
+// Prepared semantics shared by every rank. Physical bindings remain in each rank's bundle.
+message ServingContract {
+  string model_id = 1;
+  string identity = 2;
+  ModelContract model_contract = 3;
+  uint64 max_sequence_tokens = 4;
+  uint64 prefill_chunk_size = 5;
+  uint64 pages = 6;
+  uint64 state_rows = 7;
+  uint64 snapshots = 8;
+  uint64 page_tokens = 9;
+  reserved 10;
+  repeated uint64 speculative_widths = 11;
+  optional uint64 speculative_fixed_width = 12;
+  bool history_drafts = 13;
+  string speculative_proposal_source = 14;
+  optional uint64 max_new_tokens = 15;
+  optional uint64 max_active = 16;
+  repeated string served_names = 17;
+  optional uint64 reserve_bytes = 18;
+  optional uint64 queue_capacity = 19;
+  optional uint64 frontend_workers = 20;
+  optional uint64 max_body_bytes = 21;
+  string context_hint = 22;
+  string capacity_hint = 23;
+  uint64 speculative_token_capacity = 24;
+  // Bytes of weights one decode step reads for one request, as the recipe declares for the
+  // checkpoint; absent when the recipe declares none. Multiplied by steps per second it is the
+  // memory bandwidth the model consumes, which integrated GPUs do not measure.
+  optional uint64 decode_weight_bytes = 25;
+}
+message ModelContract {
+  uint32 version = 1;
+  uint64 vocabulary = 2;
+  uint64 input_vocabulary = 3;
+  VisionCapacity vision = 4;
+  CacheContract cache = 5;
+  repeated GraphContract graphs = 6;
+  FrontendContract frontend = 7;
+}
+message VisionCapacity {
+  // Zero inherits prepared execution concurrency when max_images is nonzero.
+  uint64 feature_slots = 5;
+  uint64 features_per_request = 1;
+  uint64 max_images = 2;
+  uint64 patches_per_feature = 3;
+  repeated uint64 patch_capacities = 4;
+}
+enum HistoryKind {
+  HISTORY_UNSPECIFIED = 0;
+  PAGED_KEY_VALUE = 1;
+  PAGED_LATENT = 2;
+  SLIDING_WINDOW = 3;
+  RECURRENT_STATE = 4;
+  CONTINUATION_STATE = 5;
+}
+message CacheContract {
+  uint64 page_tokens = 1;
+  repeated HistoryRegion regions = 2;
+  repeated PageTableView page_tables = 3;
+}
+message HistoryRegion {
+  HistoryKind kind = 1;
+  StateView storage = 2;
+  uint64 tokens_per_record = 3;
+  uint64 window_tokens = 4;
+}
+message PageTableView {
+  string buffer = 1;
+  uint64 page_offset = 2;
+}
+enum ValueSource {
+  VALUE_UNSPECIFIED = 0;
+  CONSTANT = 1;
+  REQUEST_SLOT = 2;
+  REQUEST_GENERATION = 3;
+  LIVE_ROWS = 4;
+  QUERY_LENGTH = 5;
+  SAMPLE_ENABLED = 6;
+  PROMPT_TOKEN = 7;
+  PENDING_TOKEN = 8;
+  PROMPT_AND_PENDING_TOKEN = 9;
+  PROMPT_POSITION = 10;
+  IMAGE_FEATURE_INDEX = 11;
+  IMAGE_LEFT_CONTEXT = 12;
+  IMAGE_RIGHT_CONTEXT = 13;
+  PAGE_TABLE = 14;
+  LIVE_STATE_ROWS = 15;
+  LIVE_STATE_ROW = 16;
+  PREFIX_STATE_ROW = 17;
+  SNAPSHOT_STATE_ROW = 18;
+  CONSUMED_TOKENS = 19;
+  SNAPSHOT_CONSUMED_TOKENS = 20;
+  PREFILL_ROW = 21;
+  SAMPLING_SEED = 22;
+  SAMPLING_PARAMETERS = 23;
+  SAMPLING_TOP_K = 24;
+  MAX_NEW_TOKENS = 25;
+  EOS_TOKEN_IDS = 26;
+  EOS_COUNT = 27;
+  PROMPT_HISTOGRAM = 28;
+  GRAMMAR_MASK = 29;
+  GRAMMAR_ENABLED = 30;
+  COPY_TOKEN_IDS = 31;
+  COPY_TOKEN_COUNT = 32;
+  COPY_CONSUMED_TOKENS = 33;
+  COPY_GENERATION = 34;
+  COPY_GRAMMAR_MASK = 35;
+  COPY_GRAMMAR_COUNT = 36;
+  IMAGE_TENSOR = 37;
+  IMAGE_FEATURE_SLOT = 38;
+  PROMPT_TARGET_TOKEN = 39;
+  // Immutable per-request query-length ceiling for GPU-owned packed allocation.
+  SPECULATIVE_PREFIX_LIMIT = 40;
+}
+enum InputIndexing {
+  INDEXING_UNSPECIFIED = 0;
+  SCALAR = 1;
+  SUBMISSION_ROW = 2;
+  REQUEST_ROW = 3;
+  PACKED_TOKEN = 4;
+  ACTIVE_ROW = 5;
+}
+message ValueBinding {
+  string buffer = 1;
+  ValueSource source = 2;
+  InputIndexing indexing = 3;
+  sint64 value_offset = 4;
+  sint64 padding = 5;
+  string tensor = 6;
+}
+enum StateAccessKind {
+  STATE_ACCESS_UNSPECIFIED = 0;
+  READ = 1;
+  WRITE = 2;
+  READ_WRITE = 3;
+}
+message StateView {
+  string buffer = 1;
+  uint64 offset = 2;
+  uint64 stride = 3;
+  uint64 nbytes = 4;
+}
+message StateAccess {
+  StateView view = 1;
+  StateAccessKind access = 2;
+}
+message CompletionCursor {
+  StateView state = 1;
+  uint64 lag_tokens = 2;
+}
+enum GraphOperation {
+  GRAPH_OPERATION_UNSPECIFIED = 0;
+  INIT = 1;
+  RESTORE = 2;
+  SNAPSHOT = 3;
+  PREFILL = 4;
+  DECODE = 5;
+  RESUME = 6;
+  VISION = 7;
+  SPECULATIVE = 8;
+  MIXED = 9;
+  reserved 10, 11, 13;
+  reserved "PROPOSAL", "VERIFICATION", "PACKED_SPECULATIVE";
+  SCORED_PREFILL = 12;
+
+}
+message TunedBinding { string buffer = 1; string tuning_graph = 2; }
+message GraphContract {
+  string graph = 1;
+  repeated ValueBinding inputs = 2;
+  repeated StateAccess state = 3;
+  uint64 state_rows_per_request = 4;
+  CompletionCursor draft_cursor = 5;
+  // References to table indices in the core's embedding table catalog.
+  repeated uint32 embedding_tables = 6;
+  // The graph consumes its pending input directly from this persistent device value.
+  StateView pending_token = 7;
+  GraphOperation kind = 8;
+  repeated TunedBinding tuned_bindings = 9;
+}
+enum ToolParserKind {
+  TOOL_PARSER_UNSPECIFIED = 0;
+  QWEN_CODER = 1;
+  GLM_ARGUMENT_TAGS = 2;
+  DSML = 3;
+  XTML = 4;
+  MINIMAX_XML = 5;
+  GEMMA_CALL = 6;
+  ATEM = 7;
+}
+enum ReasoningParserKind {
+  REASONING_PARSER_UNSPECIFIED = 0;
+  THINK_TAGS = 1;
+  XTML_THINK = 2;
+  MM_THINK = 3;
+  CHANNEL_THOUGHT = 4;
+  RECIPIENT_HEADERS = 5;
+}
+enum ImagePreparationKind {
+  IMAGE_PREPARATION_UNSPECIFIED = 0;
+  QWEN_IMAGE_PREPARATION = 1;
+  MIMO_IMAGE_PREPARATION = 2;
+  DEEPSEEK_IMAGE_PREPARATION = 3;
+  MOONVIT_IMAGE_PREPARATION = 4;
+  STEP_IMAGE_PREPARATION = 5;
+  RADIO_IMAGE_PREPARATION = 6;
+  DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
+  GLM_IMAGE_PREPARATION = 8;
+  PATCH_MERGE_IMAGE_PREPARATION = 9;
+}
+enum ImageLayoutKind {
+  IMAGE_LAYOUT_UNSPECIFIED = 0;
+  QWEN_IMAGE_LAYOUT = 1;
+  MIMO_IMAGE_LAYOUT = 2;
+  DEEPSEEK_IMAGE_LAYOUT = 3;
+  MOONVIT_IMAGE_LAYOUT = 4;
+  STEP_IMAGE_LAYOUT = 5;
+  RADIO_IMAGE_LAYOUT = 6;
+  DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
+  GLM_IMAGE_LAYOUT = 8;
+  BRACKETED_IMAGE_LAYOUT = 9;
+}
+message ToolParser {
+  ToolParserKind kind = 1;
+  uint32 wrapping_newlines = 2;
+  string tag_separator = 3;
+}
+message ReasoningParser {
+  ReasoningParserKind kind = 1;
+  string open = 2;
+  string close = 3;
+  uint32 wrapping_newlines = 4;
+  repeated string terminal_markers = 5;
+}
+message PrefixBoundary {
+  repeated string roles = 1;
+  optional string append_role = 2;
+  bool continue_final_message = 3;
+  uint64 minimum_messages = 4;
+  string required_start = 5;
+  string required_end = 6;
+  string required_marker = 7;
+}
+message ImageSpan {
+  uint32 start_token = 1;
+  uint32 end_token = 2;
+  uint64 max_tokens = 3;
+  repeated uint32 interior_tokens = 4;
+  repeated uint32 unscoped_tokens = 5;
+}
+message ImageTokenLayout {
+  uint32 feature_token = 1;
+  ImageSpan span = 2;
+}
+message FrontendContract {
+  ToolParser tools = 1;
+  ReasoningParser reasoning = 2;
+  optional ImagePreparationKind image_preparation = 3;
+  optional ImageLayoutKind image_layout = 4;
+  repeated uint32 rejected_tokens = 5;
+  uint32 position_dimensions = 6;
+  string assistant_marker = 7;
+  repeated string message_end_markers = 8;
+  PrefixBoundary prefix_boundary = 9;
+  ImageTokenLayout image_tokens = 10;
+}
+message Cluster {
+  uint32 world = 1;
+  reserved 2;
+  // Names the export; hosts serving different exports refuse to join.
+  string export_id = 3;
+}
+message DefaultSamplingParameters {
+  optional uint64 seed = 1;
+  optional float temperature = 2;
+  optional int32 top_k = 3;
+  optional float top_p = 4;
+  optional float min_p = 5;
+  optional float repetition_penalty = 6;
+  optional float presence_penalty = 7;
+  optional float frequency_penalty = 8;
+  // Absent parameter ranges fix those parameters at their declared defaults.
+  SamplingRanges ranges = 9;
+}
+message SamplingFloatRange {
+  optional float min = 1;
+  optional float max = 2;
+}
+message SamplingIntRange {
+  optional int32 min = 1;
+  optional int32 max = 2;
+}
+message SamplingRanges {
+  SamplingFloatRange temperature = 1;
+  SamplingIntRange top_k = 2;
+  SamplingFloatRange top_p = 3;
+  SamplingFloatRange min_p = 4;
+  SamplingFloatRange repetition_penalty = 5;
+  SamplingFloatRange presence_penalty = 6;
+  SamplingFloatRange frequency_penalty = 7;
+}
+message FrontendSettings {
+  TokenizerSettings tokenizer = 1;
+  ImageSettings image = 2;
+  repeated uint32 eos_token_ids = 3;
+  TemplateEncoding template_encoding = 4;
+  PromptEncoder prompt_encoder = 5;
+  optional uint32 image_placeholder_token_id = 6;
+}
+enum PromptEncoder {
+  PROMPT_JINJA = 0;
+  DEEPSEEK_V4 = 1;
+  DEEPSEEK_V41 = 2;
+}
+enum TemplateEncoding {
+  TEMPLATE_TEXT = 0;
+  TEMPLATE_TOKEN_SEGMENTS = 1;
+}
+message TokenizerSettings {
+  optional string bos_token = 1;
+  optional string eos_token = 2;
+  optional string unk_token = 3;
+  optional string sep_token = 4;
+  optional string pad_token = 5;
+  optional string cls_token = 6;
+  optional string mask_token = 7;
+  TokenList additional_special_tokens = 8;
+}
+message TokenList { repeated string values = 1; }
+message ImageSettings {
+  oneof profile {
+    QwenImageSettings qwen = 1;
+    MimoImageSettings mimo = 2;
+    Empty deepseek4 = 3;
+    Empty moonvit = 4;
+    Empty step = 5;
+    Empty radio = 6;
+    DeepseekRowMajorImageSettings deepseek_row_major = 7;
+    Empty glm = 8;
+    PatchMergeImageSettings patch_merge = 9;
+  }
+}
+message PatchMergeImageSettings {
+  uint32 patch_size = 1;
+  uint64 min_pixels = 2;
+  uint64 max_pixels = 3;
+  repeated float image_mean = 4;
+  repeated float image_std = 5;
+  string image_token = 6;
+  string start_token = 7;
+  string end_token = 8;
+}
+message DeepseekRowMajorImageSettings {
+  uint64 min_pixels = 1;
+  uint64 max_tokens = 2;
+  optional uint64 max_width_height_ratio = 3;
+}
+message QwenImageSettings {
+  uint64 min_pixels = 1;
+  uint64 max_pixels = 2;
+  uint32 position_side = 3;
+  uint32 image_token_id = 4;
+  uint32 video_token_id = 5;
+}
+message MimoImageSettings {
+  uint64 min_pixels = 1;
+  uint64 max_pixels = 2;
+  repeated float image_mean = 3;
+  repeated float image_std = 4;
+}
+message Engram {
+  // Raw token ID to normalized vocabulary ID; normalization runs only during preparation.
+  repeated uint32 token_map = 1;
+  uint32 pad_token_id = 2;
+  uint32 compressed_vocabulary = 3;
+  repeated EngramTable tables = 4;
+}
+message EngramTable {
+  enum Encoding { UNSPECIFIED = 0; FP8_E4M3_E8M0 = 1; NVFP4_E4M3_GLOBAL = 2; }
+  uint32 layer = 1;
+  uint64 rows = 2;
+  uint32 embedding_width = 3;
+  uint32 scale_block = 4;
+  // Row-major planes. Span offsets are relative to the core payload base.
+  Span weights = 5;
+  Span scales = 6;
+  EngramHash hash = 7;
+  string weight_buffer = 8;
+  string scale_buffer = 9;
+  string hash_buffer = 10;
+  string ready_event = 11;
+  Encoding encoding = 12;
+  // Mapped host int64 row IDs followed by the release-published submission sequence.
+  string request_buffer = 13;
+  float global_scale = 14;
+  // Disjoint row partitions owned by individual TP ranks. Empty retains the shared
+  // weights/scales planes above. Partitioned tables publish partition-local row IDs.
+  repeated EngramTableShard shards = 15;
+}
+message EngramTableShard {
+  uint32 rank = 1;
+  uint64 first_row = 2;
+  uint64 rows = 3;
+  Span weights = 4;
+  Span scales = 5;
+}
+message EngramHash {
+  enum Method { UNSPECIFIED = 0; XOR_MODULO = 1; EOS_XOR_MODULO = 2; }
+  Method method = 1;
+  // One order, modulus, and row offset per lookup head, in output-column order.
+  repeated uint32 orders = 2;
+  // Multipliers by lag: current token first, then preceding tokens. Missing history uses pad_token_id.
+  repeated uint64 multipliers = 3;
+  repeated uint64 primes = 4;
+  repeated uint64 offsets = 5;
+}
+message Asset { string name = 1; Span payload = 2; string sha256 = 3; }
+message BundleIndex {
+  repeated int32 architecture = 1;
+  repeated Allocation allocations = 2;
+  repeated Module modules = 3;
+  repeated Function functions = 4;
+  repeated GraphIndex graphs = 5;
+  repeated Reservation reservations = 6;
+  Execution execution = 7;
+  Context context = 8;
+  map<string, Span> resources = 9;
+  repeated string events = 10;
+  RoceTransport roce = 11;
+  // Absent in cores without a prepared-weight catalog. Ignored during replay.
+  RebuildWeights rebuild_weights = 12;
+}
+// A RoCEnante (b12x.comm.roce) transport whose kernels the rank's graphs launch. Its pinned region
+// and device counters are allocations restored at their recorded addresses and zeroed; the native
+// runtime registers the region with the HCAs, reconnects every peer and runs the posting proxy.
+message RoceTransport {
+  uint32 proxy_abi = 1;
+  uint32 world = 2;
+  uint32 rank = 3;
+  uint64 region_address = 4;
+  uint64 region_bytes = 5;
+  uint64 counters_address = 6;
+  uint64 counters_bytes = 7;
+  uint64 slot_bytes = 8;
+  uint64 pipe_bytes = 9;
+  uint64 ctrl_offset = 10;
+  // Formerly the preparing hosts' devices, GID index, traffic class, rails and routes. Each
+  // serving host discovers its own fabric instead.
+  reserved 11 to 15;
+  // Per-rank capacity of the variable-length all-gather area; 0 without one (proxy ABI 7).
+  uint64 varlen_bytes = 16;
+}
+message GraphIndex {
+  string name = 1;
+  uint64 flags = 2;
+  string resource = 3;
+  uint64 node_count = 4;
+  uint64 edge_count = 5;
+  repeated uint64 functions = 6;
+}
+
+
+message PeerMemory {
+  uint32 owner = 1;
+  uint64 address = 2;
+  uint64 nbytes = 3;
+  repeated uint32 readers = 4;
+}
+
+
+message Context { uint32 flags = 1; int32 cache = 2; repeated Limit limits = 3; }
+message Limit { uint64 id = 1; uint64 value = 2; }
+message Reservation { uint64 address = 1; uint64 nbytes = 2; }
+message Span {
+  uint64 offset = 1;
+  uint64 nbytes = 2;
+  // Empty selects the primary payload. Allocation destination spans must leave this empty.
+  string filename = 3;
+}
+// PEER names another rank's device allocation that this rank reads or writes at its recorded
+// address; the owner allocates it and model.pb grants this rank access.
+enum Memory { DEVICE = 0; MAPPED_HOST = 1; PEER = 2; }
+message Allocation {
+  string name = 1;
+  uint64 nbytes = 2;
+  uint64 alignment = 3;
+  optional string file = 4;
+  repeated Span data_spans = 5;
+  repeated Relocation relocations = 6;
+  optional uint64 address = 7;
+  Memory memory = 8;
+  Sizing sizing = 9;
+}
+enum Capacity { STATE_ROWS = 0; KV_PAGES = 1; }
+message Sizing { Capacity capacity = 1; uint64 unit_bytes = 2; uint64 maximum = 3; }
+message Module { string name = 1; string file = 2; repeated Global globals = 3; }
+message Global { string symbol = 1; string file = 2; uint64 nbytes = 3; repeated Relocation relocations = 4; }
+message Function {
+  string module = 1;
+  string symbol = 2;
+  repeated uint64 parameter_sizes = 3;
+  repeated FunctionAttribute attributes = 4;
+}
+message FunctionAttribute { int32 id = 1; int32 value = 2; }
+message Reference { string allocation = 1; uint64 offset = 2; }
+enum RelocationKind { POINTER = 0; TENSOR_MAP = 1; }
+message Relocation { uint64 offset = 1; Reference target = 2; RelocationKind kind = 3; }
+message Blob { bytes data = 1; repeated Relocation relocations = 2; }
+message Attribute { int32 id = 1; Blob value = 2; }
+message Kernel {
+  uint64 function = 1;
+  repeated uint32 grid = 2;
+  repeated uint32 block = 3;
+  uint32 shared = 4;
+  repeated Blob arguments = 5;
+  repeated Attribute attributes = 6;
+}
+message Memset {
+  Reference destination = 1;
+  uint64 pitch = 2;
+  uint32 value = 3;
+  uint32 element_size = 4;
+  uint64 width = 5;
+  uint64 height = 6;
+}
+message Copy { Reference source = 1; Reference destination = 2; uint64 nbytes = 3; }
+message Empty {}
+message EventWait { string event = 1; }
+message Node {
+  oneof operation {
+    Kernel kernel = 1;
+    Memset memset = 2;
+    Copy copy = 3;
+    Empty empty = 4;
+    EventWait event_wait = 5;
+  }
+}
+message Edge { uint64 source = 1; uint64 destination = 2; bytes data = 3; }
+
+message Execution {
+  uint32 abi_version = 1;
+  uint64 max_active = 2;
+  uint64 input_frame_bytes = 3;
+  repeated Buffer buffers = 4;
+  repeated ExecutionGraph graphs = 5;
+  repeated TuningGraph tuning_graphs = 6;
+  uint32 completion_token_capacity = 7;
+}
+message TuningGraph {
+  string name = 1;
+  repeated string outputs = 2;
+  string status_buffer = 3;
+}
+message Buffer {
+  string name = 1;
+  uint64 nbytes = 2;
+  string dtype = 3;
+  repeated uint64 shape = 4;
+  repeated uint64 strides = 5;
+  Reference reference = 6;
+}
+message ExecutionGraph {
+  string name = 1;
+  string kind = 2;
+  string sampling_mode = 3;
+  uint64 batch_capacity = 4;
+  uint64 token_capacity = 5;
+  repeated InputBinding input_bindings = 6;
+  optional uint32 draft_tokens = 7;
+  // Target positions evaluated, including the pending input token.
+  optional uint32 verify_tokens = 8;
+  DraftSource draft_source = 9;
+  // Absent for shared operations; otherwise selects the complete serving mode.
+  optional bool speculation_enabled = 10;
+  uint64 estimated_duration_ns = 11; // Zero denotes an indeterminate duration.
+  uint64 prefill_capacity = 12; // Prompt capacity of a mixed graph; zero otherwise.
+  // Physical target rows of a complete speculative operation. Zero retains the rectangular
+  // batch_capacity * token_capacity layout.
+  uint64 packed_token_capacity = 13;
+  // Number of confidence prefixes produced per request in the selected completion frame.
+  uint32 confidence_width = 14;
+  repeated TunedBinding tuned_bindings = 15;
+}
+enum DraftSource { NO_DRAFT = 0; MTP = 1; COPY_DRAFT = 2; }
+message InputBinding { string buffer_name = 1; uint64 host_offset = 2; uint64 nbytes = 3; }

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Cross-rank access to fixed collective buffers and incrementally backed cache regions."""
 
 import os
@@ -12,12 +15,12 @@ import torch.multiprocessing as mp
 def _rank(rank, rendezvous):
     from b12x.sequence._shared.disk_table import _tensor_from_pointer
     from ignition.preparation.module_images import ModuleImages
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
 
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2,
                             timeout=timedelta(seconds=60))
-    with ModuleImages() as images, PackageStorage(rank=rank, world=2, device=rank) as storage:
+    with ModuleImages() as images, CoreStorage(rank=rank, world=2, device=rank) as storage:
         peer = storage.peer_storage
         size = storage.granularity
         pointer = peer.cudaMalloc(size)

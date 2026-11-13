@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Ordering of writes through typed aliases in captured inference forwards."""
 
 import os
@@ -21,8 +24,8 @@ def test_compiled_gather_reads_only_backed_state_rows():
     import ctypes as C
     from b12x.sequence._shared.disk_table import _tensor_from_pointer
     from ignition.components.state import gather_rows
-    from ignition.preparation.package_storage import DeviceRegion
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.core_storage import DeviceRegion
+    from ignition.preparation.runtime_core import _Cuda
 
     torch.cuda.init()
     torch.empty(0, device="cuda")
@@ -343,6 +346,80 @@ def _fake_fill_output(out, value):
     pass
 
 
+class StorageMutationForward:
+    def __init__(self, offset):
+        self.storage = torch.empty(1 << 19, dtype=torch.int32, device="cuda")
+        self.source = self.storage[:8]
+        self.destination = self.storage[offset:offset + 8]
+        self.output = torch.empty((3, 8), dtype=torch.int64, device="cuda")
+
+    def __call__(self):
+        first = self.source.long()
+        _fill_output(self.destination, 7.)
+        second = self.source.long()
+        _fill_output(self.destination, 11.)
+        self.output[0].copy_(first + 3)
+        self.output[1].copy_(second + 5)
+        self.output[2].copy_(self.source)
+        return self.output
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("backend", ["fx", "aot"])
+@pytest.mark.parametrize("offset", [0, 16])
+@torch.no_grad()
+def test_live_values_do_not_clone_backing_storage(backend, offset, tmp_path, monkeypatch):
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.compilation import _Invocation
+
+    monkeypatch.setattr("ignition.preparation.compilation.DEFAULT_CACHE_ROOT", tmp_path)
+
+    forward = StorageMutationForward(offset)
+    compiled = compile_forward(forward) if backend == "fx" else aot_forward(forward)
+    if backend == "aot":
+        path = tmp_path / "mutations.bin"
+        compiled.save_compiled_function(str(path))
+        with path.open("rb") as file:
+            compiled = torch.compiler.load_compiled_function(file)
+
+    def run():
+        return compiled() if backend == "fx" else compiled(forward)
+
+    addresses, sizes = [], []
+    original = _Invocation.run
+
+    def observe(invocation, reads, writes, integers=()):
+        if invocation.target == torch.ops.test_compilation.fill_output.default:
+            _, _, index, descriptor = invocation.operands[0]
+            offset = 0 if descriptor is None else descriptor[3] * descriptor[0].itemsize
+            addresses.append(writes[index].data_ptr() + offset)
+            sizes.append(writes[index].nbytes)
+        return original(invocation, reads, writes, integers)
+
+    monkeypatch.setattr(_Invocation, "run", observe)
+    run()
+    assert addresses == [forward.destination.data_ptr()] * 2
+    assert sizes == [forward.destination.nbytes] * 2
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for initial in (2, -17, 101):
+        forward.storage.fill_(initial)
+        forward.output.fill_(-1)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        expected = torch.tensor([initial + 3, (7 if offset == 0 else initial) + 5,
+                                 11 if offset == 0 else initial], device="cuda").view(3, 1).expand(3, 8)
+        torch.testing.assert_close(forward.output, expected, rtol=0, atol=0, check_dtype=False)
+        assert (forward.destination == 11).all()
+        assert (forward.storage[offset + 8:] == initial).all()
+        if offset:
+            assert (forward.storage[:offset] == initial).all()
+    graph.reset()
+
+
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
 @torch.no_grad()
 def test_cloned_value_survives_scratch_overwrite():
@@ -588,6 +665,183 @@ def test_snapshots_of_reused_copy_destinations():
     graph.replay()
     for value, snapshot in enumerate(snapshots, 1):
         torch.testing.assert_close(snapshot, torch.full_like(snapshot, value), rtol=0, atol=0)
+
+
+@torch.library.custom_op("test_compilation::observe", mutates_args=("result",))
+def _observe(source: torch.Tensor, result: torch.Tensor) -> None:
+    result.copy_(source)
+
+
+@_observe.register_fake
+def _fake_observe(source, result):
+    pass
+
+
+def _complete_copy_cases():
+    """Complete copies into persistent storage whose destination a later opaque call reads."""
+    def token_count(arena, dest, seen):
+        lengths = torch.ones(16, dtype=torch.int32, device="cuda")
+        count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        result = torch.full((1,), -7, dtype=torch.int32, device="cuda")
+
+        def forward():
+            count.copy_(lengths.cumsum(0, dtype=torch.int32)[-1:])
+            _observe(count, result)
+
+        return forward, result, lambda: torch.full((1,), 16, dtype=torch.int32, device="cuda")
+
+    def offset_view(arena, dest, seen):
+        def forward():
+            arena.mul_(1.)
+            dest.copy_(arena[1000:1256])
+            _observe(dest, seen)
+
+        return forward, seen, lambda: arena[1000:1256]
+
+    def sub_view_read(arena, dest, seen):
+        result = seen[:10]
+
+        def forward():
+            arena.mul_(1.)
+            dest.copy_(arena[1000:1256])
+            _observe(dest[100:110], result)
+
+        return forward, result, lambda: arena[1100:1110]
+
+    def strided_source(arena, dest, seen):
+        plane = arena.view(8, 512)
+
+        def forward():
+            arena.mul_(1.)
+            dest.view(8, 32).copy_(plane[:, 16:48])
+            _observe(dest, seen)
+
+        return forward, seen, lambda: plane[:, 16:48].reshape(-1)
+
+    def converted_source(arena, dest, seen):
+        half = torch.zeros(256, dtype=torch.bfloat16, device="cuda")
+        result = torch.full_like(half, -7.)
+
+        def forward():
+            arena.mul_(1.)
+            half.copy_(arena[1000:1256])
+            _observe(half, result)
+
+        return forward, result, lambda: arena[1000:1256].bfloat16()
+
+    def broadcast_source(arena, dest, seen):
+        def forward():
+            arena.mul_(1.)
+            dest.copy_(arena[1000:1001])
+            _observe(dest, seen)
+
+        return forward, seen, lambda: arena[1000:1001].expand(256)
+
+    def write_then_read(arena, dest, seen):
+        def forward():
+            arena.mul_(1.)
+            dest.copy_(arena[1000:1256])
+            _fill_output(dest[:4], 5.)
+            _observe(dest, seen)
+
+        return forward, seen, lambda: torch.cat([torch.full((4,), 5., device="cuda"), arena[1004:1256]])
+
+    def triton_reader(arena, dest, seen):
+        from ignition.preparation.triton import prepare_triton
+
+        launch = prepare_triton(_copy_triton, (dest, seen, 256), (1,))
+
+        def forward():
+            arena.mul_(1.)
+            dest.copy_(arena[1000:1256])
+            launch()
+
+        return forward, seen, lambda: arena[1000:1256]
+
+    return {case.__name__: case for case in (token_count, offset_view, sub_view_read, strided_source,
+                                             converted_source, broadcast_source, write_then_read, triton_reader)}
+
+
+@triton.jit
+def _copy_triton(source, result, n: tl.constexpr):
+    offsets = tl.arange(0, n)
+    tl.store(result + offsets, tl.load(source + offsets))
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("case", sorted(_complete_copy_cases()))
+@torch.no_grad()
+def test_opaque_calls_read_the_written_destination_of_a_complete_copy(case):
+    arena = torch.arange(4096, dtype=torch.float32, device="cuda")
+    dest = torch.zeros(256, device="cuda")
+    seen = torch.full((256,), -7., device="cuda")
+    forward, observed, expected = _complete_copy_cases()[case](arena, dest, seen)
+    compiled = compile_forward(forward)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for scale in (1., -3.):
+        arena.copy_(torch.arange(4096, device="cuda") * scale)
+        observed.fill_(-7.)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(observed, expected(), rtol=0, atol=0)
+    assert torch.equal(arena, torch.arange(4096, device="cuda") * -3.)
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@torch.no_grad()
+def test_complete_copies_stay_fused_unless_an_opaque_call_takes_their_destination():
+    source = torch.arange(256, dtype=torch.float32, device="cuda")
+    fused = torch.zeros(256, device="cuda")
+    ordered = torch.zeros(256, device="cuda")
+    seen = torch.full((256,), -7., device="cuda")
+
+    def forward():
+        fused.copy_(source * 2)
+        ordered.copy_(source * 3)
+        _observe(ordered, seen)
+
+    compiled = compile_forward(forward)
+    copies = [call for call in compiled.invocations if call.target is torch.ops.aten.copy_.default]
+    assert len(copies) == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    source.add_(1)
+    graph.replay()
+    torch.testing.assert_close(fused, source * 2, rtol=0, atol=0)
+    torch.testing.assert_close(seen, source * 3, rtol=0, atol=0)
+    torch.testing.assert_close(ordered, source * 3, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@torch.no_grad()
+def test_row_expansion_reads_overlapping_rows_before_writing():
+    # Packed rows expand into sample slots of the same buffer, as vocabulary and hidden heads do.
+    rows, width = 6, 129280
+    output = torch.empty((2 * rows, width), device="cuda")
+    physical = output[:rows]
+    source = torch.zeros_like(physical)
+    indices = torch.zeros(2 * rows, dtype=torch.int64, device="cuda")
+
+    def forward():
+        physical.copy_(source)
+        output.copy_(physical[indices])
+
+    compiled = compile_forward(forward)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for shift in range(1, rows):
+        source.copy_(torch.randn_like(source))
+        indices.copy_((torch.arange(2 * rows, device="cuda") + shift) % rows)
+        graph.replay()
+        torch.testing.assert_close(output, source[indices], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")

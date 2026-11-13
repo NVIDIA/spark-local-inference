@@ -1,36 +1,15 @@
-"""Prepared grouped low-rank attention output projection through b12x."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import replace
+"""Prepared grouped low-rank attention output projection through b12x."""
 
 import torch
 from b12x.gemm import wo_projection
 from b12x.preparation import PreparedCall
-from b12x.preparation.types import plan_from_handle
 
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
-
-
-@torch.library.custom_op("flare::grouped_attention_output", mutates_args=("out", "scratch"))
-def _project(source: torch.Tensor, weights: list[torch.Tensor], out: torch.Tensor,
-             scratch: torch.Tensor, handle: int) -> None:
-    plan = plan_from_handle(handle)
-    q = plan.query
-    def matrix(parts):
-        return wo_projection.MXFP8Rows(parts[0], parts[1].view(torch.float8_e8m0fnu),
-                                      parts[2].view(torch.float8_e8m0fnu))
-    packed = wo_projection.Weights(matrix(weights[:3]), matrix(weights[3:]),
-                                  q.groups, q.group_width, q.rank, q.hidden)
-    binding = wo_projection.bind(plan, source_tgd=source, weights=packed, scratch=scratch)
-    binding = replace(binding, output=out.as_strided((source.shape[0], q.hidden, 1),
-                                                   (q.hidden, 1, source.shape[0] * q.hidden)))
-    wo_projection.run(binding=binding, plan=plan)
-
-
-@_project.register_fake
-def _project_fake(source, weights, out, scratch, handle):
-    pass
 
 
 class PreparedGroupedOutputProjection:
@@ -48,9 +27,7 @@ class PreparedGroupedOutputProjection:
 
         def call(state, values, out, *, produce=None, owners=()):
             scratch = planned_scratch(state._scratch_state.scratch_specs(), workspace)
-            binding = state.bind(source_tgd=values, weights=weights, scratch=scratch)
-            binding = replace(binding, output=out.as_strided((values.shape[0], weights.hidden, 1),
-                (weights.hidden, 1, values.shape[0] * weights.hidden)))
+            binding = state.bind(source_tgd=values, weights=weights, scratch=scratch, out=out)
             return PreparedCall(run=lambda: state.run(binding), output=out, produce=produce,
                 owners=(*owners, weights, *prime_owners(workspace, scratch, binding)))
 
@@ -67,6 +44,20 @@ class PreparedGroupedOutputProjection:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
+    def functional(self, *, session):
+        self.output_layout = (tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.output = self.workspace = self.scratch = None
+
     def __call__(self, source):
-        _project(source, self.operands, self.output, self.scratch, self.plan.handle)
-        return self.output
+        output, scratch = self.output, self.scratch
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+            scratch, = (torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.scratch_layout)
+        wo_projection.run_out(source, self.weights, out=output, scratch=scratch, plan=self.plan)
+        return output

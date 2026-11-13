@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Compiled chat templates with zero-output position annotations.
 
 mod compiler;
@@ -71,6 +77,7 @@ impl CompiledTemplate {
     }
 
     #[cfg(test)]
+    #[cfg_attr(test, allow(dead_code))]
     pub fn bytecode_bytes(&self) -> usize {
         self.code.len() * std::mem::size_of::<Instruction>()
     }

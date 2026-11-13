@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Preparation-only registration of shared RAM tables for native graph execution.
 
 use crate::engram::Binding;
@@ -82,7 +88,7 @@ impl NativeEmbeddingTables {
         {
             let _ = (py, catalog, descriptors);
             Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "shared RAM table handoff for ignition serve requires Linux; load an exported package for native RAM serving",
+                "shared RAM table handoff for ignition debug-serve requires Linux; load an exported core for native RAM serving",
             ))
         }
     }

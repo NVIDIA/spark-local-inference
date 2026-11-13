@@ -6,11 +6,17 @@ build-backend = "maturin"
 name = "flare-heliopause"
 version = "0.1.0"
 requires-python = ">=3.12"
-description = "Heliopause: CPython preparation hooks for Flare runtime packages"
+description = "Heliopause: CPython preparation hooks for Flare runtime cores"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 
 [tool.maturin]
 features = ["server", "extension-module"]
 module-name = "flare_heliopause"
-include = [{ path = "licenses/*", format = ["sdist", "wheel"] }]
+include = [
+    { path = "licenses/*", format = ["sdist", "wheel"] },
+    { path = "ignition/recipes/qwen38/assets/chat_template.patch.json", format = "sdist" },
+    { path = "ignition/recipes/step5/assets/chat_template.patch.json", format = "sdist" },
+    { path = "ignition/recipes/kimi3/assets/chat_template.jinja", format = "sdist" },
+    { path = "ignition/recipes/kimi31/assets/chat_template.jinja", format = "sdist" },
+]

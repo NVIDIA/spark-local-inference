@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Local tuning replicas with independent serving and candidate-sharding groups."""
 
 from dataclasses import dataclass, fields, replace
@@ -32,13 +35,13 @@ def authorization(states, *, replica, rank, tensor_parallel, ranks):
     if all(item[3] is not None for item in peers):
         return {"cache": tuple(item[3] for item in peers)}
     if all(item[4] for item in peers):
-        from .collectives import _winners
+        from .collectives import _tuning_results
 
         keys = [sorted(value.key for value in item[4]) for item in peers]
         if any(value != keys[0] for value in keys[1:]):
             raise RuntimeError("corresponding tuning ranks declared different candidate races")
-        winners = _winners(value for item in peers for value in item[4])
-        return {"tuning": winners[0] if len(winners) == 1 else winners}
+        results = _tuning_results(value for item in peers for value in item[4])
+        return {"tuning": results[0] if len(results) == 1 else results}
     if any(item[0] for item in peers) and any(item[3] is not None or item[4] for item in peers):
         raise RuntimeError("a tuning replica finished before its corresponding rank")
     local = states[replica * tensor_parallel:(replica + 1) * tensor_parallel]
@@ -124,20 +127,23 @@ class ReplicaPreparation:
 
 def _replica(parent, prepare, snapshot, values, gpu_uuids, options):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
+    from ignition import runtime_patches
+
+    runtime_patches.apply()
     import flare_heliopause
 
     flare_heliopause.bind_parent_lifetime(parent)
     import torch
     from ignition.planning import Plan
-    from .package_storage import PackageStorage
+    from .core_storage import CoreStorage
 
     recipe = importlib.import_module(prepare.__module__).RECIPE
     plan = Plan(recipe=recipe, **values)
     torch.cuda.set_device(0)
-    with PackageStorage(world=plan.world_size) as storage:
+    with CoreStorage(world=plan.world_size) as storage:
         try:
             prepare(snapshot, plan, compile_forwards=False, retain_graphs=False, progress=None,
-                    package_storage=storage, **options)
+                    core_storage=storage, **options)
         except TuningComplete:
             torch.cuda.synchronize()
         else:

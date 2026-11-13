@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Native tokenization and rendering over verified Hugging Face assets.
 
 mod deepseek;
@@ -18,6 +24,12 @@ use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::{Error, Failure, FrontendError, Result};
+
+pub(crate) fn validate_chat_template(source: &str) -> Result<()> {
+    templates::compile(source).map(|_| ()).map_err(|error| {
+        Error::frontend(FrontendError::Template(Failure::caused_by(error.to_string(), error)))
+    })
+}
 
 pub struct Asset {
     pub path: PathBuf,
@@ -50,7 +62,7 @@ impl Asset {
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "frontend asset exceeds package",
+                        "frontend asset exceeds core",
                     ));
                 }
                 let mut bytes = vec![0; size];
@@ -180,6 +192,37 @@ impl TryFrom<i32> for TemplateEncoding {
 struct TokenSegment {
     text: String,
     allow_special: bool,
+    #[serde(default)]
+    image_index: Option<usize>,
+}
+
+fn order_segment_images(
+    segments: &[TokenSegment],
+    sources: &mut Vec<String>,
+    hints: &mut [usize],
+) -> Result<()> {
+    let order: Vec<_> = segments.iter().filter_map(|segment| segment.image_index).collect();
+    if order.is_empty() {
+        return Ok(());
+    }
+    if order.len() != sources.len() {
+        return Err(deepseek::invalid("image segment indices must include each image source exactly once"));
+    }
+    let mut positions = vec![None; sources.len()];
+    for (position, &index) in order.iter().enumerate() {
+        let Some(slot) = positions.get_mut(index) else {
+            return Err(deepseek::invalid("image segment index exceeds the image source count"));
+        };
+        if slot.replace(position).is_some() {
+            return Err(deepseek::invalid("image segment indices must not repeat an image source"));
+        }
+    }
+    for hint in hints {
+        *hint = positions[*hint].unwrap();
+    }
+    let mut original: Vec<_> = std::mem::take(sources).into_iter().map(Some).collect();
+    *sources = order.into_iter().map(|index| original[index].take().unwrap()).collect();
+    Ok(())
 }
 
 fn token_segments(text: &str, hints: &mut Vec<usize>) -> serde_json::Result<Vec<TokenSegment>> {
@@ -192,6 +235,8 @@ fn token_segments(text: &str, hints: &mut Vec<usize>) -> serde_json::Result<Vec<
         #[serde(borrow)]
         text: &'a serde_json::value::RawValue,
         allow_special: bool,
+        #[serde(default)]
+        image_index: Option<usize>,
     }
     let raw_segments: Vec<RawSegment<'_>> = serde_json::from_str(text)?;
     let mut segments = Vec::with_capacity(raw_segments.len());
@@ -214,6 +259,7 @@ fn token_segments(text: &str, hints: &mut Vec<usize>) -> serde_json::Result<Vec<
         segments.push(TokenSegment {
             text: decoded,
             allow_special: segment.allow_special,
+            image_index: segment.image_index,
         });
     }
     *hints = positions;
@@ -248,9 +294,9 @@ impl Frontend {
         self.prompt_encoder
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
-        self.ordinary_tokenizer = match encoding {
-            TemplateEncoding::Text => None,
-            TemplateEncoding::TokenSegments => {
+        self.ordinary_tokenizer = match (self.prompt_encoder, encoding) {
+            (PromptEncoder::Jinja, TemplateEncoding::Text) => None,
+            _ => {
                 let mut tokenizer = self.tokenizer.clone();
                 tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
                 Some(tokenizer)
@@ -616,8 +662,9 @@ impl Frontend {
                         if checkpoint_hints.contains(&(index, part_index + 1)) {
                             image_checkpoint_hints.push(image_sources.len());
                         }
+                        let image_index = image_sources.len();
                         image_sources.push(url.to_owned());
-                        *part = serde_json::json!({"type":"image"});
+                        *part = serde_json::json!({"type":"image", "image_index":image_index});
                     }
                 }
             }
@@ -657,8 +704,10 @@ impl Frontend {
             vec![TokenSegment {
                 text: rendered,
                 allow_special: true,
+                image_index: None,
             }]
         };
+        order_segment_images(&segments, &mut image_sources, &mut image_checkpoint_hints)?;
         let mut segment_ends = Vec::with_capacity(segments.len() + 1);
         segment_ends.push(0usize);
         for segment in &segments {
@@ -833,6 +882,7 @@ impl IncrementalDecoder<'_> {
         })
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn pending_text(&self) -> Result<String> {
         let text = self.tokenizer.decode(&self.ids, self.skip_special_tokens).map_err(|e| e.to_string())?;
         Ok(text.strip_prefix(&self.prefix).ok_or("decoder changed its emitted prefix")?.to_owned())
@@ -1088,6 +1138,27 @@ mod tests {
         ));
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn image_segment_indices_reorder_sources_and_hints_and_reject_ambiguity() {
+        let mut hints = Vec::new();
+        let segments = token_segments(r#"[{"text":"second","allow_special":true,"image_index":1},{"text":"first","allow_special":true,"image_index":0}]"#, &mut hints).unwrap();
+        let mut sources = vec!["first".into(), "second".into()];
+        let mut checkpoints = vec![0];
+        order_segment_images(&segments, &mut sources, &mut checkpoints).unwrap();
+        assert_eq!(sources, ["second", "first"]);
+        assert_eq!(checkpoints, [1]);
+        for indices in [vec![0,0], vec![0,2], vec![1]] {
+            let segments = indices.into_iter().map(|index| TokenSegment {
+                text: "image".into(), allow_special:true, image_index:Some(index),
+            }).collect::<Vec<_>>();
+            assert!(order_segment_images(&segments, &mut sources, &mut checkpoints).is_err());
+        }
+        let segments = token_segments(r#"[{"text":"legacy","allow_special":true}]"#, &mut hints).unwrap();
+        order_segment_images(&segments, &mut sources, &mut checkpoints).unwrap();
+        assert_eq!(sources, ["second", "first"]);
+        assert_eq!(checkpoints, [1]);
     }
 
     #[test]

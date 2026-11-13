@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
 use crate::{
     cache::Fence,
@@ -10,6 +16,9 @@ use sha2::{Digest, Sha256};
 use std::ops::ControlFlow;
 use std::sync::atomic::AtomicUsize;
 
+#[path = "response_lifecycle_tests.rs"]
+mod response_lifecycle_tests;
+
 struct Fixture {
     config: ModelConfig,
     frontend: Frontend,
@@ -19,6 +28,47 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_template(b"{% mark %}{{ messages[0].content }}", &["<eos>"], &[])
+    }
+
+    fn reasoning() -> Self {
+        let mut fixture = Self::with_template(
+            b"a{% mark %}assistant<think>",
+            &[
+                "<eos>",
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</function>",
+                "</tool_call>",
+                "<parameter=n>",
+                "</parameter>",
+            ],
+            &["<function=lookup>"],
+        );
+        fixture.config.contract.frontend.assistant_marker = "assistant".into();
+        fixture.config.contract.frontend.reasoning =
+            Some(crate::model::contract::ReasoningParser {
+                kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+                open: "<think>".into(),
+                close: "</think>".into(),
+                wrapping_newlines: 0,
+                terminal_markers: vec![],
+            });
+        // Prepared text prompts have no image arrays or image graph inputs.
+        for graph in &mut fixture.config.contract.graphs {
+            graph.inputs.retain(|binding| {
+                !matches!(
+                    binding.source,
+                    crate::model::contract::ValueSource::ImageFeatureIndex
+                        | crate::model::contract::ValueSource::ImageFeatureSlot
+                )
+            });
+        }
+        fixture
+    }
+
+    fn with_template(template: &[u8], special_tokens: &[&str], text_tokens: &[&str]) -> Self {
         static SERIAL: AtomicUsize = AtomicUsize::new(0);
         let directory = std::env::temp_dir().join(format!(
             "flare-worker-phase-{}-{}",
@@ -28,6 +78,7 @@ impl Fixture {
         std::fs::create_dir(&directory).unwrap();
         let vocabulary: tokenizers::models::bpe::Vocab = ["a", "b", "c", "d", "x"]
             .into_iter()
+            .chain(text_tokens.iter().copied())
             .enumerate()
             .map(|(id, token)| (token.to_owned(), id as u32))
             .collect();
@@ -39,8 +90,13 @@ impl Fixture {
         );
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
         tokenizer
-            .add_special_tokens([tokenizers::AddedToken::from("<eos>", true)])
+            .add_special_tokens(
+                special_tokens
+                    .iter()
+                    .map(|&text| tokenizers::AddedToken::from(text, true)),
+            )
             .unwrap();
+        let eos = tokenizer.token_to_id("<eos>").unwrap();
         let asset = |name: &str, bytes: &[u8]| {
             let path = directory.join(name);
             std::fs::write(&path, bytes).unwrap();
@@ -57,7 +113,7 @@ impl Fixture {
                     tokenizer.to_string(false).unwrap().as_bytes(),
                 ),
                 tokens: Default::default(),
-                chat_template: Some(asset("chat.jinja", b"{% mark %}{{ messages[0].content }}")),
+                chat_template: Some(asset("chat.jinja", template)),
             },
             Default::default(),
         )
@@ -65,6 +121,7 @@ impl Fixture {
         std::fs::remove_dir_all(directory).unwrap();
         Self {
             config: ModelConfig {
+                completion_token_capacity: 16,
                 max_top_logprobs: 0,
                 logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
@@ -79,7 +136,7 @@ impl Fixture {
                     pages: 16,
                     snapshots: 16,
                 },
-                eos_token_ids: vec![5],
+                eos_token_ids: vec![eos],
                 sampling_ranges: Default::default(),
                 sampling_defaults: SamplingParameters::default(),
                 max_new_tokens: 16,
@@ -92,7 +149,7 @@ impl Fixture {
             },
             frontend,
             stop: AtomicBool::new(false),
-            metrics: Arc::new(Default::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
         }
     }
 
@@ -147,6 +204,26 @@ impl Fixture {
         )
     }
 
+    fn prompt_for(tokens: Vec<u32>, limit: u32, data: PromptData) -> Prompt {
+        Prompt {
+            tokens,
+            message_boundaries: vec![],
+            data,
+            conditioned_inputs: vec![],
+            conditioning: vec![],
+            sampling: SamplingParameters::default(),
+            max_new_tokens: limit,
+            reasoning_cut: None,
+            stop_sequences: vec![],
+            stop_strings: vec![],
+            logprobs: false,
+            logprob_token_ids: vec![],
+            prompt_logprobs: false,
+            ignore_eos: false,
+            grammar: None,
+        }
+    }
+
     fn incoming_for(
         &self,
         tokens: Vec<u32>,
@@ -163,22 +240,7 @@ impl Fixture {
                 _capacity: None,
                 arrival_ns: super::super::observation::monotonic_ns(),
                 publications: Default::default(),
-                prompt: Prompt {
-                    tokens,
-                    message_boundaries: vec![],
-                    data,
-                    conditioned_inputs: vec![],
-                    conditioning: vec![],
-                    sampling: SamplingParameters::default(),
-                    max_new_tokens: limit,
-                    stop_sequences: vec![],
-                    stop_strings: vec![],
-                    logprobs: false,
-                    logprob_token_ids: vec![],
-                    prompt_logprobs: false,
-                    ignore_eos: false,
-                    grammar: None,
-                },
+                prompt: Self::prompt_for(tokens, limit, data),
                 events,
                 admission: Mutex::new(Some(admission)),
                 first_token: std::cell::Cell::new(Some(first_token)),
@@ -191,9 +253,14 @@ impl Fixture {
                 prompt_score_end: 0,
                 prompt_scored: 0,
                 blocked: None,
+                pool_lookup: None,
+                pool_lookup_started: None,
+                host_lookup_outcome: None,
+                pool_plan: None,
             },
             Generation {
                 events: receiver,
+                _capacity: None,
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -302,7 +369,7 @@ fn completion(
     sequence: u64,
     sampled: Option<u32>,
 ) -> FrameCompletion {
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     for lane in &step.lanes {
         let live = worker.scheduler.request(lane.request).unwrap();
         records[lane.request.slot as usize] = CompletionRecord {
@@ -331,6 +398,648 @@ fn advance(worker: &mut Worker<'_>, kind: GraphKind, sequence: u64, token: Optio
     let step = planned(worker, kind, sequence);
     let frame = completion(worker, &step, sequence, token);
     worker.complete(kind, frame).unwrap();
+}
+
+fn budget_cut(close: u32, after: u32) -> ReasoningCut {
+    let close_text = ["a", "b", "c", "d", "x"][close as usize];
+    let mut syntax = crate::model::testing::metadata().frontend;
+    syntax.reasoning = Some(crate::model::contract::ReasoningParser {
+        kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+        open: "<think>".into(),
+        close: close_text.into(),
+        wrapping_newlines: 0,
+        terminal_markers: vec![],
+    });
+    ReasoningCut {
+        close,
+        after,
+        output: Some(crate::output::OutputConfig {
+            syntax,
+            content: crate::output::tagged::OutputConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Reasoning,
+                tools: vec![],
+            },
+            control_tokens: vec![(close, close_text.into())],
+        }),
+    }
+}
+
+// Drive the worker's normal completion and terminal-checkpoint phases without CUDA.
+fn budget_pass(worker: &mut Worker<'_>, sequence: &mut u64, samples: &[u32]) {
+    let steps = samples.len() + 40;
+    let mut samples = samples.iter().copied();
+    for _ in 0..steps {
+        if worker.active.iter().all(Option::is_none) {
+            assert!(samples.next().is_none());
+            return;
+        }
+        let step = worker
+            .plan(0)
+            .unwrap()
+            .0
+            .expect("budget pass must progress");
+        *sequence += 1;
+        worker.reserve_and_pack(&step, Fence(*sequence)).unwrap();
+        let lane = &step.lanes[0];
+        let live = worker.scheduler.request(lane.request).unwrap();
+        let generates = matches!(step.kind, GraphKind::Decode | GraphKind::Resume)
+            || (step.kind == GraphKind::Prefill
+                && lane.start_position + lane.tokens as u64 == live.prompt_tokens as u64);
+        let token = generates.then(|| samples.next().expect("unexpected generation"));
+        let mut frame = completion(worker, &step, *sequence, token);
+        if token.is_some_and(|token| worker.config.eos_token_ids.contains(&token))
+            && !worker.active[lane.request.slot as usize]
+                .as_ref()
+                .unwrap()
+                .incoming
+                .prompt
+                .ignore_eos
+        {
+            frame.records[lane.request.slot as usize].status = 2;
+        }
+        if let Some(token) = token
+            && worker.active[lane.request.slot as usize]
+                .as_ref()
+                .unwrap()
+                .incoming
+                .prompt
+                .logprobs
+        {
+            let mut values = vec![vec![None; 16]; 4];
+            values[lane.request.slot as usize][0] = Some(crate::execution::TokenLogprobs {
+                token,
+                logprob: -1.,
+                top: vec![],
+            });
+            frame.logprobs = Some(values);
+        }
+        worker.complete(step.kind, frame).unwrap();
+        worker.publish().unwrap();
+    }
+    panic!("budget pass did not finish");
+}
+
+fn budget_events(
+    generation: &mut Generation,
+) -> (Vec<u32>, Vec<(usize, u32, &'static str)>, Vec<u32>) {
+    let mut tokens = vec![];
+    let mut finished = vec![];
+    let mut logprobs = vec![];
+    while let Ok(event) = generation.events.try_recv() {
+        match event {
+            GenerationEvent::Token(token) => tokens.push(token),
+            GenerationEvent::LogprobToken(value) => {
+                tokens.push(value.token);
+                logprobs.push(value.token);
+            }
+            GenerationEvent::Protocol(pieces) => {
+                for piece in pieces {
+                    match piece {
+                        crate::output::Piece::Token(token) => tokens.push(token),
+                        crate::output::Piece::Logprob(entry) => logprobs.push(entry.value.token),
+                        _ => {}
+                    }
+                }
+            }
+            GenerationEvent::Finished {
+                prompt_tokens,
+                generated_tokens,
+                reason,
+                ..
+            } => {
+                finished.push((prompt_tokens, generated_tokens, reason));
+            }
+            GenerationEvent::Error(error) | GenerationEvent::AdmissionRejected(error) => {
+                panic!("{error}")
+            }
+            _ => {}
+        }
+    }
+    (tokens, finished, logprobs)
+}
+
+#[test]
+fn reasoning_budget_cuts_or_plainly_continues_with_exact_history_and_usage() {
+    for close_at in [None, Some(1), Some(2)] {
+        for after in [1, 4] {
+            let mut fixture = Fixture::new();
+            fixture.config.history_drafts = true;
+            let (sender, receiver) = mpsc::channel();
+            let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+            incoming.prompt.reasoning_cut = Some(budget_cut(4, after));
+            sender.send(vec![incoming]).unwrap();
+            let mut worker = fixture.worker(receiver);
+            worker.admit().unwrap();
+            let mut first = [1; 3];
+            if let Some(at) = close_at {
+                first[at] = 4;
+            }
+            let mut sequence = 0;
+            budget_pass(&mut worker, &mut sequence, &first);
+            let (mut tokens, mut finished, _) = budget_events(&mut generation);
+            let forced = close_at.is_none();
+            let mut expected = first.to_vec();
+            if forced {
+                expected.push(4);
+            }
+            assert_eq!(tokens, expected);
+            assert_eq!(
+                worker.metrics.snapshot(false).reasoning_budget_cuts,
+                u64::from(forced)
+            );
+            if after > u32::from(forced) {
+                assert!(finished.is_empty());
+                assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 0);
+                let (incoming, parked) = worker.parked.front().unwrap();
+                assert_eq!(incoming.prompt.tokens, [vec![0], expected.clone()].concat());
+                assert!(incoming.prompt.reasoning_cut.is_none());
+                assert_eq!(incoming.prompt.max_new_tokens, after - u32::from(forced));
+                assert_eq!(parked.carried.generated_tokens, expected.len() as u32);
+                assert!(parked.reasoning.is_none());
+                assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+                budget_pass(
+                    &mut worker,
+                    &mut sequence,
+                    &vec![2; after as usize - usize::from(forced)],
+                );
+                let (tail, terminal, _) = budget_events(&mut generation);
+                tokens.extend(tail);
+                finished.extend(terminal);
+            }
+            assert_eq!(tokens.len(), 3 + after as usize);
+            assert_eq!(tokens.iter().filter(|&&token| token == 4).count(), 1);
+            assert_eq!(finished, vec![(1, 3 + after, "length")]);
+            assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+            assert_eq!(worker.metrics.admitted.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                worker.metrics.snapshot(false).generated_tokens,
+                (3 + after) as u64
+            );
+            assert!(worker.parked.is_empty());
+            if forced && after == 4 {
+                assert_eq!(
+                    worker.scheduler.history_proposal(&[1, 1, 1, 4], 7),
+                    (vec![2, 2, 2, -1, -1, -1, -1], 3)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_cuts_when_ignored_eos_is_the_last_pass_token() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+    incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+    incoming.prompt.ignore_eos = true;
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.admit().unwrap();
+    let mut sequence = 0;
+    budget_pass(&mut worker, &mut sequence, &[1, 1, 5]);
+    let (incoming, parked) = worker.parked.front().unwrap();
+    assert_eq!(incoming.prompt.tokens, vec![0, 1, 1, 5, 4]);
+    assert_eq!(incoming.prompt.max_new_tokens, 2);
+    assert_eq!(parked.carried.generated_tokens, 4);
+    assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 1);
+    worker.admit().unwrap();
+    budget_pass(&mut worker, &mut sequence, &[2, 2]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![1, 1, 5, 4, 2, 2], vec![(1, 6, "length")], vec![])
+    );
+}
+
+#[test]
+fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
+    let mut fixture = Fixture::new();
+    fixture.config.speculative_widths = vec![1, 4];
+    fixture.config.speculative_fixed_width = Some(4);
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 4);
+    incoming.prompt.reasoning_cut = Some(budget_cut(4, 2));
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.scheduler.enable_speculation(&[1, 4]).unwrap();
+    worker.scheduler.fixed_speculative_width(Some(4)).unwrap();
+    worker.admit().unwrap();
+    advance(&mut worker, GraphKind::Init, 1, None);
+    advance(&mut worker, GraphKind::Prefill, 2, Some(1));
+    advance(&mut worker, GraphKind::Snapshot, 3, None);
+    let step = planned(&mut worker, GraphKind::Speculative, 4);
+    assert_eq!(step.token_capacity, 4);
+    assert_eq!(step.lanes[0].tokens, 3);
+    let mut frame = completion(&worker, &step, 4, None);
+    let record = &mut frame.records[step.lanes[0].request.slot as usize];
+    record.consumed_tokens = 16;
+    record.generated_tokens = 4;
+    record.token_id = 1;
+    record.vector = Some(crate::execution::TokenVector {
+        emitted_count: 3,
+        offered_drafts: 2,
+        accepted_drafts: 2,
+        verification_width: 4,
+        draft_cache_consumed: 15,
+        tokens: vec![1, 1, 1, -1, -1, -1, -1, -1],
+        ..Default::default()
+    });
+    worker.complete(GraphKind::Speculative, frame).unwrap();
+    worker.publish().unwrap();
+    let mut sequence = 4;
+    budget_pass(&mut worker, &mut sequence, &[]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![1, 1, 1, 1, 4], vec![], vec![])
+    );
+    let (incoming, parked) = worker.parked.front().unwrap();
+    assert_eq!(
+        incoming.prompt.tokens,
+        [vec![0; 13], vec![1, 1, 1, 1, 4]].concat()
+    );
+    assert_eq!(incoming.prompt.max_new_tokens, 1);
+    assert_eq!(parked.carried.generated_tokens, 5);
+    assert!(
+        worker
+            .metrics
+            .render()
+            .contains("flare_reasoning_budget_cuts_total 1\n")
+    );
+    worker.admit().unwrap();
+    budget_pass(&mut worker, &mut sequence, &[2]);
+    assert_eq!(
+        budget_events(&mut generation),
+        (vec![2], vec![(13, 6, "length")], vec![])
+    );
+}
+
+fn prepared_budget_request(
+    fixture: &Fixture,
+    protocol: crate::server::protocol::Protocol,
+    body: serde_json::Value,
+) -> (
+    Incoming,
+    Generation,
+    super::super::output::Decoder<'_, crate::output::OutputPipeline>,
+    usize,
+) {
+    let decoded = crate::server::protocol::decode(protocol, body, false).unwrap();
+    let compiler = crate::grammar::GrammarCompiler::new(
+        fixture.frontend.tokenizer(),
+        fixture.config.contract.vocabulary,
+        &fixture.config.eos_token_ids,
+        &[],
+    )
+    .unwrap();
+    let prepared = crate::server::request::prepare_inference(
+        &fixture.frontend,
+        None,
+        &compiler,
+        &fixture.config,
+        &decoded.request,
+        0,
+        false,
+    )
+    .unwrap();
+    let prompt_tokens = prepared.prompt.tokens.len();
+    let decoder = super::super::output::Decoder::new(
+        &fixture.frontend,
+        &fixture.config.eos_token_ids,
+        prepared.output,
+    );
+    let (mut incoming, generation) = fixture.incoming(vec![], 0);
+    incoming.prompt = prepared.prompt;
+    (incoming, generation, decoder, prompt_tokens)
+}
+
+#[test]
+fn reasoning_budget_does_not_inject_a_close_inside_a_tool_call() {
+    use crate::model::contract::{ToolParser, ToolParserKind};
+    use crate::server::protocol::Protocol;
+    use serde_json::json;
+    for (budget, constrained) in [(2, false), (2, true), (4, false), (4, true)] {
+        let mut fixture = Fixture::reasoning();
+        fixture
+            .config
+            .contract
+            .frontend
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .terminal_markers = vec!["<tool_call>".into()];
+        fixture.config.contract.frontend.tools = Some(ToolParser {
+            kind: ToolParserKind::QwenCoder,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let mut body = json!({"messages":[{"role":"user","content":"a"}],
+            "max_tokens":8,"thinking_token_budget":budget,"add_generation_prompt":true,
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                "type":"object","properties":{"n":{"type":"string"}}}}}]});
+        if constrained {
+            body["response_format"] = json!({"type":"json_object"});
+        }
+        let (incoming, mut generation, mut decoder, prompt_tokens) =
+            prepared_budget_request(&fixture, Protocol::Chat, body);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        let token = |text| fixture.frontend.tokenizer().token_to_id(text).unwrap();
+        let samples = [
+            token("b"),
+            token("<tool_call>"),
+            token("<function=lookup>"),
+            token("<parameter=n>"),
+            token("c"),
+            token("</parameter>"),
+            token("</function>"),
+            token("</tool_call>"),
+        ];
+        let first = &samples[..budget];
+        budget_pass(&mut worker, &mut sequence, first);
+        let (mut tokens, finished, _) = budget_events(&mut generation);
+        assert!(finished.is_empty());
+        let (incoming, parked) = worker.parked.front().unwrap();
+        assert_eq!(&incoming.prompt.tokens[prompt_tokens..], first);
+        assert_eq!(incoming.prompt.max_new_tokens, (8 - budget) as u32);
+        assert_eq!(parked.carried.generated_tokens, budget as u32);
+        assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &samples[budget..]);
+        let (tail, finished, _) = budget_events(&mut generation);
+        tokens.extend(tail);
+        assert!(!tokens.contains(&token("</think>")));
+        assert_eq!(finished, vec![(prompt_tokens, 8, "length")]);
+        let mut output = crate::server::output::Accumulator::new("tool".into());
+        for token in tokens {
+            output.apply(decoder.push(token).unwrap()).unwrap();
+        }
+        output
+            .apply(
+                decoder
+                    .finish(crate::output::Termination::OutputLimit)
+                    .unwrap(),
+            )
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(output.message()["reasoning_content"], "b");
+        assert_eq!(
+            output.message()["tool_calls"][0]["function"]["arguments"],
+            "{\"n\":\"c\"}"
+        );
+    }
+}
+
+#[test]
+fn reasoning_budget_streams_reasoning_then_content_on_chat_and_messages() {
+    use crate::server::protocol::{Encoder, PromptUsage, Protocol};
+    use serde_json::json;
+    for protocol in [Protocol::Chat, Protocol::Messages] {
+        let fixture = Fixture::reasoning();
+        let (incoming, mut generation, mut decoder, prompt_tokens) = prepared_budget_request(
+            &fixture,
+            protocol,
+            json!({"messages":[{"role":"user","content":"a"}],
+            "max_tokens":5,"thinking_token_budget":2,"add_generation_prompt":true,"stream":true}),
+        );
+        let mut encoder = Encoder::new(
+            protocol,
+            "cut".into(),
+            "local".into(),
+            0,
+            1,
+            vec![PromptUsage {
+                tokens: prompt_tokens,
+                image_tokens: 0,
+            }],
+            vec![],
+            crate::server::inference::ToolChoice::Auto,
+            true,
+            true,
+            json!({}),
+        );
+        let mut frames = encoder.start();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &[2, 2]);
+        while let Ok(event) = generation.events.try_recv() {
+            match event {
+                GenerationEvent::Token(token) => {
+                    frames.extend(encoder.apply(0, decoder.push(token).unwrap()).unwrap())
+                }
+                GenerationEvent::Finished {
+                    generated_tokens,
+                    reused_prompt_tokens,
+                    termination,
+                    ..
+                } => {
+                    frames.extend(
+                        encoder
+                            .apply(0, decoder.finish(termination).unwrap())
+                            .unwrap(),
+                    );
+                    frames.extend(
+                        encoder
+                            .finish(0, termination, generated_tokens, reused_prompt_tokens, None)
+                            .unwrap(),
+                    );
+                }
+                GenerationEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let (reasoning, content) = if protocol == Protocol::Chat {
+            (
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["choices"][0]["delta"]["reasoning_content"].as_str())
+                    .collect::<String>(),
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>(),
+            )
+        } else {
+            (
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["delta"]["thinking"].as_str())
+                    .collect::<String>(),
+                frames
+                    .iter()
+                    .filter_map(|f| f.data["delta"]["text"].as_str())
+                    .collect::<String>(),
+            )
+        };
+        assert_eq!((reasoning.as_str(), content.as_str()), ("bb", "cc"));
+        assert_eq!(
+            encoder.usage_value()[if protocol == Protocol::Chat {
+                "completion_tokens"
+            } else {
+                "output_tokens"
+            }],
+            5
+        );
+    }
+}
+
+#[test]
+fn reasoning_budget_does_not_readmit_eos_or_user_stops() {
+    for (strings, sequences, samples, generated) in [
+        (vec![], vec![], vec![5], 1),
+        (vec!["b".into()], vec![], vec![1], 1),
+        (vec![], vec![vec![1]], vec![1], 1),
+        (vec![], vec![], vec![1, 1, 5], 3),
+    ] {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 3);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 4));
+        incoming.prompt.stop_strings = strings;
+        incoming.prompt.stop_sequences = sequences;
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut 0, &samples);
+        assert_eq!(
+            budget_events(&mut generation).1,
+            vec![(1, generated, "stop")]
+        );
+        assert!(worker.parked.is_empty());
+        assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+    }
+}
+
+#[test]
+fn forced_reasoning_close_obeys_text_stops_and_park_cancellation() {
+    for mode in 0..3 {
+        let fixture = Fixture::new();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 4));
+        incoming.prompt.stop_strings = vec![if mode == 0 { "bx" } else { "xc" }.into()];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        let (tokens, finished, _) = budget_events(&mut generation);
+        if mode == 0 {
+            assert_eq!(finished, vec![(1, 3, "stop")]);
+            assert!(!tokens.contains(&4));
+            assert!(worker.parked.is_empty());
+        } else {
+            assert!(finished.is_empty());
+            assert_eq!(worker.parked.len(), 1);
+            if mode == 1 {
+                generation.cancelled.store(true, Ordering::Release);
+                worker.admit().unwrap();
+                assert!(worker.parked.is_empty());
+                assert!(worker.active.iter().all(Option::is_none));
+                assert_eq!(worker.metrics.cancelled.load(Ordering::Relaxed), 1);
+            } else {
+                worker.admit().unwrap();
+                budget_pass(&mut worker, &mut sequence, &[2]);
+                assert_eq!(budget_events(&mut generation).1, vec![(1, 4, "stop")]);
+                assert!(worker.parked.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_only_injects_a_close_allowed_by_the_grammar() {
+    for allows_close in [false, true] {
+        let fixture = Fixture::new();
+        let compiler = crate::grammar::GrammarCompiler::new(
+            fixture.frontend.tokenizer(),
+            fixture.config.contract.vocabulary,
+            &fixture.config.eos_token_ids,
+            &[],
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+        incoming.prompt.grammar = Some(
+            compiler
+                .compile_lark(if allows_close {
+                    "start: \"bbxcc\""
+                } else {
+                    "start: \"bbccc\""
+                })
+                .unwrap(),
+        );
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        if allows_close {
+            let grammar = worker
+                .parked
+                .front()
+                .unwrap()
+                .0
+                .prompt
+                .grammar
+                .as_ref()
+                .unwrap();
+            assert!(grammar.allows(2));
+            worker.admit().unwrap();
+            budget_pass(&mut worker, &mut sequence, &[2, 2]);
+            assert_eq!(
+                budget_events(&mut generation),
+                (vec![1, 1, 4, 2, 2], vec![(1, 5, "length")], vec![])
+            );
+        } else {
+            let (incoming, parked) = worker.parked.front().unwrap();
+            assert_eq!(incoming.prompt.tokens, vec![0, 1, 1]);
+            assert_eq!(incoming.prompt.max_new_tokens, 3);
+            assert_eq!(parked.carried.generated_tokens, 2);
+            assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+            worker.admit().unwrap();
+            budget_pass(&mut worker, &mut sequence, &[2, 2, 2]);
+            assert_eq!(
+                budget_events(&mut generation),
+                (vec![1, 1, 2, 2, 2], vec![(1, 5, "length")], vec![])
+            );
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_omits_only_the_forced_tokens_logprob() {
+    for text_stops in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.max_top_logprobs = 20;
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 3));
+        incoming.prompt.logprobs = true;
+        if text_stops {
+            incoming.prompt.stop_strings = vec!["dx".into()];
+        }
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.admit().unwrap();
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &[1, 1]);
+        worker.admit().unwrap();
+        budget_pass(&mut worker, &mut sequence, &[2, 2]);
+        let (tokens, finished, logprobs) = budget_events(&mut generation);
+        assert_eq!(finished, vec![(1, 5, "length")]);
+        assert_eq!(tokens, vec![1, 1, 4, 2, 2]);
+        assert_eq!(logprobs, vec![1, 1, 2, 2]);
+    }
 }
 
 #[test]
@@ -405,7 +1114,7 @@ fn worker_observes_prefill_decode_and_prerequisite_timings() {
         ];
         frame.timing.wall_ns = 350;
         worker.complete(kind, frame).unwrap();
-        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(619));
+        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(600));
         let metrics = fixture.metrics.snapshot(false);
         assert_eq!(metrics.verification_drafts, 0);
         assert_eq!(
@@ -634,6 +1343,11 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
     incoming.prompt.message_boundaries = vec![10];
     sender.send(vec![incoming]).unwrap();
     let mut worker = fixture.worker(receiver);
+    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let handle = worker.active[0].as_ref().unwrap().request;
     advance(&mut worker, GraphKind::Init, 1, None);
@@ -716,6 +1430,38 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
 }
 
 #[test]
+fn ignored_eos_at_the_output_limit_finishes_for_length() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+    incoming.prompt.ignore_eos = true;
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    advance(&mut worker, GraphKind::Init, 1, None);
+    advance(&mut worker, GraphKind::Prefill, 2, Some(5));
+    advance(&mut worker, GraphKind::Snapshot, 3, None);
+    advance(&mut worker, GraphKind::Decode, 4, Some(5));
+    assert!(worker.publish().unwrap());
+    let mut finished = Vec::new();
+    while let Ok(event) = generation.events.try_recv() {
+        if let GenerationEvent::Finished {
+            generated_tokens,
+            reason,
+            termination,
+            ..
+        } = event
+        {
+            finished.push((generated_tokens, reason, termination));
+        }
+    }
+    assert_eq!(
+        finished,
+        vec![(2, "length", crate::output::Termination::OutputLimit)]
+    );
+}
+
+#[test]
 fn disabled_host_store_preserves_decode_prefix_reuse_and_cancellation() {
     let fixture = Fixture::new();
     let (sender, receiver) = mpsc::channel();
@@ -782,7 +1528,7 @@ fn disabled_host_store_preserves_decode_prefix_reuse_and_cancellation() {
     assert!(!worker.service_store().unwrap());
     assert_eq!(fixture.metrics.cancelled.load(Ordering::Relaxed), 1);
     assert_eq!(worker.prefill_started.capacity(), 0);
-    assert_eq!(worker.prefill_rate, crate::offload::INITIAL_PREFILL_RATE);
+    assert_eq!(worker.prefill_rate, flare_selene::INITIAL_PREFILL_RATE);
     let stats = worker.scheduler.stats();
     assert_eq!((stats.cache_hits, stats.reused_tokens), (1, 13));
     assert_eq!(
@@ -841,7 +1587,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
                     handle,
                     crate::scheduler::speculation::CopyProposal {
                         consumed: 13,
-                        tokens: [0, 0, 0, -1, -1, -1, -1],
+                        tokens: vec![0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                         count: 3,
                         grammar_masks: vec![],
                     },
@@ -864,10 +1610,10 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             copy_offered_mask: if copy { 7 } else { 0 },
             verification_width: 4,
             draft_cache_consumed: if copy { -1 } else { 15 },
-            tokens: [1, 1, 2, -1, -1, -1, -1, -1],
+            tokens: vec![1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
-        let mut invalid = frame.records;
+        let mut invalid = frame.records.clone();
         invalid[step.lanes[0].request.slot as usize].generated_tokens = 20;
         assert!(
             worker
@@ -896,7 +1642,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
         let source = fixture.config.speculative_proposal_source;
         assert!(profile.prefix_probability(source, 0).unwrap() > 0.5);
         assert!(profile.prefix_probability(source, 2).unwrap() < 0.125);
-        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(1063));
+        assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(1000));
         let metrics = fixture.metrics.snapshot(!copy);
         assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 4));
         assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (2, 1));
@@ -1000,7 +1746,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         (4, 8, 3)
     );
     let mut frame = completion(&worker, &step, sequence, Some(1));
-    frame.proposal_confidence = Some([[0.5; 7]; crate::execution::REQUEST_LANES]);
+    frame.proposal_confidence = Some(vec![vec![0.5; 15]; crate::execution::REQUEST_LANES]);
     for (lane, offered) in step.lanes.iter().zip([5, 1, 0]) {
         let record = &mut frame.records[lane.request.slot as usize];
         record.consumed_tokens = lane.start_position as i64 + 1;
@@ -1010,7 +1756,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
             accepted_drafts: 0,
             verification_width: 8,
             draft_cache_consumed: lane.start_position as i64,
-            tokens: [1, -1, -1, -1, -1, -1, -1, -1],
+            tokens: vec![1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
             ..Default::default()
         });
     }
@@ -1094,12 +1840,11 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 } else {
                     record.consumed_tokens - 1
                 },
-                tokens: [i64::from(token), -1, -1, -1, -1, -1, -1, -1],
+                tokens: vec![i64::from(token), -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             });
             worker.complete(GraphKind::Speculative, frame).unwrap();
         }
-        advance(&mut worker, GraphKind::Snapshot, 9, None);
         worker.publish().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
         let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
@@ -1142,6 +1887,7 @@ fn observations_precede_grammar_failures_and_token_stop_completion() {
             fixture.frontend.tokenizer(),
             fixture.config.contract.vocabulary,
             &[5],
+            &[],
         )
         .unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -1222,24 +1968,47 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 
 /// A host store that answers lookups from a script and reports completions on demand.
 struct FakeStore {
-    hit: Option<crate::offload::HostHit>,
+    copies: std::collections::HashSet<crate::cache::PrefixKey>,
+    hit: Option<flare_selene::HostHit>,
     reject_fetch: bool,
-    store_outcomes: VecDeque<crate::offload::StoreOutcome>,
+    store_outcomes: VecDeque<flare_selene::StoreOutcome>,
     progress: u64,
-    stored: Vec<crate::offload::PublishedCheckpoint>,
-    fetched: Vec<(crate::offload::HostHit, crate::offload::InboundTicket)>,
-    events: VecDeque<crate::offload::StoreEvent>,
+    stored: Vec<flare_selene::PublishedCheckpoint>,
+    fetched: Vec<(flare_selene::HostHit, flare_selene::InboundTicket)>,
+    events: VecDeque<flare_selene::StoreEvent>,
     close_error: Option<Error>,
     poll_error: Option<Error>,
     close_panics: bool,
     close_calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    /// Shares prefixes through a pool: lookups begin at arrival and evictions are reported.
+    pooled: bool,
+    /// Token counts of the histories `begin_lookup` received.
+    begun: Vec<u64>,
+    reused: Vec<crate::cache::PrefixKey>,
+    /// Whether each `lookup_for` call carried a ticket.
+    tickets_seen: Vec<bool>,
+    /// Tickets dropped without an answer.
+    withdrawn: Arc<AtomicUsize>,
+    exports: Vec<(flare_selene::ExportId, flare_selene::ExportChain)>,
+    refused: Vec<(flare_selene::ExportId, flare_selene::ExportRefusal)>,
+    reject_export: bool,
+    evictions_lost: usize,
+    /// Tickets stay unanswered instead of answering with nothing.
+    pending_tickets: bool,
+    /// Each eviction notice with the number of `store` calls made before it.
+    evicted: Vec<(
+        crate::cache::PrefixKey,
+        Option<flare_selene::PublishedCheckpoint>,
+        usize,
+    )>,
 }
 
 impl FakeStore {
-    fn new(hit: Option<crate::offload::HostHit>) -> Self {
+    fn new(hit: Option<flare_selene::HostHit>) -> Self {
         Self {
             hit,
+            copies: Default::default(),
             reject_fetch: false,
             store_outcomes: VecDeque::new(),
             progress: 0,
@@ -1251,17 +2020,90 @@ impl FakeStore {
             close_panics: false,
             close_calls: Arc::new(AtomicUsize::new(0)),
             drops: Arc::new(AtomicUsize::new(0)),
+            pooled: false,
+            begun: Vec::new(),
+            reused: Vec::new(),
+            tickets_seen: Vec::new(),
+            withdrawn: Arc::new(AtomicUsize::new(0)),
+            exports: Vec::new(),
+            refused: Vec::new(),
+            reject_export: false,
+            evictions_lost: 0,
+            pending_tickets: false,
+            evicted: Vec::new(),
         }
     }
 }
 
-impl crate::offload::PrefixStore for FakeStore {
-    fn lookup(
+impl flare_selene::HostStore for FakeStore {
+    fn reused(&mut self, key: crate::cache::PrefixKey) {
+        self.reused.push(key);
+    }
+    fn pooled(&self) -> bool {
+        self.pooled
+    }
+    fn begin_lookup(
         &mut self,
-        history: &crate::cache::PrefixHistory,
+        history: &dyn flare_selene::History,
+    ) -> Option<flare_selene::pool::LookupTicket> {
+        self.begun.push(history.token_count());
+        let withdrawn = self.withdrawn.clone();
+        Some(flare_selene::pool::LookupTicket::watched(
+            if self.pending_tickets {
+                flare_selene::pool::LookupState::Pending
+            } else {
+                flare_selene::pool::LookupState::None
+            },
+            move || {
+                withdrawn.fetch_add(1, Ordering::Relaxed);
+            },
+        ))
+    }
+    fn lookup_for(
+        &mut self,
+        ticket: Option<&flare_selene::pool::LookupTicket>,
+        history: &dyn flare_selene::History,
         resident: u64,
         before: u64,
-    ) -> Option<crate::offload::HostHit> {
+    ) -> Option<flare_selene::HostHit> {
+        self.tickets_seen.push(ticket.is_some());
+        self.lookup(history, resident, before)
+    }
+    fn export_pinned(
+        &mut self,
+        export: flare_selene::ExportId,
+        chain: flare_selene::ExportChain,
+    ) -> flare_selene::Result<()> {
+        if self.reject_export {
+            return Err("export rejected".into());
+        }
+        self.exports.push((export, chain));
+        Ok(())
+    }
+    fn export_refused(
+        &mut self,
+        export: flare_selene::ExportId,
+        reason: flare_selene::ExportRefusal,
+    ) {
+        self.refused.push((export, reason));
+    }
+    fn evicted(
+        &mut self,
+        key: crate::cache::PrefixKey,
+        heir: Option<&flare_selene::PublishedCheckpoint>,
+    ) {
+        self.evicted
+            .push((key, heir.cloned(), self.stored.len()));
+    }
+    fn evictions_lost(&mut self) {
+        self.evictions_lost += 1;
+    }
+    fn lookup(
+        &mut self,
+        history: &dyn flare_selene::History,
+        resident: u64,
+        before: u64,
+    ) -> Option<flare_selene::HostHit> {
         self.hit.clone().filter(|hit| {
             history.key_at(hit.consumed_tokens) == Some(hit.key)
                 && hit.consumed_tokens > resident
@@ -1271,42 +2113,51 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn store(
         &mut self,
-        checkpoint: &crate::offload::PublishedCheckpoint,
-    ) -> Result<crate::offload::StoreOutcome> {
+        checkpoint: &flare_selene::PublishedCheckpoint,
+    ) -> flare_selene::Result<flare_selene::StoreOutcome> {
         self.stored.push(checkpoint.clone());
-        Ok(self
+        let outcome = self
             .store_outcomes
             .pop_front()
-            .unwrap_or(crate::offload::StoreOutcome::Queued))
+            .unwrap_or(flare_selene::StoreOutcome::Present);
+        if outcome == flare_selene::StoreOutcome::Present {
+            self.copies.insert(checkpoint.key);
+        }
+        Ok(outcome)
     }
     fn fetch(
         &mut self,
-        hit: crate::offload::HostHit,
-        ticket: crate::offload::InboundTicket,
-    ) -> Result<()> {
+        hit: flare_selene::HostHit,
+        ticket: flare_selene::InboundTicket,
+    ) -> flare_selene::Result<()> {
         if self.reject_fetch {
             return Err("fetch rejected".into());
         }
         self.fetched.push((hit, ticket));
         Ok(())
     }
-    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) -> Result<()> {
+    fn poll(&mut self, events: &mut Vec<flare_selene::StoreEvent>) -> flare_selene::Result<()> {
         if let Some(error) = &self.poll_error {
-            return Err(error.clone());
+            return Err(error.clone().into());
         }
-        events.extend(self.events.drain(..));
+        for event in self.events.drain(..) {
+            if let flare_selene::StoreEvent::Stored { key, result: Ok(_), .. } = &event {
+                self.copies.insert(*key);
+            }
+            events.push(event);
+        }
         Ok(())
     }
-    fn stats(&self) -> crate::offload::StoreStats {
-        crate::offload::StoreStats {
+    fn stats(&self) -> flare_selene::StoreStats {
+        flare_selene::StoreStats {
             progress: self.progress,
             ..Default::default()
         }
     }
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> flare_selene::Result<()> {
         self.close_calls.fetch_add(1, Ordering::Relaxed);
         assert!(!self.close_panics, "transfer drain panicked");
-        self.close_error.clone().map_or(Ok(()), Err)
+        self.close_error.clone().map_or(Ok(()), |error| Err(error.into()))
     }
 }
 
@@ -1440,17 +2291,17 @@ fn a_store_that_cannot_report_completions_stops_the_worker() {
     );
 }
 
-fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> crate::offload::HostHit {
+fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> flare_selene::HostHit {
     let key = history.key_at(consumed).unwrap();
-    crate::offload::HostHit {
+    flare_selene::HostHit {
         key,
         consumed_tokens: consumed,
         resident_tokens: 0,
         pages: (consumed / 64) as usize,
         bytes: 1 << 20,
-        tier: crate::offload::Tier::Memory,
+        tier: flare_selene::Tier::Dram,
         estimated_seconds: 0.0,
-        chain: crate::offload::index::Match {
+        chain: flare_selene::index::Match {
             key,
             consumed_tokens: consumed,
             resident_tokens: 0,
@@ -1462,9 +2313,24 @@ fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> crate::offl
 }
 
 fn fake_store<'w>(worker: &'w mut Worker<'_>) -> &'w mut FakeStore {
-    let store = worker.store.as_mut().unwrap().as_mut() as *mut dyn crate::offload::PrefixStore;
+    let store = worker.store.as_mut().unwrap().as_mut() as *mut dyn flare_selene::HostStore;
     // SAFETY: The worker holds the only store and it was constructed as a FakeStore.
     unsafe { &mut *(store as *mut FakeStore) }
+}
+
+#[test]
+fn a_gpu_hit_refreshes_the_host_record_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let checkpoint = unpinned_checkpoint(&mut worker, 0, 64);
+    let key = worker.scheduler.publication(checkpoint).unwrap().key;
+    worker.attach_store(Some(Box::new(FakeStore::new(None))));
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    assert_eq!(fake_store(&mut worker).reused, [key]);
 }
 
 #[test]
@@ -1501,7 +2367,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
     assert_eq!((ticket.key, ticket.pages.len()), (hit.key, 1));
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Ok(1 << 20),
         });
@@ -1512,7 +2378,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (RequestPhase::Restore, 1)
     );
     let restored = live.prefix().unwrap();
-    // Polling the restore publishes it and admits its copy-out in the same pass.
+    // Polling the restore publishes it without an eager copy-out.
     assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let publication = fake_store(&mut worker).stored[0].clone();
     assert_eq!(
@@ -1524,32 +2390,8 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (restored, 1, 1)
     );
     assert_eq!(publication.key, history.key_at(70).unwrap());
-    assert_eq!(
-        worker
-            .scheduler
-            .cache()
-            .checkpoint(restored)
-            .unwrap()
-            .pin_count(),
-        2
-    );
-    fake_store(&mut worker)
-        .events
-        .push_back(crate::offload::StoreEvent::Stored {
-            checkpoint: restored,
-            key: publication.key,
-            result: Ok(1 << 20),
-        });
-    assert!(worker.service_store().unwrap());
-    assert_eq!(
-        worker
-            .scheduler
-            .cache()
-            .checkpoint(restored)
-            .unwrap()
-            .pin_count(),
-        1
-    );
+    assert_eq!(pins(&worker, restored), 1);
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
     advance(&mut worker, GraphKind::Restore, 1, None);
     advance(&mut worker, GraphKind::Resume, 2, Some(1));
     assert_eq!(
@@ -1609,7 +2451,7 @@ fn failed_restores_readmit_the_request_without_the_host_store() {
             let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
             fake_store(&mut worker)
                 .events
-                .push_back(crate::offload::StoreEvent::Fetched {
+                .push_back(flare_selene::StoreEvent::Fetched {
                     key: ticket.key,
                     result: Err("transfer failed".into()),
                 });
@@ -1651,6 +2493,615 @@ fn failed_restores_readmit_the_request_without_the_host_store() {
     }
 }
 
+/// A worker over a pooled fake store whose scripted hit restores a 70-token prompt,
+/// leaving a GPU-ready one-page checkpoint. Returns the sender that keeps the
+/// worker's channel open, the request's handle, the checkpoint and its key.
+fn worker_with_checkpoint(
+    fixture: &Fixture,
+    pooled: bool,
+) -> (
+    Worker<'_>,
+    mpsc::Sender<Vec<Incoming>>,
+    RequestHandle,
+    crate::cache::CheckpointId,
+    crate::cache::PrefixKey,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, generation) = fixture.incoming(vec![0; 70], 4);
+    std::mem::forget(generation);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = pooled;
+    worker.attach_store(Some(Box::new(store)));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+    fake_store(&mut worker)
+        .events
+        .push_back(flare_selene::StoreEvent::Fetched {
+            key: ticket.key,
+            result: Ok(1 << 20),
+        });
+    assert!(worker.service_store().unwrap());
+    let id = worker.scheduler.request(handle).unwrap().prefix().unwrap();
+    (worker, sender, handle, id, history.key_at(70).unwrap())
+}
+
+fn pins(worker: &Worker<'_>, id: crate::cache::CheckpointId) -> u64 {
+    worker.scheduler.cache().checkpoint(id).unwrap().pin_count()
+}
+
+fn export_request(
+    export: u64,
+    key: crate::cache::PrefixKey,
+    generation: u64,
+    begin_tokens: u64,
+) -> flare_selene::StoreEvent {
+    flare_selene::StoreEvent::ExportRequested {
+        export: flare_selene::ExportId(export),
+        key,
+        begin_tokens,
+        want_row: true,
+        reserved_bytes: 1 << 20,
+    }
+}
+
+fn export_ended(export: u64) -> flare_selene::StoreEvent {
+    flare_selene::StoreEvent::ExportEnded {
+        export: flare_selene::ExportId(export),
+    }
+}
+
+#[test]
+fn an_export_pins_its_checkpoint_until_it_ends_and_releases_once() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(7, key, id.value(), 0));
+    worker.service_store().unwrap();
+    // The answer comes in the iteration of the request, after the pin.
+    assert_eq!(pins(&worker, id), base + 1);
+    let store = fake_store(&mut worker);
+    assert!(store.refused.is_empty());
+    let (export, chain) = store.exports.pop().unwrap();
+    assert_eq!(export, flare_selene::ExportId(7));
+    assert_eq!(chain.nodes.len(), 1);
+    assert_eq!(chain.nodes[0].key, key);
+    assert!(chain.row.is_some());
+    assert_eq!(worker.exports.len(), 1);
+    // A duplicate end for the same export finds nothing: one unpin.
+    fake_store(&mut worker).events.push_back(export_ended(7));
+    fake_store(&mut worker).events.push_back(export_ended(7));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base);
+    assert!(worker.exports.is_empty());
+}
+
+#[test]
+fn an_export_without_an_end_keeps_its_pin() {
+    // A quarantined export never reports an end: its pin must outlive everything else.
+    let fixture = Fixture::new();
+    let (mut worker, _sender, handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let store = fake_store(&mut worker);
+    store
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    worker.service_store().unwrap();
+    worker.retire(&[handle]).unwrap();
+    for _ in 0..3 {
+        worker.service_store().unwrap();
+    }
+    // The request's pin is gone; the export's remains.
+    assert_eq!(pins(&worker, id), 1);
+    assert_eq!(worker.exports.len(), 1);
+}
+
+#[test]
+fn exports_that_cannot_be_served_are_refused_without_a_pin() {
+    use flare_selene::ExportRefusal::*;
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    let mut other = crate::cache::PrefixHistory::new(fixture.config.identity);
+    other.append(&[9; 70], &[]).unwrap();
+    let store = fake_store(&mut worker);
+    store
+        .events
+        .push_back(export_request(1, other.key_at(70).unwrap(), id.value(), 0));
+    store
+        .events
+        .push_back(export_request(3, key, id.value(), 10_000));
+    store
+        .events
+        .push_back(export_request(4, key, id.value(), 0));
+    store
+        .events
+        .push_back(export_request(4, key, id.value(), 0));
+    worker.service_store().unwrap();
+    let store = fake_store(&mut worker);
+    let refused: Vec<_> = store.refused.iter().map(|(e, r)| (e.0, *r)).collect();
+    assert_eq!(
+        refused,
+        [
+            (1, NotFound),
+            (3, ChainGap),
+            (4, Busy)
+        ]
+    );
+    assert_eq!(store.exports.len(), 1);
+    assert_eq!(pins(&worker, id), base + 1);
+}
+
+#[test]
+fn a_store_that_rejects_a_pinned_export_gets_the_pin_back() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    let store = fake_store(&mut worker);
+    store.reject_export = true;
+    store
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base);
+    assert!(worker.exports.is_empty());
+}
+
+#[test]
+fn an_export_is_refused_when_the_next_admission_would_no_longer_fit() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 4;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    // With nothing queued the export fits.
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base + 1);
+    fake_store(&mut worker).events.push_back(export_ended(1));
+    worker.service_store().unwrap();
+    // A queued three-page request would not fit, once the checkpoint's page is protected.
+    let (queued, _generation) = fixture.incoming(vec![9; 150], 4);
+    std::mem::forget(_generation);
+    worker.pending.push_back(queued);
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(2, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(
+        fake_store(&mut worker)
+            .refused
+            .last()
+            .map(|(e, r)| (e.0, *r)),
+        Some((2, flare_selene::ExportRefusal::NoHeadroom))
+    );
+    assert_eq!(pins(&worker, id), base);
+}
+
+#[test]
+fn only_pooled_stores_hear_of_evictions() {
+    for pooled in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 3;
+        fixture.config.limits.max_sequence_tokens = 192;
+        let (mut worker, _sender, handle, _id, key) = worker_with_checkpoint(&fixture, pooled);
+        worker.retire(&[handle]).unwrap();
+        let publication = fake_store(&mut worker).stored[0].clone();
+        let (queued, generation) = fixture.incoming(vec![9; 150], 4);
+        std::mem::forget(generation);
+        worker.pending.push_back(queued);
+        worker.admit().unwrap();
+        worker.service_store().unwrap();
+        let evicted = &fake_store(&mut worker).evicted;
+        assert_eq!(evicted.len(), usize::from(pooled));
+        if pooled {
+            assert_eq!(evicted[0].0, key);
+            assert!(evicted[0].1.is_none());
+        }
+        assert_eq!(publication.key, key);
+    }
+}
+
+#[test]
+fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    let withdrawn = store.withdrawn.clone();
+    worker.attach_store(Some(Box::new(store)));
+    // Five requests arrive for four slots; the fifth keeps waiting.
+    let mut generations = Vec::new();
+    let mut group = Vec::new();
+    for fill in 0..5 {
+        let (incoming, generation) = fixture.incoming(vec![fill; 70], 4);
+        generations.push(generation);
+        group.push(incoming);
+    }
+    sender.send(group).unwrap();
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 5]);
+    // Admission consulted the ticket and then released it.
+    assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 4);
+    assert!(
+        worker
+            .active
+            .iter()
+            .flatten()
+            .all(|a| a.incoming.pool_lookup.is_none())
+    );
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].pool_lookup.is_some());
+    // Cancelling the waiting request withdraws its lookup with it.
+    generations[4].cancelled.store(true, Ordering::Release);
+    worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn a_full_gpu_hit_starts_no_pool_lookup_or_admission_hold() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
+    let key = worker.scheduler.publication(checkpoint).unwrap().key;
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.pending_tickets = true;
+    worker.attach_store(Some(Box::new(store)));
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    worker.enqueue(vec![incoming]);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    assert!(worker.pending[0].pool_lookup.is_none());
+    assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().history().token_count(), 70);
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    assert!(fake_store(&mut worker).tickets_seen.is_empty());
+    assert_eq!(fake_store(&mut worker).reused, [key]);
+}
+
+#[test]
+fn gpu_residency_is_rechecked_using_the_queued_history() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    worker.attach_store(Some(Box::new(store)));
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    worker.enqueue(vec![incoming]);
+    assert_eq!(worker.pending[0].pool_plan.as_ref().unwrap().resident_tokens(), 0);
+    let checkpoint = unpinned_checkpoint(&mut worker, 0, 70);
+    worker.admit().unwrap();
+    let handle = worker.active[0].as_ref().unwrap().request;
+    assert_eq!(worker.scheduler.request(handle).unwrap().prefix(), Some(checkpoint));
+    assert!(fake_store(&mut worker).tickets_seen.is_empty());
+}
+
+#[test]
+fn late_pool_replies_retry_all_capacity_blocked_requests() {
+    use flare_selene::pool::{Answer, LookupState};
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let (first, _first_generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&first.prompt.tokens, &[]).unwrap();
+    let hit = host_hit(&history, 70);
+    let mut store = FakeStore::new(Some(hit.clone()));
+    store.pooled = true;
+    worker.attach_store(Some(Box::new(store)));
+    worker.enqueue(vec![first]);
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+    fake_store(&mut worker).hit = None;
+    fake_store(&mut worker).pending_tickets = true;
+    let (requests, _generations): (Vec<_>, Vec<_>) =
+        (0..3).map(|_| fixture.incoming(vec![0; 70], 4)).unzip();
+    worker.enqueue(requests);
+    for incoming in &mut worker.pending {
+        incoming.pool_lookup_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    }
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.pending.len(), 3);
+    let stats = worker.scheduler.stats();
+    let resources = (
+        worker.scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    );
+    for incoming in &worker.pending {
+        assert_eq!(incoming.blocked, Some(resources));
+        incoming
+            .pool_lookup
+            .as_ref()
+            .unwrap()
+            .set_state(LookupState::Ready(Arc::new(Answer { candidates: vec![] })));
+    }
+    fake_store(&mut worker).hit = Some(hit);
+    let attempts = fake_store(&mut worker).tickets_seen.len();
+    let _ = worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).tickets_seen.len(), attempts + 3);
+    assert_eq!(worker.pending.len(), 2);
+    assert!(
+        worker
+            .pending
+            .iter()
+            .all(|incoming| incoming.pool_lookup_started.is_none())
+    );
+    assert_eq!(worker.active.iter().flatten().count(), 2);
+    assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+}
+
+#[test]
+fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, _id, _key) = worker_with_checkpoint(&fixture, false);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    assert_eq!(fake_store(&mut worker).tickets_seen, [false]);
+
+    // A pooled request whose restore fails is readmitted without the store, and
+    // without a new lookup.
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    worker.attach_store(Some(Box::new(store)));
+    worker.admit().unwrap();
+    let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+    fake_store(&mut worker)
+        .events
+        .push_back(flare_selene::StoreEvent::Fetched {
+            key: ticket.key,
+            result: Err("transfer failed".into()),
+        });
+    worker.service_store().unwrap();
+    assert_eq!(worker.parked.len(), 1);
+    assert!(worker.parked[0].0.pool_lookup.is_none());
+    assert_eq!(fake_store(&mut worker).begun, [70]);
+}
+
+fn complete_pool_answer(worker: &mut Worker<'_>, slot: usize, key: crate::cache::PrefixKey) {
+    use flare_selene::{
+        levels::Level,
+        plan,
+        pool::{Answer, LookupState, PoolCandidate, SourceRef, Tier},
+    };
+    let answer = Answer {
+        candidates: vec![PoolCandidate {
+            plan: plan::Candidate {
+                level: Level::HostNvme,
+                source: plan::SourceId(1),
+                key,
+                begin_tokens: 0,
+                skip_pages: 0,
+                nodes: vec![plan::ChainNode {
+                    key,
+                    tail_pages: (key.consumed_tokens / 64) as usize,
+                }],
+            },
+            source: SourceRef {
+                instance: vec![1; 16],
+                session_incarnation: 1,
+            },
+            tier: Tier::Nvme,
+        }],
+    };
+    worker.active[slot]
+        .as_ref()
+        .unwrap()
+        .incoming
+        .pool_lookup
+        .as_ref()
+        .unwrap()
+        .set_state(LookupState::Ready(Arc::new(answer)));
+}
+
+#[test]
+fn a_late_pool_answer_retries_admission_only_before_prefill_and_after_drain() {
+    use std::time::{Duration, Instant};
+    for phase in 0..5 {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.pending_tickets = true;
+        worker.attach_store(Some(Box::new(store)));
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        worker.enqueue(vec![incoming]);
+        let hit = host_hit(worker.pending[0].pool_plan.as_ref().unwrap().history(), 70);
+        worker.pending[0].pool_lookup_started = Some(Instant::now() - Duration::from_secs(1));
+        let _ = worker.admit().unwrap();
+        let handle = worker.active[0].as_ref().unwrap().request;
+        let mut in_flight = None;
+        if phase > 0 {
+            let step = planned(&mut worker, GraphKind::Init, 1);
+            if phase == 1 {
+                in_flight = Some(step);
+            } else {
+                worker
+                    .complete(GraphKind::Init, completion(&worker, &step, 1, None))
+                    .unwrap();
+            }
+        }
+        if phase >= 3 {
+            let step = planned(&mut worker, GraphKind::Prefill, 2);
+            if phase == 3 {
+                in_flight = Some(step);
+            } else {
+                worker
+                    .complete(GraphKind::Prefill, completion(&worker, &step, 2, None))
+                    .unwrap();
+            }
+        }
+        complete_pool_answer(&mut worker, 0, hit.key);
+        fake_store(&mut worker).hit = Some(hit);
+        if let Some(step) = in_flight {
+            assert!(
+                !worker.retry_late_pool_answers().unwrap(),
+                "in-flight slot stays owned"
+            );
+            assert_eq!(worker.active[0].as_ref().unwrap().request, handle);
+            worker
+                .complete(
+                    step.kind,
+                    completion(&worker, &step, if phase == 1 { 1 } else { 2 }, None),
+                )
+                .unwrap();
+        }
+        if phase < 3 {
+            let (step, progress) = worker.plan(0).unwrap();
+            assert!(step.is_none() && progress);
+            assert!(worker.scheduler.request(handle).is_err());
+            let _ = worker.admit().unwrap();
+            let next = worker.active[0].as_ref().unwrap().request;
+            assert_ne!(next, handle);
+            assert_eq!(
+                worker.scheduler.request(next).unwrap().phase,
+                RequestPhase::Inbound
+            );
+            assert_eq!(fake_store(&mut worker).fetched.len(), 1);
+            assert_eq!(fake_store(&mut worker).begun, [70]);
+            assert_eq!(fixture.metrics.admitted.load(Ordering::Relaxed), 1);
+            let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+            fake_store(&mut worker)
+                .events
+                .push_back(flare_selene::StoreEvent::Fetched {
+                    key: ticket.key,
+                    result: Ok(1 << 20),
+                });
+            worker.service_store().unwrap();
+            let fence = if phase == 0 { 1 } else { 2 };
+            advance(&mut worker, GraphKind::Restore, fence, None);
+            advance(&mut worker, GraphKind::Resume, fence + 1, Some(1));
+            assert_eq!(fixture.metrics.snapshot(false).prefill_tokens, 0);
+        } else {
+            assert!(!worker.retry_late_pool_answers().unwrap());
+            assert_eq!(worker.active[0].as_ref().unwrap().request, handle);
+            assert!(
+                worker.active[0]
+                    .as_ref()
+                    .unwrap()
+                    .incoming
+                    .pool_lookup
+                    .is_none()
+            );
+            assert!(fake_store(&mut worker).fetched.is_empty());
+        }
+        drop(worker);
+        let text = fixture.metrics.render();
+        for (outcome, count) in [
+            ("no_match", u64::from(phase >= 3)),
+            ("admitted", u64::from(phase < 3)),
+        ] {
+            let line = format!("flare_host_cache_lookup_outcomes_total{{reason=\"{outcome}\"}} {count}\n");
+            assert!(text.contains(&line), "missing {line}");
+        }
+    }
+}
+
+#[test]
+fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
+    use flare_selene::pool::{Answer, LookupState};
+    use std::time::{Duration, Instant};
+
+    for answer in [
+        Some(LookupState::Ready(Arc::new(Answer { candidates: vec![] }))),
+        Some(LookupState::None),
+        None,
+    ] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.pending_tickets = true;
+        let withdrawn = store.withdrawn.clone();
+        worker.attach_store(Some(Box::new(store)));
+        worker.enqueue(vec![incoming]);
+        // Hold the observation fixed even if the test thread is descheduled.
+        let started = Instant::now() + Duration::from_secs(60);
+        worker.pending[0].pool_lookup_started = Some(started);
+        let grace = worker.pending[0].pool_lookup.as_ref().unwrap().grace();
+        assert_eq!(grace, Duration::from_millis(2));
+        assert!(worker.pending[0].awaits_pool(started + grace - Duration::from_nanos(1)));
+        assert!(!worker.pending[0].awaits_pool(started + grace));
+        worker.admit().unwrap();
+        assert!(worker.active.iter().all(Option::is_none));
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.idle_wait(), Duration::from_micros(100));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
+
+        let pending = answer.is_none();
+        if let Some(answer) = answer {
+            worker.pending[0]
+                .pool_lookup
+                .as_ref()
+                .unwrap()
+                .set_state(answer);
+        } else {
+            worker.pending[0].pool_lookup_started = Some(Instant::now() - grace);
+        }
+        worker.admit().unwrap();
+        assert!(worker.active[0].is_some());
+        assert!(worker.pending.is_empty());
+        assert_eq!(worker.idle_wait(), Duration::from_millis(2));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), usize::from(!pending));
+        if pending {
+            assert!(worker.active[0].as_ref().unwrap().incoming.pool_lookup.is_some());
+            advance(&mut worker, GraphKind::Init, 1, None);
+            let step = planned(&mut worker, GraphKind::Prefill, 2);
+            let _ = worker.plan(1).unwrap();
+            assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
+            assert!(worker.active[0].as_ref().unwrap().incoming.pool_lookup.is_none());
+            worker
+                .complete(GraphKind::Prefill, completion(&worker, &step, 2, None))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_pending_pool_lookup_does_not_hold_other_requests() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.pending_tickets = true;
+    worker.attach_store(Some(Box::new(store)));
+    let (waiting, _waiting_generation) = fixture.incoming(vec![0; 70], 4);
+    worker.enqueue(vec![waiting]);
+    worker.pending[0].pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    let (ready, _ready_generation) = fixture.incoming(vec![1; 70], 4);
+    worker.enqueue(vec![ready]);
+    worker.pending[1].pool_lookup.as_ref().unwrap().set_state(flare_selene::pool::LookupState::None);
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].pool_lookup.is_some());
+}
+
 fn group_runtime(
     fixture: &Fixture,
     capacity: usize,
@@ -1674,11 +3125,106 @@ fn group_runtime(
     )
 }
 #[test]
+fn unread_responses_finish_and_release_model_resources_but_retain_admission_capacity() {
+    for logprobs in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.prepared_sequence_tokens = 1024;
+        fixture.config.limits.max_sequence_tokens = 1024;
+        fixture.config.limits.pages = 64;
+        fixture.config.max_top_logprobs = 20;
+        let (runtime, receiver) = group_runtime(&fixture, 2);
+        let prompt = |limit| Fixture::prompt_for(vec![0], limit, PromptData {
+            positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
+        });
+        let mut slow_prompt = prompt(512);
+        slow_prompt.logprobs = logprobs;
+        slow_prompt.stop_sequences = vec![vec![2, 3]];
+        let mut slow = runtime.generate_observed(slow_prompt, true).unwrap();
+        let mut worker = fixture.worker(receiver);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let mut tokens = vec![1; 512];
+        tokens[511] = 2; // An unfinished stop prefix must flush before Finished.
+        let mut sequence = 0;
+        budget_pass(&mut worker, &mut sequence, &tokens);
+        assert!(worker.active.iter().all(Option::is_none));
+        assert!(worker.admissions.iter().all(Option::is_none));
+        assert!(!slow.cancelled.load(Ordering::Acquire));
+        assert_eq!(runtime.capacity.available_permits(), 1);
+
+        // A completed response whose reader is paused cannot hold a model slot
+        // or prevent another admitted request from producing its answer.
+        let mut fast = runtime.generate(prompt(2)).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        budget_pass(&mut worker, &mut sequence, &[3, 1]);
+        assert_eq!(budget_events(&mut fast).0, vec![3, 1]);
+        assert!(runtime.generate(prompt(1)).is_err());
+        drop(fast);
+        assert_eq!(runtime.capacity.available_permits(), 1);
+
+        let mut presented = Vec::new();
+        let mut observed = Vec::new();
+        let mut finished = false;
+        while let Ok(event) = slow.events.try_recv() {
+            assert!(!finished, "event after terminal completion");
+            match event {
+                GenerationEvent::Token(token) => presented.push(token),
+                GenerationEvent::LogprobToken(value) => presented.push(value.token),
+                GenerationEvent::ObservedToken { token, timestamp_ns: Some(_) } => observed.push(token),
+                GenerationEvent::Finished { generated_tokens: 512, reason: "length", .. } => finished = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(presented, tokens);
+        assert_eq!(observed, tokens);
+        assert_eq!(fixture.metrics.failed.load(Ordering::Relaxed), 0);
+        drop(slow);
+        assert_eq!(runtime.capacity.available_permits(), 2);
+    }
+}
+
+#[test]
+fn unread_response_keeps_its_budget_through_a_reasoning_continuation() {
+    let mut fixture = Fixture::new();
+    fixture.config.prepared_sequence_tokens = 256;
+    fixture.config.limits.max_sequence_tokens = 256;
+    let (runtime, receiver) = group_runtime(&fixture, 1);
+    let mut prompt = Fixture::prompt_for(vec![0], 80, PromptData {
+        positions: vec![[0; 3]], vision_token_indices: vec![-1], ..Default::default()
+    });
+    prompt.reasoning_cut = Some(budget_cut(4, 81));
+    let mut generation = runtime.generate_observed(prompt, false).unwrap();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let mut sequence = 0;
+    budget_pass(&mut worker, &mut sequence, &[1; 80]);
+    assert_eq!(worker.parked.len(), 1);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    budget_pass(&mut worker, &mut sequence, &[2; 80]);
+    let (tokens, finished, _) = budget_events(&mut generation);
+    assert_eq!(tokens, [vec![1; 80], vec![4], vec![2; 80]].concat());
+    assert_eq!(finished, vec![(1, 161, "length")]);
+    assert_eq!(fixture.metrics.failed.load(Ordering::Relaxed), 0);
+    assert!(!generation.cancelled.load(Ordering::Acquire));
+}
+
+#[test]
 fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacity() {
     let fixture = Fixture::new();
     let (runtime, receiver) = group_runtime(&fixture, 4);
-    let good = fixture.incoming(vec![1, 2], 4).0.prompt;
-    let mut bad = fixture.incoming(vec![1, 2], 4).0.prompt;
+    let prompt = || {
+        Fixture::prompt_for(
+            vec![1, 2],
+            4,
+            PromptData {
+                positions: vec![[0; 3], [1; 3]],
+                vision_token_indices: vec![-1; 2],
+                ..Default::default()
+            },
+        )
+    };
+    let good = prompt();
+    let mut bad = prompt();
     bad.tokens.clear();
     assert!(runtime.generate_many(vec![good, bad]).is_err());
     assert!(matches!(
@@ -1686,16 +3232,12 @@ fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacit
         Err(mpsc::TryRecvError::Empty)
     ));
     assert_eq!(runtime.capacity.available_permits(), 4);
-    let prompts = (0..3)
-        .map(|_| fixture.incoming(vec![1, 2], 4).0.prompt)
-        .collect();
+    let prompts = (0..3).map(|_| prompt()).collect();
     let generations = runtime.generate_many(prompts).unwrap();
     let group = receiver.try_recv().unwrap();
     assert_eq!(group.len(), 3);
     assert_eq!(runtime.capacity.available_permits(), 1);
-    let prompts = (0..2)
-        .map(|_| fixture.incoming(vec![1, 2], 4).0.prompt)
-        .collect();
+    let prompts = (0..2).map(|_| prompt()).collect();
     assert!(runtime.generate_many(prompts).is_err());
     assert!(matches!(
         receiver.try_recv(),
@@ -1711,6 +3253,7 @@ fn exercise_text_preemption(
     metadata: crate::model::PreparedContract,
     data: impl Fn(usize) -> crate::model::PromptData,
     evict_checkpoint: bool,
+    reasoning_cut: Option<ReasoningCut>,
 ) {
     let mut fixture = Fixture::new();
     fixture.config.history_drafts = true;
@@ -1722,15 +3265,24 @@ fn exercise_text_preemption(
     let page_tokens = crate::model::scheduler_capabilities(&fixture.config).page_tokens;
     let budget = (page_tokens * 4) as u32;
     let (sender, receiver) = mpsc::channel();
-    let (first, mut first_generation) = fixture.incoming_for(vec![0; 60], budget, data(60));
-    let (second, mut second_generation) = fixture.incoming_for(vec![2; 60], budget, data(60));
+    let (mut first, mut first_generation) = fixture.incoming_for(vec![0; 60], budget, data(60));
+    let (mut second, mut second_generation) = fixture.incoming_for(vec![2; 60], budget, data(60));
+    first.prompt.message_boundaries = vec![32];
+    second.prompt.message_boundaries = vec![32];
+    first.prompt.reasoning_cut = reasoning_cut.clone();
+    second.prompt.reasoning_cut = reasoning_cut.clone();
     sender.send(vec![first, second]).unwrap();
     let mut worker = fixture.worker_for(receiver);
+    let mut graphs = crate::model::testing::manifest(&fixture.config).graphs;
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = if graph.kind == GraphKind::Snapshot { 10 } else { 1000 };
+    }
+    worker.scheduler.measured_graph_durations(&graphs).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     assert_eq!(worker.active.iter().flatten().count(), 2);
     assert_eq!(worker.scheduler.free_page_count(), 2);
-    let older = worker.active[0].as_ref().unwrap().request;
     let mut sequence = 0;
+    let mut emitted = [vec![], vec![]];
     while worker.parked.is_empty() {
         sequence += 1;
         assert!(sequence < (page_tokens * 8) as u64, "no request was parked");
@@ -1749,22 +3301,43 @@ fn exercise_text_preemption(
             }
             _ => None,
         };
-        let frame = completion(&worker, &step, sequence, sample);
+        let mut frame = completion(&worker, &step, sequence, sample);
+        frame.timing.gpu_ns[0] = Some(if step.kind == GraphKind::Snapshot { 10 } else { 1000 });
         worker.complete(step.kind, frame).unwrap();
         worker.publish().unwrap();
-        for generation in [&mut first_generation, &mut second_generation] {
-            while let Ok(event) = generation.events.try_recv() {
-                assert!(!matches!(
-                    event,
-                    GenerationEvent::Error(_) | GenerationEvent::AdmissionRejected(_)
-                ));
-            }
+        for (index, generation) in [&mut first_generation, &mut second_generation]
+            .into_iter()
+            .enumerate()
+        {
+            let (tokens, finished, _) = budget_events(generation);
+            assert!(finished.is_empty());
+            emitted[index].extend(tokens);
         }
     }
     assert!(worker.scheduler.stats().preemptions > 0);
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
+    assert_eq!(
+        incoming
+            .prompt
+            .reasoning_cut
+            .as_ref()
+            .map(|cut| (cut.close, cut.after)),
+        reasoning_cut.as_ref().map(|cut| (cut.close, cut.after))
+    );
+    assert_eq!(
+        parked
+            .reasoning
+            .as_ref()
+            .is_some_and(|parser| parser.reasoning_open()),
+        reasoning_cut.as_ref().is_some_and(|cut| cut.close != 1)
+    );
+    let index = usize::from(incoming.prompt.tokens[0] == 2);
     let decoded_sequence = parked.carried.decoded_sequence;
+    let checkpoint_accounting = parked.checkpoint_accounting.clone();
+    assert!(checkpoint_accounting.initial_prefill_ns.is_some());
+    assert!(checkpoint_accounting.productive_decode_ns > 0);
+    assert!(checkpoint_accounting.extra_spent_ns > 0);
     assert_ne!(decoded_sequence, Default::default());
     let history_len = incoming.prompt.tokens.len();
     assert_eq!(history_len, 60 + parked.carried.generated_tokens as usize);
@@ -1785,7 +3358,9 @@ fn exercise_text_preemption(
     if let Some(indices) = metadata.vision_token_indices {
         assert_eq!(indices, &vec![-1; history_len]);
     }
-    worker.retire(&[older]).unwrap();
+    let running = worker.active.iter().flatten().map(|active| active.request).collect::<Vec<_>>();
+    assert_eq!(running.len(), 1);
+    worker.retire(&running).unwrap();
     if evict_checkpoint {
         let pressure = worker
             .scheduler
@@ -1807,6 +3382,11 @@ fn exercise_text_preemption(
     let resumed = worker.active.iter().flatten().next().unwrap().request;
     let live = worker.scheduler.request(resumed).unwrap();
     assert_eq!(live.decoded_sequence, decoded_sequence);
+    let resumed_accounting = live.checkpoint_accounting();
+    assert_eq!(resumed_accounting.demand_epoch, checkpoint_accounting.demand_epoch);
+    assert_eq!(resumed_accounting.initial_prefill_ns, checkpoint_accounting.initial_prefill_ns);
+    assert_eq!(resumed_accounting.productive_decode_ns, checkpoint_accounting.productive_decode_ns);
+    assert_eq!(resumed_accounting.extra_spent_ns, checkpoint_accounting.extra_spent_ns);
     if evict_checkpoint {
         assert!(live.consumed_tokens < history_len as u64 - 1);
     } else {
@@ -1814,7 +3394,8 @@ fn exercise_text_preemption(
         assert_eq!(live.consumed_tokens, history_len as u64 - 1);
     }
     let mut recomputed = false;
-    for _ in 0..history_len / 64 + 8 {
+    let mut generated_once = false;
+    for _ in 0..budget as usize + history_len / 64 + 40 {
         sequence += 1;
         let step = worker.plan(0).unwrap().0.unwrap();
         recomputed |= step.kind == GraphKind::Prefill
@@ -1831,7 +3412,7 @@ fn exercise_text_preemption(
         let frame = completion(&worker, &step, sequence, sample);
         worker.complete(step.kind, frame).unwrap();
         worker.publish().unwrap();
-        if worker.scheduler.request(resumed).unwrap().generated_tokens > 0 {
+        if !generated_once && worker.scheduler.request(resumed).unwrap().generated_tokens > 0 {
             assert_eq!(recomputed, evict_checkpoint);
             assert!(
                 worker.active[resumed.slot as usize]
@@ -1841,6 +3422,38 @@ fn exercise_text_preemption(
                     .generated_tokens
                     > 0
             );
+            if reasoning_cut.is_none() {
+                return;
+            }
+            generated_once = true;
+        }
+        let generation = if index == 0 {
+            &mut first_generation
+        } else {
+            &mut second_generation
+        };
+        let (tokens, finished, _) = budget_events(generation);
+        assert!(finished.is_empty());
+        emitted[index].extend(tokens);
+        if worker.active.iter().all(Option::is_none) {
+            let cut = reasoning_cut.as_ref().unwrap();
+            let forced = cut.close != 1;
+            let mut expected = vec![1; budget as usize];
+            if forced {
+                expected.push(cut.close);
+            }
+            worker.admit().unwrap();
+            budget_pass(
+                &mut worker,
+                &mut sequence,
+                &vec![2; (cut.after - u32::from(forced)) as usize],
+            );
+            let (tokens, finished, _) = budget_events(generation);
+            emitted[index].extend(tokens);
+            expected.extend(vec![2; (cut.after - u32::from(forced)) as usize]);
+            assert_eq!(emitted[index], expected);
+            assert_eq!(finished, vec![(60, budget + cut.after, "length")]);
+            assert!(worker.parked.is_empty());
             return;
         }
     }
@@ -1861,6 +3474,25 @@ fn text_preemption_restores_or_recomputes_every_attention_contract() {
                     ..Default::default()
                 },
                 evict,
+                None,
+            );
+        }
+    }
+}
+
+#[test]
+fn reasoning_budget_survives_preemption_and_checkpoint_recomputation() {
+    for evict in [false, true] {
+        for close in [1, 4] {
+            exercise_text_preemption(
+                crate::model::testing::metadata(),
+                |n| PromptData {
+                    positions: (0..n).map(|p| [p as i64; 3]).collect(),
+                    vision_token_indices: vec![-1; n],
+                    ..Default::default()
+                },
+                evict,
+                Some(budget_cut(close, 16)),
             );
         }
     }
@@ -1968,16 +3600,25 @@ fn http_state(
     sender: mpsc::SyncSender<Vec<Incoming>>,
     api_key: Option<String>,
 ) -> Arc<super::super::HttpState> {
+    http_state_for(Fixture::new(), sender, api_key)
+}
+
+fn http_state_for(
+    mut fixture: Fixture,
+    sender: mpsc::SyncSender<Vec<Incoming>>,
+    api_key: Option<String>,
+) -> Arc<super::super::HttpState> {
     use super::super::HttpState;
     use tokio::sync::Semaphore;
-    let mut fixture = Fixture::new();
-    fixture.config.contract.vocabulary = 6;
-    fixture.config.contract.input_vocabulary = 6;
+    let vocabulary = fixture.frontend.tokenizer().get_vocab_size(true);
+    fixture.config.contract.vocabulary = vocabulary;
+    fixture.config.contract.input_vocabulary = vocabulary;
     fixture.config.sampling_defaults.top_k = -1;
     let grammar = crate::grammar::GrammarCompiler::new(
         fixture.frontend.tokenizer(),
-        6,
+        vocabulary,
         &fixture.config.eos_token_ids,
+        &[],
     )
     .unwrap();
     let model = Arc::new(ModelRuntime {
@@ -1997,6 +3638,8 @@ fn http_state(
         input_store: None,
     });
     Arc::new(HttpState {
+        first_response: Arc::new(super::super::latency::FirstResponseSamples::default()),
+        log_to_stderr: false,
         model,
         frontend: Arc::new(fixture.frontend),
         images: None,
@@ -2006,13 +3649,49 @@ fn http_state(
         max_body_bytes: 65536,
         frontend_capacity: 1,
         ingress_capacity: 4,
+        run: crate::server::run_id(),
         ids: Default::default(),
         api_key,
+        thinking_token_budget: None,
         context_hint: String::new(),
         capacity_hint: String::new(),
         started: std::time::Instant::now(),
         generated: Default::default(),
+        accepting: Mutex::new(true),
     })
+}
+
+#[test]
+fn server_snapshot_and_request_drain_preserve_pause_resume_state() {
+    use super::super::{Server, HttpControl, IngressRejection};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let server = Server {
+        address: "127.0.0.1:0".parse().unwrap(),
+        model: state.model.clone(),
+        control: Mutex::new(HttpControl { stop: None, thread: None }),
+        shutdown: Mutex::new(None),
+        dashboard: Mutex::new(None),
+        state: state.clone(),
+        http_alive: Arc::new(AtomicBool::new(true)),
+    };
+    let admitted = super::super::acquire_ingress(&state.accepting, &state.ingress_slots)
+        .unwrap_or_else(|_| panic!("admission failed"));
+    let before = server.snapshot();
+    assert!(before.ready);
+    assert_eq!(before.ingress_active, 1);
+    server.pause_admission();
+    assert!(!server.snapshot().ready);
+    assert!(!server.wait_for_requests(std::time::Duration::ZERO));
+    assert!(matches!(super::super::acquire_ingress(&state.accepting, &state.ingress_slots), Err(IngressRejection::Paused)));
+    drop(admitted);
+    assert!(server.wait_for_requests(std::time::Duration::ZERO));
+    server.resume_admission();
+    let after = server.snapshot();
+    assert!(after.ready);
+    assert_eq!(after.ingress_active, 0);
+    assert_eq!(after.session_id, before.session_id);
+    assert!(after.sampled_at_ns >= before.sampled_at_ns);
 }
 
 async fn http_generation(
@@ -2032,12 +3711,126 @@ async fn http_generation(
     .await
 }
 
+#[test]
+fn http_worker_exit_or_panic_invalidates_readiness_while_model_stays_healthy() {
+    use super::super::{HttpControl, HttpLifetime, Server};
+    use std::time::{Duration, Instant};
+    for panic in [false, true] {
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let state = http_state(sender, None);
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = alive.clone();
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || -> Result<()> {
+            let _lifetime = HttpLifetime(worker_alive.clone());
+            worker_alive.store(true, Ordering::Release);
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+            if panic { panic!("HTTP worker panicked after readiness"); }
+            Ok(())
+        });
+        let server = Server {
+            address: "127.0.0.1:0".parse().unwrap(), model: state.model.clone(),
+            control: Mutex::new(HttpControl { stop: None, thread: Some(worker) }),
+            shutdown: Mutex::new(None), dashboard: Mutex::new(None), state: state.clone(), http_alive: alive.clone(),
+        };
+        ready_rx.recv().unwrap();
+        let before = server.snapshot();
+        release.send(()).unwrap();
+        let started = Instant::now();
+        while alive.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = server.snapshot();
+        let model_healthy = state.model.healthy();
+        let wait_healthy = server.wait(Duration::ZERO);
+        let shutdown = server.close();
+        assert!(before.ready);
+        assert!(model_healthy);
+        assert!(after.accepting);
+        assert!(!after.healthy);
+        assert!(!after.ready);
+        assert!(!wait_healthy);
+        assert_eq!(shutdown.error.is_some(), panic);
+    }
+}
+
+#[test]
+fn server_snapshot_does_not_wait_for_http_shutdown_join() {
+    use super::super::{HttpControl, HttpLifetime, Server};
+    use std::time::Duration;
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let alive = Arc::new(AtomicBool::new(true));
+    let worker_alive = alive.clone();
+    let (stop, stopped) = oneshot::channel();
+    let (joining, joining_rx) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || -> Result<()> {
+        let _lifetime = HttpLifetime(worker_alive);
+        let _ = stopped.blocking_recv();
+        joining.send(()).unwrap();
+        released.recv().unwrap();
+        Ok(())
+    });
+    let server = Arc::new(Server {
+        address: "127.0.0.1:0".parse().unwrap(), model: state.model.clone(),
+        control: Mutex::new(HttpControl { stop: Some(stop), thread: Some(worker) }),
+        shutdown: Mutex::new(None), dashboard: Mutex::new(None), state, http_alive: alive,
+    });
+    let closing = server.clone();
+    let admitted = super::super::acquire_ingress(&server.state.accepting, &server.state.ingress_slots)
+        .unwrap_or_else(|_| panic!("initial admission failed"));
+    let inflight = server.state.ingress_slots.available_permits();
+    let closer = thread::spawn(move || closing.close());
+    joining_rx.recv().unwrap();
+    let control_locked = server.control.try_lock().is_err();
+    // The HTTP thread is held after receiving stop, with its lifetime flag and
+    // model health still true. Resume must not reopen admission during this gap.
+    server.resume_admission();
+    let sampling = server.clone();
+    let (sample, sampled) = mpsc::sync_channel(1);
+    let sampler = thread::spawn(move || { sample.send(sampling.snapshot()).unwrap(); });
+    let snapshot = sampled.recv_timeout(Duration::from_secs(1));
+    // Always release the join before assertions so a failed check cannot strand a worker.
+    release.send(()).unwrap();
+    let shutdown = closer.join().unwrap();
+    sampler.join().unwrap();
+    assert!(control_locked);
+    let snapshot = snapshot.expect("snapshot waited for HTTP thread join");
+    assert!(!snapshot.ready);
+    assert!(!snapshot.accepting);
+    assert_eq!(server.state.ingress_slots.available_permits(), inflight);
+    assert!(server.state.ingress_slots.is_closed());
+    assert!(matches!(
+        super::super::acquire_ingress(&server.state.accepting, &server.state.ingress_slots),
+        Err(super::super::IngressRejection::Paused)
+    ));
+    drop(admitted);
+    assert_eq!(server.state.ingress_slots.available_permits(), server.state.ingress_capacity);
+    assert!(shutdown.drained);
+    assert!(!server.healthy());
+}
+
 async fn http_generation_request(
     path: &str,
     body: serde_json::Value,
 ) -> (
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
+) {
+    let (response, incoming, _) = http_generation_request_observed(path, body).await;
+    (response, incoming)
+}
+
+async fn http_generation_request_observed(
+    path: &str,
+    body: serde_json::Value,
+) -> (
+    tokio::task::JoinHandle<axum::response::Response>,
+    Vec<Incoming>,
+    Arc<super::super::HttpState>,
 ) {
     use super::super::http;
     use axum::{Extension, extract::State};
@@ -2050,7 +3843,7 @@ async fn http_generation_request(
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
-    let response = tokio::spawn(http::generate(State(state), Extension(ingress), request));
+    let response = tokio::spawn(http::generate(State(state.clone()), Extension(ingress), request));
     let incoming = tokio::task::spawn_blocking(move || {
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -2058,7 +3851,270 @@ async fn http_generation_request(
     })
     .await
     .unwrap();
-    (response, incoming)
+    (response, incoming, state)
+}
+
+#[tokio::test]
+async fn first_response_http_stream_excludes_pretext_failures_and_unpolled_bodies() {
+    for (emit_text, poll_body) in [(false, true), (true, false), (true, true)] {
+        let (response, incoming, state) = http_generation_request_observed(
+            "/v1/completions",
+            serde_json::json!({"prompt":"a", "max_tokens":2, "stream":true}),
+        ).await;
+        let response = response.await.unwrap();
+        incoming[0].notify_admission(Ok(()));
+        if emit_text { incoming[0].emit_token(1); }
+        incoming[0].fail(Error::execution(ExecutionError::Worker, "fixture failure"));
+        assert_eq!(state.first_response.snapshot().samples, 0);
+        if poll_body {
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().contains("fixture failure"));
+        } else {
+            drop(response);
+        }
+        let snapshot = state.first_response.snapshot();
+        assert_eq!(snapshot.samples, u64::from(emit_text && poll_body));
+        assert_eq!(snapshot.median_seconds.is_some(), emit_text && poll_body);
+    }
+}
+
+#[tokio::test]
+async fn first_response_http_nonstream_records_only_when_completed_body_is_offered() {
+    for poll_body in [false, true] {
+        let (response, incoming, state) = http_generation_request_observed(
+            "/v1/completions",
+            serde_json::json!({"prompt":"a", "max_tokens":2, "stream":false}),
+        ).await;
+        incoming[0].notify_admission(Ok(()));
+        incoming[0].emit_token(1);
+        incoming[0].emit(GenerationEvent::Finished {
+            prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 1,
+            reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+            termination: crate::output::Termination::OutputLimit,
+        });
+        let response = response.await.unwrap();
+        assert_eq!(state.first_response.snapshot().samples, 0);
+        if poll_body {
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["choices"][0]["text"], "b");
+        } else {
+            drop(response);
+        }
+        assert_eq!(state.first_response.snapshot().samples, u64::from(poll_body));
+    }
+}
+
+#[tokio::test]
+async fn unread_http_stream_preserves_all_tokens_and_its_terminal_event() {
+    for fail in [false, true] {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 100, "stream": true, "return_token_ids": true,
+        });
+        let (response, incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        incoming[0].notify_admission(Ok(()));
+        // An unpolled response body models socket backpressure without relying on
+        // kernel send-buffer sizes or wall-clock delays to make the test fail.
+        let expected = (0..100).map(|i| 1 + i % 3).collect::<Vec<_>>();
+        for &token in &expected {
+            incoming[0].observe_token(token);
+            incoming[0].emit_token(token);
+        }
+        if fail {
+            incoming[0].fail(Error::execution(ExecutionError::Worker, "test worker failure"));
+        } else {
+            incoming[0].emit(GenerationEvent::Finished {
+                prompt_tokens: incoming[0].prompt.tokens.len(), generated_tokens: 100,
+                reused_prompt_tokens: 0, reason: "length", stop_sequence: None,
+                termination: crate::output::Termination::OutputLimit,
+            });
+        }
+        assert!(!incoming[0].cancelled.load(Ordering::Acquire));
+        drop(incoming);
+        let bytes = axum::body::to_bytes(response.into_body(), 131072).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = body.lines().filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let observed = events.iter().filter_map(|event| event["choices"][0]["token_ids"].as_array())
+            .flatten().map(|token| token.as_u64().unwrap() as u32).collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+        let text = events.iter().filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "bcd".repeat(33) + "b");
+        if fail {
+            assert_eq!(events.last().unwrap()["error"]["message"], "test worker failure");
+            assert!(!body.contains("[DONE]"));
+        } else {
+            assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "length");
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn paused_http_bodies_preserve_output_and_completion_for_every_protocol() {
+    use axum::{Extension, extract::State};
+    use futures_util::StreamExt;
+    use serde_json::json;
+    for (path, mut body, terminal) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":3000}),
+            "\"finish_reason\":\"length\"",
+        ),
+        (
+            "/v1/completions",
+            json!({"prompt":"a", "max_tokens":3000}),
+            "\"finish_reason\":\"length\"",
+        ),
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"a"}], "max_tokens":3000}),
+            "message_stop",
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"a", "max_output_tokens":3000}),
+            "response.incomplete",
+        ),
+    ] {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut fixture = Fixture::new();
+        fixture.config.limits.max_sequence_tokens = 4096;
+        fixture.config.prepared_sequence_tokens = 4096;
+        let state = http_state_for(fixture, sender, None);
+        body["model"] = json!("qwen-worker-phases");
+        body["stream"] = json!(true);
+        let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response =
+            super::super::http::generate(State(state.clone()), Extension(ingress), request).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+        let incoming = receiver.try_recv().unwrap().remove(0);
+        incoming.notify_admission(Ok(()));
+        incoming.observe_token(1);
+        incoming.emit_token(1);
+        let mut reader = response.into_body().into_data_stream();
+        let first = reader.next().await.unwrap().unwrap();
+        // Not polling the body reproduces transport backpressure deterministically,
+        // without depending on the OS TCP send-buffer size or a timed sleep.
+        for _ in 1..3000 {
+            incoming.observe_token(1);
+            incoming.emit_token(1);
+        }
+        incoming.emit(GenerationEvent::Finished {
+            prompt_tokens: incoming.prompt.tokens.len(),
+            generated_tokens: 3000,
+            reused_prompt_tokens: 0,
+            reason: "length",
+            termination: crate::output::Termination::OutputLimit,
+            stop_sequence: None,
+        });
+        assert!(!incoming.cancelled.load(Ordering::Acquire));
+        assert_eq!(incoming.publications.get(), 3000);
+        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 0);
+        drop(incoming);
+        // The unread response body still holds its native admission permit.
+        assert_eq!(state.model.capacity.available_permits(), 3);
+        let mut bytes = first.to_vec();
+        while let Some(chunk) = reader.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains(terminal), "{path}: missing {terminal}");
+        let mut content = String::new();
+        for value in text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            assert!(value["error"].is_null(), "{path}: {value}");
+            assert_ne!(value["type"], "error", "{path}: {value}");
+            let delta = match path {
+                "/v1/chat/completions" => value["choices"][0]["delta"]["content"].as_str(),
+                "/v1/completions" => value["choices"][0]["text"].as_str(),
+                "/v1/messages" => value["delta"]["text"].as_str(),
+                _ if value["type"] == "response.output_text.delta" => value["delta"].as_str(),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                content.push_str(delta);
+            }
+        }
+        assert_eq!(content, "b".repeat(3000), "{path}");
+        assert_eq!(state.model.capacity.available_permits(), 4);
+    }
+}
+
+#[tokio::test]
+async fn http_operator_thinking_budget_defaults_and_request_overrides() {
+    use super::super::http;
+    use axum::{Extension, extract::State};
+    use serde_json::json;
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/messages",
+        "/v1/completions",
+    ] {
+        for explicit in [None, Some(3)] {
+            let fixture = Fixture::reasoning();
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let mut state = http_state_for(fixture, sender, None);
+            Arc::get_mut(&mut state).unwrap().thinking_token_budget = Some(2);
+            let mut body = json!({"model":"qwen-worker-phases", "max_tokens":8,
+                "max_output_tokens":8, "add_generation_prompt":true});
+            match path {
+                "/v1/responses" => body["input"] = json!("a"),
+                "/v1/completions" => body["prompt"] = json!("a"),
+                _ => body["messages"] = json!([{"role":"user","content":"a"}]),
+            }
+            if path == "/v1/messages" {
+                if let Some(budget) = explicit {
+                    body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
+                }
+            } else if path != "/v1/completions" {
+                body["thinking_token_budget"] = json!(explicit);
+            }
+            let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = tokio::spawn(http::generate(State(state), Extension(ingress), request));
+            let incoming = tokio::task::spawn_blocking(move || {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            let prompt = &incoming[0].prompt;
+            if path == "/v1/completions" {
+                assert_eq!(prompt.max_new_tokens, 8);
+                assert!(prompt.reasoning_cut.is_none());
+            } else {
+                let budget = explicit.unwrap_or(2);
+                assert_eq!(prompt.max_new_tokens, budget);
+                assert_eq!(prompt.reasoning_cut.as_ref().unwrap().after, 8 - budget);
+            }
+            response.abort();
+        }
+    }
 }
 
 #[tokio::test]
@@ -2167,6 +4223,24 @@ async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_t
 }
 
 #[tokio::test]
+async fn request_ids_differ_across_server_starts() {
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 4, "stream": true,
+        });
+        let (response, _incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        ids.push(response.headers()["x-request-id"].to_str().unwrap().to_owned());
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[tokio::test]
 async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_tokens() {
     use futures_util::StreamExt;
     for (hidden, eos) in [(false, false), (true, false), (false, true)] {
@@ -2177,8 +4251,8 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
         if hidden {
             request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
         }
-        let (response, mut incoming) =
-            http_generation_request("/v1/chat/completions", request).await;
+        let (response, mut incoming, state) =
+            http_generation_request_observed("/v1/chat/completions", request).await;
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .unwrap()
@@ -2222,6 +4296,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             role["choices"][0]["delta"],
             serde_json::json!({"role":"assistant","content":""})
         );
+        assert_eq!(state.first_response.snapshot().samples, 0);
         if hidden || eos {
             assert!(futures_util::poll!(body.next()).is_pending());
         } else {
@@ -2240,6 +4315,7 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
             .clone();
         drop(body);
         assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(state.first_response.snapshot().samples, u64::from(!hidden && !eos));
     }
 }
 
@@ -2371,6 +4447,31 @@ async fn chat_stream_flushes_headers_over_tcp_before_admission_or_tokens() {
 }
 
 #[tokio::test]
+async fn http_pause_rejects_before_body_preparation_and_resume_restores_validation() {
+    use std::io::{Read, Write};
+    let (sender, _receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state.clone(), &[], 65536);
+    let serving = tokio::spawn(async move { axum::serve(listener, router).await });
+    for (accepting, expected) in [(false, "503"), (true, "400")] {
+        *state.accepting.lock().unwrap() = accepting;
+        let response = tokio::task::spawn_blocking(move || {
+            let mut socket = std::net::TcpStream::connect(address).unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n{").unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).unwrap();
+            response
+        }).await.unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {expected}")), "{response}");
+        assert_eq!(state.ingress_slots.available_permits(), state.ingress_capacity);
+    }
+    serving.abort();
+}
+
+#[tokio::test]
 async fn http_disconnect_while_waiting_cancels_queued_generation() {
     let (response, incoming) = http_generation(true, 1).await;
     drop(response.await.unwrap());
@@ -2439,7 +4540,7 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     state.model.metrics().progress(10, 3, 0, 0, 0, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let router = super::super::router(state, &[], 65536);
+    let router = super::super::router(state.clone(), &[], 65536);
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
     let get = |path: &'static str, accept: Option<&'static str>| {
         tokio::task::spawn_blocking(move || {
@@ -2476,6 +4577,8 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         "{body}"
     );
     assert!(body.contains("\nflare_prefill_tokens_total 10\n"));
+    assert!(body.contains("\nflare_first_response_samples 0\n"));
+    assert!(!body.contains("flare_first_response_median_seconds"));
     for (path, accept) in [
         ("/metrics", Some("application/json")),
         ("/metrics?format=json", Some("text/plain")),
@@ -2488,12 +4591,22 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         );
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["learned_drafter"], false);
+        assert!(value["first_response"]["median_seconds"].is_null());
+        assert_eq!(value["first_response"]["samples"], 0);
+        assert_eq!(value["first_response"]["window_seconds"], 60);
         let snapshot: super::super::Snapshot = serde_json::from_value(value).unwrap();
         assert_eq!(
             (snapshot.prefill_tokens, snapshot.generated_tokens),
             (10, 3)
         );
     }
+    state.first_response.observe(std::time::Instant::now()).output();
+    let (_, _, body) = get("/metrics?format=json", None).await.unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["first_response"]["samples"], 1);
+    assert!(value["first_response"]["median_seconds"].is_number());
+    let (_, _, body) = get("/metrics", None).await.unwrap();
+    assert!(body.contains("\nflare_first_response_median_seconds "));
     assert_eq!(get("/metrics?format=yaml", None).await.unwrap().0, 400);
     assert_eq!(get("/health", None).await.unwrap().0, 200);
     assert_eq!(get("/v1/models", None).await.unwrap().0, 401);
@@ -2646,7 +4759,7 @@ fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Err("restore transfer failed".into()),
         });
@@ -2848,7 +4961,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         });
         manifest.input_frame_bytes += 16;
     }
-    fixture.config.contract.graphs.push(GraphContract {
+    fixture.config.contract.graphs.push(GraphContract { tuned_bindings: vec![],
         graph: "Vision-1-256".into(),
         kind: GraphOperation::Vision,
         inputs: semantic,
@@ -2858,7 +4971,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         embedding_tables: vec![],
         pending_token: None,
     });
-    manifest.graphs.push(GraphDescriptor {
+    manifest.graphs.push(GraphDescriptor { tuned_bindings: vec![],
         confidence_width: 0,
         draft_tokens: 0,
         name: "Vision-1-256".into(),
@@ -3029,100 +5142,6 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
 }
 
 #[test]
-fn publication_retries_wait_for_progress_and_pin_only_admitted_copies() {
-    use crate::offload::{StoreOutcome, StoreReason};
-    let mut fixture = Fixture::new();
-    fixture.config.limits.snapshots = 1;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store
-        .store_outcomes
-        .push_back(StoreOutcome::Retry(StoreReason::Slabs));
-    worker.attach_store(Some(Box::new(store)));
-    let spec = RequestSpec {
-        prompt: vec![0; 70],
-        message_boundaries: vec![],
-        conditioning: vec![],
-        max_new_tokens: 1,
-        grammar_constrained: false,
-        host_stops: false,
-        prompt_logprobs: false,
-        growable_output: true,
-    };
-    let plan = worker.scheduler.plan_admission(&spec).unwrap();
-    let key = plan.history().key_at(64).unwrap();
-    let admitted = worker
-        .scheduler
-        .admit_planned(
-            spec.clone(),
-            plan,
-            Some(crate::scheduler::InboundRequest {
-                key,
-                consumed_tokens: 64,
-                pages: 1,
-            }),
-        )
-        .unwrap();
-    worker.scheduler.finish_inbound(key, true).unwrap();
-    let id = worker
-        .scheduler
-        .request(admitted.handle)
-        .unwrap()
-        .prefix()
-        .unwrap();
-    assert!(worker.service_store().unwrap());
-    assert_eq!(worker.deferred_stores, [id]);
-    assert_eq!(
-        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
-        1
-    );
-    assert!(!worker.service_store().unwrap());
-    assert_eq!(fake_store(&mut worker).stored.len(), 1);
-    fake_store(&mut worker).progress += 1;
-    assert!(worker.service_store().unwrap());
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(fake_store(&mut worker).stored.len(), 2);
-    assert_eq!(
-        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
-        2
-    );
-    assert_eq!(
-        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
-        1
-    );
-    fake_store(&mut worker)
-        .events
-        .push_back(crate::offload::StoreEvent::Deferred { checkpoint: id });
-    worker.service_store().unwrap();
-    assert_eq!(worker.deferred_stores, [id]);
-    worker.scheduler.cancel(admitted.handle).unwrap();
-    let mut other = spec;
-    other.prompt.fill(1);
-    let plan = worker.scheduler.plan_admission(&other).unwrap();
-    let key = plan.history().key_at(64).unwrap();
-    worker
-        .scheduler
-        .admit_planned(
-            other,
-            plan,
-            Some(crate::scheduler::InboundRequest {
-                key,
-                consumed_tokens: 64,
-                pages: 1,
-            }),
-        )
-        .unwrap();
-    assert!(worker.scheduler.cache().checkpoint(id).is_err());
-    worker.service_store().unwrap();
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(
-        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
-        1
-    );
-}
-
-#[test]
 fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 2;
@@ -3137,14 +5156,19 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let handle = worker.active[0].as_ref().unwrap().request;
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: history.key_at(64).unwrap(),
             result: Ok(4096),
         });
+    fake_store(&mut worker)
+        .store_outcomes
+        .push_back(flare_selene::StoreOutcome::Queued);
     worker.service_store().unwrap();
     let publication = fake_store(&mut worker).stored[0].clone();
     worker.scheduler.cancel(handle).unwrap();
     worker.active[0] = None;
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
     sender.send(vec![incoming]).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -3153,7 +5177,7 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let fence = worker.scheduler.completed();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Stored {
+        .push_back(flare_selene::StoreEvent::Stored {
             checkpoint: publication.id,
             key: publication.key,
             result: Ok(4096),
@@ -3194,4 +5218,444 @@ fn native_prompt_rejects_invalid_requested_logprob_ids() {
     incoming.prompt.logprob_token_ids = vec![0];
     incoming.prompt.logprobs = false;
     assert!(validate(&fixture.config, &incoming.prompt).is_err());
+}
+
+/// Create a ready checkpoint through the scheduler's inbound publication path,
+/// then release its request so eviction policy can consider it.
+fn unpinned_checkpoint(
+    worker: &mut Worker<'_>,
+    token: u32,
+    end: usize,
+) -> crate::cache::CheckpointId {
+    let spec = RequestSpec {
+        prompt: vec![token; end + 1],
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(end as u64).unwrap();
+    let pages = (end as u64 - plan.resident_tokens()) as usize / 64;
+    let admitted = worker
+        .scheduler
+        .admit_planned(
+            spec,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: end as u64,
+                pages,
+            }),
+        )
+        .unwrap();
+    worker.scheduler.finish_inbound(key, true).unwrap();
+    let id = worker
+        .scheduler
+        .request(admitted.handle)
+        .unwrap()
+        .prefix()
+        .unwrap();
+    worker.scheduler.cancel(admitted.handle).unwrap();
+    id
+}
+
+fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, success: bool) {
+    let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+    fake_store(worker)
+        .events
+        .push_back(flare_selene::StoreEvent::Stored {
+            checkpoint: id,
+            key,
+            result: if success {
+                Ok(1)
+            } else {
+                Err("copy failed".into())
+            },
+        });
+}
+
+#[test]
+fn queued_publication_copies_release_one_pin_on_success_or_failure() {
+    for success in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 128;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store
+            .store_outcomes
+            .push_back(flare_selene::StoreOutcome::Queued);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 1);
+        assert!(!has_copy(&mut worker, id));
+        complete_store(&mut worker, id, success);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(
+            has_copy(&mut worker, id),
+            success
+        );
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+#[test]
+fn admission_proceeds_while_a_publication_copy_is_in_flight() {
+    use flare_selene::StoreOutcome::*;
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.push_back(Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 1);
+    let (incoming, generation) = fixture.incoming(vec![1; 70], 4);
+    worker.pending.push_back(incoming);
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.scheduler.stats().active_requests, 1);
+    assert_eq!(pins(&worker, id), 1);
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    drop(generation);
+}
+
+#[test]
+fn publication_copy_and_export_release_their_own_pins_in_either_completion_order() {
+    use flare_selene::StoreOutcome::*;
+    for export_first in [false, true] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.store_outcomes.push_back(Queued);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+        fake_store(&mut worker)
+            .events
+            .push_back(export_request(1, key, id.value(), 0));
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 2);
+        if export_first {
+            fake_store(&mut worker).events.push_back(export_ended(1));
+        } else {
+            complete_store(&mut worker, id, true);
+        }
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 1);
+        if export_first {
+            complete_store(&mut worker, id, true);
+        } else {
+            fake_store(&mut worker).events.push_back(export_ended(1));
+        }
+        fake_store(&mut worker).events.push_back(export_ended(1));
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert!(has_copy(&mut worker, id));
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    }
+}
+
+#[test]
+fn publication_copy_pins_survive_ancestor_compaction() {
+    use flare_selene::StoreOutcome::*;
+    let mut fixture = Fixture::new();
+    fixture.config.limits.max_sequence_tokens = 256;
+    fixture.config.limits.snapshots = 2;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    worker.attach_store(Some(Box::new(store)));
+    let a = unpinned_checkpoint(&mut worker, 0, 64);
+    let b = unpinned_checkpoint(&mut worker, 0, 128);
+    fake_store(&mut worker)
+        .store_outcomes
+        .extend([Present, Queued]);
+    worker.service_store().unwrap();
+    let original = fake_store(&mut worker).stored[1].clone();
+    assert_eq!(original.id, b);
+    assert_eq!(pins(&worker, b), 1);
+    let (incoming, generation) = fixture.incoming(vec![1; 70], 4);
+    let spec = RequestSpec {
+        prompt: incoming.prompt.tokens.clone(),
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 4,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    worker
+        .scheduler
+        .admit_planned(
+            spec,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    assert!(worker.scheduler.cache().checkpoint(a).is_err());
+    assert_eq!(pins(&worker, b), 1);
+    assert_eq!(
+        worker.scheduler.cache().page_chain(b).unwrap(),
+        original.chain_pages
+    );
+    complete_store(&mut worker, b, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, b), 0);
+    let notice = &fake_store(&mut worker).evicted[0];
+    assert_eq!(notice.1.as_ref().unwrap().id, b);
+    drop(generation);
+}
+
+#[test]
+fn a_present_publication_takes_no_pin() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(flare_selene::StoreOutcome::Present);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    assert!(has_copy(&mut worker, id));
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+}
+
+fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
+    let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+    fake_store(worker).copies.contains(&key)
+}
+
+#[test]
+fn losing_a_host_copy_does_not_recopy_a_gpu_checkpoint() {
+    use flare_selene::StoreOutcome;
+    for outcome in [StoreOutcome::Present, StoreOutcome::Queued] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.store_outcomes.push_back(outcome);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        if outcome == StoreOutcome::Queued {
+            complete_store(&mut worker, id, true);
+            worker.service_store().unwrap();
+        }
+        assert!(has_copy(&mut worker, id));
+        fake_store(&mut worker).copies.clear();
+        assert!(!worker.service_store().unwrap());
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+#[test]
+fn publications_copy_immediately_even_without_gpu_pressure() {
+    for pooled in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 256;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = pooled;
+        store
+            .store_outcomes
+            .push_back(flare_selene::StoreOutcome::Queued);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(fake_store(&mut worker).stored[0].id, id);
+        assert_eq!(pins(&worker, id), 1);
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        complete_store(&mut worker, id, true);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+#[test]
+fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
+    use flare_selene::{StoreOutcome::*, StoreReason};
+    for reason in [
+        StoreReason::Inflight,
+        StoreReason::Slabs,
+        StoreReason::Queue,
+        StoreReason::Budget,
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 2;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.store_outcomes.extend([Retry(reason), Queued]);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(worker.deferred_stores, [(id, reason)]);
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        fake_store(&mut worker).progress += 1;
+        worker.service_store().unwrap();
+        assert!(worker.deferred_stores.is_empty());
+        assert_eq!(pins(&worker, id), 1);
+        assert_eq!(
+            fixture.metrics.host_retry_success.load(Ordering::Relaxed),
+            1
+        );
+        fake_store(&mut worker)
+            .events
+            .push_back(flare_selene::StoreEvent::Deferred {
+                checkpoint: id,
+                reason: reason,
+            });
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(worker.deferred_stores, [(id, reason)]);
+        let spec = RequestSpec {
+            prompt: vec![1; 70],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: true,
+        };
+        worker.scheduler.admit(spec).unwrap();
+        worker.service_store().unwrap();
+        assert!(worker.deferred_stores.is_empty());
+        assert_eq!(
+            fixture.metrics.host_retry_abandoned[reason as usize].load(Ordering::Relaxed),
+            1
+        );
+    }
+}
+
+#[test]
+fn publication_losses_classify_oversize_and_copy_failure() {
+    use flare_selene::StoreOutcome;
+    for (outcome, reason) in [(StoreOutcome::Oversize, 4), (StoreOutcome::Queued, 5)] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.store_outcomes.push_back(outcome);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        if outcome == StoreOutcome::Queued {
+            complete_store(&mut worker, id, false);
+            worker.service_store().unwrap();
+        }
+        assert_eq!(
+            fixture.metrics.host_retry_abandoned[reason].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+
+#[test]
+fn local_copyout_defers_without_a_pin_until_pending_admission_headroom_returns() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.push_back(flare_selene::StoreOutcome::Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 150], 4);
+    worker.pending.push_back(incoming);
+    assert!(worker.service_store().unwrap());
+    assert!(fake_store(&mut worker).stored.is_empty());
+    assert_eq!(pins(&worker, id), 0);
+    assert_eq!(worker.deferred_copyouts, [id]);
+    assert_eq!(fixture.metrics.copyout_headroom_deferrals.load(Ordering::Relaxed), 1);
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fixture.metrics.copyout_headroom_deferrals.load(Ordering::Relaxed), 1);
+    worker.pending.clear();
+    assert!(worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    assert_eq!(pins(&worker, id), 1);
+    assert!(worker.deferred_copyouts.is_empty());
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+}
+
+#[test]
+fn local_copyout_discards_an_evicted_unpinned_deferral() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    worker.attach_store(Some(Box::new(FakeStore::new(None))));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 150], 4);
+    worker.pending.push_back(incoming);
+    worker.service_store().unwrap();
+    assert_eq!(worker.deferred_copyouts, [id]);
+    let _ = worker.admit().unwrap();
+    assert!(worker.scheduler.cache().checkpoint(id).is_err());
+    worker.service_store().unwrap();
+    assert!(worker.deferred_copyouts.is_empty());
+    assert!(fake_store(&mut worker).stored.is_empty());
+}
+
+
+#[test]
+fn local_copyout_rechecks_headroom_after_each_queued_pin() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([flare_selene::StoreOutcome::Queued; 2]);
+    worker.attach_store(Some(Box::new(store)));
+    let first = unpinned_checkpoint(&mut worker, 0, 64);
+    let second = unpinned_checkpoint(&mut worker, 1, 64);
+    let (incoming, _generation) = fixture.incoming(vec![9; 70], 1);
+    worker.pending.push_back(incoming);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    assert_eq!(fake_store(&mut worker).stored[0].id, first);
+    assert_eq!(pins(&worker, first), 1);
+    assert_eq!(pins(&worker, second), 0);
+    assert_eq!(worker.deferred_copyouts, [second]);
+    complete_store(&mut worker, first, true);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).stored.len(), 2);
+    assert_eq!(pins(&worker, second), 1);
 }

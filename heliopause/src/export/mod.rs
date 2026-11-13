@@ -1,4 +1,9 @@
-//! Preparation-time graph export and package publication.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Preparation-time graph export and core publication.
 
 pub(crate) mod archive;
 pub(crate) mod binding;
@@ -7,19 +12,20 @@ pub(crate) mod capture;
 pub(crate) mod conversion;
 pub(crate) mod cubin;
 pub(crate) mod io;
-pub(crate) mod package;
+pub(crate) mod core;
 pub(crate) mod protection;
 pub(crate) mod reachability;
 pub(crate) mod recorder;
 pub(crate) mod source_identity;
 pub(crate) mod weight_payload;
+pub(crate) mod weight_reuse;
 #[cfg(unix)]
 pub(crate) mod transfer;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub(crate) use helios_core::runtime_package::wire;
+pub(crate) use helios_core::runtime_core::wire;
 use serde::{Deserialize, Serialize};
 
 pub(crate) type ExportResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -100,8 +106,14 @@ pub(crate) struct Kernel {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GraphHandle {
     pub name: String,
+    #[serde(default)]
     pub graph: usize,
+    #[serde(default)]
     pub executable: usize,
+    #[serde(default)]
+    pub instantiate_flags: Option<u64>,
+    #[serde(default)]
+    pub recorded: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -122,6 +134,8 @@ pub(crate) struct ExportOptions {
     pub cache: Option<PathBuf>,
     #[serde(default)]
     pub no_weights: bool,
+    #[serde(default)]
+    pub reuse_weights: Option<weight_reuse::Source>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -177,7 +191,7 @@ pub(crate) struct CaptureRequest {
     /// Thin semantic weight declaration; resolved against retained allocations.
     #[serde(default)]
     pub weight_payload: Option<serde_json::Value>,
-    pub package_data: Option<serde_json::Value>,
+    pub core_data: Option<serde_json::Value>,
     #[serde(default)]
     pub options: ExportOptions,
     #[serde(default)]
@@ -274,12 +288,18 @@ pub(crate) struct WeightPayloadSources {
     /// Semantic group of every declared view, independent of retained coverage.
     #[serde(default)]
     pub views: Vec<WeightPayloadView>,
+    /// Payloads that the receiving coordinator already holds; no sender file is required.
+    #[serde(default)]
+    pub cached: Vec<helios_core::core::schema::wire::PayloadDescriptor>,
+    /// File-backed embedding table metadata rebound to this preparation's buffers.
+    #[serde(default)]
+    pub engram: Option<helios_core::core::schema::wire::Engram>,
 }
 
 /// Leases for captured cache objects, held from capture through publication and
 /// rank transfer so collection cannot unlink a payload between phases.
 #[derive(Clone, Default)]
-pub(crate) struct PayloadLeases(pub Vec<crate::package::cache::PayloadObject>);
+pub(crate) struct PayloadLeases(pub Vec<crate::core::cache::PayloadObject>);
 
 impl std::fmt::Debug for PayloadLeases {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -302,7 +322,7 @@ pub(crate) struct RankOutput {
     /// Stable semantic weight groups resolved against retained byte sources.
     #[serde(default)]
     pub weight_payload: Option<WeightPayloadSources>,
-    /// Platform identifier detected from the capture device (gb10, gb202).
+    /// Platform identifier detected from the capture device.
     #[serde(default)]
     pub hardware: Option<String>,
     /// Live object leases; serialized rank sources carry none.

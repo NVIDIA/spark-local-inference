@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared projection tuning fixtures and scratch finalization."""
 
 from dataclasses import dataclass
@@ -84,10 +88,10 @@ def test_dense_benchmark_uses_finite_private_strided_inputs_and_planned_workspac
     assert trial_source.data_ptr() != source.data_ptr()
     if isinstance(workspace, ScratchArena):
         assert trial_workspace is workspace.tensor and workspace.nbytes == 256
-    else:
+    elif workspace is not None:
         assert trial_workspace is workspace
-    if trial_workspace is not None:
-        assert trial_workspace.nbytes >= state.required_workspace
+    assert trial_workspace is not None
+    assert trial_workspace.nbytes >= state.required_workspace
     assert torch.isfinite(trial_source).all() and trial_source.count_nonzero() > 0
     torch.testing.assert_close(actual, trial_source @ values.T + bias, rtol=0, atol=0)
     assert source.count_nonzero() == 0 and output.count_nonzero() == 0

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise native speculative serving, batching, prefix reuse, and cancellation.
 
 Run against an already loaded Flare service. Output contains HTTP replies and

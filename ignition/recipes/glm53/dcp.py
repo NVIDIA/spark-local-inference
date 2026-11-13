@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Decode context parallel placement of GLM latent records and C4 index pools.
 
 Ranks own interleaved four-token groups: global position t belongs to rank

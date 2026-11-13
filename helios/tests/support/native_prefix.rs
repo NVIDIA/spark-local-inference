@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use flare_helios::frontend::{Frontend, RenderedPrompt};
 use serde_json::{Map, Value};
 
@@ -15,7 +20,7 @@ pub fn without_generation(
     rendered.token_ids.clear();
     for (i, span) in rendered
         .text
-        .split(deepseek_recipe_core::multimodal::IMAGE_SPECIAL_TOKEN)
+        .split(deepseek_recipe_core::special_tokens::SpecialToken::Image.default_str())
         .enumerate()
     {
         if i != 0 {

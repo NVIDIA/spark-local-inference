@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Captured image delivery against the checkpoint's ViT and aligner."""
 
 import importlib.util
+from dataclasses import fields, is_dataclass
 import json
 import os
 from pathlib import Path
@@ -15,7 +20,7 @@ from b12x.preparation import PreparationSession
 from ignition.components.paged_batch import BatchInputs
 from ignition.components.sampling import DeviceRequestState
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.checkpoint import IndexedCheckpoint, _read_header
 from ignition.components.deepseek_vision import (
     PreparedVision,
@@ -42,6 +47,7 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
         Path.home()
         / ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
     )
+    snapshot = Path(os.environ.get("FLARE_DS41_SNAPSHOT", snapshot))
     if not (snapshot / "inference/vision.py").is_file():
         pytest.skip("DeepSeek V4.1 Flash checkpoint is unavailable")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -86,16 +92,14 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     patches = height * width
     feature_h, feature_w = (height + 2) // 3, (width + 2) // 3
     features = feature_h * feature_w
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
-    scratch = VisionScratch.allocate(capacity, device, hidden=5120, buffers=buffers)
+    scratch = VisionScratch.allocate(capacity, device, hidden=5120)
     inputs = VisionInputs.allocate(device, patches=9216)
     requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=4)
     batch = BatchInputs.allocate(512, 8, device, capacity=4)
     state = VisionState(weights, batch, PrefillVisionInputs.allocate(512, device), requests, features=4096,
         token_base=129280, sentinel_names=("image_start", "image_start", "image_newline", "image_end"), feature_type=1,
         image_slots=2)
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     frame, sequence = (
         torch.zeros(1, dtype=torch.int32, device=device),
         torch.ones(1, dtype=torch.int64, device=device),
@@ -123,8 +127,8 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     requests.generation[2] = 7
     requests.status[2] = 1
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision", buffers=buffers)
-        operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, buffers=buffers)
+        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision")
+        operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence)
         if compiler == "aot":
             from ignition.preparation.aot import aot_forward
 
@@ -143,9 +147,13 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
             inputs.vision_pixel_values[:patches].copy_(source)
             state.arena.fill_(float("nan"))
             sequence.fill_(iteration + 2)
-            for chunks in pool.chunks.values():
-                for tensor in chunks:
-                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
+            def poison_examples(value):
+                if is_dataclass(value):
+                    for field in fields(value):
+                        poison_examples(getattr(value, field.name))
+                else:
+                    value.fill_(float("nan") if value.is_floating_point() else -37)
+            poison_examples(scratch)
             graph.replay()
             torch.cuda.synchronize()
             with torch.device(device):

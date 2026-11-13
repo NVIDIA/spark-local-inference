@@ -7,7 +7,7 @@ name = "ignition"
 version = "0.1.0"
 description = "Python model preparation for the Helios CUDA graph serving core"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "helios/licenses/PyTorch.txt", "ignition/recipes/deepseek41/assets/LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
@@ -22,7 +22,7 @@ prepare = [
     "torch==2.14.1+cu132",
     "torchvision==0.29.1+cu132",
     "transformers[torch,vision,chat_template] @ git+https://github.com/huggingface/transformers.git@1d9654e78a23fb167ef539cbd699dfbd3e4830cf",
-    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@259648d983fdd1488bb6b8df8e5ea6134901a4d4",
+    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@a11f259ba3f0ee179814bd717995a8b9c74f082d",
     "cuda-python==13.3.1",
     "cuda-tile[tileiras]==1.6.0",
     "safetensors==0.8.0",
@@ -31,7 +31,7 @@ prepare = [
     "accelerate==1.14.0",
     "Pillow==12.3.0",
     "flare-heliopause",
-    "protobuf>=7.35.1,<8",
+    "protobuf>=7.36.2,<8",
     "rich>=13",
 ]
 
@@ -49,15 +49,18 @@ flare-heliopause = { path = "heliopause" }
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
+"ignition.preparation" = ["ladders/*.json"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
 "ignition.recipes.gemma4" = ["assets/*"]
 "ignition.recipes.kimi3" = ["assets/*"]
+"ignition.recipes.kimi31" = ["assets/*"]
 "ignition.recipes.glm53" = ["assets/*"]
 "ignition.recipes.mimo_v2" = ["assets/*"]
 "ignition.recipes.nemotron_h" = ["assets/*"]
 "ignition.recipes.qwen38" = ["assets/*"]
 "ignition.recipes.step5" = ["assets/*"]
+"ignition.recipes.muse_spark" = ["assets/*"]
 "ignition.recipes.minimax_m3" = ["assets/*"]
 
 [tool.pytest.ini_options]

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Preparation error and speculation formatting."""
 
 import sys
@@ -28,10 +32,13 @@ def speculation(settings, *, brief: bool = False) -> str:
         return "speculation off" if brief else "off"
     drafts = settings.draft_tokens
     depth = f"{'up to' if settings.adaptive else 'exactly'} {drafts} draft token{'' if drafts == 1 else 's'}"
+    parallel = " · vocabulary-parallel block sampling" if settings.vocabulary_parallel_sampling else ""
     selection = " · GPU prefix selection" if settings.draft_prefix_selection == "gpu" else ""
     heads = [f"{head} head {getattr(settings, head + '_head_quantization').upper()}"
              for head in ("draft", "markov") if getattr(settings, head + '_head_quantization') is not None]
     precision = " · " + ", ".join(heads) if heads else ""
+    catalog = " · MTP-only graphs" if settings.mtp_only else ""
     if brief:
-        return depth + selection + precision
-    return f"{depth} per round · MTP module" + selection + precision
+        return depth + selection + precision + parallel + catalog
+    source = "DFlash2" if settings.method == "dflash2" else "MTP module"
+    return f"{depth} per round · {source}" + selection + precision + parallel + catalog

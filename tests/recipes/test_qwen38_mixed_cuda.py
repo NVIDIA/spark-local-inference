@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Mixed target metadata and state endpoints through native CUDA graph replay."""
 
 import os
@@ -6,6 +9,7 @@ import pytest
 import torch
 
 from ignition.preparation.graphs import PreparedGraphBundle
+from ignition.recipes.qwen38.attention import QSAMetadata
 from ignition.recipes.qwen38.decoder_state import DecoderInputs, PreparedDecoderState
 from ignition.recipes.qwen38.mixed_state import MixedPacking, MixedScratch, PreparedMixedState, role_inputs
 from ignition.recipes.qwen38.mixed_model import MixedEmbeddingInjection
@@ -59,12 +63,23 @@ def test_mixed_metadata_and_committed_endpoints(enabled, width, compiled, live):
     embedding = torch.zeros((tokens, 2560), dtype=torch.bfloat16, device=device)
     injection = MixedEmbeddingInjection(packing, features, p, embedding, scratch.prompt_gdn.output)
 
+    packing.functional()
+    state.functional()
+    injection.functional()
+    observed = QSAMetadata.allocate(tokens=tokens, batch=batch, context=256, device=device)
+
     def forward():
-        packing.upload_roles()
-        injection.validate()
-        state.begin()
-        injection.inject()
-        state.finish()
+        current = packing.runtime()
+        prompt = p.begin_runtime(current.prompt)
+        decode = (d.begin_runtime(candidates, current.decode) if enabled
+                  else d.begin_runtime(current.decode))
+        runtime = state.combine_runtime(current, prompt, decode)
+        errors = injection.validate_runtime(current)
+        injection.inject(embedding, (errors, current))
+        sample.copy_(state.finish_runtime(runtime, hidden, residual))
+        observed.request_ids.copy_(runtime.qsa.request_ids)
+        observed.is_prefilling.copy_(runtime.qsa.is_prefilling)
+        observed.query_start_loc.copy_(runtime.qsa.query_start_loc)
 
     function = forward
     if compiled:
@@ -79,7 +94,7 @@ def test_mixed_metadata_and_committed_endpoints(enabled, width, compiled, live):
     with torch.cuda.graph(graph, stream=stream):
         function()
     worker = PreparedGraphBundle(device=0, graphs={"mixed": graph}, buffers={"sample": sample},
-        resources=(pool, requests, inputs, p, d, packing, scratch, state, hidden, residual, function)).start_worker()
+        resources=(pool, requests, inputs, p, d, packing, scratch, state, hidden, residual, observed, function)).start_worker()
     try:
         for prompt_row in (-1, 0, 1, 3):
             if prompt_row >= live:
@@ -124,8 +139,8 @@ def test_mixed_metadata_and_committed_endpoints(enabled, width, compiled, live):
                 for row, slot in enumerate([2, 0, 3, 1]):
                     start, length = starts[row], lengths[row]
                     active = row < live and not (stale and row == stale_row)
-                    assert state.qsa.request_ids[start:start + length].tolist() == [row if active else -1] * length
-                    assert state.qsa.is_prefilling[row].item() == (row == prompt_row)
+                    assert observed.request_ids[start:start + length].tolist() == [row if active else -1] * length
+                    assert observed.is_prefilling[row].item() == (row == prompt_row)
                     consumed = int(requests.consumed_tokens[slot])
                     expected = 65 if row == prompt_row else 63 + int(active and not enabled)
                     assert consumed == expected
@@ -133,8 +148,8 @@ def test_mixed_metadata_and_committed_endpoints(enabled, width, compiled, live):
                         assert pool.last_hidden[slot + 1, 0] == hidden[start + length - 1, 0]
                     else:
                         assert not pool.last_hidden[slot + 1].any()
-                assert (state.qsa.request_ids[sum(lengths):] == -1).all()
-                assert state.qsa.query_start_loc.tolist() == [0, *[sum(lengths[:r + 1]) for r in range(4)]]
+                assert (observed.request_ids[sum(lengths):] == -1).all()
+                assert observed.query_start_loc.tolist() == [0, *[sum(lengths[:r + 1]) for r in range(4)]]
                 expected_embedding = torch.full_like(embedding, -4)
                 if prompt_row >= 0:
                     expected_embedding[starts[prompt_row] + 17] = 77

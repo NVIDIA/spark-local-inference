@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared packed GQA/index projections and signed block selection."""
 
 from dataclasses import dataclass, replace
@@ -12,6 +15,7 @@ from b12x.attention.dsa_indexer import MSACaps, plan_msa, run_msa
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
@@ -367,8 +371,9 @@ class PreparedPackedAttention:
                 "index page table must be contiguous integer storage matching the main "
                 "page table shape, dtype and device"
             )
-        self.weights = torch.stack(norms)
-        unit = torch.ones(1, dtype=torch.float32, device=projected.device)
+        self.weights = persistent_empty((len(norms), *norms[0].shape), norms[0].dtype, norms[0].device)
+        torch.stack(norms, out=self.weights)
+        unit = persistent_empty((1,), torch.float32, projected.device).fill_(1)
         self.arguments = (
             projected,
             self.weights,
@@ -389,8 +394,10 @@ class PreparedPackedAttention:
         q = PackedQuery(tuple(tensor_facts(t) for t in self.arguments), float(epsilon))
         payload = PACKED.encode_query(q)
 
+        device = projected.device
+
         def materialize(warps):
-            program = compile_packed(payload, warps, projected.device.index)
+            program = compile_packed(payload, warps, device.index)
             load_programs(program)
             return attach_programs(PackedState(q, program), program)
 
@@ -410,9 +417,11 @@ class PreparedPackedAttention:
             ),
         )
 
+        declaration = self.arguments
+
         def benchmark(state):
             def inputs():
-                values = list(self.arguments)
+                values = list(declaration)
                 batch, width = metadata.page_table.shape
                 pages_per_request = min(
                     width, triton.cdiv(triton.cdiv(rows, batch), key_cache.shape[1])
@@ -476,9 +485,27 @@ class PreparedPackedAttention:
             ),
         )
 
-    def __call__(self):
-        _execute(*self.arguments, self.plan.handle)
-        return self.output
+    def functional(self, *, session):
+        self.query_layouts = tuple((tuple(t.shape), t.dtype) for t in self.arguments[7:9])
+        self.constants = self.arguments[1:3]
+        self.cache = self.arguments[9:]
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.arguments = self.output = None
+
+    def __call__(self, projected=None, metadata=None, *, index_page_table=None):
+        if self.arguments is not None:
+            _execute(*self.arguments, self.plan.handle)
+            return self.output
+        query, index_query = (torch.zeros(shape, dtype=dtype, device=projected.device)
+                              for shape, dtype in self.query_layouts)
+        m = metadata
+        pages = m.page_table if index_page_table is None else index_page_table
+        _execute(projected, *self.constants, m.requests, m.positions, m.page_table, pages,
+                 query, index_query, *self.cache, self.plan.handle)
+        return query, index_query
 
 
 class PreparedMSAIndexer:
@@ -592,5 +619,21 @@ class PreparedMSAIndexer:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
-    def __call__(self):
-        return run_msa(self.plan, **self.arguments, scratch=self.scratch)
+    def functional(self, *, session):
+        self.cache = self.arguments["cache"]
+        self.output_layout = tuple(self.output.shape), self.output.dtype
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.arguments = self.output = self.workspace = self.scratch = None
+
+    def __call__(self, query=None, page_table=None, lengths=None, starts=None, positions=None):
+        if self.arguments is not None:
+            return run_msa(self.plan, **self.arguments, scratch=self.scratch)
+        shape, dtype = self.output_layout
+        output = torch.full(shape, -1, dtype=dtype, device=query.device)
+        scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        return run_msa(self.plan, query=query, cache=self.cache, page_table=page_table, cache_lengths=lengths,
+                       cu_seqlens_q=starts, positions=positions, output=output, scratch=scratch)

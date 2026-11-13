@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Literal window-address formulas used to check shared metadata buffers.
 
 The formula bodies are copied from the DeepSeek 4 and DeepSeek 4.1 attention

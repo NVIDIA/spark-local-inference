@@ -1,5 +1,11 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -29,6 +35,7 @@ pub struct Prompt {
     pub conditioning: Vec<ConditioningEvent>,
     pub sampling: SamplingParameters,
     pub max_new_tokens: u32,
+    pub reasoning_cut: Option<ReasoningCut>,
     pub stop_sequences: Vec<Vec<u32>>,
     pub stop_strings: Vec<String>,
     pub grammar: Option<crate::grammar::RequestGrammar>,
@@ -39,9 +46,39 @@ pub struct Prompt {
     pub prompt_logprobs: bool,
 }
 
+#[derive(Clone)]
+pub struct ReasoningCut {
+    pub close: u32,
+    /// Output tokens available after the budget pass.
+    pub after: u32,
+    pub output: Option<crate::output::OutputConfig>,
+}
+
 impl Prompt {
     fn has_host_stops(&self) -> bool {
         !self.stop_sequences.is_empty() || !self.stop_strings.is_empty()
+    }
+
+    fn output_event_capacity(&self, minimum: usize, observed: bool) -> Result<usize> {
+        // Each generated token produces at most one presentation event and one
+        // optional observation. A reasoning cut's forced token is part of `after`.
+        // Prompt-score chunks cover disjoint, nonempty ranges of the original prompt.
+        let tokens = u64::from(self.max_new_tokens)
+            + u64::from(self.reasoning_cut.as_ref().map_or(0, |cut| cut.after));
+        let events = usize::try_from(tokens)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(if observed { 2 } else { 1 }))
+            .and_then(|events| {
+                events.checked_add(if self.prompt_logprobs { self.tokens.len() } else { 0 })
+            })
+            // Text-stop flush, terminal completion, and the first failure.
+            .and_then(|events| events.checked_add(3))
+            .map(|events| events.max(minimum))
+            .filter(|events| *events <= tokio::sync::Semaphore::MAX_PERMITS)
+            .ok_or_else(|| {
+                Error::admission(AdmissionError::Invalid, "output event budget is too large")
+            })?;
+        Ok(events)
     }
 }
 
@@ -69,6 +106,9 @@ pub enum GenerationEvent {
 
 pub struct Generation {
     pub events: async_mpsc::Receiver<GenerationEvent>,
+    // Finished responses still consume host admission capacity until their reader
+    // releases them. GPU request slots and cache pages have a separate lifetime.
+    _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     admission: oneshot::Receiver<Result<()>>,
     /// Completes before stop matching or decoding can hide the first token.
     first_token: oneshot::Receiver<Result<()>>,
@@ -77,8 +117,8 @@ pub struct Generation {
     pub(super) enqueue_ns: Option<u64>,
 }
 
-/// A buffered group waits for one admission. Waiting for every choice would
-/// leave admitted choices' bounded output queues undrained.
+/// A buffered group starts consuming output after one choice is admitted;
+/// other choices may still be waiting for model capacity.
 pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()> {
     use std::{future::Future, pin::Pin, task::Poll};
     std::future::poll_fn(|cx| {
@@ -154,8 +194,56 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
+    /// Pool lookup started on arrival, retained until its answer or the first
+    /// prefill submission. Cancellation drops it with the `Incoming`.
+    pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    pool_lookup_started: Option<std::time::Instant>,
+    /// Replaced on readmission and counted once when this request ends.
+    host_lookup_outcome: Option<crate::offload::LookupOutcome>,
+    pool_plan: Option<crate::scheduler::AdmissionPlan>,
 }
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.host_lookup_outcome {
+            self.metrics.host_lookup_outcome(outcome);
+        }
+    }
+}
+
 impl Incoming {
+    fn spec(&self) -> RequestSpec {
+        RequestSpec {
+            message_boundaries: self.prompt.message_boundaries.clone(),
+            prompt: self.prompt.tokens.clone(),
+            conditioning: self.prompt.conditioning.clone(),
+            max_new_tokens: self.prompt.max_new_tokens,
+            grammar_constrained: self.prompt.grammar.is_some(),
+            host_stops: self.prompt.has_host_stops(),
+            prompt_logprobs: self.prompt_scored < self.prompt_score_end,
+            growable_output: true,
+        }
+    }
+
+    fn poll_pool_lookup(&mut self) {
+        if self.pool_lookup_started.is_some()
+            && self.pool_lookup.as_ref().is_some_and(|ticket| {
+                !matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+            })
+        {
+            self.pool_lookup_started = None;
+            self.blocked = None;
+        }
+    }
+
+    fn awaits_pool(&self, now: std::time::Instant) -> bool {
+        self.pool_lookup.as_ref().is_some_and(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                && self
+                    .pool_lookup_started
+                    .is_some_and(|started| now.saturating_duration_since(started) < ticket.grace())
+        })
+    }
+
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
@@ -190,6 +278,7 @@ impl Incoming {
         self.metrics.failed.fetch_add(1, Ordering::Relaxed);
         let _ = self.events.try_send(event(error));
     }
+    #[cfg(test)]
     fn emit_token(&self, token: u32) {
         self.emit(GenerationEvent::Token(token));
     }
@@ -210,15 +299,24 @@ impl Incoming {
             &event,
             GenerationEvent::Token(_) | GenerationEvent::LogprobToken(_) | GenerationEvent::Protocol(_)
         );
-        if self.events.try_send(event).is_err() {
-            self.fail(Error::execution(
-                ExecutionError::Capacity,
-                "generation consumer exceeded the bounded output queue",
-            ));
-            self.cancelled.store(true, Ordering::Release);
-        } else if publishes {
-            self.publications
-                .set(self.publications.get().saturating_add(1));
+        match self.events.try_send(event) {
+            Ok(()) if publishes => {
+                self.publications
+                    .set(self.publications.get().saturating_add(1));
+            }
+            Ok(()) => {}
+            Err(async_mpsc::error::TrySendError::Closed(_)) => {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            Err(async_mpsc::error::TrySendError::Full(_)) => {
+                // Admission budgets the complete response, so a full queue is a
+                // producer invariant violation, not a slow or disconnected reader.
+                self.fail(Error::execution(
+                    ExecutionError::Completion,
+                    "generation exceeded its output event budget",
+                ));
+                self.cancelled.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -233,7 +331,10 @@ struct Active<'a> {
     stops: super::stops::TokenStops,
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
+    checkpoint_accounting: crate::scheduler::CheckpointAccounting,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
+    // The client decoder runs on another thread; the worker needs reasoning state at the cut.
+    reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
 }
 
 /// Output accounting and decoded tail retained across admissions.
@@ -265,10 +366,27 @@ struct Parked<'a> {
     stops: super::stops::TokenStops,
     text_stops: Option<super::stops::TextStops<'a>>,
     carried: Carried,
+    checkpoint_accounting: crate::scheduler::CheckpointAccounting,
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
+    reasoning: Option<super::output::Decoder<'a, crate::output::OutputPipeline>>,
 }
 
 impl Active<'_> {
+    fn close_reasoning(&mut self, close: u32, eos: &[u32]) -> Result<bool> {
+        if let Some(grammar) = &mut self.incoming.prompt.grammar {
+            grammar.advance(close).map_err(|error| {
+                Error::from(ExecutionError::Completion(Failure::caused_by(
+                    format!("thinking_token_budget grammar advancement failed: {error}"),
+                    error,
+                )))
+            })?;
+        }
+        self.incoming.observe_token(close);
+        self.last_token = Some(close);
+        self.carried.generated_tokens += 1;
+        self.emit_output(close, eos, None)
+    }
+
     fn emit_output(
         &mut self,
         token: u32,
@@ -317,13 +435,15 @@ pub struct ModelRuntime {
     shutdown: Mutex<Option<Shutdown>>,
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
-    input_store: Option<crate::offload::input::InputStore>,
+    input_store: Option<flare_selene::input::InputStore>,
 }
 
 impl ModelRuntime {
     /// # Safety
     /// The caller retains every prepared graph/context/allocation until close
     /// confirms drain, and grants this runtime exclusive graph mutation access.
+    /// Startup errors do not confirm drain; retain owners conservatively on error,
+    /// or use `start_retaining_drain` to inspect explicit startup drain status.
     pub unsafe fn start(
         manifest: ExecutionManifest,
         config: ModelConfig,
@@ -333,6 +453,23 @@ impl ModelRuntime {
         peers: Option<crate::execution::RankPeers>,
         policy: crate::scheduler::PolicyConfig,
     ) -> Result<Self> {
+        unsafe { Self::start_retaining_drain(manifest, config, queue_capacity, event_capacity, frontend, peers, policy, true) }
+            .map_err(|failure| failure.message)
+    }
+
+    /// # Safety
+    /// Prepared resources remain exclusive and retained until confirmed drain,
+    /// including when startup returns a failure with `drained` set to false.
+    pub unsafe fn start_retaining_drain(
+        manifest: ExecutionManifest,
+        config: ModelConfig,
+        queue_capacity: usize,
+        event_capacity: usize,
+        frontend: Arc<crate::frontend::Frontend>,
+        peers: Option<crate::execution::RankPeers>,
+        policy: crate::scheduler::PolicyConfig,
+        log_to_stderr: bool,
+    ) -> std::result::Result<Self, super::StartFailure> {
         crate::model::catalog::validate(&config, &manifest)?;
         super::observation::initialize_clock();
         if queue_capacity == 0 || queue_capacity > 1024 || !(2..=4096).contains(&event_capacity) {
@@ -361,6 +498,7 @@ impl ModelRuntime {
                 config.limits.pages,
                 config.contract.cache.page_tokens,
                 config.decode_weight_bytes,
+                config.completion_token_capacity,
             );
         metrics.history_drafts = config.history_drafts;
         metrics.engram = manifest
@@ -491,7 +629,14 @@ impl ModelRuntime {
                     .offload
                     .as_ref()
                     .and_then(|binding| binding.take())
-                    .map(crate::offload::open)
+                    .map(|prepared| {
+                        if let Some(warning) =
+                            prepared.intake_warning(worker_config.limits.max_active)
+                        {
+                            if log_to_stderr { eprintln!("warning: {warning}"); }
+                        }
+                        crate::offload::open(prepared)
+                    })
                     .transpose()
                 {
                     Ok(store) => store,
@@ -569,21 +714,25 @@ impl ModelRuntime {
                 metrics,
             }),
             result => {
-                let returned = thread.join().ok().and_then(|shutdown| shutdown.error);
-                Err(match result {
+                let shutdown = thread.join().unwrap_or_else(|_| Shutdown {
+                    drained: false,
+                    error: Some(Error::execution(ExecutionError::Worker, "model thread panicked before readiness")),
+                });
+                let message = match result {
                     Ok(Err(error)) => error,
                     Err(disconnected) => super::readiness_failure(
                         "model worker exited before readiness",
                         disconnected,
-                        returned,
+                        shutdown.error,
                     ),
                     Ok(Ok(())) => unreachable!("ready success handled above"),
-                })
+                };
+                Err(super::StartFailure { message, drained: shutdown.drained })
             }
         }
     }
 
-    pub(super) fn input_store(&self) -> Option<&crate::offload::input::InputStore> {
+    pub(super) fn input_store(&self) -> Option<&flare_selene::input::InputStore> {
         self.input_store.as_ref()
     }
 
@@ -675,7 +824,10 @@ impl ModelRuntime {
             )?;
             crate::model::admission::validate_prompt(&self.config, &prompt)
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
-            let (events, receiver) = async_mpsc::channel(self.event_capacity);
+            // Tokio allocates queue blocks as events arrive, not at this capacity.
+            let event_capacity =
+                prompt.output_event_capacity(self.event_capacity, observation.is_some())?;
+            let (events, receiver) = async_mpsc::channel(event_capacity);
             let (admission, admitted) = oneshot::channel();
             let (first_token, first_token_ready) = oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -697,6 +849,10 @@ impl ModelRuntime {
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
+                pool_lookup: None,
+                pool_lookup_started: None,
+                host_lookup_outcome: None,
+                pool_plan: None,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -704,6 +860,7 @@ impl ModelRuntime {
             incoming_group.push(incoming);
             generations.push(Generation {
                 events: receiver,
+                _capacity: Some(capacity.clone()),
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -782,7 +939,7 @@ struct ImagePreparation {
 }
 
 impl ImagePreparation {
-    fn new(store: Option<crate::offload::input::InputStore>) -> Self {
+    fn new(store: Option<flare_selene::input::InputStore>) -> Self {
         let (sender, jobs) = mpsc::sync_channel::<ImagePreparationJob>(1);
         let (results, receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -822,6 +979,14 @@ impl Drop for ImagePreparation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CopyoutResources {
+    completed: crate::cache::Fence,
+    scheduler: crate::scheduler::SchedulerStats,
+    exports: usize,
+    next: Option<(usize, u32, bool)>,
+}
+
 struct Worker<'a> {
     config: &'a ModelConfig,
     frontend: &'a crate::frontend::Frontend,
@@ -836,9 +1001,14 @@ struct Worker<'a> {
     admissions: Vec<Option<crate::model::Admission>>,
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
-    store: Option<Box<dyn crate::offload::PrefixStore>>,
-    deferred_stores: Vec<crate::cache::CheckpointId>,
+    store: Option<Box<dyn flare_selene::HostStore>>,
+    deferred_stores: Vec<(crate::cache::CheckpointId, flare_selene::StoreReason)>,
     store_progress: u64,
+    deferred_copyouts: Vec<crate::cache::CheckpointId>,
+    copyout_resources: Option<CopyoutResources>,
+    /// The checkpoint each served export pins, until its `ExportEnded`: the only
+    /// place an export's pin is released.
+    exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -869,12 +1039,15 @@ impl<'a> Worker<'a> {
             store: None,
             deferred_stores: Vec::new(),
             store_progress: 0,
+            deferred_copyouts: Vec::new(),
+            copyout_resources: None,
+            exports: HashMap::new(),
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
             admissions: (0..config.limits.max_active).map(|_| None).collect(),
             inputs: None,
-            prefill_rate: crate::offload::INITIAL_PREFILL_RATE,
+            prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
             image_preparation: None,
             preparing_image: None,
@@ -931,15 +1104,16 @@ impl<'a> Worker<'a> {
             });
             if !progress {
                 if executor.outstanding() > 0 {
-                    std::hint::spin_loop();
+                    // A park is bounded; the yield keeps the old loop's cooperative handoff.
+                    if !executor.park() {
+                        std::hint::spin_loop();
+                    }
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
-                    match self
-                        .receiver
-                        .recv_timeout(std::time::Duration::from_millis(2))
-                    {
-                        Ok(request) => self.pending.extend(request),
+                    let wait = self.idle_wait();
+                    match self.receiver.recv_timeout(wait) {
+                        Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
@@ -949,11 +1123,49 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    fn attach_store(&mut self, store: Option<Box<dyn crate::offload::PrefixStore>>) {
+    fn idle_wait(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        if self
+            .pending
+            .iter()
+            .any(|incoming| incoming.awaits_pool(now))
+            || self
+                .parked
+                .iter()
+                .any(|(incoming, _)| incoming.awaits_pool(now))
+        {
+            std::time::Duration::from_micros(100)
+        } else {
+            std::time::Duration::from_millis(2)
+        }
+    }
+
+    fn attach_store(&mut self, store: Option<Box<dyn flare_selene::HostStore>>) {
         if store.is_some() {
             self.scheduler.enable_publications();
+            if store.as_ref().is_some_and(|store| store.pooled()) {
+                self.scheduler.enable_evictions();
+            }
         }
         self.store = store;
+    }
+
+    /// Queue arriving requests, starting each one's pool lookup so its answer is
+    /// ready by admission.
+    fn enqueue(&mut self, mut requests: Vec<Incoming>) {
+        self.begin_pool_lookups(&mut requests);
+        self.pending.extend(requests);
+    }
+
+    /// Starts a pool lookup for each request that will consult the store. Nothing
+    /// is built unless the store shares prefixes.
+    fn begin_pool_lookups(&mut self, requests: &mut [Incoming]) {
+        let Some(store) = self.store.as_mut().filter(|store| store.pooled()) else {
+            return;
+        };
+        for incoming in requests {
+            begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+        }
     }
 
     fn close_store(&mut self, shutdown: &mut Shutdown) {
@@ -973,7 +1185,7 @@ impl<'a> Worker<'a> {
                 drop(std::mem::ManuallyDrop::into_inner(store));
             }
             Err(error) => {
-                shutdown.error.get_or_insert(error);
+                shutdown.error.get_or_insert(error.into());
             }
         }
     }
@@ -1036,7 +1248,7 @@ impl<'a> Worker<'a> {
         while self.pending.len() < self.queue_capacity {
             match self.receiver.try_recv() {
                 Ok(request) => {
-                    self.pending.extend(request);
+                    self.enqueue(request);
                     progress = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -1069,6 +1281,12 @@ impl<'a> Worker<'a> {
             }
         }
         while self.scheduler.has_available_slot() {
+            for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
+                if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                    begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+                }
+                incoming.poll_pool_lookup();
+            }
             let stats = self.scheduler.stats();
             let resources = (
                 self.scheduler.completed(),
@@ -1076,7 +1294,10 @@ impl<'a> Worker<'a> {
                 stats.free_snapshots,
                 stats.free_slots,
             );
-            let eligible = |incoming: &Incoming| incoming.blocked != Some(resources);
+            let now = std::time::Instant::now();
+            let eligible = |incoming: &Incoming| {
+                incoming.blocked != Some(resources) && !incoming.awaits_pool(now)
+            };
             let parked = self
                 .parked
                 .iter()
@@ -1098,19 +1319,14 @@ impl<'a> Worker<'a> {
                 continue;
             }
             if incoming.prompt.logprobs && self.config.max_top_logprobs == 0 {
-                incoming.reject_admission("logprobs are not available in this model package".into());
+                incoming.reject_admission("logprobs are not available in this model core".into());
                 continue;
             }
-            let spec = RequestSpec {
-                message_boundaries: incoming.prompt.message_boundaries.clone(),
-                prompt: incoming.prompt.tokens.clone(),
-                conditioning: incoming.prompt.conditioning.clone(),
-                max_new_tokens: incoming.prompt.max_new_tokens,
-                grammar_constrained: incoming.prompt.grammar.is_some(),
-                host_stops: incoming.prompt.has_host_stops(),
-                prompt_logprobs: incoming.prompt_scored < incoming.prompt_score_end,
-                growable_output: true,
-            };
+            let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
+                matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+            });
+            let checkpoint_accounting = parked.as_ref().map(|parked| parked.checkpoint_accounting.clone());
+            let spec = incoming.spec();
             self.scheduler
                 .advance_to(super::observation::monotonic_ns())?;
             let admission = if let Some(store) =
@@ -1119,12 +1335,21 @@ impl<'a> Worker<'a> {
                 admit_with_host_store(
                     &mut self.scheduler,
                     store.as_mut(),
+                    incoming.pool_lookup.as_ref(),
                     spec,
+                    incoming.pool_plan.as_ref(),
+                    checkpoint_accounting,
                     self.prefill_rate,
                     self.metrics,
                 )
+                .map(|(handle, outcome)| {
+                    if outcome.is_some() {
+                        incoming.host_lookup_outcome = outcome;
+                    }
+                    handle
+                })
             } else {
-                self.scheduler.admit(spec)
+                admit_with_checkpoint_accounting(&mut self.scheduler, spec, checkpoint_accounting)
             };
             let handle = match admission {
                 Ok(handle) => handle,
@@ -1214,6 +1439,14 @@ impl<'a> Worker<'a> {
                     },
                     last_token: None,
                     carried: Carried::default(),
+                    checkpoint_accounting: Default::default(),
+                    reasoning: incoming.prompt.reasoning_cut.as_mut().map(|cut| {
+                        super::output::Decoder::new(
+                            self.frontend,
+                            &self.config.eos_token_ids,
+                            cut.output.take(),
+                        )
+                    }),
                     held_logprobs: VecDeque::new(),
                 },
             };
@@ -1221,6 +1454,10 @@ impl<'a> Worker<'a> {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
             }
             self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
+            if !pending_pool_answer {
+                incoming.pool_lookup = None;
+                incoming.pool_plan = None;
+            }
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1232,7 +1469,9 @@ impl<'a> Worker<'a> {
                 selected_images,
                 prepared_image: None,
                 carried: parked.carried,
+                checkpoint_accounting: self.scheduler.request(handle)?.checkpoint_accounting(),
                 held_logprobs: parked.held_logprobs,
+                reasoning: parked.reasoning,
             });
             progress = true;
         }
@@ -1335,7 +1574,7 @@ impl<'a> Worker<'a> {
                         .min(lane.tokens as u64);
                 } else if record.generated_tokens > live.generated_tokens as i64 {
                     verification_rounds += 1;
-                    if let Some(vector) = record.vector {
+                    if let Some(vector) = record.vector.as_ref() {
                         let offered =
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
                         verification_drafts += offered as u64;
@@ -1411,11 +1650,9 @@ impl<'a> Worker<'a> {
                 }).collect::<Result<Vec<_>>>()?;
                 if first < end {
                     request.incoming.prompt_scored = end;
-                    if request.incoming.events.try_send(GenerationEvent::PromptLogprobs {
+                    request.incoming.emit(GenerationEvent::PromptLogprobs {
                         start: first, tokens: prompt.tokens[first..end].to_vec(), values,
-                    }).is_err() {
-                        request.incoming.cancelled.store(true, Ordering::Release);
-                    }
+                    });
                 }
             }
         }
@@ -1434,6 +1671,14 @@ impl<'a> Worker<'a> {
             {
                 request.incoming.observe_token(token.token);
                 request.last_token = Some(token.token);
+                if let Some(reasoning) = &mut request.reasoning {
+                    if let Err(error) = reasoning.push(token.token) {
+                        // The budget tracker surfaces errors the client decoder would also report.
+                        request.incoming.fail(error);
+                        stopped.push(token.request);
+                        continue;
+                    }
+                }
                 if let Some(grammar) = &mut request.incoming.prompt.grammar {
                     if let Err(error) = grammar.advance(token.token) {
                         request.incoming.fail(
@@ -1487,10 +1732,9 @@ impl<'a> Worker<'a> {
                 if stop {
                     self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                     let live = self.scheduler.request(token.request)?;
-                    if request
+                    request
                         .incoming
-                        .events
-                        .try_send(GenerationEvent::Finished {
+                        .emit(GenerationEvent::Finished {
                             prompt_tokens: request
                                 .carried
                                 .prompt_tokens
@@ -1507,13 +1751,7 @@ impl<'a> Worker<'a> {
                                 .text_stops
                                 .as_ref()
                                 .and_then(|s| s.matched().map(str::to_owned)),
-                        })
-                        .is_err()
-                    {
-                        request
-                            .incoming
-                            .fail("generation consumer exceeded the bounded output queue".into());
-                    }
+                        });
                     stopped.push(token.request);
                 }
             }
@@ -1550,11 +1788,74 @@ impl<'a> Worker<'a> {
                 if live.phase == RequestPhase::Finishing
                     && live.last_use() <= self.scheduler.completed()
                 {
+                    let (generated, prompt_tokens, reused) = (
+                        live.generated_tokens,
+                        live.prompt_tokens,
+                        live.reused_prompt_tokens(),
+                    );
                     if let Some(error) = live.error_code {
                         request
                             .incoming
                             .fail(ExecutionError::Device { code: error }.into());
                     } else {
+                        let mut budget_stop = false;
+                        if request.incoming.prompt.reasoning_cut.is_some()
+                            && generated == request.incoming.prompt.max_new_tokens
+                            && !request.incoming.cancelled.load(Ordering::Acquire)
+                            && (request.incoming.prompt.ignore_eos
+                                || !request.last_token.is_some_and(|token| {
+                                    self.config.eos_token_ids.contains(&token)
+                                }))
+                        {
+                            let cut = request.incoming.prompt.reasoning_cut.take().unwrap();
+                            let close_allowed = request
+                                .incoming
+                                .prompt
+                                .grammar
+                                .as_ref()
+                                .is_none_or(|grammar| grammar.allows(cut.close));
+                            let forced =
+                                request.reasoning.take().unwrap().reasoning_open() && close_allowed;
+                            let abandon = forced
+                                && match request
+                                    .close_reasoning(cut.close, &self.config.eos_token_ids)
+                                {
+                                    Ok(stopped) => {
+                                        budget_stop = stopped;
+                                        false
+                                    }
+                                    Err(error) => {
+                                        request.incoming.fail(error);
+                                        true
+                                    }
+                                };
+                            if forced && !abandon {
+                                self.scheduler
+                                    .record_decoded_token(request.request, cut.close)?;
+                                self.metrics
+                                    .reasoning_budget_cuts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.metrics.progress(0, 1, 0, 0, 0, 0);
+                            }
+                            if abandon || request.incoming.cancelled.load(Ordering::Acquire) {
+                                self.scheduler.cancel(request.request)?;
+                                self.active[slot] = None;
+                                self.admissions[slot] = None;
+                                progress = true;
+                                continue;
+                            }
+                            let remaining = cut.after - u32::from(forced);
+                            if remaining > 0 && !budget_stop {
+                                let appended = if forced {
+                                    std::slice::from_ref(&cut.close)
+                                } else {
+                                    &[]
+                                };
+                                self.park(slot, appended, remaining)?;
+                                progress = true;
+                                continue;
+                            }
+                        }
                         let user_stop = if let Some(stops) = &mut request.text_stops {
                             let eos = request
                                 .last_token
@@ -1577,46 +1878,33 @@ impl<'a> Worker<'a> {
                             }
                         } else {
                             false
-                        };
+                        } || budget_stop;
                         self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                         for token in request.stops.finish() {
-                            if request
+                            request
                                 .incoming
-                                .events
-                                .try_send(match request.held_logprobs.pop_front().flatten() {
+                                .emit(match request.held_logprobs.pop_front().flatten() {
                                     Some(value) => GenerationEvent::LogprobToken(value),
                                     None => GenerationEvent::Token(token),
-                                })
-                                .is_err()
-                            {
-                                request.incoming.fail(
-                                    "generation consumer exceeded the bounded output queue".into(),
-                                );
-                            }
+                                });
                         }
-                        let reason = if user_stop
-                            || request
+                        let eos = !request.incoming.prompt.ignore_eos
+                            && request
                                 .last_token
-                                .is_some_and(|token| self.config.eos_token_ids.contains(&token))
-                        {
-                            "stop"
-                        } else {
-                            "length"
-                        };
-                        if request
+                                .is_some_and(|token| self.config.eos_token_ids.contains(&token));
+                        let reason = if user_stop || eos { "stop" } else { "length" };
+                        request
                             .incoming
-                            .events
-                            .try_send(GenerationEvent::Finished {
+                            .emit(GenerationEvent::Finished {
                                 prompt_tokens: request
                                     .carried
                                     .prompt_tokens
-                                    .unwrap_or(live.prompt_tokens),
-                                generated_tokens: request.carried.generated_tokens
-                                    + live.generated_tokens,
+                                    .unwrap_or(prompt_tokens),
+                                generated_tokens: request.carried.generated_tokens + generated,
                                 reused_prompt_tokens: request
                                     .carried
                                     .reused_prompt_tokens
-                                    .unwrap_or(live.reused_prompt_tokens()),
+                                    .unwrap_or(reused),
                                 reason,
                                 stop_sequence: request
                                     .text_stops
@@ -1629,13 +1917,7 @@ impl<'a> Worker<'a> {
                                 } else {
                                     crate::output::Termination::OutputLimit
                                 },
-                            })
-                            .is_err()
-                        {
-                            request.incoming.fail(
-                                "generation consumer exceeded the bounded output queue".into(),
-                            );
-                        }
+                            });
                         if user_stop {
                             self.scheduler.cancel(request.request)?;
                             self.active[slot] = None;
@@ -1669,13 +1951,29 @@ impl<'a> Worker<'a> {
         {
             return Ok(false);
         }
-        let tokens = live.tokens().to_vec();
+        let remaining = self.active[slot]
+            .as_ref()
+            .unwrap()
+            .incoming
+            .prompt
+            .max_new_tokens
+            - live.generated_tokens;
+        self.park(slot, &[], remaining)?;
+        Ok(true)
+    }
+
+    fn park(&mut self, slot: usize, appended: &[u32], remaining: u32) -> Result<()> {
+        let handle = self.active[slot].as_ref().unwrap().request;
+        let live = self.scheduler.request(handle)?;
+        let mut tokens = live.tokens().to_vec();
+        tokens.extend_from_slice(appended);
         let decoded_sequence = live.decoded_sequence;
         let (generated, prompt_tokens, reused) = (
             live.generated_tokens,
             live.prompt_tokens,
             live.reused_prompt_tokens(),
         );
+        let checkpoint_accounting = live.checkpoint_accounting();
         self.scheduler.finish(handle)?;
         let active = self.active[slot].take().unwrap();
         self.admissions[slot] = None;
@@ -1683,16 +1981,19 @@ impl<'a> Worker<'a> {
         crate::model::prompt_metadata(&mut incoming.prompt.data)
             .extend_text(incoming.prompt.tokens.len(), tokens.len())?;
         incoming.prompt.tokens = tokens;
-        incoming.prompt.max_new_tokens -= generated;
+        incoming.prompt.max_new_tokens = remaining;
         incoming.readmitted = true;
+        self.begin_pool_lookups(std::slice::from_mut(&mut incoming));
         let seed = active.carried.seed.unwrap_or(incoming.prompt.sampling.seed);
         let generated_tokens = active.carried.generated_tokens + generated;
         incoming.prompt.sampling.seed = continuation_seed(seed, generated_tokens);
         let parked = Parked {
+            checkpoint_accounting,
             last_token: active.last_token,
             stops: active.stops,
             text_stops: active.text_stops,
             held_logprobs: active.held_logprobs,
+            reasoning: active.reasoning,
             carried: Carried {
                 decoded_sequence,
                 prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(prompt_tokens)),
@@ -1702,7 +2003,7 @@ impl<'a> Worker<'a> {
             },
         };
         self.parked.push_back((incoming, parked));
-        Ok(true)
+        Ok(())
     }
 
     fn retire(&mut self, stopped: &[RequestHandle]) -> Result<()> {
@@ -1715,6 +2016,9 @@ impl<'a> Worker<'a> {
     }
 
     fn plan(&mut self, outstanding: usize) -> Result<(Option<ScheduledPlan>, bool)> {
+        if self.retry_late_pool_answers()? {
+            return Ok((None, true));
+        }
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
         let mut progress = false;
@@ -1722,6 +2026,11 @@ impl<'a> Worker<'a> {
             == crate::scheduler::speculation::ProposalSource::Copy
             && outstanding == 0
         {
+            let prepared_copy_capacity = self.inputs.as_ref()
+                .ok_or("copy proposals require prepared inputs")?
+                .copy_proposal_capacity(self.config.contract.vocabulary);
+            let copy_capacity = self.config.speculative_widths.iter().copied().max()
+                .unwrap_or(1).saturating_sub(1).min(prepared_copy_capacity);
             for slot in 0..self.active.len() {
                 let Some(request) = self.active[slot].as_ref() else {
                     continue;
@@ -1731,7 +2040,7 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { 7 }),
+                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { copy_capacity }),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
                     &self.config.eos_token_ids,
@@ -1919,15 +2228,15 @@ impl<'a> Worker<'a> {
         Ok(true)
     }
 
-    /// Copy newly ready checkpoints out, apply finished host transfers, and
-    /// re-admit the waiters of a failed restore without the host store.
+    /// Copy newly ready checkpoints out and apply finished host transfers.
+    /// Re-admit the waiters of a failed restore without the host store.
     fn service_store(&mut self) -> Result<bool> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        use crate::offload::{StoreEvent, StoreOutcome};
+        use flare_selene::{StoreEvent, StoreOutcome};
         let mut events = Vec::new();
         store.poll(&mut events)?;
         let mut progress = !events.is_empty();
@@ -1935,21 +2244,63 @@ impl<'a> Worker<'a> {
         let mut released = false;
         for event in events {
             match event {
-                StoreEvent::Stored { checkpoint, .. } => {
+                StoreEvent::Stored {
+                    checkpoint, result, ..
+                } => {
+                    if let Err(error) = &result {
+                        eprintln!(
+                            "HOST_CACHE_STORE_ERROR checkpoint={} error={error}",
+                            checkpoint.value()
+                        );
+                    }
+                    self.metrics.host_retry_abandoned[5]
+                        .fetch_add(u64::from(result.is_err()), Ordering::Relaxed);
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
-                StoreEvent::Deferred { checkpoint } => {
+                StoreEvent::Deferred { checkpoint, reason } => {
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
-                    if !self.deferred_stores.contains(&checkpoint) {
-                        self.deferred_stores.push(checkpoint);
+                    if !self.deferred_stores.iter().any(|(id, _)| *id == checkpoint) {
+                        self.deferred_stores.push((checkpoint, reason));
                     }
                 }
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
+                StoreEvent::ExportRequested {
+                    export,
+                    key,
+                    begin_tokens,
+                    want_row,
+                    ..
+                } => {
+                    let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+                    serve_export(
+                        &mut self.scheduler,
+                        store.as_mut(),
+                        &mut self.exports,
+                        next,
+                        export,
+                        (key, begin_tokens, want_row),
+                    )?;
+                }
+                StoreEvent::ExportEnded { export } => {
+                    // A second end for the same export finds nothing: one unpin.
+                    if let Some(id) = self.exports.remove(&export) {
+                        self.scheduler.unpin_checkpoint(id)?;
+                        released = true;
+                    }
+                }
             }
+        }
+        // Eviction notices precede the next `store`, so a pool never learns of a
+        // replacement before the removal it replaces.
+        for evicted in self.scheduler.take_evictions() {
+            store.evicted(evicted.key, evicted.heir.as_ref());
+        }
+        if self.scheduler.take_evictions_lost() {
+            store.evictions_lost();
         }
         if released {
             for incoming in self
@@ -1966,60 +2317,147 @@ impl<'a> Worker<'a> {
         let mut publications = self.scheduler.take_publications();
         let retry_ids = self.deferred_stores.clone();
         let mut waiting = Vec::new();
-        for id in self.deferred_stores.drain(..) {
+        for (id, reason) in self.deferred_stores.drain(..) {
             if let Some(publication) = self.scheduler.publication(id) {
                 if retry {
                     publications.push(publication);
                 } else {
-                    waiting.push(id);
+                    waiting.push((id, reason));
                 }
             } else {
                 self.metrics
-                    .host_retry_abandoned
+                    .host_retry_abandoned[reason as usize]
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+        let resources = CopyoutResources {
+            completed: self.scheduler.completed(),
+            scheduler: self.scheduler.stats(),
+            exports: self.exports.len(),
+            next: next_admission(&self.scheduler, &self.parked, &self.pending)
+                .map(|next| (next.prompt_tokens, next.max_new_tokens, next.growable)),
+        };
+        let retry_copyouts = retry || progress || self.copyout_resources != Some(resources);
+        self.copyout_resources = Some(resources);
+        let deferred_copyouts = std::mem::take(&mut self.deferred_copyouts);
+        for id in &deferred_copyouts {
+            if !publications.iter().any(|publication| publication.id == *id) {
+                if let Some(publication) = self.scheduler.publication(*id) {
+                    if retry_copyouts {
+                        publications.push(publication);
+                    } else {
+                        self.deferred_copyouts.push(*id);
+                    }
+                }
+            }
+        }
         for publication in publications {
+            let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+            if !self.scheduler.export_fits(publication.id, next) {
+                if !deferred_copyouts.contains(&publication.id) {
+                    self.metrics.copyout_headroom_deferrals.fetch_add(1, Ordering::Relaxed);
+                    progress = true;
+                }
+                self.deferred_copyouts.push(publication.id);
+                continue;
+            }
             progress = true;
+            self.scheduler.pin_checkpoint(publication.id)?;
             let outcome = store.store(&publication);
+            if !matches!(outcome, Ok(StoreOutcome::Queued)) {
+                self.scheduler.unpin_checkpoint(publication.id)?;
+            }
+            if let Err(error) = &outcome {
+                eprintln!(
+                    "HOST_CACHE_STORE_SUBMIT_ERROR checkpoint={} error={error}",
+                    publication.id.value()
+                );
+            }
             if let Ok(outcome) = outcome {
                 self.metrics.host_store_outcome(outcome);
                 match outcome {
-                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
-                    StoreOutcome::Retry(_) => {
-                        if !waiting.contains(&publication.id) {
-                            waiting.push(publication.id);
+                    StoreOutcome::Queued => {},
+                    StoreOutcome::Retry(reason) => {
+                        if !waiting.iter().any(|(id, _)| *id == publication.id) {
+                            waiting.push((publication.id, reason));
                         }
                         continue;
                     }
                     _ => {}
                 }
-                if retry_ids.contains(&publication.id) {
-                    let counter = if outcome == StoreOutcome::Oversize {
-                        &self.metrics.host_retry_abandoned
-                    } else {
-                        &self.metrics.host_retry_success
-                    };
-                    counter.fetch_add(1, Ordering::Relaxed);
+                if outcome == StoreOutcome::Oversize {
+                    self.metrics.host_retry_abandoned[4].fetch_add(1, Ordering::Relaxed);
+                } else if retry_ids.iter().any(|(id, _)| *id == publication.id) {
+                    self.metrics
+                        .host_retry_success
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-            } else if retry_ids.contains(&publication.id) {
-                self.metrics
-                    .host_retry_abandoned
-                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.host_retry_abandoned[5].fetch_add(1, Ordering::Relaxed);
             }
         }
         self.deferred_stores = waiting;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {
-            self.requeue(handle);
+            self.requeue(handle, false);
         }
         Ok(progress)
     }
 
-    /// Return a request whose restore failed to the front of the queue; its next
-    /// admission skips the host store.
-    fn requeue(&mut self, handle: RequestHandle) {
+    /// Reuse the ordinary admission path when an answer beats the first prefill.
+    fn retry_late_pool_answers(&mut self) -> Result<bool> {
+        use flare_selene::pool::LookupState;
+        let mut progress = false;
+        for slot in 0..self.active.len() {
+            let Some(active) = self.active[slot].as_mut() else {
+                continue;
+            };
+            let Some(ticket) = active.incoming.pool_lookup.as_ref() else {
+                continue;
+            };
+            let live = self.scheduler.request(active.request)?;
+            let eligible = matches!(
+                live.phase,
+                RequestPhase::Initialize | RequestPhase::Restore | RequestPhase::Prefill
+            ) && live.consumed_tokens == live.reused_prompt_tokens()
+                && live.generated_tokens == 0
+                && !(live.phase == RequestPhase::Prefill
+                    && live.last_use() > self.scheduler.completed())
+                && active.incoming.prompt.conditioned_inputs.is_empty();
+            let state = ticket.state();
+            if !eligible || matches!(state, LookupState::None) {
+                active.incoming.pool_lookup = None;
+                active.incoming.pool_plan = None;
+                continue;
+            }
+            let LookupState::Ready(answer) = state else {
+                continue;
+            };
+            if !answer
+                .candidates
+                .iter()
+                .any(|candidate| candidate.plan.key.consumed_tokens > live.reused_prompt_tokens())
+            {
+                active.incoming.pool_lookup = None;
+                active.incoming.pool_plan = None;
+                continue;
+            }
+            // Initialization or restoration may still own the slot.
+            if live.last_use() > self.scheduler.completed() {
+                continue;
+            }
+            let handle = active.request;
+            active.checkpoint_accounting = live.checkpoint_accounting();
+            self.scheduler.cancel(handle)?;
+            self.requeue(handle, true);
+            progress = true;
+        }
+        Ok(progress)
+    }
+
+    /// Return a retired request to the front of the queue for another admission.
+    fn requeue(&mut self, handle: RequestHandle, host_lookup: bool) {
         let slot = handle.slot as usize;
         let Some(active) = self.active[slot].take_if(|active| active.request == handle) else {
             return;
@@ -2029,16 +2467,22 @@ impl<'a> Worker<'a> {
             self.preparing_image = None;
         }
         let mut incoming = active.incoming;
-        incoming.host_lookup = false;
+        incoming.host_lookup = host_lookup;
+        if !host_lookup {
+            incoming.pool_lookup = None;
+            incoming.pool_plan = None;
+        }
         incoming.readmitted = true;
         self.parked.push_front((
             incoming,
             Parked {
+                checkpoint_accounting: active.checkpoint_accounting,
                 last_token: active.last_token,
                 stops: active.stops,
                 text_stops: active.text_stops,
                 carried: active.carried,
                 held_logprobs: active.held_logprobs,
+                reasoning: active.reasoning,
             },
         ));
     }
@@ -2076,68 +2520,176 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// The request admission would take next, as the export headroom check sees it:
+/// the first eligible one, parked before pending, as the admission loop picks.
+fn next_admission(
+    scheduler: &RequestScheduler,
+    parked: &VecDeque<(Incoming, Parked<'_>)>,
+    pending: &VecDeque<Incoming>,
+) -> Option<crate::scheduler::NextAdmission> {
+    let stats = scheduler.stats();
+    let resources = (
+        scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    );
+    parked
+        .iter()
+        .map(|(incoming, _)| incoming)
+        .chain(pending)
+        .find(|incoming| incoming.blocked != Some(resources))
+        .map(|incoming| crate::scheduler::NextAdmission {
+            prompt_tokens: incoming.prompt.tokens.len(),
+            max_new_tokens: incoming.prompt.max_new_tokens,
+            growable: true,
+        })
+}
+
+/// Answers one export request in the iteration it arrived: validate, check
+/// headroom, pin, then describe the chain to the store. Nothing is pinned after
+/// a refusal, and the pin is recorded before the store hears of the export.
+fn serve_export(
+    scheduler: &mut RequestScheduler,
+    store: &mut dyn flare_selene::HostStore,
+    exports: &mut HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
+    next: Option<crate::scheduler::NextAdmission>,
+    export: flare_selene::ExportId,
+    (key, begin_tokens, want_row): (crate::cache::PrefixKey, u64, bool),
+) -> Result<()> {
+    use flare_selene::ExportRefusal;
+    let refuse = |store: &mut dyn flare_selene::HostStore, reason| {
+        store.export_refused(export, reason);
+        Ok(())
+    };
+    if exports.contains_key(&export) {
+        return refuse(store, ExportRefusal::Busy);
+    }
+    let id = match scheduler.checkpoint_by_key(&key) {
+        Ok(id) => id,
+        Err(reason) => return refuse(store, reason),
+    };
+    let Some(chain) = scheduler.export_chain(id, begin_tokens, want_row) else {
+        return refuse(store, ExportRefusal::ChainGap);
+    };
+    if !scheduler.export_fits(id, next) {
+        return refuse(store, ExportRefusal::NoHeadroom);
+    }
+    scheduler.pin_checkpoint(id)?;
+    exports.insert(export, id);
+    if store.export_pinned(export, chain).is_err() {
+        // The store will not serve it and sends no end: release the pin here.
+        exports.remove(&export);
+        scheduler.unpin_checkpoint(id)?;
+    }
+    Ok(())
+}
+
+fn begin_pool_lookup(
+    scheduler: &mut RequestScheduler,
+    store: &mut dyn flare_selene::HostStore,
+    incoming: &mut Incoming,
+) {
+    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end || incoming.pool_plan.is_some() {
+        return;
+    }
+    let Ok(plan) = scheduler.plan_admission(&incoming.spec()) else {
+        return;
+    };
+    if plan.resident_tokens() < incoming.prompt.tokens.len() as u64 {
+        incoming.pool_lookup_started = Some(std::time::Instant::now());
+        incoming.pool_lookup = store.begin_lookup(plan.history());
+    }
+    incoming.pool_plan = Some(plan);
+}
+
+fn admit_with_checkpoint_accounting(
+    scheduler: &mut RequestScheduler,
+    spec: RequestSpec,
+    accounting: Option<crate::scheduler::CheckpointAccounting>,
+) -> Result<RequestHandle> {
+    let plan = scheduler.plan_admission(&spec)?;
+    Ok(scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting)?.handle)
+}
+
 /// Plan the admission, look the history up in the host store above the GPU
 /// checkpoint, and start a restore when the transfer beats recomputation.
 fn admit_with_host_store(
     scheduler: &mut RequestScheduler,
-    store: &mut dyn crate::offload::PrefixStore,
+    store: &mut dyn flare_selene::HostStore,
+    pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
+    queued_plan: Option<&crate::scheduler::AdmissionPlan>,
+    accounting: Option<crate::scheduler::CheckpointAccounting>,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
-) -> Result<RequestHandle> {
-    let plan = scheduler.plan_admission(&spec)?;
-    use crate::offload::LookupOutcome;
-    let mut before = u64::MAX;
-    let hit = loop {
-        let Some(hit) = store.lookup(plan.history(), plan.resident_tokens(), before) else {
-            if before == u64::MAX {
-                metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
+    let plan = match queued_plan {
+        Some(plan) => scheduler.refresh_admission_plan(plan)?,
+        None => scheduler.plan_admission(&spec)?,
+    };
+    let reused = (plan.resident_tokens() != 0)
+        .then(|| plan.history().key_at(plan.resident_tokens()))
+        .flatten();
+    let result = (|| {
+        use crate::offload::LookupOutcome;
+        if plan.resident_tokens() == plan.history().token_count() {
+            return Ok((scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting.clone())?.handle, None));
+        }
+        let mut outcome = LookupOutcome::NoMatch;
+        let mut before = u64::MAX;
+        let hit = loop {
+            let Some(hit) =
+                store.lookup_for(pool_lookup, plan.history(), plan.resident_tokens(), before)
+            else {
+                break None;
+            };
+            metrics.host_lookup_cost(&hit, prefill_rate);
+            if flare_selene::worth_fetching(&hit, prefill_rate) {
+                break Some(hit);
             }
-            break None;
+            outcome = LookupOutcome::CostRejected;
+            before = hit.consumed_tokens;
         };
-        metrics.host_lookup_cost(&hit, prefill_rate);
-        if crate::offload::worth_fetching(&hit, prefill_rate) {
-            break Some(hit);
-        }
-        metrics.host_lookup_outcome(LookupOutcome::CostRejected);
-        before = hit.consumed_tokens;
-    };
-    let Some(hit) = hit else {
-        let handle = scheduler.admit_planned(spec, plan, None)?.handle;
-        // Lookups count once per admitted request, not per attempt of a waiting one.
-        scheduler.record_host_lookup();
-        return Ok(handle);
-    };
-    let inbound = crate::scheduler::InboundRequest {
-        key: hit.key,
-        consumed_tokens: hit.consumed_tokens,
-        pages: hit.pages,
-    };
-    let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
-        Ok(admitted) => admitted,
-        Err(Error::Admission(AdmissionError::Capacity(_))) => {
-            metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
-            let handle = scheduler.admit(spec)?;
+        let Some(hit) = hit else {
+            let handle = scheduler.admit_planned_with_checkpoint_accounting(spec, plan, None, accounting.clone())?.handle;
+            // Lookups count once per admitted request, not per attempt of a waiting one.
             scheduler.record_host_lookup();
-            return Ok(handle);
+            return Ok((handle, Some(outcome)));
+        };
+        let inbound = crate::scheduler::InboundRequest {
+            key: hit.key,
+            consumed_tokens: hit.consumed_tokens,
+            pages: hit.pages,
+        };
+        let admitted = match scheduler.admit_planned_with_checkpoint_accounting(spec.clone(), plan, Some(inbound), accounting.clone()) {
+            Ok(admitted) => admitted,
+            Err(Error::Admission(AdmissionError::Capacity(_))) => {
+                let handle = admit_with_checkpoint_accounting(scheduler, spec, accounting.clone())?;
+                scheduler.record_host_lookup();
+                return Ok((handle, Some(LookupOutcome::CapacityRejected)));
+            }
+            Err(error) => return Err(error),
+        };
+        scheduler.record_host_lookup();
+        let Some(ticket) = admitted.ticket else {
+            return Ok((admitted.handle, Some(LookupOutcome::Admitted)));
+        };
+        let key = ticket.key;
+        let admitted_accounting = scheduler.request(admitted.handle)?.checkpoint_accounting();
+        if store.fetch(hit, ticket).is_err() {
+            // No event follows a rejected fetch; this request is the ticket's only
+            // waiter, so retire it and admit the request again without the store.
+            scheduler.finish_inbound(key, false)?;
+            return admit_with_checkpoint_accounting(scheduler, spec, Some(admitted_accounting))
+                .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
         }
-        Err(error) => return Err(error),
-    };
-    scheduler.record_host_lookup();
-    let Some(ticket) = admitted.ticket else {
-        metrics.host_lookup_outcome(LookupOutcome::Admitted);
-        return Ok(admitted.handle);
-    };
-    let key = ticket.key;
-    if store.fetch(hit, ticket).is_err() {
-        metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
-        // No event follows a rejected fetch; this request is the ticket's only
-        // waiter, so retire it and admit the request again without the store.
-        scheduler.finish_inbound(key, false)?;
-        return scheduler.admit(spec);
+        Ok((admitted.handle, Some(LookupOutcome::Admitted)))
+    })();
+    if result.is_ok() && let Some(key) = reused {
+        store.reused(key);
     }
-    metrics.host_lookup_outcome(LookupOutcome::Admitted);
-    Ok(admitted.handle)
+    result
 }
 
 fn cancel_stopped(
@@ -2159,11 +2711,14 @@ fn cancel_stopped(
 }
 
 fn prepare_copy_proposal(
-    (mut ids, mut count): ([i64; 7], usize),
+    (mut ids, mut count): (Vec<i64>, usize),
     consumed: u64,
     grammar: Option<&crate::grammar::RequestGrammar>,
     eos_ids: &[u32],
 ) -> Result<crate::scheduler::speculation::CopyProposal> {
+    if count > ids.len() || count > crate::scheduler::speculation::COPY_DRAFT_CAPACITY {
+        return Err("copied-token count exceeds proposal storage".into());
+    }
     if let Some(end) = ids[..count]
         .iter()
         .position(|id| eos_ids.contains(&(*id as u32)))
@@ -2324,13 +2879,13 @@ mod tests {
 
     #[test]
     fn copy_preparation_trims_eos_and_preserves_empty_proposals() {
-        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
+        let copy = prepare_copy_proposal((vec![11, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
         assert_eq!(copy.count, 1);
-        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1]);
+        assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]);
         assert_eq!(copy.consumed, 11);
         assert!(copy.grammar_masks.is_empty());
-        let empty = prepare_copy_proposal(([-1; 7], 0), 11, None, &[12]).unwrap();
-        assert_eq!((empty.count, empty.tokens), (0, [-1; 7]));
+        let empty = prepare_copy_proposal((vec![-1; 15], 0), 11, None, &[12]).unwrap();
+        assert_eq!((empty.count, empty.tokens), (0, vec![-1; 15]));
     }
 
     #[test]
@@ -2348,7 +2903,7 @@ mod tests {
             let fence = Fence(sequence * 2);
             scheduler.commit(&step, fence).unwrap();
             observe_submission(metrics, scheduler, &step, outstanding).unwrap();
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             for lane in &step.lanes {
                 let live = scheduler.request(lane.request).unwrap();
                 let samples = matches!(step.kind, GraphKind::Prefill | GraphKind::Decode);
@@ -2370,7 +2925,7 @@ mod tests {
                 assert_eq!(capture.kind, GraphKind::Snapshot);
                 let copy_fence = Fence(fence.0 + 1);
                 scheduler.commit(&capture, copy_fence).unwrap();
-                let mut copies = [CompletionRecord::default(); 4];
+                let mut copies = vec![CompletionRecord::default(); 4];
                 for lane in &capture.lanes {
                     let live = scheduler.request(lane.request).unwrap();
                     copies[lane.request.slot as usize] = CompletionRecord {
@@ -2390,7 +2945,7 @@ mod tests {
             step
         }
 
-        let metrics = super::super::metrics::Metrics::default();
+        let metrics = super::super::metrics::Metrics::new(0, 0, 0, 16);
         let mut scheduler = RequestScheduler::new(
             [5; 32],
             SchedulerLimits {
@@ -2402,6 +2957,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,
@@ -2507,6 +3063,7 @@ mod tests {
                 conditioning: vec![],
                 sampling: SamplingParameters::default(),
                 max_new_tokens: 10,
+                reasoning_cut: None,
                 stop_sequences: vec![],
                 stop_strings: vec![],
                 logprobs: false,
@@ -2520,18 +3077,23 @@ mod tests {
             first_token: std::cell::Cell::new(Some(first_token)),
             cancelled: cancelled.clone(),
             failure: failure.clone(),
-            metrics: Arc::new(super::super::metrics::Metrics::default()),
+            metrics: Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16)),
             observation: None,
             host_lookup: true,
             readmitted: false,
             prompt_score_end: 0,
             prompt_scored: 0,
             blocked: None,
+            pool_lookup: None,
+            pool_lookup_started: None,
+            host_lookup_outcome: None,
+            pool_plan: None,
         };
         (
             incoming,
             Generation {
                 events: receiver,
+                _capacity: None,
                 admission: admitted,
                 first_token: first_token_ready,
                 cancelled,
@@ -2539,6 +3101,22 @@ mod tests {
                 enqueue_ns: None,
             },
         )
+    }
+
+    #[test]
+    fn response_event_budget_covers_observation_scores_and_reasoning_continuation() {
+        let (mut incoming, _generation) = stream(2);
+        let prompt = &mut incoming.prompt;
+        prompt.max_new_tokens = 1_000_000;
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 1_000_003);
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_003);
+        prompt.reasoning_cut = Some(ReasoningCut { close: 8, after: 20, output: None });
+        prompt.prompt_logprobs = true;
+        assert_eq!(prompt.output_event_capacity(128, true).unwrap(), 2_000_044);
+        prompt.max_new_tokens = 0;
+        prompt.reasoning_cut = None;
+        assert_eq!(prompt.output_event_capacity(128, false).unwrap(), 128);
+        assert!(prompt.output_event_capacity(usize::MAX, true).is_err());
     }
 
     #[test]
@@ -2636,6 +3214,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 6,
                 page_tokens: 64,
@@ -2697,7 +3276,7 @@ mod tests {
         tokenizer
             .add_special_tokens([tokenizers::AddedToken::from("<eos>", true)])
             .unwrap();
-        let compiler = crate::grammar::GrammarCompiler::new(&tokenizer, 6, &[5]).unwrap();
+        let compiler = crate::grammar::GrammarCompiler::new(&tokenizer, 6, &[5], &[]).unwrap();
         let mut grammar = compiler.compile_lark("start: \"abcd\"").unwrap();
         grammar.advance(0).unwrap();
 
@@ -2717,7 +3296,7 @@ mod tests {
             assert_eq!(step.kind, expected);
             scheduler.commit(&step, Fence(sequence)).unwrap();
             let sampled = expected != GraphKind::Init;
-            let mut records = [CompletionRecord::default(); 4];
+            let mut records = vec![CompletionRecord::default(); 4];
             records[failed.slot as usize] = CompletionRecord {
                 generation: failed.generation as i64,
                 submission_sequence: sequence as i64,
@@ -2742,7 +3321,7 @@ mod tests {
                 failed,
                 crate::scheduler::speculation::CopyProposal {
                     consumed: 1,
-                    tokens: [1, 2, 3, -1, -1, -1, -1],
+                    tokens: vec![1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                     count,
                     grammar_masks,
                 },
@@ -2760,7 +3339,7 @@ mod tests {
             .unwrap()
             .pages()
             .collect::<Vec<_>>();
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         records[failed.slot as usize] = CompletionRecord {
             generation: failed.generation as i64,
             submission_sequence: 4,
@@ -2774,7 +3353,7 @@ mod tests {
                 accepted_drafts: 2,
                 draft_cache_consumed: -1,
                 verification_width: 4,
-                tokens: [4, 1, 2, -1, -1, -1, -1, -1],
+                tokens: vec![4, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             }),
             ..Default::default()
@@ -2805,6 +3384,8 @@ mod tests {
             text_stops: None,
             held_logprobs: VecDeque::new(),
             carried: Carried::default(),
+            checkpoint_accounting: Default::default(),
+            reasoning: None,
         };
         let mut active: [Option<Active<'_>>; 4] = std::array::from_fn(|_| None);
         active[failed.slot as usize] = Some(make_active(failed, incoming));
@@ -2917,7 +3498,7 @@ mod tests {
         assert_eq!(scheduler.stats().retiring_slots, 1);
         assert_eq!(scheduler.free_page_count(), free_pages);
         assert_eq!(scheduler.free_snapshot_count(), free_snapshots);
-        let mut records = [CompletionRecord::default(); 4];
+        let mut records = vec![CompletionRecord::default(); 4];
         records[handle.slot as usize] = CompletionRecord {
             generation: handle.generation as i64,
             submission_sequence: 1,
@@ -2995,6 +3576,8 @@ mod tests {
                 super::super::stops::TextStops::new(&frontend, vec!["END".into()]).unwrap(),
             ),
             carried: Carried::default(),
+            checkpoint_accounting: Default::default(),
+            reasoning: None,
         };
         request.incoming.observe_token(0);
         assert!(!request.emit_output(0, &[248046], None).unwrap());
@@ -3025,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_output_cancels_without_blocking_and_preserves_first_failure() {
+    fn an_undersized_event_budget_cancels_and_preserves_the_first_failure() {
         let (incoming, mut generation) = stream(2);
         incoming.emit_token(11);
         incoming.emit_token(12);
@@ -3037,7 +3620,7 @@ mod tests {
         assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 1);
         assert_eq!(
             generation.failure().to_string(),
-            "generation consumer exceeded the bounded output queue"
+            "generation exceeded its output event budget"
         );
         assert!(matches!(
             generation.events.try_recv(),
@@ -3104,7 +3687,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_timestamps_are_monotonic_and_backpressure_remains_bounded() {
+    fn observation_timestamps_are_monotonic_and_count_toward_the_event_budget() {
         let (mut incoming, mut generation) = stream(2);
         incoming.observation = Some(true);
         let start = super::super::observation::monotonic_ns();
@@ -3127,22 +3710,19 @@ mod tests {
         }
         assert!(matches!(
             generation.failure(),
-            Error::Execution(ExecutionError::Capacity(_))
+            Error::Execution(ExecutionError::Completion(_))
         ));
     }
 
     #[test]
-    fn disconnected_output_marks_cancellation_and_retains_failure_for_the_reader() {
+    fn disconnected_output_cancels_without_reporting_an_execution_failure() {
         let (incoming, generation) = stream(2);
         let failure = generation.failure.clone();
         drop(generation);
         assert!(incoming.cancelled.load(Ordering::Acquire));
         incoming.emit_token(11);
-        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            failure.lock().unwrap().as_ref().unwrap(),
-            Error::Execution(ExecutionError::Capacity(_))
-        ));
+        assert_eq!(incoming.metrics.failed.load(Ordering::Relaxed), 0);
+        assert!(failure.lock().unwrap().is_none());
     }
 
     #[test]
@@ -3158,6 +3738,7 @@ mod tests {
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                completion_token_capacity: 16,
                 speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,
@@ -3225,5 +3806,5 @@ mod tests {
 #[path = "runtime/phase_tests.rs"]
 mod phase_tests;
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod prompt_tests;

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 /* Build: cc -O2 -Wall -Wextra -I/opt/cuda/include qualify/pcie_peer_probe.c
  *        -L/opt/cuda/lib64 -Wl,-rpath,/opt/cuda/lib64 -lcuda -lnvrtc -o /tmp/pcie_peer_probe
  * Run each case in a fresh process: /tmp/pcie_peer_probe legacy|vmm directed|full [gpu_count]

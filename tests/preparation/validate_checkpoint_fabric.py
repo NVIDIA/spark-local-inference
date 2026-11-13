@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise rank-owned checkpoint reads and export channels on a configured Spark fabric.
 
 Run with --rank 0..N-1 and the same --ranks, --rendezvous, --streams and --ring or --chain on

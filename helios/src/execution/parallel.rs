@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Native rank coordination over process-local CUDA executors and control sockets.
 
 #[cfg(test)]
@@ -94,6 +100,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
         manifest.validate()?;
+        wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
         let mut peers = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
@@ -110,9 +117,67 @@ impl TensorParallelExecutor {
             });
         }
         // SAFETY: The caller retains all rank-local prepared resources through drain.
-        let local = unsafe { GraphExecutor::new(manifest)? };
-        for peer in &mut peers {
-            peer.channel.send(READY, &[])?;
+        let mut local = unsafe { GraphExecutor::new_unstarted(manifest)? };
+        let startup = (|| -> Result<()> {
+            for index in local.manifest().referenced_tuning_graphs() {
+                let mut bytes = Vec::new();
+                number(&mut bytes, index);
+                for (sent, peer) in peers.iter_mut().enumerate() {
+                    if let Err(error) = peer.channel.send(TUNE, &bytes) {
+                        // A failed socket write may have delivered the complete command.
+                        eprintln!("startup rank {sent} dispatch is unconfirmed: {error}; terminating the CUDA process");
+                        std::process::abort();
+                    }
+                }
+                let mut failure = local.run_tuning_graph(index).err();
+                for peer in &mut peers {
+                    match peer.channel.receive(TUNED) {
+                        Ok(reply) if reply.starts_with(&bytes) => {
+                            if reply.len() != bytes.len() {
+                                failure.get_or_insert_with(|| invalid(String::from_utf8_lossy(&reply[bytes.len()..]).into_owned()));
+                            }
+                        }
+                        reply => {
+                            let message = reply.err().map_or_else(|| "rank tuning completion identity differs".to_string(), |error| error.to_string());
+                            eprintln!("startup rank completion is unconfirmed: {message}; terminating the CUDA process");
+                            std::process::abort();
+                        }
+                    }
+                }
+                if let Some(error) = failure { return Err(error); }
+            }
+            for peer in &mut peers { peer.channel.send(READY, &[])?; }
+            local.finish_startup()?;
+            for peer in &mut peers {
+                if !peer.channel.receive(STARTED)?.is_empty() {
+                    return Err(invalid("rank startup completion payload is not empty"));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = startup {
+            // Tuning completion is confirmed on every rank before ordinary errors.
+            let sent: Vec<_> = peers.iter_mut().map(|peer| peer.channel.send(DRAIN, &[]).is_ok()).collect();
+            for (peer, sent) in peers.iter_mut().zip(sent) {
+                if sent {
+                    loop {
+                        match peer.channel.wait(false) {
+                            Ok((STARTED, bytes)) if bytes.is_empty() => continue,
+                            Ok((DRAINED, bytes)) if bytes.is_empty() => {
+                                let _ = peer.channel.send(RELEASE, &[]);
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                let _ = peer.channel.stream.shutdown(std::net::Shutdown::Both);
+            }
+            if !local.close().drained {
+                eprintln!("startup coordinator cleanup did not drain; terminating the CUDA process");
+                std::process::abort();
+            }
+            return Err(error);
         }
         Ok(Self {
             local,
@@ -125,6 +190,12 @@ impl TensorParallelExecutor {
 
     pub fn outstanding(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Park on rank zero's own running frame; peers' completions arrive over their sockets
+    /// and are polled by the caller as before. See [`GraphExecutor::park`].
+    pub fn park(&self) -> bool {
+        self.local.park()
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
@@ -230,8 +301,8 @@ impl TensorParallelExecutor {
                         let graph = reader.number()?;
                         let frame = completion_frame(&mut self.pending, index, fence, graph)?;
                         let timing = wire::timing(&mut reader)?;
-                        let proposal_confidence = wire::proposal_confidence(&mut reader)?;
-                        let speculative_survival = wire::speculative_survival(&mut reader)?;
+                        let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
+                        let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
                         if reader.0.len() != self.local.manifest().completion_bytes() {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
@@ -339,6 +410,12 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
     match (&root.proposal_confidence, &peer.proposal_confidence) {
         (None, None) => {}
         (Some(root_values), Some(peer_values)) => {
+            for (values, records) in [(root_values, &root.records), (peer_values, &peer.records)] {
+                if values.len() != records.len() || values.iter().zip(records.iter()).any(|(row, record)|
+                    record.vector.as_ref().is_none_or(|vector| row.len() + 1 != vector.tokens.len())) {
+                    return Err(invalid("proposal confidence geometry differs from completion capacity"));
+                }
+            }
             // Only the root completion is returned to the shared scheduler.
             // Peer estimates do not select execution or enter the root's curve;
             // their floating-point agreement is not a control-plane invariant.
@@ -401,6 +478,23 @@ pub(super) fn agree_speculative(root: &FrameCompletion, peer: &FrameCompletion) 
     Ok(())
 }
 
+fn startup_message(channel: &mut Channel, executor: &mut GraphExecutor, expected: u8) -> Result<Option<Vec<u8>>> {
+    let (tag, bytes) = channel.wait(false)?;
+    if tag == DRAIN && bytes.is_empty() {
+        let shutdown = executor.close();
+        if !shutdown.drained {
+            return Err(shutdown.error.unwrap_or_else(|| invalid("startup rank did not drain")));
+        }
+        channel.send(DRAINED, &[])?;
+        if !channel.receive(RELEASE)?.is_empty() {
+            return Err(invalid("unexpected startup release payload"));
+        }
+        return Ok(None);
+    }
+    if tag != expected { return Err(invalid("unexpected startup rank command")); }
+    Ok(Some(bytes))
+}
+
 /// Run a peer's native control loop until coordinated drain and release.
 ///
 /// # Safety
@@ -413,7 +507,10 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
-    let mut executor = match unsafe { GraphExecutor::new(manifest) } {
+    if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
+        return Shutdown { drained: true, error: Some(error) };
+    }
+    let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
         Ok(executor) => executor,
         Err(error) => {
             return Shutdown {
@@ -434,9 +531,23 @@ pub unsafe fn serve_rank(
             number(&mut hello, world);
             hello.extend(layout(executor.manifest()));
             channel.send(HELLO, &hello)?;
-            if !channel.receive(READY)?.is_empty() {
+            for index in executor.manifest().referenced_tuning_graphs() {
+                let Some(bytes) = startup_message(&mut channel, &mut executor, TUNE)? else { return Ok(()); };
+                let mut reader = Reader(&bytes);
+                if reader.number()? != index { return Err(invalid("rank startup tuning order differs")); }
+                reader.end()?;
+                let mut reply = bytes;
+                if let Err(error) = executor.run_tuning_graph(index) {
+                    reply.extend(error.to_string().as_bytes());
+                }
+                channel.send(TUNED, &reply)?;
+            }
+            let Some(ready) = startup_message(&mut channel, &mut executor, READY)? else { return Ok(()); };
+            if !ready.is_empty() {
                 return Err(invalid("unexpected coordinator readiness payload"));
             }
+            executor.finish_startup()?;
+            channel.send(STARTED, &[])?;
             let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>)> = None;
             let mut prepared_at: Option<Instant> = None;
             let mut started = VecDeque::new();
@@ -502,7 +613,13 @@ pub unsafe fn serve_rank(
                 if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
                     return Err(invalid("rank graph completion deadline expired"));
                 }
-                if active { std::thread::yield_now(); }
+                // A peer waiting only on its own running frame parks on it; a prepared frame waits
+                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
+                // the old loop's cooperative handoff after either.
+                if active {
+                    if prepared.is_none() { executor.park(); }
+                    std::thread::yield_now();
+                }
             }
         })();
         if let Err(error) = &result {

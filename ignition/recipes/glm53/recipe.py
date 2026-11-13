@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Qualified checkpoint, serving range, and memory costs of the GLM 5.3 recipe."""
 
 from types import MappingProxyType
@@ -23,7 +27,7 @@ def _costs(state_row_bytes, graph_bytes, *, ranks, speculating):
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     """Prepare the plan's catalog and speculation settings on process-local GPUs 0 through N-1.
 
     With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
@@ -36,9 +40,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
-    config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
+        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
         image_concurrency=plan.image_concurrency, language_model_only=plan.language_model_only,
@@ -53,8 +59,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         expand_expert_scales=plan.world_size >= 4,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
-        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
@@ -83,9 +89,9 @@ RECIPE = Recipe(
     ranks=MappingProxyType({
         # DGX Station can hold GLM on one GPU; TP1 must remain a supported rank count.
         # One rank holds every head: twice TP2's recurrent rows less the replicated part.
-        1: _costs(161_123_584, _GRAPH_BYTES, ranks=1, speculating=True),
-        2: _costs(81_464_576, _GRAPH_BYTES, ranks=2, speculating=True),
-        4: _costs(41_635_072, _GRAPH_BYTES, ranks=4, speculating=True),
+        1: _costs(161_267_200, _GRAPH_BYTES, ranks=1, speculating=True),
+        2: _costs(81_608_192, _GRAPH_BYTES, ranks=2, speculating=True),
+        4: _costs(41_778_688, _GRAPH_BYTES, ranks=4, speculating=True),
     }),
     plain_ranks=MappingProxyType({
         1: _costs(149_230_592, _GRAPH_BYTES, ranks=1, speculating=False),

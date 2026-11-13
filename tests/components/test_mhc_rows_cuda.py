@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Row-bounded mHC preserves coefficients and outputs through native graph replay."""
 
 import os

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Accepted-prefix cache writes and GPU-produced Engram requests under replay."""
 
 import os
@@ -25,8 +29,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("rank", [None, 0, 1, 2, 3])
-def test_graph_produced_hashes_publish_after_all_rows_are_visible(rank):
+def test_graph_produced_hashes_publish_after_all_rows_are_visible(rank, functional):
     device = torch.device("cuda:0")
     tokens, rows = 12, 3
     token_map = tuple((i * 7) % 32 for i in range(32))
@@ -48,7 +53,12 @@ def test_graph_produced_hashes_publish_after_all_rows_are_visible(rank):
             operation = PreparedEngramRequests(inputs, ids, starts, history, counts, mailbox.device_view, sequence,
                 layer=1, token_map=token_map, geometry=geometry, session=session, name="hash_requests",
                 row_mapping=mapping)
-            compiled = compile_forward(operation)
+            if functional:
+                operation.functional()
+                forward = lambda: operation(ids, starts, history, counts)
+            else:
+                forward = operation
+            compiled = compile_forward(forward)
             compiled()
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
@@ -126,7 +136,8 @@ def test_ratio_two_pending_state_selects_the_last_accepted_target_token(compiled
     counts = torch.tensor([2, 2, 0], dtype=torch.int32, device="cuda:0")
     for name in ("pending_values", "pending_gates", "pending_position"):
         pool.region("layer2." + name).fill_(42)
-    forward = lambda: operator.commit(counts)
+    def forward():
+        return operator.commit(counts, (operator.values, operator.gates), metadata)
     run = compile_forward(forward) if compiled else forward
     for name in ("pending_values", "pending_gates", "pending_position"):
         pool.region("layer2." + name).fill_(42)
@@ -208,7 +219,7 @@ def test_recipe_requests_replay_full_table_rows_with_tp_projection_ownership(wor
     try:
         with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
             operation = PreparedTableRequests(tables, metadata, pool, session=session, name="shared_table_requests")
-            compiled = compile_forward(operation)
+            compiled = compile_forward(lambda: operation(metadata))
             compiled()
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()

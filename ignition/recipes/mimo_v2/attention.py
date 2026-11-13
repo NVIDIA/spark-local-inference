@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MiMo partial RoPE, paged global attention and circular sliding histories."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 
 import torch
 
@@ -8,7 +12,7 @@ from ignition.components.block_fp8 import BlockFP8Projection, BlockFP8Weight
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
-from ignition.components.window_attention import stage_windows
+from ignition.components.window_attention import stage_windows, commit_window
 
 from .pool import PAGE_TOKENS
 
@@ -26,11 +30,13 @@ class AttentionScratch:
 
     @classmethod
     def allocate(cls, config, shard, tokens, device, *, requests=1, buffers=None):
+        """Size the scratch for the widest layer; layers with fewer KV heads view its leading bytes."""
         geometries = [config.attention(i) for i in range(config.layers)]
-        if len({(a.heads, a.kv_heads, a.key_dim, a.value_dim) for a in geometries}) != 1:
-            raise ValueError("MiMo attention scratch requires matching global and sliding head geometry")
+        if len({(a.heads, a.key_dim, a.value_dim) for a in geometries}) != 1:
+            raise ValueError("MiMo attention scratch requires matching query head counts and head dimensions")
         geometry = geometries[0]
-        heads, kv_heads = geometry.local(shard)
+        heads = geometry.local(shard)[0]
+        kv_heads = max(a.local(shard)[1] for a in geometries)
         def zeros(*shape, dtype=torch.bfloat16):
             return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
                     else buffers.zeros(shape, dtype))
@@ -46,6 +52,22 @@ class AttentionScratch:
     def rows(self, tokens):
         return type(self)(*(getattr(self, name) if name.startswith("window_") else getattr(self, name)[:tokens]
                             for name in self.__dataclass_fields__))
+
+    def for_kv_heads(self, kv_heads):
+        """View the KV scratch at one layer's local head count over the leading bytes of each buffer.
+
+        Layers run serially on one stream, so a narrower layer reuses the wider layer's storage.
+        """
+        if not 0 < kv_heads <= self.key.shape[1]:
+            raise ValueError("a layer's KV heads must fit the allocated attention scratch")
+
+        def narrow(tensor, *leading):
+            count = math.prod(leading) * kv_heads * tensor.shape[-1]
+            return tensor.flatten()[:count].view(*leading, kv_heads, tensor.shape[-1])
+
+        return replace(self, key=narrow(self.key, self.key.shape[0]), value=narrow(self.value, self.value.shape[0]),
+                       window_key=narrow(self.window_key, *self.window_key.shape[:2]),
+                       window_value=narrow(self.window_value, *self.window_value.shape[:2]))
 
 
 def stage_window(history, values, output, row, start, length):
@@ -63,20 +85,6 @@ def stage_window(history, values, output, row, start, length):
     output.view(-1, *values.shape[1:]).copy_(staged)
 
 
-def commit_window(history, values, row, start, length):
-    """Retain the final window with token positions selecting their circular slots."""
-    offsets = torch.arange(history.shape[1], device=values.device)
-    end = start + length
-    positions = end - 1 - (end - 1 - offsets).remainder(history.shape[1])
-    current = values[(positions - start).clamp(0, values.shape[0] - 1)]
-    rows = row.expand_as(offsets)
-    previous = history[rows, offsets].to(values.dtype)
-    committed = torch.where(((positions >= start) & (positions < end))[:, None, None], current, previous)
-    if history.dtype == torch.float8_e4m3fn:
-        committed = committed.clamp(-448, 448)
-    history[rows, offsets] = committed.to(history.dtype)
-
-
 def partial_rotary(values, positions, inverse):
     dimension = inverse.numel() * 2
     frequencies = positions.clamp_min(0).float()[:, None] * inverse[None]
@@ -91,7 +99,8 @@ class PreparedAttention(torch.nn.Module):
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
                  runtime, coordinator, session, name, workspace):
         super().__init__()
-        self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
+        self.geometry, self.metadata = config.attention(layer), metadata
+        scratch = self.scratch = scratch.for_kv_heads(self.geometry.local(shard)[1])
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported MiMo attention mode: {mode}")
         self.mode, self.pool, self.layer = mode, pool, layer
@@ -137,8 +146,14 @@ class PreparedAttention(torch.nn.Module):
         if geometry.window < 0 or mode == "decode":
             self.writer = PreparedPagedKVWriter(scratch.key, scratch.value, key, value, self.slots,
                                                   session=session, name=name + ".cache_write")
+        if geometry.window > 0:
+            tuning_page_count = (key.shape[0] if mode in ("prefill", "verify") else
+                                 int(pool.memory_capacity[0].item()))
+        else:
+            tuning_page_count = int(pool.memory_capacity[1].item())
         self.attention = PreparedPagedAttention(scratch.query, key, value, self.pages, self.lengths,
             metadata.query_start_loc, scratch.attended, sink=weights.sink, mode=mode, window=window,
+            tuning_page_count=tuning_page_count,
             width=1 if mode == "prefill" else metadata.max_query_tokens,
             session=session, workspace=workspace, name=name + ".attention")
 

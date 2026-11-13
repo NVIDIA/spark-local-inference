@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Paged attention over circular continuations and private candidate sequences."""
 
 from dataclasses import dataclass, replace
@@ -10,6 +13,7 @@ from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
@@ -34,7 +38,21 @@ def stage_windows(history, values, output, metadata, *, counts=None, first_posit
         torch.where((positions < m.starts[:, None])[:, :, None, None], previous, current), 0)
     if output.dtype == torch.float8_e4m3fn:
         staged = staged.clamp(-448, 448)
-    output.view(rows, capacity, *values.shape[1:]).copy_(staged)
+    output.view(rows, capacity, *values.shape[1:]).copy_(staged.to(output.dtype))
+
+
+def commit_window(history, values, row, start, length):
+    """Retain the final window with token positions selecting their circular slots."""
+    offsets = torch.arange(history.shape[1], device=values.device)
+    end = start + length
+    positions = end - 1 - (end - 1 - offsets).remainder(history.shape[1])
+    current = values[(positions - start).clamp(0, values.shape[0] - 1)]
+    rows = row.expand_as(offsets)
+    previous = history[rows, offsets].to(values.dtype)
+    committed = torch.where(((positions >= start) & (positions < end))[:, None, None], current, previous)
+    if history.dtype == torch.float8_e4m3fn:
+        committed = committed.clamp(-448, 448)
+    history[rows, offsets] = committed.to(history.dtype)
 
 
 @dataclass(frozen=True)
@@ -172,13 +190,15 @@ class PreparedWindowAttention:
 
         _output_gate_stride(output_gate, query)
         self.output_gate = output_gate
-        self.descale = torch.ones(1, dtype=torch.float32, device=query.device)
+        self.descale = persistent_empty((1,), torch.float32, query.device).fill_(1)
         q = Query(tuple(tensor_facts(x) for x in self.arguments), first_position,
                   tensor_facts(output_gate) if output_gate is not None else None)
         payload = CONTRACT.encode_query(q)
 
+        device = query.device
+
         def materialize(tactic):
-            programs = compile_attention(payload, tactic, query.device.index)
+            programs = compile_attention(payload, tactic, device.index)
             load_programs(programs)
             return attach_programs(State(q, tactic, programs), *programs.values())
 
@@ -187,11 +207,13 @@ class PreparedWindowAttention:
             compile_jobs=lambda t, d: (CompileJob.create(
                 "ignition.components.window_attention:compile_attention", payload, t, d.ordinal),))
 
+        declaration, declaration_gate = self.arguments, self.output_gate
+
         def call(state, benchmark=False):
-            args, produce, gate = self.arguments, None, self.output_gate
+            args, produce, gate = declaration, None, declaration_gate
             if benchmark:
                 def inputs():
-                    a, k, v, hk, hv, r, pos, start, begin, rows, out = self.arguments
+                    a, k, v, hk, hv, r, pos, start, begin, rows, out = declaration
                     a, k, v, r, pos, start, begin, rows, out = (
                         torch.empty_like(t) for t in (a, k, v, r, pos, start, begin, rows, out))
                     a.normal_(std=.2)
@@ -221,7 +243,33 @@ class PreparedWindowAttention:
     def _bind(self, workspace):
         self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.history = self.arguments[3:5]
+        self.output_shape = tuple(self.arguments[-1].shape)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.arguments = self.output_gate = self.scratch = None
+        self.key = self.value = self.proposal = None
+
+    def __call__(self, query=None, key=None, value=None, metadata=None, *, output_gate=None, proposal=None):
+        if self.arguments is not None:
+            return self._bound_call()
+        if proposal is not None:
+            keys, values, step = proposal
+            keys[:, step].copy_(key)
+            values[:, step].copy_(value)
+            key, value = keys.flatten(0, 1), values.flatten(0, 1)
+        m = metadata
+        output = torch.zeros(self.output_shape, dtype=query.dtype, device=query.device)
+        scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        _execute(query, key, value, *self.history, m.requests, m.positions, m.starts,
+                 m.query_start_loc, m.state_rows, output, output_gate, self.descale, scratch, self.plan.handle)
+        return output
+
+    def _bound_call(self):
         if self.proposal is not None:
             key, value, step = self.proposal
             key[:, step].copy_(self.key)

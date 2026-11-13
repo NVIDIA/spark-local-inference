@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Captured image delivery against the checkpoint's ViT and aligner."""
 
 import importlib.util
@@ -17,7 +21,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import DeviceRequestState
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.deepseek4.config import REVISION
 from ignition.components.deepseek_vision import (
     PreparedVision,
@@ -78,15 +82,13 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler):
         },
         assign=True,
     )
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
-    scratch = VisionScratch.allocate(576, device, hidden=4096, buffers=buffers)
+    scratch = VisionScratch.allocate(576, device, hidden=4096)
     inputs = VisionInputs.allocate(device, patches=3456)
     requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=4)
     batch = BatchInputs.allocate(512, 8, device, capacity=4)
     state = VisionState(weights, batch, PrefillVisionInputs.allocate(512, device), requests, features=1536,
         token_base=129280, sentinel_names=("image_start", "image_pad", "image_pad", "image_newline", "image_end"), feature_type=2)
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     frame, sequence = (
         torch.zeros(1, dtype=torch.int32, device=device),
         torch.ones(1, dtype=torch.int64, device=device),
@@ -113,8 +115,8 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler):
     requests.generation[2] = 7
     requests.status[2] = 1
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision", buffers=buffers)
-        operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, buffers=buffers)
+        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision")
+        operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence)
         if compiler == "aot":
             from ignition.preparation.aot import aot_forward
 
@@ -133,9 +135,6 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler):
             inputs.vision_pixel_values[:576].copy_(source)
             state.arena.fill_(float("nan"))
             sequence.fill_(iteration + 2)
-            for chunks in pool.chunks.values():
-                for tensor in chunks:
-                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
             graph.replay()
             torch.cuda.synchronize()
             with torch.device(device):

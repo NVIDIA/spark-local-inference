@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Gemma 4 text inputs, continuation state, and paged attention storage."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .config import PAGE_TOKENS
 

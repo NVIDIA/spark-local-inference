@@ -2,14 +2,16 @@
 
 Helios serves captured programs through one `ModelRuntime` and one `Server`.
 Ignition recipes declare their inputs, storage, frontend syntax, and capacities
-in `ModelIndex.contract`, a typed Protobuf `ServingContract`. Its versioned
+in a typed Protobuf `ServingContract`: `DeploymentBody.contract` in
+payload-format cores and `ModelIndex.contract` in logical-resource cores
+([core carriers](manifest.md#native-runtime-core)). Its versioned
 `ModelContract` is decoded as `model::PreparedContract`; there is no per-model
 native implementation or model-name dispatch.
 
-The [Protobuf schema](proto/runtime_package.proto) defines the wire contract.
+The [Protobuf schema](proto/runtime_core.proto) defines the wire contract.
 The [execution manifest](manifest.md) describes physical buffers, graph handles,
 transport, and completion records. The
-[runtime package design](../docs/runtime-package-design.md) specifies resource
+[runtime core design](../docs/runtime-core-design.md) specifies resource
 ownership, signatures, loading, and cache allocation.
 
 ## Ownership and bootstrap
@@ -20,12 +22,13 @@ shared admission, sampling, state transfer, and paged-text components. A recipe
 may bind different buffer names to the same value source. It cannot install
 native scheduling or state-update code.
 
-Build Helios with `server,runtime-package`. `NativeModel::load` selects graph
+Build Helios with `server,runtime-core`. `NativeModel::load` selects graph
 capacities, loads each rank's resources, and backs declared cache storage.
 `NativeModel::manifests` exposes the resulting execution geometry.
 `Bootstrap::load` validates the prepared contract and loads the tokenizer, chat
 template, and typed frontend settings. `Server::start` starts the native model
-workers and listener. Tensor-parallel peers use `RankPeers::Threads`.
+workers and listener. Tensor-parallel peers on the serving host use
+`RankPeers::Threads`; ranks on other hosts connect as `RankPeers::Processes`.
 
 The native owner retains graphs, CUDA contexts, weights, cache storage, mapped
 allocations, and workspaces through confirmed execution drain. Serving performs
@@ -33,15 +36,19 @@ no Python calls, CUDA allocation, compilation, or graph capture. Missing graph
 variants and inconsistent contracts fail startup; requests outside prepared
 capacities fail admission.
 
-Payload packages use `PackageBody.format_version` 2 with a signed payload
+Payload cores use `CoreBody.format_version` 2 with a signed payload
 envelope and unsigned `LocationSet`. Each executable resource is one zstd
 level-3 frame with a signed decoded length and compressed-chunk commitments.
-Execution ABI 4, prepared model contract 2, and payload format 2 are independent
-version domains. A package with another execution ABI or prepared contract
-requires re-export with Ignition and fails loading before replay.
+Execution ABI, prepared model contract, and payload format are independent
+version domains. Execution ABI labels do not gate loading; the runtime validates
+the declared layouts and operations. Engine upgrades must preserve support for
+previously supported models without re-export.
 
-Executable resources are one mandatory zstd level-3 frame per resource. The
-signed `ExecutableResource` binds its stored frame, signed decoded length,
+Payload format 2 and logical-resource cores with `ProtectedIndex.version` 6
+encode each executable resource as one mandatory zstd level-3 frame.
+Logical-resource cores with `ProtectedIndex.version` 4 are read through the
+authenticated AES-GCM chunk reader. In payload cores, the signed `ExecutableResource` binds its
+stored frame, signed decoded length,
 resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
 compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
 capped at 8 MiB and rejects truncated or extra frames, trailing bytes, and
@@ -58,9 +65,9 @@ reduce captured concurrency and speculative width. Physical cache capacities
 are chosen after graph loading and replace preparation's working-set counts.
 History drafting is a startup option that requires enabled learned speculation
 and concrete copied-token inputs in each selected wider graph. Export records
-no history preference. Package defaults fill missing settings; explicit startup options take precedence.
+no history preference. Core defaults fill missing settings; explicit startup options take precedence.
 
-The optional package rebuild manifest and per-rank weight catalogs describe
+The optional core rebuild manifest and per-rank weight catalogs describe
 preparation inputs and stored tensor views. They do not select serving behavior.
 Missing fields, or catalog versions unknown to a serving runtime, leave the
 serving contract and replay path unchanged.
@@ -69,7 +76,7 @@ serving contract and replay path unchanged.
 
 | Field | Meaning |
 |---|---|
-| `version` | Semantic contract version, 2 |
+| `version` | Semantic contract version, 1, 2, or 3; exporters write 3 |
 | `vocabulary` | Valid sampled token range and histogram/mask geometry |
 | `input_vocabulary` | Valid input range, including declared nonsampled image sentinels |
 | `vision` | Feature-slot and per-window feature capacities, patch-to-feature ratio, and captured patch capacities |
@@ -90,8 +97,8 @@ registered transport destination and an enum-selected source:
 
 | Sources | Values supplied by shared packing |
 |---|---|
-| Request identity and lane geometry | Slot, generation, live-row count, query length, sampling decision, and mixed prefill row |
-| Tokens and positions | Prompt tokens, completed pending token, prompt positions, and image feature/context indices |
+| Request identity and lane geometry | Slot, generation, live-row count, query length, speculative prefix ceiling, sampling decision, and mixed prefill row |
+| Tokens and positions | Prompt tokens, scored-prefill target tokens, completed pending token, prompt positions, image feature/context indices, and image feature slot |
 | Cache bindings | Page tables, live state rows, restore source, snapshot destination, and consumed-token endpoints |
 | Admission sampling | Seed bits, sampling parameters, output limit, EOS IDs, full prompt histogram, and grammar mask |
 | Copied proposals | Candidate IDs, count, generation, consumed endpoint, and per-position grammar masks |
@@ -104,6 +111,14 @@ padding across the request capacity. Packed-token indices follow each lane's
 actual token count. Integer offsets and padding are declared separately.
 Omitted transfers retain device bytes; scratch buffers need no host value source.
 The execution transport owns frame index and submission sequence.
+
+`GraphContract.tuned_bindings` names persistent buffers populated by captured
+startup tuning graphs. Each binding declares the buffer and its producer graph
+name, matching the physical execution descriptor exactly. Producers belong to
+the execution manifest's separate tuning catalog. Their outputs cannot overlap
+request inputs, writable graph state, or cache storage. Startup executes required
+producers before exposing the dependent serving graphs; selection logic belongs
+to the captured producer. See [startup tuning bindings](manifest.md#startup-tuning-bindings).
 
 Shared packing resolves sources, types, extents, and indexing once at startup.
 It uses bounded host staging, initializes admission histograms once, and uploads
@@ -196,7 +211,7 @@ readmission, and offload consume the same storage contract.
 A completion cursor names committed state and its lag behind target consumption.
 For a successful speculative lane, the reported draft cursor must equal
 `max(consumed_tokens - lag_tokens, 0)`. A graph with no draft cursor reports -1.
-Sampled IDs must fit the vocabulary; the ABI4 reserved model field remains -1.
+Sampled IDs must fit the vocabulary; the ABI6 reserved model field remains -1.
 The scheduler independently validates generations, submission order, accepted
 counts, and request endpoints before retiring any lane.
 
@@ -212,9 +227,16 @@ Tool parsers, reasoning parsers, image preparation, and image layouts each have
 an independent enum selector. Implementations are reusable syntax or image
 algorithms, not model identities. Qwen Coder function tags, GLM argument tags,
 and DSML tool syntax may be paired independently with think-tag reasoning.
+XTML think reasoning requires the XTML tool parser.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
 markers are explicit syntax data. A reasoning terminal marker must be the
-declared tool syntax's opener.
+declared tool syntax's opener. Reasoning delimiters that the frontend tokenizer
+encodes as one token delimit output only when generated as that token. A close
+delimiter generated as its token ends reasoning once; a later one is protocol
+markup that the parser drops instead of emitting as answer content, while a
+plain-text spelling that is not the token remains text. A structured answer
+stays an opaque grammar-constrained document, so literal delimiters inside it
+remain answer text.
 
 The shared prompt path determines initial reasoning state from an open assistant
 envelope, excluding completed user, tool, and assistant messages. When a template
@@ -224,6 +246,22 @@ rules declare message roles and rendering constraints. Image token layout data
 declares feature IDs and atomic spans; custom image layout code produces token
 positions, feature mappings, and vision tensors. The generic graph packer binds
 those tensors to declared destinations.
+
+Recipient-header reasoning uses `<|start|>assistant to=RECIPIENT<|message|>`
+frames. The `self` recipient carries reasoning; `commentary` and `user` carry
+visible content. Tool recipients contain ATEM `<atem:function_calls>` blocks
+with named invocations and schema-typed scalar or JSON parameters. These two
+syntax identifiers are paired because their parser consumes complete recipient
+frames. A frame carries one invocation; parallel calls use consecutive assistant
+frames. The generic `tool` recipient accepts the request's registered invocation
+names. A named tool recipient requires the invocation to match that exact name.
+`<|eom|>` closes an internal message and permits another assistant
+header. Generation ends only at the core's EOS IDs. Header controls delimit
+frames only when observed as their tokenizer tokens. An initially open
+`<|start|>assistant` header accepts the generated recipient suffix; assistant
+continuation starts inside the prepared reasoning, content, or tool body.
+Structured-output grammars preserve recipient frames and constrain the user
+answer while allowing the registered tool recipients.
 
 `OutputPipeline` selects reusable parsers. The shared presentation layer emits
 JSON or SSE while preserving streamed tool IDs and argument fragments. The same
@@ -291,9 +329,9 @@ queue. Both timestamps use the token timestamp origin.
 `choices=[]` before `[DONE]`; preceding chunks have `usage=null`. Otherwise an
 observed stream includes usage on its terminal choice chunk. Observation flags
 and `include_usage` accept only booleans or null; null is equivalent to false.
-The existing bounded event queue also bounds observation events. A slow reader
-can cancel an observed request through the same backpressure policy as normal
-generation. Observation changes no CUDA graph, device allocation or replay ABI.
+The response event budget includes one observation per generated token when
+requested, in addition to presentation events. Observation changes no CUDA
+graph, device allocation or replay ABI.
 
 `stop_token_ids` and `stop_token_sequences` accept explicit vocabulary IDs.
 At most sixteen sequences of at most 64 tokens are supported. Matching tokens
@@ -305,9 +343,16 @@ HTTP admission allows at most `queue_capacity + max_active` requests, including
 CPU preparation, queued generation, and streamed responses awaiting delivery. Admitted
 requests wait asynchronously for one of `frontend_workers` CPU preparation
 slots. The native ingress channel and pending admission deque each hold at most
-`queue_capacity` requests. A dropped response cancels its request. A slow reader that fills its
-bounded event queue cancels generation and receives an error if still
-connected. Neither case blocks graph scheduling. HTTP shutdown allows five
+`queue_capacity` requests. A dropped response cancels its request. Each response's
+event queue can hold its complete validated output budget, optional token
+observations and prompt scores, and terminal events. Queue storage grows as
+events arrive; it is not allocated at the full capacity on admission. A connected
+reader may pause and resume without losing output or blocking graph scheduling.
+Finished responses release model slots and KV resources but retain their host
+admission permit until the reader releases the response. This bounds retained
+output by admitted requests and their prompt and output limits. The native
+`event_capacity` setting is a minimum, not a cap on a response's event budget.
+HTTP shutdown allows five
 seconds for connection drain, then drops remaining connections; CUDA ownership
 remains governed by its separate stream-drain confirmation.
 

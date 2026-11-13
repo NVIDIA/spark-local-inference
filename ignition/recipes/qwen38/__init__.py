@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Preparation of the pinned Qwen3.8 mixed-precision checkpoint.
 
 Persistent-state dataclasses own or borrow allocations retained by the prepared

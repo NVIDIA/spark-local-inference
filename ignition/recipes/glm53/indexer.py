@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM C4 index projections, sequence pooling and sparse physical selection."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from b12x.attention import dsa_indexer, sparse_mla
@@ -130,10 +134,10 @@ class PreparedGlmIndexer:
                 or metadata.block_table.shape[1] != scratch.page_table.shape[1]
                 or scratch.page_table.shape[0] != (1 if mode == "prefill" else rows)):
             raise ValueError("GLM index scratch and metadata capacities differ")
-        self.module, self.scratch, self.state, self.metadata, self.mode = module, scratch, state, metadata, mode
+        self.module, self.scratch, self.state, self.cache, self.metadata, self.mode = (
+            module, scratch, state, state.cache, metadata, mode)
+        self.blocks = metadata.block_table.shape[1]
         self.context = context
-        # Layers of one forward share index scratch and metadata; only the first fills the selection tables.
-        self.prepares_tables = True
         if context is not None and scratch.gathered.shape != (rows, context.shards.world * 512, 2):
             raise ValueError("GLM context-parallel selection requires candidate scratch for every row")
         # The index key and head weights arrive as columns of the layer's fused input projection.
@@ -154,11 +158,12 @@ class PreparedGlmIndexer:
         self.pool_arguments = (state.cache, state.tail, metadata.state_slots, metadata.query_start_loc,
             scratch.normalized_key, scratch.gate, self.ape, metadata.token_slots, metadata.positions)
         self.pool_plan = glm_pool.plan_pools(*self.pool_arguments, mode=mode)
+        query_arguments, pool_arguments = self.query_arguments, self.pool_arguments
         declare(session, (
             self.query_plan.request(name=f"{name}.rotate", prepare_call=lambda state:
-                PreparedCall(run=lambda: state.quantize(*self.query_arguments))),
+                PreparedCall(run=lambda: state.quantize(*query_arguments))),
             self.pool_plan.request(name=f"{name}.pool", prepare_call=lambda state:
-                PreparedCall(run=lambda: state.update(*self.pool_arguments))),
+                PreparedCall(run=lambda: state.update(*pool_arguments))),
         ))
         page_table = scratch.page_table.expand(rows, -1) if mode == "prefill" else scratch.page_table
         # Prefill selection scratch grows with query rows (about 140 KB each), so long chunks select in slices.
@@ -197,55 +202,89 @@ class PreparedGlmIndexer:
         self.expand_plan = sparse_mla.plan_pooled_selection(device=source.device, max_rows=rows,
             page_size=256, max_page_table_width=metadata.block_table.shape[1],
             num_cache_blocks=max(state.cache.shape[0], max_cache_pages or 0))
+        expand_arguments, expand_options = self.expand_arguments, self.expand_options
         declare(session, (self.expand_plan.request(name=f"{name}.expand", prepare_call=lambda state:
-            PreparedCall(run=lambda: state.run(*self.expand_arguments, **self.expand_options))),))
+            PreparedCall(run=lambda: state.run(*expand_arguments, **expand_options))),))
 
     def rebind_pages(self):
         """Address the state's current index cache; plans bound its page count from above."""
         cache = self.state.cache
-        self.pool_arguments = (cache, *self.pool_arguments[1:])
+        self.cache = cache
         for selector in self.selectors:
             selector.rebind_cache(cache.view(cache.shape[0], -1))
         if not self.logical:
             self.expand_options["num_cache_blocks"] = cache.shape[0]
 
-    def __call__(self):
-        s, m = self.scratch, self.metadata
-        self.query_projection(self.query_residual)
-        s.normalized_key.copy_(self.module.k_norm(self.key_input))
-        self.gate_projection(self.source)
-        s.weights.copy_(self.weight_input)
-        glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
-        glm_pool.update_pools(*self.pool_arguments, plan=self.pool_plan)
-        if self.prepares_tables:
-            pools = (m.positions + 1) // 4
-            s.pool_lengths.copy_(pools if self.context is None else self.context.shards.local_pools(pools))
-            if self.mode == "prefill":
-                s.page_table.copy_(m.block_table)
-            else:
-                s.page_table.copy_(m.block_table[m.requests.long()])
+    def functional(self, *, session):
+        self.query_projection.functional(session=session)
+        self.gate_projection.functional(session=session)
         for selector in self.selectors:
-            selector()
+            selector.functional(session=session)
+        for gather in self.gathers:
+            gather.functional(session=session)
+        self.scratch = self.metadata = self.query_arguments = self.pool_arguments = None
+        self.expand_arguments = None
+        self.source = self.query_residual = self.key_input = self.weight_input = None
+        return self
+
+    def __call__(self, source, query_residual, key_input, weight_input, metadata, scratch=None):
+        result, _ = self.forward(source, query_residual, key_input, weight_input, metadata, scratch)
+        return result
+
+    def forward(self, source, query_residual, key_input, weight_input, metadata, scratch=None):
+        rows = source.shape[0]
+        s = IndexScratch.allocate(rows, self.blocks, self.mode, source.device,
+            context_ranks=1 if self.context is None else self.context.shards.world) if scratch is None else scratch
+        query = self.query_projection(query_residual)
+        s.normalized_key.copy_(self.module.k_norm(key_input))
+        gate = self.gate_projection(source)
+        s = replace(s, query=query, gate=gate)
+        s.weights.copy_(weight_input)
+        glm_pool.quantize_queries(query.view(-1, 128), s.query_fp8.view(-1, 128),
+            s.query_scales.view(-1), s.weights.view(-1), plan=self.query_plan)
+        glm_pool.update_pools(self.cache, self.state.tail, metadata.state_slots, metadata.query_start_loc,
+            s.normalized_key, gate, self.ape, metadata.token_slots, metadata.positions, plan=self.pool_plan)
+        pools = (metadata.positions + 1) // 4
+        s.pool_lengths.copy_(pools if self.context is None else self.context.shards.local_pools(pools))
+        if self.mode == "prefill":
+            s.page_table.copy_(metadata.block_table)
+        else:
+            s.page_table.copy_(metadata.block_table[metadata.requests.long()])
+        page_table = s.page_table.expand(rows, -1) if self.mode == "prefill" else s.page_table
+        for selector, (start, end) in zip(self.selectors,
+                ((start, min(rows, start + (_SELECT_ROWS if self.mode == "prefill" else rows)))
+                 for start in range(0, rows, _SELECT_ROWS if self.mode == "prefill" else rows)), strict=True):
+            result = selector(s.query_fp8[start:end].view(end - start, 32, 128), s.weights[start:end], page_table[start:end],
+                s.pool_lengths[start:end], None, cache=self.cache.view(self.cache.shape[0], -1))
+            if isinstance(result, tuple):
+                selected, scores = result
+                s.scores[start:end].copy_(scores)
+            else:
+                selected = result
+            s.pools[start:end].copy_(selected)
         if self.logical:
             from .dcp import expand_tokens
 
-            expand_tokens(s.pools, m.positions, s.physical, s.selected_lengths)
-            return s.physical
+            expand_tokens(s.pools, metadata.positions, s.physical, s.selected_lengths)
+            return (s.physical, s.selected_lengths, page_table), s
         if self.context is None:
-            sparse_mla.expand_pooled_topk_to_physical_slots(*self.expand_arguments,
+            sparse_mla.expand_pooled_topk_to_physical_slots(s.pools, metadata.positions, metadata.requests,
+                metadata.block_table, s.physical, s.selected_lengths,
                 **self.expand_options, plan=self.expand_plan)
-            return s.physical
+            return (s.physical, s.selected_lengths, page_table), s
         from .dcp import expand_tokens, merge_candidates, merge_expand_local, pack_candidates
 
         # Every rank merges identical global candidates, then keeps the records it owns.
         pack_candidates(s.pools, s.scores, s.candidates, self.context.shards)
         for gather, (start, end) in zip(self.gathers, self.context.slices(s.pools.shape[0]), strict=True):
-            gather(s.candidates[start:end].view(torch.bfloat16).view(end - start, -1))
+            gather(s.candidates[start:end].view(torch.bfloat16).view(end - start, -1),
+                   output=s.gathered[start:end].view(torch.bfloat16).view(end - start, -1))
         if self.mode == "prefill":
             # Prefill attends over gathered context blocks addressed by global position.
             merge_candidates(s.gathered, s.global_pools)
-            expand_tokens(s.global_pools, m.positions, s.physical, s.selected_lengths)
+            expand_tokens(s.global_pools, metadata.positions, s.physical, s.selected_lengths)
         else:
-            merge_expand_local(s.gathered, s.global_pools, m.positions, m.requests, m.block_table, s.physical,
+            merge_expand_local(s.gathered, s.global_pools, metadata.positions, metadata.requests,
+                               metadata.block_table, s.physical,
                                s.selected_lengths, self.context.shards)
-        return s.physical
+        return (s.physical, s.selected_lengths, page_table), s

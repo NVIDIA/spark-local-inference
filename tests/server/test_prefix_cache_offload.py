@@ -1,8 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native Qwen TP1 cache persistence and disabled-path regressions.
 
 Requires FLARE_RUN_CUDA_TESTS=1, an assigned CUDA_VISIBLE_DEVICES, and
-FLARE_OFFLOAD_TEST_PACKAGE pointing to a Qwen package with ordinary and MTP5
-graphs. Build flare/target/release/flare before running. Use pytest --basetemp
+FLARE_OFFLOAD_TEST_CORE pointing to a Qwen core with ordinary and MTP5
+graphs. Build flare-cli/target/release/flare before running. Use pytest --basetemp
 on a filesystem supporting direct I/O; the test creates and removes its records.
 """
 
@@ -21,9 +25,9 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1"
-    or not os.environ.get("FLARE_OFFLOAD_TEST_PACKAGE")
+    or not os.environ.get("FLARE_OFFLOAD_TEST_CORE")
     or not os.environ.get("CUDA_VISIBLE_DEVICES"),
-    reason="requires assigned GPUs and a compatible runtime package",
+    reason="requires assigned GPUs and a compatible runtime core",
 )
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -72,8 +76,8 @@ def server(tmp_path, name, drafts=5, flags=()):
         port = sock.getsockname()[1]
     log_path = tmp_path / f"{name}.log"
     devices = ",".join(str(rank) for rank in range(len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))))
-    args = [str(ROOT / "flare/target/release/flare"), "run",
-            os.environ["FLARE_OFFLOAD_TEST_PACKAGE"], "--gpus", devices,
+    args = [str(ROOT / "flare-cli/target/release/flare"), "run",
+            os.environ["FLARE_OFFLOAD_TEST_CORE"], "--gpus", devices,
             "--host", "127.0.0.1", "--port", str(port), "--mtp-draft-tokens", str(drafts), *flags]
     if publisher := os.environ.get("FLARE_TEST_PUBLISHER_KEYS"):
         args.extend(("--publisher-keys", publisher))

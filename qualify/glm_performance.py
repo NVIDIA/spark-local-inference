@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Batch-one GLM HTTP decode measurements and CUDA graph tracing.
 
 Create one corpus and reuse it for both engines. The ``flare`` command prepares

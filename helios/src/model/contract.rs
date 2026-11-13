@@ -1,10 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Prepared storage, value sources, and frontend syntax independent of model identity.
 
 use super::VisionCapabilities;
 use crate::{
     Result,
-    execution::{ExecutionManifest, GraphKind},
+    execution::{BufferDescriptor, ExecutionManifest, GraphKind, TunedBinding},
 };
+
+#[cfg(kani)]
+mod kani_proofs;
 
 macro_rules! contract_enum {
     ($name:ident { $($variant:ident = $value:literal),+ $(,)? }) => {
@@ -20,13 +29,13 @@ macro_rules! contract_enum {
                 }
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
                 serializer.serialize_i32(*self as i32)
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
                 let value = <i32 as serde::Deserialize>::deserialize(deserializer)?;
@@ -54,8 +63,8 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
@@ -81,11 +90,11 @@ impl TryFrom<GraphKind> for GraphOperation {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PreparedContract {
@@ -100,11 +109,11 @@ pub struct PreparedContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CacheContract {
@@ -115,11 +124,11 @@ pub struct CacheContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct HistoryRegion {
@@ -131,11 +140,11 @@ pub struct HistoryRegion {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PageTableView {
@@ -145,11 +154,11 @@ pub struct PageTableView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ValueBinding {
@@ -163,11 +172,11 @@ pub struct ValueBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateView {
@@ -179,11 +188,11 @@ pub struct StateView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateAccess {
@@ -193,11 +202,11 @@ pub struct StateAccess {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CompletionCursor {
@@ -207,11 +216,11 @@ pub struct CompletionCursor {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct GraphContract {
@@ -223,15 +232,16 @@ pub struct GraphContract {
     pub draft_cursor: Option<CompletionCursor>,
     pub embedding_tables: Vec<u32>,
     pub pending_token: Option<StateView>,
+    pub tuned_bindings: Vec<TunedBinding>,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ToolParser {
@@ -242,11 +252,11 @@ pub struct ToolParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ReasoningParser {
@@ -259,11 +269,11 @@ pub struct ReasoningParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PrefixBoundary {
@@ -278,11 +288,11 @@ pub struct PrefixBoundary {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct FrontendContract {
@@ -300,11 +310,11 @@ pub struct FrontendContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageTokenLayout {
@@ -314,11 +324,11 @@ pub struct ImageTokenLayout {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageSpan {
@@ -338,8 +348,8 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if self.version != 2 {
-            return Err("unsupported prepared model contract version; re-export the model package".into());
+        if !(1..=3).contains(&self.version) {
+            return Err("unsupported prepared model contract version; re-export the model core".into());
         }
         if self.vocabulary == 0
             || self.input_vocabulary < self.vocabulary
@@ -394,9 +404,25 @@ impl PreparedContract {
                 return Err("duplicate page-table view".into());
             }
         }
+        let protected: std::collections::HashSet<_> = manifest.tuning_graphs.iter()
+            .flat_map(|graph| graph.outputs.iter().chain(std::iter::once(&graph.status_buffer)))
+            .collect();
+        for name in &protected {
+            manifest.buffer(name)?;
+            if self.cache.regions.iter().any(|region| &region.storage.buffer == *name)
+                || self.cache.page_tables.iter().any(|view| &view.buffer == *name)
+                || self.graphs.iter().any(|graph| {
+                    graph.inputs.iter().any(|input| &input.buffer == *name)
+                        || graph.state.iter().any(|state| &state.view.buffer == *name)
+                        || graph.pending_token.as_ref().is_some_and(|view| &view.buffer == *name)
+                        || graph.draft_cursor.as_ref().is_some_and(|cursor| &cursor.state.buffer == *name)
+                }) {
+                return Err("startup tuning storage overlaps request inputs or state".into());
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for graph in &self.graphs {
-            if !names.insert(&graph.graph) || !(1..=8).contains(&graph.state_rows_per_request) {
+            if !names.insert(&graph.graph) || graph.state_rows_per_request == 0 {
                 return Err(
                     "duplicate graph contract or invalid continuation-row requirement".into(),
                 );
@@ -406,6 +432,14 @@ impl PreparedContract {
             let graph = self.graph(&descriptor.name)?;
             if graph.kind != descriptor.kind.try_into()? {
                 return Err("semantic graph operation differs from its execution catalog".into());
+            }
+            let semantic: std::collections::BTreeMap<_, _> = graph.tuned_bindings.iter()
+                .map(|binding| (&binding.buffer, &binding.tuning_graph)).collect();
+            let physical: std::collections::BTreeMap<_, _> = descriptor.tuned_bindings.iter()
+                .map(|binding| (&binding.buffer, &binding.tuning_graph)).collect();
+            if semantic.len() != graph.tuned_bindings.len()
+                || physical.len() != descriptor.tuned_bindings.len() || semantic != physical {
+                return Err("semantic tuned bindings differ from the execution catalog".into());
             }
             let targets: Vec<_> = graph.inputs.iter().filter(|b| b.source == ValueSource::PromptTargetToken).collect();
             if (descriptor.kind == GraphKind::ScoredPrefill && (targets.len() != 1
@@ -556,24 +590,27 @@ impl StateView {
 
     fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
         let buffer = manifest.buffer(&self.buffer)?;
-        if self.nbytes == 0
-            || buffer.shape.is_empty()
-            || buffer
-                .strides
-                .first()
-                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
-                != Some(self.stride)
-            || self
-                .offset
-                .checked_add(self.nbytes)
-                .is_none_or(|end| end > self.stride)
-            || buffer.shape[0]
-                .checked_mul(self.stride)
-                .is_none_or(|end| end > buffer.nbytes)
-        {
+        if !self.fits_storage(buffer) {
             return Err("persistent state view exceeds its prepared storage".into());
         }
         Ok(())
+    }
+
+    fn fits_storage(&self, buffer: &BufferDescriptor) -> bool {
+        self.nbytes != 0
+            && !buffer.shape.is_empty()
+            && buffer
+                .strides
+                .first()
+                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
+                == Some(self.stride)
+            && self
+                .offset
+                .checked_add(self.nbytes)
+                .is_some_and(|end| end <= self.stride)
+            && buffer.shape[0]
+                .checked_mul(self.stride)
+                .is_some_and(|end| end <= buffer.nbytes)
     }
 }
 
@@ -592,12 +629,18 @@ impl FrontendContract {
                 return Err("unsupported tool parser syntax parameters".into());
             }
         }
+        if self.tools.as_ref().is_some_and(|t| t.kind == ToolParserKind::Atem)
+            != self.reasoning.as_ref().is_some_and(|r| r.kind == ReasoningParserKind::RecipientHeaders)
+        {
+            return Err("ATEM recipient framing requires recipient-header reasoning syntax".into());
+        }
         if let Some(reasoning) = &self.reasoning {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
                 ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
+                ReasoningParserKind::RecipientHeaders => ("<|start|>assistant to=self<|message|>", "<|eom|>"),
             };
             let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
                 ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
@@ -613,6 +656,8 @@ impl FrontendContract {
                             .tools
                             .as_ref()
                             .is_none_or(|tool| tool.kind != ToolParserKind::Xtml)))
+                || (reasoning.kind == ReasoningParserKind::RecipientHeaders
+                    && (reasoning.wrapping_newlines != 0 || !reasoning.terminal_markers.is_empty()))
                 || reasoning.wrapping_newlines > 1
                 || reasoning
                     .terminal_markers
@@ -636,6 +681,153 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_contract_versions_validate_declared_state_storage() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+        for version in [1, 2, 3] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            contract.validate(&manifest).unwrap();
+            contract.graphs[0].state[0].view.buffer = "missing_state".into();
+            assert!(contract.validate(&manifest).is_err());
+        }
+        for version in [0, 4, u32::MAX] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            assert!(contract.validate(&manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn state_view_validation_resolves_buffers_and_preserves_storage_errors() {
+        use crate::{Error, ExecutionError, execution::Dtype};
+        let view = StateView { buffer: "state".into(), offset: 4, stride: 16, nbytes: 12 };
+        let buffer = BufferDescriptor {
+            name: "state".into(), address: 4096, nbytes: 32,
+            dtype: Dtype::Int32, shape: vec![2], strides: vec![4],
+        };
+        let mut manifest = ExecutionManifest {
+            engram: None, collectives: None, cache: None, offload: None,
+            abi_version: crate::execution::ABI_VERSION, context: 0, device: 0,
+            completion_token_capacity: 8,
+            max_active: 1, input_frame_bytes: 8,
+            buffers: vec![BufferDescriptor {
+                name: "other".into(), shape: vec![], ..buffer.clone()
+            }, buffer],
+            graphs: vec![], tuning_graphs: vec![],
+        };
+        view.validate(&manifest).unwrap();
+        let mut missing = view.clone();
+        missing.buffer = "missing".into();
+        missing.nbytes = 0;
+        let error = missing.validate(&manifest).unwrap_err();
+        assert!(matches!(&error, Error::Execution(ExecutionError::Manifest(_))));
+        assert_eq!(error.to_string(), "unknown buffer \"missing\"");
+
+        type Invalid = (&'static str, fn(&mut StateView, &mut BufferDescriptor));
+        let cases: [Invalid; 9] = [
+            ("zero extent", |v, _| v.nbytes = 0),
+            ("empty shape", |_, b| b.shape.clear()),
+            ("missing element stride", |_, b| b.strides.clear()),
+            ("mismatched byte stride", |_, b| b.strides[0] = 5),
+            ("element stride overflow", |_, b| b.strides[0] = usize::MAX),
+            ("view extent overflow", |v, _| v.offset = usize::MAX),
+            ("view extends past its row", |v, _| v.offset = 5),
+            ("row extent overflow", |_, b| b.shape[0] = usize::MAX),
+            ("rows extend past storage", |_, b| b.nbytes = 31),
+        ];
+        for (name, invalidate) in cases {
+            let mut invalid_view = view.clone();
+            let saved = manifest.buffers[1].clone();
+            invalidate(&mut invalid_view, &mut manifest.buffers[1]);
+            let error = invalid_view.validate(&manifest).unwrap_err();
+            assert!(matches!(&error, Error::Execution(ExecutionError::State(_))), "{name}");
+            assert_eq!(error.to_string(), "persistent state view exceeds its prepared storage", "{name}");
+            manifest.buffers[1] = saved;
+        }
+        let exact = StateView {
+            buffer: "state".into(), offset: usize::MAX - 1, stride: usize::MAX, nbytes: 1,
+        };
+        manifest.buffers[1].dtype = Dtype::Uint8;
+        manifest.buffers[1].shape = vec![1];
+        manifest.buffers[1].strides = vec![usize::MAX];
+        manifest.buffers[1].nbytes = usize::MAX;
+        exact.validate(&manifest).unwrap();
+    }
+
+    #[test]
+    fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
+        assert_eq!(ToolParserKind::try_from(7).unwrap(), ToolParserKind::Atem);
+        assert_eq!(ReasoningParserKind::try_from(5).unwrap(), ReasoningParserKind::RecipientHeaders);
+        for value in [0, 8, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
+        for value in [0, 6, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {kind: ToolParserKind::Atem, wrapping_newlines: 0, tag_separator: String::new()});
+        assert!(syntax.validate().is_err());
+        syntax.reasoning = Some(ReasoningParser {kind: ReasoningParserKind::ThinkTags, open: "<think>".into(), close: "</think>".into(), wrapping_newlines: 0, terminal_markers: vec![]});
+        let reasoning = syntax.reasoning.as_mut().unwrap();
+        reasoning.kind = ReasoningParserKind::RecipientHeaders;
+        reasoning.open = "<|start|>assistant to=self<|message|>".into();
+        reasoning.close = "<|eom|>".into();
+        reasoning.wrapping_newlines = 0;
+        reasoning.terminal_markers.clear();
+        syntax.tools.as_mut().unwrap().wrapping_newlines = 0;
+        assert!(syntax.validate().is_ok());
+    }
+
+    #[test]
+    fn startup_tuning_bindings_match_transport_and_exclude_request_state() {
+        use crate::execution::{BufferDescriptor, Dtype, TuningGraphDescriptor};
+        let config = crate::model::tests::config();
+        let mut contract = config.contract.clone();
+        let mut manifest = crate::model::testing::manifest(&config);
+        let base = manifest.buffers.iter().map(|buffer| buffer.address + buffer.nbytes).max().unwrap() + 256;
+        for (index, name) in ["tuning_winner", "tuning_status"].into_iter().enumerate() {
+            manifest.buffers.push(BufferDescriptor {
+                name: name.into(), address: (base + 255) / 256 * 256 + index * 256,
+                nbytes: 4, dtype: Dtype::Int32, shape: vec![1], strides: vec![1],
+            });
+        }
+        manifest.tuning_graphs.push(TuningGraphDescriptor {
+            name: "startup_tune".into(), handle: 99999, outputs: vec!["tuning_winner".into()],
+            status_buffer: "tuning_status".into(),
+        });
+        let binding = TunedBinding { buffer: "tuning_winner".into(), tuning_graph: "startup_tune".into() };
+        manifest.graphs[0].tuned_bindings.push(binding.clone());
+        let name = manifest.graphs[0].name.clone();
+        contract.graphs.iter_mut().find(|graph| graph.graph == name).unwrap().tuned_bindings.push(binding);
+        contract.validate(&manifest).unwrap();
+        let mut wrong = contract.clone();
+        wrong.graphs.iter_mut().find(|graph| graph.graph == name).unwrap().tuned_bindings.clear();
+        assert!(wrong.validate(&manifest).unwrap_err().to_string().contains("semantic tuned bindings"));
+        let mut wrong = contract.clone();
+        let graph = wrong.graphs.iter_mut().find(|graph| graph.graph == name).unwrap();
+        graph.tuned_bindings.push(graph.tuned_bindings[0].clone());
+        assert!(wrong.validate(&manifest).unwrap_err().to_string().contains("semantic tuned bindings"));
+        for protected in [contract.graphs[0].inputs[0].buffer.clone(),
+            contract.graphs[0].state[0].view.buffer.clone()] {
+            let mut wrong_manifest = manifest.clone();
+            wrong_manifest.tuning_graphs[0].status_buffer = protected;
+            assert!(contract.validate(&wrong_manifest).unwrap_err().to_string().contains("overlaps request"));
+        }
+    }
+
+    #[test]
+    fn startup_tuning_outputs_cannot_alias_cache_storage() {
+        let config = crate::model::tests::config();
+        let mut contract = config.contract.clone();
+        let mut manifest = crate::model::testing::manifest(&config);
+        let storage = contract.graphs[0].state[0].view.clone();
+        contract.cache.regions.push(HistoryRegion {
+            kind: HistoryKind::RecurrentState, storage: storage.clone(), tokens_per_record: 1, window_tokens: 0,
+        });
+        manifest.tuning_graphs.push(crate::execution::TuningGraphDescriptor {
+            name: "tune".into(), handle: 99999, outputs: vec![storage.buffer], status_buffer: "frame_index".into(),
+        });
+        assert!(contract.validate(&manifest).unwrap_err().to_string().contains("overlaps request"));
+    }
 
     #[test]
     fn pending_token_admission_writes_are_distinct_from_generation_reads() {

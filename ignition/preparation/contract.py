@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Semantic host uploads and persistent-state dependencies of prepared programs."""
 
-from . import runtime_package_pb2 as p
+from . import runtime_core_pb2 as p
 
 
 def binding(buffer, source, indexing=p.SUBMISSION_ROW, *, offset=0, padding=0, tensor=""):
@@ -76,6 +80,7 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
         if pending is not None and kind not in ("snapshot", "vision"):
             states.append(dict(view=pending, access=p.WRITE if kind in ("init", "restore") else p.READ_WRITE))
         result.append(dict(graph=name, kind=p.GraphOperation.Value(kind.upper()), inputs=values, state=states,
+            tuned_bindings=[],
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,
             embedding_tables=list(embedding_tables) if kind in (
@@ -103,7 +108,7 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
 
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
                    regions):
-    return dict(version=2, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
+    return dict(version=3, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
         cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
 

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Translate the official DeepSeek parser's actions into shared output events.
 
 use super::{
@@ -5,8 +11,9 @@ use super::{
     tagged::{OutputConfig, OutputStart},
 };
 use crate::Result;
-use deepseek_recipe::stream::state_machine::{
-    OutputAction, OutputActionSegment, ParsingOptions, ReasoningStage, StateMachine,
+use deepseek_recipe::stream::{
+    ParsingOptions, ThinkingInitialStage,
+    output_parser::{ChunkKind, OutputAction, OutputActionSegment, OutputParser},
 };
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
@@ -22,31 +29,42 @@ struct Call {
 
 pub struct DsmlOutput<const SPACED: bool> {
     consumed: usize,
+    reasoning_open: bool,
     spans: Vec<Option<std::ops::Range<usize>>>,
-    machine: Option<StateMachine>,
+    machine: Option<OutputParser>,
     pending: String,
     last_action: OutputAction,
     call: Option<Call>,
     calls: usize,
     structured: bool,
     verbatim: bool,
+    special_tokens: Vec<(u32, String)>,
+    last_token: Option<u32>,
 }
 
 impl<const SPACED: bool> DsmlOutput<SPACED> {
     fn apply(&mut self, actions: Vec<OutputActionSegment>, events: &mut Vec<Event>) -> Result<()> {
         let mut consumed = 0;
         for segment in actions {
-            let end = consumed + segment.len;
+            let end = consumed + segment.byte_len;
             let source = self
                 .pending
                 .get(consumed..end)
                 .ok_or("DeepSeek parser returned an invalid source span")?;
+            // The upstream parser skips leading newlines; other non-reasoning actions end reasoning.
+            if self.reasoning_open
+                && segment.action != OutputAction::Reasoning
+                && !(segment.action == OutputAction::Skip && source.bytes().all(|b| b == b'\n'))
+            {
+                self.reasoning_open = false;
+            }
             let repeated = self.last_action == segment.action;
             self.last_action = segment.action;
             match segment.action {
-                OutputAction::Raw => {
+                OutputAction::Content => {
                     if !source.is_empty() {
-                        self.spans.push(Some(self.consumed + consumed..self.consumed + end));
+                        self.spans
+                            .push(Some(self.consumed + consumed..self.consumed + end));
                         events.push(Event::Content(source.to_owned()));
                         self.verbatim = self.structured && !source.trim().is_empty();
                     }
@@ -82,14 +100,16 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         return Err("tool function name is empty".into());
                     }
                 }
-                OutputAction::LabelToolCallArguments { label, .. } if !repeated => {
+                OutputAction::LabelToolCallArguments(label) if !repeated => {
                     self.call
                         .as_mut()
                         .ok_or("DeepSeek tool arguments have no call")?
                         .arguments
-                        .push_str(label);
+                        .push_str(label.as_str());
                 }
-                OutputAction::RawToolCallArguments { string } => {
+                OutputAction::ToolCallArgumentsText {
+                    is_string_value: string,
+                } => {
                     let arguments = &mut self
                         .call
                         .as_mut()
@@ -103,12 +123,12 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         arguments.push_str(source);
                     }
                 }
-                OutputAction::ToolCallArgumentsEnd { output } if !repeated => {
+                OutputAction::ToolCallArgumentsEnd { closing_text } if !repeated => {
                     let mut call = self
                         .call
                         .take()
                         .ok_or("DeepSeek tool arguments have no call")?;
-                    call.arguments.push_str(output.unwrap_or_default());
+                    call.arguments.push_str(closing_text);
                     validate_arguments(&call.arguments)?;
                     let index = self.calls;
                     events.extend([
@@ -130,9 +150,10 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                     events.push(Event::Content(label.into()))
                 }
                 OutputAction::ToSpace => {
-                    self.spans.push(Some(self.consumed + consumed..self.consumed + end));
+                    self.spans
+                        .push(Some(self.consumed + consumed..self.consumed + end));
                     events.push(Event::Content(" ".into()));
-                },
+                }
                 _ => {}
             }
             if self.call.as_ref().is_some_and(|call| {
@@ -148,7 +169,8 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         self.pending.drain(..consumed);
         self.consumed += consumed;
         if self.verbatim && !self.pending.is_empty() {
-            self.spans.push(Some(self.consumed..self.consumed + self.pending.len()));
+            self.spans
+                .push(Some(self.consumed..self.consumed + self.pending.len()));
             self.consumed += self.pending.len();
             events.push(Event::Content(std::mem::take(&mut self.pending)));
         }
@@ -158,9 +180,42 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         Ok(())
     }
 
-    fn feed(&mut self, text: &str, events: &mut Vec<Event>) -> Result<()> {
+    pub fn reasoning_open(&self) -> bool {
+        self.reasoning_open
+    }
+
+    pub fn with_special_tokens(mut self, tokens: Vec<(u32, String)>) -> Self {
+        self.special_tokens = tokens;
+        self
+    }
+
+    fn present(&mut self, text: &str, kind: ChunkKind, events: &mut Vec<Event>) -> Result<()> {
+        let mut rest = text;
+        while self.structured
+            && !self.verbatim
+            && !rest.is_empty()
+            && kind != ChunkKind::SpecialToken
+        {
+            let length = rest.chars().next().unwrap().len_utf8();
+            self.feed(&rest[..length], kind, events)?;
+            rest = &rest[length..];
+        }
+        if !rest.is_empty() {
+            if self.verbatim {
+                self.spans
+                    .push(Some(self.consumed..self.consumed + rest.len()));
+                self.consumed += rest.len();
+                events.push(Event::Content(rest.to_owned()));
+            } else {
+                self.feed(rest, kind, events)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn feed(&mut self, text: &str, kind: ChunkKind, events: &mut Vec<Event>) -> Result<()> {
         self.pending.push_str(text);
-        let actions = self.machine.as_mut().unwrap().feed(text);
+        let actions = self.machine.as_mut().unwrap().feed(text, kind);
         self.apply(actions, events)
     }
 }
@@ -171,15 +226,16 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
     fn new(config: OutputConfig) -> Self {
         Self {
             consumed: 0,
+            reasoning_open: config.start == OutputStart::Reasoning,
             spans: vec![],
-            machine: Some(StateMachine::new(ParsingOptions {
+            machine: Some(OutputParser::new(ParsingOptions {
                 parse_tool_calls: !config.tools.is_empty(),
-                tool_call_initial_stage: config.start == OutputStart::ToolBody,
+                starts_in_tool_calls: config.start == OutputStart::ToolBody,
                 // Helios grammars also support scalar JSON and non-JSON languages.
                 parse_json_output: false,
-                reasoning_initial_stage: (config.start == OutputStart::Reasoning)
-                    .then_some(ReasoningStage::Start),
-                stop_sequences: vec![],
+                thinking_initial_stage: (config.start == OutputStart::Reasoning)
+                    .then_some(ThinkingInitialStage::ReasoningStart),
+                ..ParsingOptions::default()
             })),
             pending: String::new(),
             last_action: OutputAction::Skip,
@@ -187,11 +243,14 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             calls: 0,
             structured: config.structured,
             verbatim: false,
+            special_tokens: Vec::new(),
+            last_token: None,
         }
     }
 
     fn grammar_envelope(config: &Self::Config) -> Option<crate::grammar::OutputEnvelope> {
         Some(crate::grammar::OutputEnvelope {
+            recipient: None,
             reasoning_end: (config.start == OutputStart::Reasoning).then_some("</think>"),
             tool: (!config.tools.is_empty()).then_some(if SPACED {
                 ("<｜DSML｜ calls>", "</｜DSML｜ calls>")
@@ -201,6 +260,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             function: None,
             tool_ends_reasoning: false,
             response: None,
+            message_close: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })
     }
@@ -216,25 +276,35 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
         if self.machine.is_none() {
             return Err("output presentation is finished".into());
         }
-        let Input::Text(text) = input else {
-            return Ok(vec![]);
+        let text = match input {
+            Input::Token(token) => {
+                self.last_token = Some(token);
+                return Ok(vec![]);
+            }
+            Input::Text(text) => text,
+        };
+        // A completed control token ends its decoded span; clipped stop spans carry no token ID.
+        let special = self.last_token.take().and_then(|token| {
+            self.special_tokens
+                .iter()
+                .find(|(id, _)| *id == token)
+                .map(|(_, text)| text.clone())
+        });
+        let plain_kind = if self.special_tokens.is_empty() {
+            ChunkKind::Text
+        } else {
+            ChunkKind::PlainTokens
         };
         let mut events = Vec::new();
-        let mut rest = text;
-        // Stop interpreting markup as soon as a grammar-constrained answer begins.
-        while self.structured && !self.verbatim && !rest.is_empty() {
-            let length = rest.chars().next().unwrap().len_utf8();
-            self.feed(&rest[..length], &mut events)?;
-            rest = &rest[length..];
-        }
-        if !rest.is_empty() {
-            if self.verbatim {
-                self.spans.push(Some(self.consumed..self.consumed + rest.len()));
-                self.consumed += rest.len();
-                events.push(Event::Content(rest.to_owned()));
-            } else {
-                self.feed(rest, &mut events)?;
+        if let Some(marker) = special {
+            if !text.ends_with(&marker) {
+                return Err("DeepSeek control token does not match decoded text".into());
             }
+            let end = text.len() - marker.len();
+            self.present(&text[..end], plain_kind, &mut events)?;
+            self.present(&text[end..], ChunkKind::SpecialToken, &mut events)?;
+        } else {
+            self.present(text, plain_kind, &mut events)?;
         }
         Ok(events)
     }
@@ -375,6 +445,83 @@ mod deepseek4_syntax_tests {
                 message["tool_calls"][1]["function"]["arguments"],
                 "{\"n\": 3}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_close_tests {
+    use super::*;
+    use crate::output::tagged::OutputConfig;
+    use crate::output::{Input, ModelOutput, Termination};
+    use crate::server::output::Accumulator;
+
+    /// The reported shape: reasoning, its close delimiter token, a short answer, a
+    /// second close delimiter token, and the rest of the answer. The DeepSeek
+    /// parser skips a thinking-end token outside reasoning, so no close delimiter
+    /// reaches content. A plain-text spelling is plain tokens and stays content.
+    fn check<const SPACED: bool>(feed: usize, spelled: bool) {
+        let close = (128822, "</think>".to_owned());
+        let mut parser = DsmlOutput::<SPACED>::new(OutputConfig {
+            structured: false,
+            start: OutputStart::Reasoning,
+            tools: vec![],
+        })
+        .with_special_tokens(vec![(128821, "<think>".to_owned()), close.clone()]);
+        let mut output = Accumulator::new("close".into());
+        let second = if spelled { None } else { Some(close.0) };
+        let pieces = [
+            (None, "Reason."),
+            (Some(close.0), close.1.as_str()),
+            (None, "Answer."),
+            (second, close.1.as_str()),
+            (None, "More."),
+        ];
+        for (token, text) in pieces {
+            if let Some(token) = token {
+                output
+                    .apply(parser.push(Input::Token(token)).unwrap())
+                    .unwrap();
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else if feed == 0 {
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else {
+                for character in text.chars() {
+                    output
+                        .apply(parser.push(Input::Text(&character.to_string())).unwrap())
+                        .unwrap();
+                }
+            }
+        }
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        let message = output.message();
+        assert_eq!(message["reasoning_content"], "Reason.");
+        assert_eq!(
+            message["content"],
+            if spelled { "Answer.</think>More." } else { "Answer.More." }
+        );
+    }
+
+    #[test]
+    fn compact_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<false>(feed, false);
+            check::<false>(feed, true);
+        }
+    }
+
+    #[test]
+    fn spaced_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<true>(feed, false);
+            check::<true>(feed, true);
         }
     }
 }

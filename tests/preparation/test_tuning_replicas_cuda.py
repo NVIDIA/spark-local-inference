@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Candidate sharding and graph replay through the shared b12x preparation path."""
 
 import multiprocessing
@@ -305,9 +308,9 @@ def _partial_race_worker(directory, interrupt, connection):
         return (yield from trial(job, obligation, index, assignment, config))
 
     PreparationJob._measure, PreparationJob._trial = interrupt_batch, record_trial
-    with autotune_effort('high'), RecordedPreparationSession(device='cuda:0',
+    with autotune_effort('audit'), RecordedPreparationSession(device='cuda:0',
             checkpoint='confidence-tuning-restart', workload_schema='confidence', numerical_policy='fp32',
-            namespace={'case': directory}, compile_workers=2, autotune_effort='high') as session:
+            namespace={'case': directory}, compile_workers=2, autotune_effort='audit') as session:
         session.cache_dir = Path(directory) / 'selections'
         session.race_batch = 2
         projection = UnquantizedProjection(source, weight, output, session=session,

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -46,10 +52,16 @@ impl ExecutionWorker {
         manifest: ExecutionManifest,
         peers: Vec<RankStream>,
     ) -> Result<Self> {
-        unsafe { Self::start(manifest, Some(peers)) }
+        unsafe { Self::start(manifest, Some(super::RankPeers::Processes(peers))) }
     }
 
-    unsafe fn start(manifest: ExecutionManifest, peers: Option<Vec<RankStream>>) -> Result<Self> {
+    /// # Safety
+    /// All rank owners must remain alive until coordinated execution drains.
+    pub unsafe fn new_threaded(manifest: ExecutionManifest, ranks: Vec<ExecutionManifest>) -> Result<Self> {
+        unsafe { Self::start(manifest, Some(super::RankPeers::Threads(ranks))) }
+    }
+
+    unsafe fn start(manifest: ExecutionManifest, peers: Option<super::RankPeers>) -> Result<Self> {
         manifest.validate()?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready) = mpsc::sync_channel(1);
@@ -60,7 +72,7 @@ impl ExecutionWorker {
                 // until this worker reports drain. The executor binds its streams
                 // to the declared context on this thread and has exclusive access.
                 let opened =
-                    unsafe { RankExecutor::new(manifest, peers.map(super::RankPeers::Processes)) };
+                    unsafe { RankExecutor::new(manifest, peers) };
                 let mut executor = match opened {
                     Ok(executor) => executor,
                     Err(error) => {

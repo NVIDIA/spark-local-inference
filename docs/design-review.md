@@ -1,6 +1,7 @@
 # Commit design review
 
-Every commit requires review of its staged diff against the principles below.
+Every commit requires review of its staged diff and final commit message against
+the principles below.
 They summarize [the core design](core-design.md) and [repository guidance](../AGENTS.md).
 Consult those specifications for details relevant to the change.
 
@@ -46,15 +47,17 @@ before committing; a design acknowledgment cannot authorize them.
    default-false opt-ins. Enums, callbacks, schema names, and metadata fields
    cannot serve as alternative model allowlists. Review each member and its
    consumers for a concrete meaning independent of model identity.
-4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM120/SM121, reuse proven
+4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM103/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
-   Remove superseded internal paths unless compatibility is explicitly required.
-   Package version validation is required by principle 13.
+   Retain internal paths required to load and serve previously supported models.
+   Model core compatibility is required by principle 13.
 5. **Finish preparation before capture.** Constructors declare operations; one
    preparation batch tunes the complete shape catalog. Size scratch from tuned
    plans, refresh bindings, compile complete forwards, and warm every variant
    before capture. TP forwards compile once, sharded across ranks; every rank
    binds the same artifacts and captures.
+   Captured startup tuning graphs may select persistent binding values from
+   prepared candidates before serving; compilation and capture remain preparation work.
 6. **Make storage and lifetimes explicit.** Concurrent work has disjoint scratch
    and preserved fork/join dependencies. Values surviving graph boundaries use
    persistent storage. Never reuse inputs, pages, or slots while queued work or
@@ -92,21 +95,22 @@ before committing; a design acknowledgment cannot authorize them.
     shapes, tails, inactive rows, graph transitions, cache boundaries, request
     lifecycle, and allocation stability. Preserve native frontend and request-local
     sampling semantics. Performance claims require equivalent baselines, complete
-    GPU steps across all ranks, and actual Helios service measurements. Correctness
+    GPU steps across all ranks, and actual Helios service measurements. Comparisons
+    against other runtimes must use exported cores with `flare run`;
+    `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
-13. **Validate the supported model package contract.** Serving requires execution
-    ABI 4 and prepared model contract 2. Payload format 2 is the canonical carrier;
-    signed format-6 logical-resource containers require the same contracts. Reject unsupported
-    execution ABI and prepared contract versions before replay with a clear
-    re-export error. Version semantic contract changes, reserve removed Protobuf
-    fields and enum values, and validate required data and explicit values in
-    every affected consumer. Remove superseded loaders and migration-only tests;
-    backward compatibility requires an explicit maintainer requirement. Validate
-    affected loading and serving paths and unsupported-version rejection.
+13. **Preserve model core compatibility.** Every engine version must load
+    models supported by previous engine versions without re-export, re-signing,
+    or graph changes. Execution ABI numbers are descriptive metadata, not loading
+    gates. Validate actual operations, buffers, capacities, dependencies, signatures,
+    and resources. Protobuf additions must preserve existing behavior through
+    compatible defaults; an absent or zero completion token capacity means eight.
+    Reserve removed wire identifiers and retain readers and tests needed by
+    existing cores. Validate previous cores through loading and serving.
 14. **Restrict Claude Opus 5.5 authorship of CUDA kernels and model optimizations.**
-    Claude Opus 5.5 has repeatedly produced defective low-level kernel changes
-    in this project. It must not design or implement low-level CUDA kernels
+    Claude Opus 5.5 is not reliable for low-level kernel changes in this
+    project. It must not design or implement low-level CUDA kernels
     (CUDA C++, PTX, CuTe DSL, or Triton) or changes to existing model fusion and
     GPU execution optimizations, including projection packing, fused arithmetic,
     stream overlap, and scratch aliasing in optimized model paths. Do not
@@ -127,16 +131,41 @@ before committing; a design acknowledgment cannot authorize them.
     behavior, weaken numerical or lifetime contracts, or shift model computation
     or policy across the preparation/runtime boundary. Do not make a violating
     contribution acceptable by weakening its governing rule.
+16. **Write without hidden context.** Read and apply the
+    [repository prose skill](../.agents/skills/repo-prose/SKILL.md). Review changed
+    prose and the final commit message for an audience without the development
+    conversation. Commit message bodies and PR descriptions must follow the
+    [required explanation scheme](../AGENTS.md#required-pr-descriptions), in order:
+    **why the change is needed and why this approach; what exactly changed;
+    the claimed benefit or result; and the supporting evidence.** Require an
+    explicit before/after explanation and distinguish expected benefits from
+    measured results. Connect evidence to claims and disclose material limitations.
+    Reject messages that leave these answers implicit, omit them, or present them
+    out of order. A reviewer must not need the diff or development conversation
+    to reconstruct the argument. Scale detail to the change. Particular headings
+    are not required. Reject unexplained references and unsupported claims in all
+    changed prose. Rewrite deficient text before committing or publishing.
+    PR descriptions, comments, and agent reports require prose review before
+    publication.
 
 ## Review and acknowledgment
 
 1. Inspect `git diff --cached`. Apply every relevant principle, fix violations,
-   and obtain any required graph-family approval before committing. State validation
-   performed and material limitations in the commit message. Validation requirements
-   apply to the affected behavior; documentation changes do not require GPU tests.
+   and obtain any required graph-family approval before committing. Validation
+   requirements apply to the affected behavior. Documentation changes do not
+   require GPU tests.
 2. Read the staged checklist with `git show :docs/design-review.md`. When changing
    this document, stage the intended version before reviewing and acknowledging it.
-3. Compute SHA-256 over the exact staged document bytes and take its first two
+   Also read the staged prose skill with
+   `git show :.agents/skills/repo-prose/SKILL.md` and apply it to the staged prose
+   and final commit message.
+3. Review the final commit message body against the four-part scheme in principle
+   16. Read it independently of the diff and confirm that each answer is explicit
+   and in the required order. Check the stated validation and material limitations
+   against the work performed. **Do not add the design acknowledgment until the
+   message passes this review.** Rewrite failures and review the revised message.
+   Adding headings or an acknowledgment does not repair missing explanations.
+4. Compute SHA-256 over the exact staged document bytes and take its first two
    bytes as four lowercase hex characters:
 
    ```sh
@@ -149,7 +178,7 @@ before committing; a design acknowledgment cannot authorize them.
    PY
    ```
 
-4. Add exactly one acknowledgment to the final commit-message trailer block,
+5. Add exactly one acknowledgment to the final commit-message trailer block,
    separated from the body by a blank line:
 
    ```text
@@ -157,9 +186,12 @@ before committing; a design acknowledgment cannot authorize them.
    ```
 
    Use the reviewing agent's name and model, or the human reviewer's identity.
-   The acknowledgment means: **I read the staged checklist, reviewed the staged
-   diff against every applicable principle, found no unapproved design violations,
-   and accurately disclosed validation and material limitations.**
+   The acknowledgment means: **I read the staged checklist and prose skill,
+   reviewed the staged diff and final commit message against every applicable
+   principle, verified that the commit message body explains the rationale,
+   exact change, claimed benefit or result, and supporting evidence in that
+   order, found no unapproved design violations, and accurately disclosed
+   validation and material limitations.**
 
 Read and review before acknowledging. Do not automatically insert the footer or
 copy an acknowledgment from another commit. A missing or rejected acknowledgment

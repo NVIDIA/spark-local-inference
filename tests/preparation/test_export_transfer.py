@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native export transfers preserve authenticated channels and atomic cache publication."""
 
 from contextlib import ExitStack
@@ -19,8 +22,8 @@ import pytest
 
 from ignition.preparation import host_ranks
 from ignition.preparation.checkpoint_source import BLOCK_BYTES, Channel
-from ignition.preparation.package_file import container_header, read_sources, write_sources
-from ignition.preparation.runtime_package_pb2 import BundleIndex, ModelIndex, Span
+from ignition.preparation.core_file import container_header, read_sources, write_sources
+from ignition.preparation.runtime_core_pb2 import BundleIndex, ModelIndex, Span
 
 
 def sockets(stack):
@@ -40,7 +43,7 @@ def channels(stack, count):
     return roots, peers
 
 
-def package(path):
+def core(path):
     return SimpleNamespace(native_output=flare_heliopause.NativeRankOutput.from_sources(path), memory_inventory={})
 
 
@@ -132,7 +135,7 @@ def transfer(path, destination, cache, *, streams=4, no_weights=False):
     with ExitStack() as stack:
         control, peer = sockets(stack)
         roots, peers = channels(stack, streams)
-        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, package(path), {}, channels=peers),
+        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, core(path), {}, channels=peers),
                                   [peer, *(channel.connection for channel in peers)])
         receiving_error = None
         try:
@@ -179,7 +182,7 @@ def description(path):
         data = Path(name).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         files[name] = dict(size=len(data), sha256=digest, blob=Path(name).name == digest + '.safetensors')
-    return dict(version=1, output=output, files=files, inventory={})
+    return dict(version=2, output=output, files=files, inventory={})
 
 
 def assert_contents(path, contents):
@@ -189,6 +192,19 @@ def assert_contents(path, contents):
         with Path(location).open('rb') as source:
             source.seek(offset)
             assert source.read(size) == contents[name]
+
+
+def test_export_rejects_unsupported_transfer_protocol(tmp_path):
+    path, _ = manifest(tmp_path / 'peer', 1)
+    document = description(path)
+    document['version'] = 1
+    with ExitStack() as stack:
+        control, peer = sockets(stack)
+        roots, _ = channels(stack, 1)
+        control_send(peer, document)
+        with pytest.raises(RuntimeError, match='incompatible native rank export protocol version'):
+            receive(control, roots, tmp_path / 'received.json', tmp_path / 'cache')
+    assert not (tmp_path / 'received.json').exists()
 
 
 @pytest.mark.parametrize('streams', [1, 4, 8])
@@ -209,7 +225,7 @@ def test_export_rejects_management_payload_fallback(tmp_path):
     with ExitStack() as stack:
         control, _ = sockets(stack)
         with pytest.raises(RuntimeError, match='established fabric channels'):
-            host_ranks.send_export_sources(control, package(path), {}, channels=[])
+            host_ranks.send_export_sources(control, core(path), {}, channels=[])
         request = dict(control_fd=control.fileno(), channels=[], destination=str(tmp_path / 'rank.json'))
         stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
         try:
@@ -236,7 +252,7 @@ def test_export_stage_retention_requires_a_live_stage(tmp_path):
 def test_export_requires_retained_socket_owners(tmp_path):
     path, _ = manifest(tmp_path / 'peer', 1)
     with pytest.raises(ValueError, match='retained socket owners'):
-        flare_heliopause.export_send_rank(package(path).native_output, '{}', -1, '[]', None)
+        flare_heliopause.export_send_rank(core(path).native_output, '{}', -1, '[]', None)
     stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
     try:
         with pytest.raises(ValueError, match='retained socket owners'):
@@ -287,7 +303,7 @@ def test_large_export_frames_progress_with_scarce_descriptors(tmp_path, disconne
         bundle.allocations.add(name=str(index), file=str(index))
     path = tmp_path / 'peer.json'
     write_sources(path, ModelIndex(version=4, ranks=[bundle]), payload)
-    prepared = package(path)
+    prepared = core(path)
     limits = resource.getrlimit(resource.RLIMIT_NOFILE)
     with ExitStack() as stack:
         control, peer = sockets(stack)
@@ -372,7 +388,7 @@ def test_export_rejects_sources_changed_after_metadata_scan(tmp_path, change):
     with ExitStack() as stack:
         control, peer = sockets(stack)
         roots, peers = channels(stack, 4)
-        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, package(path), {}, channels=peers),
+        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, core(path), {}, channels=peers),
                                   [peer, *(channel.connection for channel in peers)])
         document = control_receive(control)
         name = next(iter(document['files']))
@@ -386,7 +402,7 @@ def test_export_rejects_sources_changed_after_metadata_scan(tmp_path, change):
         else:
             with target.open('r+b') as source:
                 source.write(b'changed')
-        control_send(control, dict(version=1, files=[name]))
+        control_send(control, dict(version=2, files=[name]))
         with pytest.raises(ConnectionError):
             roots[0].receive()
         thread.join(5)
@@ -406,7 +422,7 @@ def test_checkpoint_completion_hands_authenticated_channel_to_native_export(tmp_
         assert client.channel.received == server.channel.sent
         before = (client.channel.sent, client.channel.received)
         control, peer = sockets(stack)
-        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, package(path), {}, channels=[client.channel]),
+        thread, failures = launch(lambda: host_ranks.send_export_sources(peer, core(path), {}, channels=[client.channel]),
                                   [peer, client.channel.connection])
         report = receive(control, [server.channel], tmp_path / 'root.json', tmp_path / 'root-cache')
         thread.join(5)

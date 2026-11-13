@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Live DeepSeek V4 Flash Vision requests through the native HTTP service.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_DEEPSEEK4_TEST_URL to a Flare service
-loaded with a V4 Flash Vision package, concurrency four, and a 4096-token
+loaded with a V4 Flash Vision core, concurrency four, and a 4096-token
 prefill chunk. Run with DSpark enabled and with --mtp-draft-tokens 0.
 """
 

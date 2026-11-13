@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Concurrent requests through a Qwen service loaded with mixed target graphs.
 
 Use FLARE_RUN_CUDA_TESTS=1 and FLARE_SCHEDULER_TEST_URL for an idle service

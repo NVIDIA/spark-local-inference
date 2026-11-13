@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture gated compression and cache publication beside query preparation."""
 
 from types import SimpleNamespace
@@ -12,11 +15,18 @@ from ignition.components.rotary import _rotate
 from ignition.preparation.tuning import register_finalizer
 
 
-@torch.library.custom_op("flare::start_compressor_chain", mutates_args=("outputs", "caches"))
+@torch.library.custom_op("flare::start_compressor_chain", mutates_args=("borrowed", "outputs", "caches"))
 def _start(source: torch.Tensor, weights: list[torch.Tensor], history: list[torch.Tensor],
            metadata: list[torch.Tensor], positions: torch.Tensor, frequencies: torch.Tensor, angles: torch.Tensor | None,
-           slots: torch.Tensor, outputs: list[torch.Tensor], caches: list[torch.Tensor],
+           slots: torch.Tensor, borrowed: list[torch.Tensor], outputs: list[torch.Tensor], caches: list[torch.Tensor],
            plans: list[int], ratio: int, eps: float, stream: int) -> None:
+    inputs = [source, *metadata, positions, slots]
+    if angles is not None:
+        inputs.append(angles)
+    for destination, value in zip(borrowed, inputs, strict=True):
+        destination.copy_(value)
+    source, metadata, positions, slots = borrowed[0], borrowed[1:6], borrowed[6], borrowed[7]
+    angles = None if angles is None else borrowed[8]
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
     auxiliary.wait_stream(torch.cuda.current_stream(source.device))
     batch = SimpleNamespace(**dict(zip(
@@ -50,19 +60,20 @@ def _start(source: torch.Tensor, weights: list[torch.Tensor], history: list[torc
 
 
 @_start.register_fake
-def _start_fake(source, weights, history, metadata, positions, frequencies, angles, slots, outputs, caches,
+def _start_fake(source, weights, history, metadata, positions, frequencies, angles, slots, borrowed, outputs, caches,
                 plans, ratio, eps, stream):
     pass
 
 
 @torch.library.custom_op("flare::join_compressor_chain", mutates_args=("outputs", "caches"))
-def _join(source: torch.Tensor, dependencies: list[torch.Tensor], angles: torch.Tensor | None, outputs: list[torch.Tensor],
+def _join(borrowed: list[torch.Tensor], dependencies: list[torch.Tensor], operands: list[torch.Tensor], outputs: list[torch.Tensor],
           caches: list[torch.Tensor], stream: int) -> None:
+    source = borrowed[0]
     torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
 
 
 @_join.register_fake
-def _join_fake(source, dependencies, angles, outputs, caches, stream):
+def _join_fake(borrowed, dependencies, operands, outputs, caches, stream):
     pass
 
 
@@ -114,9 +125,29 @@ class ConcurrentGatedCompression:
         if any(plan.memory_requirements().scratch_nbytes for plan in self.side_plans):
             raise ValueError("compressor overlap requires scratch-free selected side-branch plans")
 
-    def start(self, source):
-        _start(source, self.weights, self.history, self.metadata, self.positions, self.frequencies, self.angles,
-               self.slots, self.outputs, self.caches, self.plans, self.ratio, self.eps, self.stream_handle)
+    def functional(self, *, session):
+        self.output_layouts = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in self.outputs)
+        register_finalizer(session, self._release_examples)
+        return self
 
-    def finish(self, source, dependencies):
-        _join(source, dependencies, self.angles, self.outputs, self.caches, self.stream_handle)
+    def _release_examples(self):
+        self.outputs = self.metadata = self.positions = self.slots = self.angles = None
+
+    def start(self, source, metadata=None, positions=None, slots=None, *, angles=None):
+        outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+                   for shape, stride, dtype in self.output_layouts]
+        m = metadata
+        operands = [m.requests, m.positions, m.starts, m.query_start_loc, m.state_rows]
+        inputs = [source, *operands, positions, slots]
+        if angles is not None:
+            inputs.append(angles)
+        borrowed = [torch.empty_like(value) for value in inputs]
+        _start(source, self.weights, self.history, operands, positions, self.frequencies, angles,
+               slots, borrowed, outputs, self.caches, self.plans, self.ratio, self.eps, self.stream_handle)
+        return borrowed, outputs
+
+    def finish(self, pending, dependencies):
+        borrowed, outputs = pending
+        _join(borrowed, dependencies, [*self.weights, *self.history, self.frequencies],
+              outputs, self.caches, self.stream_handle)
+        return outputs

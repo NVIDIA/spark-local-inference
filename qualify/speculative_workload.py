@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Freeze stochastic HTTP inputs and paired execution order for speculation.
 
 The authored fixtures contain recorded conversations, never benchmark-generated
@@ -213,6 +216,17 @@ def template_input(request):
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be a JSON object")
             call["function"]["arguments"] = arguments
+    response_format = request.get("response_format", {})
+    if response_format.get("type") == "json_schema":
+        schema = json_bytes(response_format["json_schema"]["schema"]).decode()
+        instruction = (
+            "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\n"
+            f"JSON schema:\n{schema}"
+        )
+        if messages and messages[0]["role"] == "system":
+            messages[0]["content"] += "\n\n" + instruction
+        else:
+            messages.insert(0, _message("system", instruction))
     options = deepcopy(request["chat_template_kwargs"])
     options["tools"] = [] if request.get("tool_choice") == "none" else deepcopy(request["tools"])
     return messages, options

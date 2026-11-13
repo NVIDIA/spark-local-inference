@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Kimi KDA verification commits only the accepted recurrent and convolution prefix."""
 
 import os
@@ -12,7 +15,9 @@ cuda = pytest.mark.skipif(os.getenv("FLARE_RUN_CUDA_TESTS") != "1", reason="requ
 
 @cuda
 @torch.no_grad()
-def test_checkpoint_kda_verification_commits_only_accepted_prefix():
+def test_checkpoint_kda_verification_commits_only_accepted_prefix(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     from ignition.components.kda_speculation import KDARecords, PreparedKDAReplay
     from ignition.components.parallel import TensorParallelShard
     from ignition.components.recurrent import DeltaMetadata
@@ -52,7 +57,7 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
         verify = PreparedKDA(w, source, state, verify_meta, mode="verify", eps=1e-5,
             session=session, name="verify", workspace=arena, buffers=buffers, records=records.layer(0))
         replay = PreparedKDAReplay(pool.backing, [state.recurrent], records, verify.plan,
-            verify_meta.state_indices[:, 0], session=session, workspace=arena)
+            session=session).functional()
         session.tune(show_progress=False)
         for meta, tokens in ((verify_meta, 8), (decode_meta, 1)):
             meta.query_start_loc[1] = tokens
@@ -61,8 +66,8 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             meta.num_seqs.fill_(1)
             meta.num_tokens.fill_(tokens)
         def verify_commit():
-            verify(source)
-            replay(counts)
+            verify(source, verify_meta, records=records.layer(0))
+            replay(counts, records, verify_meta)
             torch.library.wrap_triton(_commit_convolution)[(1, 1, 18)](
                 pool.backing.view(torch.bfloat16), offsets, verify_meta.state_indices[:, 0], counts,
                 pool.layout.row_bytes // 2, 2304, 10, 128)
@@ -74,16 +79,16 @@ def test_checkpoint_kda_verification_commits_only_accepted_prefix():
             compiled()
         pool.backing.zero_()
         for i in range(3):
-            decode(source[i:i+1])
+            decode(source[i:i+1], decode_meta)
         initial = pool.backing.clone()
         initial_recurrent = state.recurrent.clone()
         expected, outputs = [], []
         for i in range(8):
-            outputs.append(decode(source[i:i+1]).clone())
+            outputs.append(decode(source[i:i+1], decode_meta).clone())
             expected.append((state.convolution[1, :, :3].clone(), state.recurrent[1].clone()))
         for count in range(1, 9):
             pool.backing.copy_(initial)
-            actual = verify(source).clone()
+            actual = verify(source, verify_meta, records=records.layer(0)).clone()
             torch.testing.assert_close(state.recurrent, initial_recurrent, rtol=0, atol=0)
             counts.fill_(count)
             pool.backing.copy_(initial)

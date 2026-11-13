@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Immutable content-addressed payload publication with hash-before-write reuse.
 
 use super::{
@@ -75,6 +80,7 @@ impl BlobStore {
             },
         );
     }
+    #[cfg(test)]
     pub(crate) fn put(
         &self,
         size: u64,
@@ -93,7 +99,7 @@ impl BlobStore {
         mut fill: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<PreparedBlob> {
         if size == 0 || size > MAX_PUBLISHED_BLOB_BYTES - 4096 {
-            return Err("package resource exceeds the 64 GB payload shard limit".into());
+            return Err("core resource exceeds the 64 GB payload shard limit".into());
         }
         let header = container_header(size, 0, "flare-data")?;
         let expected = self.budget.hash_generated(size, &header, &mut fill)?;
@@ -243,6 +249,7 @@ impl BlobStore {
         self.remember(name.to_owned(), file, identity.clone());
         Ok(identity)
     }
+    #[cfg(test)]
     pub(crate) fn link(&self, name: &str, directory: &Path) -> Result<()> {
         if !archive::blob_name(name) {
             return Err("invalid payload blob name".into());
@@ -272,15 +279,12 @@ impl BlobStore {
             }
             Err(e) if e.raw_os_error() == Some(18) => {
                 return Err(
-                    "package snapshot and blob cache must be on the same filesystem".into(),
+                    "core snapshot and blob cache must be on the same filesystem".into(),
                 );
             }
             Err(e) => return Err(e.into()),
         }
         Ok(())
-    }
-    pub(crate) fn sync(&self) -> Result<()> {
-        archive::sync_directory(&self.root)
     }
 }
 
@@ -347,9 +351,11 @@ fn readonly(file: &File) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn same_inode(first: &File, second: &File) -> Result<bool> {
     Ok(Identity::of(first)?.same_file(&Identity::of(second)?))
 }
+#[cfg(test)]
 fn same_content_identity(first: &Identity, second: &Identity) -> bool {
     first.same_content(second)
 }
@@ -362,6 +368,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     }
     text
 }
+#[cfg(test)]
 fn decode_digest(text: &str) -> Result<[u8; 32]> {
     let mut digest = [0; 32];
     if text.len() != 64 {

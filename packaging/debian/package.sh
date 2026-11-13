@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 : "${PACKAGE_VERSION:?package version is required}"
@@ -10,16 +14,17 @@ arch=$(dpkg --print-architecture)
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 chmod 0755 "$stage"
-install -Dm755 flare/target/release/flare "$stage/usr/bin/flare"
+install -Dm755 flare-cli/target/release/flare "$stage/usr/bin/flare"
 docs="$stage/usr/share/doc/flare-inference"
 install -Dm644 packaging/debian/copyright "$docs/copyright"
-install -m644 LICENSE NOTICE "$docs/"
+install -m644 LICENSE NOTICE THIRD_PARTY_NOTICES.md "$docs/"
+install -d "$docs/licenses"
+install -m644 helios/licenses/*.txt "$docs/licenses/"
 install -m644 packaging/debian/README "$docs/README.Debian"
 install -Dm644 packaging/debian/lintian-overrides "$stage/usr/share/lintian/overrides/flare-inference"
 install -Dm644 packaging/debian/flare.1 "$stage/usr/share/man/man1/flare.1"
 gzip -n -9 "$stage/usr/share/man/man1/flare.1"
-python3 packaging/debian/licenses.py "$docs/third-party-licenses"
-find "$docs/third-party-licenses" -type f -exec gzip -n -9 '{}' +
+python3 packaging/debian/licenses.py "$docs/third_party/rust"
 printf 'Source-Commit: %s\nRust: %s\n' "$SOURCE_COMMIT" "$(rustc --version)" > "$docs/build-info"
 date_text=$(date -u -d "@$SOURCE_DATE_EPOCH" -R)
 cat > "$docs/changelog.Debian" <<EOF
@@ -52,7 +57,7 @@ Installed-Size: $installed_size
 Depends: $dependencies, ca-certificates
 Section: utils
 Priority: optional
-Homepage: https://github.com/NVIDIA/flare-local-inference
+Homepage: https://github.com/NVIDIA/spark-local-inference
 Description: native inference server for prepared Flare model packages
  Runs prepared CUDA graphs on supported NVIDIA GPUs. Includes the Flare
  command, the host agent, and Orbit multi-host management. ARM64 builds

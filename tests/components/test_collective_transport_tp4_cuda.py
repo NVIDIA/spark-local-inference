@@ -1,4 +1,7 @@
-"""Package-owned TP4 reductions across retained graph variants and native replay."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Core-owned TP4 reductions across retained graph variants and native replay."""
 
 from datetime import timedelta
 import os
@@ -13,7 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-pytestmark = pytest.mark.skipif(
+_gpu_only = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
     reason="requires four assigned CUDA devices and FLARE_RUN_TP_CUDA_TESTS=1",
 )
@@ -31,17 +34,28 @@ def _operands(rows, columns, step):
 
 
 def _selected_query(operation):
-    plan = operation.plan
-    return plan.query.alternatives[plan.selection.config.implementation]
+    query = operation.plan.prepared.state.query
+    return dict(surface=query.surface, call=dict(query.call))
 
 
 def _expected(values, rank, query):
     surface = query["surface"]
     assert surface in ("OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"), surface
-    transport = query["call"]["transport"] if surface == "OneshotAllReduce.all_reduce" else None
-    if surface == "OneshotAllReduce.all_reduce":
-        assert transport in ("pull", "tp4_push_sentinel", "tp4_push_rsag"), transport
-    if transport in ("tp4_push_sentinel", "tp4_push_rsag"):
+    transport = query["call"]["transport"]
+    if surface == "PCIeTwoShotBF16.all_reduce":
+        assert transport in ("push", "pull"), transport
+        transport = "bulk_" + transport
+    else:
+        if transport in ("joint_latency", "joint_bandwidth"):
+            mode = query["call"]["submode"]
+            modes = (("full", "payload_rsag", "pull") if transport == "joint_latency"
+                     else ("payload_rsag", "bulk_push", "bulk_pull", "pull"))
+            assert mode in modes, (transport, mode)
+            transport = {"full": "remote_push_full", "payload_rsag": "remote_push_rsag"}.get(mode, mode)
+        else:
+            assert transport in ("pull", "remote_push_full", "remote_push_rsag"), transport
+    bulk = transport in ("bulk_push", "bulk_pull")
+    if transport in ("remote_push_full", "remote_push_rsag"):
         values = [value.clone() for value in values]
         for value in values:
             bits = value.view(torch.int16)
@@ -49,19 +63,20 @@ def _expected(values, rank, query):
     cyclic = []
     for first in range(4):
         value = values[first].float()
-        if surface == "PCIeTwoShotBF16.all_reduce":
+        if bulk:
             value = torch.zeros_like(value) + value
         for offset in range(1, 4):
             value = value + values[(first + offset) % 4].float()
         cyclic.append(value.bfloat16())
-    if surface == "PCIeTwoShotBF16.all_reduce" or transport == "tp4_push_rsag":
-        # Each quarter is summed once by its owner, then copied to every rank.
+    if bulk or transport == "remote_push_rsag":
         elements = values[0].numel()
-        assert elements % 32 == 0
-        quarter = elements // 4
-        parts = [cyclic[owner].flatten()[owner * quarter:(owner + 1) * quarter].clone()
+        assert elements % 8 == 0
+        packs = elements // 8
+        shard = ((packs + 3) // 4 if bulk else packs // 4) * 8
+        parts = [cyclic[owner].flatten()[min(elements, owner * shard):
+                 elements if owner == 3 else min(elements, (owner + 1) * shard)].clone()
                  for owner in range(4)]
-        if transport == "tp4_push_rsag":
+        if transport == "remote_push_rsag":
             for owner, part in enumerate(parts):
                 if owner != rank:
                     bits = part.view(torch.int16)
@@ -72,17 +87,51 @@ def _expected(values, rank, query):
 
 def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_transport():
     zeros = [torch.zeros((1, 32), dtype=torch.bfloat16) for _ in range(4)]
-    for transport, bits in (("pull", 0), ("tp4_push_sentinel", -32768), ("tp4_push_rsag", -32768)):
+    for transport, bits in (("pull", 0), ("remote_push_full", -32768), ("remote_push_rsag", -32768)):
         query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport))
         assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
     negative = [value.neg() for value in zeros]
-    query = dict(surface="PCIeTwoShotBF16.all_reduce", call={})
-    assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
+    for transport in ("push", "pull"):
+        query = dict(surface="PCIeTwoShotBF16.all_reduce", call=dict(transport=transport))
+        assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
+    for family, modes in (("joint_latency", ("full", "payload_rsag", "pull")),
+                          ("joint_bandwidth", ("payload_rsag", "bulk_push", "bulk_pull", "pull"))):
+        for mode in modes:
+            query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=family, submode=mode))
+            bits = -32768 if mode in ("full", "payload_rsag") else 0
+            assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
+            bits = 0 if mode.startswith("bulk_") else -32768
+            assert torch.all(_expected(negative, 0, query).view(torch.int16) == bits)
+        with pytest.raises(AssertionError):
+            _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce",
+                                   call=dict(transport=family, submode="unknown")))
     for transport in ("unknown", None):
         with pytest.raises(AssertionError):
             _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport)))
     with pytest.raises(AssertionError):
         _expected(zeros, 0, dict(surface="unknown", call={}))
+    with pytest.raises(AssertionError):
+        _expected(zeros, 0, dict(surface="PCIeTwoShotBF16.all_reduce", call=dict(transport="unknown")))
+
+
+@pytest.mark.parametrize("elements", (8, 40, 72))
+@pytest.mark.parametrize("mode", ("payload_rsag", "bulk_push", "bulk_pull"))
+def test_collective_oracle_preserves_pack_owners_and_cancellation_order(elements, mode):
+    values = [torch.full((elements,), value, dtype=torch.bfloat16)
+              for value in (1e8, 1, -1e8, 1)]
+    query = dict(surface="OneshotAllReduce.all_reduce",
+                 call=dict(transport="joint_bandwidth", submode=mode))
+    packs = elements // 8
+    shard = (packs + 3) // 4 if mode.startswith("bulk_") else packs // 4
+    owners = [min(pack // shard, 3) if shard else 3 for pack in range(packs)]
+    for rank in range(4):
+        expected = torch.tensor([1 if owner % 2 == 0 else 0 for owner in owners], dtype=torch.bfloat16)
+        if mode == "payload_rsag":
+            for index, owner in enumerate(owners):
+                if owner != rank and expected[index] == 0:
+                    expected.view(torch.int16)[index] = -32768
+        assert torch.equal(_expected(values, rank, query).view(torch.int16),
+                           expected.repeat_interleave(8).view(torch.int16))
 
 
 def _rank(rank, rendezvous, directory, widths):
@@ -90,8 +139,8 @@ def _rank(rank, rendezvous, directory, widths):
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.module_images import ModuleImages
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.runtime_package import export_model
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.runtime_core import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -102,7 +151,7 @@ def _rank(rank, rendezvous, directory, widths):
     runtime = worker = None
     graphs = {}
     try:
-        with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
+        with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=max_rows,
                 hidden_size=max(widths), ipc=storage.peer_storage)
@@ -141,7 +190,7 @@ def _rank(rank, rendezvous, directory, widths):
                 session.freeze()
 
                 # Both transports must use the same explicit VMM ownership path
-                # that the runtime-package exporter uses for peer resources.
+                # that the runtime-core exporter uses for peer resources.
                 peer = storage.peer_storage
                 assert len(peer.owned) >= 2 and len(peer.imported) >= 6
                 for address, size in peer.owned.items():
@@ -158,7 +207,7 @@ def _rank(rank, rendezvous, directory, widths):
 
                 buffers = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device)}
+                    "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device=device)}
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{width}-{rows}": value
                                 for (width, rows), value in outputs.items()})
@@ -166,17 +215,17 @@ def _rank(rank, rendezvous, directory, widths):
                     signatures={name: GraphSignature("decode", 1, 1) for name in graphs}, max_active=1,
                     resources=(runtime, session, stream, storage, operations, sources, outputs))
                 bundle.server_config = {}
-                bundle.package_data = None
+                bundle.core_data = None
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 peer.reset()
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 # Stage a tiny unsigned rank bundle, not a model checkpoint.
-                package = export_model(bundle, images, storage,
+                core = export_model(bundle, images, storage,
                     directory / f"rank-{rank}.json", options={}, bundle_only=True, sources=True)
-                assert package.export_counts["modules"] > 0
-                exported = {(allocation.address, allocation.nbytes) for allocation in package.allocations
+                assert core.export_counts["modules"] > 0
+                exported = {(allocation.address, allocation.nbytes) for allocation in core.allocations
                             if allocation.memory == "peer"}
                 assert exported == set(peer.imported.items())
                 worker = bundle.start_executor()
@@ -230,27 +279,29 @@ def _rank(rank, rendezvous, directory, widths):
 
 
 @pytest.mark.parametrize("widths", [(4096, 5120), (2560,)], ids=["4096-5120", "qwen-2560"])
-def test_package_owned_tp4_collective_graph_variants(tmp_path, widths):
+@_gpu_only
+def test_core_owned_tp4_collective_graph_variants(tmp_path, widths):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
     mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths), nprocs=4, join=True)
 
 
+@_gpu_only
 def test_exported_tp4_collectives_replay_after_preparation_exit(tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     root = Path(__file__).resolve().parents[2]
     target = Path(os.environ.get("CARGO_TARGET_DIR", root / "helios" / "target"))
     subprocess.run(["cargo", "build", "-j", "4", "--manifest-path", str(root / "helios/Cargo.toml"),
-        "--no-default-features", "--features", "runtime-package,test-tools", "--bin", "test_fixed_runtime_package"],
+        "--no-default-features", "--features", "runtime-core,test-tools", "--bin", "test_fixed_runtime_core"],
         cwd=root, check=True, timeout=600)
-    result = subprocess.run([sys.executable, str(root / "helios/tests/collective_package_fixture.py"),
+    result = subprocess.run([sys.executable, str(root / "helios/tests/collective_core_fixture.py"),
         str(tmp_path)], cwd=root, text=True, capture_output=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "all four preparation ranks exited" in result.stdout
     print(result.stdout, end="")
     # subprocess.run waits for the Python exporter; the Rust reader independently
     # rejects any still-live recorded preparation PID before initializing CUDA.
-    result = subprocess.run([str(target / "debug/test_fixed_runtime_package"), str(tmp_path), "--tp4-collective"],
+    result = subprocess.run([str(target / "debug/test_fixed_runtime_core"), str(tmp_path), "--tp4-collective"],
         cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "native TP4 collective package replay passed after Python exit" in result.stdout
+    assert "native TP4 collective core replay passed after Python exit" in result.stdout

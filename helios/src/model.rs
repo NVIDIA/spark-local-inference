@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Shared execution of prepared storage and graph-input contracts.
 
 pub mod admission;
@@ -5,6 +11,8 @@ pub mod catalog;
 pub mod contract;
 pub(crate) mod inputs;
 mod packing;
+#[cfg(kani)]
+mod kani_proofs;
 #[cfg(feature = "server")]
 mod prompt;
 
@@ -18,16 +26,16 @@ pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
 #[cfg(feature = "server")]
-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output};
+pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, reasoning_delimiter_tokens};
 #[cfg(feature = "server")]
 pub(crate) use prompt::validate_conditioned_inputs;
 
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +87,7 @@ impl VisionCapabilities {
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
+    pub completion_token_capacity: usize,
     pub max_top_logprobs: usize,
     pub logprob_token_id_capacity: usize,
     /// Context extent of captured page tables and workspaces; serving may use a smaller limit.
@@ -95,7 +104,7 @@ pub struct ModelConfig {
     pub speculative_fixed_width: Option<usize>,
     /// Maximum target-token rows in wider speculative graphs.
     pub speculative_token_capacity: usize,
-    /// Bytes of weights one decode step reads for one request, as the package declares; zero
+    /// Bytes of weights one decode step reads for one request, as the core declares; zero
     /// when it declares none.
     pub decode_weight_bytes: u64,
     pub history_drafts: bool,
@@ -132,11 +141,11 @@ impl Default for SamplingParameters {
 }
 
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,11 +164,11 @@ impl<T: Copy> SamplingRange<T> {
 }
 
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "server", feature = "runtime-package"),
+    any(feature = "server", feature = "runtime-core"),
     serde(default, deny_unknown_fields)
 )]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -294,6 +303,7 @@ pub struct PreparedInput {
 
 pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
     SchedulerCapabilities {
+        completion_token_capacity: config.completion_token_capacity,
         vocabulary: config.contract.vocabulary,
         page_tokens: config.contract.cache.page_tokens,
         vision: config.contract.vision.clone(),
@@ -331,6 +341,9 @@ pub fn scheduler_capabilities_with_manifest(
     manifest: &ExecutionManifest,
 ) -> Result<SchedulerCapabilities> {
     use contract::ValueSource;
+    if config.completion_token_capacity != manifest.completion_token_capacity {
+        return Err("model completion capacity differs from its execution manifest".into());
+    }
     let mut capabilities = scheduler_capabilities(config);
     for graph in &manifest.graphs {
         let semantics = config.contract.graph(&graph.name)?;
@@ -366,7 +379,7 @@ pub fn validate_completion(
 ) -> Result<()> {
     if ((record.status == 1 || record.status == 2)
         && record.token_id >= config.contract.vocabulary as i64)
-        || record.vector.is_some_and(|v| {
+        || record.vector.as_ref().is_some_and(|v| {
             v.model_reserved != -1
                 || v.tokens
                     .iter()

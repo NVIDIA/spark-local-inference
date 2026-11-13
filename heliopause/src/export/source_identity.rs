@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Source compatibility identity for preparation metadata.
 
 use std::{
@@ -10,7 +16,10 @@ use sha2::{Digest, Sha256};
 
 use super::{Result, invalid};
 
-fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect(directory: &Path, files: &mut Vec<PathBuf>, excluded: &[PathBuf]) -> Result<()> {
+    if excluded.iter().any(|path| path == directory) {
+        return Ok(());
+    }
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error)
@@ -29,7 +38,7 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            collect(&path, files)?;
+            collect(&path, files, excluded)?;
         } else if path.is_file()
             && path
                 .extension()
@@ -59,11 +68,15 @@ fn sort_key(path: &Path) -> Result<Vec<String>> {
 }
 
 pub(crate) fn source_identity(roots: &[PathBuf]) -> Result<String> {
+    source_identity_excluding(roots, &[])
+}
+
+pub(crate) fn source_identity_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 << 10];
     for root in roots {
         let mut files = Vec::new();
-        collect(root, &mut files)?;
+        collect(root, &mut files, excluded)?;
         let mut files = files
             .into_iter()
             .map(|path| Ok((sort_key(&path)?, path)))

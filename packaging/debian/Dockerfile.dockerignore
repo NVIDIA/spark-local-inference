@@ -1,9 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 **
 !flare/
 !flare/Cargo.toml
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!flare-cli/
+!flare-cli/Cargo.toml
+!flare-cli/Cargo.lock
+!flare-cli/src/
+!flare-cli/src/**
+!selene/
+!selene/Cargo.toml
+!selene/Cargo.lock
+!selene/build.rs
+!selene/examples/
+!selene/examples/**
+!selene/proto/
+!selene/proto/**
+!selene/src/
+!selene/src/**
+!selene-manager/
+!selene-manager/Cargo.toml
+!selene-manager/tests/
+!selene-manager/tests/**
+!selene-manager/src/
+!selene-manager/src/**
+!eos/
+!eos/Cargo.toml
+!eos/Cargo.lock
+!eos/src/
+!eos/src/**
 !helios/
 !helios/Cargo.toml
 !helios/build.rs
@@ -17,8 +47,16 @@
 !ignition/recipes/qwen38/assets/**
 !ignition/recipes/step5/assets/
 !ignition/recipes/step5/assets/**
+!ignition/recipes/kimi3/assets/
+!ignition/recipes/kimi3/assets/**
 !LICENSE
 !NOTICE
+!THIRD_PARTY_NOTICES.md
+!helios/licenses/
+!helios/licenses/PyTorch.txt
 !packaging/
+!packaging/licenses.py
+!packaging/license-supplements/
+!packaging/license-supplements/**
 !packaging/debian/
 !packaging/debian/**

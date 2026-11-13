@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native rank fanout, b12x agreement, and coordinated completion without Python peer steps."""
 
 import os
@@ -207,7 +211,7 @@ def _rank(rank, world, rendezvous, sockets, fields, compilation):
                 connection.close()
 
 
-@pytest.mark.parametrize("world,fields", [(2, 8), (4, 24)])
+@pytest.mark.parametrize("world,fields", [(2, 32), (4, 32)])
 @pytest.mark.parametrize("compilation", ["lowered", "aot", "parallel"])
 def test_native_rank_coordination(world, fields, compilation, tmp_path, monkeypatch):
     assert os.environ.get("CUDA_VISIBLE_DEVICES") and torch.cuda.device_count() == 4
@@ -215,6 +219,157 @@ def test_native_rank_coordination(world, fields, compilation, tmp_path, monkeypa
     sockets = [socket.socketpair() for _ in range(world - 1)]
     processes = mp.spawn(_rank, args=(world, (tmp_path / "rendezvous").as_uri(), sockets, fields, compilation),
                          nprocs=world, join=False)
+    for pair in sockets:
+        for connection in pair:
+            connection.close()
+    while not processes.join(timeout=1):
+        pass
+
+
+def _startup_rank(rank, world, rendezvous, sockets, fail_peer):
+    from ignition.components.collectives import PreparedAllReduce
+    from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
+    from ignition.preparation.execution import GraphSignature, PreparedExecution, TunedBinding, TuningGraph
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    peers = []
+    for index, (root, peer) in enumerate(sockets, start=1):
+        if rank == 0:
+            peers.append(root)
+            peer.close()
+        else:
+            root.close()
+            if rank == index:
+                connection = peer
+            else:
+                peer.close()
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world,
+                            timeout=timedelta(minutes=2))
+    coordinator = CollectivePreparation(dist.group.WORLD)
+    runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1, hidden_size=8)
+    worker, captured = None, []
+    try:
+        source = torch.full((1, 8), rank + 1, dtype=torch.bfloat16, device=device)
+        reduced = torch.empty_like(source)
+        buffers = {name: torch.zeros(1, dtype=torch.int32, device=device)
+                   for name in ("selector", "startup_count", "startup_status", "startup_failure",
+                                "request_value", "first_output", "second_output", "replay_count", "output_sum")}
+        if fail_peer and rank == 1:
+            buffers["startup_failure"].fill_(17)
+        buffers.update(frame_index=torch.zeros(1, dtype=torch.int32, device=device),
+                       submission_sequence=torch.zeros(1, dtype=torch.int64, device=device),
+                       completion_records=torch.zeros((2, 1, 32), dtype=torch.int64, device=device))
+        with RecordedPreparationSession(device=device, checkpoint="process-startup-tuning",
+                workload_schema="shared-selector", numerical_policy="exact-integer-sum",
+                coordinator=coordinator) as session:
+            reduction = PreparedAllReduce(source, reduced, runtime=runtime, session=session,
+                coordinator=coordinator, name="startup-sum")
+            session.tune(show_progress=False)
+            source.fill_(rank + 1)
+
+            def produce():
+                reduction(source)
+                buffers["selector"].copy_(reduced.flatten()[:1].to(torch.int32))
+                buffers["startup_count"].add_(1)
+                buffers["startup_status"].copy_(buffers["startup_failure"])
+
+            def consume(output):
+                output.copy_(buffers["selector"] * 11 + buffers["request_value"])
+                buffers["output_sum"].add_(output)
+                buffers["replay_count"].add_(1)
+
+            producer = torch.compile(produce, fullgraph=True)
+            consumer = torch.compile(consume, fullgraph=True)
+            producer()
+            for name in ("first", "second"):
+                consumer(buffers[f"{name}_output"])
+            torch.cuda.synchronize(device)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            pool = torch.cuda.graph_pool_handle()
+            dist.barrier()
+            startup = torch.cuda.CUDAGraph()
+            with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(startup, stream=stream, pool=pool):
+                producer()
+            captured.append(startup)
+            graphs = {}
+            for name in ("first", "second"):
+                graph = torch.cuda.CUDAGraph()
+                with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(graph, stream=stream, pool=pool):
+                    consumer(buffers[f"{name}_output"])
+                captured.append(graph)
+                graphs[name] = graph
+            session.freeze()
+            prepared = PreparedExecution(device=rank, graphs=graphs, buffers=buffers, max_active=1,
+                signatures={name: GraphSignature("decode", 1, 1, ("request_value",)) for name in graphs},
+                tuning_graphs={"choose-selector": TuningGraph(graph=startup,
+                    outputs=("selector", "startup_count"), status_buffer="startup_status")},
+                tuned_bindings={name: (TunedBinding(buffer="selector", tuning_graph="choose-selector"),)
+                                for name in graphs},
+                resources=(runtime, session, reduction, source, reduced, producer, consumer, stream))
+            for name in ("selector", "startup_count", "startup_status", "first_output", "second_output",
+                         "replay_count", "output_sum"):
+                buffers[name].zero_()
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            before = torch.cuda.memory_stats(device)
+            expected_selector = world * (world + 1) // 2
+            if rank:
+                prepared.serve_rank(connection, rank=rank, world=world)
+            elif fail_peer:
+                with pytest.raises(RuntimeError, match="status 17"):
+                    prepared.start_executor(peers=peers)
+            else:
+                worker = prepared.start_executor(peers=peers)
+                assert buffers["selector"].item() == expected_selector
+                assert buffers["startup_count"].item() == 1
+                for name, value in (("first", 2), ("second", 3), ("first", 5), ("second", 9)):
+                    payload = torch.tensor([value], dtype=torch.int32).numpy().tobytes()
+                    ticket = worker.submit(prepared.graph_indices[name], [("request_value", 0, payload)])
+                    assert ticket is not None
+                    deadline = time.monotonic() + 30
+                    completion = None
+                    while completion is None and time.monotonic() < deadline:
+                        completion = worker.poll()
+                        if completion is None:
+                            time.sleep(.001)
+                    assert completion is not None and completion.fence == ticket
+                    assert buffers[f"{name}_output"].item() == expected_selector * 11 + value
+                    assert buffers["startup_count"].item() == 1
+                worker.close()
+                assert worker.drained
+                worker = None
+            after = torch.cuda.memory_stats(device)
+            for key in ("allocation.all.allocated", "allocation.all.freed", "segment.all.allocated", "segment.all.freed"):
+                assert before[key] == after[key], key
+            assert buffers["selector"].item() == expected_selector
+            assert buffers["startup_count"].item() == 1
+            assert buffers["startup_status"].item() == (17 if fail_peer and rank == 1 else 0)
+            assert buffers["replay_count"].item() == (0 if fail_peer else 4)
+            assert buffers["first_output"].item() == (0 if fail_peer else expected_selector * 11 + 5)
+            assert buffers["second_output"].item() == (0 if fail_peer else expected_selector * 11 + 9)
+            assert buffers["output_sum"].item() == (0 if fail_peer else expected_selector * 44 + 19)
+    finally:
+        if worker is not None:
+            worker.close()
+        for graph in captured:
+            graph.reset()
+        runtime.close()
+        dist.destroy_process_group()
+        for pair in sockets:
+            for connection in pair:
+                connection.close()
+
+
+@pytest.mark.parametrize("world", (2, 4))
+@pytest.mark.parametrize("fail_peer", (False, True), ids=("shared-producer", "peer-status-failure"))
+def test_native_process_startup_tuning(world, fail_peer, tmp_path):
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") and torch.cuda.device_count() == 4
+    sockets = [socket.socketpair() for _ in range(world - 1)]
+    processes = mp.spawn(_startup_rank,
+        args=(world, (tmp_path / "rendezvous").as_uri(), sockets, fail_peer), nprocs=world, join=False)
     for pair in sockets:
         for connection in pair:
             connection.close()

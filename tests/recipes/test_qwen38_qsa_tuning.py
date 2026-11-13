@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """QSA candidate races use active private inputs with the serving tensor ABI."""
 
 import gc
@@ -117,7 +120,7 @@ def test_qwen_qsa_request_tunes_active_candidates_and_replays(rows, batch):
     rotary = RotaryTables(torch.ones(context, 32, device=device), torch.zeros(context, 32, device=device),
                           torch.zeros(32, device=device, dtype=torch.int64))
     workspace = ScratchArena(device)
-    session = preparation_session(device=device, checkpoint="qsa-benchmark-test", autotune_effort="medium")
+    session = preparation_session(device=device, checkpoint="qsa-benchmark-test", autotune_effort="default")
     session.configure_compile_workers(2)
     try:
         attention = PreparedAttention(module, weights, source, scratch, state, metadata, rotary,

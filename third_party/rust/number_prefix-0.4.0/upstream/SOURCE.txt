@@ -1,0 +1,2 @@
+License text omitted from the published crate; copied verbatim from its recorded upstream revision.
+https://github.com/ogham/rust-number-prefix/blob/eb6ebd215d50df1b199737f0356b988bebaedc84/LICENCE

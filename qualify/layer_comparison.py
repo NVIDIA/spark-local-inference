@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure Qwen decoder boundaries on identical teacher-forced contexts.
 
 Layer tensors contain all 48 residual outputs, with shape [48,rows,10240].

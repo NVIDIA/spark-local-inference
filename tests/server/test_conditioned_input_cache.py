@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native conditioned-input reuse through GPU, memory, and disk prefix caches.
 
-Uses the GPU assignment and compatible package configured for
-test_prefix_cache_offload.py. Build flare/target/release/flare before running.
+Uses the GPU assignment and compatible core configured for
+test_prefix_cache_offload.py. Build flare-cli/target/release/flare before running.
 """
 
 import base64

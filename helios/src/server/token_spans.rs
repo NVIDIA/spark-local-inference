@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Attribute delayed decoder text to its tokens without retaining prefix copies.
 
 use crate::{Result, execution::TokenLogprobs, frontend::{Frontend, IncrementalDecoder}};

@@ -1,0 +1,49 @@
+[package]
+name = "flare-cli"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[features]
+# Multi-host collectives on Linux x86_64; links libibverbs.
+roce = ["flare-helios/roce", "flare/roce"]
+# The prefix cache pool's data channel may use RDMA when its manager offers it (experimental).
+rdma = ["flare-helios/rdma", "flare/rdma"]
+
+[profile.release]
+strip = "symbols"
+
+[[bin]]
+name = "flare"
+path = "src/main.rs"
+
+[dependencies]
+flare = { path = "../flare" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4.6", features = ["derive"] }
+flare-helios = { path = "../helios", features = ["runtime-core", "server"] }
+libc = "0.2.189"
+serde_json = "1.0"
+sha2 = "0.10.9"
+# Orbit agents fetch authenticated core chunks over HTTP.
+ureq = "3"
+libloading = "0.8.9"
+# Fleet control signs grants and encrypts agent sessions with the ring Helios already links.
+ring = "0.17.14"
+socket2 = "0.6"
+tempfile = "3"
+
+[dev-dependencies]
+prost = "0.14"
+
+# DGX Spark and Grace hosts serve multi-host cores over RoCEnante, which links libibverbs.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+flare-helios = { path = "../helios", features = ["runtime-core", "server", "roce"] }
+# sha2 0.10 gates ARM SHA-256 instructions behind its asm feature.
+sha2 = { version = "0.10.9", features = ["asm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization"] }

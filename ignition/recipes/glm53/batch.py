@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Fixed native uploads and captured request metadata for GLM text forwards."""
 
 from dataclasses import dataclass
@@ -59,27 +63,31 @@ class PreparedBatch:
             raise ValueError("GLM batches require positive cache capacity and a 154880-token vocabulary")
         self.inputs, self.requests, self.metadata = inputs, requests, metadata
         self.rows, self.tokens, self.pages, self.mode, self.shard = rows, tokens, pages, mode, shard
+        self.blocks = inputs.page_tables.shape[1]
+        self.sample_count = metadata.sample_indices.numel()
+        self.verification_columns = metadata.recurrent.state_indices.shape[1]
         from .dcp import ContextShards
 
         self.shards = ContextShards() if shards is None else shards
         self.validate_prefill = validate_prefill
-        device = metadata.token_ids.device
-        self.row_ids = torch.arange(rows, device=device)
-        self.slot_ids = torch.arange(self.capacity, device=device)
-        self.token_offsets = torch.arange(tokens, device=device)
-        self.block_ids = torch.arange(inputs.page_tables.shape[1], device=device)
-        self.validation_input = torch.zeros((1, max(8, 2 * self.capacity)), dtype=torch.bfloat16, device=device)
-        self.validation_sum = torch.zeros_like(self.validation_input)
-        self.present = torch.zeros(self.capacity, dtype=torch.bool, device=device)
         self.token_state = PreparedTokenState(requests, metadata.token_ids, metadata.recurrent.query_start_loc,
             inputs.row_slot_ids[:rows], inputs.row_generations[:rows], inputs.live_rows)
         self.token_state.prepare()
+
+    def functional(self):
+        self.token_state.functional()
+        self.metadata = None
+        return self
 
     def validate(self):
         b, r = self.inputs, self.requests
         slots = b.row_slot_ids[:self.rows].long()
         safe_slots = slots.clamp(0, self.capacity - 1)
-        resident = (self.row_ids < b.live_rows) & (slots >= 0) & (slots < self.capacity)
+        row_ids = torch.arange(self.rows, device=r.generation.device)
+        slot_ids = torch.arange(self.capacity, device=r.generation.device)
+        block_ids = torch.arange(b.page_tables.shape[1], device=r.generation.device)
+        token_offsets = torch.arange(self.tokens, device=r.generation.device)
+        resident = (row_ids < b.live_rows) & (slots >= 0) & (slots < self.capacity)
         resident &= b.row_generations[:self.rows] == r.generation[safe_slots]
         duplicate = ((slots[:, None] == slots[None, :]) & resident[:, None] & resident[None, :]).sum(1) > 1
         lengths = b.query_lengths[:self.rows] if self.mode == "prefill" else torch.ones_like(safe_slots)
@@ -90,11 +98,11 @@ class PreparedBatch:
         valid &= (positions >= 0) & (ends <= b.page_tables.shape[1] * page_tokens)
         pages = b.page_tables[safe_slots]
         valid &= (((pages >= 0) & (pages < self.pages))
-                  | (self.block_ids >= (ends[:, None] + page_tokens - 1) // page_tokens)).all(1)
+                  | (block_ids >= (ends[:, None] + page_tokens - 1) // page_tokens)).all(1)
         pending = r.pending_token[safe_slots]
         uploaded = b.token_ids[:self.tokens]
         if self.mode == "prefill":
-            invalid_tokens = ((uploaded < 0) | (uploaded >= r.vocab_size)) & (self.token_offsets < lengths[0])
+            invalid_tokens = ((uploaded < 0) | (uploaded >= r.vocab_size)) & (token_offsets < lengths[0])
             valid &= (pending < 0) & ~invalid_tokens.any()
             if self.validate_prefill is not None:
                 valid &= self.validate_prefill(uploaded, lengths)
@@ -102,53 +110,61 @@ class PreparedBatch:
             valid &= (pending >= 0) & (pending < r.vocab_size)
         present = resident & (r.status[safe_slots] == RUNNING)
         bad = present & ~valid
-        bad_slots = ((self.slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
-        self.present.copy_(((self.slot_ids[:, None] == slots[None, :]) & present[None, :]).any(1))
-        self.validation_input[0, :self.capacity].copy_(bad_slots)
-        self.validation_input[0, self.capacity:2 * self.capacity].copy_(self.present)
-        return self.validation_input
+        bad_slots = ((slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
+        present_slots = ((slot_ids[:, None] == slots[None, :]) & present[None, :]).any(1)
+        validation_input = torch.zeros((1, max(8, 2 * self.capacity)), dtype=torch.bfloat16,
+                                       device=r.generation.device)
+        validation_input[0, :self.capacity].copy_(bad_slots)
+        validation_input[0, self.capacity:2 * self.capacity].copy_(present_slots)
+        return validation_input, present_slots
 
-    def begin(self, validation_sum):
+    def begin(self, validation_sum, present):
         participants = validation_sum[0, self.capacity:2 * self.capacity]
         mismatch = (participants > 0) & (participants < self.shard.world_size)
-        bad_slots = self.present & ((validation_sum[0, :self.capacity] > 0) | mismatch)
+        bad_slots = present & ((validation_sum[0, :self.capacity] > 0) | mismatch)
         self.requests.status.copy_(torch.where(bad_slots, ERROR, self.requests.status))
         self.requests.error_code.copy_(torch.where(bad_slots, 32, self.requests.error_code))
-        self.token_state.gather()
-        b, m, t = self.inputs, self.metadata, self.token_state
-        g, index = m.recurrent, m.indexed
+        pending_tokens, positions, _, active_rows = self.token_state.gather()
+        b = self.inputs
         slots = b.row_slot_ids[:self.rows].long()
-        active = t.active.bool()
+        active = active_rows.bool()
         lengths = b.query_lengths[:self.rows] if self.mode == "prefill" else torch.ones_like(b.query_lengths[:self.rows])
         lengths = torch.where(active, lengths, 0)
         ends = lengths.cumsum(0, dtype=torch.int32)
         starts = ends - lengths
-        g.query_start_loc[0].zero_()
-        g.query_start_loc[1:].copy_(ends)
+        token_offsets = torch.arange(self.tokens, device=ends.device)
+        request = (token_offsets[:, None] >= ends[None, :]).sum(1).clamp(max=self.rows - 1)
+        live_token = token_offsets < ends[-1]
+        position = positions[request] + token_offsets - starts[request]
+        tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else pending_tokens[request]
+        metadata = DecoderMetadata.allocate(self.tokens, self.rows, self.blocks, self.inputs.token_ids.device,
+            samples=self.sample_count, verification_columns=self.verification_columns)
+        g, index = metadata.recurrent, metadata.indexed
+        query_start_loc = torch.cat((torch.zeros((1,), dtype=torch.int32, device=ends.device), ends))
         state = b.request_state_rows[slots.clamp(0, self.capacity - 1), 0]
+        pages = torch.where(active[:, None], b.page_tables[slots.clamp(0, self.capacity - 1)], -1)
+        g.query_start_loc.copy_(query_start_loc)
         g.convolution_slots.copy_(torch.where(active, state, -1))
-        g.fresh.copy_(active & (t.positions == 0))
+        g.fresh.copy_(active & (positions == 0))
         g.accepted_tokens.fill_(1)
-        g.state_indices[:, 0].copy_(torch.where(active, state, 0))
-        g.initial_state_indices.copy_(torch.where(active & (t.positions > 0), state, 0))
+        state_columns = torch.zeros_like(g.state_indices)
+        state_columns[:, 0] = torch.where(active, state, 0)
+        g.state_indices.copy_(state_columns)
+        g.initial_state_indices.copy_(torch.where(active & (positions > 0), state, 0))
         g.final_state_indices.copy_(torch.where(active, state, 0))
         g.checkpoint_state_indices.zero_()
         g.checkpoint_offsets.zero_()
         g.num_seqs.copy_(b.live_rows.clamp(0, self.rows))
         g.num_tokens.copy_(ends[-1:])
-        m.sample_indices.copy_((ends - 1).clamp(min=0))
-        index.query_start_loc.copy_(g.query_start_loc)
+        metadata.sample_indices.copy_((ends - 1).clamp(min=0))
+        index.query_start_loc.copy_(query_start_loc)
         index.state_slots.copy_(g.convolution_slots)
-        index.block_table.copy_(torch.where(active[:, None], b.page_tables[slots.clamp(0, self.capacity - 1)], -1))
-        request = (self.token_offsets[:, None] >= ends[None, :]).sum(1).clamp(max=self.rows - 1)
-        live_token = self.token_offsets < ends[-1]
-        position = t.positions[request] + self.token_offsets - starts[request]
+        index.block_table.copy_(pages)
         index.requests.copy_(torch.where(live_token, request, 0))
         index.positions.copy_(torch.where(live_token, position, -1))
-        index.token_slots.copy_(torch.where(live_token,
-            self.shards.token_slots(position, index.block_table[request]), -1))
-        tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else t.pending_tokens[request]
-        m.token_ids.copy_(torch.where(live_token, tokens, 0))
+        index.token_slots.copy_(torch.where(live_token, self.shards.token_slots(position, pages[request]), -1))
+        metadata.token_ids.copy_(torch.where(live_token, tokens, 0))
+        return metadata
 
-    def finish(self):
-        self.token_state.consume()
+    def finish(self, metadata):
+        self.token_state.consume(metadata.token_ids, metadata.recurrent.query_start_loc)

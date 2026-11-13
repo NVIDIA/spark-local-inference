@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
 use flare_helios::{frontend, model, scheduler};
 #[path = "support/frontend.rs"]
@@ -44,7 +50,10 @@ fn numeric_effort_matches_python_reference_bytes_and_checkpoint_token_ids() {
         )
         .unwrap();
     assert_eq!(prompt.text, fixture["rendered"].as_str().unwrap());
-    assert_eq!(serde_json::to_value(prompt.token_ids).unwrap(), fixture["token_ids"]);
+    assert_eq!(
+        serde_json::to_value(prompt.token_ids).unwrap(),
+        fixture["token_ids"]
+    );
 }
 
 #[test]
@@ -77,7 +86,7 @@ fn official_encoder_renders_and_initializes_native_output_state() {
     .unwrap();
     let mut canonical = Conversation {
         messages: vec![InputMessage::User {
-            content: "Hello".into(),
+            content: deepseek_recipe_core::prompt::Prompt::plain("Hello"),
             image_sources: vec![],
         }],
         ..Default::default()
@@ -89,11 +98,15 @@ fn official_encoder_renders_and_initializes_native_output_state() {
     assert_eq!(
         prompt.text,
         DeepseekV41Encoding::new()
-            .render_conversation(&canonical, &[])
+            .render_conversation(&canonical)
             .prompt
     );
     assert!(prompt.text.contains("Reasoning Effort: 75"));
     assert!(!prompt.token_ids.is_empty());
+    let delimiters =
+        model::reasoning_delimiter_tokens(&frontend, &support::contract("deepseek41").frontend)
+            .unwrap();
+    assert_eq!(delimiters, [(128821, "<think>".to_owned()), (128822, "</think>".to_owned())]);
     let output = flare_helios::model::prepare_output(
         &support::model_config(support::contract("deepseek41")),
         &frontend,
@@ -101,16 +114,18 @@ fn official_encoder_renders_and_initializes_native_output_state() {
         &messages,
         &options,
         false,
+        &delimiters,
     )
     .unwrap();
     assert!((output.content.start == flare_helios::output::tagged::OutputStart::Reasoning));
+    assert!(output.control_tokens.contains(&(128825, "｜DSML｜".to_owned())));
     options.insert("enable_thinking".into(), false.into());
     let prompt = frontend.render_chat(&messages, &options).unwrap();
     canonical.thinking_mode = false;
     assert_eq!(
         prompt.text,
         DeepseekV41Encoding::new()
-            .render_conversation(&canonical, &[])
+            .render_conversation(&canonical)
             .prompt
     );
     assert!(!prompt.text.contains("Reasoning Effort:"));
@@ -121,6 +136,7 @@ fn official_encoder_renders_and_initializes_native_output_state() {
         &messages,
         &options,
         false,
+        &delimiters,
     )
     .unwrap();
     assert!(!(output.content.start == flare_helios::output::tagged::OutputStart::Reasoning));

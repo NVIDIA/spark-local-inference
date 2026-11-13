@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Captured GLM vision tower with canonical blocks and prepared projections."""
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from transformers.models.glm5_next.modeling_glm5_next import (
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.preparation.persistent import persistent_copy
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,7 @@ class VisionWeights:
                 parameters[path] = loader.load_tensor("model.visual." + path)
         # Patch rows are ordered [merge_h, merge_w, channel]. Conv2d stores
         # weights as [out, channel, merge_h, merge_w]; transpose once at load.
-        downsample = parameters["downsample.weight"].permute(0, 2, 3, 1).reshape(4096, 4096).contiguous()
+        downsample = persistent_copy(parameters["downsample.weight"].permute(0, 2, 3, 1).reshape(4096, 4096))
         return cls(parameters, projections, downsample)
 
 
@@ -114,17 +118,23 @@ class _Attention(torch.nn.Module):
         self.attention = shared.attention if shared is not None else PreparedVarlenAttention(
             scratch.query, scratch.key, scratch.value, metadata.cu_seqlens,
             scratch.attention.view_as(scratch.query), session=session, workspace=attention_workspace, name=name)
+        self.owns_attention = shared is None
+
+    def functional(self, *, session):
+        self.qkv.functional(session=session)
+        self.proj.functional(session=session)
+        if self.owns_attention:
+            self.attention.functional(session=session)
+        self.scratch = None
+        return self
 
     def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
-        s = self.scratch
         projected = self.qkv(hidden_states).view(-1, 3, 16, 64)
         query, key = apply_rotary_pos_emb_vision(self.q_norm(projected[:, 0]), self.k_norm(projected[:, 1]),
                                                *position_embeddings)
-        s.query.copy_(query)
-        s.key.copy_(key)
-        s.value.copy_(projected[:, 2])
-        self.attention()
-        return self.proj(s.attention)
+        attended = self.attention(query.contiguous(), key.contiguous(), projected[:, 2].contiguous(),
+                                  cu_seqlens)
+        return self.proj(attended.view(hidden_states.shape[0], 1024))
 
 
 class PreparedVision:
@@ -183,17 +193,28 @@ class PreparedVision:
                 weights.projections[f"merger.{key}"], output,
                 session=session, name=f"{name}.merger.{key}",
                 activation_mode="auto", bias=original.bias, workspace=projection_workspace)))
-        self.output_rows = torch.arange(capacity // 4, device=device)
+        self.capacity = capacity
 
-    def __call__(self, pixels):
-        module, scratch, metadata = self.module, self.scratch, self.metadata
-        scratch.patches.copy_(pixels)
-        hidden = self.patch_embed(scratch.patches)
+    def functional(self, *, session):
+        self.patch_embed.projection.functional(session=session)
+        for block in self.module.blocks:
+            block.attn.functional(session=session)
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                getattr(block.mlp, name).projection.functional(session=session)
+        self.downsample.projection.functional(session=session)
+        for name in ("proj", "gate_proj", "up_proj", "down_proj"):
+            getattr(self.module.merger, name).projection.functional(session=session)
+        self.scratch = self.metadata = None
+        return self
+
+    def __call__(self, pixels, metadata):
+        module = self.module
+        hidden = self.patch_embed(pixels)
         rope = module.rotary_pos_emb(hidden, metadata.position_ids)
         for block in module.blocks:
             hidden = block(hidden, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope)
         hidden = module.post_layernorm(hidden)
         hidden = self.downsample(hidden.view(-1, 4096))
         output = module.merger(hidden)
-        output.masked_fill_((self.output_rows >= metadata.num_patches // 4)[:, None], 0)
+        output.masked_fill_((torch.arange(self.capacity // 4, device=pixels.device) >= metadata.num_patches // 4)[:, None], 0)
         return output

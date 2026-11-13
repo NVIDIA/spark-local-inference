@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CPU binding-lifetime checks around batched preparation selection."""
 
 from types import SimpleNamespace
@@ -60,6 +63,9 @@ class Session:
     def declare(self, requests, *, coordinator=None):
         for request in requests:
             self.requests[request.name] = request
+
+    def release_benchmark_cache(self):
+        pass
 
     def finalize(self):
         for arena in self.arenas:
@@ -257,11 +263,12 @@ def test_vision_benchmark_owns_active_operands_and_aliases_follow_selected_bindi
     assert owner.attention.scratch.data_ptr() == grown.data_ptr()
     assert owner.attention.scratch.shape == (32,)
     launches = []
-    monkeypatch.setattr(varlen_attention, "_attention", lambda *args: launches.append(args))
+    monkeypatch.setattr(varlen_attention.varlen, "run_out", lambda *args, **kwargs: launches.append((args, kwargs)))
     for operator in (owner, *aliases):
         assert operator.attention() is owner.attention.out
     assert len(launches) == 3
-    assert all(args[5] is owner.attention.scratch and args[7] == 123 for args in launches)
+    assert all(kwargs["scratch"] is owner.attention.scratch and kwargs["plan"] is plan
+               for _, kwargs in launches)
 
 
 def test_vision_private_producer_preserves_padded_operand_strides():

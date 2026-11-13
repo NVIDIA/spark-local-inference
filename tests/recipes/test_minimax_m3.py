@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MiniMax M3 checkpoint precision, logical pages, and continuation geometry."""
 
 import json
@@ -198,8 +201,8 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
     import ignition.preparation.rank_group as rank_group
 
     rendezvous = SimpleNamespace(hosts=("rank0", "rank1", "rank2", "rank3"))
-    plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="high", tuning_replica=None,
-        native_dense_activations=True,
+    plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="audit", tuning_replica=None,
+        native_dense_activations=True, collective_tuning="static", collective_ladder=None, lock_gpu_clocks=False,
         image_concurrency=4, language_model_only=False, world_size=4, roce_ring=False,
         context=1048576, concurrency=4, prefill_chunk=4096, snapshots=4,
         costs=RECIPE.ranks[4], headroom_bytes=8 << 30, reserve_bytes=4 << 30,
@@ -219,7 +222,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
     assert result["config"].vision and result["config"].dspark
     assert result["config"].prefill_chunk_size == 4096
     assert result["config"].speculative_token_capacity == 32
-    assert result["config"].autotune_effort == "high"
+    assert result["config"].autotune_effort == "audit"
     assert result["config"].native_dense_activations
     assert result["config"].packed_verification
     assert result["config"].draft_prefix_selection == "gpu"
@@ -229,7 +232,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
 @pytest.mark.parametrize("vision", [False, True])
 def test_contract_preserves_cache_planes_and_complete_round_bindings(vision):
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
     from ignition.preparation.execution import GraphSignature
     from ignition.recipes.minimax_m3.contract import prepare
     from ignition.recipes.minimax_m3.frontend import FRONTEND

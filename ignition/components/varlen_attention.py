@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared variable-length attention with explicit compiler-visible storage."""
 
 from functools import partial
@@ -5,45 +8,10 @@ from functools import partial
 import torch
 from b12x.attention import varlen
 from b12x.preparation import PreparedCall
-from b12x.preparation.types import plan_from_handle
 
 from ignition.preparation.fixtures import varlen_attention as fixtures
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
-
-
-@torch.library.custom_op("flare::varlen_attention", mutates_args=("out", "scratch"))
-def _attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu: torch.Tensor,
-    out: torch.Tensor,
-    scratch: torch.Tensor,
-    sink: torch.Tensor | None,
-    handle: int,
-    max_seqlen: int,
-) -> None:
-    binding = varlen.bind(
-        plan_from_handle(handle),
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=q.shape[-1] ** -0.5,
-        causal=False,
-        attention_sink_bias=sink,
-        scratch=scratch,
-    )
-    values, _ = varlen.run(binding)
-    out.copy_(values)
-
-
-@_attention.register_fake
-def _fake_attention(q, k, v, cu, out, scratch, sink, handle, max_seqlen):
-    pass
 
 
 class PreparedVarlenAttention:
@@ -59,6 +27,7 @@ class PreparedVarlenAttention:
         self.plan = varlen.plan(q, k, v, cu, max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen,
                                causal=False, window_size=window, attention_sink_bias=sink, **arithmetic)
         arguments = {
+            "out": out,
             "q": q,
             "k": k,
             "v": v,
@@ -84,7 +53,8 @@ class PreparedVarlenAttention:
                     name=name,
                     prepare_call=prepare,
                     benchmark_call=partial(fixtures.benchmark_call, arguments=arguments, workspace=workspace,
-                        inputs=fixtures.input_factory(arguments, storage=getattr(session, "benchmark_storage", None))),
+                        inputs=fixtures.input_factory(arguments, storage=getattr(session, "benchmark_storage", None),
+                                                      session=session)),
                 ),
             ),
         )
@@ -93,6 +63,23 @@ class PreparedVarlenAttention:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
-    def __call__(self):
-        _attention(self.q, self.k, self.v, self.cu, self.out, self.scratch, self.sink, self.plan.handle, self.max_seqlen)
-        return self.out
+    def functional(self, *, session):
+        self.output_layout = (tuple(self.out.shape), tuple(self.out.stride()), self.out.dtype)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.q = self.k = self.v = self.cu = self.out = self.workspace = self.scratch = None
+
+    def __call__(self, q=None, k=None, v=None, cu=None):
+        if self.out is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=q.device).zero_()
+            scratch, = (torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in self.scratch_layout)
+        else:
+            q, k, v, cu, output, scratch = self.q, self.k, self.v, self.cu, self.out, self.scratch
+        varlen.run_out(q, k, v, cu, out=output,
+            scratch=scratch, plan=self.plan, attention_sink_bias=self.sink,
+            max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen)
+        return output

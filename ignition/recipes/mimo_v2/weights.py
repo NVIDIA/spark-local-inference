@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MiMo checkpoint transfers preserving MXFP4 experts and FP32 block scales."""
 
 from dataclasses import dataclass

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Target feedback capture preserves row means and accepted-tail order in native replay."""
 
 import os
@@ -9,7 +12,6 @@ from ignition.components.dspark import PreparedFeedbackCapture
 from ignition.components.paged_batch import Metadata
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an assigned CUDA device")
@@ -21,19 +23,20 @@ def test_feedback_capture_alternates_native_capacities_without_allocation():
     torch.manual_seed(2167)
     source = torch.randn((8192, 4, 4096), device=device, dtype=torch.bfloat16)
     seed = source.clone()
-    buffers = GraphBufferPool(device)
     variants, graphs, owners = {}, {}, []
     for capacity in (8192, 4096, 256, 128, 8):
         metadata = Metadata.allocate(capacity, 1, 1, device)
-        capture = PreparedFeedbackCapture(metadata, 3 * 4096, buffers.cursor(), compact_prefill=True)
+        capture = PreparedFeedbackCapture(metadata, 3 * 4096, compact_prefill=True)
+        observed = torch.empty(capture.shape, dtype=torch.bfloat16, device=device)
         inputs = source[:capacity]
 
-        def forward(inputs=inputs, capture=capture):
-            capture.begin()
+        def forward(inputs=inputs, capture=capture, metadata=metadata, observed=observed):
+            state = capture.begin(metadata)
             for column in range(3):
-                capture(inputs, column * 4096)
+                capture(state, inputs, column * 4096)
                 # Subsequent target layers replace the residual before their feedback is captured.
                 inputs.add_(.125)
+            observed.copy_(state[0])
 
         compiled = compile_forward(forward)
         compiled()
@@ -42,14 +45,14 @@ def test_feedback_capture_alternates_native_capacities_without_allocation():
             compiled()
         key = str(capacity)
         graphs[key] = graph
-        variants[capacity] = metadata, capture
+        variants[capacity] = metadata, observed
         owners.append(compiled)
     bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={"source": source},
-                                 resources=(variants, buffers, owners))
+                                 resources=(variants, owners))
     worker = bundle.start_worker()
     try:
         for capacity in (8192, 8, 4096, 128, 256, 8192):
-            metadata, capture = variants[capacity]
+            metadata, observed = variants[capacity]
             counts = sorted({0, 1, min(127, capacity), min(128, capacity),
                              min(129, capacity), capacity - 7, capacity})
             for step, count in enumerate(counts):
@@ -61,7 +64,7 @@ def test_feedback_capture_alternates_native_capacities_without_allocation():
                 metadata.positions[begin:begin + count].copy_(
                     torch.arange(start, start + count, device=device))
                 reference = seed[:capacity].clone()
-                expected = torch.empty_like(capture.output)
+                expected = torch.empty_like(observed)
                 for column in range(3):
                     means = reference.float().mean(1).bfloat16()
                     target = expected[:, column * 4096:(column + 1) * 4096]
@@ -73,10 +76,7 @@ def test_feedback_capture_alternates_native_capacities_without_allocation():
                         target.copy_(means)
                     reference.add_(.125)
                 source.copy_(seed)
-                capture.output.fill_(float("nan"))
-                if capture.indices is not None:
-                    capture.indices.fill_(-999)
-                    capture.live.fill_(True)
+                observed.fill_(float("nan"))
                 torch.cuda.synchronize()
                 before = torch.cuda.memory_stats()
                 ticket = worker.submit(bundle.graph_indices[str(capacity)])
@@ -86,7 +86,7 @@ def test_feedback_capture_alternates_native_capacities_without_allocation():
                 for key in ("allocation.all.allocated", "allocation.all.freed",
                             "segment.all.allocated", "segment.all.freed"):
                     assert before[key] == after[key]
-                torch.testing.assert_close(capture.output, expected, rtol=0, atol=0)
+                torch.testing.assert_close(observed, expected, rtol=0, atol=0)
                 torch.testing.assert_close(source[:capacity], reference, rtol=0, atol=0)
     finally:
         worker.close()

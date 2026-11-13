@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -6,8 +12,10 @@ use std::time::Instant;
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde_json::{Value as Json, json};
 
+#[cfg_attr(test, allow(dead_code, unused_imports))]
 #[path = "../src/frontend/jinja/mod.rs"]
 mod jinja;
+#[cfg_attr(test, allow(unused_imports))]
 #[path = "../src/frontend/json.rs"]
 mod json;
 

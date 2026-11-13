@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed catalogs refine physical row budgets independently of proposal depth."""
 
 from fractions import Fraction
@@ -73,7 +76,7 @@ def test_budget_must_cover_mandatory_endpoints(budget):
         packed_speculative_shapes(32, 6, 128, budget)
 
 
-@pytest.mark.parametrize("width", [0, 1, 9, True, 6.0])
+@pytest.mark.parametrize("width", [0, 1, 1 << 31, True, 6.0])
 def test_logical_width_is_a_supported_positive_draft_block(width):
     with pytest.raises(ValueError, match="width"):
         packed_speculative_shapes(32, width)

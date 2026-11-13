@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Streaming canonical text-model reference for the exact mixed-precision checkpoint.
 
 Transformers owns the model, attention, recurrence, PLE, routing, and residual

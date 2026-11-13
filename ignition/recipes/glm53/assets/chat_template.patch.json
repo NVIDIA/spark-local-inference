@@ -1,0 +1,17 @@
+{
+  "source": {
+    "repository": "nvidia/GLM-5.3-Flash-FP4-Local",
+    "revision": "76348ddb2be2e35e39ecfc00e75dc07703f4f3d5",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5",
+  "result_sha256": "1c80fbd2e9e8a2321e06af17f71ec312a012f8597a098726a28b070a061eebde",
+  "insertions": [
+    5251,
+    10049,
+    10172,
+    10467,
+    10712,
+    10853
+  ]
+}

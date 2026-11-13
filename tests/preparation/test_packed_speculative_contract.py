@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed rounds declare proposal depth separately from verifier width and rows."""
 
 import pytest
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.execution import GraphSignature
 from tests.preparation.test_execution import _execution, _tensor
 
@@ -17,14 +20,14 @@ def signature(depth=5, **changes):
 
 
 def test_depth_and_physical_capacity_are_independent():
-    for depth in range(1, 8):
+    for depth in range(1, 16):
         for rows in (32, 64, 96, 128):
             graph = signature(depth, packed_token_capacity=rows)
             assert (graph.draft_tokens, graph.token_capacity, graph.packed_token_capacity) == (depth, 6, rows)
 
 
 @pytest.mark.parametrize("changes", [
-    {"draft_tokens": None}, {"draft_tokens": 0}, {"draft_tokens": 8},
+    {"draft_tokens": None}, {"draft_tokens": 0}, {"draft_tokens": (1 << 31) - 1},
     {"draft_tokens": True}, {"packed_token_capacity": 0}, {"packed_token_capacity": 31},
     {"packed_token_capacity": 193}, {"inputs": ("query_lengths", "speculative_prefix_limits")},
     {"speculation_enabled": False},
@@ -37,7 +40,7 @@ def test_invalid_round_geometry_or_host_query_lengths_are_rejected(changes):
 def test_manifest_preserves_shallow_depth_and_requires_vector_completion(monkeypatch):
     graph = signature(1)
     buffers = {"frame_index": _tensor("int32", (1,)), "submission_sequence": _tensor("int64", (1,)),
-        "completion_records": _tensor("int64", (2, 32, 24))}
+        "completion_records": _tensor("int64", (2, 32, 32))}
     buffers.update((name, _tensor("int32", (32,))) for name in graph.inputs)
     execution = _execution(graphs={"round": object()}, signatures={"round": graph},
                            buffers=buffers, max_active=32)
@@ -46,7 +49,7 @@ def test_manifest_preserves_shallow_depth_and_requires_vector_completion(monkeyp
     manifest = execution.manifest()
     encoded = p.ExecutionGraph(**{k: v for k, v in manifest["graphs"][0].items() if k != "handle"})
     decoded = p.ExecutionGraph.FromString(encoded.SerializeToString())
-    assert manifest["abi_version"] == 4
+    assert manifest["abi_version"] == 6
     assert (decoded.draft_tokens, decoded.verify_tokens, decoded.packed_token_capacity) == (1, 6, 128)
     assert decoded.draft_source == p.MTP
     assert decoded.confidence_width == 1

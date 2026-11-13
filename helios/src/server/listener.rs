@@ -1,12 +1,22 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use axum::serve::Listener;
 use std::{io, net::SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
 
-pub(super) struct HttpListener(TcpListener);
+pub(super) struct HttpListener(TcpListener, bool);
 
 impl HttpListener {
+    #[cfg(test)]
     pub(super) fn new(listener: TcpListener) -> Self {
-        Self(listener)
+        Self::with_diagnostics(listener, true)
+    }
+
+    pub(super) fn with_diagnostics(listener: TcpListener, log_to_stderr: bool) -> Self {
+        Self(listener, log_to_stderr)
     }
 }
 
@@ -20,9 +30,9 @@ impl Listener for HttpListener {
             match stream.set_nodelay(true) {
                 Ok(()) => return (stream, peer),
                 Err(error) => {
-                    eprintln!(
+                    if self.1 { eprintln!(
                         "rejecting HTTP connection from {peer}: cannot set TCP_NODELAY: {error}"
-                    );
+                    ); }
                 }
             }
         }

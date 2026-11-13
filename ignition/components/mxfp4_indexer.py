@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared MXFP4 sparse selection and hierarchical candidate sharing."""
 
 import torch
@@ -73,9 +77,11 @@ class PreparedMXFP4Indexer:
         self.plan = dsa.plan(caps, invocation=dsa.invocation_from_tensors(caps, **self.arguments))
         self.workspace = workspace
 
+        declaration = self.arguments
+
         def prepare(state):
             scratch = planned_scratch(state.layout.scratch_specs(), workspace)
-            inputs = acquire_inputs(state, self.arguments, session)
+            inputs = acquire_inputs(state, declaration, session)
             arguments = inputs.arguments
             binding = state.bind(scratch=scratch, **arguments)
             def run():
@@ -84,7 +90,7 @@ class PreparedMXFP4Indexer:
             return PreparedCall(run=run, owners=prime_owners(workspace, inputs, scratch, binding))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare,
-            benchmark_call=partial(benchmark_call, arguments=self.arguments, session=session, workspace=workspace)),))
+            benchmark_call=partial(benchmark_call, arguments=declaration, session=session, workspace=workspace)),))
         register_finalizer(session, self.rebind, workspace=workspace)
 
     def rebind(self):
@@ -93,7 +99,30 @@ class PreparedMXFP4Indexer:
     def write_keys(self, keys, slots):
         _write(keys, self.cache, slots, self.plan.handle)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.layouts = {key: None if value is None else (tuple(value.shape), tuple(value.stride()), value.dtype)
+                       for key, value in self.arguments.items()
+                       if key in ("q_mxfp4", "q_scales", "output_indices", "candidate_output", "candidate_output_lengths")}
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.query = self.output = self.packed = self.scales = self.arguments = self.workspace = self.scratch = None
+
+    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None, *, candidates=None, counts=None):
+        if self.arguments is None:
+            def allocate(name, fill):
+                layout = self.layouts[name]
+                return None if layout is None else torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=query.device).fill_(fill)
+            packed, scales = allocate("q_mxfp4", 0), allocate("q_scales", 127)
+            output = allocate("output_indices", -1)
+            candidates_out, counts_out = allocate("candidate_output", -1), allocate("candidate_output_lengths", 0)
+            scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+            _quantize(query, packed, scales, self.plan.handle)
+            _select(packed, scales, weights, self.cache, pages, lengths, active, output, scratch,
+                    candidates, counts, candidates_out, counts_out, self.plan.handle)
+            return output if candidates_out is None else (output, candidates_out, counts_out)
         _quantize(self.query, self.packed, self.scales, self.plan.handle)
         a = self.arguments
         _select(self.packed, self.scales, a["query_weights"], self.cache, a["page_table"],

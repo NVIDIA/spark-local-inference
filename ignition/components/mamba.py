@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared Mamba-2 scans and FlashInfer selective state updates."""
 
 from dataclasses import dataclass, replace
@@ -11,7 +14,7 @@ from ignition.preparation.fixtures.recurrent import (
     BenchmarkStateArena, RecurrentBenchmarkInputs, _benchmark_state_key,
 )
 from ignition.preparation.scratch import planned_scratch
-from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare
 
 from .native_operator import native_contract, native_plan
 
@@ -32,9 +35,10 @@ class PreparedMambaScan:
     """Packed prefill with BF16 inputs and caller-owned recurrent state and scratch."""
 
     def __init__(self, args, *, session, workspace, name):
-        self.args, self.output = _operands(args), args["out"]
-        query = mamba_ssd.query_from_call(*self.args, out=self.output)
-        self.plan = mamba_ssd.plan(query, device=self.output.device)
+        output = args["out"]
+        self.output_shape, self.output_dtype = tuple(output.shape), output.dtype
+        query = mamba_ssd.query_from_call(*_operands(args), out=output)
+        self.plan = mamba_ssd.plan(query, device=output.device)
 
         def benchmark(state):
             operands = _fixture(args, session=session, name=name, mode="prefill")
@@ -45,14 +49,12 @@ class PreparedMambaScan:
 
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
-        register_finalizer(session, lambda: self._bind(workspace), workspace=workspace)
 
-    def _bind(self, workspace):
+    def __call__(self, operands):
+        output = torch.empty(self.output_shape, dtype=self.output_dtype, device=operands["x"].device)
         specs = self.plan.scratch_specs()
-        self.scratch = planned_scratch(specs, workspace) if specs else None
-
-    def __call__(self):
-        return mamba_ssd.run(*self.args, out=self.output, plan=self.plan, workspace=self.scratch)
+        workspace = planned_scratch(specs) if specs else None
+        return mamba_ssd.run(*_operands(operands), out=output, plan=self.plan, workspace=workspace)
 
 
 @dataclass(frozen=True)
@@ -115,24 +117,26 @@ class PreparedMambaUpdate:
     """
 
     def __init__(self, args, *, session, name):
-        self.args, self.output = _operands(args), args["out"]
-        q = mamba_ssd.query_from_call(*self.args, out=self.output)
+        output = args["out"]
+        self.output_shape, self.output_dtype = tuple(output.shape), output.dtype
+        q = mamba_ssd.query_from_call(*_operands(args), out=output)
         if q.max_tokens > q.max_seqs:
             raise ValueError("single-token Mamba update requires at most one token of capacity per sequence")
         if args["dt"].dtype != args["D"].dtype or args["dt"].dtype != args["dt_bias"].dtype:
             raise ValueError("FlashInfer SSU requires dt, D, and dt_bias to share their dtype")
         query = UpdateQuery(q.heads, q.groups, q.head_dim, q.dstate, q.max_seqs, q.max_tokens,
             q.state_dtype, q.dt_dtype, q.index_dtype, q.state_stride, q.x_stride, q.dt_stride, q.b_stride, q.c_stride)
+        device = output.device
 
         def materialize(algorithm):
             from flashinfer.mamba.selective_state_update import get_selective_state_update_module
 
-            module = get_selective_state_update_module(self.output.device,
+            module = get_selective_state_update_module(device,
                 getattr(torch, q.state_dtype), torch.bfloat16, getattr(torch, q.dt_dtype), torch.float32,
                 getattr(torch, q.index_dtype), q.head_dim, q.dstate, 1, torch.int32, torch.int64)
             return UpdateState(module, algorithm)
 
-        self.plan = native_plan(contract=UPDATE_CONTRACT, query=query, device=self.output.device,
+        self.plan = native_plan(contract=UPDATE_CONTRACT, query=query, device=device,
             scratch_bytes=lambda t: 0, materialize=materialize)
 
         def benchmark(state):
@@ -144,6 +148,7 @@ class PreparedMambaUpdate:
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
 
-    def __call__(self):
-        _update(*self.args, self.output, self.plan.handle)
-        return self.output
+    def __call__(self, operands):
+        output = torch.empty(self.output_shape, dtype=self.output_dtype, device=operands["x"].device)
+        _update(*_operands(operands), output, self.plan.handle)
+        return output

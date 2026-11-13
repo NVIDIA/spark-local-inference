@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Restored static reduction winners retain their compiled candidate set."""
 
 import threading
 import pickle
+import copy
 from collections import namedtuple
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -86,6 +91,22 @@ def test_prepared_winner_does_not_reopen_occupancy_search(monkeypatch):
     assert len(tuner.launchers) == len(tuner.compile_results) == 1
     assert tuner.compile_results[0].config is selected
     assert tuner.launchers[0].config.kwargs == {"XBLOCK": 8, "R0_BLOCK": 256}
+
+
+def test_frozen_config_restores_exact_state_after_torch_cache_recheck(monkeypatch):
+    tuner, selected = restored_reduction(monkeypatch)
+    state = copy.deepcopy(vars(selected))
+    tuner.compile_results[0]._flare_config_state = state
+    bundle = SimpleNamespace(static_autotuners=[
+        SimpleNamespace(cache_key='reduction-key', kernel=tuner, kernel_name='restored_reduction')])
+    _freeze_tuning_winners(bundle)
+    future = StaticAutotunerFuture(tuner)
+    future.reload_kernel_from_src = lambda: tuner
+    assert future.result() is tuner
+    assert 'found_by_coordesc' not in state
+    assert vars(selected)['found_by_coordesc'] is False
+    _freeze_tuning_winners(bundle)
+    assert vars(selected) == state
 
 
 @pytest.mark.parametrize("pending", ["multiple", "empty", "coordesc", "combo"])
@@ -212,6 +233,8 @@ def test_artifact_binding_freezes_an_unpickled_entry_before_deserialization(monk
     from torch._inductor.async_compile import CompiledTritonKernels
     from torch._inductor.codecache import code_hash
     from torch._functorch._aot_autograd import aot_autograd_result
+    from torch._functorch._aot_autograd.runtime_wrappers import SerializableCompiledFunction
+    from torch._functorch._aot_autograd.utils import simple_wraps
     from ignition.preparation import aot
     standalone_compile = importlib.import_module('torch._inductor.standalone_compile')
 
@@ -242,7 +265,12 @@ def test_artifact_binding_freezes_an_unpickled_entry_before_deserialization(monk
         frozen = copied.compiled_fw.result._triton_bundle.static_autotuners[0].kernel
         assert frozen.inductor_meta["dynamic_scale_rblock"] is False
         assert "_could_rblock_scale" not in vars(frozen)
-        return SimpleNamespace(serialize=lambda: copied)
+        owner = SerializableCompiledFunction(lambda args: None, lambda: copied)
+        @simple_wraps(owner)
+        def compiled(*args):
+            return owner(list(args))
+        compiled.serialize = owner.serialize
+        return compiled
     monkeypatch.setattr(aot_autograd_result, "deserialize_bundled_cache_entry", deserialize)
     monkeypatch.setattr(standalone_compile, "AOTCompiledArtifact", lambda compiled: compiled)
     with bind_device(f"cuda:{target}", freeze_tuning=True):

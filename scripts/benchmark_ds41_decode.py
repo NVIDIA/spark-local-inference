@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure streamed decode throughput while every request remains active."""
 
 import argparse
@@ -24,8 +27,8 @@ async def request(client, args, lane, repeat, budget, on_tokens=None):
     template = dict(reasoning_effort="low")
     template["enable_thinking" if args.engine == "flare" else "thinking"] = True
     body = dict(
-        model=args.model, messages=[dict(role="user", content=PROMPT)],
-        max_tokens=budget, temperature=1.0, top_p=1.0, top_k=-1,
+        model=args.model, messages=[dict(role="user", content=args.prompt)],
+        max_tokens=budget, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
         seed=1234 + repeat * 16 + lane,
         chat_template_kwargs=template,
         stream=True, stream_options=dict(include_usage=True), return_token_ids=True,
@@ -94,6 +97,7 @@ def summarize(rows):
 
 
 async def main(args):
+    args.prompt = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else PROMPT
     args.output.mkdir(parents=True, exist_ok=True)
     async with httpx.AsyncClient(timeout=httpx.Timeout(1800), trust_env=False) as client:
         for url in [args.url, *args.peer_url]:
@@ -112,7 +116,7 @@ async def main(args):
                 warmup = repeat == -1
                 metrics = (await client.get(args.url + "/metrics")).text
                 rows = await asyncio.gather(*(request(client, args, i, repeat,
-                    128 if warmup else 4096) for i in range(c)))
+                    128 if warmup else args.max_tokens) for i in range(c)))
                 try:
                     measurement = summarize(rows)
                 except RuntimeError:
@@ -144,4 +148,12 @@ if __name__ == "__main__":
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
-    asyncio.run(main(p.parse_args()))
+    p.add_argument("--prompt-file", type=Path, help="UTF-8 user prompt; defaults to the programming task")
+    p.add_argument("--max-tokens", type=int, default=4096, help="measured request output budget")
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=-1)
+    args = p.parse_args()
+    if args.max_tokens < 1:
+        p.error('--max-tokens must be positive')
+    asyncio.run(main(args))

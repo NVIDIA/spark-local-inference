@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """A small fixed scheduler and the graph inputs it packs, mirroring Helios for paged text models.
 
 This is the CPU half of Ignition's diagnostic direct execution. It owns request
@@ -34,6 +38,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 import numpy as np
+
+from ignition.components.capacity import completion_token_capacity
 
 from .policy import Accounting, Policy
 
@@ -78,15 +84,19 @@ class Layout:
     def __post_init__(self):
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
             raise ValueError("direct execution requires positive pages and slots within request capacity")
-        if self.record_fields != 24:
-            raise ValueError("completions require token-vector records")
+        if type(self.record_fields) is not int or self.record_fields <= 16:
+            raise ValueError("completions require a positive token-vector capacity")
+        completion_token_capacity(self.record_fields - 16)
+        if (self.max_width > self.completion_token_capacity
+                or any(key[0] == "speculative" and key[2] > self.completion_token_capacity for key in self.graphs)):
+            raise ValueError("verification width exceeds completion token capacity")
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
 
     @classmethod
     def of(cls, model):
         """Read a prepared model's serving configuration and graph catalog."""
         config, buffers = model.server_config, model.buffers
-        speculative = any(signature.kind in ("speculative",)
+        speculative = any(signature.kind == "speculative" or signature.speculation_enabled is True
                           for signature in model.signatures.values())
         graphs = {}
         for name, signature in model.signatures.items():
@@ -116,6 +126,10 @@ class Layout:
                                       if signature.confidence_width},
                    completion_cursors={g["graph"]: None if g["draft_cursor"] is None else g["draft_cursor"]["lag_tokens"]
                        for g in config["model_contract"]["graphs"] if "draft_cursor" in g and g["graph"] in graphs.values()})
+
+    @property
+    def completion_token_capacity(self):
+        return self.record_fields - 16
 
     @property
     def speculative(self):
@@ -196,8 +210,8 @@ class Acceptance:
 
     MEMORY = 128.
 
-    def __init__(self):
-        self.depths = [[.5, 2.] for _ in range(7)]
+    def __init__(self, token_capacity=0):
+        self.depths = [[.5, 2.] for _ in range(completion_token_capacity(token_capacity) - 1)]
         self.native_confidence = False
 
     def confidence(self, values):
@@ -220,7 +234,7 @@ class Acceptance:
     def expected(self, width):
         """Expected tokens one round of `width` emits: the pending token, then each accepted draft."""
         chain, total = 1., float(width != 0)
-        for probability, _ in self.depths[:min(max(width - 1, 0), 7)]:
+        for probability, _ in self.depths[:min(max(width - 1, 0), len(self.depths))]:
             chain *= probability
             total += chain
         return total
@@ -228,7 +242,7 @@ class Acceptance:
     def expectations(self, maximum):
         """`expected(width)` for every width through `maximum`, computed in one pass."""
         chain, total, values = 1., 1., [0., 1.]
-        for probability, _ in self.depths[:min(max(maximum - 1, 0), 7)]:
+        for probability, _ in self.depths[:min(max(maximum - 1, 0), len(self.depths))]:
             chain *= probability
             total += chain
             values.append(total)
@@ -439,6 +453,7 @@ class Scheduler:
             self.generations[slot] += 1
             self.slots[slot] = request
             request.slot, request.generation = slot, self.generations[slot]
+            request.acceptance = Acceptance(self.layout.completion_token_capacity)
             self.page_pool.retain(shared)
             request.pages = [*shared, *self.page_pool.take(needed)]
             request.shared = len(shared)
@@ -660,7 +675,7 @@ class Scheduler:
                 raise CompletionError("packed completion is inactive, stale, or has an invalid frozen ceiling")
             width = int(record[15])
             tokens = record[16:16 + max(emitted, 0)]
-            if (not 1 <= width <= 8 or not 0 <= emitted <= width or not 0 <= offered < width
+            if (not 1 <= width <= self.layout.completion_token_capacity or not 0 <= emitted <= width or not 0 <= offered < width
                     or not max(emitted - 1, 0) <= accepted <= min(emitted, offered)
                     or record[7] != 0 or record[11] != 0 or record[12] != -1
                     or record[13] < -1 or record[14] != 0

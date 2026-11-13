@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed attention preparation preserves FP8 casts, inactive rows and cache slots."""
 
 import os
@@ -39,11 +42,12 @@ def private_fixtures(monkeypatch):
     return references
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("start", [125, 1048569])
 @pytest.mark.parametrize("separate_index_table", [False, True])
 @torch.no_grad()
-def test_packed_gemma_rope_index_cache_graph(cache_dtype, start, separate_index_table, private_fixtures):
+def test_packed_gemma_rope_index_cache_graph(cache_dtype, start, separate_index_table, private_fixtures, functional):
     from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
     from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLRotaryEmbedding
 
@@ -98,7 +102,15 @@ def test_packed_gemma_rope_index_cache_graph(cache_dtype, start, separate_index_
             name="packed",
             index_page_table=index_pages,
         )
+        if functional:
+            operation.functional(session=session)
         session.tune()
+        if functional:
+            packed = operation
+            def operation():
+                query, index_query = packed(projected, metadata, index_page_table=index_pages)
+                q.copy_(query)
+                iq.copy_(index_query)
         assert private_fixtures and all(reference() is None for reference in private_fixtures)
         compiled = compile_forward(operation)
         compiled()

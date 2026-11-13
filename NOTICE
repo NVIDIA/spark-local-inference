@@ -1,6 +1,66 @@
 Flare
-Copyright 2026 NVIDIA Corporation
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Copyright 2026 Flare community contributors
 
 Licensed under the Apache License, Version 2.0.
 See LICENSE for the full license text.
+
+Native dependency licenses and source locations are listed in
+THIRD_PARTY_NOTICES.md and third_party/rust/README.md.
+
+Third-party code and attributions
+================================
+
+FlashInfer/b12x RoCE proxy
+-------------------------
+helios/native/roce_proxy.c was contributed by its original author from:
+https://github.com/local-inference-lab/flashinfer/blob/f5f5341d711f8210ce91af5731a0841570f70e53/flashinfer/experimental/b12x/comm/roce/_roce_proxy.c
+The proxy is compiled into Linux aarch64 builds. Its implementation is unchanged
+from that revision; Flare adds a license and provenance preamble.
+The upstream Apache-2.0 license is reproduced in helios/licenses/FlashInfer.txt
+in the source tree and licenses/FlashInfer.txt in binary distributions.
+
+libibverbs
+----------
+The RoCE proxy uses libibverbs and its inline header interfaces under the
+OpenIB.org BSD license alternative. The verbs.h copyright and license notice
+is retained in helios/licenses/libibverbs.txt in the source tree and
+licenses/libibverbs.txt in binary distributions. The shared library itself
+is supplied by the user's operating system.
+
+vLLM
+----
+Copyright contributors to the vLLM project
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+ignition/components/markov_sampling.py adapts the sequential vocabulary-block
+schedule from vLLM's DS41 fused Markov sampler:
+https://github.com/vllm-project/vllm/blob/df3bd094/vllm/models/deepseek_v41/amd/ops/fused_markov.py
+Flare's implementation changes score rounding, explicit proposal probabilities,
+and random-number domains for its probability-based rejection contract.
+The upstream copyright notice is retained in that source file.
+
+PyTorch
+-------
+helios/src/frontend/images/resize.rs adapts the resize coefficient generator
+and uint8 antialiased convolution from PyTorch's UpSampleKernel.cpp:
+https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/cpu/UpSampleKernel.cpp
+The scalar Rust implementation preserves adaptive coefficient precision and
+intermediate uint8 rounding.
+
+PyTorch's copyright notices and BSD-style license terms are reproduced in
+helios/licenses/PyTorch.txt and heliopause/licenses/PyTorch.txt in the source
+tree, and licenses/PyTorch.txt in the installed Flare package documentation.
+The original copyright notices are also retained in the adapted source file.
+
+DeepSeek
+--------
+Copyright (c) 2023 DeepSeek
+The MIT license supplied with the DeepSeek recipe assets is retained at
+ignition/recipes/deepseek41/assets/LICENSE.
+
+libjpeg-turbo
+-------------
+This software is based in part on the work of the Independent JPEG
+Group.
+The libjpeg-turbo license texts are linked from third_party/rust/README.md.

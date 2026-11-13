@@ -1,4 +1,8 @@
-"""The `ignition` preparation and development serving command line."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""The `ignition` preparation and diagnostic command line."""
 
 import argparse
 from pathlib import Path
@@ -9,11 +13,12 @@ from ignition.errors import FlareError
 def _parser() -> argparse.ArgumentParser:
     from . import serve
     from . import publishing
+    from . import bench
     from .help import RecipeHelp, recipe_help
 
     parser = argparse.ArgumentParser(
         prog="ignition", allow_abbrev=False,
-        description="Prepare native runtime packages for NVIDIA SM103, SM120, and SM121 GPUs.",
+        description="Prepare native runtime cores for NVIDIA SM103, SM120, and SM121 GPUs.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=recipe_help())
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -22,20 +27,31 @@ def _parser() -> argparse.ArgumentParser:
             name, help=summary, description=summary, allow_abbrev=False, add_help=False,
             formatter_class=argparse.RawDescriptionHelpFormatter)
         subparser.add_argument("-h", "--help",
-                               action=RecipeHelp if name in ("export", "serve") else "help",
+                               action=RecipeHelp if name in ("export", "debug-serve") else "help",
                                help="show this help message and exit")
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
                                help="configuration file (default: ~/.config/flare/config.toml)")
         return subparser
 
-    exporting = command("export", serve.export, "prepare a native model package in the shared cache")
-    exporting.add_argument("--no-weights", action="store_true",
+    exporting = command("export", serve.export, "prepare a native model core in the shared cache")
+    weights = exporting.add_mutually_exclusive_group()
+    weights.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
+    weights.add_argument("--reuse-weights", action="store_true",
+                        help="reuse the cached default version's weight hashes and layouts without hashing live weights")
+    exporting.add_argument("--publisher-key", dest="publisher_keys", action="append", type=Path, default=[],
+                           help="public publisher profile authenticating the cached weight source")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
     _preparation_arguments(exporting)
-    serving = command("serve", serve.serve, "prepare in this process and serve over HTTP, with peer ranks on other hosts")
+    benchmarking = command("bench", bench.run,
+        "measure complete prepared GPU graph latency without export or HTTP; not serving throughput")
+    _preparation_arguments(benchmarking, model_default="defaults.model, else qwen3.8-27b")
+    bench.arguments(benchmarking)
+    serving = command("debug-serve", serve.debug_serve,
+                      "prepare and run diagnostic HTTP requests; not for actual serving or performance"
+                      " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
     _preparation_arguments(serving)
@@ -81,23 +97,31 @@ def _parser() -> argparse.ArgumentParser:
     keys.add_argument("--namespace", required=True, help="publisher Hugging Face namespace")
     password = command("key-password", publishing.key_password, "change a signing key's passphrase")
     password.add_argument("--signing-key", required=True, type=Path, help="Ed25519 PEM key to re-encrypt in place")
-    signing = command("sign", publishing.sign, "verify and sign a development package for production")
-    signing.add_argument("package", type=Path, help="signed development .safetensors package")
-    signing.add_argument("--output", required=True, type=Path, help="destination package; must not exist")
+    signing = command("sign", publishing.sign, "verify and sign a development core for production")
+    signing.add_argument("core", type=Path, help="signed development .safetensors core")
+    signing.add_argument("--output", required=True, type=Path, help="destination core; must not exist")
     signing.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
     signing.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     signing.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     signing.add_argument("--development-publisher", type=Path, help="source public profile (default: beside config)")
-    combining = command("combine", publishing.combine, "combine prepared TP packages into one signed package")
-    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format packages")
-    combining.add_argument("--output", required=True, type=Path, help="destination package directory; must not exist")
+    editing = command("edit", publishing.edit, "edit core frontend metadata without rebuilding the model")
+    editing.add_argument("core", type=Path, help="signed payload core file or directory")
+    editing.add_argument("--output", required=True, type=Path, help="destination directory; must not exist")
+    editing.add_argument("--served-model-name", help="replace the served alias for every deployment")
+    editing.add_argument("--chat-template", type=Path, help="replacement UTF-8 Jinja template with message-boundary marks")
+    editing.add_argument("--publisher-keys", type=Path, action="append", default=[],
+                         help="public publisher profiles authenticating the source; repeatable")
+    editing.add_argument("--development-publisher", type=Path, help="source development public profile (default: beside config)")
+    combining = command("combine", publishing.combine, "combine prepared TP cores into one signed core")
+    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format cores")
+    combining.add_argument("--output", required=True, type=Path, help="destination core directory; must not exist")
     combining.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
     combining.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     combining.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     combining.add_argument("--publisher-keys", type=Path, action="append", default=[],
                            help="trusted public publisher profiles of the sources; repeatable")
-    converting = command("convert", publishing.convert, "convert a package to the selected canonical container form")
-    converting.add_argument("package", type=Path, help="existing signed package file or directory, including a cache entry")
+    converting = command("convert", publishing.convert, "convert a core to the selected canonical container form")
+    converting.add_argument("core", type=Path, help="existing signed core file or directory, including a cache entry")
     converting.add_argument("--output", type=Path, help="standalone destination (default: shared model cache entry)")
     converting.add_argument("--publisher-keys", type=Path, action="append", default=[],
                             help="trusted public publisher profiles; repeatable")
@@ -106,7 +130,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _preparation_arguments(running):
+def _preparation_arguments(running, *, model_default="defaults.model"):
     from .help import recipe_help
 
     running.usage = "%(prog)s [MODEL] [options]"
@@ -114,9 +138,10 @@ def _preparation_arguments(running):
     running.set_defaults(roce_ring=False, roce_chain=False)
     running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
     running.add_argument("model", nargs="?", metavar="MODEL",
-                         help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")
+                         help=f"recipe alias, repository id, or checkpoint directory (default: {model_default})")
     running.add_argument("--gpus", metavar="LIST",
-                         help="GPU indices as NVML enumerates them, such as 0, 0,1, or 0-3;"
+                         help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
+                              " such as 0, 0,1, or 0-3;"
                               " their count is the tensor-parallel size (default: first GPUs that fit)")
     running.add_argument("--max-concurrency", type=int, metavar="N",
                          help="maximum simultaneously active requests (default: defaults.max_concurrency,"
@@ -144,9 +169,14 @@ def _preparation_arguments(running):
     speculative = running.add_argument_group("speculative decoding",
         "MTP flags configure speculative decoding, including DSpark and DFlash.\n"
         "Recipe defaults and limits: ignition export MODEL --help.")
+    speculative.add_argument("--speculative-method", choices=("mtp", "dflash2"),
+                          help="learned proposal method; supported choices and the default depend on MODEL")
     speculative.add_argument("--no-mtp", action="store_true",
                           help="disable multi-token speculation: load no draft model and decode one token"
                                " per step; cannot accompany other speculation flags")
+    speculative.add_argument("--mtp-only", action="store_true",
+                          help="omit MTP-disabled execution graphs; package requires speculation at runtime."
+                               " Requires positive draft depth and cannot accompany --no-mtp")
     speculative.add_argument("--mtp-draft-tokens", type=int, metavar="N",
                           help="most draft tokens verified per round; limits and defaults depend on MODEL."
                                " 0 selects width-one rounds while retaining draft state; --no-mtp excludes it")
@@ -162,30 +192,55 @@ def _preparation_arguments(running):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
+                          help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
+                               " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
-    advanced.add_argument("--draft-head-quantization", choices=("nvfp4",),
-                          help="prepare a separate NVFP4 vocabulary head for learned draft proposals;"
-                               " target verification retains its precision (DeepSeek V4/V4.1)")
-    advanced.add_argument("--markov-head-quantization", choices=("nvfp4",),
+    advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
+                          help="prepare a separate quantized vocabulary head for learned draft proposals;"
+                               " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
+                               " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense and Flash Next DFlash2 with a BF16 checkpoint head;"
+                               " default: checkpoint precision)")
+    advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
-                               " (DeepSeek V4/V4.1; default: checkpoint precision)")
+                               " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
+    advanced.add_argument("--vocabulary-parallel-sampling", action="store_true",
+                          help="prepare vocabulary-sharded DSpark proposals and block rejection sampling"
+                               " (DeepSeek V4.1; default: full-vocabulary sampling)")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
                                " kernel tuning (default: see MODEL --help)")
     from .config import AUTOTUNE_EFFORTS
 
     advanced.add_argument("--autotune-effort", choices=AUTOTUNE_EFFORTS,
-                          help="kernel search effort: off uses heuristics; low applies broad exclusions;"
-                               " medium balances search cost; high keeps conservative exclusions;"
-                               " max searches all legal candidates (default: medium)")
+                          help="kernel search effort: off uses heuristics without races; default races"
+                               " the pruned candidate set; audit lifts the performance exclusions to"
+                               " check that pruning drops no winners (default: default)")
+    advanced.add_argument("--collective-ladder", type=Path,
+                          help="JSON file of final joint collective choices; required for runtime tuning")
+    advanced.add_argument("--collective-tuning", choices=("static", "runtime"),
+                          help="collective selection: static autotunes during preparation; runtime uses the supplied"
+                               " ladder and captures runtime profile selection (default: recipe, currently static)")
+    advanced.add_argument("--shard-hyperconnections", action="store_true",
+                          help="shard Qwen3.8 Flash hyperconnection bottlenecks across TP ranks with"
+                               " BF16 gate-logit reduction (default: replicated)")
+    advanced.add_argument("--joint-tuning", action="store_true",
+                          help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
+                               " prefill, decode, and speculative shapes (default: off)")
+    advanced.add_argument("--lock-gpu-clocks", action="store_true",
+                          help="lock each tuning GPU to its maximum supported graphics clock during"
+                               " autotuning; requires root or noninteractive sudo for nvidia-smi")
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")
+    advanced.add_argument("--dcp-size", type=int, choices=(8, 16), metavar="N",
+                          help="decode context-parallel ranks per group; Kimi K3.1 TP16 supports 16 or 8"
+                               " (default: tensor-parallel size)")
     advanced.add_argument("--no-context-parallel", action="store_true",
                           help="keep each rank's attention context whole instead of sharding it across"
                                " tensor-parallel ranks; fewer cached tokens (default: the recipe's)")
@@ -196,13 +251,14 @@ def _preparation_arguments(running):
     advanced.add_argument("--no-compile", action="store_true",
                           help="development: capture graphs without compiling forwards")
     advanced.add_argument("--online-mxfp8", action="store_true",
-                          help="store the recipe's eligible BF16 projections as MXFP8 while loading; faster"
-                               " decode at reduced precision (Kimi K3 KDA, MLA except batched key/value, shared"
+                          help="store the recipe's eligible BF16 projections as MXFP8 while loading"
+                               " (Kimi K3.1 target KDA inputs only; Kimi K3 KDA, MLA except batched key/value, shared"
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
+                               " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
-                               " pages (Kimi K3; default: the recipe's image support)")
+                               " pages (recipes with a separable encoder; default: the recipe's image support)")
 
 
 def main(argv=None) -> int:

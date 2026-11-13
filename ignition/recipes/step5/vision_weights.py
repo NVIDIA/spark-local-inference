@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tensor-parallel BF16 perception-encoder projections and convolution weights."""
 
 from dataclasses import dataclass

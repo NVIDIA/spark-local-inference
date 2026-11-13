@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native replay delivers canonical full-table rows from sealed resident planes."""
 
 import os
@@ -15,7 +19,7 @@ from ignition.components.ngram_delivery import publish_requests
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
-from ignition.preparation.runtime_package import FileSource
+from ignition.preparation.runtime_core import FileSource
 from ignition.recipes.deepseek41.engram import Tables
 
 
@@ -43,7 +47,7 @@ def test_native_replay_reads_full_tables_without_checkpoint_files(tmp_path, rank
     count = torch.full((1,), tokens, dtype=torch.int32, device=device)
     source = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
-    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device)
     mailbox = MappedHostAllocation((tokens * 24 + 1,), torch.int64, device)
     mailbox.host_view.zero_()
     worker = graph = None

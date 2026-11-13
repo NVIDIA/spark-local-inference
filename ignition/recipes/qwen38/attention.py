@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared Qwen sparse attention with paged KV and selector state."""
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ from ignition.preparation.fixtures import qsa as qsa_fixtures
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
-from .attention_overlap import ConcurrentAttention
+from .attention_overlap import ConcurrentAttention, FunctionalQSA
+from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros
 
 
 # b12x attends at most this many rows with its split schedule: it splits each row's selected
@@ -44,10 +49,14 @@ class RotaryTables:
             raise ValueError("Qwen rotary geometry differs from the checkpoint contract")
         inverse = (1.0 / (rope["rope_theta"] ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).to(device)
         frequency = torch.arange(capacity, device=device, dtype=torch.float32)[:, None] * inverse
-        axes = torch.zeros(32, device=device, dtype=torch.int64)
+        axes = persistent_zeros((32,), dtype=torch.int64, device=device)
         axes[1:33:3] = 1
         axes[2:30:3] = 2
-        return cls(frequency.cos(), frequency.sin(), axes)
+        cos = persistent_empty(frequency.shape, dtype=torch.float32, device=device)
+        sin = persistent_empty(frequency.shape, dtype=torch.float32, device=device)
+        torch.cos(frequency, out=cos)
+        torch.sin(frequency, out=sin)
+        return cls(cos, sin, axes)
 
     def gather(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Negative metadata marks inactive rows; their arithmetic uses position zero.
@@ -155,12 +164,11 @@ class QSAScratch:
     partial_lse: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens: int, device: torch.device, *, world_size=1, buffers=None, output=None) -> QSAScratch:
+    def allocate(cls, tokens: int, device: torch.device, *, world_size=1, output=None) -> QSAScratch:
         if tokens <= 0:
             raise ValueError("QSA token capacity must be positive")
         def zeros(*shape, dtype=torch.bfloat16):
-            return (torch.zeros(shape, device=device, dtype=dtype) if buffers is None
-                    else buffers.zeros(shape, dtype))
+            return torch.zeros(shape, device=device, dtype=dtype)
         q_heads, kv_heads = 24 // world_size, max(1, 2 // world_size)
         q_width, kv_width = q_heads * 512, kv_heads * 256
         qkv = zeros(tokens, q_width + 2 * kv_width)
@@ -243,8 +251,8 @@ class PreparedAttention:
             **{field: getattr(state, field) for field in state.__dataclass_fields__},
             **{field: getattr(metadata, field) for field in
                ("main_block_table", "compressed_block_table", "raw_state_slot_ids")},
-            "index_q_norm_weight": module.indexer.q_layernorm.weight.detach().float(),
-            "index_k_norm_weight": module.indexer.k_layernorm.weight.detach().float(),
+            "index_q_norm_weight": persistent_copy(module.indexer.q_layernorm.weight.detach().float()),
+            "index_k_norm_weight": persistent_copy(module.indexer.k_layernorm.weight.detach().float()),
             "rope_cos": rotary.cos, "rope_sin": rotary.sin,
         }
         operands = {**self.binding_kwargs, "request_ids": metadata.request_ids,
@@ -252,8 +260,8 @@ class PreparedAttention:
                     "raw_index_key": self.index_key}
         self.plan = qsa.plan(caps, invocation=qsa.invocation_from_tensors(caps, **operands))
         self.binding_kwargs.update(output=scratch.attended, selected_positions=scratch.selected_positions,
-            k_descale=torch.ones(1, dtype=torch.float32, device=source.device),
-            v_descale=torch.ones(1, dtype=torch.float32, device=source.device))
+            k_descale=persistent_copy(torch.ones(1, dtype=torch.float32, device=source.device)),
+            v_descale=persistent_copy(torch.ones(1, dtype=torch.float32, device=source.device)))
         self.workspace = workspace
 
         def prepare(materialized):
@@ -264,7 +272,7 @@ class PreparedAttention:
                                 owners=prime_owners(workspace, storage, binding))
 
         benchmark_inputs = qsa_fixtures.input_factory(caps, self.binding_kwargs, self.dynamic(),
-            storage=getattr(session, "benchmark_storage", None))
+            storage=getattr(session, "benchmark_storage", None), session=session)
         declare(session, (self.plan.request(name=f"{name}.qsa", prepare_call=prepare,
             benchmark_call=partial(qsa_fixtures.benchmark_call, inputs=benchmark_inputs, workspace=workspace)),))
         def refresh():
@@ -319,38 +327,78 @@ class PreparedAttention:
             if (before.shape[1:] != after.shape[1:] or before.stride() != after.stride()
                     or before.dtype != after.dtype or before.device != after.device):
                 raise ValueError("page rebinding must preserve the prepared cache ABI")
-            self.binding_kwargs[name] = after
+            if self.binding_kwargs is None:
+                self.constants[name] = after
+            else:
+                self.binding_kwargs[name] = after
+        if self.binding_kwargs is None:
+            self.state = state
+            return
         self.binding = qsa.bind(self.plan, scratch=self.workspace, **self.binding_kwargs)
         self.write_kwargs.update(k_cache=state.main_k_cache, v_cache=state.main_v_cache)
         self.state = state
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor | None:
-        s = self.scratch
+    def functional(self, *, session):
+        self.functional_qsa = FunctionalQSA(self)
+        for projection in self.projections.values():
+            projection.functional(session=session)
+        if self.concurrent is not None:
+            self.concurrent.functional(session=session)
+        if self.sparse is not None:
+            self.sparse.functional(session=session)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.workspace_bytes = self.workspace.numel()
+        self.constants = {name: value for name, value in self.binding_kwargs.items()
+            if name not in ("main_block_table", "compressed_block_table", "raw_state_slot_ids",
+                            "output", "selected_positions")}
+        self.scratch = self.metadata = self.index_query = self.index_key = None
+        self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
+
+    def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
         if self.concurrent is None:
-            self.projections["indexer.index_qk_proj"](source)
-            self.projections["qkv_proj"](source)
+            projected_index = self.projections["indexer.index_qk_proj"](source)
+            projected_qkv = self.projections["qkv_proj"](source)
+            projection_workspaces = None
         else:
-            self.concurrent.project(source)
-        projected = s.projected_q.view(self.tokens, self.q_heads, 512)
-        query, gate = projected[..., :256], projected[..., 256:]
-        key = s.projected_k.view(self.tokens, self.kv_heads, 256)
-        cos, sin = self.rotary.gather(self.metadata.rope_positions)
+            (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
+        q_width = self.q_heads * 512
+        kv_width = self.kv_heads * 256
+        projected_q = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)
+        query, gate = projected_q[..., :256], projected_q[..., 256:]
+        key = projected_qkv[:, q_width:q_width + kv_width].view(self.tokens, self.kv_heads, 256)
+        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
+        cos, sin = self.rotary.gather(metadata.rope_positions)
         query, key = apply_rotary_pos_emb(self.module.q_norm(query), self.module.k_norm(key), cos, sin,
                                          unsqueeze_dim=1)
-        s.query.copy_(query)
-        s.key.copy_(key)
-        paged_kv_write.run(self.writer, **self.write_kwargs)
+        query, key = query.contiguous(), key.contiguous()
+        paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
+            v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
+            k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
+        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
+        selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
+        bindings = {**self.constants, "main_block_table": metadata.main_block_table,
+            "compressed_block_table": metadata.compressed_block_table,
+            "raw_state_slot_ids": metadata.raw_state_slot_ids, "output": attended,
+            "selected_positions": selected}
+        dynamic = {"query": query, "index_query": projected_index[:, :512].view(self.tokens, 4, 128),
+            "raw_index_key": projected_index[:, 512:], **{name: getattr(metadata, name) for name in
+                ("request_ids", "query_positions", "rope_positions", "sequence_lengths", "query_start_loc",
+                 "num_accepted_tokens", "is_prefilling")}}
+        if self.concurrent is None:
+            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=source.device)
+            self.functional_qsa(source, bindings, dynamic, workspace)
+        else:
+            self.concurrent.attend_runtime(source, bindings, dynamic, projection_workspaces)
         if self.cache_only:
-            qsa.run(self.binding, **self.dynamic(), cache_only=True)
             return None
         if self.sparse is not None:
-            qsa.run(self.binding, **self.dynamic(), selection_only=True)
-            attention = self.sparse(self.state.main_k_cache, self.state.main_v_cache)
-        elif self.concurrent is None:
-            attention = qsa.run(self.binding, **self.dynamic())
-        else:
-            attention = self.concurrent.attend(source)
-        s.gated.copy_(attention.flatten(1) * torch.sigmoid(gate.reshape(self.tokens, self.q_heads * 256)))
-        output = self.projections["o_proj"](s.gated)
-        output.masked_fill_((self.metadata.request_ids < 0)[:, None], 0)
+            attended = self.sparse(self.state.main_k_cache, self.state.main_v_cache, query=query,
+                selected=selected, block_table=metadata.main_block_table,
+                requests=metadata.request_ids, positions=metadata.query_positions)
+        gated = attended.flatten(1) * torch.sigmoid(gate.reshape(self.tokens, self.q_heads * 256))
+        output = self.projections["o_proj"](gated)
+        output.masked_fill_((metadata.request_ids < 0)[:, None], 0)
         return output

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Official DeepSeek conversation encoding with normalized message positions.
 
 use super::{Frontend, Json, Map, PromptEncoder, RenderedPrompt};
@@ -5,42 +11,46 @@ use crate::{Error, Failure, FrontendError, Result};
 use deepseek_recipe_core::{
     conversation::{Conversation, ReasoningEffort, ResponseFormat},
     messages::{InputMessage, ToolCall},
-    multimodal::{IMAGE_SPECIAL_TOKEN, ImageDetail, ImageSource},
+    multimodal::{ImageDetail, ImageSource},
+    prompt::Prompt,
+    special_tokens::SpecialToken,
     tools::{ToolChoice, ToolDefinition},
 };
 use deepseek_recipe_encoding::{
     PromptEncoding, dsv4::DeepseekV4Encoding, dsv41::DeepseekV41Encoding,
 };
 
+const IMAGE_SPECIAL_TOKEN: &str = SpecialToken::Image.default_str();
+
 pub(super) fn invalid(message: impl Into<String>) -> Error {
     Error::frontend(FrontendError::Input(Failure::new(message.into())))
 }
 
-fn content(value: &Json, hints: &[Json]) -> Result<(String, Vec<ImageSource>, Vec<usize>)> {
+fn content(value: &Json, hints: &[Json]) -> Result<(Prompt, Vec<ImageSource>)> {
+    let mut prompt = Prompt::new();
+    let mut images = Vec::new();
     if value.is_null() {
-        return Ok((String::new(), vec![], vec![]));
+        return Ok((prompt, images));
     }
     if let Some(text) = value.as_str() {
-        return Ok((
-            text.to_owned(),
-            vec![],
-            hints.iter().map(|_| text.len()).collect(),
-        ));
+        prompt.push_plain(text);
+        for _ in hints {
+            prompt.mark_checkpoint(text.len());
+        }
+        return Ok((prompt, images));
     }
     let parts = value
         .as_array()
         .ok_or_else(|| invalid("message content must be text or content blocks"))?;
-    let mut text = Vec::new();
-    let mut images = Vec::new();
-    let mut positions = Vec::new();
-    let mut end = 0;
     for (index, part) in parts.iter().enumerate() {
+        if index != 0 {
+            prompt.push_plain("\n\n");
+        }
         match part["type"].as_str() {
-            Some("text") => text.push(
+            Some("text") => prompt.push_plain(
                 part["text"]
                     .as_str()
-                    .ok_or_else(|| invalid("text content must be a string"))?
-                    .to_owned(),
+                    .ok_or_else(|| invalid("text content must be a string"))?,
             ),
             Some("image_url") => {
                 let url = part["image_url"]["url"]
@@ -49,25 +59,22 @@ fn content(value: &Json, hints: &[Json]) -> Result<(String, Vec<ImageSource>, Ve
                 if !url.starts_with("data:image/") {
                     return Err(invalid("image input requires a data URL"));
                 }
-                text.push(IMAGE_SPECIAL_TOKEN.to_owned());
+                prompt.push_special(IMAGE_SPECIAL_TOKEN);
                 images.push(ImageSource::DataUrl {
                     data_url: url.to_owned(),
                     detail: ImageDetail::Auto,
+                    path: String::new(),
                 });
             }
             _ => return Err(invalid("unsupported DeepSeek content block")),
         }
-        if index != 0 {
-            end += 2;
-        }
-        end += text.last().unwrap().len();
         if hints.contains(&Json::from(index + 1))
             || (hints == [Json::from(0)] && index + 1 == parts.len())
         {
-            positions.push(end);
+            prompt.mark_checkpoint(prompt.as_str().len());
         }
     }
-    Ok((text.join("\n\n"), images, positions))
+    Ok((prompt, images))
 }
 
 fn tool_arguments(value: &Json) -> Result<String> {
@@ -87,7 +94,7 @@ fn conversation(
     frontend: &Frontend,
     messages: &[Json],
     options: &Map<String, Json>,
-) -> Result<(Conversation, Vec<(usize, usize)>, Option<u8>)> {
+) -> Result<(Conversation, Vec<(String, Vec<usize>)>, Option<u8>)> {
     if messages.is_empty() {
         return Err(invalid("cannot encode an empty conversation"));
     }
@@ -250,6 +257,7 @@ fn conversation(
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
+                defer_loading: false,
                 strict: function
                     .get("strict")
                     .filter(|v| !v.is_null())
@@ -264,11 +272,12 @@ fn conversation(
     if tool_choice == ToolChoice::Required && tools.is_empty() {
         return Err(invalid("required tool choice needs at least one tool"));
     }
-    if tool_choice == ToolChoice::Required && thinking_mode {
-        return Err(invalid(
-            "thinking mode does not support required tool choice",
-        ));
-    }
+    // Required calls are checked at completion; thinking starts before the tool block.
+    let tool_choice = if tool_choice == ToolChoice::Required && thinking_mode {
+        ToolChoice::Auto
+    } else {
+        tool_choice
+    };
     let response_format = match options.get("response_format").filter(|v| !v.is_null()) {
         None => ResponseFormat::Text,
         Some(value) if value == "text" || value["type"] == "text" => ResponseFormat::Text,
@@ -277,28 +286,8 @@ fn conversation(
         }
         _ => return Err(invalid("unsupported DeepSeek response_format")),
     };
-    let supplied_text = format!(
-        "{}{}",
-        serde_json::to_string(&messages).unwrap(),
-        options
-            .get("tools")
-            .map(Json::to_string)
-            .unwrap_or_default()
-    );
-    let package_marker = frontend
-        .image_placeholder_token_id
-        .and_then(|id| frontend.tokenizer.id_to_token(id));
-    if supplied_text.contains(IMAGE_SPECIAL_TOKEN)
-        || package_marker
-            .as_ref()
-            .is_some_and(|marker| supplied_text.contains(marker))
-    {
-        return Err(invalid(
-            "literal DeepSeek image placeholder is ambiguous; use an image_url content block",
-        ));
-    }
     let mut converted = Vec::new();
-    let mut hints = Vec::new();
+    let mut assistant_hints = Vec::new();
     for message in messages {
         if message.get("task").is_some() || message.get("prefix").is_some() {
             return Err(invalid(
@@ -309,17 +298,7 @@ fn conversation(
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let (text, image_sources, positions) = content(&message["content"], block_hints)?;
-        let suffix = if message["role"] == "tool" {
-            "</tool_result>".len()
-        } else {
-            0
-        };
-        hints.extend(
-            positions
-                .into_iter()
-                .map(|position| (converted.len(), position + suffix)),
-        );
+        let (prompt, image_sources) = content(&message["content"], block_hints)?;
         let role = message["role"]
             .as_str()
             .ok_or_else(|| invalid("message requires a role"))?;
@@ -327,20 +306,30 @@ fn conversation(
             return Err(invalid("images require user or tool messages"));
         }
         converted.push(match role {
-            "system" | "developer" => InputMessage::System { content: text },
+            "system" | "developer" => InputMessage::System {
+                content: prompt,
+                image_sources,
+                tools: None,
+            },
             "user" => InputMessage::User {
-                content: text,
+                content: prompt,
                 image_sources,
             },
             "tool" => InputMessage::Tool {
-                content: text,
+                content: prompt,
                 image_sources,
-                tool_call_id: message["tool_call_id"]
-                    .as_str()
-                    .ok_or_else(|| invalid("tool message requires tool_call_id"))?
-                    .to_owned(),
+                tool_call_id: Some(
+                    message["tool_call_id"]
+                        .as_str()
+                        .ok_or_else(|| invalid("tool message requires tool_call_id"))?
+                        .to_owned(),
+                ),
             },
             "assistant" => {
+                assistant_hints.push((
+                    prompt.as_str().to_owned(),
+                    prompt.checkpoint_hints().to_vec(),
+                ));
                 let reasoning_content = message
                     .get("reasoning_content")
                     .or_else(|| message.get("thinking"))
@@ -374,9 +363,10 @@ fn conversation(
                     })
                     .transpose()?;
                 InputMessage::Assistant {
-                    content: text,
+                    content: prompt.as_str().to_owned(),
                     reasoning_content,
                     tool_calls,
+                    prefix: false,
                 }
             }
             _ => return Err(invalid("unsupported DeepSeek message role")),
@@ -391,7 +381,7 @@ fn conversation(
             reasoning_effort,
             response_format,
         },
-        hints,
+        assistant_hints,
         reasoning_effort_score,
     ))
 }
@@ -408,13 +398,10 @@ pub(super) fn validate_defaults(frontend: &Frontend) -> Result<()> {
 fn official(
     encoder: PromptEncoder,
     conversation: &Conversation,
-    hints: &[(usize, usize)],
     reasoning_effort_score: Option<u8>,
 ) -> Result<deepseek_recipe_encoding::RenderedPrompt> {
     Ok(match encoder {
-        PromptEncoder::DeepseekV4 => {
-            DeepseekV4Encoding::new().render_conversation(conversation, hints)
-        }
+        PromptEncoder::DeepseekV4 => DeepseekV4Encoding::new().render_conversation(conversation),
         PromptEncoder::DeepseekV41 => {
             let mut encoder = DeepseekV41Encoding::new();
             if let Some(score) = reasoning_effort_score {
@@ -422,7 +409,7 @@ fn official(
                     .with_reasoning_effort_score(score)
                     .map_err(|error| invalid(error.to_string()))?;
             }
-            encoder.render_conversation(conversation, hints)
+            encoder.render_conversation(conversation)
         }
         PromptEncoder::Jinja => unreachable!(),
     })
@@ -433,8 +420,13 @@ pub(super) fn render(
     messages: &[Json],
     options: &Map<String, Json>,
 ) -> Result<RenderedPrompt> {
-    let (conversation, hints, reasoning_effort_score) = conversation(frontend, messages, options)?;
-    let rendered = official(frontend.prompt_encoder, &conversation, &hints, reasoning_effort_score)?;
+    let (conversation, assistant_hints, reasoning_effort_score) =
+        conversation(frontend, messages, options)?;
+    let rendered = official(
+        frontend.prompt_encoder,
+        &conversation,
+        reasoning_effort_score,
+    )?;
     let image_sources = rendered
         .image_sources
         .into_iter()
@@ -445,37 +437,102 @@ pub(super) fn render(
         .collect::<Result<Vec<_>>>()?;
     let mut token_ids = Vec::new();
     let mut offsets = Vec::new();
-    let mut byte_start = 0;
-    let spans: Vec<_> = rendered.prompt.split(IMAGE_SPECIAL_TOKEN).collect();
-    if spans.len() - 1 != image_sources.len() {
+    let plain = frontend
+        .ordinary_tokenizer
+        .as_ref()
+        .expect("DeepSeek plain tokenizer is initialized");
+    let mut start = 0;
+    let mut image_count = 0;
+    for range in &rendered.special_ranges {
+        let span = &rendered.prompt[start..range.start];
+        let encoding = plain.encode(span, false).map_err(|error| {
+            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                error.to_string(),
+                error,
+            )))
+        })?;
+        token_ids.extend_from_slice(encoding.get_ids());
+        offsets.extend(
+            encoding
+                .get_offsets()
+                .iter()
+                .map(|&(a, b)| (start + a, start + b)),
+        );
+        let special = &rendered.prompt[range.clone()];
+        let id = if special == IMAGE_SPECIAL_TOKEN {
+            image_count += 1;
+            frontend.image_placeholder_token_id.ok_or_else(|| {
+                invalid("image inputs require a prepared image placeholder token ID")
+            })?
+        } else {
+            frontend.tokenizer.get_added_vocabulary().get_vocab().get(special).copied()
+                .ok_or_else(|| invalid(format!("missing DeepSeek special token: {special}")))?
+        };
+        token_ids.push(id);
+        offsets.push((range.start, range.end));
+        start = range.end;
+    }
+    let encoding = plain
+        .encode(&rendered.prompt[start..], false)
+        .map_err(|error| {
+            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                error.to_string(),
+                error,
+            )))
+        })?;
+    token_ids.extend_from_slice(encoding.get_ids());
+    offsets.extend(
+        encoding
+            .get_offsets()
+            .iter()
+            .map(|&(a, b)| (start + a, start + b)),
+    );
+    if image_count != image_sources.len() {
         return Err(invalid(
             "image placeholder count does not match image sources",
         ));
     }
-    let placeholder =
-        if image_sources.is_empty() {
-            None
-        } else {
-            Some(frontend.image_placeholder_token_id.ok_or_else(|| {
-                invalid("image inputs require a prepared image placeholder token ID")
-            })?)
-        };
-    for (index, span) in spans.into_iter().enumerate() {
-        if index != 0 {
-            token_ids.push(placeholder.unwrap());
-            offsets.push((byte_start, byte_start + IMAGE_SPECIAL_TOKEN.len()));
-            byte_start += IMAGE_SPECIAL_TOKEN.len();
+    let mut checkpoint_hints = rendered.checkpoint_hints.clone();
+    if assistant_hints.iter().any(|(_, hints)| !hints.is_empty()) {
+        let assistant = SpecialToken::Assistant.default_str();
+        let thinking_end = SpecialToken::ThinkingEnd.default_str();
+        let mut messages = assistant_hints.iter();
+        for bounds in rendered.message_boundaries.windows(2) {
+            let ranges = rendered
+                .special_ranges
+                .iter()
+                .filter(|r| r.start >= bounds[0] && r.end <= bounds[1]);
+            let Some(marker) = ranges
+                .clone()
+                .find(|r| &rendered.prompt[(*r).clone()] == assistant)
+            else {
+                continue;
+            };
+            let Some((content, hints)) = messages.next() else {
+                return Err(invalid("unexpected rendered assistant message"));
+            };
+            if hints.is_empty() {
+                continue;
+            }
+            let end = ranges
+                .filter(|r| r.start >= marker.end)
+                .find(|r| &rendered.prompt[(*r).clone()] == thinking_end)
+                .ok_or_else(|| invalid("rendered assistant message lacks a thinking delimiter"))?
+                .end;
+            if rendered.prompt.get(end..end + content.len()) != Some(content.as_str()) {
+                return Err(invalid(
+                    "rendered assistant content does not match checkpoint hints",
+                ));
+            }
+            checkpoint_hints.extend(hints.iter().map(|&offset| end + offset));
         }
-        let encoding = frontend.tokenizer.encode(span, false).map_err(|error| {
-            Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
-        })?;
-        token_ids.extend_from_slice(encoding.get_ids());
-        offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
-        byte_start += span.len();
+        if messages.next().is_some() {
+            return Err(invalid("rendered assistant message is missing"));
+        }
     }
     let message_boundaries = super::boundaries::token_ends(
         &rendered.message_boundaries,
-        &rendered.checkpoint_hints,
+        &checkpoint_hints,
         &offsets,
         rendered.prompt.len(),
     )?;
@@ -499,5 +556,4 @@ impl Frontend {
         }
         Ok(ids[0])
     }
-
 }

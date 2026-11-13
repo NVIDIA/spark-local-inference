@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Nemotron-H Bolt preparation capacities and serving defaults."""
 
 from types import MappingProxyType
@@ -6,7 +10,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from .bootstrap import PreparationConfig, prepare as prepare_model
 
     if plan.world_size != 1 or ranks is not None:
@@ -21,15 +25,17 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         drafting = dict(draft_checkpoint=draft, speculative_widths=plan.speculation.widths,
             speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
             speculative_graph_budget=plan.speculation.graph_budget or 64)
-    config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
-        native_dense_activations=plan.native_dense_activations,
+        native_dense_activations=plan.native_dense_activations, benchmark_selection=plan.benchmark_selection,
+        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.context,
         stream_overlap=plan.stream_overlap,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, **drafting)
-    return prepare_model(snapshot, config, progress=progress, package_storage=package_storage)
+    return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
 
 
 def usage(prepared):

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """SM103 GDN prefill through FlashInfer's chunked delta rule against b12x's token-sequential prefill."""
 
 import os

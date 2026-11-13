@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Every peer must acknowledge resident table setup before native graph handoff."""
 
 from types import SimpleNamespace

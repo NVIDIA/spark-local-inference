@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The graph qualifier rejects stale scratch pointers and escaping arena outputs."""
 
 from types import SimpleNamespace

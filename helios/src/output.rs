@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Reusable output syntax and transport-neutral incremental events.
 
 #[cfg(feature = "server")]
@@ -10,6 +16,8 @@ mod minimax_xml;
 pub mod chatml;
 #[cfg(feature = "server")]
 mod pipeline;
+#[cfg(feature = "server")]
+mod recipient;
 pub mod tagged;
 #[cfg(feature = "server")]
 mod xtml;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Tuning on a unified-memory GPU splits into jobs that ranks enter together."""
 
 from types import SimpleNamespace

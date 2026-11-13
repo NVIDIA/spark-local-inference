@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM text and image answers through native HTTP on one fully provisioned GPU."""
 
 import base64

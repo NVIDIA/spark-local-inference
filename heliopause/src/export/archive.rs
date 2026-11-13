@@ -1,4 +1,9 @@
-//! Safetensors metadata and pinned logical package sources.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Safetensors metadata and pinned logical core sources.
 
 use super::{
     ExportResult as Result,
@@ -34,7 +39,7 @@ fn unique_files<'de, D: serde::Deserializer<'de>>(
     impl<'de> serde::de::Visitor<'de> for Unique {
         type Value = BTreeMap<String, Vec<(u64, String)>>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("unique logical package files")
+            f.write_str("unique logical core files")
         }
         fn visit_map<A: serde::de::MapAccess<'de>>(
             self,
@@ -43,7 +48,7 @@ fn unique_files<'de, D: serde::Deserializer<'de>>(
             let mut result = BTreeMap::new();
             while let Some((name, parts)) = map.next_entry::<String, Vec<(u64, String)>>()? {
                 if result.insert(name, parts).is_some() {
-                    return Err(serde::de::Error::custom("duplicate logical package file"));
+                    return Err(serde::de::Error::custom("duplicate logical core file"));
                 }
             }
             Ok(result)
@@ -74,7 +79,7 @@ impl Layout {
                 }
                 total = total
                     .checked_add(*size)
-                    .ok_or("logical package length overflow")?;
+                    .ok_or("logical core length overflow")?;
                 if !blob.is_empty()
                     && lengths
                         .insert(blob, *size)
@@ -111,7 +116,7 @@ pub(crate) fn validate_filename(name: &str) -> Result<()> {
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
     {
-        return Err("invalid package companion filename".into());
+        return Err("invalid core companion filename".into());
     }
     Ok(())
 }
@@ -133,7 +138,7 @@ impl Tensor {
         if self.dtype != "U8"
             || self.data_offsets[1].checked_sub(self.data_offsets[0]) != Some(self.shape[0])
         {
-            return Err("invalid package byte tensor".into());
+            return Err("invalid core byte tensor".into());
         }
         Ok(self.shape[0])
     }
@@ -170,7 +175,7 @@ impl Container {
         io::read_exact_at(&file, &mut prefix, 0)?;
         let size = u64::from_le_bytes(prefix);
         if size == 0 || size > MAX_HEADER || (size + 8) % 4096 != 0 {
-            return Err("invalid package header size".into());
+            return Err("invalid core header size".into());
         }
         let base = size + 8;
         let mut bytes = vec![0; size as usize];
@@ -179,7 +184,7 @@ impl Container {
         let header_json = serde_json::from_slice(&bytes)?;
         let payload_length = header.payload.length()?;
         if header.payload.data_offsets[0] != 0 {
-            return Err("invalid package payload range".into());
+            return Err("invalid core payload range".into());
         }
         let mut end = payload_length;
         let mut envelope = Vec::new();
@@ -219,13 +224,13 @@ impl Container {
                     return Err("unexpected snapshot layout".into());
                 }
             }
-            _ => return Err("not a Flare package".into()),
+            _ => return Err("not a Flare core".into()),
         }
         if file.metadata()?.len() != base.checked_add(end).ok_or("container length overflow")? {
-            return Err("safetensors data length differs from model package".into());
+            return Err("safetensors data length differs from model core".into());
         }
         if before != Identity::of(&file)? {
-            return Err("package metadata changed while reading".into());
+            return Err("core metadata changed while reading".into());
         }
         Ok(Self {
             header_json,
@@ -244,13 +249,13 @@ pub(crate) enum SourcePiece {
     Data(Source),
     Zero(u64),
 }
-pub(crate) struct PackageSources {
+pub(crate) struct CoreSources {
     pub(crate) container: Container,
     directory: PathBuf,
     physical: BTreeMap<String, Source>,
     _directory: File,
 }
-impl PackageSources {
+impl CoreSources {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let directory = path
             .parent()
@@ -288,11 +293,11 @@ impl PackageSources {
                 100
             }
         {
-            return Err("too many physical package files".into());
+            return Err("too many physical core files".into());
         }
         let file = Container::open(&self.directory.join(name))?;
         if file.format != "flare-data" {
-            return Err("invalid package companion format".into());
+            return Err("invalid core companion format".into());
         }
         let source = Source::from_file(file.file, file.base, file.payload_length)?;
         self.physical.insert(name.to_owned(), source.clone());
@@ -303,7 +308,7 @@ impl PackageSources {
             return Ok(layout
                 .files
                 .get(name)
-                .ok_or("missing logical package file")?
+                .ok_or("missing logical core file")?
                 .iter()
                 .map(|p| p.0)
                 .sum());
@@ -328,7 +333,7 @@ impl PackageSources {
         let parts = layout
             .files
             .get(name)
-            .ok_or("missing logical package file")?
+            .ok_or("missing logical core file")?
             .clone();
         let mut cursor = 0;
         let mut pieces = Vec::new();
@@ -367,7 +372,7 @@ impl PackageSources {
             cursor += count;
         }
         if cursor != output.len() {
-            return Err("truncated logical package range".into());
+            return Err("truncated logical core range".into());
         }
         Ok(())
     }
@@ -376,7 +381,7 @@ impl PackageSources {
 fn encode_header(raw: Vec<u8>) -> Result<Vec<u8>> {
     let size = (raw.len() + 8).next_multiple_of(4096) - 8;
     if size > MAX_HEADER as usize {
-        return Err("package header exceeds its size limit".into());
+        return Err("core header exceeds its size limit".into());
     }
     let mut header = Vec::with_capacity(size + 8);
     header.extend_from_slice(&(size as u64).to_le_bytes());
@@ -777,7 +782,7 @@ mod tests {
         bytes.extend_from_slice(envelope);
         bytes.extend_from_slice(&encoded);
         std::fs::write(&path, bytes).unwrap();
-        let mut sources = PackageSources::open(&path).unwrap();
+        let mut sources = CoreSources::open(&path).unwrap();
         let mut output = [0xff; 6];
         sources.read_at("", 0, &mut output).unwrap();
         assert_eq!(&output, b"\0\0abc\0");
@@ -801,7 +806,7 @@ mod tests {
         let mut companion = container_header(2, 0, "flare-data").unwrap();
         companion.extend_from_slice(b"yz");
         std::fs::write(directory.join("data.safetensors"), companion).unwrap();
-        let mut sources = PackageSources::open(&primary).unwrap();
+        let mut sources = CoreSources::open(&primary).unwrap();
         let mut output = [0; 2];
         sources.read_at("data.safetensors", 0, &mut output).unwrap();
         assert_eq!(&output, b"yz");

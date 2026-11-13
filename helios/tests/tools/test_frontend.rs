@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -87,9 +92,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if serde_json::to_value(&rendered.token_ids).unwrap() != case["token_ids"] {
                             return Err((format!("{name}: token IDs differ")).into());
                         }
+                        if let Some(expected) = case.get("image_sources") {
+                            if serde_json::to_value(&rendered.image_sources).unwrap() != *expected {
+                                return Err(format!("{name}: image sources differ").into());
+                            }
+                        }
                         if let Some(expected) = case.get("message_boundaries") {
                             if serde_json::to_value(&rendered.message_boundaries).unwrap() != *expected {
-                                return Err(format!("{name}: message boundaries differ").into());
+                                return Err(format!("{name}: message boundaries differ: expected {expected}, received {:?}", rendered.message_boundaries).into());
                             }
                         }
                     }
@@ -137,10 +147,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap(),
             chat_template: Some(asset("chat_template.jinja")?),
         },
-        serde_json::json!({"enable_thinking": false, "add_generation_prompt": true})
-            .as_object()
-            .unwrap()
-            .clone(),
+        fixture.get("template_defaults").cloned()
+            .unwrap_or_else(|| serde_json::json!({"enable_thinking": false, "add_generation_prompt": true}))
+            .as_object().unwrap().clone(),
     )?
     .with_template_encoding(serde_json::from_value(
         fixture
@@ -148,17 +157,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .unwrap_or(Value::from(0)),
     )?);
-    for (fixture_name, overrides) in [
-        ("thinking_disabled", serde_json::json!({})),
+    let default_overrides: Vec<(String, Value)> = fixture.get("default_overrides")
+        .map(|cases| serde_json::from_value(cases.clone()).unwrap())
+        .unwrap_or_else(|| vec![
+        ("thinking_disabled".into(), serde_json::json!({})),
         (
-            "thinking_enabled",
+            "thinking_enabled".into(),
             serde_json::json!({"enable_thinking": true}),
         ),
         (
-            "default",
+            "default".into(),
             serde_json::json!({"enable_thinking": true, "add_generation_prompt": false}),
         ),
-    ] {
+    ]);
+    let default_override_count = default_overrides.len();
+    for (fixture_name, overrides) in default_overrides {
         let case = fixture["cases"]
             .as_array()
             .unwrap()
@@ -178,7 +191,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    counts.insert("default_override_cases".into(), Value::from(3));
+    counts.insert("default_override_cases".into(), Value::from(default_override_count));
     println!("{}", Value::Object(counts));
     Ok(())
 }

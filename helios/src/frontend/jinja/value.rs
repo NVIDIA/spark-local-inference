@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 use std::rc::Rc;
@@ -24,6 +30,7 @@ pub(super) enum Value<'a> {
     Namespace(Rc<RefCell<Vec<(String, Value<'a>)>>>),
     Loop(Rc<LoopValue<'a>>),
     Macro(u32),
+    Builtin,
 }
 
 #[derive(Debug)]
@@ -126,7 +133,7 @@ impl<'a> Value<'a> {
             Self::Int(v) => *v != 0,
             Self::UInt(v) => *v != 0,
             Self::Float(v) => *v != 0.0,
-            Self::Loop(_) | Self::Macro(_) | Self::Namespace(_) => true,
+            Self::Loop(_) | Self::Macro(_) | Self::Builtin | Self::Namespace(_) => true,
             _ => self.len() != 0,
         }
     }

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Restored storage calls retain traced Triton launch options without decorators."""
 
 import sys
@@ -111,11 +115,12 @@ def test_storage_roundtrip_bypasses_imported_global_autotuner(
         artifact=SimpleNamespace(serialize=lambda: b"inner artifact"),
         inputs=[],
         _serialized_artifact=None,
+        _tuning_frozen=False,
         invocations=[_Invocation(node.target, leaves, tree, operands)],
         signature=(((32,), (1,), 0, torch.float32, torch.device("cuda:0"), 0),),
     )
     payload = aot.StorageBackend.serialize_compile_artifacts(owner)
-    monkeypatch.setattr(aot, "_load_inductor", lambda artifact, device: (object(), None))
+    monkeypatch.setattr(aot, "_load_inductor", lambda artifact, device, *, frozen: (object(), None))
     restored = aot.StorageBackend.deserialize_compile_artifacts(payload)
     launches = []
     monkeypatch.setattr(

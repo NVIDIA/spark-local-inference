@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use crate::{Result, frontend::Frontend};
 use serde_json::{Value, json};
 
@@ -228,18 +234,32 @@ mod tests {
             let mut config = config(true);
             config.syntax.tools = Some(ToolParser { kind, wrapping_newlines: 0, tag_separator: separator.into() });
             config.control_tokens = vec![(1, boundary.into())];
-            let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
-            decoder.track_logprobs(&frontend, true);
-            let mut events = Vec::new();
-            for token in 0..3 {
-                events.extend(decoder.push_logprob(value(token)).unwrap());
+            for worker in [false, true] {
+                let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config.clone()));
+                decoder.track_logprobs(&frontend, true);
+                let mut events = Vec::new();
+                if worker {
+                    let mut stops = crate::server::stops::TextStops::new(&frontend, vec!["UNMATCHED".into()]).unwrap();
+                    stops.track(&frontend);
+                    for token in 0..3 {
+                        let (pieces, matched) = stops.push_logprob(token, value(token), false).unwrap();
+                        assert!(!matched);
+                        events.extend(decoder.push_protocol(pieces).unwrap());
+                    }
+                    let (pieces, _) = stops.finish(None).unwrap();
+                    events.extend(decoder.push_protocol(pieces).unwrap());
+                } else {
+                    for token in 0..3 {
+                        events.extend(decoder.push_logprob(value(token)).unwrap());
+                    }
+                }
+                events.extend(decoder.finish(Termination::Eos).unwrap());
+                let content: Vec<_> = events.iter().filter_map(|e| match e {
+                    Event::ContentLogprobs(entries) => Some(entries.iter().map(|e| e.value.token)),
+                    _ => None,
+                }).flatten().collect();
+                assert_eq!(content, [2], "{kind:?} {separator:?} worker={worker}");
             }
-            events.extend(decoder.finish(Termination::Eos).unwrap());
-            let content: Vec<_> = events.iter().filter_map(|e| match e {
-                Event::ContentLogprobs(entries) => Some(entries.iter().map(|e| e.value.token)),
-                _ => None,
-            }).flatten().collect();
-            assert_eq!(content, [2], "{kind:?} {separator:?}");
         }
     }
 
@@ -269,6 +289,73 @@ mod tests {
             assert_eq!(json!(streamed), part["logprobs"]);
             if let Some(expected) = &expected { assert_eq!(part, expected); }
             expected = Some(part.clone());
+        }
+    }
+
+    #[test]
+    fn spelled_reasoning_delimiter_in_the_answer_receives_output_text_logprobs() {
+        let frontend = Arc::new(crate::server::output::tests::frontend(&[
+            "plan", "</think>", "Use ", "</", "think>", ".",
+        ]));
+        for (worker, streaming) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut config = config(true);
+            config.control_tokens = vec![(1, "</think>".into())];
+            let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
+            decoder.track_logprobs(&frontend, true);
+            let mut encoder = encoder(Protocol::Responses, frontend.clone(), streaming);
+            let mut streamed = Vec::new();
+            let mut stops =
+                crate::server::stops::TextStops::new(&frontend, vec!["UNMATCHED".into()]).unwrap();
+            stops.track(&frontend);
+            for token in 0..6 {
+                let events = if worker {
+                    let (pieces, matched) = stops.push_logprob(token, value(token), false).unwrap();
+                    assert!(!matched);
+                    decoder.push_protocol(pieces).unwrap()
+                } else {
+                    decoder.push_logprob(value(token)).unwrap()
+                };
+                for frame in encoder.apply(0, events).unwrap() {
+                    if frame.data["type"] == "response.output_text.delta" {
+                        streamed.extend(frame.data["logprobs"].as_array().unwrap().iter().cloned());
+                    }
+                }
+            }
+            if worker {
+                let (pieces, _) = stops.finish(None).unwrap();
+                encoder
+                    .apply(0, decoder.push_protocol(pieces).unwrap())
+                    .unwrap();
+            }
+            for frame in encoder
+                .apply(0, decoder.finish(Termination::Eos).unwrap())
+                .unwrap()
+            {
+                if frame.data["type"] == "response.output_text.delta" {
+                    streamed.extend(frame.data["logprobs"].as_array().unwrap().iter().cloned());
+                }
+            }
+            encoder.finish(0, Termination::Eos, 6, 0, None).unwrap();
+            let response = encoder.response();
+            let part = &response["output"][1]["content"][0];
+            assert_eq!(
+                part["text"], "Use </think>.",
+                "worker {worker} streaming {streaming}"
+            );
+            let tokens: Vec<_> = part["logprobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["token"].clone())
+                .collect();
+            assert_eq!(
+                tokens,
+                ["token_id:2", "token_id:3", "token_id:4", "token_id:5"],
+                "worker {worker} streaming {streaming}"
+            );
+            if streaming {
+                assert_eq!(json!(streamed), part["logprobs"]);
+            }
         }
     }
 

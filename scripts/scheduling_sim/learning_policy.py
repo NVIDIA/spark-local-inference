@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Observed-cost graph selection with explicit foreground exploration accounting."""
 
 from dataclasses import dataclass, replace

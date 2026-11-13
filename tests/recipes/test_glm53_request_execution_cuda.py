@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM request metadata and completions through native uploads and transport frames.
 
 The graphs exercise request processing with fixed test logits; model layers are
@@ -31,7 +35,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("rank", [0, 3])
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [32])
 @torch.no_grad()
 def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -48,7 +52,7 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
     for mode, capacity in (("prefill", 128), ("decode", 1)):
         metadata = DecoderMetadata.allocate(capacity, 1, 32, "cuda")
         batch = PreparedBatch(inputs, requests, metadata, mode=mode,
-            shard=TensorParallelShard(rank, 4), pages=64)
+            shard=TensorParallelShard(rank, 4), pages=torch.tensor([64], device="cuda"))
         arguments = (requests, inputs.row_slot_ids[:1], inputs.row_generations[:1],
                      inputs.live_rows, records, frame, sequence)
         if rank == 0:
@@ -59,9 +63,11 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
             completion = PreparedCompletion(*arguments)
         completion.prepare()
 
+        batch.functional()
         def forward(batch=batch, completion=completion):
-            batch.begin(batch.validate() * batch.shard.world_size)
-            batch.finish()
+            validation, present = batch.validate()
+            metadata = batch.begin(validation * batch.shard.world_size, present)
+            batch.finish(metadata)
             completion()
 
         operations[mode] = compile_forward(forward)
@@ -126,7 +132,7 @@ def test_native_glm_admission_prefill_decode_and_rank_completion(rank, fields):
         assert record[5:8] == [2 if rank == 0 else 1, 0, 0]
         assert requests.rng_counter[2].item() == (2 if rank == 0 else 0)
         assert requests.histogram[2].sum().item() == 65 + (2 if rank == 0 else 0)
-        if fields == 24:
+        if fields == 32:
             assert record[8] == int(rank == 0)
             assert record[16] == record[4]
         assert executor.outstanding == 0

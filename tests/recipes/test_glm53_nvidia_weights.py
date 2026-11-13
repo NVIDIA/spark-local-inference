@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """NVIDIA GLM checkpoint partitions preserve packed values, scales, and plain weights."""
 
 import json

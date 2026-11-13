@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Record one configured speculation arm through the actual native HTTP service.
 
 Requests come from frozen files. This client neither starts a model nor changes

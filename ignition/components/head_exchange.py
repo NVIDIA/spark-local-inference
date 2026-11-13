@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Combine context-parallel attention across hosts by log-sum-exp, over a RoCE all-gather.
 
 Under decode context parallelism every rank attends all heads over its share of the

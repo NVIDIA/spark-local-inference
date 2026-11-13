@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Summarize TP graph envelopes from GLM HTTP benchmark Nsight traces.
 
 Flare graph names come from its prepared catalog. Peer launches are matched by

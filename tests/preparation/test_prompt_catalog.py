@@ -1,18 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare real exports made with the same shape catalog and weights."""
 
 import os
 
 import pytest
 
-from ignition.preparation import runtime_package_pb2 as proto
-from ignition.preparation.package_file import read_index
+from ignition.preparation import runtime_core_pb2 as proto
+from ignition.preparation.core_file import read_index
 
 
-@pytest.mark.skipif(not os.environ.get("FLARE_PROMPT_TEST_OFF_PACKAGE"),
+@pytest.mark.skipif(not os.environ.get("FLARE_PROMPT_TEST_OFF_CORE"),
     reason="requires matching flag-off and flag-on exports")
 def test_flag_off_export_preserves_ordinary_catalog_and_buffers():
-    off, _ = read_index(os.environ["FLARE_PROMPT_TEST_OFF_PACKAGE"])
-    on, _ = read_index(os.environ["FLARE_PROMPT_TEST_PACKAGE"])
+    off, _ = read_index(os.environ["FLARE_PROMPT_TEST_OFF_CORE"])
+    on, _ = read_index(os.environ["FLARE_PROMPT_TEST_CORE"])
     assert not any(g.kind == proto.SCORED_PREFILL for g in off.contract.model_contract.graphs)
     assert any(g.kind == proto.SCORED_PREFILL for g in on.contract.model_contract.graphs)
     assert [g.SerializeToString() for g in off.contract.model_contract.graphs] == [

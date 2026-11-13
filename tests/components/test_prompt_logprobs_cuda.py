@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prompt reductions use bounded logits and preserve frame and block ownership."""
 
 import gc
@@ -13,7 +16,6 @@ pytestmark = pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', r
 @pytest.mark.parametrize('compiled', [False, True])
 def test_prompt_reduction(vocab, compiled):
     from ignition.components.prompt_logprobs import PromptOutputs, PreparedPromptReduction
-    from ignition.preparation.scratch import GraphBufferPool
     rows, start = 5, 16
     torch.manual_seed(42)
     logits = torch.randn((rows, vocab), device='cuda', dtype=torch.bfloat16)
@@ -24,12 +26,12 @@ def test_prompt_reduction(vocab, compiled):
     outputs.targets[start:start + rows] = torch.tensor(targets, device='cuda')
     outputs.values.fill_(-777)
     frame = torch.ones(1, device='cuda', dtype=torch.int32)
-    scratch = GraphBufferPool('cuda')
     op = PreparedPromptReduction(logits, outputs.targets, outputs.values, frame,
         start=start, vocabulary=vocab, offset=0, runtime=None, session=None,
-        coordinator=None, name='test', buffers=scratch.cursor())
+        coordinator=None, name='test')
     from ignition.preparation.compilation import compile_forward
-    call = compile_forward(op) if compiled else op
+    op = op.functional(session=None)
+    call = compile_forward(lambda: op(logits)) if compiled else lambda: op(logits)
     call()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -77,7 +79,6 @@ def test_prompt_reduction(vocab, compiled):
 @pytest.mark.parametrize('world', [2, 4])
 def test_prompt_partial_combination_excludes_padding_and_counts_cross_shard_ties(world):
     from ignition.components.prompt_logprobs import PromptOutputs, PreparedPromptReduction
-    from ignition.preparation.scratch import GraphBufferPool
     vocab, rows = 1025, 3
     width = (vocab + world * 64 - 1) // (world * 64) * 64
     torch.manual_seed(7)
@@ -87,19 +88,17 @@ def test_prompt_partial_combination_excludes_padding_and_counts_cross_shard_ties
     targets = torch.tensor([5, vocab - 1, width], device='cuda', dtype=torch.int32)
     outputs = [PromptOutputs(rows, 'cuda') for _ in range(world)]
     frame = torch.zeros(1, device='cuda', dtype=torch.int32)
-    parts, shards, pools = [], [], []
+    parts, shards = [], []
     for rank in range(world):
         shard = torch.full((rows, width), 1000., device='cuda')
         size = min(width, vocab - rank * width)
         shard[:, :size].copy_(raw[:, rank * width:rank * width + size])
-        pool = GraphBufferPool('cuda')
         outputs[rank].targets.copy_(targets)
         op = PreparedPromptReduction(shard, outputs[rank].targets, outputs[rank].values, frame,
             start=0, vocabulary=vocab, offset=rank * width, runtime=None, session=None,
-            coordinator=None, name=f'shard{rank}', buffers=pool.cursor())
+            coordinator=None, name=f'shard{rank}')
         parts.append(op)
         shards.append(shard)
-        pools.append(pool)
     # Simulate the bit-preserving collective between the two reduction phases.
     from ignition.components.prompt_logprobs import _global_stats, _finish, PROMPT_FIELDS
     from ignition.components.completion import MAX_TOP_LOGPROBS
@@ -126,24 +125,29 @@ def test_prompt_partial_combination_excludes_padding_and_counts_cross_shard_ties
         assert actual[row, 3::2].tolist() == expected
 
 
+@pytest.mark.parametrize('logits_dtype', [torch.bfloat16, torch.float32])
 @torch.no_grad()
-def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
-    from ignition.components.prompt_logprobs import PromptOutputs, PreparedPromptScoring, BLOCK_ROWS
+def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(logits_dtype):
+    from ignition.components.prompt_logprobs import PromptScoring, BLOCK_ROWS
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
 
     rows, vocab, hidden = BLOCK_ROWS * 2 + 1, 4096, 256
     source = torch.randn(rows, hidden, device='cuda', dtype=torch.bfloat16) * .125
     weight = torch.randn(vocab, hidden, device='cuda', dtype=torch.bfloat16) * .125
-    outputs = PromptOutputs(rows, 'cuda')
-    outputs.targets.copy_(torch.arange(rows, device='cuda', dtype=torch.int32) % vocab)
     frame = torch.ones(1, dtype=torch.int32, device='cuda')
+    scoring = PromptScoring(rows, 'cuda', frame=frame)
+    outputs = scoring.outputs
+    outputs.targets.copy_(torch.arange(rows, device='cuda', dtype=torch.int32) % vocab)
     with RecordedPreparationSession(device=torch.device('cuda'), checkpoint='prompt-projection-test',
             workload_schema='prompt-blocks-v1', numerical_policy='default') as session:
-        op = PreparedPromptScoring(source, weight, outputs, frame, vocabulary=vocab,
-            session=session, name='score')
+        op = scoring.prepare(source, weight, vocabulary=vocab,
+            session=session, coordinator=None, name='score', logits_dtype=logits_dtype)
         session.tune()
-        call = compile_forward(op)
+        declaration_source = source
+        source = source.clone()
+        declaration_source.fill_(float('nan'))
+        call = compile_forward(lambda: op(source))
         call()
         torch.cuda.synchronize()
         stream = torch.cuda.Stream()
@@ -152,6 +156,7 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
         with session.capture(), torch.cuda.graph(graph, stream=stream):
             call()
         torch.cuda.current_stream().wait_stream(stream)
+        source.add_(.03125)
         before = torch.cuda.memory_stats()['allocation.all.allocated']
         peak = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
@@ -161,16 +166,18 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
         assert torch.cuda.memory_stats()['allocation.all.allocated'] == before
         assert torch.cuda.max_memory_allocated() == peak
         print(dict(rows=rows, vocabulary=vocab, replay_peak_bytes=peak,
-                   scoring_pool_bytes=outputs.scratch.nbytes, replay_allocations=0))
+                   replay_allocations=0))
         # Every declared projection output has the fixed block bound, including the tail.
-        assert max(projection.output.shape[0] for _, projection, _ in op.parts) == BLOCK_ROWS
-        assert op.parts[-1][0].shape[0] == 1
-        logits = (source.cpu().float() @ weight.cpu().float().T).bfloat16().double()
+        assert max(count for _, count, _, _ in op.parts) == BLOCK_ROWS
+        assert op.parts[-1][1] == 1
+        assert all(projection.output is None for _, _, projection, _ in op.parts)
+        assert all(projection.output_layout[2] == logits_dtype for _, _, projection, _ in op.parts)
+        logits = (source.cpu().float() @ weight.cpu().float().T).to(logits_dtype).double()
         ref = logits.log_softmax(-1)
         result = outputs.values[1].cpu()
         for row in [0, BLOCK_ROWS - 1, BLOCK_ROWS, rows - 1]:
             actual = result[row, 1:2].view(torch.float32).item()
-            assert abs(actual - ref[row, row].item()) < .03
+            assert abs(actual - ref[row, row].item()) < (.03 if logits_dtype == torch.bfloat16 else 5e-5)
 
 
 def _prompt_tp_rank(rank, rendezvous):
@@ -206,12 +213,13 @@ def _prompt_tp_rank(rank, rendezvous):
                 workload_schema='prompt-partials-v1', numerical_policy='default', coordinator=coordinator) as session:
             op = PreparedPromptReduction(local, outputs.targets, outputs.values, frame, start=0,
                 vocabulary=1025, offset=rank * width, runtime=runtime, session=session,
-                coordinator=coordinator, name='scores', buffers=outputs.scratch.cursor())
+                coordinator=coordinator, name='scores')
             hashes = [None, None]
             dist.all_gather_object(hashes, op.operations[0].compiled.hash)
             assert hashes[0] == hashes[1]
+            op = op.functional(session=session)
             session.tune()
-            call = compile_forward(op)
+            call = compile_forward(lambda: op(local))
             call()
             torch.cuda.synchronize()
             stream = torch.cuda.Stream()
@@ -255,8 +263,8 @@ def test_prompt_reported_value_ties_and_negative_infinity_targets():
         frame = torch.zeros(1, dtype=torch.int32, device='cuda')
         op = PreparedPromptReduction(logits, outputs.targets, outputs.values, frame, start=0,
             vocabulary=logits.shape[1], offset=0, runtime=None, session=None, coordinator=None,
-            name='ties', buffers=outputs.scratch.cursor())
-        op()
+            name='ties').functional(session=None)
+        op(logits)
         actual = outputs.values[0, 0].cpu()
         assert actual[2] == (2 if target == 2 else 1)
         assert actual[3:3 + 2 * min(20, logits.shape[1]):2].tolist() == list(range(min(20, logits.shape[1])))

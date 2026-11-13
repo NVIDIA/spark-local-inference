@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Read lossless MXFP4-CSF containers without restoring expanded checkpoints."""
 
 from dataclasses import dataclass

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM continuation transitions with b12x rank agreement before mutation."""
 
 from ignition.components.collectives import PreparedAllReduce
@@ -26,6 +30,8 @@ class PreparedMaintenance:
         self.state.prepare()
         self.validation = PreparedAllReduce(self.state.validation_input, self.state.validation_sum,
             runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.validation")
+        self.state.functional()
+        self.validation.functional(session=session)
 
     def _transfer(self):
         return PreparedStateTransfer(self.pool, self.commands, self.tables, pages=self.pool.partial_pages(),
@@ -40,5 +46,5 @@ class PreparedMaintenance:
         self.state.transfer.prepare()
 
     def __call__(self):
-        self.validation(self.state.validate())
-        self.state.apply()
+        validation, admission_errors = self.state.validate()
+        self.state.apply(self.validation(validation), admission_errors=admission_errors)

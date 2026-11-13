@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Requested raw-distribution reductions with exact cutoff tie ordering."""
 
 import torch
@@ -7,8 +11,8 @@ import triton.language as tl
 from ignition.preparation.triton import prepare_triton
 
 from .completion import (
-    EMITTED_COUNT_FIELD, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_OUTPUT_TOKENS,
-    MAX_LOGPROB_TOKEN_IDS, MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_RECORD_FIELDS, VECTOR_TOKENS_FIELD,
+    EMITTED_COUNT_FIELD, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
+    MAX_LOGPROB_TOKEN_IDS, MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_TOKENS_FIELD, validate_completion_buffers,
 )
 
 _VOCAB_TILE = 1024
@@ -35,7 +39,6 @@ def _sort_pair(keys):
 @triton.jit
 def _position(Records, Frame, Requested, Slots, Epochs, Live, row, col,
               SLOTS: tl.constexpr, FIELDS: tl.constexpr,
-              VECTOR_FIELDS: tl.constexpr = VECTOR_RECORD_FIELDS,
               COUNT_FIELD: tl.constexpr = EMITTED_COUNT_FIELD,
               TOKENS_FIELD: tl.constexpr = VECTOR_TOKENS_FIELD,
               CHOSEN_FIELD: tl.constexpr = TOKEN_FIELD):
@@ -132,16 +135,24 @@ def _finish(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Keys, O
 
 class PreparedLogprobs:
     def __init__(self, logits, completion, slots, epochs, live, frame):
+        validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
         batch, width, vocab = logits.shape
         if not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("raw logprob logits require contiguous BF16 or FP32 storage")
+        if not 1 <= width <= completion.token_capacity:
+            raise ValueError("raw logprob width exceeds completion token capacity")
         tiles = triton.cdiv(vocab, _VOCAB_TILE)
-        cursor = completion.scratch.cursor()
-        self.stats = cursor.zeros((batch, width, tiles, 2), torch.float32)  # Maximum and exponential mass.
-        self.lse = cursor.zeros((batch, width), torch.float32)
-        self.keys = cursor.zeros((batch, width, tiles, _TILE_CANDIDATES), torch.uint64)
+        self.logits = logits
+        self.row_inputs = (slots, epochs, live)
+        self.layout = {
+            "stats": ((batch, width, tiles, 2), torch.float32),
+            "lse": ((batch, width), torch.float32),
+            "keys": ((batch, width, tiles, _TILE_CANDIDATES), torch.uint64),
+        }
+        for name, (shape, dtype) in self.layout.items():
+            setattr(self, name, torch.empty(shape, dtype=dtype, device=logits.device))
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         dimensions = (vocab, width, tiles, completion.records.shape[1], completion.records.shape[2])
         self._preparation = (
@@ -153,7 +164,7 @@ class PreparedLogprobs:
             (_finish, (*common, self.lse, self.keys, completion.logprobs, completion.token_ids,
                 completion.token_id_counts, *dimensions,
                 triton.next_power_of_2(tiles * _TILE_CANDIDATES), _TILE_CANDIDATES,
-                MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
+                MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
                 (batch, width, 1), _MERGE_WARPS),
         )
         self.statistics = self.normalization = self.candidates = self.finish = None
@@ -163,16 +174,58 @@ class PreparedLogprobs:
             return
         operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
                            for kernel, args, grid, warps in self._preparation)
+        names = {id(getattr(self, name)): name for name in self.layout}
+        for operation in operations:
+            operation.scratch_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                            if id(value) in names)
+            slots = {index for index, _ in operation.scratch_slots}
+            operation.args = tuple(None if index in slots else value for index, value in enumerate(operation.args))
         self.statistics, self.normalization, self.candidates, self.finish = operations
+        for operation in (self.statistics, self.candidates, self.finish):
+            operation.args = (None, *operation.args[1:])
         self._preparation = ()
+        for name in self.layout:
+            setattr(self, name, None)
 
     def __call__(self):
+        return self.run(self.logits)
+
+    def functional(self, *, session=None, dynamic_inputs=False):
+        self.release_logits()
+        if dynamic_inputs:
+            self.row_inputs = (None, None, None)
+            for operation in (self.statistics, self.normalization, self.candidates, self.finish):
+                start = 3 if operation is self.normalization else 4
+                args = list(operation.args)
+                args[start:start + 3] = (None, None, None)
+                operation.args = tuple(args)
+        return self
+
+    def release_logits(self):
+        self.logits = None
+
+    def run(self, logits, *, slots=None, generations=None, live_rows=None):
+        from ignition.preparation.triton import launch_triton
+
         if self.statistics is None:
             raise RuntimeError("logprob reduction prepare() must finish before capture")
-        self.statistics()
-        self.normalization()
-        self.candidates()
-        self.finish()
+        if logits.ndim == 2:
+            logits = logits[:, None, :]
+        row_inputs = tuple(default if value is None else value for default, value in
+                           zip(self.row_inputs, (slots, generations, live_rows), strict=True))
+        if any(value is None for value in row_inputs):
+            raise ValueError("functional logprobs require runtime row operands")
+        scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
+                   for name, (shape, dtype) in self.layout.items()}
+        for operation in (self.statistics, self.normalization, self.candidates, self.finish):
+            args = list(operation.args)
+            if operation is not self.normalization:
+                args[0] = logits
+            start = 3 if operation is self.normalization else 4
+            args[start:start + 3] = row_inputs
+            for index, name in operation.scratch_slots:
+                args[index] = scratch[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
 
 
 @triton.jit

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Check real-model scoring against an independent head and FP64 softmax."""
 
 import json
@@ -13,7 +16,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", r
 
 def test_real_qwen_prompt_head_and_reduction():
     from tokenizers import Tokenizer
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.recipes.qwen38.bootstrap import PreparationConfig, prepare_model
     from ignition.recipes.qwen38.decoder import DecoderScratch, ModelWeights
     from ignition.recipes.qwen38.decoder_state import DecoderInputs
@@ -31,8 +34,8 @@ def test_real_qwen_prompt_head_and_reduction():
     config = PreparationConfig(prompt_logprobs=True, max_active=1, context=128, prefill_chunk_size=128,
         pages=4, snapshot_budget_bytes=256 << 20, compile_workers=12,
         kernel_cache=Path.home() / ".cache/flare/kernels-qwen")
-    with PackageStorage(world=1) as storage:
-        with prepare_model(snapshot, config, compile_decoder=False, package_storage=storage,
+    with CoreStorage(world=1) as storage:
+        with prepare_model(snapshot, config, compile_decoder=False, core_storage=storage,
                            progress=lambda message: print(message, flush=True)) as model:
             def owner(kind):
                 return next(value for value in model.resources if isinstance(value, kind))

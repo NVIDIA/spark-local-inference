@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint quantization dispatch and projection fusion constraints."""
 
 import json
@@ -108,7 +112,7 @@ def test_checkpoint_selects_single_projection_format(tmp_path, monkeypatch, load
     assert slices == {"row_ranges": ((0, 32),), "column_range": (16, 144)}
 
 
-@pytest.mark.parametrize("formats", [("NVFP4", "NVFP4"), ("MXFP8", "NVFP4"),
+@pytest.mark.parametrize("formats", [("MXFP8", "NVFP4"),
                                       ("W4A16_NVFP4", "MXFP8")])
 def test_nvfp4_fusion_rejected_before_tensor_access(tmp_path, formats):
     layers = {name: {"quant_algo": algo, "group_size": 32 if algo == "MXFP8" else 16}
@@ -116,7 +120,7 @@ def test_nvfp4_fusion_rejected_before_tensor_access(tmp_path, formats):
     (tmp_path / "config.json").write_text(json.dumps(config(layers)))
     loader = DirectWeightLoader(SimpleNamespace(snapshot=tmp_path, metadata_path=tmp_path), "cuda:0")
     loader._session = object()
-    with pytest.raises(ValueError, match="cannot fuse NVFP4.*only MoE expert w1/w3"):
+    with pytest.raises(ValueError, match="same quantization format"):
         loader.load_linear_group(("q", "k"))
 
 
@@ -237,7 +241,7 @@ def test_nvfp4_reciprocal_globals_and_token_outer_scales_preserve_packed_tp_slic
     loader = DirectWeightLoader(SimpleNamespace(), "cpu")
     loader._session = SimpleNamespace(flush=lambda: None)
     monkeypatch.setattr(loader, "_copy", lambda destination, source: destination.copy_(source))
-    monkeypatch.setattr(reference, "swizzle_block_scale", lambda value: value)
+    monkeypatch.setattr(reference, "swizzle_block_scale", lambda value, *, allocate=None: value)
     monkeypatch.setattr(moe, "plan_weights", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(moe, "prepare_weights", lambda **kwargs: SimpleNamespace(**kwargs))
     for index, projection in enumerate(("w1", "w3", "w2")):
@@ -292,3 +296,21 @@ def test_mxfp8_projection_fusion_preserves_unsigned_exponent_payload(monkeypatch
     assert torch.equal(values.float(), torch.cat((torch.ones(4, 32), torch.full((4, 32), 2.))))
     assert torch.equal(scales, torch.cat((loader._sources["q.weight_scale_inv"][1:5, 1:],
                                          loader._sources["k.weight_scale_inv"][2:6, 1:])))
+
+
+@pytest.mark.parametrize("difference", ["weight_scale_2", "input_scale", "algorithm"])
+def test_nvfp4_group_rejects_calibration_mismatch_before_payload(tmp_path, difference):
+    import torch
+
+    layers = {name: {"quant_algo": "NVFP4", "group_size": 16} for name in ("gate", "up")}
+    if difference == "algorithm":
+        layers["up"]["quant_algo"] = "W4A16_NVFP4"
+    (tmp_path / "config.json").write_text(json.dumps(config(layers)))
+    loader = DirectWeightLoader(SimpleNamespace(snapshot=tmp_path, metadata_path=tmp_path), "cuda:0")
+    loader._session = object()
+    loader._sources = {f"{part}.{name}": torch.tensor(.5 if name == "weight_scale_2" else .03125)
+                       for part in layers for name in ("weight_scale_2", "input_scale")}
+    if difference != "algorithm":
+        loader._sources[f"up.{difference}"] *= 2
+    with pytest.raises(ValueError, match="identical weight and activation calibration"):
+        loader.load_linear_group(("gate", "up"))

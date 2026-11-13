@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CLIP vision encoder with axial RoPE and projection before spatial patch merging."""
 
 import json
@@ -14,8 +17,10 @@ from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.preparation.persistent import persistent_copy
 from ignition.components.vision_delivery import PreparedFeaturePublication
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.persistent import persistent_cat
 
 PATCH_CAPACITIES = (256, 1024, 2304)
 FEATURES = 2304
@@ -62,25 +67,25 @@ class VisionWeights:
             progress_label="Load vision weights",
         ) as loader:
 
-            def tensor(name, extent=None, *, dtype=torch.bfloat16):
+            def tensor(name, extent=None, *, dtype=torch.bfloat16, temporary=False):
                 value = loader._sources[name]
                 if value.dtype != dtype:
                     raise ValueError(
                         f"{name}: vision weights require {dtype} checkpoint storage"
                     )
-                return loader.load_tensor(name, extent=extent)
+                return loader.load_tensor(name, extent=extent, temporary=temporary)
 
-            def affine(prefix, rows=None, columns=None):
+            def affine(prefix, rows=None, columns=None, *, temporary=False):
                 return (
                     tensor(
                         prefix + ".weight",
                         (
                             slice(None) if rows is None else slice(*rows),
                             slice(None) if columns is None else slice(*columns),
-                        ),
+                        ), temporary=temporary,
                     ),
                     tensor(
-                        prefix + ".bias", slice(None) if rows is None else slice(*rows)
+                        prefix + ".bias", slice(None) if rows is None else slice(*rows), temporary=temporary
                     ),
                 )
 
@@ -94,7 +99,7 @@ class VisionWeights:
             for index in range(32):
                 prefix = f"vision_tower.vision_model.encoder.layers.{index}"
                 projections = [
-                    affine(prefix + ".self_attn." + role + "_proj", rows=h)
+                    affine(prefix + ".self_attn." + role + "_proj", rows=h, temporary=True)
                     for role in ("q", "k", "v")
                 ]
                 layers.append(
@@ -102,8 +107,8 @@ class VisionWeights:
                         norm1=norm(prefix + ".layer_norm1"),
                         norm2=norm(prefix + ".layer_norm2"),
                         qkv=(
-                            torch.cat([w for w, _ in projections]),
-                            torch.cat([b for _, b in projections]),
+                            persistent_cat([w for w, _ in projections]),
+                            persistent_cat([b for _, b in projections]),
                         ),
                         output=affine(prefix + ".self_attn.out_proj", columns=h),
                         up=affine(prefix + ".mlp.fc1", rows=m),
@@ -187,12 +192,10 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, shard, device, *, buffers=None):
+    def allocate(cls, patches, shard, device):
         def zeros(*shape, dtype=torch.bfloat16):
             return (
                 torch.zeros(shape, dtype=dtype, device=device)
-                if buffers is None
-                else buffers.zeros(shape, dtype)
             )
 
         h, m, p = (
@@ -273,6 +276,7 @@ class VisionAttention(nn.Module):
         super().__init__()
         self.scratch, self.positions, self.inverse = scratch, positions, inverse
         s = scratch
+        self.query_shape = tuple(s.query.shape)
         self.qkv = UnquantizedProjection(
             s.normalized,
             weights["qkv"][0],
@@ -280,7 +284,7 @@ class VisionAttention(nn.Module):
             bias=weights["qkv"][1],
             session=session,
             name=name + ".qkv",
-        )
+        ).functional(session=session)
         self.attention = PreparedVarlenAttention(
             s.query,
             s.key,
@@ -291,14 +295,14 @@ class VisionAttention(nn.Module):
             session=session,
             workspace=workspace,
             name=name + ".attention",
-        )
+        ).functional(session=session)
         self.output = UnquantizedProjection(
             s.attended.flatten(1),
             weights["output"][0],
             s.projected,
             session=session,
             name=name + ".output",
-        )
+        ).functional(session=session)
         self.reduce = PreparedAllReduce(
             s.projected,
             s.reduced,
@@ -306,18 +310,16 @@ class VisionAttention(nn.Module):
             coordinator=coordinator,
             session=session,
             name=name + ".reduce",
-        )
+        ).functional(session=session)
         self.bias = weights["output"][1]
 
-    def forward(self, hidden_states, **kwargs):
-        s = self.scratch
-        s.normalized.copy_(hidden_states)
-        q, k, v = self.qkv(s.normalized).chunk(3, -1)
-        s.query.copy_(axial_rope(q.view_as(s.query), self.positions, self.inverse))
-        s.key.copy_(axial_rope(k.view_as(s.key), self.positions, self.inverse))
-        s.value.copy_(v.view_as(s.value))
-        self.attention()
-        return self.reduce(self.output(s.attended.flatten(1))) + self.bias, None
+    def forward(self, hidden_states, *, positions, cu, **kwargs):
+        q, k, v = self.qkv(hidden_states).chunk(3, -1)
+        query = axial_rope(q.view(self.query_shape), positions, self.inverse).contiguous()
+        key = axial_rope(k.view(self.query_shape), positions, self.inverse).contiguous()
+        value = v.view(self.query_shape).contiguous()
+        attended = self.attention(query, key, value, cu)
+        return self.reduce(self.output(attended.flatten(1))) + self.bias, None
 
 
 class VisionMLP(nn.Module):
@@ -344,10 +346,10 @@ class VisionMLP(nn.Module):
             bias=weights[0][1],
             session=session,
             name=name + ".up",
-        )
+        ).functional(session=session)
         self.down = UnquantizedProjection(
             activated, weights[1][0], output, session=session, name=name + ".down"
-        )
+        ).functional(session=session)
         self.reduce = PreparedAllReduce(
             output,
             reduced,
@@ -355,13 +357,12 @@ class VisionMLP(nn.Module):
             coordinator=coordinator,
             session=session,
             name=name + ".reduce",
-        )
+        ).functional(session=session)
         self.bias = weights[1][1]
 
     def forward(self, hidden_states):
-        self.source.copy_(hidden_states)
-        self.activated.copy_(torch.nn.functional.gelu(self.up(self.source)))
-        return self.reduce(self.down(self.activated)) + self.bias
+        activated = torch.nn.functional.gelu(self.up(hidden_states))
+        return self.reduce(self.down(activated)) + self.bias
 
 
 class PreparedVision:
@@ -376,7 +377,6 @@ class PreparedVision:
         session,
         workspace,
         name,
-        buffers=None,
     ):
         self.weights, self.scratch, self.inputs = weights, scratch, inputs
         s = scratch
@@ -384,8 +384,6 @@ class PreparedVision:
         def zeros(shape, dtype=torch.int32):
             return (
                 torch.zeros(shape, dtype=dtype, device=s.hidden.device)
-                if buffers is None
-                else buffers.zeros(shape, dtype)
             )
 
         self.positions = zeros((s.hidden.shape[0], 2), torch.int64)
@@ -404,9 +402,10 @@ class PreparedVision:
                 device=s.hidden.device,
             )
         )
+        self.inverse = persistent_copy(self.inverse)
         self.patch = UnquantizedProjection(
             s.patches, weights.patch, s.hidden, session=session, name=name + ".patch"
-        )
+        ).functional(session=session)
         self.norm = layer_norm(weights.norm)
         common = dict(runtime=runtime, coordinator=coordinator, session=session)
         self.blocks = []
@@ -458,40 +457,56 @@ class PreparedVision:
             name=name + ".merger",
             **common,
         )
-        self.output_columns = torch.arange(
-            *weights.shard.partition(6144), device=s.output.device, dtype=torch.int64
-        )
+        self.output_columns = persistent_copy(torch.arange(
+            *weights.shard.partition(6144), device=s.output.device, dtype=torch.int64))
 
-    def __call__(self):
-        s = self.scratch
-        hidden = self.norm(self.patch(s.patches))
+        self.input_layout = {field: (tuple(value.shape), value.dtype)
+                             for field in ("positions", "cu", "num_patches", "num_features")
+                             if (value := getattr(self, field)) is not None}
+        self.input_layout["patches"] = (tuple(s.patches.shape), s.patches.dtype)
+
+    def allocate_inputs(self):
+        return {name: torch.empty(shape, dtype=dtype, device=self.inputs.vision_slot.device)
+                for name, (shape, dtype) in self.input_layout.items()}
+
+    def __call__(self, inputs):
+        hidden = self.norm(self.patch(inputs["patches"]))
         for block in self.blocks:
-            hidden = block(hidden, attention_mask=None)
-        s.projector_reduced.copy_(self.projector(hidden))
-        s.merger_reduced.copy_(self.merger(s.projector_reduced.view(-1, 4 * 6144)))
-        s.output.copy_(s.merger_reduced.index_select(1, self.output_columns))
-        return s.output
+            hidden = block(hidden, attention_mask=None, positions=inputs["positions"], cu=inputs["cu"])
+        projected = self.projector(hidden)
+        merged = self.merger(projected.view(-1, 4 * 6144))
+        return merged.index_select(1, self.output_columns)
+
+    def release_outputs(self):
+        self.scratch = None
+        for name in self.input_layout:
+            if name != "patches":
+                setattr(self, name, None)
+        for block in self.blocks:
+            block.self_attn.scratch = block.self_attn.positions = None
+            block.mlp.source = block.mlp.activated = None
+        self.projector.source = self.projector.activated = None
+        self.merger.source = self.merger.activated = None
 
     def scratch_tensors(self):
-        return self.positions, self.cu, self.num_patches, self.num_features
+        return ()
 
 
 class PreparedVisionGeneration:
-    def __init__(self, encoder, state, records, frame, sequence, *, buffers=None):
+    def __init__(self, encoder, state, records, frame, sequence):
         self.encoder, self.state = encoder, state
-        self.errors = (
-            torch.zeros(1, dtype=torch.int32, device=records.device)
-            if buffers is None
-            else buffers.zeros((1,), torch.int32)
-        )
         self.publish = PreparedFeaturePublication(
             state, encoder.inputs, records, frame, sequence
         )
 
+        self.capacity = encoder.input_layout["patches"][0][0]
+        encoder.release_outputs()
+
     def __call__(self):
         e, state = self.encoder, self.state
         i, r = e.inputs, state.requests
-        capacity = e.scratch.patches.shape[0]
+        capacity = self.capacity
+        work = e.allocate_inputs()
         slot = i.vision_slot.long().clamp(0, r.capacity - 1)
         count, features, offset = (
             i.vision_num_patches,
@@ -515,16 +530,13 @@ class PreparedVisionGeneration:
         )
         valid &= (~live[:, None] | torch.isfinite(pixels)).all()
         valid &= (~live[:, None] | ((positions >= 0) & (positions < capacity))).all()
-        self.errors.copy_(~valid)
-        e.scratch.patches.copy_(torch.where(valid & live[:, None], pixels, 0))
-        e.positions.copy_(torch.where(valid & live[:, None], positions, 0))
-        e.cu.copy_(torch.where(valid, i.vision_cu_seqlens, 0))
-        e.num_patches.copy_(torch.where(valid, count, 0))
-        e.num_features.copy_(torch.where(valid, features, 0))
-        output = e()
+        errors = (~valid).to(torch.int32)
+        work["patches"].copy_(torch.where(valid & live[:, None], pixels, 0))
+        work["positions"].copy_(torch.where(valid & live[:, None], positions, 0))
+        work["cu"].copy_(torch.where(valid, i.vision_cu_seqlens, 0))
+        work["num_patches"].copy_(torch.where(valid, count, 0))
+        work["num_features"].copy_(torch.where(valid, features, 0))
+        output = e(work)
         active = torch.arange(capacity // 4, device=count.device) < features
-        self.errors.copy_(
-            self.errors
-            | (~((~active[:, None]) | torch.isfinite(output)).all()).int() * 64
-        )
-        self.publish(output, e.num_features, self.errors)
+        errors = errors | (~((~active[:, None]) | torch.isfinite(output)).all()).int() * 64
+        self.publish(output, work["num_features"], errors)

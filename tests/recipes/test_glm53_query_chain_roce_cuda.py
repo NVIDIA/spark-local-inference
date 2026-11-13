@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM query overlap captures alongside a shared RoCEnante transport.
 
 Run the test on two assigned Spark hosts with FLARE_RUN_ROCE_TESTS=1,
@@ -77,16 +80,29 @@ def test_query_chain_with_main_stream_collectives():
                 chain = QueryChain(projection, absorb, source, query, absorbed, gather, gathered,
                     session=session, workspace=arena, parallel_plans=(main_projection.plan,))
 
-                def forward(chain=chain, reduce=reduce, main_projection=main_projection, source=source):
-                    reduce(source)
-                    chain.start()
-                    main_projection(source)
-                    reduce(source)
-                    chain.finish()
+                chain.functional(session=session)
+                main_projection.functional(session=session)
+                reduce.functional(session=session)
+
+                def forward(chain=chain, reduce=reduce, main_projection=main_projection, source=source,
+                            query=query, absorbed=absorbed, gathered=gathered, main_output=main_output, reduced=reduced):
+                    reduced.copy_(reduce(source))
+                    local_query = torch.empty_like(query)
+                    local_absorbed = torch.empty_like(absorbed)
+                    local_gathered = torch.empty_like(gathered)
+                    pending = chain.start(source, local_query, local_absorbed, local_gathered)
+                    main = main_projection(source)
+                    reduced.copy_(reduce(source))
+                    result = chain.finish(pending, main)
+                    query.copy_(local_query)
+                    absorbed.copy_(local_absorbed)
+                    gathered.copy_(result)
+                    main_output.copy_(main)
 
                 cases.append((rows, source, query, absorbed, gathered, main_output, reduced,
                               projection, absorb, forward))
             session.tune(show_progress=False)
+            arena.release_preparation()
             assert arena.auxiliary_stream != torch.cuda.current_stream(device)
             pool = torch.cuda.graph_pool_handle()
             for case in cases:
@@ -112,8 +128,8 @@ def test_query_chain_with_main_stream_collectives():
                     source.normal_(std=.1)
                     if rows > 1:
                         source[-1].zero_()
-                    projection(source)
-                    absorb(query.transpose(0, 1))
+                    query.copy_(projection(source).view_as(query))
+                    absorbed.copy_(absorb(query.transpose(0, 1)).transpose(0, 1))
                     expected_query = query.clone()
                     local = absorbed.cpu().reshape(rows, -1)
                     parts = [torch.empty_like(local) for _ in range(2)]
@@ -123,7 +139,6 @@ def test_query_chain_with_main_stream_collectives():
                     dist.all_reduce(expected_reduced)
                     for output in (query, absorbed, gathered, main_output, reduced):
                         output.fill_(float("nan"))
-                    arena.tensor.fill_(0x7f)
                     torch.cuda.synchronize(device)
                     dist.barrier()
                     before = torch.cuda.memory_stats(device)

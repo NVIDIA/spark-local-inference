@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Persistent graph-catalog output through the shared capture boundary."""
 
 from contextlib import nullcontext
@@ -36,8 +39,11 @@ def test_capture_reports_catalog_once_before_compilation_and_on_recapture(captur
         calls.append("forward")
     class Cached:
         cache_hit = True
+        capture_allocation_sizes = ()
         def prepare_capture(self):
             return 0
+        def retire_after_capture(self):
+            pass
         def __call__(self):
             calls.append("cached")
     class Cache:
@@ -76,6 +82,18 @@ def test_catalog_display_failure_does_not_mark_the_session_reported(capture_opti
     with pytest.raises(RuntimeError, match="output failed"):
         capture.capture_forwards({}, {}, compile_decoder=False, progress=failed, **capture_options)
     assert not hasattr(capture_options["session"], "_graph_catalog_reported")
+
+
+def test_tuning_capture_does_not_consume_serving_catalog_report(capture_options):
+    messages = []
+    options = dict(capture_options, compile_decoder=False, progress=messages.append)
+    capture.capture_forwards({"trial": lambda: None},
+        {"trial": GraphSignature("decode", 1, 1)}, report_catalog=False, **options)
+    assert not hasattr(capture_options["session"], "_graph_catalog_reported")
+    assert not any("Graph catalog" in line for line in messages)
+    signatures = {f"decode{batch}": GraphSignature("decode", batch, 1) for batch in (1, 8, 32)}
+    capture.capture_forwards({name: lambda: None for name in signatures}, signatures, **options)
+    assert sum("Graph catalog: 3 graphs" in line for line in messages) == 1
 
 
 @pytest.fixture

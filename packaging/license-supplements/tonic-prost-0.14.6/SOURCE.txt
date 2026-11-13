@@ -1,0 +1,2 @@
+License text omitted from the published crate; copied verbatim from its recorded upstream revision.
+https://github.com/hyperium/tonic/blob/6cb6056b5a748bc5a29bd48f4602dbc4e552bb7d/LICENSE

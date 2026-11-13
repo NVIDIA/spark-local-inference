@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
 from dataclasses import dataclass, replace
@@ -6,7 +10,9 @@ import torch
 
 from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
-from ignition.components.vocabulary import nvfp4_draft_head
+from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+from ignition.components.markov_sampling import fp8_markov_head
+from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
 from .config import ModelConfig
 
@@ -41,15 +47,19 @@ class DSparkWeights:
     draft_head: object | None = None
 
     @classmethod
-    def load(cls, loader, *, confidence=False):
+    def load(cls, loader, *, confidence=False, vocabulary_parallel_sampling=False, markov_head_quantization=None):
         config = loader.config.draft
         last = f"mtp.{config.layers - 1}"
+        markov_name = last + ".markov_head.head.weight"
+        temporary = markov_head_quantization in ("nvfp4", "fp8")
         return cls(tuple(loader.load_layer(i, draft=True) for i in range(config.layers)),
             loader.load_linear("mtp.0.main_proj"),
             loader.load_linear_group(tuple(f"mtp.{i}.attn.wkv" for i in range(config.layers))),
             loader.load_tensor("mtp.0.main_norm.weight"),
             loader.load_tensor(last + ".norm.weight"), loader.load_tensor(last + ".markov_head.embed.weight"),
-            loader.load_tensor(last + ".markov_head.head.weight"),
+            loader.load_padded_tensor(markov_name, rows=loader.shard.padded_partition(129280, alignment=64),
+                                      temporary=temporary) if vocabulary_parallel_sampling
+            else loader.load_tensor(markov_name, temporary=temporary),
             loader.load_tensor(last + ".confidence_head.proj.weight") if confidence else None)
 
 
@@ -67,25 +77,32 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
-             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None):
+             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
+             vocabulary_parallel_sampling=False):
         config = ModelConfig.load(manifest.metadata_path)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
-            draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
+            draft = DSparkWeights.load(loader, confidence=confidence,
+                vocabulary_parallel_sampling=vocabulary_parallel_sampling,
+                markov_head_quantization=markov_head_quantization) if dspark else None
             if draft is not None:
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
+                elif draft_head_quantization == "mxfp8":
+                    draft = replace(draft, draft_head=mxfp8_draft_head(head))
                 if markov_head_quantization == "nvfp4":
                     draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
+                elif markov_head_quantization == "fp8":
+                    draft = replace(draft, markov_head=fp8_markov_head(draft.markov_head))
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
         return cls(config, shard, embedding, norm, head, layers, draft,
-                   torch.cuda.memory_allocated(device) - before, vision)
+                   allocated_tensor_bytes(device) - before, vision)
 
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
@@ -160,6 +177,6 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         if not draft and layer in text["engram_layer_ids"]:
             engram = {"projection": self.load_linear_columns(prefix + ".engram.wkv",
                 ((head * 256, (head + 1) * 256) for head in range(shard.rank, 24, shard.world_size))),
-                "weight": self.load_tensor(prefix + ".engram.q_weight").float()
-                          * self.load_tensor(prefix + ".engram.k_weight").float()}
+                "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
+                          * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
         return LayerWeights(result, routed, residual, engram)

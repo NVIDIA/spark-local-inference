@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Decoder capacity and public b12x workspace planning without CUDA execution."""
 
 from contextlib import nullcontext
@@ -37,8 +40,9 @@ def tensors(value):
             yield member
 
 
-def test_mixer_and_layer_temporaries_preserve_live_residual_and_output():
-    scratch = DecoderScratch.allocate(128, "cpu", sample_rows=4)
+@pytest.mark.parametrize("lowrank", [320, 160, 80])
+def test_mixer_and_layer_temporaries_preserve_live_residual_and_output(lowrank):
+    scratch = DecoderScratch.allocate(128, "cpu", sample_rows=4, hyperconnection_lowrank=lowrank)
     hc = scratch.hyperconnection
     assert scratch.gdn.output.data_ptr() == scratch.qsa.output.data_ptr() == scratch.moe.output.data_ptr()
     live = (scratch.residual, hc.block_input, hc.down_and_injection, scratch.gdn.output)
@@ -46,7 +50,8 @@ def test_mixer_and_layer_temporaries_preserve_live_residual_and_output():
         tensor.fill_(index)
     for transient in (hc.normalized, hc.bottleneck, hc.gate_workspace,
                       scratch.gdn.projected_qkvz, scratch.gdn.convolved_qkv, scratch.gdn.gated,
-                      scratch.qsa.projected_qkv, scratch.qsa.attended, scratch.moe.routed_output):
+                      scratch.qsa.projected_qkv, scratch.qsa.attended, scratch.moe.routed_output,
+                      *((hc.gate_logits,) if hc.gate_logits is not None else ())):
         transient.fill_(-37)
         for index, tensor in enumerate(live, 1):
             assert tensor.eq(index).all()

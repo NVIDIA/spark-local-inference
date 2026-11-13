@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Reproduce GLM-5.3 Flash answer corruption under batched speculative decoding.
 
 Standard library only; point it at a Flare server's OpenAI-compatible endpoint.

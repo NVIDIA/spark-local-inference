@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from ignition.preparation import model_package
+from ignition.preparation import model_core
 
 
 def test_directory_preflight_stops_export_before_capture(monkeypatch, tmp_path):
-    from ignition.preparation.package_snapshot import _OPTIONS, export_options
+    from ignition.preparation.core_snapshot import _OPTIONS, export_options
 
     calls = []
     staging = tmp_path / "staging"
@@ -32,8 +32,8 @@ def test_directory_preflight_stops_export_before_capture(monkeypatch, tmp_path):
     destination = tmp_path / "export"
     with export_options(tmp_path / "cache"):
         with pytest.raises(RuntimeError, match="atomic no-replace"):
-            model_package.export_package(None, None, SimpleNamespace(world=1), destination,
-                                         options={}, publisher=object())
+            model_core.export_core(None, None, SimpleNamespace(world=1), destination,
+                                   options={}, publisher=object())
     assert calls == [str(destination)]
     assert not destination.exists()
     assert not staging.exists()
@@ -48,8 +48,8 @@ def test_cache_only_and_packed_exports_do_not_probe_directory_publication(monkey
     monkeypatch.setitem(sys.modules, "flare_heliopause", SimpleNamespace(export_preflight_directory=unexpected))
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=object()))
     monkeypatch.setitem(sys.modules, "torch.distributed", object())
-    with pytest.raises(RuntimeError, match="configured package cache"):
-        model_package.export_package(None, None, None, destination, options={}, publisher=object(), form=form)
+    with pytest.raises(RuntimeError, match="configured core cache"):
+        model_core.export_core(None, None, None, destination, options={}, publisher=object(), form=form)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux no-replace directory preflight")

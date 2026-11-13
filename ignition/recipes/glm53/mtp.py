@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Learned GLM draft layer and target-feedback cache absorption."""
 
 from copy import deepcopy
@@ -121,17 +125,37 @@ def _draft_metadata(Lengths, Starts, Slots, Tokens, Hidden, Tables, StateRows, R
             tl.store(BlockTable + r * blocks + offsets, values, mask=inside)
 
 
+@dataclass(init=False)
 class DraftMetadata:
-    def __init__(self, tokens, rows, blocks, device, *, shards=None):
+    shards: object
+    indexed: IndexMetadata
+    token_ids: torch.Tensor
+    hidden: torch.Tensor
+    indices: torch.Tensor
+    output_indices: torch.Tensor
+    num_tokens: torch.Tensor
+
+    def __init__(self, tokens, rows, blocks, device, *, shards=None, hidden=None):
         from .dcp import ContextShards
 
         self.shards = ContextShards() if shards is None else shards
         self.indexed = IndexMetadata.allocate(tokens, rows, blocks, device)
         self.token_ids = torch.zeros(tokens, dtype=torch.int64, device=device)
-        self.hidden = torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device)
+        if hidden is None:
+            hidden = torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device)
+        if (hidden.shape != (tokens, 4096) or hidden.dtype != torch.bfloat16
+                or hidden.device != self.token_ids.device or not hidden.is_contiguous()):
+            raise ValueError("GLM draft hidden storage must be contiguous BF16 [tokens, 4096] on the metadata device")
+        self.hidden = hidden
         self.indices = torch.arange(tokens, device=device)
         self.output_indices = torch.zeros(rows, dtype=torch.int64, device=device)
         self.num_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+
+    @classmethod
+    def pack(cls, slots, lengths, starts, tokens, hidden, tables, *, capacity, state_rows, shards=None):
+        metadata = cls(lengths.numel() * capacity, lengths.numel(), tables.shape[1], tokens.device, shards=shards)
+        metadata.set(slots, lengths, starts, tokens, hidden, tables, capacity=capacity, state_rows=state_rows)
+        return metadata
 
     def set(self, slots, lengths, starts, tokens, hidden, tables, *, capacity, state_rows):
         """Place each request's draft rows in one kernel: tokens, hidden states, positions, slots and tables."""
@@ -229,34 +253,52 @@ class PreparedMTP:
             head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.head
             self.head = PreparedVocabularyProjection(self.hidden, head,
                 self.local_logits, self.logits, runtime=vocabulary_runtime, coordinator=coordinator,
-                session=session, name=f"{name}.lm_head")
+                session=session, name=f"{name}.lm_head", workspace=workspace)
 
     def rebind_pages(self):
         self.attention.rebind_pages()
 
-    def __call__(self):
-        w, m = self.weights.tensors, self.metadata
-        self.embedding()
-        self.embedded.masked_fill_((m.indexed.positions == 0)[:, None], 0)
-        rms_norm(self.embedded, w["enorm"], self.joined[:, :4096], self.eps, round_before_weight=True)
-        rms_norm(m.hidden, w["hnorm"], self.joined[:, 4096:], self.eps, round_before_weight=True)
-        self.projection(self.joined)
-        rms_norm(self.residual, w["input_layernorm"], self.normalized, self.eps, round_before_weight=True)
+    def functional(self, *, session):
+        self.embedding.functional(session=session, dynamic_inputs=True)
+        self.projection.functional(session=session)
+        self.attention.functional(session=session)
+        if not self.cache_only:
+            self.attention_reduce.functional(session=session)
+            self.moe.functional(session=session)
+            self.mlp_reduce.functional(session=session)
+            self.head.functional(session=session)
+            self.local_logits = self.logits = None
+        self.metadata = self.embedded = self.joined = self.residual = self.normalized = None
+        self.attention_output = self.mlp_output = self.hidden = None
+        return self
+
+    def __call__(self, metadata):
+        w, m = self.weights.tensors, metadata
+        embedded = self.embedding(token_ids=m.token_ids, num_rows=m.num_tokens)
+        embedded = embedded.masked_fill((m.indexed.positions == 0)[:, None], 0)
+        joined = torch.empty((embedded.shape[0], 8192), dtype=embedded.dtype, device=embedded.device)
+        rms_norm(embedded, w["enorm"], joined[:, :4096], self.eps, round_before_weight=True)
+        rms_norm(m.hidden, w["hnorm"], joined[:, 4096:], self.eps, round_before_weight=True)
+        residual = self.projection(joined)
+        normalized = torch.empty_like(residual)
+        rms_norm(residual, w["input_layernorm"], normalized, self.eps, round_before_weight=True)
         if self.cache_only:
             a = self.attention
-            a.projections["qkv_a_proj"](self.normalized)
-            rms_norm(a.scratch.latent_input, a.module.kv_a_layernorm.weight, a.scratch.latent,
+            projected = a.projections["qkv_a_proj"](normalized)
+            latent = torch.empty((embedded.shape[0], 512), dtype=embedded.dtype, device=embedded.device)
+            rms_norm(projected[:, 1536:2048], a.module.kv_a_layernorm.weight, latent,
                 self.eps, round_before_weight=True)
-            a.writer()
+            a.writer(latent, m.indexed.token_slots)
             index = a.indexer
-            index.scratch.normalized_key.copy_(index.module.k_norm(index.key_input))
-            index.gate_projection(self.normalized)
-            glm_pool.update_pools(*index.pool_arguments, plan=index.pool_plan)
+            key = index.module.k_norm(projected[:, 2048:2176])
+            gate = index.gate_projection(normalized)
+            glm_pool.update_pools(index.cache, index.state.tail, m.indexed.state_slots,
+                m.indexed.query_start_loc, key, gate, index.ape, m.indexed.token_slots,
+                m.indexed.positions, plan=index.pool_plan)
             return
-        self.attention_reduce(self.attention(self.normalized))
-        rms_norm_add_residual(self.attention_output, self.residual, w["post_attention_layernorm"],
-                              self.eps, x_out=self.normalized)
-        self.mlp_reduce(self.moe(self.normalized))
-        rms_norm_add_residual(self.mlp_output, self.residual, w["shared_head.norm"], self.eps, x_out=self.hidden)
-        self.head(self.hidden)
-        return self.hidden
+        attended = self.attention_reduce(self.attention(normalized, m.indexed))
+        rms_norm_add_residual(attended, residual, w["post_attention_layernorm"], self.eps, x_out=normalized)
+        mlp = self.mlp_reduce(self.moe(normalized))
+        hidden = torch.empty_like(normalized)
+        rms_norm_add_residual(mlp, residual, w["shared_head.norm"], self.eps, x_out=hidden)
+        return hidden, self.head(hidden)

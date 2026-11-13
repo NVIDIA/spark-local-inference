@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Unconditional vocabulary scoring oracle for request-parameter branch checks."""
 
 import triton

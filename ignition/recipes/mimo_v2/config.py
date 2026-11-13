@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MiMo text geometry and lossless partitions of chunked checkpoint projections."""
 
 from dataclasses import dataclass

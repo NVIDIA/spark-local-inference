@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure batch-one MTP graph replay and annotate one round for Nsight Compute.
 
 CUDA events exclude input uploads and completion readback. Each trial starts

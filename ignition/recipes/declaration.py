@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Recipe declarations: qualified checkpoints, serving ranges, and memory costs.
 
 Declarations import no model code, so planning and model listing run without
@@ -81,13 +85,16 @@ class Checkpoint:
     # Estimated resident device weights after optional lossless expert-scale compression.
     scale_compressed_device_bytes: Mapping[str, int] = field(default_factory=dict)
     # Per-rank costs replacing the recipe's `ranks` and `plain_ranks` when this checkpoint's draft or state
-    # layout differs, such as a draft model that only this checkpoint carries.
+    # layout differs, such as a draft model that only this checkpoint carries. The declared sizes may be
+    # a subset of the recipe's when the checkpoint's stored shards exclude a tensor-parallel size.
     ranks: Mapping[int, "RankCosts"] | None = None
     # Bytes of weights one decode step reads for one request across every rank: dense weights
     # plus the experts one token activates, at their stored precision. Zero leaves the serving
     # contract without the value, and dashboards then show no weight bandwidth.
     decode_weight_bytes: int = 0
     plain_ranks: Mapping[int, "RankCosts"] | None = None
+    # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
+    served_model_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,7 +105,7 @@ class Speculation:
     Preparation captures width one at every request bucket and complete rounds
     within the target-token capacity. `adaptive` sets the serving default: choose
     prepared layouts from measured costs and conditional acceptance estimates
-    when true, or use the fixed maximum verification width when false. Package
+    when true, or use the fixed maximum verification width when false. Core
     loading accepts capacity reductions represented by captured graphs. Drafts
     come from the checkpoint's learned draft model.
     """
@@ -111,11 +118,23 @@ class Speculation:
     graph_budget: int | None = None
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
+    vocabulary_parallel_sampling: bool = False
+    method: str | None = None
+    mtp_only: bool = False
 
     def __post_init__(self):
-        for value in (self.draft_head_quantization, self.markov_head_quantization):
-            if value not in (None, "nvfp4"):
-                raise ValueError("draft head quantization must be omitted or nvfp4")
+        if self.mtp_only and self.draft_tokens < 1:
+            raise ValueError("--mtp-only requires positive learned draft depth")
+        if self.method not in (None, "mtp", "dflash2"):
+            raise ValueError("speculative method must be omitted, mtp or dflash2")
+        if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
+            raise ValueError("vocabulary-parallel sampling requires positive learned draft depth")
+        if self.vocabulary_parallel_sampling and self.markov_head_quantization == "nvfp4":
+            raise ValueError("vocabulary-parallel sampling requires BF16 or row-scaled FP8 Markov weights")
+        for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4", "fp8"))):
+            value = getattr(self, f"{head}_head_quantization")
+            if value is not None and value not in choices:
+                raise ValueError(f"{head} head quantization must be omitted or one of: {', '.join(choices)}")
             if value is not None and self.draft_tokens < 1:
                 raise ValueError("draft head quantization requires positive learned draft depth")
         if self.graph_budget is not None:
@@ -159,6 +178,14 @@ class RankUsage:
 
 
 @dataclass(frozen=True)
+class SpeculativeMethod:
+    """Physical preparation costs for a recipe's learned proposal source."""
+
+    ranks: Mapping[int, RankCosts]
+    draft_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class Recipe:
     """One model family's qualified checkpoints, serving range, costs, and bootstrap.
 
@@ -178,6 +205,9 @@ class Recipe:
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as
     MXFP8 while loading, trading checkpoint precision for decode bandwidth.
+    `online_mxfp8_scope` selects the conversion group for preparation; `all` selects
+    the complete eligible set. `online_mxfp8_scopes` also accepts groups recorded in
+    prepared metadata so an explicit precision choice retains its meaning.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
@@ -202,15 +232,19 @@ class Recipe:
     prepare: Callable
     usage: Callable
     sampling_defaults: SamplingDefaults
+    collective_tuning: str = "static"
     mapped_host_name: str = ""
     max_images: int = 0
     image_bytes: int = 0
     speculation: Speculation | None = None
+    speculative_methods: Mapping[str, SpeculativeMethod] = field(default_factory=lambda: MappingProxyType({}))
     plain_ranks: Mapping[int, RankCosts] = field(default_factory=lambda: MappingProxyType({}))
     verification_rows: int | None = None
     stream_overlap: bool = False
     mixed_prefill: bool = False
     online_mxfp8: bool = False
+    online_mxfp8_scope: str = "all"
+    online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     mla_compute_modes: tuple[str, ...] = ("auto",)
@@ -222,16 +256,18 @@ class Recipe:
     markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
-        from ignition.components.capacity import mixed_shapes
+        from ignition.components.capacity import mixed_shapes, serving_modes
 
         if not self.mixed_prefill:
             return ()
-        modes = (True, False) if speculation is not None else (False,)
+        modes = serving_modes(speculation is not None, speculation is not None and speculation.mtp_only)
         return tuple((enabled, b, w, p) for enabled in modes
             for b, w, p in mixed_shapes(concurrency, chunk, speculation.widths if enabled else (1,),
                                         speculation.token_capacity if enabled else None))
 
     def __post_init__(self):
+        if self.online_mxfp8_scope not in self.online_mxfp8_scopes:
+            raise ValueError("recipe online MXFP8 scope must belong to its supported conversion groups")
         if self.export_repository:
             import re
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*', self.export_repository) or '..' in self.export_repository:
@@ -241,14 +277,29 @@ class Recipe:
             raise ValueError("b12x settings name B12X_ variables with string values")
         if self.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
+        for name, method in self.speculative_methods.items():
+            if name not in ("mtp", "dflash2") or set(method.ranks) != set(self.ranks):
+                raise ValueError("speculative methods require known names and every declared tensor-parallel size")
+            if method.draft_bytes is not None and method.draft_bytes <= 0:
+                raise ValueError("speculative draft bytes must be positive")
         for checkpoint in self.checkpoints:
-            if any(costs is not None and set(costs) != set(self.ranks)
+            if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
-                raise ValueError(f"{checkpoint.alias} declares costs for other tensor-parallel sizes than its recipe")
+                raise ValueError(f"{checkpoint.alias} declares costs for tensor-parallel sizes its recipe does not serve")
+            if (checkpoint.ranks is None) != (checkpoint.plain_ranks is None) or (
+                    checkpoint.ranks is not None and set(checkpoint.ranks) != set(checkpoint.plain_ranks)):
+                raise ValueError(f"{checkpoint.alias} declares costs with and without speculation for different sizes")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:
         return tuple(sorted(self.ranks))
+
+    def checkpoint_tensor_parallel(self, checkpoint: Checkpoint) -> tuple[int, ...]:
+        """Tensor-parallel sizes `checkpoint` prepares: its own declared sizes, else the recipe's."""
+        return self.tensor_parallel if checkpoint.ranks is None else tuple(sorted(checkpoint.ranks))
+
+    def served_name(self, checkpoint: Checkpoint) -> str:
+        return checkpoint.served_model_name or self.served_model_name
 
     def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None) -> RankCosts:
         """Return one rank's costs under the given speculation settings, for `checkpoint` when it declares its own."""
@@ -256,7 +307,8 @@ class Recipe:
         plain = self.plain_ranks if checkpoint is None or checkpoint.plain_ranks is None else checkpoint.plain_ranks
         if speculation is None:
             return (plain or ranks)[world_size]
-        return ranks[world_size]
+        method = self.speculative_methods.get(speculation.method)
+        return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
                       expert_scale_compression: str | None = None) -> int:
@@ -264,8 +316,12 @@ class Recipe:
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
-        return -(-(device_bytes + checkpoint.expansion_bytes
-                   - (0 if learned else checkpoint.draft_bytes)) // world_size)
+        draft_bytes = checkpoint.draft_bytes
+        method = None if speculation is None else self.speculative_methods.get(speculation.method)
+        if method is not None and method.draft_bytes is not None:
+            draft_bytes = method.draft_bytes
+        return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
+                   + (draft_bytes if learned else 0)) // world_size)
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""

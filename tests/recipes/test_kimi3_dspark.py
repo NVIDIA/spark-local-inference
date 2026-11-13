@@ -1,6 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Red Hat DSpark scratch ownership and checkpoint selection."""
 
+import pytest
 import torch
+
+
+@pytest.mark.parametrize("recipe", ["kimi3", "kimi31"])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+def test_draft_result_preserves_every_block_position(recipe, batch):
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    prepared = import_module(f"ignition.recipes.{recipe}.dspark").PreparedDraft
+    draft = prepared.__new__(prepared)
+    block, hidden, vocabulary = 7, 16, 32
+    embedding = torch.nn.Embedding(vocabulary, hidden)
+    draft.embedding = lambda *, token_ids, num_rows: embedding(token_ids)
+    draft.layers = []
+    draft.norm = torch.nn.Identity()
+    draft.head = torch.nn.Linear(hidden, vocabulary, bias=False)
+    draft.block = block
+    metadata = SimpleNamespace(token_ids=torch.zeros(batch * block, dtype=torch.int64),
+        sample_indices=torch.arange(batch * block), live_counts=torch.tensor([batch * block]),
+        lengths=torch.full((batch,), block))
+
+    logits, selector_features = draft(metadata)
+    assert logits.view(batch, block, vocabulary).shape == (batch, block, vocabulary)
+    assert selector_features is None
 
 
 def test_draft_scratch_export_ranges():

@@ -1,8 +1,11 @@
-"""Native chunked prefill exceeding a Qwen package's image feature arena.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Uses the GPU assignment and TP1 Qwen package configured for
+"""Native chunked prefill exceeding a Qwen core's image feature arena.
+
+Uses the GPU assignment and TP1 Qwen core configured for
 test_prefix_cache_offload.py. Each image contributes 4,096 feature tokens;
-five images exceed the package's 16,384-token arena without exceeding context.
+five images exceed the core's 16,384-token arena without exceeding context.
 """
 
 import base64

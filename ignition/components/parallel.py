@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Explicit tensor partitions for single-rank and b12x tensor-parallel recipes."""
 
 from dataclasses import dataclass

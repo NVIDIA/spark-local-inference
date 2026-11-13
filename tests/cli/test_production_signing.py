@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Production keys stay encrypted on disk and are unlocked through a terminal."""
 
 import json
@@ -30,9 +34,9 @@ def test_encrypted_key_and_public_profile(tmp_path, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from tests.preparation.payload_fixture import publish, verify_signatures
 
-    package = publish(tmp_path, publisher)
+    core = publish(tmp_path, publisher)
     public_key = Ed25519PublicKey.from_public_bytes(bytes(profile['public_key']))
-    verify_signatures(package, public_key)
+    verify_signatures(core, public_key)
     with pytest.raises(FileExistsError):
         signing.generate(directory, 'Example publisher', 'example', password)
     assert path.read_bytes() == encoded
@@ -81,7 +85,7 @@ def test_key_password_cli_preserves_identity_and_signed_messages(tmp_path, monke
     path = directory / 'signing-key.pem'
     original = path.read_bytes()
     key = serialization.load_pem_private_key(original, old)
-    signature = key.sign(b'previously signed package')
+    signature = key.sign(b'previously signed core')
     profile = (directory / 'publisher.json').read_bytes()
     passwords = iter((old, new, new))
     monkeypatch.setattr(signing, 'passphrase', lambda prompt: next(passwords))
@@ -92,7 +96,7 @@ def test_key_password_cli_preserves_identity_and_signed_messages(tmp_path, monke
         serialization.load_pem_private_key(result, old)
     changed = serialization.load_pem_private_key(result, new)
     assert changed.public_key().public_bytes_raw() == key.public_key().public_bytes_raw()
-    changed.public_key().verify(signature, b'previously signed package')
+    changed.public_key().verify(signature, b'previously signed core')
     assert (directory / 'publisher.json').read_bytes() == profile
     assert sorted(p.name for p in directory.iterdir()) == ['publisher.json', 'signing-key.pem']
     output = capsys.readouterr().out
@@ -173,3 +177,42 @@ def test_password_change_reports_replacement_when_directory_sync_fails(tmp_path,
         signing.change_password(path)
     serialization.load_pem_private_key(path.read_bytes(), new)
     assert not list(directory.glob('.signing-key.pem-*'))
+
+
+def test_sign_promotes_the_identity_and_keeps_the_exported_license(tmp_path, monkeypatch):
+    """A signed core shows the same license terms the export recorded from the model card."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from ignition.cli import publishing
+    from ignition.preparation.protection import License
+    from tests.preparation.payload_fixture import manifest, publish, schema, verify_signatures
+    from tests.preparation.test_core_protection import development_publisher
+
+    license_link = 'https://huggingface.co/example/model/blob/abcdef/LICENSE'
+    signer = replace(development_publisher(), license=License('apache-2.0', license_link))
+    source = publish(tmp_path / 'exported', signer)
+
+    password = b'fixture-passphrase-not-a-production-secret'
+    monkeypatch.setattr(signing, 'passphrase', lambda prompt: password)
+    keys = tmp_path / 'keys'
+    signing.generate(keys, 'Example publisher', 'example', password)
+    profile_path = tmp_path / 'development-publisher.json'
+    profile_path.write_text(json.dumps([{'namespace': signer.namespace, 'development': signer.development,
+                                         'public_key': list(signer.public_key)}]))
+    config = tmp_path / 'config.toml'
+    config.write_text('')
+    output = tmp_path / 'signed'
+    args = SimpleNamespace(core=source, output=output, config=config,
+                           signing_key=keys / 'signing-key.pem', namespace='example',
+                           official_source='https://huggingface.co/example/model',
+                           development_publisher=profile_path)
+    publishing.sign(args)
+
+    publisher = schema()('CoreBody').FromString(manifest(output).core_body).publisher
+    assert publisher.namespace == 'example'
+    assert publisher.official_source == 'https://huggingface.co/example/model'
+    assert not publisher.development
+    assert (publisher.license_name, publisher.license_link) == ('apache-2.0', license_link)
+    profile = json.loads((keys / 'publisher.json').read_text())[0]
+    verify_signatures(output, Ed25519PublicKey.from_public_bytes(bytes(profile['public_key'])))

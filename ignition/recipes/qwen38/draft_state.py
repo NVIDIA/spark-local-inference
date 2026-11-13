@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed target-feedback inputs and metadata for prepared MTP execution."""
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ class DraftMetadata:
     """Caller-owned feedback rows and QSA metadata for one prepared MTP shape."""
 
     def __init__(self, *, tokens, rows, context, device, hidden=None):
-        self.tokens, self.rows = tokens, rows
+        self.tokens, self.rows, self.context, self.device = tokens, rows, context, device
         self.qsa = QSAMetadata.allocate(tokens=tokens, batch=rows, context=context, device=device)
         self.token_ids = torch.zeros(tokens, dtype=torch.int64, device=device)
         self.hidden = (torch.zeros((tokens, 10240), dtype=torch.bfloat16, device=device)
@@ -90,6 +93,11 @@ class DraftMetadata:
         self.output_indices = torch.zeros(rows, dtype=torch.int64, device=device)
         self.indices = torch.arange(tokens, device=device)
         self.row_indices = torch.arange(rows, device=device)
+
+    def functional(self):
+        self.qsa = self.token_ids = self.hidden = self.output_indices = None
+        self.indices = self.row_indices = None
+        return self
 
     def _set_eager(self, slots, lengths, starts, token_ids, hidden, rope, tables, *, capacity):
         """Pack fixed-stride source rows into b12x's dense request intervals."""
@@ -123,6 +131,10 @@ class DraftMetadata:
 
     def set(self, slots, lengths, starts, token_ids, hidden, rope, tables, *, capacity):
         """Pack fixed-stride source rows into b12x's dense request intervals in one launch."""
+        if self.token_ids is None:
+            local = DraftMetadata(tokens=self.tokens, rows=self.rows, context=self.context, device=self.device)
+            local.set(slots, lengths, starts, token_ids, hidden, rope, tables, capacity=capacity)
+            return local
         if not self.token_ids.is_cuda:
             return self._set_eager(slots, lengths, starts, token_ids, hidden, rope, tables, capacity=capacity)
         m = self.qsa

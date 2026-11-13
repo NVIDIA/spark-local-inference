@@ -1,3 +1,12 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+const MAX_OUTPUT_TOKENS: usize = 16;
+const MAX_DRAFT_TOKENS: usize = 15;
+const VECTOR_RECORD_FIELDS: usize = 32;
 use super::*;
 
 #[test]
@@ -20,16 +29,16 @@ fn optional_readiness_output_preserves_uninstrumented_manifests_and_rejects_inva
 fn optional_speculative_survival_validates_frame_layout() {
     let mut value = manifest();
     value.abi_version = ABI_VERSION;
-    value.buffers[2].shape = vec![2, 4, 24];
-    value.buffers[2].strides = vec![96, 24, 1];
-    value.buffers[2].nbytes = 1536;
+    value.buffers[2].shape = vec![2, 4, VECTOR_RECORD_FIELDS];
+    value.buffers[2].strides = vec![4 * VECTOR_RECORD_FIELDS, VECTOR_RECORD_FIELDS, 1];
+    value.buffers[2].nbytes = 2 * 4 * VECTOR_RECORD_FIELDS * 8;
     value.validate().unwrap();
     value.buffers.push(BufferDescriptor { name: "completion_speculative_survival".into(),
-        address: 0x10000, nbytes: 224, dtype: Dtype::Float32,
-        shape: vec![2, 4, 7], strides: vec![28, 7, 1] });
+        address: 0x10000, nbytes: 2 * 4 * MAX_DRAFT_TOKENS * 4, dtype: Dtype::Float32,
+        shape: vec![2, 4, MAX_DRAFT_TOKENS], strides: vec![4 * MAX_DRAFT_TOKENS, MAX_DRAFT_TOKENS, 1] });
     value.validate().unwrap();
     for (shape, dtype) in [(vec![1, 8, 7], Dtype::Float32), (vec![2, 2, 14], Dtype::Float32),
-        (vec![2, 4, 7], Dtype::Int32)] {
+        (vec![2, 4, MAX_DRAFT_TOKENS], Dtype::Int32)] {
         let mut invalid = value.clone();
         let buffer = invalid.buffers.last_mut().unwrap();
         buffer.shape = shape;
@@ -37,7 +46,7 @@ fn optional_speculative_survival_validates_frame_layout() {
         assert!(invalid.validate().is_err());
     }
     value.graphs[0].input_bindings.push(InputBinding {
-        buffer_name: "completion_speculative_survival".into(), host_offset: 0, nbytes: 224 });
+        buffer_name: "completion_speculative_survival".into(), host_offset: 0, nbytes: 2 * 4 * MAX_DRAFT_TOKENS * 4 });
     assert!(value.validate().is_err());
 }
 
@@ -90,19 +99,19 @@ fn tensor_parallel_capacity_rejects_more_than_sixteen_ranks() {
 #[test]
 fn completion_wire_decodes_every_configured_lane() {
     for capacity in [1, 2, 8, 64] {
-        for fields in [24] {
+        for fields in [VECTOR_RECORD_FIELDS] {
             let mut bytes = vec![0u8; capacity * fields * 8];
             let last = (capacity - 1) * fields * 8;
             for (field, value) in [(0, 7i64), (1, 9), (4, -1), (5, 1)] {
                 bytes[last + field * 8..last + (field + 1) * 8]
                     .copy_from_slice(&value.to_le_bytes());
             }
-            if fields == 24 {
+            if fields == VECTOR_RECORD_FIELDS {
                 for (field, value) in [(12, -1i64), (15, 1)] {
                     bytes[last + field * 8..last + (field + 1) * 8]
                         .copy_from_slice(&value.to_le_bytes());
                 }
-                for field in 16..24 {
+                for field in 16..VECTOR_RECORD_FIELDS {
                     bytes[last + field * 8..last + (field + 1) * 8]
                         .copy_from_slice(&(-1i64).to_le_bytes());
                 }
@@ -141,10 +150,10 @@ pub(super) fn manifest() -> ExecutionManifest {
         BufferDescriptor {
             name: "completion_records".into(),
             address: 0x3000,
-            nbytes: 1536,
+            nbytes: 2 * 4 * VECTOR_RECORD_FIELDS * 8,
             dtype: Dtype::Int64,
-            shape: vec![2, 4, 24],
-            strides: vec![96, 24, 1],
+            shape: vec![2, 4, VECTOR_RECORD_FIELDS],
+            strides: vec![4 * VECTOR_RECORD_FIELDS, VECTOR_RECORD_FIELDS, 1],
         },
         BufferDescriptor {
             name: "tokens".into(),
@@ -155,7 +164,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             strides: vec![1],
         },
     ];
-    let graph = GraphDescriptor { confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+    let graph = GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
         name: "decode4".into(),
         kind: GraphKind::Decode,
         sampling_mode: SamplingMode::General,
@@ -182,7 +191,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             },
         ],
     };
-    ExecutionManifest {
+    ExecutionManifest { completion_token_capacity: 16, tuning_graphs: vec![],
         engram: None,
         collectives: None,
         cache: None,
@@ -198,15 +207,14 @@ pub(super) fn manifest() -> ExecutionManifest {
 }
 
 #[test]
-fn execution_abi_and_unsupported_sampling_modes_reject_before_cuda() {
-    let mut value = manifest();
-    value.abi_version = 1;
-    assert!(matches!(
-        value.validate().unwrap_err(),
-        Error::Execution(ExecutionError::Manifest(_))
-    ));
-    value.abi_version = ABI_VERSION;
-    value.validate().unwrap();
+fn execution_abi_labels_do_not_reject_valid_layouts() {
+    for abi in [0, 1, 5, 6, 7, u32::MAX] {
+        let mut value = manifest();
+        value.abi_version = abi;
+        value.validate().unwrap();
+        value.buffers[2].shape[2] += 1;
+        assert!(value.validate().is_err());
+    }
     assert!(SamplingMode::try_from("greedy").is_err());
     assert!(SamplingMode::try_from("automatic").is_err());
 }
@@ -417,9 +425,9 @@ fn physical_lane_records_reject_stale_sequences_and_impossible_status() {
 fn speculative_requires_vector_storage_and_explicit_target_geometry() {
     let mut manifest = manifest();
     manifest.abi_version = ABI_VERSION;
-    manifest.buffers[2].shape = vec![2, 4, 24];
-    manifest.buffers[2].strides = vec![96, 24, 1];
-    manifest.buffers[2].nbytes = 1536;
+    manifest.buffers[2].shape = vec![2, 4, VECTOR_RECORD_FIELDS];
+    manifest.buffers[2].strides = vec![4 * VECTOR_RECORD_FIELDS, VECTOR_RECORD_FIELDS, 1];
+    manifest.buffers[2].nbytes = 2 * 4 * VECTOR_RECORD_FIELDS * 8;
     manifest.graphs[0].kind = GraphKind::Speculative;
     for batch in [1, 2, 4] {
         manifest.graphs[0].batch_capacity = batch;
@@ -445,10 +453,10 @@ fn speculative_requires_vector_storage_and_explicit_target_geometry() {
     invalid.graphs[0].packed_token_capacity = 33;
     assert!(invalid.validate().is_err());
     let mut invalid = manifest.clone();
-    invalid.graphs[0].token_capacity = 9;
+    invalid.graphs[0].token_capacity = 17;
     assert!(invalid.validate().is_err());
     manifest.abi_version = 3;
-    assert!(manifest.validate().is_err());
+    manifest.validate().unwrap();
 }
 
 #[test]
@@ -471,6 +479,7 @@ fn vector_parser_rejects_counts_tails_and_stale_epochs_without_cuda() {
         model_reserved: 65,
         draft_cache_consumed: 66,
         verification_width: 8,
+        tokens: vec![-1; 16],
         ..Default::default()
     };
     vector.tokens[..3].copy_from_slice(&[40, 41, 42]);
@@ -495,11 +504,11 @@ fn vector_parser_rejects_counts_tails_and_stale_epochs_without_cuda() {
         bytes
     };
     assert_eq!(
-        transport::decode_records(&encoded(good), Fence(9), 4, VECTOR_RECORD_FIELDS).unwrap()[0],
+        transport::decode_records(&encoded(good.clone()), Fence(9), 4, VECTOR_RECORD_FIELDS).unwrap()[0],
         good
     );
     for change in 0..8 {
-        let mut row = good;
+        let mut row = good.clone();
         let v = row.vector.as_mut().unwrap();
         match change {
             0 => v.emitted_count = 9,
@@ -769,9 +778,9 @@ fn fragmented_upload_descriptors_reuse_their_highwater_capacity() {
 fn mixed_manifest_requires_independent_prompt_capacity_and_a_role_input() {
     let mut m = manifest();
     m.abi_version = ABI_VERSION;
-    m.buffers[2].shape = vec![2, 4, 24];
-    m.buffers[2].strides = vec![96, 24, 1];
-    m.buffers[2].nbytes = 1536;
+    m.buffers[2].shape = vec![2, 4, VECTOR_RECORD_FIELDS];
+    m.buffers[2].strides = vec![4 * VECTOR_RECORD_FIELDS, VECTOR_RECORD_FIELDS, 1];
+    m.buffers[2].nbytes = 2 * 4 * VECTOR_RECORD_FIELDS * 8;
     m.graphs[0].kind = GraphKind::Mixed;
     m.graphs[0].prefill_capacity = 512;
     m.graphs[0].token_capacity = 8;
@@ -795,7 +804,7 @@ fn mixed_manifest_requires_independent_prompt_capacity_and_a_role_input() {
     assert_eq!(m.graphs[0].packed_tokens(), 536);
     for (batch, width, prefill) in [
         (1, 8, 512),
-        (4, 9, 512),
+        (4, 17, 512),
         (4, 8, 0),
         (4, 8, 65),
         (4, 8, 1usize << 31),
@@ -820,7 +829,7 @@ pub(super) fn with_logprobs(k: usize) -> ExecutionManifest {
         strides: vec![4 * MAX_OUTPUT_TOKENS * fields, MAX_OUTPUT_TOKENS * fields, fields, 1],
     });
     value.buffers.push(BufferDescriptor {
-        name: "logprob_requested".into(), address: if k == MAX_LOGPROB_TOKEN_IDS { 0x30000 } else { 0x20000 },
+        name: "logprob_requested".into(), address: if k == MAX_LOGPROB_TOKEN_IDS { 0x60000 } else { 0x20000 },
         nbytes: 16, dtype: Dtype::Int32, shape: vec![4], strides: vec![1],
     });
     value.graphs[0].input_bindings.push(InputBinding {
@@ -893,13 +902,13 @@ fn old_execution_manifests_serve_without_logprob_outputs_and_partial_declaration
 
 #[test]
 fn logprob_readback_uses_only_emitted_positions_and_validates_chosen_ids() {
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord { vector: Some(TokenVector { tokens: vec![-1; 16], ..Default::default() }), ..Default::default() }; 4];
     records[2] = CompletionRecord {
         generation: 9, submission_sequence: 7, consumed_tokens: 3,
         generated_tokens: 2, token_id: 8, status: 1,
         vector: Some(TokenVector {
             emitted_count: 2, offered_drafts: 1, accepted_drafts: 1, verification_width: 2,
-            tokens: [7, 8, -1, -1, -1, -1, -1, -1], ..Default::default()
+            tokens: vec![7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], ..Default::default()
         }),
         ..Default::default()
     };
@@ -1010,12 +1019,12 @@ fn prompt_catalog_storage_and_bindings_are_validated_together() {
 
 #[test]
 fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
-    let mut vector = TokenVector { verification_width: 6, ..Default::default() };
+    let mut vector = TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() };
     vector.offered_drafts = 1;
     let record = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
         token_id: -1, status: 1, vector: Some(vector), ..Default::default() };
     let completion = || FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
-        records: [record; 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
+        records: vec![record.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     for mutation in 0..5 {
         let root = completion(); let mut peer = completion();
         match mutation {
@@ -1034,12 +1043,12 @@ fn packed_combined_peer_agreement_checks_the_complete_committed_vector() {
 #[test]
 fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload() {
     let active = CompletionRecord { generation: 1, submission_sequence: 1, consumed_tokens: 65,
-        token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, ..Default::default() }),
+        token_id: -1, status: 1, vector: Some(TokenVector { verification_width: 6, tokens: vec![-1; 16], ..Default::default() }),
         ..Default::default() };
     let mut root = FrameCompletion { speculative_survival: None, prompt_logprobs: None, fence: crate::cache::Fence(1), graph_index: 0,
-        records: [active; 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
+        records: vec![active.clone(); 4].into(), timing: Default::default(), logprobs: None, proposal_confidence: None };
     root.records[3].status = 0;
-    let mut peer_records = root.records;
+    let mut peer_records = root.records.clone();
     peer_records[3].generated_tokens = 17;
     peer_records[3].token_id = 400;
     peer_records[3].vector.as_mut().unwrap().offered_drafts = 6;
@@ -1048,7 +1057,7 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
     // Both byte images satisfy the transport ABI; inactive payload is not state.
     for records in [&root.records, &peer_records] {
         let bytes: Vec<_> = records.iter().flat_map(|r| r.fields()).flat_map(i64::to_le_bytes).collect();
-        transport::decode_records(&bytes, crate::cache::Fence(1), 4, 24).unwrap();
+        transport::decode_records(&bytes, crate::cache::Fence(1), 4, VECTOR_RECORD_FIELDS).unwrap();
     }
     let mut peer = FrameCompletion { speculative_survival: None, prompt_logprobs: None, records: peer_records, fence: root.fence, graph_index: root.graph_index,
         timing: Default::default(), logprobs: None, proposal_confidence: None };
@@ -1061,9 +1070,11 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
 fn explicit_logprob_decoding_preserves_order_appends_sample_and_honors_pitch() {
     for count in [1, 20, 21, 127, 128] {
         for fields in [2 + 2 * count.max(MAX_TOP_LOGPROBS), LOGPROB_FIELDS] {
-            let mut records = [CompletionRecord::default(); 2];
+            let mut records = vec![CompletionRecord { vector: Some(TokenVector { tokens: vec![-1; 16], ..Default::default() }), ..Default::default() }; 2];
             records[1].status = 1;
             records[1].token_id = 999;
+            records[1].vector.as_mut().unwrap().emitted_count = 1;
+            records[1].vector.as_mut().unwrap().tokens[0] = 999;
             let ids: Vec<u32> = (0..count as u32).rev().collect();
             let selections = [vec![], ids.clone()];
             let mut words = vec![-777i32; 2 * MAX_OUTPUT_TOKENS * fields];
@@ -1096,6 +1107,7 @@ fn explicit_logprob_decoding_preserves_order_appends_sample_and_honors_pitch() {
             assert!(result[1][1..].iter().all(Option::is_none));
             words[start] = ids[0] as i32;
             records[1].token_id = i64::from(ids[0]);
+            records[1].vector.as_mut().unwrap().tokens[0] = i64::from(ids[0]);
             assert_eq!(
                 decode(&words, &records).unwrap()[1][0]
                     .as_ref()
@@ -1134,8 +1146,8 @@ fn confidence_readback_is_declared_per_graph_and_bounded_by_frame_capacity() {
     assert!(manifest.validate().is_err());
     manifest.buffers.push(BufferDescriptor {
         name: "proposal_confidence".into(), address: 0x20000,
-        nbytes: 2 * 4 * 7 * 4, dtype: Dtype::Float32,
-        shape: vec![2, 4, 7], strides: vec![28, 7, 1],
+        nbytes: 2 * 4 * MAX_DRAFT_TOKENS * 4, dtype: Dtype::Float32,
+        shape: vec![2, 4, MAX_DRAFT_TOKENS], strides: vec![4 * MAX_DRAFT_TOKENS, MAX_DRAFT_TOKENS, 1],
     });
     manifest.validate().unwrap();
     let mut no_readback = manifest.graphs[0].clone();
@@ -1175,4 +1187,145 @@ fn scheduler_width_one_round_has_no_proposal_work() {
 #[should_panic(expected = "completion serialization requires a token vector")]
 fn completion_serialization_rejects_missing_vector_storage() {
     CompletionRecord::default().fields();
+}
+
+pub(super) fn tuning_manifest() -> ExecutionManifest {
+    let mut value = manifest();
+    for (name, address, dtype, nbytes) in [
+        ("choice", 0x10000, Dtype::Int64, 8),
+        ("tuning_status", 0x10010, Dtype::Int32, 4),
+    ] {
+        value.buffers.push(BufferDescriptor { name: name.into(), address, dtype, nbytes,
+            shape: vec![1], strides: vec![1] });
+    }
+    value.tuning_graphs.push(TuningGraphDescriptor { name: "select".into(), handle: 0x90000,
+        outputs: vec!["choice".into()], status_buffer: "tuning_status".into() });
+    value.graphs[0].tuned_bindings.push(TunedBinding { buffer: "choice".into(), tuning_graph: "select".into() });
+    value
+}
+
+#[test]
+fn tuning_outputs_have_exact_producers_and_no_host_writers() {
+    let valid = tuning_manifest();
+    valid.validate().unwrap();
+    for mutation in 0..7 {
+        let mut value = valid.clone();
+        match mutation {
+            0 => value.graphs[0].tuned_bindings[0].tuning_graph = "missing".into(),
+            1 => value.graphs[0].tuned_bindings[0].buffer = "missing".into(),
+            2 => value.tuning_graphs[0].outputs.push("choice".into()),
+            3 => value.tuning_graphs[0].status_buffer = "choice".into(),
+            4 => value.tuning_graphs[0].outputs = vec!["frame_index".into()],
+            5 => value.tuning_graphs[0].handle = value.graphs[0].handle,
+            _ => { let duplicate = value.graphs[0].tuned_bindings[0].clone(); value.graphs[0].tuned_bindings.push(duplicate); },
+        }
+        assert!(value.validate().is_err(), "mutation {mutation}");
+    }
+}
+
+#[test]
+fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
+    let mut value = tuning_manifest();
+    value.graphs.push(value.graphs[0].clone());
+    assert_eq!(value.referenced_tuning_graphs(), vec![0]);
+    value.graphs.iter_mut().for_each(|graph| graph.tuned_bindings.clear());
+    assert!(value.referenced_tuning_graphs().is_empty());
+}
+
+#[test]
+fn core_sized_completion_records_roundtrip_without_a_fixed_depth_ceiling() {
+    for capacity in [1usize, 8, 16, 33, 65] {
+        let tokens: Vec<_> = (0..capacity).map(|i| 100 + i as i64).collect();
+        let record = CompletionRecord { generation: 1, submission_sequence: 2, consumed_tokens: capacity as i64,
+            generated_tokens: capacity as i64, token_id: *tokens.last().unwrap(), status: 1,
+            vector: Some(TokenVector { emitted_count: capacity as i64, offered_drafts: capacity as i64 - 1,
+                accepted_drafts: capacity as i64 - 1, copy_offered_mask: 0,
+                verification_width: capacity as i64, tokens, ..Default::default() }), ..Default::default() };
+        let fields = COMPLETION_METADATA_FIELDS + capacity;
+        let bytes: Vec<_> = record.fields().into_iter().flat_map(i64::to_le_bytes).collect();
+        let decoded = transport::decode_records(&bytes, Fence(2), 1, fields).unwrap();
+        assert_eq!(decoded[0], record);
+        assert!(transport::decode_records(&bytes[..bytes.len() - 8], Fence(2), 1, fields).is_err());
+        let mut invalid = record;
+        invalid.vector.as_mut().unwrap().verification_width = capacity as i64 + 1;
+        assert!(invalid.validate_vector().is_err());
+        let mut manifest = manifest();
+        manifest.completion_token_capacity = capacity;
+        let output = &mut manifest.buffers[2];
+        output.address = 0x10000;
+        output.shape = vec![2, 4, fields];
+        output.strides = vec![4 * fields, fields, 1];
+        output.nbytes = 2 * 4 * fields * 8;
+        manifest.graphs[0].kind = GraphKind::Speculative;
+        manifest.graphs[0].token_capacity = capacity;
+        manifest.graphs[0].draft_tokens = capacity - 1;
+        manifest.graphs[0].packed_token_capacity = 4 * capacity;
+        manifest.validate().unwrap();
+        if capacity > 1 {
+            manifest.buffers.push(BufferDescriptor { name: "completion_speculative_survival".into(),
+                address: 0x20000, nbytes: 2 * 4 * (capacity - 1) * 4, dtype: Dtype::Float32,
+                shape: vec![2, 4, capacity - 1], strides: vec![4 * (capacity - 1), capacity - 1, 1] });
+            manifest.validate().unwrap();
+        }
+        manifest.completion_token_capacity += 1;
+        assert!(manifest.validate().is_err());
+    }
+    assert_eq!(resolve_completion_token_capacity(0), 8);
+    assert_eq!(resolve_completion_token_capacity(1), 1);
+    assert_eq!(resolve_completion_token_capacity(65), 65);
+    let mut previous = manifest();
+    previous.abi_version = 5;
+    previous.validate().unwrap();
+}
+
+#[test]
+fn core_sized_logprobs_and_survival_decode_active_and_padding_rows() {
+    for capacity in [1usize, 8, 16, 33, 65] {
+        let mut records = vec![CompletionRecord { vector: Some(TokenVector {
+            tokens: vec![-1; capacity], ..Default::default() }), ..Default::default() }; 2];
+        records[1].status = 1;
+        records[1].token_id = 42;
+        let vector = records[1].vector.as_mut().unwrap();
+        vector.tokens[0] = 42;
+        vector.emitted_count = 1;
+        let fields = 4;
+        let mut words = vec![0i32; 2 * capacity * fields];
+        let start = capacity * fields;
+        words[start..start + 4].copy_from_slice(&[42, (-0.5f32).to_bits() as i32, 42, (-0.5f32).to_bits() as i32]);
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let decoded = transport::decode_logprobs(&bytes, &records, 1, fields, 2, &[vec![], vec![]]).unwrap();
+        assert_eq!(decoded[1].len(), capacity);
+        assert_eq!(decoded[1][0].as_ref().unwrap().token, 42);
+        assert!(decoded[0].iter().all(Option::is_none));
+        assert!(decoded[1][1..].iter().all(Option::is_none));
+        let rows = vec![vec![-1.0; capacity - 1]; 2];
+        validate_speculative_survival(&rows, &records).unwrap();
+        let mut invalid = rows;
+        invalid[0].push(-1.0);
+        assert!(validate_speculative_survival(&invalid, &records).is_err());
+    }
+}
+
+#[test]
+fn eight_token_completions_accept_shorter_proposal_confidence() {
+    let mut value = manifest();
+    value.abi_version = 5;
+    value.completion_token_capacity = resolve_completion_token_capacity(0);
+    let output = &mut value.buffers[2];
+    output.shape = vec![2, 4, 24];
+    output.strides = vec![96, 24, 1];
+    output.nbytes = 2 * 4 * 24 * 8;
+    value.graphs[0].kind = GraphKind::Speculative;
+    value.graphs[0].token_capacity = 6;
+    value.graphs[0].draft_tokens = 5;
+    value.graphs[0].packed_token_capacity = 24;
+    value.graphs[0].confidence_width = 5;
+    value.buffers.push(BufferDescriptor { name: "proposal_confidence".into(),
+        address: 0x20000, nbytes: 2 * 4 * 5 * 4, dtype: Dtype::Float32,
+        shape: vec![2, 4, 5], strides: vec![20, 5, 1] });
+    value.validate().unwrap();
+    value.graphs[0].confidence_width = 6;
+    value.graphs[0].draft_tokens = 6;
+    value.graphs[0].token_capacity = 7;
+    assert!(value.validate().is_err());
 }

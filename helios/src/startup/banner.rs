@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::{fmt::Write as _, time::Duration};
 
 const ART: &str = include_str!("banner.txt");
@@ -33,7 +38,7 @@ fn render(art: &str, progress: f64, width: usize) -> String {
             .take(width.min(72))
             .enumerate()
         {
-            let wordmark = (3..=8).contains(&row) && (5..44).contains(&column);
+            let wordmark = (3..=8).contains(&row) && (5..41).contains(&column);
             let highlight = "⣿⣾⣷✦".contains(character);
             let color = if wordmark {
                 0xfff0c7

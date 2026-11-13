@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM 5.3 sparse attention on SM103: FlashInfer index selection, Triton and Cake sparse MLA against b12x references."""
 
 from __future__ import annotations

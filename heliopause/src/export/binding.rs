@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! CPython handoff for retained preparation resources.
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -26,7 +32,7 @@ fn export_capture(
     let recorder_lock = recorder.as_ref().map(|r| &r.recorder);
     let capture = || {
         if !request.sources && !request.path.as_os_str().is_empty() {
-            helios_core::package::cache::preflight_directory_publication(&request.path)?;
+            helios_core::core::cache::preflight_directory_publication(&request.path)?;
         }
         let result = match recorder_lock {
             Some(recorder) => {
@@ -42,10 +48,10 @@ fn export_capture(
                 if request.sources {
                     if request.publisher.is_some() {
                         return Err(super::invalid(
-                            "a signed package cannot reference staged sources",
+                            "a signed core cannot reference staged sources",
                         ));
                     }
-                    super::package::write_sources(&request.path, &output)?;
+                    super::core::write_sources(&request.path, &output)?;
                 } else {
                     let publisher = request
                         .publisher
@@ -55,7 +61,7 @@ fn export_capture(
                         .map(|p| p.publisher())
                         .transpose()?
                         .ok_or_else(|| super::invalid("export requires a publisher identity"))?;
-                    super::package::publish_payload(
+                    super::core::publish_payload(
                         &request.path,
                         std::slice::from_ref(&output),
                         output.index.peer_memory.clone(),
@@ -79,7 +85,11 @@ fn export_capture(
         result
     };
     let output = py
-        .detach(|| capture_with_owners(owners, capture, || super::capture::drain_context(request.context)))
+        .detach(|| {
+            capture_with_owners(owners, capture, || {
+                super::capture::drain_context(request.context)
+            })
+        })
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     Ok(NativeRankOutput { output })
 }
@@ -109,7 +119,7 @@ fn capture_with_owners<O, T>(
 
 #[pyfunction]
 fn export_preflight_directory(py: Python<'_>, destination: std::path::PathBuf) -> PyResult<()> {
-    py.detach(|| helios_core::package::cache::preflight_directory_publication(&destination))
+    py.detach(|| helios_core::core::cache::preflight_directory_publication(&destination))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
@@ -122,8 +132,9 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeExportStage>()?;
     module.add_class::<NativeRankOutput>()?;
     super::recorder::register(module)?;
-    super::package::register(module)?;
+    super::core::register(module)?;
     super::conversion::register(module)?;
+    super::weight_reuse::register(module)?;
     #[cfg(unix)]
     super::transfer::register(module)?;
     module.add_function(wrap_pyfunction!(export_source_identity, module)?)?;
@@ -135,10 +146,10 @@ pub(crate) fn message<T: prost::Message + Default>(
     value: &serde_json::Value,
 ) -> super::Result<T> {
     let pool =
-        prost_reflect::DescriptorPool::decode(helios_core::runtime_package::WIRE_DESCRIPTOR)?;
+        prost_reflect::DescriptorPool::decode(helios_core::runtime_core::WIRE_DESCRIPTOR)?;
     let descriptor = pool
         .get_message_by_name(&format!("flare.runtime.{name}"))
-        .ok_or_else(|| super::invalid(format!("unknown package message {name}")))?;
+        .ok_or_else(|| super::invalid(format!("unknown core message {name}")))?;
     let dynamic = prost_reflect::DynamicMessage::deserialize(descriptor, value.clone())?;
     Ok(dynamic.transcode_to()?)
 }
@@ -212,6 +223,13 @@ pub(crate) fn execution(
         }
 
     }
+    if let Some(tuners) = object.get_mut("tuning_graphs") {
+        for tuner in tuners.as_array_mut()
+            .ok_or_else(|| super::invalid("tuning graphs must be an array"))? {
+            tuner.as_object_mut()
+                .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
+        }
+    }
     message("Execution", &value)
 }
 
@@ -265,19 +283,24 @@ pub(crate) fn finish_rank(
         }
         phase.finish("");
     }
-    if let Some(data) = request.package_data.as_ref() {
-        let mut data = data.clone();
-        if let Some(tables) = data.get_mut("tables").and_then(|v| v.as_array_mut()) {
-            for table in tables {
-                append_planes(table, &mut cursor, &mut output.payload)?;
-                if let Some(shards) = table.get_mut("shards").and_then(|v| v.as_array_mut()) {
-                    for shard in shards {
-                        append_planes(shard, &mut cursor, &mut output.payload)?;
+    if let Some(data) = request.core_data.as_ref() {
+        if let Some(source) = request.options.reuse_weights.as_ref() {
+            let engram = source.engram(request, output, data)?;
+            output.weight_payload.get_or_insert_with(Default::default).engram = Some(engram);
+        } else {
+            let mut data = data.clone();
+            if let Some(tables) = data.get_mut("tables").and_then(|v| v.as_array_mut()) {
+                for table in tables {
+                    append_planes(table, &mut cursor, &mut output.payload)?;
+                    if let Some(shards) = table.get_mut("shards").and_then(|v| v.as_array_mut()) {
+                        for shard in shards {
+                            append_planes(shard, &mut cursor, &mut output.payload)?;
+                        }
                     }
                 }
             }
+            output.index.engram = Some(message("Engram", &data)?);
         }
-        output.index.engram = Some(message("Engram", &data)?);
     }
     if let Some(weights) = request.rebuild_weights.as_ref() {
         let mut weights = weights.clone();
@@ -449,7 +472,7 @@ fn append_planes(
 pub(crate) struct NativeExportStage {
     directory: std::sync::Mutex<Option<tempfile::TempDir>>,
     cache: Option<std::path::PathBuf>,
-    leases: std::sync::Mutex<Vec<crate::package::cache::PayloadObject>>,
+    leases: std::sync::Mutex<Vec<crate::core::cache::PayloadObject>>,
     #[pyo3(get)]
     path: String,
 }
@@ -557,13 +580,13 @@ impl NativeExportStage {
         let cache = self
             .cache
             .clone()
-            .ok_or_else(|| PyRuntimeError::new_err("export stage has no package cache"))?;
+            .ok_or_else(|| PyRuntimeError::new_err("export stage has no core cache"))?;
         let retained = py
-            .detach(|| -> super::Result<Vec<crate::package::cache::PayloadObject>> {
-                let root = crate::package::cache::Root::open(&cache)?;
+            .detach(|| -> super::Result<Vec<crate::core::cache::PayloadObject>> {
+                let root = crate::core::cache::Root::open(&cache)?;
                 let mut objects = Vec::new();
                 for path in paths {
-                    for id in super::package::source_payload_ids(&path)? {
+                    for id in super::core::source_payload_ids(&path)? {
                         let object = root
                             .payload(id)?
                             .ok_or_else(|| super::invalid(format!("staged source names missing payload {id}")))?;
@@ -601,7 +624,7 @@ impl NativeExportStage {
 /// Directory that hosts the native export workspace.
 ///
 /// An absent destination means a cache-only export: the workspace comes from
-/// explicit staging or the package cache. A relative destination with no
+/// explicit staging or the core cache. A relative destination with no
 /// directory component resolves to the current directory, never to an empty
 /// path.
 pub(crate) fn staging_parent(
@@ -632,12 +655,12 @@ mod stage_tests {
     #[test]
     fn staging_parent_normalizes_relative_and_absent_destinations() {
         assert_eq!(
-            staging_parent(Some(Path::new("out/package")), Some(Path::new("stage")), Some(Path::new("cache"))),
+            staging_parent(Some(Path::new("out/core")), Some(Path::new("stage")), Some(Path::new("cache"))),
             Path::new("stage")
         );
-        assert_eq!(staging_parent(Some(Path::new("package")), None, None), Path::new("."));
+        assert_eq!(staging_parent(Some(Path::new("core")), None, None), Path::new("."));
         assert_eq!(
-            staging_parent(Some(Path::new("out/package")), None, None),
+            staging_parent(Some(Path::new("out/core")), None, None),
             Path::new("out")
         );
         assert_eq!(
@@ -652,10 +675,17 @@ mod stage_tests {
     }
 }
 
-#[pyfunction]
-fn export_source_identity(py: Python<'_>, roots: Vec<std::path::PathBuf>) -> PyResult<String> {
-    py.detach(|| super::source_identity::source_identity(&roots))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+#[pyfunction(signature = (roots, *, excluded_directories = None))]
+fn export_source_identity(
+    py: Python<'_>,
+    roots: Vec<std::path::PathBuf>,
+    excluded_directories: Option<Vec<std::path::PathBuf>>,
+) -> PyResult<String> {
+    py.detach(|| match excluded_directories {
+        Some(excluded) => super::source_identity::source_identity_excluding(&roots, &excluded),
+        None => super::source_identity::source_identity(&roots),
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
@@ -750,13 +780,13 @@ pub(crate) fn serving_metadata(
         .ok_or_else(|| super::invalid("frontend metadata is required"))?;
     if server.contains_key("generation_defaults") || server.contains_key("eos_token_ids") {
         return Err(super::invalid(
-            "sampling and token defaults require typed package fields",
+            "sampling and token defaults require typed core fields",
         ));
     }
     validate_sampling(&sampling)?;
     let sampling: wire::DefaultSamplingParameters =
         message("DefaultSamplingParameters", &sampling)?;
-    helios_core::runtime_package::validate_sampling_defaults(&sampling)?;
+    helios_core::runtime_core::validate_sampling_defaults(&sampling)?;
     if sampling.seed.is_none()
         || sampling.temperature.is_none()
         || sampling.top_k.is_none()
@@ -825,6 +855,23 @@ fn export_serving<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
+        let value = serde_json::json!({
+            "abi_version": 6, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
+            "graphs": [{"name": "decode", "kind": "decode", "handle": 17,
+                "tuned_bindings": [{"buffer": "winner", "tuning_graph": "tune"}]}],
+            "tuning_graphs": [{"name": "tune", "handle": 18,
+                "outputs": ["winner"], "status_buffer": "status"}]
+        });
+        let encoded = execution(&value, &[]).unwrap();
+        assert_eq!(encoded.tuning_graphs[0].name, "tune");
+        assert_eq!(encoded.tuning_graphs[0].outputs, ["winner"]);
+        assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
+        assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
+        assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
+    }
+
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
         use super::super::wire;
         (wire::RebuildWeights {
@@ -885,7 +932,7 @@ mod tests {
     fn native_rank_emission_validates_resolved_rebuild_weights() {
         let request: super::super::CaptureRequest = serde_json::from_value(serde_json::json!({
             "path":"unused", "context":0, "graphs":[], "allocations":[], "execution":null,
-            "server":null, "package_data":null,
+            "server":null, "core_data":null,
             "rebuild_weights":{"version":1,"tensors":[{"name":"weight","dtype":"float32",
                 "element_bytes":4,"shape":[4],"stride":[1],"address":4096,"extent":16}],"unavailable":[]}
         })).unwrap();
@@ -990,7 +1037,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":4,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
+        let input = serde_json::json!({"abi_version":6,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));
@@ -1170,7 +1217,7 @@ impl NativeRankOutput {
     #[staticmethod]
     fn from_sources(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
         let output = py
-            .detach(|| super::package::read_sources(&path))
+            .detach(|| super::core::read_sources(&path))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { output })
     }

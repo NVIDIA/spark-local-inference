@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compacted target feedback preserves draft windows across accepted-prefix transitions."""
 
 from copy import copy
@@ -53,10 +57,10 @@ def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_n
     weights = SimpleNamespace(config=config, draft=draft)
     pool = ContinuationPool.allocate(config, 4, 2, device, dspark=True)
     metadata = Metadata.allocate(4096, 1, 1, device)
-    packing = PreparedDecoderSuffix(metadata)
+    packing = PreparedDecoderSuffix(metadata).functional()
     hidden = config.text["hidden_size"]
     source = torch.randn((3, 4096, 4, hidden), dtype=torch.bfloat16, device=device)
-    gathered = torch.empty((128, 4, hidden), dtype=torch.bfloat16, device=device)
+    suffix_positions = torch.empty(128, dtype=torch.int64, device=device)
     feedback = torch.empty((128, 3 * hidden), dtype=torch.bfloat16, device=device)
     verification_feedback = torch.randn((8, 3 * hidden), dtype=torch.bfloat16, device=device)
     verification = Metadata.allocate(8, 1, 1, device)
@@ -77,24 +81,23 @@ def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_n
         # Reuse the exact numerical plans and scratch. Only row coordinates differ
         # in the independently constructed reference, so state bytes are comparable.
         prefill_reference = copy(context)
-        prefill_reference.metadata = reference_prefill
-        prefill_reference.prefill_offsets = prefill_reference.prefill_positions = None
+        prefill_reference.compact = False
         verify_reference = copy(verify_context)
-        verify_reference.metadata = reference_verify
         session.tune()
 
         def prefill():
-            packing.begin()
+            suffix = packing.begin(metadata)
+            suffix_positions.copy_(suffix.metadata.positions)
             for column in range(3):
-                packing.gather(source[column], gathered)
+                gathered = suffix.gather(source[column])
                 feedback[:, column * hidden:(column + 1) * hidden].copy_(gathered.float().mean(1))
-            context(feedback, prefill_counts)
+            context(feedback, prefill_counts, metadata)
 
         forwards = {
             "prefill": prefill,
-            "prefill_reference": lambda: prefill_reference(feedback, reference_prefill_counts),
-            "verify": lambda: verify_context(verification_feedback, accepted),
-            "verify_reference": lambda: verify_reference(verification_feedback, accepted),
+            "prefill_reference": lambda: prefill_reference(feedback, reference_prefill_counts, reference_prefill),
+            "verify": lambda: verify_context(verification_feedback, accepted, verification),
+            "verify_reference": lambda: verify_reference(verification_feedback, accepted, reference_verify),
         }
         for name, forward in forwards.items():
             compiled = compile_forward(forward)
@@ -153,7 +156,7 @@ def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_n
                 replay("prefill")
                 assert torch.equal(feedback, expected_feedback)
                 assert torch.equal(pool.backing, expected)
-                assert torch.equal(context.prefill_positions, reference_prefill.positions)
+                assert torch.equal(suffix_positions, reference_prefill.positions)
                 start += count
             # Counts include the pending target input: eight accepted feedback
             # rows represent that input plus at most seven accepted drafts.

@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "google/gemma-4-26B-A4B-it",
+    "revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+  "result_sha256": "b7d673241724619a6787b13830d92571e109bf3a61b3bcf4cc15bc312fd7eef6",
+  "insertions": [
+    9696,
+    18082
+  ]
+}

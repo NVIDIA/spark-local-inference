@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Real-checkpoint TP4 FFN oracle, independent of the prepared MoE implementation.
 
 Run with torchrun on four assigned GPUs. Inputs are checkpoint embedding rows
@@ -21,7 +24,7 @@ from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, Route
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.minimax_m3.config import TEXT_PREFIX
 from ignition.recipes.minimax_m3.decoder import AttentionScratch, PreparedAttention
 from ignition.recipes.minimax_m3.weights import MiniMaxWeightLoader
@@ -30,6 +33,19 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1" or "FLARE_MINIMAX_CHECKPOINT" not in os.environ,
     reason="requires an assigned TP4 group and the local MiniMax checkpoint",
 )
+
+
+@pytest.fixture(scope="module")
+def tensor_parallel_group():
+    assert int(os.environ.get("WORLD_SIZE", "1")) == 4, "launch this oracle with torchrun --nproc-per-node=4"
+    rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    try:
+        yield rank, device
+    finally:
+        dist.destroy_process_group()
 
 
 class LayerLoader(MiniMaxWeightLoader):
@@ -229,141 +245,213 @@ def attention_oracle(loader, source, shard, positions, *, input_mode, output_mod
                          ids=("ffn", "full_layer", "verification_layer"))
 @pytest.mark.parametrize("scale_compression", [None, "csf"], ids=("native_scales", "csf_scales"))
 @torch.no_grad()
-def test_real_checkpoint_first_routed_ffn_tp4(attention_mode, scale_compression):
-    assert int(os.environ.get("WORLD_SIZE", "1")) == 4, "launch this oracle with torchrun --nproc-per-node=4"
-    rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+def test_real_checkpoint_first_routed_ffn_tp4(attention_mode, scale_compression, tensor_parallel_group):
+    rank, device = tensor_parallel_group
     torch.set_float32_matmul_precision("highest")
-    dist.init_process_group("nccl", device_id=device)
     shard = TensorParallelShard(rank, 4)
     manifest = inspect_indexed_checkpoint(Path(os.environ["FLARE_MINIMAX_CHECKPOINT"]))
+    with ExitStack() as stack, LayerLoader(manifest, device, shard=shard, expert_scale_compression=scale_compression) as loader:
+        loader.raw = RawWeights(manifest, stack)
+        layer, c = loader.load_layer(3), loader.config.text
+        for tokens in ((8,) if attention_mode == "verify" else (1, 17)):
+            embedding = loader.raw(TEXT_PREFIX + ".embed_tokens.weight",
+                                   (slice(1234, 1234 + tokens), slice(None))).to(device)
+            source = embedding
+            x = source.float() * torch.rsqrt(source.float().square().mean(-1, keepdim=True) + c["rms_norm_eps"])
+            source = (x * (1 + layer.post_attention_norm.float())).bfloat16()
+            logits = torch.empty(tokens, c["num_local_experts"], dtype=torch.float32, device=device)
+            router = RouterScratch.allocate(tokens, device, experts=c["num_local_experts"], top_k=c["num_experts_per_tok"])
+            routed = torch.empty_like(source)
+            scratch = MLPScratch.allocate(tokens, c["hidden_size"], c["shared_intermediate_size"] // 4, device)
+            arena = ScratchArena(device, overlap=False)
+            with PreparationSession(device=device, autotune=scale_compression is not None, compile_workers=0) as session:
+                attention_measured = None
+                if tokens > 1 and attention_mode is not None:
+                    a = AttentionScratch.allocate(loader.config, shard, tokens, device=device)
+                    normalized = gemma(embedding, layer.input_norm, c["rms_norm_eps"])
+                    positions = torch.arange(tokens, device=device)
+                    metadata = SimpleNamespace(lengths=torch.tensor([tokens], device=device, dtype=torch.int32),
+                        starts=torch.zeros(1, device=device, dtype=torch.int32), positions=positions,
+                        requests=torch.zeros(tokens, device=device, dtype=torch.int32),
+                        query_start_loc=torch.tensor([0, tokens], device=device, dtype=torch.int32),
+                        page_table=torch.ones((1, 1), device=device, dtype=torch.int32), max_query_tokens=tokens)
+                    cache = {role: torch.zeros((2, 128, 128) if role == "index" else (2, 128, 1, 128),
+                        dtype=torch.float8_e4m3fn, device=device) for role in ("key", "value", "index")}
+                    pool = SimpleNamespace(cache=lambda index, role: cache[role], memory_capacity=torch.tensor([1, 2]))
+                    attention = PreparedAttention(3, layer, loader.config, shard, normalized, a, metadata,
+                        pool, mode=attention_mode, inverse_frequency=loader.config.rotary_frequencies(device),
+                        session=session, name="attention", workspace=arena, cache_lengths=metadata.lengths)
+                    lengths = metadata.starts + metadata.lengths
+                    actual_attention = attention(normalized, metadata=metadata, lengths=lengths, schedule_storage=None)
+                    query, index_query = attention.pack(attention.input(normalized), metadata)
+                    selected_blocks = attention.indexer(index_query, metadata.page_table, lengths,
+                        metadata.query_start_loc, metadata.positions)
+                    def attend():
+                        return attention.attention(query, page_table=metadata.page_table, cache_seqlens=lengths,
+                            cu_seqlens_q=metadata.query_start_loc, selected_blocks=selected_blocks)
+                    attended = attend().flatten(1)
+                    input_mode = attention.input.plan.prepared.selection.config.mode
+                    output_mode = attention.output.plan.prepared.selection.config.mode
+                    expected_attention, diagnostic = attention_oracle(loader, normalized, shard, positions,
+                        input_mode=input_mode, output_mode=output_mode)
+                    attention_measured = metrics(actual_attention, expected_attention)
+                    attention_measured.update(input_mode=input_mode, output_mode=output_mode)
+                    attention_measured["query"] = metrics(query, diagnostic["query"])
+                    attention_measured["key"] = metrics(cache["key"][1, :tokens, 0], diagnostic["key"])
+                    attention_measured["value"] = metrics(cache["value"][1, :tokens, 0], diagnostic["value"])
+                    attention_measured["attended"] = metrics(attended, diagnostic["attended"])
+                    same_inputs = (query, cache["key"][1, :tokens, 0], cache["value"][1, :tokens, 0], positions)
+                    private_output, private_products = attention_products(*same_inputs)
+                    native_output, native_products = attention_products(*same_inputs, rounded_denominator=True)
+                    prescaled_output, _ = attention_products(*same_inputs, prescale_query=True)
+                    attention_measured["same_inputs_private"] = metrics(attended, private_output.flatten(1))
+                    attention_measured["same_inputs_rounded_denominator"] = metrics(attended, native_output.flatten(1))
+                    attention_measured["same_inputs_bf16_q_prescale"] = metrics(attended, prescaled_output.flatten(1))
+                    attention_measured["rounded_denominator_delta"] = metrics(native_products["denominator"],
+                                                                              private_products["denominator"])
+                    attention_measured["attention_plan"] = repr(attention.attention.plan.prepared.selection.config)
+                    attention_measured["attention_replay_us"] = graph_replay_times(attend, session)
+                    dist.all_reduce(actual_attention)
+                    dist.all_reduce(expected_attention)
+                    residual = (embedding.float() + actual_attention.float()).bfloat16()
+                    expected_residual = (embedding.float() + expected_attention.float()).bfloat16()
+                    source.copy_(gemma(residual, layer.post_attention_norm, c["rms_norm_eps"]))
+                    reference_source = gemma(expected_residual, layer.post_attention_norm, c["rms_norm_eps"])
+                project = UnquantizedProjection(source, layer.router, logits, session=session, name="router")
+                route = PreparedRouter(logits, router, session=session, name="route", score_func="sigmoid",
+                    renormalize=True, routed_scaling_factor=c["routed_scaling_factor"], correction_bias=layer.correction)
+                experts = PreparedRoutedExperts(source, layer.experts, router.ids, router.weights, routed,
+                    session=session, name="experts", workspace=arena)
+                shared = PreparedMLP(source, layer.mlp, scratch.gate_up, scratch.intermediate, scratch.output,
+                    session=session, name="shared", workspace=arena, swiglu_limit=c["swiglu_limit"],
+                    swiglu_alpha=c["swiglu_alpha"], swiglu_beta=1., round_silu=False, activation_mode="auto")
+                route(project(source))
+                scores = torch.sigmoid(source.float() @ layer.router.T)
+                expected_ids = (scores + layer.correction).topk(c["num_experts_per_tok"], -1).indices
+                expected_weights = scores.gather(1, expected_ids)
+                expected_weights = expected_weights / expected_weights.sum(-1, keepdim=True) * c["routed_scaling_factor"]
+                torch.testing.assert_close(router.ids.long(), expected_ids, atol=0, rtol=0)
+                torch.testing.assert_close(router.weights, expected_weights, atol=2e-6, rtol=2e-6)
+                experts()
+                shared(source)
+                expected_routed = routed_oracle(loader, source, expected_ids, expected_weights, shard)
+                expected_shared = shared_oracle(loader, source, shard)
+                expected_a16 = shared_oracle(loader, source, shard, quantized=False)
+                measured = {"routed": metrics(routed, expected_routed), "shared": metrics(scratch.output, expected_shared)}
+                if attention_measured is not None:
+                    measured["attention"] = attention_measured
+                measured["shared_a16"] = metrics(scratch.output, expected_a16)
+                measured["shared_up_plan"] = repr(shared.up_projection.plan.prepared.selection.config)
+                measured["shared_down_plan"] = repr(shared.down_projection.plan.prepared.selection.config)
+                selected_up = shared.up_projection.plan.prepared.selection.config.mode
+                selected_down = shared.down_projection.plan.prepared.selection.config.mode
+                assert selected_up == selected_down, "the oracle must represent both selected arithmetic modes"
+                same_arithmetic = expected_a16 if selected_up == "a16" else expected_shared
+                gathered = [None] * 4
+                dist.all_gather_object(gathered, measured)
+                actual = (routed.float() + scratch.output.float()).bfloat16()
+                expected = (expected_routed.float() + same_arithmetic.float()).bfloat16()
+                private_expected = (expected_routed.float() + expected_shared.float()).bfloat16()
+                dist.all_reduce(actual)
+                dist.all_reduce(expected)
+                dist.all_reduce(private_expected)
+                if rank == 0:
+                    print("TP4 real-checkpoint layer3 FFN", tokens, "ranks", gathered,
+                          "reduced_same_arithmetic", metrics(actual, expected),
+                          "reduced_private_mxfp8", metrics(actual, private_expected), flush=True)
+                assert measured["routed"]["normalized_rmse"] < .02
+                assert metrics(scratch.output, same_arithmetic)["normalized_rmse"] < .02
+                assert metrics(actual, expected)["normalized_rmse"] < .02
+                if attention_measured is not None:
+                    scores = torch.sigmoid(reference_source.float() @ layer.router.T)
+                    ids = (scores + layer.correction).topk(c["num_experts_per_tok"], -1).indices
+                    unchanged_routes = (ids.sort(-1).values == expected_ids.sort(-1).values).all(-1)
+                    route_agreement = unchanged_routes.float().mean()
+                    weights = scores.gather(1, ids)
+                    weights = weights / weights.sum(-1, keepdim=True) * c["routed_scaling_factor"]
+                    reference_routed = routed_oracle(loader, reference_source, ids, weights, shard)
+                    reference_shared = shared_oracle(loader, reference_source, shard, quantized=selected_up != "a16")
+                    reference_ffn = (reference_routed.float() + reference_shared.float()).bfloat16()
+                    dist.all_reduce(reference_ffn)
+                    full_actual = (residual.float() + actual.float()).bfloat16()
+                    full_expected = (expected_residual.float() + reference_ffn.float()).bfloat16()
+                    full_metrics = metrics(full_actual, full_expected)
+                    if rank == 0:
+                        print("TP4 real-checkpoint layer3 full layer", full_metrics,
+                              "route_set_agreement", float(route_agreement),
+                              "unchanged_routes", metrics(full_actual[unchanged_routes], full_expected[unchanged_routes]),
+                              "ffn_input", metrics(source, reference_source), flush=True)
+                    assert attention_measured["normalized_rmse"] < .02
+                    assert full_metrics["normalized_rmse"] < .02
+
+
+@pytest.mark.parametrize("tokens", [1, 17])
+@pytest.mark.parametrize("scale_compression", [None, "csf"], ids=("native_scales", "csf_scales"))
+@torch.no_grad()
+def test_functional_routed_ffn_matches_checkpoint_oracle(tokens, scale_compression, tensor_parallel_group):
+    from ignition.components.paged_batch import Metadata
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.minimax_m3.decoder import PreparedFeedForward, Scratch
+
+    rank, device = tensor_parallel_group
+    shard = TensorParallelShard(rank, 4)
+    torch.set_float32_matmul_precision("highest")
+    manifest = inspect_indexed_checkpoint(Path(os.environ["FLARE_MINIMAX_CHECKPOINT"]))
+    graph = None
     try:
         with ExitStack() as stack, LayerLoader(manifest, device, shard=shard, expert_scale_compression=scale_compression) as loader:
             loader.raw = RawWeights(manifest, stack)
-            layer, c = loader.load_layer(3), loader.config.text
-            for tokens in ((8,) if attention_mode == "verify" else (1, 17)):
-                embedding = loader.raw(TEXT_PREFIX + ".embed_tokens.weight",
-                                       (slice(1234, 1234 + tokens), slice(None))).to(device)
-                source = embedding
-                x = source.float() * torch.rsqrt(source.float().square().mean(-1, keepdim=True) + c["rms_norm_eps"])
-                source = (x * (1 + layer.post_attention_norm.float())).bfloat16()
-                logits = torch.empty(tokens, c["num_local_experts"], dtype=torch.float32, device=device)
-                router = RouterScratch.allocate(tokens, device, experts=c["num_local_experts"], top_k=c["num_experts_per_tok"])
-                routed = torch.empty_like(source)
-                scratch = MLPScratch.allocate(tokens, c["hidden_size"], c["shared_intermediate_size"] // 4, device)
-                arena = ScratchArena(device, overlap=False)
-                with PreparationSession(device=device, autotune=scale_compression is not None, compile_workers=0) as session:
-                    attention_measured = None
-                    if tokens > 1 and attention_mode is not None:
-                        buffers = GraphBufferPool(device).cursor()
-                        a = AttentionScratch.allocate(loader.config, shard, tokens, buffers)
-                        normalized = gemma(embedding, layer.input_norm, c["rms_norm_eps"])
-                        positions = torch.arange(tokens, device=device)
-                        metadata = SimpleNamespace(lengths=torch.tensor([tokens], device=device, dtype=torch.int32),
-                            starts=torch.zeros(1, device=device, dtype=torch.int32), positions=positions,
-                            requests=torch.zeros(tokens, device=device, dtype=torch.int32),
-                            query_start_loc=torch.tensor([0, tokens], device=device, dtype=torch.int32),
-                            page_table=torch.ones((1, 1), device=device, dtype=torch.int32))
-                        cache = {role: torch.zeros((2, 128, 128) if role == "index" else (2, 128, 1, 128),
-                            dtype=torch.float8_e4m3fn, device=device) for role in ("key", "value", "index")}
-                        pool = SimpleNamespace(cache=lambda index, role: cache[role])
-                        attention = PreparedAttention(3, layer, loader.config, shard, normalized, a, metadata,
-                            pool, mode=attention_mode, inverse_frequency=loader.config.rotary_frequencies(device),
-                            session=session, name="attention", workspace=arena, cache_lengths=metadata.lengths)
-                        attention(normalized)
-                        input_mode = attention.input.plan.prepared.selection.config.mode
-                        output_mode = attention.output.plan.prepared.selection.config.mode
-                        expected_attention, diagnostic = attention_oracle(loader, normalized, shard, positions,
-                            input_mode=input_mode, output_mode=output_mode)
-                        attention_measured = metrics(a.output, expected_attention)
-                        attention_measured.update(input_mode=input_mode, output_mode=output_mode)
-                        attention_measured["query"] = metrics(a.query, diagnostic["query"])
-                        attention_measured["key"] = metrics(cache["key"][1, :tokens, 0], diagnostic["key"])
-                        attention_measured["value"] = metrics(cache["value"][1, :tokens, 0], diagnostic["value"])
-                        attention_measured["attended"] = metrics(a.attended, diagnostic["attended"])
-                        same_inputs = (a.query, cache["key"][1, :tokens, 0], cache["value"][1, :tokens, 0], positions)
-                        private_output, private_products = attention_products(*same_inputs)
-                        native_output, native_products = attention_products(*same_inputs, rounded_denominator=True)
-                        prescaled_output, _ = attention_products(*same_inputs, prescale_query=True)
-                        attention_measured["same_inputs_private"] = metrics(a.attended, private_output.flatten(1))
-                        attention_measured["same_inputs_rounded_denominator"] = metrics(a.attended, native_output.flatten(1))
-                        attention_measured["same_inputs_bf16_q_prescale"] = metrics(a.attended, prescaled_output.flatten(1))
-                        attention_measured["rounded_denominator_delta"] = metrics(native_products["denominator"],
-                                                                                  private_products["denominator"])
-                        attention_measured["attention_plan"] = repr(attention.attention.plan.prepared.selection.config)
-                        attention_measured["attention_replay_us"] = graph_replay_times(attention.attention, session)
-                        dist.all_reduce(a.output)
-                        dist.all_reduce(expected_attention)
-                        residual = (embedding.float() + a.output.float()).bfloat16()
-                        expected_residual = (embedding.float() + expected_attention.float()).bfloat16()
-                        source.copy_(gemma(residual, layer.post_attention_norm, c["rms_norm_eps"]))
-                        reference_source = gemma(expected_residual, layer.post_attention_norm, c["rms_norm_eps"])
-                    project = UnquantizedProjection(source, layer.router, logits, session=session, name="router")
-                    route = PreparedRouter(logits, router, session=session, name="route", score_func="sigmoid",
-                        renormalize=True, routed_scaling_factor=c["routed_scaling_factor"], correction_bias=layer.correction)
-                    experts = PreparedRoutedExperts(source, layer.experts, router.ids, router.weights, routed,
-                        session=session, name="experts", workspace=arena)
-                    shared = PreparedMLP(source, layer.mlp, scratch.gate_up, scratch.intermediate, scratch.output,
-                        session=session, name="shared", workspace=arena, swiglu_limit=c["swiglu_limit"],
-                        swiglu_alpha=c["swiglu_alpha"], swiglu_beta=1., round_silu=False, activation_mode="auto")
-                    route(project(source))
-                    scores = torch.sigmoid(source.float() @ layer.router.T)
-                    expected_ids = (scores + layer.correction).topk(c["num_experts_per_tok"], -1).indices
-                    expected_weights = scores.gather(1, expected_ids)
-                    expected_weights = expected_weights / expected_weights.sum(-1, keepdim=True) * c["routed_scaling_factor"]
-                    torch.testing.assert_close(router.ids.long(), expected_ids, atol=0, rtol=0)
-                    torch.testing.assert_close(router.weights, expected_weights, atol=2e-6, rtol=2e-6)
-                    experts()
-                    shared(source)
-                    expected_routed = routed_oracle(loader, source, expected_ids, expected_weights, shard)
-                    expected_shared = shared_oracle(loader, source, shard)
-                    expected_a16 = shared_oracle(loader, source, shard, quantized=False)
-                    measured = {"routed": metrics(routed, expected_routed), "shared": metrics(scratch.output, expected_shared)}
-                    if attention_measured is not None:
-                        measured["attention"] = attention_measured
-                    measured["shared_a16"] = metrics(scratch.output, expected_a16)
-                    measured["shared_up_plan"] = repr(shared.up_projection.plan.prepared.selection.config)
-                    measured["shared_down_plan"] = repr(shared.down_projection.plan.prepared.selection.config)
-                    selected_up = shared.up_projection.plan.prepared.selection.config.mode
-                    selected_down = shared.down_projection.plan.prepared.selection.config.mode
-                    assert selected_up == selected_down, "the oracle must represent both selected arithmetic modes"
-                    same_arithmetic = expected_a16 if selected_up == "a16" else expected_shared
-                    gathered = [None] * 4
-                    dist.all_gather_object(gathered, measured)
-                    actual = (routed.float() + scratch.output.float()).bfloat16()
-                    expected = (expected_routed.float() + same_arithmetic.float()).bfloat16()
-                    private_expected = (expected_routed.float() + expected_shared.float()).bfloat16()
+            layer, config = loader.load_layer(3), loader.config
+            embedding = loader.raw(TEXT_PREFIX + ".embed_tokens.weight",
+                                   (slice(1234, 1234 + tokens), slice(None))).to(device)
+            source = gemma(embedding, layer.post_attention_norm, config.text["rms_norm_eps"])
+            scratch = Scratch.allocate(config, shard, tokens, tokens, device)
+            metadata = Metadata.allocate(tokens, 1, 1, device)
+            metadata.live_counts.copy_(torch.tensor([tokens, 1], dtype=torch.int32, device=device))
+            declarations = (scratch.normalized, scratch.router_logits, scratch.router.ids, scratch.router.weights,
+                scratch.experts, scratch.partial, scratch.shared.gate_up, scratch.shared.intermediate,
+                scratch.shared.output)
+            arena = ScratchArena(device)
+            with RecordedPreparationSession(device=device, checkpoint="minimax-routed-ffn",
+                    workload_schema="checkpoint-ffn", numerical_policy="default", compile_workers=4) as session:
+                session.register_scratch(arena)
+                operation = PreparedFeedForward(layer, config, scratch.normalized, scratch, metadata,
+                    session=session, name="layer3.ffn", workspace=arena, overlap=True)
+                session.tune(show_progress=False)
+                operation.scratch = operation.output_source = None
+                arena.release_preparation()
+                up_mode = operation.mlp.up_projection.plan.selection.config.mode
+                down_mode = operation.mlp.down_projection.plan.selection.config.mode
+                assert up_mode == down_mode, "the oracle must represent both selected arithmetic modes"
+                scores = torch.sigmoid(source.float() @ layer.router.T)
+                ids = (scores + layer.correction).topk(config.text["num_experts_per_tok"], -1).indices
+                weights = scores.gather(1, ids)
+                weights = weights / weights.sum(-1, keepdim=True) * config.text["routed_scaling_factor"]
+                expected_routed = routed_oracle(loader, source, ids, weights, shard)
+                expected_shared = shared_oracle(loader, source, shard, quantized=up_mode != "a16")
+                expected = (expected_routed.float() + expected_shared.float()).bfloat16()
+                dist.all_reduce(expected)
+                output = torch.empty_like(source)
+                forward = compile_forward(lambda: output.copy_(operation(source, metadata=metadata)))
+                forward()
+                graph = torch.cuda.CUDAGraph()
+                with session.capture(), torch.cuda.graph(graph):
+                    forward()
+                session.freeze()
+                for fill in (0, 0x7f, 0xff):
+                    for tensor in declarations:
+                        tensor.view(torch.uint8).fill_(fill)
+                    output.fill_(float("nan"))
+                    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+                    actual = output.clone()
                     dist.all_reduce(actual)
-                    dist.all_reduce(expected)
-                    dist.all_reduce(private_expected)
-                    if rank == 0:
-                        print("TP4 real-checkpoint layer3 FFN", tokens, "ranks", gathered,
-                              "reduced_same_arithmetic", metrics(actual, expected),
-                              "reduced_private_mxfp8", metrics(actual, private_expected), flush=True)
-                    assert measured["routed"]["normalized_rmse"] < .02
-                    assert metrics(scratch.output, same_arithmetic)["normalized_rmse"] < .02
                     assert metrics(actual, expected)["normalized_rmse"] < .02
-                    if attention_measured is not None:
-                        scores = torch.sigmoid(reference_source.float() @ layer.router.T)
-                        ids = (scores + layer.correction).topk(c["num_experts_per_tok"], -1).indices
-                        unchanged_routes = (ids.sort(-1).values == expected_ids.sort(-1).values).all(-1)
-                        route_agreement = unchanged_routes.float().mean()
-                        weights = scores.gather(1, ids)
-                        weights = weights / weights.sum(-1, keepdim=True) * c["routed_scaling_factor"]
-                        reference_routed = routed_oracle(loader, reference_source, ids, weights, shard)
-                        reference_shared = shared_oracle(loader, reference_source, shard, quantized=selected_up != "a16")
-                        reference_ffn = (reference_routed.float() + reference_shared.float()).bfloat16()
-                        dist.all_reduce(reference_ffn)
-                        full_actual = (residual.float() + actual.float()).bfloat16()
-                        full_expected = (expected_residual.float() + reference_ffn.float()).bfloat16()
-                        full_metrics = metrics(full_actual, full_expected)
-                        if rank == 0:
-                            print("TP4 real-checkpoint layer3 full layer", full_metrics,
-                                  "route_set_agreement", float(route_agreement),
-                                  "unchanged_routes", metrics(full_actual[unchanged_routes], full_expected[unchanged_routes]),
-                                  "ffn_input", metrics(source, reference_source), flush=True)
-                        assert attention_measured["normalized_rmse"] < .02
-                        assert full_metrics["normalized_rmse"] < .02
+                graph.reset()
+                graph = None
     finally:
-        dist.destroy_process_group()
+        if graph is not None:
+            graph.reset()

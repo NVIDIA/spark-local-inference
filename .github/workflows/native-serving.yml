@@ -14,10 +14,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare external frontend test fixtures
+        run: |
+          python -m pip install huggingface-hub==1.33.0
+          python tests/frontend/prepare_templates.py --output "${{ runner.temp }}/flare-test-templates" --recipe gemma4 --recipe glm53 --recipe mimo_v2 --recipe nemotron_h --recipe qwen38 --recipe step5
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -31,24 +42,44 @@ jobs:
           'C:\Program Files\NASM' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Build native serving
         id: build
-        run: cargo build --locked --release --manifest-path flare/Cargo.toml
+        run: cargo build --locked --release --manifest-path flare-cli/Cargo.toml
+      - name: Test host OS helpers
+        run: cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare-cli/target
+      - name: Test Selene and its manager on Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked --release --manifest-path selene/Cargo.toml --features test-support --target-dir flare-cli/target
+          cargo test --locked --release --manifest-path selene-manager/Cargo.toml --features test-support --target-dir flare-cli/target
+      - name: Test host cache tiers on Windows
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --manifest-path selene/Cargo.toml --target-dir flare-cli/target
       - name: Test native runtime on Linux
         if: runner.os == 'Linux'
+        env:
+          FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
         run: |
           ulimit -l
           sudo prlimit --pid $$ --memlock=67108864:67108864
-          cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare/target --features runtime-package,server
+          cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare-cli/target --features runtime-core,server
       - name: Test native runtime on Windows
         if: runner.os == 'Windows'
-        run: cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare/target --features runtime-package,server
+        env:
+          FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
+        run: cargo test --locked --release --manifest-path helios/Cargo.toml --target-dir flare-cli/target --features runtime-core,server
       - name: Test native CLI
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --locked --release --manifest-path flare/Cargo.toml
+        env:
+          FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
+        run: cargo test --locked --release --manifest-path flare-cli/Cargo.toml
+      - name: Test shared application workflows
+        env:
+          FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
+        run: cargo test --locked --release --manifest-path flare/Cargo.toml --target-dir flare-cli/target
       - name: Exercise native Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = '.\flare\target\release\flare.exe'
+          $exe = '.\flare-cli\target\release\flare.exe'
           & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "$exe --help failed" }
           & $exe --version
@@ -56,8 +87,27 @@ jobs:
           & $exe agent
           if ($LASTEXITCODE -eq 0) { throw "$exe accepted unsupported multi-host serving" }
           exit 0
+      - name: Package Windows executable and license notices
+        if: runner.os == 'Windows'
+        run: |
+          rustup component add rust-docs
+          python packaging/archive.py --binary flare-cli/target/release/flare.exe --target ${{ matrix.target }} --output flare-windows-native.zip
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
           name: flare-windows-native
-          path: flare/target/release/flare.exe
+          path: flare-windows-native.zip
+
+  rdma:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install RDMA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang libclang-dev pkg-config protobuf-compiler libnl-3-dev libnl-route-3-dev libibverbs-dev librdmacm-dev liburing-dev
+      - name: Compile experimental RDMA
+        run: |
+          cargo check --locked --manifest-path selene/Cargo.toml --tests --features rdma
+          cargo check --locked --manifest-path selene-manager/Cargo.toml --tests --features rdma
+          cargo check --locked --manifest-path flare-cli/Cargo.toml --tests --features roce,rdma

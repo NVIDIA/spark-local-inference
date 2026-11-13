@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Bounded top-k draft proposals: filtering and sampling over at most DRAFT_CANDIDATES tokens.
 
 Proposals follow the request policy after penalties, grammar and temperature:
@@ -79,9 +83,28 @@ def _block_candidates(Scores, Probabilities, TopK, Candidates, V: tl.constexpr, 
 
 
 @triton.jit
+def _shortlist_candidates(Scores, Ids, Candidates, id_stride, V: tl.constexpr,
+                          SUPPORT: tl.constexpr, POOL: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    index = tl.arange(0, POOL)
+    # Padding keeps top-k cutoffs above the support size valid without duplicate token IDs.
+    padding = index - SUPPORT
+    token = tl.load(Ids + row * id_stride + index, index < SUPPORT, other=0)
+    token = tl.where(index < SUPPORT, token, padding)
+    present = (index < SUPPORT) | ((padding >= 0) & (padding < K + SUPPORT) & (padding < V))
+    for entry in tl.static_range(SUPPORT):
+        support_id = tl.load(Ids + row * id_stride + entry)
+        present &= (index < SUPPORT) | (token != support_id)
+    present &= (token >= 0) & (token < V)
+    scores = tl.load(Scores + row * V + token, present, other=-float("inf"))
+    keys = (_orderable(scores).to(tl.int64) << 32) | (2147483647 - token).to(tl.int64)
+    tl.store(Candidates + row * POOL + index, tl.where(present, keys, -9223372036854775808))
+
+
+@triton.jit
 def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, Params, Slots, Seed,
                        Offset, Sampled, V: tl.constexpr, BLOCKS: tl.constexpr, POOL: tl.constexpr, K: tl.constexpr,
-                       SLOTS: tl.constexpr):
+                       SLOTS: tl.constexpr, SupportIds, SupportProbabilities, WRITE_SUPPORT: tl.constexpr):
     row = tl.program_id(0)
     index = tl.arange(0, POOL)
     pool = tl.load(Candidates + row * BLOCKS * K + index, index < BLOCKS * K, other=-9223372036854775808)
@@ -138,20 +161,52 @@ def _select_and_sample(Candidates, Selected, Probabilities, Valid, TopK, TopP, P
     tl.store(Probabilities + row * V + sampled, 1., ~valid)
     tl.store(Valid + row, valid)
     tl.store(Sampled + row, sampled.to(tl.int64))
+    if WRITE_SUPPORT:
+        # Keep the original Selected order and exact dense-q bits, including padding at token zero.
+        tl.debug_barrier()
+        local_keys = tl.load(Selected + row * K + rank)
+        support_ids = tl.where(local_keys != -9223372036854775808,
+                               2147483647 - (local_keys & 2147483647).to(tl.int32), 0)
+        support_probabilities = tl.load(Probabilities + row * V + support_ids)
+        tl.store(SupportIds + row * K + rank, tl.where(valid, support_ids, 0))
+        tl.store(SupportProbabilities + row * K + rank, tl.where(valid, support_probabilities, 1.))
 
 
 @triton.jit
-def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled, Scores, BlockMax,
-                  hist_stride, mask_stride, candidate_stride, CAPACITY: tl.constexpr, V: tl.constexpr,
-                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr):
+def _restore_draft_support(Selected, SupportIds, SupportProbabilities, Probabilities,
+                           V: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    rank = tl.arange(0, K)
+    keys = tl.load(Selected + row * K + rank)
+    local_ids = 2147483647 - (keys & 2147483647).to(tl.int32)
+    # Candidate generation zeroed the dense row; selection only wrote its local support or token zero.
+    tl.store(Probabilities + row * V + local_ids, 0.,
+             (keys != -9223372036854775808) & (local_ids > 0) & (local_ids < V))
+    tl.store(Probabilities + row * V, 0.)
+    tl.debug_barrier()
+    ids = tl.load(SupportIds + row * K + rank)
+    values = tl.load(SupportProbabilities + row * K + rank)
+    # Padding repeats zero with identical bits. Write it once without floating-point arithmetic.
+    zero_bits = tl.max(tl.where(ids == 0, values.to(tl.uint32, bitcast=True), 0), 0)
+    tl.store(Probabilities + row * V, zero_bits.to(tl.float32, bitcast=True))
+    tl.store(Probabilities + row * V + ids, values, ids != 0)
+
+
+@triton.jit
+def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled,
+                        hist_stride, mask_stride, candidate_stride, logit_stride, bias_stride,
+                        ADD_BIAS: tl.constexpr, CAPACITY: tl.constexpr, V: tl.constexpr,
+                        PREFIX: tl.constexpr, BLOCK: tl.constexpr):
     # One vocabulary block of one row: the committed histogram plus the row's earlier drafts give the penalty
     # counts; repetition, presence and frequency penalties, temperature and the grammar mask follow the
-    # unfused order of operations. Each block records its maximum.
+    # unfused order of operations. The caller reduces each block's maximum.
     row, block = tl.program_id(0), tl.program_id(1)
     safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
     token = block * BLOCK + tl.arange(0, BLOCK)
     inside = token < V
-    score = tl.load(Logits + row * V + token, mask=inside, other=0.).to(tl.float32)
+    score = tl.load(Logits + row * logit_stride + token, mask=inside, other=0.).to(tl.float32)
+    if ADD_BIAS:
+        score = score + tl.load(Bias + row * bias_stride + token, mask=inside, other=0.).to(tl.float32)
     temperature = tl.load(Params + safe * 6)
     repetition = tl.load(Params + safe * 6 + 3)
     presence = tl.load(Params + safe * 6 + 4)
@@ -173,10 +228,46 @@ def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, Gra
     if tl.load(GrammarEnabled + safe) != 0:
         word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
         score = tl.where(((word >> (token % 32)) & 1) != 0, score, -float("inf"))
+    return token, inside, score
+
+
+@triton.jit
+def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled, Scores, BlockMax,
+                  hist_stride, mask_stride, candidate_stride, CAPACITY: tl.constexpr, V: tl.constexpr,
+                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr):
+    token, inside, score = _draft_score_values(Logits, Logits, Histogram, Candidates, Slots, Params,
+        GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, V, V,
+        False, CAPACITY, V, PREFIX, BLOCK)
+    row, block = tl.program_id(0), tl.program_id(1)
     tl.store(Scores + row * V + token, score, mask=inside)
     score = tl.where(inside, score, -float("inf"))
     maximum = tl.max(score, 0)
     tl.store(BlockMax + row * BLOCKS + block, maximum)
+
+
+@triton.jit
+def _draft_score_candidates(Logits, Bias, Histogram, PrefixIds, Slots, Params, GrammarMask, GrammarEnabled,
+                            TopK, Probabilities, LocalCandidates, BlockMax, hist_stride, mask_stride,
+                            candidate_stride, logit_stride, bias_stride, ADD_BIAS: tl.constexpr,
+                            CAPACITY: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
+                            BLOCK: tl.constexpr, BLOCKS: tl.constexpr, K: tl.constexpr):
+    tokens, inside, scores = _draft_score_values(Logits, Bias, Histogram, PrefixIds, Slots, Params,
+        GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, logit_stride,
+        bias_stride, ADD_BIAS, CAPACITY, V, PREFIX, BLOCK)
+    row, block = tl.program_id(0), tl.program_id(1)
+    # Validity depends on every score, including nonfinite entries outside the selected support.
+    tl.store(BlockMax + row * BLOCKS + block, tl.max(tl.where(inside, scores, -float("inf")), 0))
+    tl.store(Probabilities + row * V + tokens, tl.zeros((BLOCK,), tl.float32), inside)
+    safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
+    top_k = tl.load(TopK + safe)
+    k = tl.minimum(tl.maximum(tl.where(top_k > 0, top_k, V), 1), K)
+    ordered = tl.where(inside, _orderable(scores), -2147483648)
+    position, take, count = _candidate_positions(ordered, _kth_largest(ordered, k), inside, K)
+    keys = (ordered.to(tl.int64) << 32) | (2147483647 - tokens).to(tl.int64)
+    base = LocalCandidates + (row * BLOCKS + block) * K
+    slots = tl.arange(0, K)
+    tl.store(base + slots, tl.full((K,), -9223372036854775808, tl.int64), slots >= count)
+    tl.store(base + position, keys, take)
 
 
 @triton.jit
@@ -217,11 +308,11 @@ def _draft_scores_finish(BlockMax, Candidates, Slots, Generations, LiveRows, Gen
     tl.store(PackedTopP + row, tl.load(Params + safe * 6 + 1))
 
 
-_SCORE_BLOCK = 4096
+_SCORE_BLOCK = BLOCK
 
 
 class PreparedDraftProposal:
-    """Two captured launches over explicit request-policy inputs for one draft position."""
+    """Captured candidate selection over explicit request-policy inputs for one draft position."""
 
     def __init__(self, scores, probabilities, valid, top_k, top_p, params, slots, seed, offset, sampled,
                  *, capacity, candidates=None, selected=None):
@@ -238,24 +329,67 @@ class PreparedDraftProposal:
                 raise ValueError("draft proposal scratch requires contiguous Int64 tensors on the score device")
         pool = triton.next_power_of_2(self.blocks * DRAFT_CANDIDATES)
         self._block_args = (scores, probabilities, top_k, self.candidates, vocab, self.blocks, BLOCK, DRAFT_CANDIDATES)
-        self._select_args = (self.candidates, self.selected, probabilities, valid, top_k, top_p,
-                             params, slots,
-                             seed, offset, sampled, vocab, self.blocks, pool, DRAFT_CANDIDATES, capacity)
+        self._select_args = (self.selected, probabilities, valid, top_k, top_p, params, slots,
+                             seed, offset, sampled, vocab)
+        self._candidate_source = self.candidates
+        self._candidate_geometry = (self.blocks, pool, DRAFT_CANDIDATES, capacity)
+        self._shortlist_args = None
         self._grids = ((rows, self.blocks, 1), (rows, 1, 1))
         self._kernels = None
+        self._support = None
 
-    def prepare(self):
+    def bind_shortlist(self, ids, candidates):
+        if self._kernels is not None:
+            raise RuntimeError("draft shortlist must be bound before prepare()")
+        rows, vocab = self._block_args[0].shape[0], self._block_args[4]
+        if (ids.ndim != 2 or ids.shape[0] != rows or not 0 < ids.shape[1] <= DRAFT_CANDIDATES
+                or ids.dtype != torch.int64 or ids.device != self.selected.device or ids.stride(-1) != 1):
+            raise ValueError("draft shortlist requires Int64 token rows with at most 64 candidates")
+        shape = (rows, 4, DRAFT_CANDIDATES)
+        if (candidates.shape != shape or candidates.dtype != torch.int64
+                or candidates.device != ids.device or not candidates.is_contiguous()):
+            raise ValueError("draft shortlist scratch requires contiguous Int64 candidate storage")
+        self._candidate_source = candidates
+        self._candidate_geometry = (4, 4 * DRAFT_CANDIDATES, DRAFT_CANDIDATES, self._candidate_geometry[-1])
+        self._shortlist_args = (self._block_args[0], ids, candidates, ids.stride(0),
+                               vocab, ids.shape[1], 4 * DRAFT_CANDIDATES, DRAFT_CANDIDATES)
+
+    def bind_support(self, ids, probabilities):
+        """Bind canonical broadcast payloads before graph capture, preserving candidate order."""
+        shape = (self.selected.shape[0], DRAFT_CANDIDATES)
+        for tensor, dtype in ((ids, torch.int64), (probabilities, torch.float32)):
+            if (tensor.shape != shape or tensor.dtype != dtype or tensor.device != self.selected.device
+                    or not tensor.is_contiguous()):
+                raise ValueError("draft support requires contiguous Int64 IDs and FP32 probabilities")
+        self._support = ids, probabilities
+        if self._kernels is not None:
+            self._kernels = self._kernels[:-1] + (self._prepare_select(),)
+
+    def _prepare_select(self):
         from ignition.preparation.triton import prepare_triton
 
-        self._kernels = (
-            prepare_triton(_block_candidates, self._block_args, self._grids[0], num_warps=8),
-            prepare_triton(_select_and_sample, self._select_args, self._grids[1], num_warps=4),
-        )
+        support = (self.selected, self._block_args[1]) if self._support is None else self._support
+        return prepare_triton(_select_and_sample,
+                              (self._candidate_source, *self._select_args, *self._candidate_geometry, *support), self._grids[1],
+                              WRITE_SUPPORT=self._support is not None, num_warps=4)
+
+    def prepare(self, *, candidates_prepared=False):
+        from ignition.preparation.triton import prepare_triton
+
+        if self._shortlist_args is not None:
+            self._kernels = (prepare_triton(_shortlist_candidates, self._shortlist_args,
+                                           self._grids[1], num_warps=4), self._prepare_select())
+        else:
+            self._kernels = (() if candidates_prepared else (
+                prepare_triton(_block_candidates, self._block_args, self._grids[0], num_warps=8),
+            )) + (self._prepare_select(),)
         self()
 
     def __call__(self):
         if self._kernels is None:
             raise RuntimeError("draft proposal prepare() must complete before capture")
+        if self._shortlist_args is not None:
+            self._block_args[1].zero_()
         for kernel in self._kernels:
             kernel()
 
@@ -275,12 +409,14 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         return {**PreparedSpeculativeDistributions.scratch_layout(batch, width, vocab),
             "block_max": ((batch, triton.cdiv(vocab, _SCORE_BLOCK)), torch.float32),
             "proposal_candidates": ((batch, triton.cdiv(vocab, BLOCK), DRAFT_CANDIDATES), torch.int64),
-            "proposal_selected": ((batch, DRAFT_CANDIDATES), torch.int64)}
+            "proposal_selected": ((batch, DRAFT_CANDIDATES), torch.int64),
+            "shortlist_candidates": ((batch, 4, DRAFT_CANDIDATES), torch.int64)}
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids, *,
                  seed, offset, sampled, prefix_offset=0, workspace=None):
         super().__init__(logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                          prefix_offset=prefix_offset, workspace=workspace)
+        del self.vocab_ids
         if logits.shape[1] != 1:
             raise ValueError("draft proposals cover one position")
         # Fused scoring: per-block maxima of each row before the row reduction.
@@ -292,6 +428,31 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
             candidates=self.proposal_candidates, selected=self.proposal_selected)
         self.sampled = sampled
         self.broadcast = None
+        self.source_logits, self.source_bias = None, None
+        self.has_source_logits = False
+        self._candidate_kernels = None
+        self._restore_support = None
+
+    def bind_shortlist(self, ids):
+        """Bind unique IDs covering every logit other than negative infinity."""
+        if self._prepared or self.source_logits is not None:
+            raise RuntimeError("draft shortlist must be bound before preparation without bound logits")
+        self.proposal.bind_shortlist(ids, self.shortlist_candidates)
+
+    def bind_logits(self, logits, bias=None):
+        """Read strided BF16/FP32 head rows and bias with FP32 addition, without staging logits."""
+        if self._prepared or self.proposal._shortlist_args is not None:
+            raise RuntimeError("draft logits must be bound before preparation without a shortlist")
+        shape = (self.logits.shape[0], self.logits.shape[-1])
+        if (self.logits.dtype != torch.float32 or logits.shape != shape
+                or logits.device != self.logits.device or logits.dtype not in (torch.bfloat16, torch.float32)
+                or logits.stride(-1) != 1 or logits.stride(0) < shape[1]):
+            raise ValueError("bound draft logits require FP32 staging and BF16/FP32 contiguous vocabulary rows")
+        if bias is not None and (bias.shape != shape or bias.dtype not in (torch.bfloat16, torch.float32)
+                or bias.device != logits.device or bias.stride(-1) != 1 or bias.stride(0) < shape[1]):
+            raise ValueError("draft bias requires BF16/FP32 contiguous vocabulary rows on the logit device")
+        self.source_logits, self.source_bias = logits, bias
+        self.has_source_logits = True
 
     def prepare_broadcast(self, *, runtime, session, coordinator, name, buffers=None):
         if runtime is None:
@@ -305,9 +466,19 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
         layout = self.broadcast_layout(self.logits.shape[0])
         self.support_ids = allocate(*layout["support_ids"])
         self.support_probabilities = allocate(*layout["support_probabilities"])
+        self.proposal.bind_support(self.support_ids, self.support_probabilities)
         self.broadcast = PreparedBroadcast(
             (self.support_ids, self.support_probabilities, self.sampled, self.valid),
             runtime=runtime, session=session, coordinator=coordinator, name=name, buffers=buffers)
+        if self._prepared:
+            self._prepare_support_restore()
+
+    def _prepare_support_restore(self):
+        from ignition.preparation.triton import prepare_triton
+
+        self._restore_support = prepare_triton(_restore_draft_support,
+            (self.proposal_selected, self.support_ids, self.support_probabilities, self.probabilities),
+            (self.logits.shape[0], 1, 1), V=self.logits.shape[-1], K=DRAFT_CANDIDATES, num_warps=4)
 
     def prepare(self):
         if self.logits.device.type != "cuda":
@@ -330,31 +501,241 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                 self.packed_top_p, self.candidates.stride(0)), (batch, 1, 1), CAPACITY=state.capacity, BATCH=batch,
                 V=vocab, PREFIX=self.prefix_offset, BLOCKS=blocks, BLOCK_COUNT=triton.next_power_of_2(blocks),
                 RUNNING=RUNNING, num_warps=1))
+        if self.source_logits is not None:
+            bias = self.source_logits if self.source_bias is None else self.source_bias
+            self._candidate_kernels = (
+                prepare_triton(_draft_score_candidates, (self.source_logits, bias, state.histogram,
+                    self.candidates, self.slots, state.parameters, state.grammar_mask, state.grammar_enabled,
+                    state.top_k, self.probabilities, self.proposal_candidates, self.block_max,
+                    state.histogram.stride(0), state.grammar_mask.stride(0), self.candidates.stride(0),
+                    self.source_logits.stride(0), bias.stride(0)), (batch, blocks, 1),
+                    ADD_BIAS=self.source_bias is not None, CAPACITY=state.capacity, V=vocab,
+                    PREFIX=self.prefix_offset, BLOCK=BLOCK, BLOCKS=blocks, K=DRAFT_CANDIDATES,
+                    num_warps=8, enable_fp_fusion=False), self._score_kernels[1])
         self._prepared = True
         self.prepare_scores()
-        self.proposal.prepare()
+        if self._candidate_kernels is not None:
+            for kernel in self._candidate_kernels:
+                kernel()
+        self.proposal.prepare(candidates_prepared=self._candidate_kernels is not None)
+        if self.broadcast is not None:
+            self._prepare_support_restore()
 
     def prepare_scores(self):
         """One-position scores in two kernels, without materialized penalty counts or a separate maximum."""
+        if self.source_logits is not None:
+            # Explicit score inspection retains the ordinary materialized-logit contract.
+            self.logits[:, 0].copy_(self.source_logits.float())
+            if self.source_bias is not None:
+                self.logits[:, 0].add_(self.source_bias)
         for kernel in self._score_kernels:
             kernel()
+
+    def release_scratch(self):
+        scratch = {id(getattr(self, name)): name for name in self.layout if name != "valid"}
+        scratch[id(self.logits)] = "logits"
+        if self.source_logits is not None:
+            scratch[id(self.source_logits)] = "source_logits"
+        if self.proposal._shortlist_args is not None:
+            scratch[id(self.proposal._shortlist_args[1])] = "shortlist_ids"
+        kernels = (*self._score_kernels, *(self._candidate_kernels or ()),
+                   *self.proposal._kernels, *((self._restore_support,) if self._restore_support is not None else ()))
+        seen = set()
+        for kernel in kernels:
+            if id(kernel) in seen:
+                continue
+            seen.add(id(kernel))
+            kernel.scratch_slots = tuple((index, scratch[id(value)]) for index, value in enumerate(kernel.args)
+                                         if id(value) in scratch)
+            slots = {index for index, _ in kernel.scratch_slots}
+            kernel.args = tuple(None if index in slots else value for index, value in enumerate(kernel.args))
+        self._runtime_shortlist = self.proposal._shortlist_args is not None
+        self.proposal._block_args = None
+        self.proposal._select_args = None
+        self.proposal._shortlist_args = None
+        self.proposal._candidate_source = None
+        self.proposal.candidates = None
+        self.proposal.selected = None
+        for name in self.layout:
+            if name != "valid":
+                setattr(self, name, None)
+        self.normalization.output = None
+        self.normalization.valid = None
+        self.logits = None
+        self.source_logits = None
+
+    def functional(self, *, session=None, dynamic_inputs=False):
+        if getattr(self, "_functional", False):
+            return self
+        if not self._prepared:
+            raise RuntimeError("draft proposal requires prepare() before functional conversion")
+        has_support = self.proposal._support is not None
+        if not hasattr(self, "_runtime_shortlist"):
+            self.release_scratch()
+
+        def runtime_slots(kernel, slots):
+            bindings = dict(kernel.scratch_slots)
+            bindings.update(slots)
+            kernel.scratch_slots = tuple(sorted(bindings.items()))
+            kernel.args = tuple(None if index in bindings else value for index, value in enumerate(kernel.args))
+
+        runtime_slots(self._score_kernels[0], {2: "candidates"})
+        runtime_slots(self._score_kernels[1], {1: "candidates", 10: "valid"})
+        if self._candidate_kernels is not None:
+            runtime_slots(self._candidate_kernels[0], {
+                1: "source_bias" if self.source_bias is not None else "source_logits",
+                3: "candidates",
+            })
+        if dynamic_inputs:
+            runtime_slots(self._score_kernels[0], {3: "slots"})
+            runtime_slots(self._score_kernels[1], {2: "slots", 3: "generations", 4: "live_rows"})
+            runtime_slots(self.proposal._kernels[-1], {7: "slots"})
+            if self._candidate_kernels is not None:
+                runtime_slots(self._candidate_kernels[0], {4: "slots"})
+            self.slots = self.generations = self.live_rows = None
+        self.source_bias = None
+        runtime_slots(self.proposal._kernels[-1], {3: "valid", 8: "seed", 9: "offset", 10: "sampled"})
+        if has_support:
+            runtime_slots(self.proposal._kernels[-1], {16: "support_ids", 17: "support_probabilities"})
+        if self._restore_support is not None:
+            runtime_slots(self._restore_support, {1: "support_ids", 2: "support_probabilities"})
+        self._has_support = has_support
+        self.proposal._support = None
+        self.sampled = self.valid = self.candidates = None
+        self.rows = self.columns = None
+        self.normalization.functional()
+        self.support_ids = self.support_probabilities = None
+        if self.broadcast is not None:
+            self.broadcast.functional(session=session)
+        self._functional = True
+        return self
+
+    def run(self, scratch, logits, *, source_logits=None, source_bias=None, shortlist_ids=None, candidates=None,
+            seed=None, offset=None, sampled=None, slots=None, generations=None, live_rows=None):
+        from ignition.preparation.triton import launch_triton
+
+        if not self._prepared:
+            raise RuntimeError("draft proposal requires prepare() before capture")
+
+        functional = getattr(self, "_functional", False)
+        source_bias = self.source_bias if source_bias is None else source_bias
+        slots = self.slots if slots is None else slots
+        generations = self.generations if generations is None else generations
+        live_rows = self.live_rows if live_rows is None else live_rows
+        runtime = dict(logits=logits, source_logits=source_logits, source_bias=source_bias, shortlist_ids=shortlist_ids,
+                       candidates=candidates, seed=seed, offset=offset, sampled=sampled,
+                       slots=slots, generations=generations, live_rows=live_rows)
+        if functional and self._has_support:
+            scratch = dict(scratch)
+            batch = logits.shape[0]
+            if "support_ids" not in scratch:
+                scratch["support_ids"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.int64, device=logits.device)
+            if "support_probabilities" not in scratch:
+                scratch["support_probabilities"] = torch.empty((batch, DRAFT_CANDIDATES), dtype=torch.float32, device=logits.device)
+
+        def launch(kernel):
+            args = list(kernel.args)
+            for index, name in kernel.scratch_slots:
+                args[index] = runtime[name] if name in runtime else scratch[name]
+            if functional:
+                if kernel is self._score_kernels[0]:
+                    args[11] = candidates.stride(0)
+                elif kernel is self._score_kernels[1]:
+                    args[13] = candidates.stride(0)
+                elif self._candidate_kernels is not None and kernel is self._candidate_kernels[0]:
+                    args[14] = candidates.stride(0)
+                    args[15] = source_logits.stride(0)
+                    args[16] = (source_logits if source_bias is None else source_bias).stride(0)
+                elif self._runtime_shortlist and kernel is self.proposal._kernels[0]:
+                    args[3] = shortlist_ids.stride(0)
+            launch_triton(kernel.kernel, kernel.compiled, tuple(args), kernel.grid, **kernel.options)
+
+        if self._candidate_kernels is None:
+            if source_logits is not None:
+                logits[:, 0].copy_(source_logits.float())
+                if source_bias is not None:
+                    logits[:, 0].add_(source_bias)
+            for kernel in self._score_kernels:
+                launch(kernel)
+        else:
+            for kernel in self._candidate_kernels:
+                launch(kernel)
+        if self._runtime_shortlist:
+            scratch["probabilities"].zero_()
+        for kernel in self.proposal._kernels:
+            launch(kernel)
+        if self.broadcast is not None:
+            if functional:
+                self.broadcast((scratch["support_ids"], scratch["support_probabilities"], sampled, scratch["valid"]))
+            else:
+                self.broadcast()
+            launch(self._restore_support)
+        return scratch["probabilities"]
 
     def __call__(self):
         if not self._prepared:
             raise RuntimeError("draft proposal requires prepare() before capture")
-        self.prepare_scores()
+        if self._candidate_kernels is None:
+            self.prepare_scores()
+        else:
+            for kernel in self._candidate_kernels:
+                kernel()
         self.proposal()
         if self.broadcast is not None:
-            keys = self.proposal_selected
-            present = keys != -9223372036854775808
-            ids = 2147483647 - (keys & 2147483647)
-            self.support_ids.copy_(torch.where(present, ids, 0))
-            probabilities = self.probabilities[:, 0].gather(1, self.support_ids)
-            # Padding repeats token zero with its exact probability, so duplicate stores agree.
-            # Invalid proposals use the sampler's point mass at token zero.
-            self.support_probabilities.copy_(torch.where(self.valid, probabilities, 1.))
-            self.support_ids.masked_fill_(~self.valid, 0)
             self.broadcast()
-            self.probabilities.zero_()
-            self.probabilities[:, 0].scatter_(1, self.support_ids, self.support_probabilities)
+            self._restore_support()
         return self.probabilities
+
+
+class PreparedDraftBlockBroadcast:
+    """Canonicalize a replicated proposal chain after its final conditional draw.
+
+    Every rank may execute a different local chain, but only rank zero's tokens,
+    exact proposal probabilities and validity survive. No peer-dependent operation
+    may consume a local proposal before finish(). Subsequent confidence features
+    must be reconstructed from the canonical preceding tokens.
+    """
+
+    @staticmethod
+    def broadcast_layout(batch, depth):
+        return dict(support_ids=((depth, batch, DRAFT_CANDIDATES), torch.int64),
+                    support_probabilities=((depth, batch, DRAFT_CANDIDATES), torch.float32),
+                    sampled=((depth, batch), torch.int64), valid=((depth, batch), torch.bool))
+
+    def __init__(self, proposals, drafts, probabilities, valid, sampled, *, runtime,
+                 session, coordinator, name):
+        from .collectives import PreparedBroadcast
+
+        batch, depth = drafts.shape
+        if not proposals or len(proposals) != depth or any(p.broadcast is not None for p in proposals):
+            raise ValueError("block proposal broadcast requires an unbroadcast complete proposal chain")
+        if (probabilities.shape[:2] != (batch, depth) or valid.shape != drafts.shape
+                or sampled.shape != (batch,)):
+            raise ValueError("block proposal outputs must cover every request and draft position")
+        self.layout = self.broadcast_layout(batch, depth)
+        examples = {key: torch.empty(shape, dtype=dtype, device=drafts.device)
+                    for key, (shape, dtype) in self.layout.items()}
+        for index, proposal in enumerate(proposals):
+            proposal.proposal.bind_support(examples["support_ids"][index], examples["support_probabilities"][index])
+        self.broadcast = PreparedBroadcast(tuple(examples.values()), runtime=runtime, session=session,
+            coordinator=coordinator, name=name).functional(session=session)
+
+    def begin(self, device):
+        return {key: torch.empty(shape, dtype=dtype, device=device)
+                for key, (shape, dtype) in self.layout.items()}
+
+    def retain(self, state, position, scratch, sampled):
+        state["support_ids"][position].copy_(scratch["support_ids"])
+        state["support_probabilities"][position].copy_(scratch["support_probabilities"])
+        state["sampled"][position].copy_(sampled)
+        state["valid"][position].copy_(scratch["valid"][:, 0])
+
+    def finish(self, state, drafts, probabilities, valid, sampled, active, limits):
+        self.broadcast(tuple(state.values()))
+        drafts.copy_(state["sampled"].T)
+        sampled.copy_(state["sampled"][-1])
+        positions = torch.arange(drafts.shape[1], device=drafts.device)
+        valid.copy_(state["valid"].T & active[:, None] & (positions[None, :] < limits[:, None] - 1))
+        probabilities.zero_()
+        probabilities.scatter_(2, state["support_ids"].permute(1, 0, 2),
+                               state["support_probabilities"].permute(1, 0, 2))

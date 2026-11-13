@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 usage() {
@@ -37,7 +40,7 @@ fi
 commit=$(git -C "$root" rev-parse HEAD)
 epoch=$(git -C "$root" show -s --format=%ct HEAD)
 if [[ -z "$version" ]]; then
-    base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/flare/Cargo.toml" | head -1)
+    base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/flare-cli/Cargo.toml" | head -1)
     stamp=$(date -u -d "@$epoch" +%Y%m%d%H%M%S)
     version="${base}~git${stamp}.${commit:0:8}-1"
 fi
@@ -45,7 +48,7 @@ if [[ ! "$version" =~ ^[0-9][A-Za-z0-9.+:~\-]*$ ]]; then
     printf 'Invalid Debian package version.\n' >&2
     exit 2
 fi
-if ! git -C "$root" diff --quiet HEAD -- flare helios; then
+if ! git -C "$root" diff --quiet HEAD -- flare helios eos selene selene-manager; then
     printf 'Commit native source changes before building a release package.\n' >&2
     exit 1
 fi

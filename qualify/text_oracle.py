@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare full-vocabulary text logits on identical recorded token contexts.
 
 The version-1 artifact contains prompt_tokens, teacher_tokens, logits, model_id,

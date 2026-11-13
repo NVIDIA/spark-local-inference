@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 FROM rust:1.94.1-slim-bookworm AS toolchain
 
 FROM ubuntu:24.04 AS build
@@ -12,11 +16,16 @@ ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 WORKDIR /src
 COPY flare/ flare/
+COPY flare-cli/ flare-cli/
 COPY helios/ helios/
+COPY eos/ eos/
+COPY selene/ selene/
+COPY selene-manager/ selene-manager/
 COPY ignition/recipes/qwen38/assets/ ignition/recipes/qwen38/assets/
 COPY ignition/recipes/step5/assets/ ignition/recipes/step5/assets/
-COPY LICENSE NOTICE ./
-COPY packaging/debian/ packaging/debian/
+COPY ignition/recipes/kimi3/assets/ ignition/recipes/kimi3/assets/
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md ./
+COPY packaging/ packaging/
 ARG PACKAGE_VERSION
 ARG SOURCE_COMMIT
 ARG SOURCE_DATE_EPOCH
@@ -24,8 +33,9 @@ ARG PACKAGE_MAINTAINER
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,id=flare-deb-noble-${TARGETARCH},target=/src/flare/target \
-    cargo build --locked --release --jobs 8 --manifest-path flare/Cargo.toml --bin flare \
+    --mount=type=cache,id=flare-deb-noble-${TARGETARCH},target=/src/flare-cli/target \
+    rustup component add rust-docs \
+    && cargo build --locked --release --jobs 8 --manifest-path flare-cli/Cargo.toml --bin flare \
     && packaging/debian/package.sh
 
 FROM scratch AS artifact

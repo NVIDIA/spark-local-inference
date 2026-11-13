@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Qualify prepared hyperconnection against exact-checkpoint canonical weights."""
 
 from __future__ import annotations
@@ -62,7 +66,8 @@ def qualify(snapshot: Path) -> list[dict]:
 
             def run_unfused():
                 prepared.mix(source)
-                unfused_combined.copy_(prepared.combine(source, block))
+                unfused_combined.copy_(source)
+                prepared.combine(unfused_combined, block)
                 unfused_following.copy_(following.mix(unfused_combined))
                 unfused_normalized.copy_(scratch.normalized)
 

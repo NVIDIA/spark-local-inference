@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::collections::HashMap;
 
 use serde_json::Value as Json;
@@ -389,6 +395,9 @@ impl Parser {
                 } else {
                     Args::default()
                 };
+                let args = if name == "sameas" && args.positional.is_empty() {
+                    Args { positional: vec![self.expression(5)?], ..args }
+                } else { args };
                 left = Expr::Test(Box::new(left), name, args);
                 if negate {
                     left = Expr::Unary(Unary::Not, Box::new(left));
@@ -918,6 +927,7 @@ impl Compiler {
                     }
                     match keyword {
                         "if" => self.if_block(rest)?,
+                        "generation" if rest.is_empty() => { self.body(&["endgeneration"])?; }
                         "for" => self.for_block(rest)?,
                         "set" => self.set(rest)?,
                         "macro" => self.macro_block(rest)?,

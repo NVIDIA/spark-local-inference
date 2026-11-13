@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
 
 use flare_helios::frontend;
@@ -46,6 +52,7 @@ fn jpeg_and_oriented_png_use_actual_checkpoint_request_preparation() {
     )
     .unwrap();
     let config = ModelConfig {
+        completion_token_capacity: 8,
         max_top_logprobs: 0,
         logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 262144,
@@ -75,6 +82,8 @@ fn jpeg_and_oriented_png_use_actual_checkpoint_request_preparation() {
         frontend.tokenizer(),
         248320,
         &config.eos_token_ids,
+        &flare_helios::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend)
+            .unwrap(),
     )
     .unwrap();
     let mut counts = 0;

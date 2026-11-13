@@ -1,15 +1,20 @@
-"""Prepared manifold hyperconnections with shared scratch and caller-owned outputs."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prepared manifold hyperconnections with invocation-local outputs."""
 
 from dataclasses import dataclass
 
 import torch
 from b12x.norm import mhc
-from b12x.norm.mhc import _impl
+from b12x.norm.mhc import _impl, _ops
+from b12x.preparation.types import require_prepared
 from b12x.preparation import PreparedCall
 
 from ignition.components import mhc_sm103, sm103
 from ignition.preparation.scratch import planned_scratch, prime_owners
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.tuning import declare
 from ignition.preparation.fixtures.resources import candidate_inputs
 
 
@@ -29,14 +34,13 @@ class MHCScratch:
     normalized: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, hidden, device, *, buffers=None):
+    def allocate(cls, tokens, hidden, device):
         if type(tokens) is not int or tokens <= 0 or hidden not in (4096, 5120, 7168):
             raise ValueError("mHC requires positive token capacity and a supported hidden size")
-        def empty(shape, dtype):
-            return (torch.empty(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        return cls(empty((tokens, 4, hidden), torch.bfloat16), empty((tokens, 4), torch.float32),
-                   empty((tokens, 4, 4), torch.float32), empty((tokens, hidden), torch.bfloat16))
+        return cls(torch.empty((tokens, 4, hidden), dtype=torch.bfloat16, device=device),
+                   torch.empty((tokens, 4), dtype=torch.float32, device=device),
+                   torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
+                   torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device))
 
     def bind_args(self):
         return {"out": self.residual, "post": self.post, "comb": self.comb, "y": self.normalized}
@@ -115,6 +119,7 @@ class PreparedMHC:
             raise ValueError("lagged mHC requires incoming and outgoing coefficient buffers")
         if pre_mix is not None:
             self.options.update(pre_mix=pre_mix)
+        declaration_options = dict(self.options)
         self.composed = self.row_calls = None
         if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
             # SM103 prefill composes FlashInfer's mHC kernels; b12x's fused launches stay for decode.
@@ -140,23 +145,24 @@ class PreparedMHC:
                 "expanded_residual": self.operation == "pre",
                 "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
                 "lagged_mix": pre_mix is not None})
-        entry = getattr(_impl, f"_b12x_mhc_{self.operation}_impl")
         parameters = (weights.fn, weights.scale, weights.base)
 
         def call(state, values, buffers, fixture=None):
             storage = planned_scratch(state.scratch_specs(), workspace)
             target_pre = pre_out if fixture is None else fixture.pre_out
             binding = state.bind(scratch=storage, tokens=tokens, pre_out=target_pre, **buffers.bind_args())
-            options = dict(self.options)
+            options = dict(declaration_options)
             if fixture is not None and pre_mix is not None:
-                options.update(pre_mix=fixture.pre_mix)
+                options["pre_mix"] = fixture.pre_mix
+            entry = getattr(_impl, f"_b12x_mhc_{self.operation}_impl")
             return PreparedCall(
                 run=lambda: entry(*values, *parameters, **options, binding=binding, _state=state),
                 produce=None if fixture is None else fixture.produce,
                 output=tuple(buffers.bind_args().values()),
                 owners=(*prime_owners(workspace, storage, binding), fixture))
 
-        benchmark_inputs = candidate_inputs(lambda: _BenchmarkInputs(residual, self.operation, pre_mix is not None))
+        benchmark_inputs = candidate_inputs(lambda: _BenchmarkInputs(residual, self.operation, pre_mix is not None),
+                                            session=session)
 
         def benchmark(state):
             fixture = benchmark_inputs()
@@ -164,24 +170,45 @@ class PreparedMHC:
 
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: call(state, inputs, scratch),
                                           benchmark_call=benchmark),))
+    def functional(self):
+        self.scratch = None
+        self.options.pop("pre_mix", None)
+        if self.row_calls is not None:
+            for _, _, call in self.row_calls:
+                call.functional()
+        self.composed = self.composed.functional() if self.composed is not None else None
+        return self
 
-        def finalize():
-            self.binding = mhc.bind(self.plan, scratch=planned_scratch(self.plan.scratch_specs(), workspace),
-                                    tokens=tokens, pre_out=pre_out, **scratch.bind_args())
-
-        register_finalizer(session, finalize, workspace=workspace)
-
-    def __call__(self, *inputs):
+    def __call__(self, *inputs, pre_mix=None, pre_out=None):
         if self.composed is not None:
             return self.composed(*inputs)
         if self.row_calls is not None:
+            output = None
             for start, end, call in self.row_calls:
-                call(*(value[start:end] for value in inputs))
-            return self.scratch.normalized
-        entry = mhc.run_pre if self.operation == "pre" else mhc.run_post_pre
-        entry(*inputs, self.weights.fn, self.weights.scale, self.weights.base,
-              **self.options, binding=self.binding)
-        return self.scratch.normalized
+                result = call(*(value[start:end] for value in inputs),
+                              pre_mix=None if pre_mix is None else pre_mix[start:end],
+                              pre_out=None if pre_out is None else pre_out[start:end])
+                if output is None:
+                    output = tuple([[] for _ in result])
+                for bucket, value in zip(output, result, strict=True):
+                    bucket.append(value)
+            return tuple(torch.cat(values, dim=0) for values in output)
+        residual = inputs[0 if self.operation == "pre" else 1]
+        tokens, _, hidden = residual.shape
+        state = require_prepared(self.plan, "norm.mhc")
+        partials = torch.empty((tokens, *state.partial_shape), dtype=torch.float32, device=residual.device)
+        normalized = torch.empty((tokens, hidden), dtype=residual.dtype, device=residual.device)
+        post = torch.empty((tokens, 4), dtype=torch.float32, device=residual.device)
+        comb = torch.empty((tokens, 4, 4), dtype=torch.float32, device=residual.device)
+        output = torch.empty((tokens, 4, hidden), dtype=residual.dtype, device=residual.device)
+        buffers = [partials, normalized, post, comb, output]
+        if pre_out is not None:
+            buffers.append(pre_out)
+        _ops._bound([*inputs, self.weights.fn, self.weights.scale, self.weights.base], buffers,
+            self.weights.norm, pre_mix, None, self.operation,
+            self.plan.handle, None, self.options["rms_eps"], self.options["hc_eps"],
+            self.options["sinkhorn_iters"], self.options["norm_eps"])
+        return output, post, comb, normalized
 
 
 class PreparedMHCPost:
@@ -190,11 +217,22 @@ class PreparedMHCPost:
         self.plan = mhc.plan(mhc.Caps(device=residual.device, max_tokens=residual.shape[0],
                                      hidden_size=residual.shape[-1]),
                              invocation={"operation": "post", "output_mode": "provided"})
-        declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
-            run=lambda: _impl._b12x_mhc_post_impl(source, residual, post, comb, out=output, _state=state))),))
+        declare(session, (self.plan.request(
+            name=name,
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: _impl._b12x_mhc_post_impl(
+                    source, residual, post, comb, out=output, _state=state),
+                output=output),
+        ),))
 
-    def __call__(self, source, residual, post, comb):
-        return mhc.run_post(source, residual, post, comb, out=self.output, plan=self.plan)
+    def functional(self):
+        self.output = None
+        return self
+
+    def __call__(self, source, residual, post, comb, out=None):
+        out = torch.empty_like(residual) if out is None else out
+        _ops.post(source, residual, post, comb, out, self.plan.handle)
+        return out
 
 
 class PreparedMHCHead:
@@ -207,11 +245,15 @@ class PreparedMHCHead:
         self.rms_eps, self.hc_eps = rms_eps, hc_eps
         self.mixes = torch.zeros(residual.shape[:2], dtype=torch.float32, device=residual.device)
         self.projection = UnquantizedProjection(residual.flatten(1), weights["fn"], self.mixes,
-            session=session, name=name + ".projection")
+            session=session, name=name + ".projection").functional(session=session)
+
+    def functional(self):
+        self.mixes = None
+        self.output = None
+        return self
 
     def __call__(self, residual):
-        self.projection(residual.flatten(1))
+        mixes = self.projection(residual.flatten(1))
         inverse = torch.rsqrt(residual.float().flatten(1).square().mean(-1,keepdim=True) + self.rms_eps)
-        mixing = (self.mixes * inverse * self.weights["scale"] + self.weights["base"]).sigmoid() + self.hc_eps
-        self.output.copy_((residual.float() * mixing[:,:,None]).sum(1))
-        return self.output
+        mixing = (mixes * inverse * self.weights["scale"] + self.weights["base"]).sigmoid() + self.hc_eps
+        return (residual.float() * mixing[:, :, None]).sum(1).to(residual.dtype)

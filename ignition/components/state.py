@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Aligned slot storage for immutable continuation states and live model state."""
 
 import math
@@ -105,6 +109,38 @@ def _gather_rows(Source, Rows, Output, SS: tl.constexpr, OS: tl.constexpr,
     selected = tl.load(Rows + row * RS)
     value = tl.load(Source + selected * SS + columns, columns < WIDTH, other=0)
     tl.store(Output + row * OS + columns, value, columns < WIDTH)
+
+
+def gather_rows_three(sources, rows, destinations):
+    """Read three typed state fields with one row map and separate destinations."""
+    first, second, third = (value.view(value.shape[0], -1) for value in sources)
+    out_first, out_second, out_third = (value.view(value.shape[0], -1) for value in destinations)
+    if first.is_cuda:
+        width = max(out_first.shape[1], out_second.shape[1], out_third.shape[1])
+        torch.library.wrap_triton(_gather_rows_three)[(out_first.shape[0], triton.cdiv(width, 1024))](
+            first, second, third, rows, out_first, out_second, out_third,
+            first.stride(0), second.stride(0), third.stride(0),
+            out_first.stride(0), out_second.stride(0), out_third.stride(0), rows.stride(0),
+            out_first.shape[1], out_second.shape[1], out_third.shape[1], 1024)
+    else:
+        for source, output in zip((first, second, third), (out_first, out_second, out_third), strict=True):
+            gather_rows(source, rows, output)
+
+
+@triton.jit
+def _gather_rows_three(First, Second, Third, Rows, OutFirst, OutSecond, OutThird,
+                       FS: tl.constexpr, SS: tl.constexpr, TS: tl.constexpr,
+                       FO: tl.constexpr, SO: tl.constexpr, TO: tl.constexpr, RS: tl.constexpr,
+                       FW: tl.constexpr, SW: tl.constexpr, TW: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    selected = tl.load(Rows + row * RS)
+    first = tl.load(First + selected * FS + columns, columns < FW, other=0)
+    second = tl.load(Second + selected * SS + columns, columns < SW, other=0)
+    third = tl.load(Third + selected * TS + columns, columns < TW, other=0)
+    tl.store(OutFirst + row * FO + columns, first, columns < FW)
+    tl.store(OutSecond + row * SO + columns, second, columns < SW)
+    tl.store(OutThird + row * TO + columns, third, columns < TW)
 
 
 def save_hidden(source, destination, slots, active):

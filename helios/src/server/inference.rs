@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Protocol-neutral inputs lowered only at the model frontend boundary.
 
 use crate::{AdmissionError, Error, Result};
@@ -38,6 +44,7 @@ pub enum Part {
         id: Option<String>,
         name: String,
         arguments: Value,
+        arguments_source: Option<String>,
     },
     ToolResult {
         id: Option<String>,
@@ -113,6 +120,19 @@ pub struct LogprobOptions {
     pub token_ids: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThinkingBudget {
+    Required(u64),
+    Advisory(u64),
+}
+impl ThinkingBudget {
+    pub fn tokens(self) -> u64 {
+        match self {
+            Self::Required(tokens) | Self::Advisory(tokens) => tokens,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Options {
     pub sampling: Sampling,
@@ -120,6 +140,7 @@ pub struct Options {
     pub prompt_logprobs: Option<usize>,
     pub effort: Option<Effort>,
     pub output_limit: Option<u64>,
+    pub thinking_budget: Option<ThinkingBudget>,
     pub stops: Vec<String>,
     pub token_stops: Vec<Vec<u32>>,
     pub constraint: Option<Constraint>,
@@ -293,12 +314,16 @@ pub fn template_messages(
                     id,
                     name,
                     arguments,
+                    arguments_source,
                 } => {
                     if current.get("tool_calls").is_none() {
                         current["tool_calls"] = json!([]);
                     }
                     let mut call =
                         json!({"type":"function","function":{"name":name,"arguments":arguments}});
+                    if let Some(source) = arguments_source {
+                        call["function"]["arguments_source"] = json!(source);
+                    }
                     if let Some(id) = id {
                         call["id"] = json!(id);
                     }
@@ -426,6 +451,7 @@ mod tool_result_order_tests {
                     id: id.map(str::to_owned),
                     name: format!("lookup_{index}"),
                     arguments: json!({}),
+                    arguments_source: None,
                 })
                 .collect(),
             phase: None,

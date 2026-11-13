@@ -1,8 +1,14 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
 
 use deepseek_recipe::stream::{
-    ChunkGenerator, InferenceChunk, InferenceFinishReason, OutputChunk, StreamProcessor,
-    state_machine::{ParsingOptions, ReasoningStage},
+    ChunkGenerator, InferenceChunk, InferenceFinishReason, OutputChunk, ParsingOptions,
+    StreamProcessor, ThinkingInitialStage,
 };
 use flare_helios::{
     model::PreparedContract,
@@ -22,7 +28,9 @@ struct Parsed {
 impl Parsed {
     fn event(&mut self, event: Event) {
         match event {
-            Event::TokenLogprobs(_) | Event::ContentLogprobs(_) => panic!("unexpected logprobs from syntax parser"),
+            Event::TokenLogprobs(_) | Event::ContentLogprobs(_) => {
+                panic!("unexpected logprobs from syntax parser")
+            }
             Event::Content(text) => self.content.push_str(&text),
             Event::Reasoning(text) => self.reasoning.push_str(&text),
             Event::ToolBegin { index, name, .. } => {
@@ -56,10 +64,11 @@ impl ChunkGenerator for OfficialChunks {
 fn options(start: OutputStart, structured: bool) -> ParsingOptions {
     ParsingOptions {
         parse_tool_calls: true,
-        tool_call_initial_stage: start == OutputStart::ToolBody,
+        starts_in_tool_calls: start == OutputStart::ToolBody,
         parse_json_output: structured,
-        reasoning_initial_stage: (start == OutputStart::Reasoning).then_some(ReasoningStage::Start),
-        stop_sequences: vec![],
+        thinking_initial_stage: (start == OutputStart::Reasoning)
+            .then_some(ThinkingInitialStage::ReasoningStart),
+        ..ParsingOptions::default()
     }
 }
 
@@ -72,24 +81,23 @@ async fn official_with_options(chunks: &[&str], parsing: ParsingOptions) -> Pars
         .iter()
         .map(|text| InferenceChunk::Text {
             content: (*text).to_owned(),
-            content_tokens: 1,
+            token_count: 1,
         })
         .chain([InferenceChunk::Finish {
             finish_reason: InferenceFinishReason::Stop,
         }]);
-    let stream =
-        StreamProcessor::new(OfficialChunks, parsing).process(futures_util::stream::iter(input));
+    let stream = StreamProcessor::new(OfficialChunks, parsing)
+        .into_protocol_stream(futures_util::stream::iter(input));
     futures_util::pin_mut!(stream);
     let mut parsed = Parsed::default();
     while let Some(chunk) = stream.next().await {
         match chunk.unwrap() {
-            OutputChunk::Raw { content } => parsed.content.push_str(&content),
-            OutputChunk::Reasoning { content } => parsed.reasoning.push_str(&content),
-            OutputChunk::ToolCall {
-                tool_name,
-                arguments,
-            } => parsed.calls.push((tool_name, arguments)),
-            OutputChunk::ToolArgumentsDelta { content } => {
+            OutputChunk::Content { content, .. } => parsed.content.push_str(&content),
+            OutputChunk::Reasoning { content, .. } => parsed.reasoning.push_str(&content),
+            OutputChunk::ToolCallNamed { tool_name } => {
+                parsed.calls.push((tool_name, String::new()))
+            }
+            OutputChunk::ToolCallArgumentsDelta { arguments: content } => {
                 parsed.calls.last_mut().unwrap().1.push_str(&content)
             }
             OutputChunk::Start { .. } | OutputChunk::ToolCallBegin | OutputChunk::Finish { .. } => {
@@ -595,5 +603,101 @@ fn partial_control_markers_flush_on_eof_limit_and_stop_but_not_cancel() {
                 assert!(output.finish(Termination::Eos).is_err());
             }
         }
+    }
+}
+
+#[test]
+fn deepseek_control_markers_require_special_tokens_for_token_input() {
+    for spaced in [false, true] {
+        let contract: PreparedContract = serde_json::from_str(if spaced {
+            include_str!("support/contracts/deepseek41.json")
+        } else {
+            include_str!("support/contracts/deepseek4.json")
+        })
+        .unwrap();
+        let config = OutputConfig {
+            syntax: contract.frontend,
+            control_tokens: vec![(101, "</think>".into()), (102, "｜DSML｜".into())],
+            content: flare_helios::output::tagged::OutputConfig {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![json!({"type":"function","function":{"name":"lookup"}})],
+            },
+        };
+        let mut parser = OutputPipeline::new(config);
+        let mut parsed = Parsed::default();
+        for ch in "literal </think> ".chars() {
+            parser.push(Input::Token(1)).unwrap();
+            for e in parser.push(Input::Text(&ch.to_string())).unwrap() {
+                parsed.event(e);
+            }
+        }
+        parser.push(Input::Token(101)).unwrap();
+        for e in parser.push(Input::Text("</think>")).unwrap() {
+            parsed.event(e);
+        }
+        for ch in "answer <｜DSML｜ calls>".chars() {
+            parser.push(Input::Token(1)).unwrap();
+            for e in parser.push(Input::Text(&ch.to_string())).unwrap() {
+                parsed.event(e);
+            }
+        }
+        for e in parser.finish(Termination::Eos).unwrap() {
+            parsed.event(e);
+        }
+        assert_eq!(parsed.reasoning, "literal </think> ");
+        assert_eq!(parsed.content, "answer <｜DSML｜ calls>");
+        assert!(parsed.calls.is_empty());
+    }
+}
+
+#[test]
+fn deepseek_tool_markup_uses_special_dsml_token() {
+    for spaced in [false, true] {
+        let contract: PreparedContract = serde_json::from_str(if spaced {
+            include_str!("support/contracts/deepseek41.json")
+        } else {
+            include_str!("support/contracts/deepseek4.json")
+        })
+        .unwrap();
+        let config = OutputConfig {
+            syntax: contract.frontend,
+            control_tokens: vec![(101, "</think>".into()), (102, "｜DSML｜".into())],
+            content: flare_helios::output::tagged::OutputConfig {
+                structured: false,
+                start: OutputStart::Content,
+                tools: vec![json!({"type":"function","function":{"name":"lookup"}})],
+            },
+        };
+        let (block, call) = if spaced {
+            (" calls", " invoke")
+        } else {
+            ("tool_calls", "invoke")
+        };
+        let text = format!(
+            "<｜DSML｜{block}><｜DSML｜{call} name=\"lookup\"></｜DSML｜{call}></｜DSML｜{block}>"
+        );
+        let mut parser = OutputPipeline::new(config);
+        let mut parsed = Parsed::default();
+        let parts: Vec<_> = text.split("｜DSML｜").collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                parser.push(Input::Token(102)).unwrap();
+                for event in parser.push(Input::Text("｜DSML｜")).unwrap() {
+                    parsed.event(event);
+                }
+            }
+            for ch in part.chars() {
+                parser.push(Input::Token(1)).unwrap();
+                for event in parser.push(Input::Text(&ch.to_string())).unwrap() {
+                    parsed.event(event);
+                }
+            }
+        }
+        for event in parser.finish(Termination::Eos).unwrap() {
+            parsed.event(event);
+        }
+        assert_eq!(parsed.calls, [("lookup".into(), "{}".into())]);
+        assert_eq!(parsed.ended, 1);
     }
 }

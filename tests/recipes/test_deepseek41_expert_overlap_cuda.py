@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compiled shared/routed expert overlap preserves outputs and scratch lifetimes."""
 
 import os
@@ -24,16 +28,21 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.fixture(scope="module", params=tuple(RECIPE.ranks), ids=lambda world: f"tp{world}")
+@pytest.fixture(scope="module", params=tuple((world, compression)
+    for world in RECIPE.ranks for compression in (None, "csf")),
+    ids=lambda case: f"tp{case[0]}-{case[1] or 'uncompressed'}")
 def expert_weights(request):
-    snapshot = os.environ.get("FLARE_DS41_SNAPSHOT")
+    world, compression = request.param
+    setting = "FLARE_DS41_CSF_SNAPSHOT" if compression == "csf" else "FLARE_DS41_SNAPSHOT"
+    snapshot = os.environ.get(setting)
     if snapshot is None:
-        pytest.skip("FLARE_DS41_SNAPSHOT must identify the checkpoint")
+        pytest.skip(f"{setting} must identify the checkpoint")
     with DeepSeekWeightLoader(inspect_indexed_checkpoint(Path(snapshot)), "cuda:0",
-            shard=TensorParallelShard(0, request.param), prefixes=("layers.3.",)) as loader:
+            shard=TensorParallelShard(0, world), prefixes=("layers.3.",),
+            expert_scale_compression=compression) as loader:
         weights = loader.load_layer(3).experts
         config = loader.config.text
-    return weights, config, request.param
+    return weights, config, world
 
 
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 16, 24, 32, 33, 48, 64, 96, 128])
@@ -61,27 +70,32 @@ def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, row
             swiglu_limit=config["swiglu_limit"], round_silu=False, activation_mode="auto")
         concurrent = ConcurrentSharedExpert(shared, parallel_plans=(projection.plan, router.plan, experts.plan),
             session=session, workspace=arena, defer_launch=rows > 4)
+        projection.functional(session=session)
+        router.functional(session=session)
+        experts.functional(session=session)
+        concurrent.functional(session=session)
         session.tune(show_progress=False)
+        arena.release_preparation()
 
         def forward():
             live.copy_(source)
-            concurrent.start(live)
-            router(projection(live))
-            experts()
-            concurrent.finish(live, routed)
-            output.copy_(routed + shared.output)
-            shared_output.copy_(shared.output)
+            pending = concurrent.start(live)
+            selected = router(projection(live))
+            routed = experts(live, selected.ids, selected.weights)
+            projected = concurrent.finish(pending, routed)
+            output.copy_(routed + projected)
+            shared_output.copy_(projected)
             storage.engram.gathered.fill_(42)
             arena.tensor.fill_(255)
             live.zero_()
 
         def serial_forward():
             live.copy_(source)
-            router(projection(live))
-            experts()
-            shared(live)
-            output.copy_(routed + shared.output)
-            shared_output.copy_(shared.output)
+            selected = router(projection(live))
+            routed = experts(live, selected.ids, selected.weights)
+            projected = shared(live)
+            output.copy_(routed + projected)
+            shared_output.copy_(projected)
             storage.engram.gathered.fill_(42)
             arena.tensor.fill_(255)
             live.zero_()
@@ -102,8 +116,8 @@ def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, row
         for _ in range(12):
             source.normal_()
             live.copy_(source)
-            router(projection(live))
-            expected_routed = experts().clone()
+            selected = router(projection(live))
+            expected_routed = experts(live, selected.ids, selected.weights).clone()
             expected_shared = shared(live).clone()
             serial_graph.replay()
             torch.cuda.synchronize()

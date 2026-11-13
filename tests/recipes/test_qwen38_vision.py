@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact-checkpoint vision encoder and native CUDA graph qualification."""
 
 from __future__ import annotations
@@ -13,7 +17,6 @@ from tests.components.completion_support import completion_outputs
 
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.recipes.qwen38.vision import PreparedVision, VisionMetadata, VisionScratch, VisionWeights
 from ignition.recipes.qwen38.weights import QwenWeightLoader
 from ignition.reference.qwen38_quant import (
@@ -23,6 +26,17 @@ from ignition.reference.qwen38_quant import (
 
 CUDA = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                          reason="requires explicit GPU assignment and FLARE_RUN_CUDA_TESTS=1")
+
+
+class ObservedVisionGeneration:
+    def __init__(self, handoff, encoder, errors):
+        self.handoff, self.encoder, self.errors = handoff, encoder, errors
+
+    def __call__(self):
+        values, metadata = self.handoff.begin()
+        output = self.encoder(values["pixels"], metadata)
+        self.handoff.finish(values, output)
+        self.errors.copy_(values["errors"])
 
 
 def test_vision_buffer_geometry():
@@ -126,15 +140,18 @@ def test_actual_vision_encoder_native_replay(manifest, record_property):
     pixels = torch.zeros((256, 1536), dtype=torch.float32, device=device)
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         prepared = PreparedVision(module, scratch, metadata, weights, session=session)
+        prepared.functional(session=session)
         session.freeze()
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
+        def forward():
+            scratch.output.copy_(prepared(pixels, metadata))
         with torch.cuda.stream(stream):
-            prepared(pixels)
+            forward()
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            prepared(pixels)
+            forward()
         worker = PreparedGraphBundle(device=0, graphs={"vision": graph},
             buffers={"pixels": pixels, "embeddings": scratch.output},
             resources=(prepared, weights, session, stream)).start_worker()
@@ -180,7 +197,7 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
     from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.qwen38.sampling import DeviceRequestState
     from ignition.recipes.qwen38.vision_state import (
-        PreparedVisionGeneration, PreparedVisionHandoff, VisionFeatureState, VisionInputs,
+        PreparedVisionHandoff, VisionFeatureState, VisionInputs,
     )
     from transformers.vision_utils import get_vision_position_ids, get_vision_interpolation_indices_and_weights
 
@@ -189,24 +206,27 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
     module = _module(manifest)
     with QwenWeightLoader(manifest, device, prefixes=("model.visual.",)) as loader:
         weights = VisionWeights.load(module, loader)
-    pool, arena = GraphBufferPool(device, chunk_bytes=2 << 20), ScratchArena(device)
-    cursor = pool.cursor()
-    scratch = VisionScratch.allocate(256, device, buffers=cursor)
+    arena = ScratchArena(device)
+    scratch = VisionScratch.allocate(256, device)
     inputs, features = VisionInputs.allocate(device), VisionFeatureState.allocate(device, capacity=1)
     requests = DeviceRequestState.allocate(device, capacity=1)
     requests.generation.fill_(7)
     requests.status.fill_(1)
-    records = torch.zeros((2, 1, 24), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 1, 32), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     handoff = PreparedVisionHandoff(inputs, features, requests, scratch.output, completion_outputs(records), frame, sequence,
-                                   pixels=scratch.patches, buffers=cursor)
+                                   pixels=scratch.patches)
     handoff.prepare()
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         encoder = PreparedVision(module, scratch, handoff.metadata, weights, session=session,
                                  projection_workspace=arena, attention_workspace=arena)
+        arena.finalize()
+        metadata_example, errors = handoff.metadata, torch.empty_like(handoff.errors)
+        handoff.functional()
+        encoder.functional(session=session)
         session.freeze()
-        forward = PreparedVisionGeneration(handoff, encoder)
+        forward = ObservedVisionGeneration(handoff, encoder, errors)
         path = tmp_path / "vision.pt2"
         with CompilePool(device, compile_workers=1) as compilers:
             compilers.submit(forward, path).result()
@@ -239,12 +259,14 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
         with torch.cuda.graph(graph):
             compiled(forward)
         worker = PreparedGraphBundle(device=0, graphs={"vision": graph}, buffers={},
-            resources=(forward, compiled, pool, arena, session)).start_worker()
+            resources=(forward, compiled, arena, session)).start_worker()
         try:
             for _ in range(2):
-                for chunks in pool.chunks.values():
-                    for tensor in chunks:
-                        tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
+                for tensor in vars(scratch).values():
+                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
+                errors.fill_(-37)
+                for tensor in vars(metadata_example).values():
+                    tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
                 reset()
                 features.arena.fill_(float("nan"))
                 torch.cuda.synchronize()
@@ -253,7 +275,7 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
                 result = worker.poll(timeout_ms=30000)
                 assert result is not None and result.ticket == ticket and result.error is None
                 assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
-                assert handoff.errors.item() == 0
+                assert errors.item() == 0
                 assert features.count.item() == 64
                 torch.testing.assert_close(features.arena[0, :64], expected, rtol=0, atol=0)
         finally:
@@ -264,7 +286,7 @@ def test_vision_generation_compiles_in_worker_and_replays_after_poisoning(manife
 @pytest.mark.parametrize("capacity", [256, 16384])
 @pytest.mark.parametrize("compiled", [False, True])
 @torch.no_grad()
-def test_pooled_vision_native_replay_matches_unpooled_after_poisoning(manifest, capacity, compiled):
+def test_vision_native_replay_matches_reference_after_poisoning(manifest, capacity, compiled):
     from b12x.preparation import PreparationSession
     from transformers.vision_utils import get_vision_position_ids, get_vision_interpolation_indices_and_weights
 
@@ -274,11 +296,9 @@ def test_pooled_vision_native_replay_matches_unpooled_after_poisoning(manifest, 
     modules = [_module(manifest), _module(manifest)]
     with QwenWeightLoader(manifest, device, prefixes=("model.visual.",)) as loader:
         weights = VisionWeights.load(modules[0], loader)
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    cursor = pool.cursor()
-    scratch = [VisionScratch.allocate(capacity, device), VisionScratch.allocate(capacity, device, buffers=cursor)]
+    scratch = [VisionScratch.allocate(capacity, device), VisionScratch.allocate(capacity, device)]
     metadata = [VisionMetadata.allocate(capacity, 1, device),
-                VisionMetadata.allocate(capacity, 1, device, buffers=cursor)]
+                VisionMetadata.allocate(capacity, 1, device)]
     pixels = torch.zeros((capacity, 1536), dtype=torch.float32, device=device)
     side = int(capacity ** .5)
     grid = torch.tensor([[1, side, side]], device=device)
@@ -288,13 +308,15 @@ def test_pooled_vision_native_replay_matches_unpooled_after_poisoning(manifest, 
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         prepared = [PreparedVision(module, s, m, weights, session=session, name=f"vision{i}")
                     for i, (module, s, m) in enumerate(zip(modules, scratch, metadata, strict=True))]
+        for encoder in prepared:
+            encoder.functional(session=session)
         session.freeze()
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         graphs = {}
         owners = []
         for index, encoder in enumerate(prepared):
-            forward = lambda encoder=encoder: encoder(pixels)
+            forward = lambda encoder=encoder, index=index: scratch[index].output.copy_(encoder(pixels, metadata[index]))
             if compiled and index == 1:
                 import io
                 from ignition.preparation.aot import aot_forward
@@ -313,13 +335,13 @@ def test_pooled_vision_native_replay_matches_unpooled_after_poisoning(manifest, 
                 forward()
             graphs[str(index)] = graph
         worker = PreparedGraphBundle(device=0, graphs=graphs, buffers={"pixels": pixels},
-            resources=(*prepared, *owners, weights, session, stream, pool)).start_worker()
+            resources=(*prepared, *owners, weights, session, stream)).start_worker()
         try:
             for seed in (31, 72):
                 pixels.normal_(generator=torch.Generator(device=device).manual_seed(seed))
-                for chunks in pool.chunks.values():
-                    for chunk in chunks:
-                        chunk.fill_(float("nan") if chunk.is_floating_point() else -37)
+                for example in scratch:
+                    for tensor in vars(example).values():
+                        tensor.fill_(float("nan") if tensor.is_floating_point() else -37)
                 for m in metadata:
                     m.interpolation_indices.copy_(indices)
                     m.interpolation_weights.copy_(factors)

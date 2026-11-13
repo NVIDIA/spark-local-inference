@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native Bolt text, tool, image, and recurrent-prefix requests.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_NEMOTRON_TEST_URL to a native service

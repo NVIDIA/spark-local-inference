@@ -1,4 +1,7 @@
-"""Package-owned TP4 reductions preserve arithmetic across graph variants."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Core-owned TP4 reductions preserve arithmetic across graph variants."""
 
 from datetime import timedelta
 import os
@@ -16,7 +19,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
 def _rank(rank, rendezvous):
     from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -24,7 +27,7 @@ def _rank(rank, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4,
                             timeout=timedelta(minutes=5))
     try:
-        with PackageStorage(rank=rank, world=4, device=rank) as storage:
+        with CoreStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=128,
                                                hidden_size=5120, ipc=storage.peer_storage)
@@ -88,6 +91,6 @@ def _rank(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_package_owned_tp4_reductions(tmp_path):
+def test_core_owned_tp4_reductions(tmp_path):
     assert torch.cuda.device_count() == 4
     mp.spawn(_rank, args=((tmp_path / "rendezvous").as_uri(),), nprocs=4, join=True)

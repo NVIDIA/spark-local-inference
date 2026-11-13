@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
 use crate::{
     output::{Event, Termination},
@@ -446,7 +452,12 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
             ),
         ),
     ];
-    let markers = [(1, "<|open|>"), (2, "<|close|>"), (3, "<|sep|>")];
+    let markers = [
+        (1, "<|open|>"),
+        (2, "<|close|>"),
+        (3, "<|sep|>"),
+        (4, "｜DSML｜"),
+    ];
     for (kind, wrapping_newlines, separator, text) in cases {
         let mut pieces = Vec::new();
         let mut rest = text;
@@ -492,10 +503,15 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
                             unreachable!("tool parser fixture contains only tokens and text")
                         }
                         Piece::Token(id) => vec![OutputInput::Token(*id)],
-                        Piece::Text(text) if split_characters => text
-                            .char_indices()
-                            .map(|(at, ch)| OutputInput::Text(&text[at..at + ch.len_utf8()]))
-                            .collect(),
+                        // Control tokens decode whole; split only ordinary text.
+                        Piece::Text(text)
+                            if split_characters
+                                && !markers.iter().any(|(_, marker)| text.as_str() == *marker) =>
+                        {
+                            text.char_indices()
+                                .map(|(at, ch)| OutputInput::Text(&text[at..at + ch.len_utf8()]))
+                                .collect()
+                        }
                         Piece::Text(text) => vec![OutputInput::Text(text)],
                     };
                     for input in inputs {
@@ -589,6 +605,75 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn glm_arguments_that_mismatch_declared_types_complete_every_protocol() {
+    use crate::{
+        model::contract::{ToolParser, ToolParserKind},
+        output::{Input as OutputInput, OutputConfig, OutputPipeline, tagged},
+    };
+
+    let text = "<tool_call>lookup<arg_key>enabled</arg_key><arg_value>\"true\"</arg_value><arg_key>count</arg_key><arg_value>two</arg_value></tool_call>";
+    let expected = json!({"enabled":"true","count":"two"});
+    for protocol in [Protocol::Chat, Protocol::Messages, Protocol::Responses] {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::GlmArgumentTags,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let mut parser = OutputPipeline::new(OutputConfig {
+            syntax,
+            control_tokens: vec![],
+            content: tagged::OutputConfig {
+                structured: false,
+                start: tagged::OutputStart::Content,
+                tools: vec![json!({"type":"function","function":{
+                    "name":"lookup","parameters":{"type":"object","properties":{
+                        "enabled":{"type":"boolean"},"count":{"type":"integer"}
+                    }}
+                }})],
+            },
+        });
+        let mut enc = encoder(protocol);
+        let mut frames = enc.start();
+        for (at, ch) in text.char_indices() {
+            let parsed = parser
+                .push(OutputInput::Text(&text[at..at + ch.len_utf8()]))
+                .unwrap();
+            frames.extend(enc.apply(0, parsed).unwrap());
+        }
+        let parsed = parser.finish(Termination::Eos).unwrap();
+        frames.extend(enc.apply(0, parsed).unwrap());
+        frames.extend(enc.finish(0, Termination::Eos, 12, 0, None).unwrap());
+        let response = enc.response();
+        let arguments = match protocol {
+            Protocol::Chat => {
+                assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                assert!(frames.last().unwrap().done);
+                let call = &response["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["function"]["name"], "lookup");
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap()
+            }
+            Protocol::Messages => {
+                assert_eq!(response["stop_reason"], "tool_use");
+                assert_eq!(frames.last().unwrap().data["type"], "message_stop");
+                assert_eq!(response["content"][0]["name"], "lookup");
+                response["content"][0]["input"].clone()
+            }
+            Protocol::Responses => {
+                assert_eq!(response["status"], "completed");
+                assert_eq!(frames.last().unwrap().data["type"], "response.completed");
+                let call = &response["output"][0];
+                assert_eq!(call["name"], "lookup");
+                serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(arguments, expected, "{protocol:?}");
     }
 }
 
@@ -1047,10 +1132,43 @@ fn messages_stream_reconstructs_ordered_buffered_blocks() {
     assert_eq!(frames.last().unwrap().data["type"], "message_stop");
 }
 #[test]
+fn chat_usage_reports_reasoning_tokens_and_completions_omits_them() {
+    let mut chat = encoder(Protocol::Chat);
+    let mut frames = chat.start();
+    frames.extend(chat.apply(0, events()).unwrap());
+    chat.report_reasoning_tokens(0, 5);
+    frames.extend(chat.finish(0, Termination::Eos, 12, 3, None).unwrap());
+    assert_eq!(
+        chat.response()["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        5,
+        "clients translating Chat traffic read completion_tokens_details"
+    );
+    let chat_usage = &chat.response()["usage"];
+    assert!(
+        chat_usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap()
+            <= chat_usage["completion_tokens"].as_u64().unwrap(),
+        "reasoning is a subset of generated output"
+    );
+
+    let mut plain = encoder(Protocol::Completions);
+    let mut frames = plain.start();
+    frames.extend(plain.apply(0, events()).unwrap());
+    plain.report_reasoning_tokens(0, 5);
+    frames.extend(plain.finish(0, Termination::Eos, 12, 3, None).unwrap());
+    assert!(
+        plain.response()["usage"].get("completion_tokens_details").is_none(),
+        "raw completions has no reasoning region to report"
+    );
+}
+
+#[test]
 fn responses_stream_has_stable_ids_sequence_and_terminal_output() {
     let mut encoder = encoder(Protocol::Responses);
     let mut frames = encoder.start();
     frames.extend(encoder.apply(0, events()).unwrap());
+    encoder.report_reasoning_tokens(0, 7);
     frames.extend(encoder.finish(0, Termination::Eos, 12, 3, None).unwrap());
     for (i, frame) in frames.iter().enumerate() {
         assert_eq!(frame.data["sequence_number"], i as u64);
@@ -1065,6 +1183,19 @@ fn responses_stream_has_stable_ids_sequence_and_terminal_output() {
     assert_eq!(
         encoder.response()["usage"]["input_tokens_details"]["cached_tokens"],
         3
+    );
+    assert_eq!(
+        encoder.response()["usage"]["output_tokens_details"]["reasoning_tokens"],
+        7,
+        "the Responses usage schema requires output_tokens_details"
+    );
+    let responses_usage = &encoder.response()["usage"];
+    assert!(
+        responses_usage["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap()
+            <= responses_usage["output_tokens"].as_u64().unwrap(),
+        "reasoning is a subset of generated output"
     );
     let mut history = encoder.response()["output"].as_array().unwrap().clone();
     history.push(json!({"type":"function_call_output","call_id":"call_1","output":"found"}));
@@ -1122,14 +1253,17 @@ fn usage_reports_uncached_partial_and_full_prefix_reuse() {
             let usage = &response["usage"];
             match protocol {
                 Protocol::Chat | Protocol::Completions => {
-                    assert_eq!(
-                        usage,
-                        &json!({
-                            "prompt_tokens":17,"completion_tokens":generated,
-                            "total_tokens":17 + generated,
-                            "prompt_tokens_details":{"cached_tokens":cached},
-                        })
-                    );
+                    // Chat carries a completion breakdown; Completions predates
+                    // the field and its wire shape is unchanged.
+                    let mut expected = json!({
+                        "prompt_tokens":17,"completion_tokens":generated,
+                        "total_tokens":17 + generated,
+                        "prompt_tokens_details":{"cached_tokens":cached},
+                    });
+                    if protocol == Protocol::Chat {
+                        expected["completion_tokens_details"] = json!({"reasoning_tokens": 0});
+                    }
+                    assert_eq!(usage, &expected);
                     assert_eq!(frames[frames.len() - 2].data["usage"], *usage);
                     assert_eq!(frames[frames.len() - 2].data["choices"], json!([]));
                     assert!(frames.last().unwrap().done);
@@ -1160,6 +1294,7 @@ fn usage_reports_uncached_partial_and_full_prefix_reuse() {
                             "input_tokens":17,"output_tokens":generated,
                             "total_tokens":17 + generated,
                             "input_tokens_details":{"cached_tokens":cached},
+                            "output_tokens_details":{"reasoning_tokens":0},
                         })
                     );
                     assert_eq!(frames.last().unwrap().data["response"]["usage"], *usage);
@@ -1192,7 +1327,8 @@ fn image_usage_is_a_prompt_subset_and_stream_usage_remains_opt_in() {
         frames.extend(enc.apply(0, vec![Event::Content("answer".into())]).unwrap());
         frames.extend(enc.finish(0, Termination::Eos, 4, 9, None).unwrap());
         let expected = json!({"prompt_tokens":17,"completion_tokens":4,"total_tokens":21,
-            "prompt_tokens_details":{"cached_tokens":9,"multimodal_tokens":{"image":8}}});
+            "prompt_tokens_details":{"cached_tokens":9,"multimodal_tokens":{"image":8}},
+            "completion_tokens_details":{"reasoning_tokens":0}});
         assert_eq!(enc.response()["usage"], expected);
         let usage_frames: Vec<_> = frames
             .iter()

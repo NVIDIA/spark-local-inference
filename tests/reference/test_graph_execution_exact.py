@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CPU command and reset contracts for ordinary exact-checkpoint replay."""
 from dataclasses import fields
 from types import SimpleNamespace
@@ -30,7 +33,9 @@ def make_scenario(tmp_path, cap=512):
         signatures[f'prefill{size}'] = GraphSignature('prefill', 1, size, tuple(buffers))
     for size in (256, 1024, 4096, 16384):
         signatures[f'vision{size}'] = GraphSignature('vision', 1, size, tuple(buffers))
-    model = SimpleNamespace(buffers=buffers, signatures=signatures, graphs=dict.fromkeys(signatures),
+    serving = dict.fromkeys(signatures)
+    model = SimpleNamespace(buffers=buffers, signatures=signatures, serving_graphs=serving,
+                            graphs={**serving, 'collective-tuning-0': object()},
                             memory_report={'pages': 4096})
     # These values exercise host packing only; they are not model numerical fixtures.
     tokenizer = SimpleNamespace(encode=lambda text, **kwargs: list(range(len(text))))
@@ -51,7 +56,8 @@ def test_complete_scenario_uses_live_exact_snapshots_and_keeps_original_branch(t
     before = torch.cuda.is_initialized()
     scenario = make_scenario(tmp_path, cap).build()
     commands = [c for g in scenario.groups for c in g]
-    assert set(c['graph'] for c in commands) == set(scenario.model.graphs)
+    assert set(c['graph'] for c in commands) == set(scenario.model.serving_graphs)
+    assert 'collective-tuning-0' not in {c['graph'] for c in commands}
     assert all(t > 0 for c in commands for t in c['temperatures'])
     assert any(len(set(c['temperatures'])) > 1 for c in commands if c['graph'].startswith('decode'))
     for command in commands:
@@ -76,6 +82,13 @@ def test_complete_scenario_uses_live_exact_snapshots_and_keeps_original_branch(t
     assert any(t['consumed'] == 67 for c in commands if c['graph'] == 'snapshot4' for t in c['transfers'])
     assert len(scenario.extended_cases) == (2 if cap == 1024 else 0)
     assert torch.cuda.is_initialized() == before
+
+
+def test_scenario_still_requires_every_serving_variant_with_startup_tuning(tmp_path):
+    scenario = make_scenario(tmp_path)
+    scenario.model.serving_graphs['uncovered'] = object()
+    with pytest.raises(ValueError, match='every prepared graph variant'):
+        scenario.build()
 
 
 def test_partial_restore_has_private_tail_and_physical_tables_before_maintenance(tmp_path):

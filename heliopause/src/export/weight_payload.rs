@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Stable semantic weight payload extraction from preparation declarations.
 //!
 //! Python supplies a thin declaration of semantic groups, storage classes, and
@@ -157,6 +162,15 @@ pub(crate) struct WeightPayloadCatalog {
 pub(crate) const INITIAL_STATE_PAYLOAD: &str = "initial-state";
 
 pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCatalog> {
+    let retained = request.allocations.iter().map(|a| a.name.as_str()).collect();
+    extract_retained(request, &retained)
+}
+
+/// Validate every declared view before excluding allocations pruned by graph reachability.
+pub(crate) fn extract_retained(
+    request: &WeightPayloadRequest,
+    retained: &BTreeSet<&str>,
+) -> Result<WeightPayloadCatalog> {
     if request.version != 1 {
         return Err(invalid(format!(
             "unsupported weight payload declaration version {}",
@@ -164,6 +178,9 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
         )));
     }
     let allocations = AllocationIndex::new(&request.allocations)?;
+    if retained.iter().any(|name| !request.allocations.iter().any(|a| a.name == *name)) {
+        return Err(invalid("retained weight allocation is absent from capture storage"));
+    }
     let mut names = BTreeSet::new();
     for view in &request.views {
         if view.name.is_empty() || !names.insert(view.name.as_str()) {
@@ -171,6 +188,9 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
         }
         if view.group.is_empty() {
             return Err(invalid(format!("weight view {:?} has no group", view.name)));
+        }
+        if view.storage == StorageClass::State {
+            return Err(invalid("state storage cannot be declared for a weight view"));
         }
     }
     for view in &request.views {
@@ -231,7 +251,7 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
         .collect();
     let mut placement: Vec<(String, Vec<(u64, u64)>)> = Vec::with_capacity(request.views.len());
     for view in &request.views {
-        let allocation = allocations.find(view.address, element_extent(view)?)?;
+        let allocation = allocations.find(view)?;
         let relative = view.address - allocation.address;
         let placed = occupied_runs(view)?
             .into_iter()
@@ -276,14 +296,17 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
                 view.name
             )));
         }
-        aliases.push(WeightAlias {
-            name: view.name.clone(),
-            of: target.clone(),
-        });
+        if retained.contains(placement[index].0.as_str()) {
+            aliases.push(WeightAlias {
+                name: view.name.clone(),
+                of: target.clone(),
+            });
+        }
     }
 
     let mut order: Vec<usize> = (0..request.views.len())
-        .filter(|&index| request.views[index].alias_of.is_none())
+        .filter(|&index| request.views[index].alias_of.is_none()
+            && retained.contains(placement[index].0.as_str()))
         .collect();
     order.sort_by(|&left, &right| request.views[left].name.cmp(&request.views[right].name));
 
@@ -291,7 +314,7 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
     let mut groups: BTreeMap<(String, StorageClass), Vec<PayloadSpan>> = BTreeMap::new();
     for index in order {
         let view = &request.views[index];
-        let allocation = allocations.find(view.address, element_extent(view)?)?;
+        let allocation = allocations.find(view)?;
         let spans = groups
             .entry((view.group.clone(), view.storage))
             .or_default();
@@ -342,6 +365,9 @@ pub(crate) fn extract(request: &WeightPayloadRequest) -> Result<WeightPayloadCat
 
     let mut state = Vec::new();
     for allocation in &request.allocations {
+        if !retained.contains(allocation.name.as_str()) {
+            continue;
+        }
         let base = allocation.address;
         let end = base
             .checked_add(allocation.nbytes)
@@ -584,7 +610,9 @@ impl<'a> AllocationIndex<'a> {
         Ok(Self { allocations })
     }
 
-    fn find(&self, address: u64, extent: u64) -> Result<&'a WeightAllocationInput> {
+    fn find(&self, view: &WeightViewInput) -> Result<&'a WeightAllocationInput> {
+        let address = view.address;
+        let extent = element_extent(view)?;
         let end = address
             .checked_add(extent)
             .ok_or_else(|| invalid("weight view address overflow"))?;
@@ -594,7 +622,10 @@ impl<'a> AllocationIndex<'a> {
                 allocation.address <= address
                     && end <= allocation.address.saturating_add(allocation.nbytes)
             })
-            .ok_or_else(|| invalid("weight view lies outside every declared allocation"))
+            .ok_or_else(|| invalid(format!(
+                "weight view {:?} at {address:#x} with extent {extent} lies outside every declared allocation",
+                view.name
+            )))
     }
 }
 
@@ -869,6 +900,49 @@ mod tests {
             }],
         ));
         assert!(declared.is_err(), "a view declared state storage was accepted");
+    }
+
+    #[test]
+    fn unreachable_weight_allocations_contribute_no_payload_or_aliases() {
+        let mut alias = view("weights.source_alias", 0x1000, vec![16], vec![1]);
+        alias.alias_of = Some("weights.source".into());
+        let request = request(
+            vec![allocation("source", 0x1000, 128), allocation("packed", 0x2000, 64)],
+            vec![view("weights.source", 0x1000, vec![16], vec![1]), alias,
+                 view("weights.packed", 0x2000, vec![8], vec![1])],
+        );
+        let catalog = extract_retained(&request, &BTreeSet::from(["packed"])).unwrap();
+        assert!(catalog.aliases.is_empty());
+        assert_eq!(catalog.groups.len(), 1);
+        assert_eq!(catalog.groups[0].nbytes, 16);
+        assert_eq!(catalog.groups[0].spans[0].allocation, "packed");
+        assert_eq!(catalog.groups[0].spans[0].payload_offset, 0);
+        assert_eq!(catalog.state.nbytes, 48);
+        assert_eq!(catalog.state.spans[0].allocation, "packed");
+        assert_eq!(catalog.state.spans[0].destination_offset, 16);
+    }
+
+    #[test]
+    fn unreachable_weight_views_still_require_valid_declarations() {
+        let request = request(
+            vec![allocation("source", 0x1000, 128), allocation("packed", 0x2000, 64)],
+            vec![view("weights.source", 0x1000, vec![16], vec![1]),
+                 view("weights.packed", 0x2000, vec![8], vec![1])],
+        );
+        let retained = BTreeSet::from(["packed"]);
+        for case in 0..5 {
+            let mut invalid = request.clone();
+            match case {
+                0 => invalid.views[0].address = 0x3000,
+                1 => invalid.views[0].shape = vec![128],
+                2 => invalid.views[0].stride = vec![0],
+                3 => invalid.views[0].alias_of = Some("weights.packed".into()),
+                4 => invalid.views[0].storage = StorageClass::State,
+                _ => unreachable!(),
+            }
+            assert!(extract_retained(&invalid, &retained).is_err(), "case {case}");
+        }
+        assert!(extract_retained(&request, &BTreeSet::from(["absent"])).is_err());
     }
 
     #[test]

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Retained duration estimates; zero denotes an unmeasured graph cost.
 
 use super::ScheduledStep;
@@ -44,7 +50,6 @@ pub(super) struct PackedRoundShape {
 struct Estimate {
     nanos: u64,
     replays: ReplayTimes,
-    handoff_ns: u64,
     observed_at_ns: u64,
     last_attempt_ns: u64,
 }
@@ -85,7 +90,7 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    packed_round_durations: [[Option<u64>; 9]; 7],
+    packed_round_durations: [Vec<Option<u64>>; 7],
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -108,12 +113,11 @@ impl ActionCosts {
         let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
         estimate.replays.observe(nanos, false);
-        estimate.handoff_ns = 0;
         estimate.observed_at_ns = self.now_ns;
         self.refresh_packed_durations();
     }
 
-    pub fn prepared(graphs: &[GraphDescriptor]) -> Result<Self> {
+    pub fn prepared(graphs: &[GraphDescriptor], token_capacity: usize) -> Result<Self> {
         let mut entries = Vec::with_capacity(graphs.len());
         let mut index = std::collections::HashMap::with_capacity(graphs.len());
         for graph in graphs {
@@ -133,7 +137,6 @@ impl ActionCosts {
                 Estimate {
                     nanos: 0,
                     replays: ReplayTimes::default(),
-                    handoff_ns: 0,
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
                 },
@@ -141,6 +144,7 @@ impl ActionCosts {
         }
         let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
         let mut costs = Self { entries, index,
+            packed_round_durations: std::array::from_fn(|_| vec![None; token_capacity + 1]),
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
         costs.refresh_packed_durations();
         Ok(costs)
@@ -156,11 +160,11 @@ impl ActionCosts {
     }
 
     fn refresh_packed_durations(&mut self) {
-        self.packed_round_durations = Default::default();
+        for row in &mut self.packed_round_durations { row.fill(None); }
         for (key, estimate) in &self.entries {
             if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
             let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
-            let nanos = estimate.nanos.saturating_add(estimate.handoff_ns);
+            let nanos = estimate.nanos;
             for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
                 *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
             }
@@ -176,7 +180,7 @@ impl ActionCosts {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
                 batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
-                nanos: estimate.nanos.saturating_add(estimate.handoff_ns),
+                nanos: estimate.nanos,
             })
     }
 
@@ -199,15 +203,21 @@ impl ActionCosts {
             prefill,
             packed: if kind == GraphKind::Speculative { batch * tokens } else { packed },
         })
-        .map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        .map(|estimate| estimate.nanos)
     }
 
     pub fn duration_key(&self, key: Key) -> Option<u64> {
-        self.entry(key).map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        self.entry(key).map(|estimate| estimate.nanos)
     }
 
     pub fn is_fresh(&self, key: Key) -> bool {
         self.entry(key).is_some_and(|estimate| estimate.fresh(self.now_ns, self.ttl_ns))
+    }
+
+    pub fn fresh_duration(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
+        let key = Key { drafts: 0, kind, batch: 1, tokens, prefill: 0, packed: 0 };
+        self.entry(key).filter(|estimate| estimate.fresh(self.now_ns, self.ttl_ns))
+            .map(|estimate| estimate.nanos)
     }
 
     pub fn stale_keys(&self) -> impl Iterator<Item = Key> + '_ {
@@ -227,7 +237,7 @@ impl ActionCosts {
     }
 
     pub fn observation(&self, key: Key) -> Option<(u64, Option<u64>, bool)> {
-        self.entry(key).map(|estimate| (estimate.nanos.saturating_add(estimate.handoff_ns),
+        self.entry(key).map(|estimate| (estimate.nanos,
             (estimate.nanos != 0).then_some(estimate.observed_at_ns),
             estimate.fresh(self.now_ns, self.ttl_ns)))
     }
@@ -259,14 +269,6 @@ impl ActionCosts {
         if let Some(&index) = self.index.get(&key) {
             let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);
-            if !timing.queued {
-                let handoff = timing.wall_ns.saturating_sub(raw_sample);
-                estimate.handoff_ns = if fresh {
-                    ((7 * u128::from(estimate.handoff_ns) + u128::from(handoff) + 4) / 8) as u64
-                } else { handoff };
-            } else if !fresh {
-                estimate.handoff_ns = 0;
-            }
             estimate.nanos = estimate.replays.observe(sample, fresh);
             estimate.observed_at_ns = self.now_ns;
             self.refresh_packed_durations();

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Run one rank's share of rank zero's direct steps: copy inputs, then replay a graph or call its forward.
 
 A step is a plain message: the graph's name, the input byte ranges to write
@@ -50,11 +54,13 @@ class StepRunner:
         self.health = tuple(health)
         torch.cuda.set_device(self.device)
         torch.cuda.synchronize(self.device)
+        self.stream = torch.cuda.Stream(self.device)
+        from ignition.preparation.startup_tuning import replay_startup_tuning
+        replay_startup_tuning(model, self.stream)
         if eager:
             for graph in model.graphs.values():
                 graph.reset()
             torch.cuda.empty_cache()
-        self.stream = torch.cuda.Stream(self.device)
         self.started = torch.cuda.Event(enable_timing=True)
         self.finished = torch.cuda.Event(enable_timing=True)
 

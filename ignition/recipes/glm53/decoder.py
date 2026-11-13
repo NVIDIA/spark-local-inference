@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """GLM decoder-layer composition with b12x operators and tensor-parallel reductions."""
 
 from dataclasses import dataclass
@@ -70,7 +74,8 @@ class PreparedGlmLayer:
                 or output.shape != (rows, 4, 4096) or source.dtype != torch.bfloat16
                 or output.dtype != source.dtype or output.device != source.device):
             raise ValueError("GLM layer residuals require BF16 [tokens, 4, 4096] on one device")
-        self.module, self.scratch, self.output, self.carry = module, scratch, output, carry
+        self.module, self.scratch, self.output = module, scratch, output
+        self.has_carry, self.defer_post = carry is not None, defer_post
         attention_mhc = _install_mhc(module.attn_hc, module.input_layernorm, residual_weights,
                                     "hc_attn", "input_layernorm")
         mlp_mhc = _install_mhc(module.ffn_hc, module.post_attention_layernorm, residual_weights,
@@ -109,13 +114,34 @@ class PreparedGlmLayer:
         self.post = None if defer_post else PreparedMHCPost(scratch.mlp_output, scratch.mlp_hc.residual,
             scratch.mlp_hc.post, scratch.mlp_hc.comb, output, session=session, name=f"{name}.post")
 
-    def __call__(self, source):
-        s = self.scratch
-        inputs = (source,) if self.carry is None else (
-            source, self.carry.residual, self.carry.post, self.carry.comb)
-        self.attention_reduce(self.attention(self.attention_hc(*inputs)))
-        self.mlp_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
-        self.mlp_reduce(self.mlp(s.mlp_hc.normalized))
+    def release_outputs(self, *, session):
+        self.attention_hc.functional()
+        self.attention.functional(session=session)
+        self.attention_reduce.functional(session=session)
+        self.mlp_hc.functional()
+        self.mlp.functional(session=session)
+        self.mlp_reduce.functional(session=session)
+        if self.post is not None:
+            self.post.functional()
+        self.scratch = self.output = None
+        return self
+
+    def __call__(self, source, metadata, carry=None, *, records=None):
+        if self.has_carry:
+            if carry is None:
+                raise ValueError("GLM post/pre layer requires runtime residual and mixing carry")
+            inputs = (source, *carry)
+        else:
+            inputs = (source,)
+        attention_residual, attention_post, attention_comb, attention_input = self.attention_hc(*inputs)
+        if self.module.block_type == "indexed_attention":
+            attended = self.attention(attention_input, metadata)
+        else:
+            attended = self.attention(attention_input, metadata, records=records)
+        attention = self.attention_reduce(attended)
+        mlp_residual, mlp_post, mlp_comb, mlp_input = self.mlp_hc(
+            attention, attention_residual, attention_post, attention_comb)
+        mlp = self.mlp_reduce(self.mlp(mlp_input))
         if self.post is None:
-            return s.mlp_output
-        return self.post(s.mlp_output, s.mlp_hc.residual, s.mlp_hc.post, s.mlp_hc.comb)
+            return mlp, (mlp_residual, mlp_post, mlp_comb)
+        return self.post(mlp, mlp_residual, mlp_post, mlp_comb), None

@@ -1,4 +1,8 @@
-"""Publisher identity metadata for the native package writer."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Publisher identity metadata for the native core writer."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,14 +91,14 @@ class Publisher:
         return hashlib.sha256(self.public_key).digest()
 
 
-def signature_message(package_id, signer, kind, body):
+def signature_message(core_id, signer, kind, body):
     import flare_heliopause
-    return flare_heliopause.export_signature_message(package_id, signer, kind, body)
+    return flare_heliopause.export_signature_message(core_id, signer, kind, body)
 
 
 def resource_roles(index):
     import json
     import flare_heliopause
-    from . import runtime_package_pb2 as proto
+    from . import runtime_core_pb2 as proto
     return [(kind, owner, proto.Span(**span)) for kind, owner, span in
             json.loads(flare_heliopause.export_roles(index.SerializeToString(deterministic=True)))]

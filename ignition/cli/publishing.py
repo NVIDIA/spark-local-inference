@@ -1,4 +1,8 @@
-"""Publisher key creation and promotion of prepared development packages."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Publisher key creation and promotion of prepared development cores."""
 
 from ignition.errors import UsageError
 
@@ -15,16 +19,16 @@ def convert(args):
     from pathlib import Path
     from google.protobuf.message import DecodeError
     from ignition.cli.config import Configuration
-    from ignition.preparation.package_snapshot import convert as convert_package, payload_form
+    from ignition.preparation.core_snapshot import convert as convert_core, payload_form
 
     configuration = Configuration.load(args.config)
     form = args.form
     output = args.output
     try:
-        kind = payload_form(args.package)
+        kind = payload_form(args.core)
         if kind == 'legacy':
-            raise UsageError('legacy package format is unsupported; re-export the model with Ignition')
-        embedded = Path(__file__).parents[2] / 'helios/src/runtime_package/publishers.json'
+            raise UsageError('legacy core format is unsupported; re-export the model with Ignition')
+        embedded = Path(__file__).parents[2] / 'helios/src/runtime_core/publishers.json'
         profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
         paths = list(args.publisher_keys)
         development = configuration.path.parent / 'development-publisher.json'
@@ -38,21 +42,45 @@ def convert(args):
                     'packed payload conversion requires --output: it writes one .safetensors file and '
                     'does not use the cache snapshot path')
         if form == 'directory' and args.output is None:
-            from ignition.preparation.package_snapshot import payload_convert_cache
+            from ignition.preparation.core_snapshot import payload_convert_cache
             store = payload_convert_cache(
-                args.package, configuration.directory('package_cache'),
+                args.core, configuration.directory('core_cache'),
                 profiles=profiles, form=form)
         else:
-            store = convert_package(args.package, output, profiles=profiles,
-                                    cache=configuration.directory('package_cache'),
+            store = convert_core(args.core, output, profiles=profiles,
+                                    cache=configuration.directory('core_cache'),
                                     form=form)
     except (ValueError, OSError, KeyError, TypeError, DecodeError) as error:
         raise UsageError(str(error)) from error
     if hasattr(store, 'entry'):
         print(f'Converted cache entry: {store.entry_path} ({store.model}/{store.entry})')
     else:
-        print(f'Converted package: {output}')
+        print(f'Converted core: {output}')
         print(f'Payload form: {store.form}; bytes written: {store.bytes}')
+
+
+def edit(args):
+    from ignition.cli.config import Configuration
+    from ignition import development
+    from ignition.preparation.core_snapshot import payload_edit, payload_form
+
+    configuration = Configuration.load(args.config)
+    try:
+        if args.served_model_name is None and args.chat_template is None:
+            raise ValueError('edit requires --served-model-name or --chat-template')
+        if args.output.exists():
+            raise FileExistsError(args.output)
+        if payload_form(args.core) == 'legacy':
+            raise ValueError('edit supports payload-format cores only')
+        template = args.chat_template.read_bytes() if args.chat_template is not None else None
+        profiles = _public_profiles(args, configuration)
+        publisher = development.publisher(configuration)
+        payload_edit(args.core, args.output, publisher=publisher, profiles=profiles,
+                     served_model_name=args.served_model_name, chat_template=template)
+    except (ValueError, OSError) as error:
+        raise UsageError(str(error)) from error
+    print(f'Edited development core: {args.output}')
+    print(f'Development publisher: {development.profile(configuration, publisher)}')
 
 
 def keygen(args):
@@ -85,7 +113,7 @@ def key_password(args):
 def _public_profiles(args, configuration):
     import json
     from pathlib import Path
-    embedded = Path(__file__).parents[2] / 'helios/src/runtime_package/publishers.json'
+    embedded = Path(__file__).parents[2] / 'helios/src/runtime_core/publishers.json'
     profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
     paths = list(getattr(args, 'publisher_keys', []) or [])
     development = getattr(args, 'development_publisher', None)
@@ -136,49 +164,50 @@ def combine(args):
     import json
     from google.protobuf.message import DecodeError
     from ignition.cli.config import Configuration
-    from ignition.preparation.package_snapshot import payload_combine, payload_form
+    from ignition.preparation.core_snapshot import payload_combine, payload_form
 
     configuration = Configuration.load(args.config)
     try:
         for source in args.sources:
             if payload_form(source) == 'legacy':
-                raise UsageError('combine accepts payload-format packages only; re-export legacy models first')
+                raise UsageError('combine accepts payload-format cores only; re-export legacy models first')
         publisher = _publisher(args, configuration)
         profiles = _public_profiles(args, configuration)
         result = payload_combine(args.sources, args.output, publisher=publisher, profiles=profiles,
                                  accepted=publisher.namespace, target_accepted=publisher.namespace)
     except (ValueError, OSError, KeyError, TypeError, DecodeError) as error:
         raise UsageError(str(error)) from error
-    print(f'Combined package: {args.output}')
+    print(f'Combined core: {args.output}')
     print(f'Deployments: {getattr(result, "payloads", 0)} payloads; form: {result.form}')
 
 
 def sign(args):
     from google.protobuf.message import DecodeError
     from ignition.cli.config import Configuration
-    from ignition.preparation.package_snapshot import payload_form, payload_promote
+    from ignition.preparation.core_snapshot import payload_form, payload_promote
 
     configuration = Configuration.load(args.config)
     try:
         if args.output.exists():
             raise FileExistsError(args.output)
-        if payload_form(args.package) == 'legacy':
-            raise UsageError('legacy package format is unsupported; re-export the model with Ignition')
+        if payload_form(args.core) == 'legacy':
+            raise UsageError('legacy core format is unsupported; re-export the model with Ignition')
         publisher = _publisher(args, configuration)
         source_profile = _source_profile(args, configuration)
+        # The license describes the checkpoint, not the publisher: the native
+        # promotion carries the name and link the export recorded over to the
+        # signed core, so the target identity rewrites namespace and key only.
         target = {
             'namespace': publisher.namespace,
             'official_source': publisher.official_source,
             'development': publisher.development,
-            'license_name': '' if publisher.license is None else publisher.license.name,
-            'license_link': '' if publisher.license is None else publisher.license.link,
         }
-        result = payload_promote(args.package, args.output, publisher=publisher,
+        result = payload_promote(args.core, args.output, publisher=publisher,
                                  profiles=[source_profile],
                                  accepted=source_profile['namespace'],
                                  target_accepted=publisher.namespace,
                                  target_publisher=target)
     except (ValueError, OSError, EOFError, DecodeError) as error:
         raise UsageError(str(error)) from error
-    print(f'Signed package: {args.output}')
+    print(f'Signed core: {args.output}')
     print(f'Payload form: {result.form}; payloads: {getattr(result, "payloads", 0)}')

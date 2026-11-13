@@ -1,8 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prefill capacity and speculative catalog configuration."""
 
 import pytest
 
 from ignition.recipes.qwen38.bootstrap import PreparationConfig
+
+
+def test_hyperconnection_sharding_requires_multiple_ranks():
+    assert not PreparationConfig().shard_hyperconnections
+    with pytest.raises(ValueError, match="tensor parallelism"):
+        PreparationConfig(shard_hyperconnections=True)
+    for devices, hosts in (((0, 1), None), ((0, 1, 2, 3), None), ((0, 0), ("a", "b"))):
+        config = PreparationConfig(devices=devices, hosts=hosts, shard_hyperconnections=True)
+        assert config.shard_hyperconnections
 
 
 @pytest.mark.parametrize("size, expected", [

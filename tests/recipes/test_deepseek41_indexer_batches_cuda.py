@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Batched sparse selection preserves scores, candidate bounds, and native storage."""
 
 import os
@@ -8,7 +12,8 @@ import torch
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
+from tests.tensor_examples import TensorExamples
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.deepseek41.attention import INDEXER_QUERY_ROWS
 
@@ -65,30 +70,48 @@ def _check_topk(indices, scores, *, allowed=None):
 class BatchedSelection:
     def __init__(self, query, weights, cache, pages, lengths, active, output, *, page_size,
                  session, arena, name, candidates=None, counts=None, produce=False, buffers=None,
-                 batch_rows=INDEXER_QUERY_ROWS, mode="decode"):
+                 batch_rows=INDEXER_QUERY_ROWS, mode="decode", functional=False):
         self.operations = []
-        cursors = []
+        self.functional = functional
+        self.operands = query, weights, pages, lengths, active, output, candidates, counts, produce
+        self.batch_rows = batch_rows
+        self.declarations = []
         for first in range(0, query.shape[0], batch_rows):
             last = min(first + batch_rows, query.shape[0])
             options = {}
             if candidates is not None:
                 options = (dict(candidates_out=candidates[first:last], counts_out=counts[first:last])
                            if produce else dict(candidates=candidates[first:last], counts=counts[first:last]))
-            cursor = None if buffers is None else buffers.fork()
-            if cursor is not None:
-                cursors.append(cursor)
             self.operations.append(PreparedMXFP4Indexer(query[first:last], weights[first:last],
                 cache, pages[first:last], lengths[first:last], active, output[first:last],
                 page_size=page_size, session=session, name=f"{name}.{first}", workspace=arena,
-                buffers=cursor, mode=mode, **options))
-        if buffers is not None:
-            buffers.join(*cursors)
+                buffers=buffers, mode=mode, **options))
+            self.declarations.extend((self.operations[-1].packed, self.operations[-1].scales))
+            if functional:
+                self.operations[-1].functional(session=session)
 
     def __call__(self):
-        for operation in self.operations:
-            operation()
+        query, weights, pages, lengths, active, output, candidates, counts, produce = self.operands
+        for index, operation in enumerate(self.operations):
+            if not self.functional:
+                operation()
+                continue
+            first = index * self.batch_rows
+            last = min(first + self.batch_rows, query.shape[0])
+            options = {} if candidates is None or produce else dict(
+                candidates=candidates[first:last], counts=counts[first:last])
+            result = operation(query[first:last], weights[first:last], pages[first:last],
+                               lengths[first:last], active, **options)
+            if produce:
+                selected, candidate_rows, candidate_counts = result
+                candidates[first:last].copy_(candidate_rows)
+                counts[first:last].copy_(candidate_counts)
+            else:
+                selected = result
+            output[first:last].copy_(selected)
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("rows,independent_pages,batch_rows,index_mode", [
     (257, False, 128, "decode"), (257, False, 128, "prefill"),
@@ -96,7 +119,7 @@ class BatchedSelection:
 ])
 @torch.no_grad()
 def test_compiled_query_batches_match_independent_scores_with_candidate_reuse(
-        page_size, rows, independent_pages, batch_rows, index_mode):
+        page_size, rows, independent_pages, batch_rows, index_mode, functional):
     device = torch.device("cuda", 0)
     torch.manual_seed(41128)
     records, heads = 32768, 32
@@ -127,7 +150,7 @@ def test_compiled_query_batches_match_independent_scores_with_candidate_reuse(
     outputs = {mode: torch.empty((rows, 512), device=device, dtype=torch.int32)
                for mode in ("full", "producer", "consumer")}
     arena = ScratchArena(device)
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+    buffers = TensorExamples(device)
     operations, functions, graphs = {}, {}, {}
     worker = None
     with RecordedPreparationSession(device=device, checkpoint="ds41-index-batches",
@@ -139,8 +162,8 @@ def test_compiled_query_batches_match_independent_scores_with_candidate_reuse(
                 operations[mode] = BatchedSelection(queries[source], weights[source], cache, table,
                     lengths, active, outputs[mode], page_size=page_size, session=session, arena=arena,
                     name=mode, candidates=None if mode == "full" else candidates,
-                    counts=counts, produce=mode == "producer", buffers=buffers.cursor(),
-                    batch_rows=batch_rows, mode=index_mode)
+                    counts=counts, produce=mode == "producer", buffers=buffers,
+                    batch_rows=batch_rows, mode=index_mode, functional=functional)
             session.tune()
             operations["full"].operations[0].write_keys(keys, slots)
             saved_cache = cache.clone()
@@ -172,9 +195,9 @@ def test_compiled_query_batches_match_independent_scores_with_candidate_reuse(
                 for mode in ("full", "producer", "consumer", "full"):
                     outputs[mode].fill_(-42)
                     arena.tensor.fill_(0x5A)
-                    for chunks in buffers.chunks.values():
-                        for chunk in chunks:
-                            chunk.fill_(0xA5)
+                    for operation in operations.values():
+                        for declaration in operation.declarations:
+                            declaration.fill_(0xA5)
                     torch.cuda.synchronize()
                     before = torch.cuda.memory_stats()
                     ticket = worker.submit(bundle.graph_indices[mode], repetitions=2)

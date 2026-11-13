@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure component-family numerical propagation on exact checkpoint images.
 
 Each isolated trajectory replaces only its named component family with prepared

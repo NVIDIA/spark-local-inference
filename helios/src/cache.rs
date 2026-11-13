@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Immutable terminal prefix metadata with explicit GPU readiness and retirement.
 
 mod hash;
@@ -5,26 +11,30 @@ mod hash;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
-pub use hash::{ConditioningEvent, HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PageId(pub u32);
+pub use flare_selene::{CheckpointId, PageId};
+pub use hash::{ConditioningEvent, PrefixHistory, PrefixKey, HASH_BLOCK_TOKENS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CheckpointId(u64);
-
-impl CheckpointId {
-    pub fn value(self) -> u64 {
-        self.0
-    }
-}
-
 /// Completion on one ordered timeline covering every relevant GPU stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fence(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RetentionRole {
+    #[default]
+    Endpoint,
+    Message,
+    Anchor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RetentionRank {
+    pub use_epoch: u64,
+    pub role: RetentionRole,
+    pub consumed_tokens: u64,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct StateSnapshot {
@@ -55,7 +65,7 @@ impl PublishResult {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Checkpoint {
     id: CheckpointId,
     parent: Option<CheckpointId>,
@@ -70,9 +80,18 @@ pub struct Checkpoint {
     direct_pins: u64,
     pins: u64,
     accessed: u64,
+    role: RetentionRole,
 }
 
 impl Checkpoint {
+    pub fn retention_rank(&self) -> RetentionRank {
+        RetentionRank {
+            use_epoch: self.accessed,
+            role: self.role,
+            consumed_tokens: self.prefix.consumed_tokens,
+        }
+    }
+
     pub fn id(&self) -> CheckpointId {
         self.id
     }
@@ -96,6 +115,7 @@ impl Checkpoint {
     pub fn ready(&self) -> bool {
         self.ready
     }
+
     pub fn pin_count(&self) -> u64 {
         self.pins
     }
@@ -116,9 +136,19 @@ pub struct Lookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetiredResources {
     pub checkpoint: CheckpointId,
+    pub key: PrefixKey,
+    /// The single child that took this checkpoint's pages when it was compacted.
+    pub heir: Option<CheckpointId>,
     pub pages: Vec<PageId>,
     pub snapshot: SnapshotId,
     pub retire_after: Fence,
+}
+
+/// Storage that eviction could retire, as projected by `reclaimable_if_pinned`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reclaimable {
+    pub pages: Vec<PageId>,
+    pub snapshots: Vec<SnapshotId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -164,6 +194,7 @@ pub struct CacheStats {
 /// pending writes to unused duplicate resources still require caller retirement.
 /// Snapshot IDs cover the recipe's complete continuation state and saved hidden
 /// vector. Page IDs cover every layer's corresponding immutable cache storage.
+#[derive(Clone)]
 pub struct PrefixCheckpointCache {
     identity: [u8; 32],
     page_tokens: usize,
@@ -213,12 +244,29 @@ impl PrefixCheckpointCache {
         self.nodes.get(&id).ok_or_else(|| {
             crate::Error::execution(
                 crate::ExecutionError::State,
-                format!("unknown or retired checkpoint {}", id.0),
+                format!("unknown or retired checkpoint {}", id.value()),
             )
         })
     }
 
-    fn chain(&self, id: CheckpointId) -> Result<Vec<CheckpointId>> {
+    pub(crate) fn single_child(&self, id: CheckpointId) -> Option<CheckpointId> {
+        if self.nodes.get(&id)?.child_count != 1 {
+            return None;
+        }
+        self.nodes
+            .values()
+            .find(|node| node.parent == Some(id))
+            .map(|node| node.id)
+    }
+
+    /// The GPU-ready checkpoint published under `prefix`, if any.
+    pub fn ready_by_prefix(&self, prefix: &PrefixKey) -> Option<CheckpointId> {
+        let id = *self.prefixes.get(prefix)?;
+        self.nodes[&id].ready.then_some(id)
+    }
+
+    /// Checkpoints from the root to `id`, each with its parent.
+    pub(crate) fn chain(&self, id: CheckpointId) -> Result<Vec<CheckpointId>> {
         let mut chain = Vec::new();
         let mut next = Some(id);
         while let Some(id) = next {
@@ -236,10 +284,44 @@ impl PrefixCheckpointCache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn publish(
         &mut self,
         history: &PrefixHistory,
         proposal: &Publication,
+    ) -> Result<PublishResult> {
+        self.publish_with_retention(history, proposal, RetentionRole::Endpoint, 0)
+    }
+
+    pub fn new_use_epoch(&mut self) -> Result<u64> {
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or("cache demand epoch exhausted")?;
+        Ok(self.clock)
+    }
+
+    pub fn touch(&mut self, id: CheckpointId, use_epoch: u64) -> Result<()> {
+        for ancestor in self.chain(id)? {
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.accessed = node.accessed.max(use_epoch);
+        }
+        Ok(())
+    }
+
+    pub fn promote(&mut self, id: CheckpointId, role: RetentionRole, use_epoch: u64) -> Result<()> {
+        self.touch(id, use_epoch)?;
+        let node = self.nodes.get_mut(&id).unwrap();
+        node.role = node.role.max(role);
+        Ok(())
+    }
+
+    pub fn publish_with_retention(
+        &mut self,
+        history: &PrefixHistory,
+        proposal: &Publication,
+        role: RetentionRole,
+        use_epoch: u64,
     ) -> Result<PublishResult> {
         self.history_matches(history)?;
         let prefix = history.key_at(proposal.consumed_tokens).ok_or(
@@ -302,15 +384,12 @@ impl PrefixCheckpointCache {
         {
             return Err("checkpoint snapshot is out of capacity or already owned".into());
         }
-        let tick = self
-            .clock
-            .checked_add(1)
-            .ok_or("cache access clock exhausted")?;
         if let Some(id) = self.prefixes.get(&prefix).copied() {
-            self.clock = tick;
             let existing = self.nodes.get_mut(&id).unwrap();
-            existing.accessed = tick;
+            existing.accessed = existing.accessed.max(use_epoch);
+            existing.role = existing.role.max(role);
             let ready = existing.ready;
+            self.touch(id, use_epoch)?;
             for ancestor in parent_chain {
                 let node = self.nodes.get_mut(&ancestor).unwrap();
                 node.last_use = node.last_use.max(proposal.ready_after);
@@ -321,7 +400,7 @@ impl PrefixCheckpointCache {
             .next_id
             .checked_add(1)
             .ok_or("checkpoint ID counter exhausted")?;
-        let id = CheckpointId(self.next_id);
+        let id = CheckpointId::new(self.next_id);
         let ready = proposal.ready_after <= self.completed;
         let node = Checkpoint {
             id,
@@ -336,10 +415,10 @@ impl PrefixCheckpointCache {
             child_count: 0,
             direct_pins: 0,
             pins: 0,
-            accessed: tick,
+            accessed: use_epoch,
+            role,
         };
         self.next_id = next_id;
-        self.clock = tick;
         self.owned_pages.extend(candidate_pages);
         self.owned_snapshots.insert(proposal.snapshot.id);
         if let Some(parent) = proposal.parent {
@@ -354,7 +433,7 @@ impl PrefixCheckpointCache {
         Ok(PublishResult::Created { id, ready })
     }
 
-    pub fn lookup(&mut self, history: &PrefixHistory) -> Result<Lookup> {
+    pub fn lookup(&self, history: &PrefixHistory) -> Result<Lookup> {
         self.history_matches(history)?;
         let selected = self
             .nodes
@@ -364,13 +443,6 @@ impl PrefixCheckpointCache {
             })
             .max_by_key(|node| node.prefix.consumed_tokens)
             .map(|node| node.id);
-        if let Some(id) = selected {
-            self.clock = self
-                .clock
-                .checked_add(1)
-                .ok_or("cache access clock exhausted")?;
-            self.nodes.get_mut(&id).unwrap().accessed = self.clock;
-        }
         match selected {
             None => Ok(Lookup {
                 checkpoint: None,
@@ -447,6 +519,8 @@ impl PrefixCheckpointCache {
         }
         let retired = RetiredResources {
             checkpoint: id,
+            key: node.prefix,
+            heir: None,
             pages: node.tail_pages,
             snapshot: node.snapshot,
             retire_after: node.last_use.max(node.ready_after),
@@ -465,6 +539,7 @@ impl PrefixCheckpointCache {
         debug_assert_eq!(node.direct_pins, 0);
         debug_assert_eq!(node.child_count, 1);
         debug_assert_eq!(node.pins, child.pins);
+        let heir = child.id;
         let mut pages = node.tail_pages;
         pages.append(&mut child.tail_pages);
         child.tail_pages = pages;
@@ -474,6 +549,8 @@ impl PrefixCheckpointCache {
         self.prefixes.remove(&node.prefix);
         let retired = RetiredResources {
             checkpoint: id,
+            key: node.prefix,
+            heir: Some(heir),
             pages: Vec::new(),
             snapshot: node.snapshot,
             retire_after: node.last_use.max(node.ready_after),
@@ -492,63 +569,127 @@ impl PrefixCheckpointCache {
         Ok(self.retire_leaf(id))
     }
 
-    /// Thin dense checkpoint chains before retiring endpoints under snapshot pressure.
+    fn eviction_candidates(&self) -> impl Iterator<Item = &Checkpoint> {
+        self.nodes.values().filter(|node| {
+            node.ready
+                && ((node.pins == 0 && node.child_count == 0)
+                    || (node.direct_pins == 0 && node.child_count == 1))
+        })
+    }
+
+    pub(crate) fn eviction_candidate(
+        &self,
+        below: Option<RetentionRank>,
+        immediate: bool,
+    ) -> Option<CheckpointId> {
+        self.eviction_candidates()
+            .filter(|node| {
+                below.is_none_or(|rank| {
+                    (node.retention_rank(), node.id.value()) < (rank, self.next_id)
+                })
+            })
+            .filter(|node| !immediate || node.last_use.max(node.ready_after) <= self.completed)
+            .min_by_key(|node| (node.retention_rank(), node.id))
+            .map(|node| node.id)
+    }
+
+    pub(crate) fn evict_checkpoint(&mut self, id: CheckpointId) -> Result<RetiredResources> {
+        if !self.eviction_candidates().any(|node| node.id == id) {
+            return Err("checkpoint is pinned or required by cache branches".into());
+        }
+        Ok(if self.nodes[&id].child_count == 0 {
+            self.retire_leaf(id)
+        } else {
+            self.compact_ancestor(id)
+        })
+    }
+
+    /// Retire removable checkpoints in demand-recency and retention-role order.
     /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let mut report = EvictionReport::default();
         while report.pages_scheduled < target.pages || report.snapshots_scheduled < target.snapshots
         {
-            let interior = (target.pages == 0)
-                .then(|| {
-                    self.nodes
-                        .values()
-                        .filter_map(|child| {
-                            let parent = self.nodes.get(&child.parent?)?;
-                            (parent.ready && parent.direct_pins == 0 && parent.child_count == 1)
-                                .then_some((parent, child))
-                        })
-                        .min_by_key(|(node, child)| {
-                            let start = node
-                                .parent
-                                .map_or(0, |id| self.nodes[&id].prefix.consumed_tokens);
-                            (
-                                node.parent.is_none(),
-                                child.prefix.consumed_tokens - start,
-                                node.accessed,
-                                node.id,
-                            )
-                        })
-                        .map(|(node, _)| node.id)
-                })
-                .flatten();
-            let candidate = interior.or_else(|| {
-                self.nodes
-                    .values()
-                    .filter(|node| {
-                        node.ready
-                            && ((node.pins == 0 && node.child_count == 0)
-                                || (node.direct_pins == 0 && node.child_count == 1))
-                    })
-                    .min_by_key(|node| (node.accessed, node.id))
-                    .map(|node| node.id)
-            });
-            let Some(id) = candidate else {
+            let Some(id) = self.eviction_candidate(None, false) else {
                 break;
             };
-            let retired = if self.nodes[&id].child_count == 0 {
-                self.retire_leaf(id)
-            } else {
-                self.compact_ancestor(id)
-            };
+            let retired = self.evict_checkpoint(id).unwrap();
             report.pages_scheduled += retired.pages.len();
             report.snapshots_scheduled += 1;
             report.retired.push(retired);
-            // Snapshot aliases can release KV pages; let the scheduler recheck actual backing.
             if target.pages != 0 && report.snapshots_scheduled >= target.snapshots {
                 break;
             }
         }
         report
+    }
+
+    /// What `evict` could retire if `pin(id)` had happened: both of its rules
+    /// run to a fixpoint on the pin-adjusted counts, read-only. A node's
+    /// unready children count as live; compaction keeps a node's pages (they
+    /// move to its child and are reclaimed with it) and reclaims its snapshot.
+    pub fn reclaimable_if_pinned(&self, id: CheckpointId) -> Result<Reclaimable> {
+        Ok(self.reclaimable(&self.chain(id)?))
+    }
+
+    fn reclaimable(&self, chain: &[CheckpointId]) -> Reclaimable {
+        let pinned = |node: &Checkpoint| node.pins + u64::from(chain.contains(&node.id));
+        let direct =
+            |node: &Checkpoint| node.direct_pins + u64::from(chain.first() == Some(&node.id));
+        let mut live: HashMap<CheckpointId, usize> = HashMap::new();
+        let mut kids: HashMap<CheckpointId, Vec<CheckpointId>> = HashMap::new();
+        let mut parent: HashMap<CheckpointId, Option<CheckpointId>> = HashMap::new();
+        for node in self.nodes.values() {
+            live.insert(node.id, node.child_count);
+            parent.insert(node.id, node.parent);
+            if let Some(up) = node.parent {
+                kids.entry(up).or_default().push(node.id);
+            }
+        }
+        // Nodes whose pages a node now holds because they were compacted into it.
+        let mut absorbed: HashMap<CheckpointId, Vec<CheckpointId>> = HashMap::new();
+        let mut removed = HashSet::new();
+        let mut out = Reclaimable::default();
+        let mut work: Vec<_> = self.nodes.keys().copied().collect();
+        while let Some(next) = work.pop() {
+            if removed.contains(&next) {
+                continue;
+            }
+            let node = &self.nodes[&next];
+            if !node.ready {
+                continue;
+            }
+            let children = live[&next];
+            if pinned(node) == 0 && children == 0 {
+                removed.insert(next);
+                out.snapshots.push(node.snapshot);
+                out.pages.extend_from_slice(&node.tail_pages);
+                for from in absorbed.remove(&next).unwrap_or_default() {
+                    out.pages.extend_from_slice(&self.nodes[&from].tail_pages);
+                }
+                if let Some(up) = parent[&next] {
+                    *live.get_mut(&up).unwrap() -= 1;
+                    work.push(up);
+                }
+            } else if direct(node) == 0 && children == 1 {
+                let heir = kids[&next]
+                    .iter()
+                    .copied()
+                    .find(|child| !removed.contains(child) && parent[child] == Some(next))
+                    .unwrap();
+                removed.insert(next);
+                out.snapshots.push(node.snapshot);
+                let mut moved = absorbed.remove(&next).unwrap_or_default();
+                moved.push(next);
+                absorbed.entry(heir).or_default().extend(moved);
+                let up = parent[&next];
+                parent.insert(heir, up);
+                if let Some(up) = up {
+                    kids.entry(up).or_default().push(heir);
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn pending_retirement(&self) -> &[RetiredResources] {
@@ -603,3 +744,6 @@ impl PrefixCheckpointCache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

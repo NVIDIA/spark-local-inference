@@ -1,11 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Kimi K3 geometry and checkpoint quantization contracts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING
 
 from ignition.components.parallel import TensorParallelShard
+
+if TYPE_CHECKING:
+    from ignition.recipes.kimi31.dflash_config import DFlash2Config
+    from ignition.recipes.kimi31.dspark_config import DSparkConfig as MLADSparkConfig
 
 PAGE_TOKENS = 128
 # Optional speculators-format draft directory within a target checkpoint.
@@ -31,6 +40,9 @@ class DSparkConfig:
 
     @classmethod
     def from_dict(cls, raw, target):
+        if raw.get("architectures") == ["DFlash2DraftModel"]:
+            from ignition.recipes.kimi31.dflash_config import DFlash2Config
+            return DFlash2Config.from_dict(raw, target)
         layer = raw.get("transformer_layer_config", {})
         aux = raw.get("aux_hidden_state_layer_ids", ())
         rope = layer.get("rope_parameters", {})
@@ -59,6 +71,10 @@ class DSparkConfig:
     def auxiliary_layers(self):
         """Decoder layers whose AttnRes input the draft reads; each follows the preceding layer's output."""
         return tuple(self.raw["aux_hidden_state_layer_ids"])
+
+    @property
+    def auxiliary_stream(self):
+        return "attn_res"
 
     @property
     def noise_token(self):
@@ -100,24 +116,51 @@ class DSparkConfig:
 
 
 @dataclass(frozen=True)
+class DSAConfig:
+    """Sparse indexer geometry and one-based decoder layer indices."""
+
+    heads: int
+    head_dim: int
+    top_k: int
+    layers: tuple[int, ...]
+
+    @classmethod
+    def from_dict(cls, raw, full_layers):
+        expected = dict(index_num_heads=32, index_head_dim=128, index_topk=2048,
+            index_rope_dim=0, index_k_norm_type="layernorm", index_topk_freq=1,
+            index_skip_topk_offset=1)
+        if (not isinstance(raw, dict) or set(raw) != {*expected, "dsa_layers"}
+                or any(type(raw.get(key)) is not type(value) or raw[key] != value
+                       for key, value in expected.items())
+                or raw.get("dsa_layers") != full_layers
+                or not full_layers or any(type(layer) is not int for layer in full_layers)
+                or full_layers != sorted(set(full_layers))):
+            raise ValueError("unsupported Kimi K3.1 DSA geometry or layer assignment")
+        return cls(raw["index_num_heads"], raw["index_head_dim"], raw["index_topk"], tuple(full_layers))
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     text: dict
     vision: dict
-    draft: DSparkConfig | None = None
+    draft: "DSparkConfig | MLADSparkConfig | DFlash2Config | None" = None
+    dsa: DSAConfig | None = None
 
     @classmethod
     def load(cls, snapshot):
         snapshot = Path(snapshot)
         config = cls.from_dict(json.loads((snapshot / "config.json").read_text()))
         draft = snapshot / DRAFT_DIRECTORY / "config.json"
-        if not draft.is_file():
+        if config.dsa is not None or not draft.is_file():
             return config
-        return cls(config.text, config.vision, DSparkConfig.from_dict(json.loads(draft.read_text()), config.text))
+        return replace(config, draft=DSparkConfig.from_dict(json.loads(draft.read_text()), config.text))
 
     @classmethod
     def from_dict(cls, raw):
-        if raw.get("model_type") != "kimi_k3" or raw.get("architectures") != ["KimiK3ForConditionalGeneration"]:
-            raise ValueError("Kimi K3 requires KimiK3ForConditionalGeneration")
+        identity = (raw.get("model_type"), raw.get("architectures"))
+        if identity not in (("kimi_k3", ["KimiK3ForConditionalGeneration"]),
+                            ("kimi_k31", ["KimiK31ForConditionalGeneration"])):
+            raise ValueError("Kimi requires matching KimiK3 or KimiK31 model type and architecture")
         c = raw["text_config"]
         required = dict(model_type="kimi_linear", hidden_act="situ", activation_situ_beta=4.0,
             activation_situ_linear_beta=25.0, mla_use_nope=True, mla_use_output_gate=True,
@@ -145,6 +188,11 @@ class ModelConfig:
         linear, full = kda["kda_layers"], kda["full_attn_layers"]
         if sorted(linear + full) != list(range(1, c["num_hidden_layers"] + 1)):
             raise ValueError("Kimi K3 attention layers must partition the one-based decoder indices")
+        dsa = None
+        if raw["model_type"] == "kimi_k31":
+            dsa = DSAConfig.from_dict(c.get("dsa_config"), full)
+        elif "dsa_config" in c:
+            raise ValueError("Kimi K3 does not declare sparse attention")
         q = c["quantization_config"]
         if (q.get("quant_method") != "compressed-tensors" or q.get("format") != "mxfp4-pack-quantized"
                 or q.get("quantization_status") != "compressed" or q.get("kv_cache_scheme") is not None
@@ -172,7 +220,7 @@ class ModelConfig:
                 raise ValueError(f"unsupported Kimi K3 vision {name}: {vision.get(name)!r}")
         if raw.get("media_placeholder_token_id") != 163605 or raw.get("image_placeholder") != "<|kimi_image_placeholder|>":
             raise ValueError("unsupported Kimi K3 image placeholder")
-        return cls(c, vision)
+        return cls(c, vision, dsa=dsa)
 
     @property
     def hidden(self):
@@ -183,9 +231,15 @@ class ModelConfig:
         return self.text["vocab_size"]
 
     @property
+    def mla_norm_eps(self):
+        """Query/KV normalization epsilon declared by the checkpoint's attention implementation."""
+        return 1e-6 if self.dsa is None else self.text["rms_norm_eps"]
+
+    @property
     def layers(self):
         linear = set(self.text["linear_attn_config"]["kda_layers"])
-        return tuple("kda" if i + 1 in linear else "mla" for i in range(self.text["num_hidden_layers"]))
+        return tuple("kda" if i + 1 in linear else "dsa" if self.dsa is not None else "mla"
+                     for i in range(self.text["num_hidden_layers"]))
 
     def validate_shard(self, shard: TensorParallelShard):
         c = self.text

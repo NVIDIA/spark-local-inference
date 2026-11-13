@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """SM103 block-FP8 GEMMs retaining arbitrary FP32 checkpoint scales."""
 
 from dataclasses import dataclass

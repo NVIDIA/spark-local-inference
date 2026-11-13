@@ -1,12 +1,15 @@
-"""Multi-host prefix cache qualification: run every rank of a multi-host package
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Multi-host prefix cache qualification: run every rank of a multi-host core
 as its own process, publish checkpoints, and confirm that each rank keeps its
 own record files and that a restart restores from all of them.
 
 Each rank runs on its own GPU with its own `--prefix-cache-disk` directory, so
-the ranks exercise the sharded record transport that a package serving one rank
+the ranks exercise the sharded record transport that a core serving one rank
 per host uses: rank zero indexes and plans, and every rank stores and restores
 its own share of each record. The ranks stay on one host, which keeps the
-scenario runnable without remote shells; a package whose ranks run on separate
+scenario runnable without remote shells; a core whose ranks run on separate
 hosts uses the same code path.
 
 A continuation asks for facts spread across the whole restored context and must
@@ -42,7 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Cluster:
-    """Every rank of a multi-host package as its own `flare run` process."""
+    """Every rank of a multi-host core as its own `flare run` process."""
 
     def __init__(self, args: argparse.Namespace, label: str):
         self.args = args
@@ -60,7 +63,7 @@ class Cluster:
         # Rank zero binds the rendezvous; peers retry until it accepts them.
         self.spawn(
             0,
-            [str(self.args.package), "--rank", "0", "--host", "127.0.0.1",
+            [str(self.args.core), "--rank", "0", "--host", "127.0.0.1",
              "--port", str(self.args.port), *rendezvous, *extra],
         )
         for rank in range(1, len(self.args.gpus)):
@@ -133,13 +136,13 @@ class Cluster:
             raise RuntimeError(f"ranks {failed} exited abnormally; see {self.args.artifacts}")
 
 
-def package_world(flare: Path, package: Path) -> int:
-    """The rank count of a multi-host package, read from its metadata."""
+def core_world(flare: Path, core: Path) -> int:
+    """The rank count of a multi-host core, read from its metadata."""
     document = json.loads(subprocess.check_output(
-        [str(flare), "inspect", "--unverified", "--json", str(package)], text=True))
-    cluster = (document.get("package") or {}).get("cluster")
+        [str(flare), "inspect", "--unverified", "--json", str(core)], text=True))
+    cluster = (document.get("core") or {}).get("cluster")
     if not cluster:
-        raise SystemExit(f"{package} serves one host; run qualify/host_cache.py instead")
+        raise SystemExit(f"{core} serves one host; run qualify/host_cache.py instead")
     return int(cluster["world"])
 
 
@@ -214,8 +217,8 @@ def scenario(args: argparse.Namespace, world: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flare", type=Path, default=ROOT / "flare/target/release/flare")
-    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--flare", type=Path, default=ROOT / "flare-cli/target/release/flare")
+    parser.add_argument("--core", type=Path, required=True)
     parser.add_argument("--gpus", default="0,1,2,3",
                         help="one GPU per rank, in rank order; the ranks run on this host")
     parser.add_argument("--port", type=int, default=8041, help="rank zero's HTTP port")
@@ -234,9 +237,9 @@ def main() -> int:
     args = parser.parse_args()
     args.gpus = [int(gpu) for gpu in args.gpus.split(",")]
     args.artifacts.mkdir(parents=True, exist_ok=True)
-    world = package_world(args.flare, args.package)
+    world = core_world(args.flare, args.core)
     if world != len(args.gpus):
-        parser.error(f"the package serves {world} ranks; give {world} GPUs")
+        parser.error(f"the core serves {world} ranks; give {world} GPUs")
     return scenario(args, world)
 
 
