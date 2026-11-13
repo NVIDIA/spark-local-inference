@@ -787,9 +787,54 @@ Collective signals and generation-tagged payloads are reset after all ranks
 drain. Imported mappings are recorded as peer dependencies and stored only in
 the owning rank's bundle.
 
-Helios checks that rank allocations do not overlap, creates every device
-context, loads rank storage, and grants the declared peer access through
-`cuMemSetAccess` before loading modules and instantiating execution state.
+Helios checks that rank allocations do not overlap and creates every device
+context before mapping storage. Each mapping receives one `cuMemSetAccess`
+grant containing its owner and the ranks whose bundles import that allocation
+as peer memory. The signed reader declaration must include these ranks but may
+contain unused ranks; cores with all-rank reader declarations therefore retain
+compatibility without granting access outside the actual import group. Static
+mappings receive access during allocation. Runtime-sized cache mappings receive
+access after backing is mapped, before zeroing or graph use. Continuation aliases
+have their own access permissions, independent of the KV plane they borrow.
+
+For shared cache allocations, startup logs each reader GPU's `cuMemGetInfo_v2`
+free bytes before and after its mapping grants, the signed used-byte delta,
+owner, address, backed size, backing mapping count, and reader rank/device pairs.
+Physical backing is already allocated at the first sample; no cache backing is
+allocated between these samples. These observations include driver access state
+and may include other processes' memory activity. They do not measure transient
+peaks inside a driver call or establish a safe planning reserve. Remote KV bytes are
+not charged as duplicated physical storage. A failed grant reports the exact
+mapping range and readers while retaining the CUDA status.
+
+Single-host startup retries a cache `cuMemCreate`, `cuMemMap`, or `cuMemSetAccess`
+out-of-memory failure with a smaller cache budget. No retry allowance is charged
+when the first allocation succeeds. Before retrying, every local context must
+synchronize, then every cache mapping and continuation alias must unmap
+successfully. Static allocations, virtual reservations, and graph executables
+remain loaded. Capacities are published only after every rank's allocation and
+access grants succeed; metadata retains its sizing declarations until then.
+
+The retry budget accounts for any reduction in observed free memory retained
+after cleanup, including driver state or other processes' memory activity. It
+also withholds a search margin for allocation and access demands not visible in
+before/after free-memory samples. The first reduction is one allocation granule
+per owned KV plane: 48 planes aligned to 2 MiB give a 96 MiB step per GPU. Steps
+double after each reduction; this is a bounded capacity search, not a measured
+driver minimum or a fixed allowance charged to every startup. A retry must reduce
+the common page count. Execution rows and the existing minimum KV capacity remain
+required; if no smaller valid capacity exists, startup returns the driver error.
+Logs report the resulting cache budget and additional driver allowance separately
+from any manual reserve. `--memory-limit=-0G` and the default memory limit use the
+same retry mechanism. Remote KV is never charged as duplicated physical backing.
+
+Cross-host startup retains its existing one-shot allocation agreement; retrying
+it requires a coordinated allocation outcome protocol. Other CUDA errors and
+cleanup failures abort startup rather than authorize reuse. Zero-manual-reserve
+allocation is qualified for TP16 cores with 8-rank and 16-rank peer-import
+groups; cleanup and retry are qualified with 16-rank groups. Other geometries
+require hardware validation.
+
 Address reservations are established before allocation. Allocation, payload
 loading, kernel loading, and execution preparation each run concurrently across
 ranks, joining all rank threads between stages. Loading retains a process-wide

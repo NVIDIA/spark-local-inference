@@ -10,7 +10,7 @@ use std::ops::Range;
 
 use super::{
     NativeResources, Storage,
-    driver::{Access, AllocationProperties, Location},
+    driver::{AllocationProperties, Handle, Location},
     format::{Memory, Core, invalid},
 };
 use crate::Result;
@@ -290,7 +290,7 @@ mod tests {
             }
             let layout = Layout::new(&geometry, 3, &[alignment; 3], alignment).unwrap();
             owner
-                .allocate_shared_cache(&core, &geometry, &layout)
+                .allocate_shared_cache(&core, &geometry, &layout, &[], false)
                 .unwrap();
             for row in 0..7 {
                 driver
@@ -436,6 +436,8 @@ impl NativeResources {
         core: &Core,
         geometry: &CacheGeometry,
         layout: &Layout,
+        contexts: &[Handle],
+        log_peer_access: bool,
     ) -> Result<()> {
         unsafe {
             self.driver
@@ -482,6 +484,9 @@ impl NativeResources {
                 }
                 self.map_cache_chunk(chunk.bytes, &mappings)?;
             }
+            for plane in std::iter::once(&geometry.row).chain(&geometry.planes) {
+                self.grant_cache_access(&plane.name, contexts, log_peer_access)?;
+            }
             // Zero each physical byte once, before any graph or transfer can read an alias.
             self.driver.check(
                 "cuMemsetD8_v2",
@@ -509,13 +514,6 @@ impl NativeResources {
             windows: std::ptr::null_mut(),
             flags: [0; 8],
         };
-        let access = Access {
-            location: Location {
-                kind: 1,
-                device: self.device,
-            },
-            flags: 3,
-        };
         let mut physical = 0;
         unsafe {
             self.driver.check(
@@ -533,10 +531,6 @@ impl NativeResources {
                         .unwrap()
                         .mappings
                         .push((address, length as usize));
-                    self.driver.check(
-                        "cuMemSetAccess",
-                        (self.driver.access)(address, length as usize, &access, 1),
-                    )?;
                 }
                 Ok(())
             })();

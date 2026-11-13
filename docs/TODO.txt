@@ -461,3 +461,9 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Exercise native cache allocation retry exhaustion at the minimum KV
+    capacity on an exported TP16 core. Confirm the original allocation error
+    is returned after all mappings unmap and no cache or execution state is
+    published. Cross-host retry remains blocked on the coordinated allocation
+    outcome protocol in runtime-core-design.md.

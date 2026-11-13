@@ -8,7 +8,6 @@
 
 use super::{
     AuthorizedCore, LoadOptions, NativeResources,
-    driver::{Access, Location},
     format::{Memory, Core, Reservation, invalid},
     payload::Files,
     protection::AuthorizedKind,
@@ -581,6 +580,7 @@ impl NativeModel {
         }
         cores[0].reservations = merged;
         validate_peer_memory(&cores, &descriptor.peer_memory)?;
+        let peer_readers = actual_peer_readers(&cores, &descriptor.peer_memory);
         // Distribution and verification can fill shared DRAM before CUDA creates its context.
         Files::release_page_cache(&files);
         phase.finish(format!(
@@ -627,6 +627,19 @@ impl NativeModel {
                 model
                     .ranks
                     .push(NativeResources::initialize(core, *device)?);
+            }
+            let rank_devices: Vec<_> = model.ranks.iter().map(|rank| rank.device).collect();
+            for (owner, rank) in model.ranks.iter_mut().enumerate() {
+                rank.rank = owner;
+                for (&address, readers) in &peer_readers[owner] {
+                    rank.peer_readers.insert(
+                        address,
+                        readers
+                            .iter()
+                            .map(|&reader| (reader, rank_devices[reader]))
+                            .collect(),
+                    );
+                }
             }
             phase.finish(
                 cores
@@ -705,7 +718,6 @@ impl NativeModel {
                 "{:.1} GiB",
                 payload_bytes as f64 / (1u64 << 30) as f64
             ));
-            model.grant_peer_access(&descriptor.peer_memory)?;
             let kernels = cores
                 .iter()
                 .map(|p| p.functions.len() as u64)
@@ -787,7 +799,6 @@ impl NativeModel {
                 &initial,
                 embedding_host_bytes,
             )?;
-            model.grant_peer_access(&descriptor.peer_memory)?;
             model.prepare_offload(root, options, progress, active)?;
         }
         Ok(model)
@@ -848,45 +859,6 @@ impl NativeModel {
         )?;
         let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);
-        Ok(())
-    }
-
-    unsafe fn grant_peer_access(&self, peers: &[protobuf::wire::PeerMemory]) -> Result<()> {
-        for peer in peers {
-            let rank = &self.ranks[peer.owner as usize];
-            let allocation = rank
-                .allocations
-                .values()
-                .find(|a| a.address == peer.address && matches!(a.memory, Memory::Device))
-                .ok_or_else(|| invalid("shared allocation is missing from its owner"))?;
-            if allocation.nbytes == 0 {
-                continue;
-            }
-            let access: Vec<_> = peer
-                .readers
-                .iter()
-                .map(|reader| Access {
-                    location: Location {
-                        kind: 1,
-                        device: self.ranks[*reader as usize].device,
-                    },
-                    flags: 3,
-                })
-                .collect();
-            unsafe {
-                rank.driver
-                    .check("cuCtxSetCurrent", (rank.driver.context_set)(rank.context))?;
-                rank.driver.check(
-                    "cuMemSetAccess",
-                    (rank.driver.access)(
-                        peer.address,
-                        allocation.nbytes,
-                        access.as_ptr(),
-                        access.len(),
-                    ),
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -1017,6 +989,31 @@ pub(super) fn offload_identity(config: &serde_json::Value) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
+/// Validated imports determine access; reader declarations may include unused ranks.
+fn actual_peer_readers(
+    cores: &[Core],
+    peers: &[protobuf::wire::PeerMemory],
+) -> Vec<std::collections::HashMap<u64, Vec<usize>>> {
+    let mut readers = vec![std::collections::HashMap::new(); cores.len()];
+    for peer in peers {
+        let owner = peer.owner as usize;
+        let actual = cores
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, core)| {
+                (rank == owner
+                    || core.allocations.iter().any(|allocation| {
+                        matches!(allocation.memory, Memory::Peer)
+                            && allocation.address == Some(peer.address)
+                    }))
+                .then_some(rank)
+            })
+            .collect();
+        readers[owner].insert(peer.address, actual);
+    }
+    readers
+}
+
 fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) -> Result<()> {
     let mut shared = HashSet::new();
     for peer in peers {
@@ -1064,6 +1061,88 @@ fn validate_peer_memory(cores: &[Core], peers: &[protobuf::wire::PeerMemory]) ->
 mod tests {
     use super::*;
     use protobuf::wire;
+
+    #[test]
+    fn actual_imports_preserve_tp16_static_access_and_scope_dcp_cache_access() {
+        for group_size in [8, 16] {
+            for overdeclared in [false, true] {
+                let address = |owner: usize, dynamic: bool| {
+                    0x200000000000 + ((owner * 2 + usize::from(dynamic)) as u64) * (1 << 30)
+                };
+                let mut peers = Vec::new();
+                for owner in 0..16 {
+                    for dynamic in [false, true] {
+                        peers.push(wire::PeerMemory {
+                            owner: owner as u32,
+                            address: address(owner, dynamic),
+                            nbytes: 8 << 20,
+                            readers: (0..16)
+                                .filter(|rank| {
+                                    overdeclared
+                                        || !dynamic
+                                        || rank / group_size == owner / group_size
+                                })
+                                .map(|rank| rank as u32)
+                                .collect(),
+                        });
+                    }
+                }
+                let cores: Vec<_> = (0..16)
+                    .map(|rank| {
+                        let allocations = peers
+                            .iter()
+                            .filter(|peer| {
+                                let dynamic = peer.address == address(peer.owner as usize, true);
+                                !dynamic || rank / group_size == peer.owner as usize / group_size
+                            })
+                            .map(|peer| {
+                                let owned = peer.owner as usize == rank;
+                                let dynamic = peer.address == address(peer.owner as usize, true);
+                                wire::Allocation {
+                                    name: format!("allocation-{:x}", peer.address),
+                                    address: Some(peer.address),
+                                    alignment: 2 << 20,
+                                    nbytes: if owned && dynamic { 0 } else { peer.nbytes },
+                                    memory: if owned {
+                                        wire::Memory::Device
+                                    } else {
+                                        wire::Memory::Peer
+                                    } as i32,
+                                    sizing: (owned && dynamic).then_some(wire::Sizing {
+                                        capacity: 1,
+                                        unit_bytes: 2 << 20,
+                                        maximum: 4,
+                                    }),
+                                    ..Default::default()
+                                }
+                            })
+                            .collect();
+                        protobuf::decode(wire::BundleIndex {
+                            architecture: vec![12, 0],
+                            context: Some(Default::default()),
+                            allocations,
+                            ..Default::default()
+                        })
+                        .unwrap()
+                    })
+                    .collect();
+                validate_peer_memory(&cores, &peers).unwrap();
+                let actual = actual_peer_readers(&cores, &peers);
+                for owner in 0..16 {
+                    assert_eq!(actual[owner].len(), 2);
+                    assert_eq!(
+                        actual[owner][&address(owner, false)],
+                        (0..16).collect::<Vec<_>>()
+                    );
+                    let first = owner / group_size * group_size;
+                    assert_eq!(
+                        actual[owner][&address(owner, true)],
+                        (first..first + group_size).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn disabled_offload_needs_no_model_metadata_or_cuda_resources() {
@@ -1156,11 +1235,15 @@ mod tests {
                 readers: vec![0, 1],
             }];
             validate_peer_memory(&cores, &peers).unwrap();
+            assert_eq!(actual_peer_readers(&cores, &peers)[0][&address], [0, 1]);
             peers[0].nbytes /= 2;
             assert!(validate_peer_memory(&cores, &peers).is_err());
             peers[0].nbytes = extent;
             peers[0].readers.pop();
             assert!(validate_peer_memory(&cores, &peers).is_err());
+            let owner_only = &cores[..1];
+            validate_peer_memory(owner_only, &peers).unwrap();
+            assert_eq!(actual_peer_readers(owner_only, &peers)[0][&address], [0]);
         }
     }
 }
