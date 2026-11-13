@@ -32,16 +32,20 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
             handle: int, decode: bool, window: int,
             schedule_storage: torch.Tensor | None, schedule_slot: int, output_gate: torch.Tensor | None,
             metadata_seeds: list[torch.Tensor], live_metadata: list[torch.Tensor],
-            chunk_pages_lut: torch.Tensor | None) -> None:
+            chunk_pages_lut: torch.Tensor | None, relative_bias: torch.Tensor | None,
+            relative_factor: torch.Tensor | None, relative_projection: torch.Tensor | None) -> None:
     plan = plan_from_handle(handle)
     if plan.component_id == "flare.paged_tma":
         from b12x.preparation.types import require_prepared
 
-        require_prepared(plan, plan.component_id).run(q, key, value, pages, lengths, cu, output, scratch[0], output_gate)
+        require_prepared(plan, plan.component_id).run(q, key, value, pages, lengths, cu, output, scratch[0],
+                                                       output_gate, sink, relative_factor, relative_projection)
         return
     arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages, cache_seqlens=lengths,
                      cu_seqlens_q=cu, attention_sink_bias=sink, output=output, scratch=scratch,
                      k_descale=k_descale, v_descale=v_descale)
+    if relative_bias is not None:
+        arguments["relative_attention_bias"] = relative_bias
     if metadata_seeds:
         arguments["replay_metadata"] = paged.ReplayMetadata(
             tuple(live_metadata if live_metadata else metadata_seeds), chunk_pages_lut)
@@ -58,15 +62,28 @@ def _attend(q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, pages: torc
 
 
 @_attend.register_fake
-def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot, output_gate, metadata_seeds, live_metadata, chunk_pages_lut):
+def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_descale, v_descale, selected_blocks, handle, decode, window, schedule_storage, schedule_slot, output_gate, metadata_seeds, live_metadata, chunk_pages_lut, relative_bias, relative_factor, relative_projection):
     pass
 
 
 class PreparedPagedAttention:
+    """Prepared paged GQA with optional sinks, windows and relative-distance logit biases.
+
+    `sink` holds one FP32 logit per query head (`[heads]`) or per query row and
+    head (`[rows, heads]`); either joins the softmax denominator with a zero
+    value. `relative_bias` (BF16 `[rows, heads, extent]`) adds `bias[row, head, d]`
+    to the scaled score of the key `d` positions before the row, for `d < extent`;
+    decode and verification evaluate it through b12x paged decode.
+    `relative_factor` (BF16 `[rows, heads, 16]`) with `relative_projection`
+    (BF16 `[extent, 16]`) is the same bias as a rank-16 product evaluated inside
+    the FP8 TMA prefill kernel. Row sinks and biases computed by a forward are
+    invocation operands of the functional call.
+    """
+
     def __init__(self, q, key, value, pages, lengths, cu, output, *, sink=None, mode,
                  window=-1, width=1, causal=True, k_descale=None, v_descale=None,
                  selected_blocks=None, session, workspace, name, schedules=None, tuning_page_count=None, output_gate=None,
-                 caller_owned_placeholders=False):
+                 caller_owned_placeholders=False, relative_bias=None, relative_factor=None, relative_projection=None):
         if tuning_page_count is None:
             tuning_page_count = min(key.shape[0], value.shape[0])
         if type(tuning_page_count) is not int or not 0 < tuning_page_count <= min(key.shape[0], value.shape[0]):
@@ -75,11 +92,31 @@ class PreparedPagedAttention:
         self.schedules = schedules
         from .paged_tma import PreparedTma, supports
 
+        row_sink = sink is not None and sink.ndim == 2
+        if row_sink and (sink.dtype != torch.float32 or sink.shape != q.shape[:2] or sink.stride(-1) != 1):
+            raise ValueError("per-row attention sinks must be FP32 [rows, heads] with contiguous heads")
+        if relative_bias is not None and (relative_bias.dtype != torch.bfloat16 or relative_bias.ndim != 3
+                or relative_bias.shape[:2] != q.shape[:2] or relative_bias.stride(-1) != 1):
+            raise ValueError("relative attention biases must be BF16 [rows, heads, extent] with unit inner stride")
+        self.row_sink, self.relative_bias = row_sink, relative_bias
+        self.relative_projection = relative_projection
         self.tma = None
         self.output_gate = None
+        if relative_factor is not None or relative_projection is not None:
+            # Only the FP8 TMA prefill kernel evaluates the rank-16 bias.
+            if (mode not in ("prefill", "extend") or not causal or selected_blocks is not None
+                    or k_descale is not None or v_descale is not None or relative_bias is not None
+                    or sink is not None and not row_sink):
+                raise ValueError("factored relative biases require causal FP8 TMA prefill with per-row sinks")
+            self.tma = PreparedTma(q, key, value, pages, lengths, cu, output, session=session,
+                workspace=workspace, name=name, output_gate=output_gate, window=window,
+                row_sink=sink, relative_factor=relative_factor, relative_projection=relative_projection)
+            self.output_gate = output_gate
+            self.plan = self.tma.plan
+            return
         if (mode in ("prefill", "extend") and causal and window == -1 and sink is None
                 and selected_blocks is None and k_descale is None and v_descale is None
-                and supports(q, key, value, pages, cu, output)):
+                and relative_bias is None and supports(q, key, value, pages, cu, output)):
             self.tma = PreparedTma(q, key, value, pages, lengths, cu, output,
                 session=session, workspace=workspace, name=name, output_gate=output_gate)
             self.output_gate = output_gate
@@ -102,12 +139,16 @@ class PreparedPagedAttention:
                 mode = "decode" if width == 1 else "verify"
             else:
                 mode = "extend"
+        sink_layout = "row" if row_sink else "head"
         self.decode = selected_blocks is None and mode in ("decode", "verify") and paged_decode.supports(
             num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
             head_dim_vo=value.shape[3], page_size=key.shape[1], kv_dtype=key.dtype,
-            max_q_per_req=width, window_left=window, causal=causal, has_sinks=sink is not None)
+            max_q_per_req=width, window_left=window, causal=causal, has_sinks=sink is not None,
+            has_relative_bias=relative_bias is not None, sink_layout=sink_layout)
         if not causal and not self.decode:
             raise ValueError("noncausal paged attention requires a supported paged-decode geometry")
+        if (relative_bias is not None or row_sink) and not self.decode:
+            raise ValueError("relative biases and per-row sinks outside TMA prefill require a paged-decode geometry")
         self.compact_decode = None
         if not self.decode and mode == "decode":
             # The GQA decode schedule has one physical query row per request.
@@ -122,6 +163,8 @@ class PreparedPagedAttention:
         self.arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages,
             cache_seqlens=lengths, cu_seqlens_q=cu, output=output, attention_sink_bias=sink,
             k_descale=k_descale, v_descale=v_descale)
+        if relative_bias is not None:
+            self.arguments["relative_attention_bias"] = relative_bias
         if selected_blocks is not None:
             self.arguments["q2k_indices"] = selected_blocks
         if self.decode:
@@ -129,7 +172,8 @@ class PreparedPagedAttention:
                 num_kv_heads=key.shape[2], head_dim_qk=q.shape[2], head_dim_vo=value.shape[3],
                 page_size=key.shape[1], max_batch=pages.shape[0], max_q_per_req=width,
                 window_left=window, has_sinks=sink is not None, causal=causal, kv_dtype=key.dtype,
-                caller_owned_placeholders=caller_owned_placeholders))
+                caller_owned_placeholders=caller_owned_placeholders,
+                has_relative_bias=relative_bias is not None, sink_layout=sink_layout))
         else:
             geometry = dict(device=q.device, q_dtype=q.dtype, kv_dtype=key.dtype,
                 num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
@@ -259,8 +303,9 @@ class PreparedPagedAttention:
     def __call__(self):
         if self.tma is not None:
             q, key, value, pages, lengths, cu, output = self.tma.arguments
-            _attend(q, key, value, pages, lengths, cu, None, output, [self.tma.scratch],
-                None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate, [], [], None)
+            _attend(q, key, value, pages, lengths, cu, self.tma.row_sink, output, [self.tma.scratch],
+                None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate, [], [], None,
+                None, self.tma.relative_factor, self.tma.relative_projection)
             return output
         a = self.arguments
         if self.compact_decode is not None:
@@ -273,7 +318,8 @@ class PreparedPagedAttention:
         _attend(a["q"], a["k_cache"], a["v_cache"], a["page_table"], a["cache_seqlens"],
                 a["cu_seqlens_q"], a["attention_sink_bias"], a["output"], self.scratch,
                 a["k_descale"], a["v_descale"], self.selected_blocks,
-                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot, None, [], [], None)
+                self.plan.handle, self.decode, self.window, self.schedule_storage, self.schedule_slot, None, [], [], None,
+                a.get("relative_attention_bias"), None, None)
         if self.compact_decode is not None:
             positions = torch.arange(destination.shape[0], device=destination.device)
             requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)
@@ -286,6 +332,10 @@ class _FunctionalPagedAttention:
     def __init__(self, prepared):
         self.plan = prepared.plan
         self.tma = prepared.tma is not None
+        # Row sinks and relative biases are forward-local values supplied at invocation.
+        self.row_sink = prepared.row_sink
+        self.relative_bias_extent = None if prepared.relative_bias is None else prepared.relative_bias.shape[2]
+        self.relative_projection = prepared.relative_projection
         if self.tma:
             q, key, value, pages, lengths, cu, output = prepared.tma.arguments
             kernel_output = output
@@ -299,7 +349,9 @@ class _FunctionalPagedAttention:
             q, output = prepared.arguments["q"], prepared.arguments["output"]
             kernel_output = output
             self.arguments = {name: value for name, value in prepared.arguments.items()
-                              if name not in ("q", "output", "q2k_indices")}
+                              if name not in ("q", "output", "q2k_indices", "relative_attention_bias")}
+            if self.row_sink:
+                self.arguments["attention_sink_bias"] = None
             self.decode, self.window = prepared.decode, prepared.window
             self.selected_blocks = prepared.selected_blocks
             self.compact_decode = None
@@ -333,13 +385,23 @@ class _FunctionalPagedAttention:
         paged.release_replay_metadata(self.plan)
 
     def __call__(self, q, *, output_gate=None, k_cache=None, v_cache=None, cache_seqlens=None,
-                 page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None):
+                 page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None,
+                 sink=None, relative_bias=None, relative_factor=None):
         if self.scratch_layout is None:
             raise RuntimeError("functional paged attention requires finalized preparation")
         if tuple(q.shape) != self.query_shape or q.dtype != self.query_dtype:
             raise ValueError("functional paged attention query differs from prepared geometry")
         if (output_gate is not None) != self.gated:
             raise ValueError("functional paged attention gate differs from prepared geometry")
+        if (sink is not None) != self.row_sink or sink is not None and (
+                sink.shape != q.shape[:2] or sink.dtype != torch.float32 or sink.stride(-1) != 1):
+            raise ValueError("functional paged attention requires FP32 [rows, heads] sinks exactly when prepared with them")
+        if (relative_bias is not None) != (self.relative_bias_extent is not None) or relative_bias is not None and (
+                relative_bias.shape != (*q.shape[:2], self.relative_bias_extent)
+                or relative_bias.dtype != torch.bfloat16 or relative_bias.stride(-1) != 1):
+            raise ValueError("functional relative bias differs from prepared geometry")
+        if (relative_factor is not None) != (self.relative_projection is not None):
+            raise ValueError("functional relative factors are required exactly when prepared with a projection")
         a = self.arguments
         if (self.schedule_slot >= 0 and schedule_storage is None and cache_seqlens is not None
                 and cache_seqlens is not a["cache_seqlens"]):
@@ -375,10 +437,11 @@ class _FunctionalPagedAttention:
                 selected = torch.where(active[None, :, None], selected[:, indices], -1)
         live_metadata = [value.clone() for value in self.metadata_seeds] if self.live_metadata else []
         _attend(q, key, value, pages, lengths,
-            cu, a["attention_sink_bias"], output, scratch,
+            cu, sink if self.row_sink else a["attention_sink_bias"], output, scratch,
             a["k_descale"], a["v_descale"], selected, self.plan.handle, self.decode,
             self.window, schedules,
-            self.schedule_slot, output_gate, list(self.metadata_seeds), live_metadata, self.chunk_pages_lut)
+            self.schedule_slot, output_gate, list(self.metadata_seeds), live_metadata, self.chunk_pages_lut,
+            relative_bias, relative_factor, self.relative_projection)
         if self.compact_decode is not None:
             positions = torch.arange(self.output_shape[0], device=output.device)
             requests = (positions[:, None] >= cu[None, 1:]).sum(1).clamp_max(cu.numel() - 2)
