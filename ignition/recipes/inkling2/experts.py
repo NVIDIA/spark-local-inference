@@ -143,7 +143,7 @@ class PreparedExperts:
         return self.experts.nvfp4
 
     def route(self, source, num_valid_tokens):
-        """Expert IDs (`-1` past the valid rows) and FP32 routing weights."""
+        """Expert IDs and FP32 routing weights; rows from the int32 `num_valid_tokens` on get ID `-1`."""
         routes = self.router(self.router_projection(source), num_valid_tokens=num_valid_tokens)
         return routes.ids, routes.weights
 
