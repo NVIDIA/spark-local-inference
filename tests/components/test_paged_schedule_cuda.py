@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared schedule lifetimes across compiled attention and numerical scratch reuse."""
 
 import copy
@@ -9,7 +12,7 @@ import torch
 from ignition.components.paged_attention import PreparedPagedAttention
 from ignition.components.paged_schedule import PreparedPagedSchedules
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 
 
@@ -46,7 +49,7 @@ def test_compiled_schedule_groups_survive_mutable_inputs_and_scratch_reuse():
         (torch.randn(rows, 16, 128, device=device) * 0.2).bfloat16() for _ in range(3)
     ]
     outputs = [torch.empty_like(q) for q in queries]
-    buffers, arena = GraphBufferPool(device), ScratchArena(device, overlap=False)
+    arena = ScratchArena(device, overlap=False)
     with RecordedPreparationSession(
         device=device,
         checkpoint="shared-paged-schedules",
@@ -56,7 +59,7 @@ def test_compiled_schedule_groups_survive_mutable_inputs_and_scratch_reuse():
     ) as session:
         session.register_scratch(arena)
         schedules = PreparedPagedSchedules(
-            lengths, cu, len(queries), buffers=buffers.cursor()
+            lengths, cu, len(queries)
         )
         operations = [
             PreparedPagedAttention(
@@ -164,7 +167,7 @@ def test_ordered_verification_and_prefill_graphs_rebuild_aliased_schedules(
     key = (torch.randn(34, 128, 1, 128, device=device) * 0.2).to(torch.float8_e4m3fn)
     value = (torch.randn_like(key.float()) * 0.2).to(key.dtype)
     table = torch.arange(1, 34, dtype=torch.int32, device=device)[None].contiguous()
-    buffers, arena = GraphBufferPool(device), ScratchArena(device, overlap=False)
+    arena = ScratchArena(device, overlap=False)
     variants = []
     with RecordedPreparationSession(
         device=device,
@@ -185,7 +188,7 @@ def test_ordered_verification_and_prefill_graphs_rebuild_aliased_schedules(
                 selected[0, :, 2] = torch.where(last >= 2, last, -1)
             query = (torch.randn(rows, 16, 128, device=device) * 0.2).bfloat16()
             output = torch.empty_like(query)
-            schedules = PreparedPagedSchedules(lengths, cu, 1, buffers=buffers.cursor())
+            schedules = PreparedPagedSchedules(lengths, cu, 1)
             operation = PreparedPagedAttention(
                 query,
                 key,
@@ -204,6 +207,11 @@ def test_ordered_verification_and_prefill_graphs_rebuild_aliased_schedules(
             )
             schedules.finalize(session)
             variants.append((operation, schedules, lengths, cu, selected))
+        schedule_backing = torch.zeros(max(item[1].storage.numel() for item in variants),
+                                       dtype=torch.uint8, device=device)
+        for operation, schedules, *_ in variants:
+            schedules.storage = schedule_backing[:schedules.storage.numel()].view_as(schedules.storage)
+            operation.schedule_storage = schedules.storage
         session.tune()
         assert (
             len({item[1].storage.untyped_storage().data_ptr() for item in variants})

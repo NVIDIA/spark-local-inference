@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compiled TP mixers preserve injection, final mixing, rank equality and graph storage."""
 
 from dataclasses import replace
@@ -77,11 +80,13 @@ def _rank(rank, rendezvous):
                                                 name=f"rows{rows}.final", **kwargs)
                 first.prepare_combine_norm(final, priming_state=state, session=session, name=f"rows{rows}.combine_norm")
 
+                first.functional(session=session)
+                final.functional(session=session)
+
                 def run(first=first, final=final, state=state):
-                    block = first.mix(state)
-                    assert block is first.scratch.block_input
-                    first.combine_norm(state, block)
-                    assert final.mix(state, pre_normalized=True) is final.scratch.block_input
+                    block, injection = first.mix_runtime(state)
+                    residual, normalized = first.combine_norm_runtime(state, block, injection)
+                    final.mix_runtime(residual, normalized)
 
                 calls.append((rows, run))
             session.tune(show_progress=False)

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The writer role: spilling a record into the manager's store.
 //!
 //! A put asks the manager to accept a record, fills the windows the manager

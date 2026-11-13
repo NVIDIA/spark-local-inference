@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared single-layer MTP feedback, sparse attention and W4A16 experts."""
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from .mtp_weights import MTPWeights
 
 @dataclass(frozen=True)
 class MTPScratch:
-    """Persistent intermediate/output storage, separate from volatile kernel scratch."""
+    """Tensor examples used to declare and tune MTP operations."""
 
     embedding_ids: torch.Tensor
     embedding: torch.Tensor
@@ -36,32 +40,26 @@ class MTPScratch:
     local_logits: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens: int, output_rows: int, device, *, world_size=1, buffers=None,
+    def allocate(cls, tokens: int, output_rows: int, device, *, world_size=1,
                  hyperconnection_lowrank=320):
         if (type(tokens) is not int or type(output_rows) is not int
                 or not 0 < output_rows <= tokens):
             raise ValueError("MTP requires positive output rows no greater than token capacity")
 
-        if buffers is None:
-            from ignition.preparation.scratch import GraphBufferPool
-
-            buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
         def zeros(rows, width):
-            return buffers.zeros((rows, width), torch.bfloat16)
+            return torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
 
-        ids = buffers.zeros(tokens, torch.int64)
+        ids = torch.zeros(tokens, dtype=torch.int64, device=device)
         embedding, residual, hidden = zeros(tokens, 2560), zeros(tokens, 10240), zeros(tokens, 2560)
         selected, logits = zeros(output_rows, 2560), zeros(output_rows, 248320)
         local_logits = zeros(output_rows, 248320 // world_size) if world_size > 1 else None
         block_input, block_output = zeros(tokens, 2560), zeros(tokens, 2560)
         projected = zeros(tokens, (hyperconnection_lowrank + 4 + 15) // 16 * 16)
-        attention, experts, mixer = buffers.fork(), buffers.fork(), buffers.fork()
-        qsa = QSAScratch.allocate(tokens, device, world_size=world_size, buffers=attention, output=block_output)
+        qsa = QSAScratch.allocate(tokens, device, world_size=world_size, output=block_output)
         moe = QwenMoeScratch.allocate(tokens, device, intermediate=640 // world_size,
-                                    buffers=experts, output=block_output)
-        hc = HyperconnectionScratch.allocate(tokens, device, buffers=mixer,
+                                    output=block_output)
+        hc = HyperconnectionScratch.allocate(tokens, device,
                                             projected=projected, block_input=block_input, lowrank=hyperconnection_lowrank)
-        buffers.join(attention, experts, mixer)
         return cls(ids, embedding, residual, hidden, selected, logits, hc, qsa, moe, local_logits)
 
     def rows(self, tokens: int, output_rows: int):
@@ -125,8 +123,26 @@ class PreparedMTPFeedback:
 
         register_finalizer(session, finalize, workspace=workspace)
 
-    def __call__(self):
-        return mtp_feedback.run(self.binding, eps=self.eps)
+    def functional(self, *, session):
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.constants = tuple(self.kwargs[name] for name in
+            ("token_norm_weight", "state_norm_weight", "embedding_fc_weight", "hidden_fc_weight"))
+        self.output_layout = (tuple(self.kwargs["output"].shape), self.kwargs["output"].dtype)
+        self.scratch_layout = (tuple(self.scratch.shape), tuple(self.scratch.stride()), self.scratch.dtype)
+        self.binding = self.kwargs = self.scratch = None
+
+    def __call__(self, token_embedding, target_hidden):
+        from b12x.sequence.mtp_feedback._kernels import run_mtp_feedback
+
+        output = torch.empty(self.output_layout[0], dtype=self.output_layout[1], device=token_embedding.device)
+        shape, stride, dtype = self.scratch_layout
+        scratch = torch.empty_strided(shape, stride, dtype=dtype, device=token_embedding.device)
+        run_mtp_feedback(token_embedding, target_hidden.view(-1, 4, 2560), *self.constants,
+                         scratch, output, eps=self.eps, plan=self.plan)
+        return output.flatten(1)
 
 
 class PreparedMTP:
@@ -215,28 +231,45 @@ class PreparedMTP:
     def rebind_pages_for_preparation(self, state):
         self.attention.rebind_pages_for_preparation(state)
 
-    def __call__(self):
-        s = self.scratch
-        active = self.metadata.request_ids >= 0
-        s.embedding_ids.copy_(self.token_ids)
-        s.embedding_ids.masked_fill_(~active, 0)
-        self.embedding()
-        self.feedback()
-        s.residual.masked_fill_(~active[:, None], 0)
-        mixed = self.attn_hc.mix(s.residual)
-        block = self.attention(mixed)
+    def functional(self, *, session):
+        if getattr(self, "_functional_requested", False):
+            return self
+        self._functional_requested = True
+        self.embedding.functional(session=session, dynamic_inputs=True)
+        self.feedback.functional(session=session)
+        self.attn_hc.functional(session=session)
+        self.attention.functional(session=session)
+        if not self.cache_only:
+            self.mlp_hc.functional(session=session)
+            self.moe.functional(session=session)
+            self.final_mixer.functional(session=session)
+            self.lm_head.functional(session=session)
+            for reduction in self.reductions:
+                reduction.functional(session=session)
+        return self
+
+    def release_outputs(self):
+        self.scratch = self.output = self.token_ids = self.target_hidden = None
+        self.metadata = self.output_indices = None
+
+    def __call__(self, token_ids, target_hidden, metadata, output_indices):
+        active = metadata.request_ids >= 0
+        embedding_ids = torch.where(active, token_ids, 0)
+        embedding = self.embedding(token_ids=embedding_ids)
+        residual = self.feedback(embedding, target_hidden)
+        residual.masked_fill_(~active[:, None], 0)
+        mixed, injection = self.attn_hc.mix_runtime(residual)
+        block = self.attention(mixed, metadata)
         if self.cache_only:
             return None
         if self.reductions:
             block = self.reductions[0](block)
-        self.attn_hc.combine_norm(s.residual, block)
-        mixed = self.mlp_hc.mix(s.residual, pre_normalized=True)
+        residual, normalized = self.attn_hc.combine_norm_runtime(residual, block, injection)
+        mixed, injection = self.mlp_hc.mix_runtime(residual, normalized)
         block = self.moe(mixed)
         if self.reductions:
             block = self.reductions[1](block)
-        self.mlp_hc.combine(s.residual, block)
-        s.residual.masked_fill_(~active[:, None], 0)
-        self.final_mixer.mix(s.residual)
-        torch.index_select(s.hidden, 0, self.output_indices, out=s.selected_hidden)
-        self.lm_head(s.selected_hidden)
-        return self.output
+        residual = self.mlp_hc.combine_runtime(residual, block, injection)
+        residual.masked_fill_(~active[:, None], 0)
+        hidden, _ = self.final_mixer.mix_runtime(residual)
+        return MTPOutput(residual, hidden, self.lm_head(torch.index_select(hidden, 0, output_indices)))

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Admission limits and power-of-two capacities for prepared request batches."""
 
 from fractions import Fraction
@@ -5,7 +9,22 @@ import heapq
 from math import isqrt
 
 MAX_CONCURRENCY = 64
+DEFAULT_COMPLETION_TOKEN_CAPACITY = 8
 BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
+
+
+def serving_modes(enabled: bool, mtp_only: bool = False) -> tuple[bool, ...]:
+    """Select generation modes before constructing their graphs."""
+    if mtp_only and not enabled:
+        raise ValueError("--mtp-only requires enabled learned speculation")
+    return (True,) if mtp_only else ((True, False) if enabled else (False,))
+
+
+def completion_token_capacity(value=0):
+    """Resolve the ABI's omitted capacity to eight; positive uint32 values are literal."""
+    if type(value) is not int or not 0 <= value < 1 << 32:
+        raise ValueError("completion token capacity must be a uint32")
+    return value or DEFAULT_COMPLETION_TOKEN_CAPACITY
 
 
 def request_capacity(concurrency: int) -> int:
@@ -62,8 +81,8 @@ def speculative_shapes(concurrency, widths, token_capacity=None):
     """Cover every prefix inside the target-token envelope and every decode batch."""
     batches = batch_capacities(concurrency)
     if (not widths or widths[0] != 1 or tuple(sorted(set(widths))) != tuple(widths)
-            or any(type(w) is not int or not 1 <= w <= 8 for w in widths)):
-        raise ValueError("speculative widths must increase from one through at most eight")
+            or any(type(w) is not int or not 1 <= w < 1 << 31 for w in widths)):
+        raise ValueError("speculative widths must increase from one within Int32 token lengths")
     capacity = speculative_token_capacity(concurrency, widths[-1], token_capacity)
     return tuple((batch, width) for batch in batches for width in reversed(widths)
                  if width == 1 or batch * width <= capacity)
@@ -79,8 +98,8 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     the complete integer capacity range saturate without duplicate graphs.
     """
     batches = batch_capacities(concurrency)
-    if type(width) is not int or not 2 <= width <= 8:
-        raise ValueError("packed verification width must be an integer in [2, 8]")
+    if type(width) is not int or not 2 <= width < 1 << 31:
+        raise ValueError("packed verification width must be an integer from two within Int32 token lengths")
     capacity = speculative_token_capacity(concurrency, width, token_capacity)
     shapes, intervals = set(), []
     total = 0
@@ -112,8 +131,8 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
 
 def proposal_shapes(concurrency, drafts):
     """Full configured proposal blocks cover every request batch."""
-    if type(drafts) is not int or not 1 <= drafts <= 7:
-        raise ValueError("proposal depth must be in [1, 7]")
+    if type(drafts) is not int or not 1 <= drafts < (1 << 31) - 1:
+        raise ValueError("proposal depth must be positive and fit Int32 verification lengths")
     return tuple((batch, drafts) for batch in batch_capacities(concurrency))
 
 

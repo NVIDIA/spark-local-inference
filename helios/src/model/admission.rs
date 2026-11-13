@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Model-independent request admission with model-specific prompt metadata.
 
 use crate::{
@@ -125,7 +131,7 @@ pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> 
     prompt.sampling.validate()?;
     if !prompt.logprob_token_ids.is_empty() {
         if config.logprob_token_id_capacity == 0 {
-            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+            return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());
         }
         let ids = &prompt.logprob_token_ids;
         if !prompt.logprobs

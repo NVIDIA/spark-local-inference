@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Pool protocol, instances on other hosts: a put and a claim whose bytes move on the
 //! data channel, over TCP and over TLS, and what happens when the instance misbehaves,
 //! stalls or dies in the middle of a transfer.

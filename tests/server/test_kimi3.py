@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native Kimi K3 text, XTML, image, and continuation requests.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_KIMI3_TEST_URL to a native service with

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Choose prepared attention plans by replaying complete catalog layers."""
 
 from __future__ import annotations
@@ -98,7 +102,7 @@ class CatalogContextualSelection:
     independent races. Inputs and trial graphs are released between contexts.
     """
 
-    def __init__(self, forwards, signatures, *, arena, coordinator, collective,
+    def __init__(self, forwards, signatures, *, coordinator, collective,
                  device, graph_pool, cache_root, compile_decoder, warmup_storage,
                  progress=None):
         if coordinator is None or len(coordinator.ranks) < 2:
@@ -119,7 +123,7 @@ class CatalogContextualSelection:
             else:
                 groups.append([fixture])
         self.groups = tuple(tuple(group) for group in groups)
-        self.arena, self.coordinator, self.collective = arena, coordinator, collective
+        self.coordinator, self.collective = coordinator, collective
         self.device, self.graph_pool = device, graph_pool
         self.cache_root = None if cache_root is None else Path(cache_root)
         self.compile_decoder, self.warmup_storage = compile_decoder, warmup_storage
@@ -195,7 +199,7 @@ class CatalogContextualSelection:
                     "config": plan.contract.config_payload(configs[role][offset]).to_dict()}
                    for plan, role, offset in zip(plans, _ROLES, selection, strict=True)]
         encoded = json.dumps({"operators": payload,
-            "target_rows": self.layers[0].metadata.positions.numel(),
+            "target_rows": self.fixtures[0].tokens,
             "contexts": tuple(fixture.label for fixture in self.fixtures)},
             sort_keys=True, separators=(",", ":")).encode()
         return f"context-{index:02d}-{sha256(encoded).hexdigest()[:12]}"
@@ -210,33 +214,6 @@ class CatalogContextualSelection:
             warmup_storage=self.warmup_storage, capture_names=tuple(functions),
             before_run=before_run, compile_group=compile_group)
 
-    def _side_workspace(self, plans):
-        sizes = []
-        for fixture_index, layer in enumerate(self.layers):
-            chain = layer.attention.concurrent_query
-            if chain is None:
-                sizes.append((0, 0))
-            else:
-                main = max(plan.memory_requirements().scratch_nbytes for plan in chain.parallel_plans)
-                side = max(plan.memory_requirements().scratch_nbytes
-                           for plan in plans[(fixture_index, "q_b")])
-                sizes.append((main, side))
-        if self.coordinator is not None:
-            import torch.distributed as dist
-
-            peers = [None] * len(self.coordinator.ranks)
-            dist.all_gather_object(peers, tuple(sizes), group=self.coordinator.group)
-            sizes = [(max(peer[index][0] for peer in peers), max(peer[index][1] for peer in peers))
-                     for index in range(len(sizes))]
-        result = []
-        for layer, (main, side) in zip(self.layers, sizes, strict=True):
-            if layer.attention.concurrent_query is None:
-                result.append(None)
-            else:
-                _, workspace = self.arena.views(((main,), torch.uint8), ((side,), torch.uint8))
-                result.append(workspace)
-        return tuple(result)
-
     def _context_exchange(self, step, payload):
         import torch.distributed as dist
 
@@ -249,35 +226,40 @@ class CatalogContextualSelection:
             self._race_stage.update(advance=len(payload["indices"]))
         return tuple(peers)
 
-    def _race_layer(self, session, fixture, fixture_index, configs, plans, workspace, selections):
+    def _race_layer(self, session, fixture, fixture_index, configs, plans, selections):
         functions, signatures, members = {}, {}, {}
         for index, selection in enumerate(selections):
             name = self._tuple_name(index, configs, selection) + f"-context{fixture_index}"
             variant_plans = tuple(plans[(fixture_index, role)][offset]
                                   for role, offset in zip(_ROLES, selection, strict=True))
             layer = prepared_layer_variant(self.layers[fixture_index],
-                qkv_plan=variant_plans[0], norm_plan=variant_plans[1],
-                query_plan=variant_plans[2], side_workspace=workspace)
+                qkv_plan=variant_plans[0], norm_plan=variant_plans[1], query_plan=variant_plans[2])
             functions[name] = fixture.trial_forward(layer)
             signatures[name] = fixture.trial_signature
             members[name] = (variant_plans, layer)
-        def before_run(name):
-            fixture.restore_tune(members[name][1])
-
-        graphs, compiled = self._capture(session, functions, signatures,
-            label=f"Capture joint tuning {fixture.label}", before_run=before_run,
-            compile_group=(f"{fixture.label}-plan-family"
-                           if self.compile_decoder else None))
-        after_free = torch.cuda.mem_get_info(self.device)[0]
-        if after_free < max(1 << 30, session.headroom_bytes):
-            for graph in graphs.values():
-                graph.reset()
-            raise MemoryError("contextual graph catalog exceeded the reserved capture headroom")
-        candidates = ()
+        graphs, compiled, candidates = {}, {}, ()
         try:
+            captured, artifacts = self._capture(session, functions, signatures,
+                label=f"Capture joint tuning {fixture.label}",
+                before_run=lambda name: fixture.restore_tune(members[name][1]),
+                compile_group=f"{fixture.label}-plan-family" if self.compile_decoder else None)
+            graphs.update(captured)
+            compiled.update(artifacts)
+            observations = {name + "-observe": fixture.observation_forward(layer)
+                            for name, (_, layer) in members.items()}
+            captured, artifacts = self._capture(session, observations,
+                {name: fixture.trial_signature for name in observations},
+                label=f"Capture joint tuning observations {fixture.label}",
+                before_run=lambda name: fixture.restore_tune(members[name.removesuffix("-observe")][1]),
+                compile_group=f"{fixture.label}-observation-family" if self.compile_decoder else None)
+            graphs.update(captured)
+            compiled.update(artifacts)
+            after_free = torch.cuda.mem_get_info(self.device)[0]
+            if after_free < max(1 << 30, session.headroom_bytes):
+                raise MemoryError("contextual graph catalog exceeded the reserved capture headroom")
             candidates = tuple(ContextCandidate(name=name, plans=members[name][0],
-                call=fixture.prepared_call(name, graphs[name], compiled.get(name), members[name][1]))
-                for name in functions)
+                call=fixture.prepared_call(name, graphs[name], compiled.get(name), members[name][1],
+                    graphs[name + "-observe"], compiled.get(name + "-observe"))) for name in functions)
             with phase(self.progress, f"Compare complete layer {fixture.label}",
                        total=len(candidates) * session.rounds) as stage:
                 self._race_stage = stage
@@ -289,8 +271,6 @@ class CatalogContextualSelection:
                     self._race_stage = None
             return result, after_free
         finally:
-            # A declaration check can fail before b12x enters its race cleanup.
-            # CUDA graph reset is idempotent after the normal race close path.
             for graph in graphs.values():
                 graph.reset()
             candidates = ()
@@ -299,24 +279,26 @@ class CatalogContextualSelection:
             functions.clear()
             members.clear()
 
-    def _validate_winner(self, session, fixture, fixture_index, plans, workspace, selection):
+    def _validate_winner(self, session, fixture, fixture_index, plans, selection):
         chosen = tuple(plans[(fixture_index, role)][offset]
                        for role, offset in zip(_ROLES, selection, strict=True))
         layer = prepared_layer_variant(self.layers[fixture_index], qkv_plan=chosen[0],
-            norm_plan=chosen[1], query_plan=chosen[2], side_workspace=workspace)
+            norm_plan=chosen[1], query_plan=chosen[2])
         name = f"{fixture.label}-heldout"
-        graphs, compiled = self._capture(session, {name: fixture.trial_forward(layer)},
-            {name: fixture.trial_signature},
+        observation = name + "-observe"
+        graphs, compiled = self._capture(session,
+            {name: fixture.trial_forward(layer), observation: fixture.observation_forward(layer)},
+            {name: fixture.trial_signature, observation: fixture.trial_signature},
             label="Validate contextual layer choice",
             before_run=lambda name: fixture.restore_tune(layer))
         try:
             fixture.restore_holdout(layer)
             graphs[name].replay()
             torch.cuda.synchronize(self.device)
-            fixture.validate_result(layer)
-            return fixture.validate_numeric(layer)
+            return fixture.validate_trial(layer, graphs[observation])
         finally:
-            graphs[name].reset()
+            for graph in graphs.values():
+                graph.reset()
             compiled.clear()
 
     def _select_group(self, session, requests, finalists):
@@ -326,19 +308,14 @@ class CatalogContextualSelection:
         if not selections:
             raise RuntimeError("contextual tuning has no legal operator tuples")
         plans = self._prepare_alternatives(session, requests, names, configs)
-        side_workspaces = self._side_workspace(plans)
         session.preview_context_bindings()
-        backing = self.arena.tensor.untyped_storage().data_ptr()
-        if any(workspace is not None and workspace.untyped_storage().data_ptr() != backing
-               for workspace in side_workspaces):
-            raise RuntimeError("contextual scratch binding moved an overlapping projection view")
         measurements, race_results = {}, {}
         for fixture_index, fixture in enumerate(self.fixtures):
             self.collective = fixture.layer.attention_reduce.runtime
             fixture.initialize()
             try:
                 result, free_after = self._race_layer(session, fixture, fixture_index, configs,
-                    plans, side_workspaces[fixture_index], selections)
+                    plans, selections)
                 race_results[fixture_index] = result
                 measurements[fixture_index] = result.latencies_us
                 self._free_after[fixture.label] = free_after
@@ -365,7 +342,7 @@ class CatalogContextualSelection:
             fixture.initialize()
             try:
                 validation[fixture.label] = self._validate_winner(session, fixture, fixture_index,
-                    plans, side_workspaces[fixture_index], winning_selection)
+                    plans, winning_selection)
             finally:
                 fixture.close()
         choices, obligations = {}, []
@@ -404,7 +381,7 @@ class CatalogContextualSelection:
                                                               winning_selection, strict=True)},
             "standalone_tuple": standalone_name,
             "standalone_total_us": totals[standalone_name],
-            "target_rows": self.layers[0].metadata.positions.numel(),
+            "target_rows": self.fixtures[0].tokens,
             "contexts": tuple(fixture.label for fixture in self.fixtures),
             "cache_policy": {fixture.label: race_results[index].cache_policy
                              for index, fixture in enumerate(self.fixtures)},
@@ -432,17 +409,13 @@ class CatalogContextualSelection:
                 reports.append(report)
         finally:
             self.fixtures, self.layers = fixtures, layers
+            for fixture in fixtures:
+                fixture.release_examples()
         return choices, {"groups": reports, "contexts": len(fixtures)}
 
 
-def prepared_layer_variant(layer, *, qkv_plan, norm_plan, query_plan, side_workspace=None):
-    """Bind three prepared Plans to a layer without copying weights or model state.
-
-    The returned layer shares every tensor, collective, and cache owner with the
-    catalog layer. Only the Python objects that dispatch the three candidate
-    kernels are copied. Captured graphs retain this variant until their replay
-    and cleanup finish; the catalog layer remains available for final binding.
-    """
+def prepared_layer_variant(layer, *, qkv_plan, norm_plan, query_plan):
+    """Bind prepared attention plans while sharing immutable weights and cache owners."""
     attention = layer.attention
     if attention.norm_quant is None or set(("qkv_a", "q_b")) - attention.projections.keys():
         raise ValueError("contextual layer requires fused query normalization and two MXFP8 projections")
@@ -459,27 +432,20 @@ def prepared_layer_variant(layer, *, qkv_plan, norm_plan, query_plan, side_works
     candidate.attention.projections = dict(attention.projections)
     query_input = copy(attention.projections["qkv_a"])
     query_input.plan = qkv_plan
+    query_input._finalize_functional()
     norm = copy(attention.norm_quant)
     norm.plan = norm_plan
     query_output = copy(attention.projections["q_b"])
     query_output.plan = query_plan
+    query_output._finalize_functional()
     candidate.attention.projections["qkv_a"] = query_input
     candidate.attention.projections["q_b"] = query_output
     candidate.attention.norm_quant = norm
-
     chain = attention.concurrent_query
     if chain is not None:
-        if (chain.encoded_projection is not attention.projections["q_b"]
-                or chain.projections != (attention.projections["q_b"],)
-                or side_workspace is None or side_workspace.dtype != torch.uint8
-                or side_workspace.device != query_output.output.device
-                or side_workspace.ndim != 1 or not side_workspace.is_contiguous()
-                or side_workspace.nbytes < query_plan.memory_requirements().scratch_nbytes):
-            raise ValueError("contextual query overlap requires disjoint caller-owned scratch")
+        if chain.encoded_layouts is None or len(chain.plan_owners) != 1:
+            raise ValueError("contextual query overlap requires one functional encoded projection")
         candidate.attention.concurrent_query = copy(chain)
-        candidate.attention.concurrent_query.projections = (query_output,)
-        candidate.attention.concurrent_query.encoded_projection = query_output
-        candidate.attention.concurrent_query.workspace = side_workspace
-    elif side_workspace is not None:
-        raise ValueError("serial contextual query projection has no side workspace")
+        candidate.attention.concurrent_query.plan_owners = (query_output,)
+        candidate.attention.concurrent_query._finalize_functional()
     return candidate

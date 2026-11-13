@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Semantic host uploads and persistent-state dependencies of prepared programs."""
 
-from . import runtime_package_pb2 as p
+from . import runtime_core_pb2 as p
 
 
 def binding(buffer, source, indexing=p.SUBMISSION_ROW, *, offset=0, padding=0, tensor=""):

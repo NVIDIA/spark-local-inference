@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::{Decoded, Protocol};
 use crate::{
     Result,
@@ -146,6 +152,7 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
                             id: optional_id(call, "id")?,
                             name: field(&call["function"], "name")?.into(),
                             arguments: arguments(&call["function"]["arguments"])?,
+                            arguments_source: call["function"]["arguments"].as_str().map(str::to_owned),
                         });
                     }
                 }
@@ -186,6 +193,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                         id: Some(field(block, "id")?.into()),
                         name: field(block, "name")?.into(),
                         arguments: arguments(&block["input"])?,
+                        arguments_source: block["input"].as_str().map(str::to_owned),
                     }],
                     "tool_result" => vec![Part::ToolResult {
                         id: Some(field(block, "tool_use_id")?.into()),
@@ -258,6 +266,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                         item.get("namespace").and_then(Value::as_str),
                     ),
                     arguments: arguments(&item["arguments"])?,
+                    arguments_source: item["arguments"].as_str().map(str::to_owned),
                 }],
             ),
             "custom_tool_call" => (
@@ -269,6 +278,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                         item.get("namespace").and_then(Value::as_str),
                     ),
                     arguments: json!({"input":field(&item,"input")?}),
+                    arguments_source: None,
                 }],
             ),
             "function_call_output" | "custom_tool_call_output" => (
@@ -382,10 +392,29 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
         grammar,
     })
 }
+fn thinking_budget(value: &Value) -> Result<u32> {
+    let budget = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("thinking_token_budget must be a positive 32-bit integer")?;
+    if budget == 0 {
+        return Err("thinking_token_budget must be positive; disable thinking with enable_thinking=false or reasoning effort none".into());
+    }
+    Ok(budget)
+}
+
 fn options(body: &Value, protocol: Protocol) -> Result<Options> {
     let mut options = Options::default();
     options.sampling = serde_json::from_value(body.clone())
         .map_err(|e| format!("invalid sampling options: {e}"))?;
+    if let Some(budget) = body.get("thinking_token_budget").filter(|v| !v.is_null()) {
+        if protocol == Protocol::Completions {
+            return Err("thinking_token_budget is not supported by raw Completions".into());
+        }
+        options.thinking_budget = Some(ThinkingBudget::Required(u64::from(thinking_budget(
+            budget,
+        )?)));
+    }
     let limit = match protocol {
         Protocol::Responses => body.get("max_output_tokens"),
         Protocol::Chat => body
@@ -482,11 +511,26 @@ fn options(body: &Value, protocol: Protocol) -> Result<Options> {
         options
             .template
             .insert("enable_thinking".into(), enabled.into());
-        if let Some(budget) = body["thinking"].get("budget_tokens") {
+        if let Some(budget) = body["thinking"].get("budget_tokens").filter(|v| !v.is_null()) {
             let budget = budget
                 .as_u64()
-                .filter(|v| *v > 0)
-                .ok_or("thinking budget must be positive")?;
+                .ok_or("thinking budget must be a positive integer")?;
+            if budget == 0 {
+                return Err("thinking budget must be positive".into());
+            }
+            if enabled {
+                if options
+                    .thinking_budget
+                    .is_some_and(|value| value.tokens() != budget)
+                {
+                    return Err(
+                        "thinking_token_budget and thinking.budget_tokens must match".into(),
+                    );
+                }
+                options
+                    .thinking_budget
+                    .get_or_insert(ThinkingBudget::Advisory(budget));
+            }
             options.effort.get_or_insert(if budget <= 5000 {
                 Effort::Low
             } else if budget <= 20000 {
@@ -933,10 +977,13 @@ mod native_prompt_tests {
                     "<|media_begin|>",
                     "<|media_content|>",
                     "<|media_end|>",
+                    "<｜System｜>",
+                    "<｜User｜>",
                 ]
                 .map(|s| AddedToken::from(s, true)),
             )
             .unwrap();
+        tokenizer.add_tokens([AddedToken::from("｜DSML｜", false)]).unwrap();
         let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").unwrap();
         let bytes = tokenizer.to_string(false).unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -1000,6 +1047,47 @@ mod native_prompt_tests {
     }
 
     #[test]
+    fn tool_argument_sources_survive_protocol_decoding_and_native_preparation() {
+        let source = r#"{"z":1e2,"a":[1,  2],"z":-0,"s":"café\n"}"#;
+        let (frontend, compiler, mut config) = renderer(
+            PromptEncoder::Jinja,
+            Some(include_str!("../../../../ignition/recipes/kimi31/assets/chat_template.jinja")),
+            TemplateEncoding::TokenSegments,
+        );
+        config.contract.frontend.rejected_tokens.clear();
+        let expected_argument = "<|open|>argument key=\"z\" type=\"number\"<|sep|>";
+        for (protocol, body) in [
+            (Protocol::Chat, json!({"messages":[{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"lookup","arguments":source}}]}, {"role":"user","content":"Continue"}]})),
+            (Protocol::Responses, json!({"input":[{"type":"function_call","call_id":"a","name":"lookup","arguments":source},{"role":"user","content":"Continue"}]})),
+            (Protocol::Messages, json!({"max_tokens":4,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"lookup","input":source}]},{"role":"user","content":"Continue"}]})),
+        ] {
+            for invalid in ["{", "null", "[]", "1", r#"{"x":1} trailing"#] {
+                let mut malformed = body.clone();
+                let pointer = match protocol {
+                    Protocol::Chat => "/messages/0/tool_calls/0/function/arguments",
+                    Protocol::Responses => "/input/0/arguments",
+                    Protocol::Messages => "/messages/0/content/0/input",
+                    _ => unreachable!(),
+                };
+                *malformed.pointer_mut(pointer).unwrap() = json!(invalid);
+                let error = decode(protocol, malformed, false).err().unwrap().to_string();
+                assert!(error.contains("invalid tool arguments JSON") || error.contains("tool arguments must be a JSON object"), "{error}");
+            }
+            let decoded = decode(protocol, body, false).unwrap();
+            let Input::Conversation(messages) = &decoded.request.input else { panic!() };
+            assert!(matches!(&messages[0].parts[0], Part::ToolCall { arguments_source: Some(original), arguments, .. }
+                if original == source && arguments["a"] == json!([1,2])));
+            let prepared = crate::server::request::prepare_inference(
+                &frontend, None, &compiler, &config, &decoded.request, 0, false,
+            ).unwrap();
+            assert!(prepared.rendered_prompt.contains(&format!("{expected_argument}1e2<|close|>argument")), "{}", prepared.rendered_prompt);
+            assert!(prepared.rendered_prompt.contains(&format!("{expected_argument}-0<|close|>argument")));
+            assert!(prepared.rendered_prompt.contains("<|sep|>[1,  2]<|close|>argument"));
+            assert!(prepared.rendered_prompt.contains("<|sep|>café\n<|close|>argument"));
+        }
+    }
+
+    #[test]
     fn messages_image_hints_end_after_expansion_for_text_and_segmented_templates() {
         use crate::frontend::images::{
             ImageLimits, ImageProcessor, ImageSettings, QwenImageSettings,
@@ -1021,7 +1109,7 @@ mod native_prompt_tests {
             "media_type":"image/png", "data":base64::engine::general_purpose::STANDARD.encode(png)}});
         for (template, encoding, layout, placeholder) in [
             (
-                include_str!("../../../../ignition/recipes/qwen38/assets/chat_template.jinja"),
+                &crate::template_fixtures::template("qwen38", "chat_template")[..],
                 TemplateEncoding::Text,
                 ImageLayoutKind::Qwen,
                 "<|image_pad|>",
@@ -1447,6 +1535,289 @@ mod native_prompt_tests {
     }
 
     #[test]
+    fn thinking_token_budget_decodes_on_conversation_protocols() {
+        for protocol in [Protocol::Chat, Protocol::Responses, Protocol::Messages] {
+            let mut body = match protocol {
+                Protocol::Responses => json!({"input":"Hello"}),
+                _ => json!({"messages":[{"role":"user","content":"Hello"}],"max_tokens":32}),
+            };
+            body["thinking_token_budget"] = json!(16);
+            assert_eq!(
+                decode(protocol, body.clone(), false)
+                    .unwrap()
+                    .request
+                    .options
+                    .thinking_budget,
+                Some(ThinkingBudget::Required(16))
+            );
+            body["thinking_token_budget"] = Value::Null;
+            assert_eq!(
+                decode(protocol, body.clone(), false)
+                    .unwrap()
+                    .request
+                    .options
+                    .thinking_budget,
+                None
+            );
+            for value in [
+                json!(0),
+                json!(-1),
+                json!(1.5),
+                json!("16"),
+                json!(true),
+                json!(u64::MAX),
+            ] {
+                body["thinking_token_budget"] = value;
+                let error = decode(protocol, body.clone(), false).err().unwrap();
+                assert!(
+                    error.to_string().contains("thinking_token_budget"),
+                    "{error}"
+                );
+            }
+        }
+        assert!(
+            decode(
+                Protocol::Completions,
+                json!({"prompt":"Hello","thinking_token_budget":null}),
+                false
+            )
+            .is_ok()
+        );
+        let error = decode(
+            Protocol::Completions,
+            json!({"prompt":"Hello","thinking_token_budget":16}),
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("thinking_token_budget"));
+    }
+
+    #[test]
+    fn messages_budgets_agree_and_keep_effort_mapping() {
+        for mode in ["enabled", "adaptive"] {
+            for (budget, effort) in [
+                (32, Effort::Low),
+                (6000, Effort::High),
+                (21000, Effort::Max),
+            ] {
+                let mut body = json!({"max_tokens":64,"messages":[{"role":"user","content":"Hello"}],
+                    "thinking":{"type":mode,"budget_tokens":budget}});
+                let decoded = decode(Protocol::Messages, body.clone(), false).unwrap();
+                assert_eq!(
+                    decoded.request.options.thinking_budget,
+                    Some(ThinkingBudget::Advisory(budget))
+                );
+                assert_eq!(decoded.request.options.effort, Some(effort));
+                body["thinking_token_budget"] = json!(budget);
+                body["output_config"] = json!({"effort":"max"});
+                assert_eq!(
+                    decode(Protocol::Messages, body.clone(), false)
+                        .unwrap()
+                        .request
+                        .options
+                        .effort,
+                    Some(Effort::Max)
+                );
+                body["thinking_token_budget"] = json!(budget + 1);
+                assert!(
+                    decode(Protocol::Messages, body, false)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("must match")
+                );
+            }
+        }
+        let decoded = decode(
+            Protocol::Messages,
+            json!({"max_tokens":64,
+            "messages":[{"role":"user","content":"Hello"}],
+            "thinking":{"type":"disabled","budget_tokens":32}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(decoded.request.options.thinking_budget, None);
+    }
+
+    #[test]
+    fn messages_budget_errors_and_large_values_preserve_messages_semantics() {
+        let (frontend, compiler, config) = native(PromptEncoder::DeepseekV41);
+        let mut body = json!({"max_tokens":32,"messages":[{"role":"user","content":"Hello"}],
+            "thinking":{"type":"enabled","budget_tokens":null}});
+        assert_eq!(
+            decode(Protocol::Messages, body.clone(), false)
+                .unwrap()
+                .request
+                .options
+                .thinking_budget,
+            None
+        );
+        for value in [json!(0), json!(-1), json!(1.5), json!("32"), json!(true)] {
+            body["thinking"]["budget_tokens"] = value;
+            let error = decode(Protocol::Messages, body.clone(), false)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.starts_with("thinking budget must be"), "{error}");
+            assert!(!error.contains("thinking_token_budget") && !error.contains("enable_thinking"));
+        }
+        let budget = u64::MAX;
+        body["thinking"]["budget_tokens"] = json!(budget);
+        let decoded = decode(Protocol::Messages, body.clone(), false).unwrap();
+        assert_eq!(
+            decoded.request.options.thinking_budget,
+            Some(ThinkingBudget::Advisory(budget))
+        );
+        assert_eq!(decoded.request.options.effort, Some(Effort::Max));
+        let prepared = crate::server::request::prepare_inference(
+            &frontend,
+            None,
+            &compiler,
+            &config,
+            &decoded.request,
+            0,
+            false,
+        )
+        .unwrap();
+        assert!(prepared.prompt.reasoning_cut.is_none());
+        assert_eq!(prepared.prompt.max_new_tokens, 32);
+        body["thinking_token_budget"] = json!(16);
+        assert!(
+            decode(Protocol::Messages, body.clone(), false)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must match")
+        );
+    }
+
+    #[test]
+    fn thinking_budget_preparation_preserves_prompts_and_limits_each_pass() {
+        for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, config) = native(encoder);
+            let decoded = decode(
+                Protocol::Chat,
+                json!({"max_tokens":32,"seed":7,
+                "messages":[{"role":"user","content":"Hello"}]}),
+                false,
+            )
+            .unwrap();
+            let prepare = |request: &crate::server::inference::Request| {
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, request, 0, false,
+                )
+            };
+            let plain = prepare(&decoded.request).unwrap();
+            assert!(plain.prompt.reasoning_cut.is_none());
+            for budget in [16, 32, 64] {
+                let mut request = decoded.request.clone();
+                request.options.thinking_budget = Some(ThinkingBudget::Required(budget));
+                let prepared = prepare(&request).unwrap();
+                assert_eq!(prepared.rendered_prompt, plain.rendered_prompt);
+                assert_eq!(prepared.prompt.tokens, plain.prompt.tokens);
+                assert_eq!(
+                    prepared.prompt.message_boundaries,
+                    plain.prompt.message_boundaries
+                );
+                assert_eq!(
+                    serde_json::to_value(&prepared.prompt.sampling).unwrap(),
+                    serde_json::to_value(&plain.prompt.sampling).unwrap()
+                );
+                assert_eq!(prepared.prompt.max_new_tokens, budget.min(32) as u32);
+                assert_eq!(
+                    prepared.prompt.reasoning_cut.as_ref().map(|cut| cut.after),
+                    (budget < 32).then_some(16)
+                );
+                if let Some(cut) = prepared.prompt.reasoning_cut {
+                    assert_eq!(frontend.encode("</think>", false).unwrap(), vec![cut.close]);
+                }
+            }
+        }
+        for (encoder, options) in [
+            (PromptEncoder::DeepseekV41, json!({"enable_thinking":false})),
+            (PromptEncoder::DeepseekV4, json!({"thinking_mode":"chat"})),
+            (PromptEncoder::Jinja, json!({})),
+        ] {
+            let (frontend, compiler, mut config) = native(encoder);
+            if encoder == PromptEncoder::Jinja {
+                config.contract.frontend.reasoning = None;
+            }
+            let mut decoded = decode(
+                Protocol::Chat,
+                json!({"max_tokens":32,"thinking_token_budget":16,
+                "messages":[{"role":"user","content":"Hello"}]}),
+                false,
+            )
+            .unwrap();
+            decoded
+                .request
+                .options
+                .template
+                .extend(options.as_object().unwrap().clone());
+            let prepared = crate::server::request::prepare_inference(
+                &frontend,
+                None,
+                &compiler,
+                &config,
+                &decoded.request,
+                0,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.output.unwrap().content.start,
+                crate::output::tagged::OutputStart::Content
+            );
+            assert!(prepared.prompt.reasoning_cut.is_none());
+            assert_eq!(prepared.prompt.max_new_tokens, 32);
+        }
+    }
+
+    #[test]
+    fn thinking_budget_keeps_messages_advisory_on_unsupported_formats() {
+        for close in [None, Some("</think>extra")] {
+            let (frontend, compiler, mut config) = native(PromptEncoder::DeepseekV41);
+            if let Some(close) = close {
+                config.contract.frontend.reasoning.as_mut().unwrap().close = close.into();
+            } else {
+                config.contract.frontend.reasoning = None;
+            }
+            let mut body = json!({"max_tokens":32,"messages":[{"role":"user","content":"Hello"}],
+                "thinking":{"type":"enabled","budget_tokens":16}});
+            for explicit in [false, true] {
+                if explicit {
+                    body["thinking_token_budget"] = json!(16);
+                }
+                let decoded = decode(Protocol::Messages, body.clone(), false).unwrap();
+                assert_eq!(decoded.request.options.effort, Some(Effort::Low));
+                let prepared = crate::server::request::prepare_inference(
+                    &frontend,
+                    None,
+                    &compiler,
+                    &config,
+                    &decoded.request,
+                    0,
+                    false,
+                );
+                if explicit && close.is_some() {
+                    assert!(
+                        prepared
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("thinking_token_budget is not supported")
+                    );
+                } else {
+                    let prepared = prepared.unwrap();
+                    assert!(prepared.prompt.reasoning_cut.is_none());
+                    assert_eq!(prepared.prompt.max_new_tokens, 32);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn anthropic_thinking_budget_maps_to_native_effort_without_continuation() {
         for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
             let (frontend, compiler, config) = native(encoder);
@@ -1468,6 +1839,10 @@ mod native_prompt_tests {
                 false,
             )
             .unwrap();
+            assert_eq!(
+                decoded.request.options.thinking_budget,
+                Some(ThinkingBudget::Advisory(4000))
+            );
             assert!(prepared.rendered_prompt.ends_with("<｜Assistant｜><think>"));
             assert_eq!(
                 prepared.output.unwrap().content.start,

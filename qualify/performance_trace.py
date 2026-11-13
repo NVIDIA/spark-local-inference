@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Analyze exported Nsight graph timelines without inferring graph identities.
 
 The SQLite file is opened read-only. Times remain in the trace's nanosecond

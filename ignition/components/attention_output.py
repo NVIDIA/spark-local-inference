@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared grouped low-rank attention output projection through b12x."""
 
 import torch
@@ -41,6 +44,20 @@ class PreparedGroupedOutputProjection:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
+    def functional(self, *, session):
+        self.output_layout = (tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.output = self.workspace = self.scratch = None
+
     def __call__(self, source):
-        wo_projection.run_out(source, self.weights, out=self.output, scratch=self.scratch, plan=self.plan)
-        return self.output
+        output, scratch = self.output, self.scratch
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+            scratch, = (torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.scratch_layout)
+        wo_projection.run_out(source, self.weights, out=output, scratch=scratch, plan=self.plan)
+        return output

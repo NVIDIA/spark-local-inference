@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Rank-local direct transfers of stacked Muse Spark checkpoint weights."""
 
 from contextlib import nullcontext
@@ -50,9 +53,9 @@ class ModelWeights:
     scale_scratch: tuple = ()
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, package_storage=None, draft_snapshot=None):
+    def load(cls, manifest, device, *, shard, progress=None, core_storage=None, draft_snapshot=None):
         before = torch.cuda.memory_allocated(device)
-        loading = nullcontext if package_storage is None else package_storage.transient
+        loading = nullcontext if core_storage is None else core_storage.transient
         with loading(), MuseSparkWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
             config = loader.config
             if draft_snapshot is not None:

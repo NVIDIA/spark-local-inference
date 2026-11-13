@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use flare_selene::{CacheGeometry, Result, offload::*, pool::PoolOptions, slab};
 
 fn pool(address: &str) -> PoolOptions {

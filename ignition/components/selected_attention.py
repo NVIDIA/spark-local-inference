@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared b12x paged GQA over caller-selected logical token positions."""
 
 from dataclasses import dataclass, replace
@@ -15,6 +18,7 @@ from b12x.attention.qsa._sparse_gqa_cute_config import split_row_limit
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
@@ -104,26 +108,30 @@ class PreparedSelectedAttention:
 
         _output_gate_stride(output_gate, query)
         self.output_gate = output_gate
-        self.descale = torch.ones(1, dtype=torch.float32, device=query.device)
+        self.descale = persistent_empty((1,), torch.float32, query.device).fill_(1)
         q = Query(tuple(tensor_facts(x) for x in (query, key, value, requests, selected)),
                   tensor_facts(output_gate) if output_gate is not None else None)
 
+        device, heads, dim = query.device, query.shape[1], query.shape[2]
+
         def materialize(tactic):
-            programs = compile_attention(q.operands, q.output_gate, tactic[1], query.device.index)
+            programs = compile_attention(q.operands, q.output_gate, tactic[1], device.index)
             load_programs(programs)
             return attach_programs(State(q, tactic, programs), *programs.values())
 
         self.plan = native_plan(contract=CONTRACT, query=q, device=query.device,
-            scratch_bytes=lambda t: 0 if q.direct else q.rows * t[0] * query.shape[1] * (query.shape[2] + 1) * 4,
+            scratch_bytes=lambda t: 0 if q.direct else q.rows * t[0] * heads * (dim + 1) * 4,
             materialize=materialize, compile_jobs=lambda t, d: (CompileJob.create(
                 "ignition.components.selected_attention:compile_attention", q.operands, q.output_gate, t[1], d.ordinal),))
 
+        declaration, declaration_gate = self.arguments, self.output_gate
+
         def call(state, benchmark=False):
-            args, gate = self.arguments, self.output_gate
+            args, gate = declaration, declaration_gate
             produce = None
             if benchmark:
                 def inputs():
-                    a, k, v, pt, r, pos, ids, out = self.arguments
+                    a, k, v, pt, r, pos, ids, out = declaration
                     a, pt, r, pos, ids, out = (torch.empty_like(x) for x in (a, pt, r, pos, ids, out))
                     a.normal_(std=.2)
                     pt.zero_()
@@ -152,6 +160,22 @@ class PreparedSelectedAttention:
     def _bind(self, workspace):
         self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
 
-    def __call__(self):
-        _execute(*self.arguments, self.output_gate, self.descale, self.scratch, self.plan.handle)
-        return self.arguments[-1]
+    def functional(self, *, session):
+        self.cache = self.arguments[1:3]
+        self.output_layout = tuple(self.arguments[-1].shape), tuple(self.arguments[-1].stride())
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.arguments = self.output_gate = self.scratch = None
+
+    def __call__(self, query=None, pages=None, requests=None, positions=None, selected=None, *, output_gate=None):
+        if self.arguments is not None:
+            _execute(*self.arguments, self.output_gate, self.descale, self.scratch, self.plan.handle)
+            return self.arguments[-1]
+        output = torch.empty_strided(*self.output_layout, dtype=query.dtype, device=query.device).zero_()
+        scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        _execute(query, *self.cache, pages, requests, positions, selected, output, output_gate,
+                 self.descale, scratch, self.plan.handle)
+        return output

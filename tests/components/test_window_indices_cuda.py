@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compiled and native window metadata with layer-specific cache consumers."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,9 +20,42 @@ from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
 from ignition.recipes.deepseek4.attention import AttentionIndices
 from ignition.recipes.deepseek41.attention import AttentionIndices as DeepSeek41Indices
-from ignition.preparation.scratch import GraphBufferPool
+from tests.tensor_examples import TensorExamples
 from .test_window_indices import assert_metadata_equal, poison, set_metadata
 from .window_indices_reference import LiteralDeepSeek4WindowIndices, LiteralDeepSeek41WindowIndices
+
+
+def observe_indices(operation, metadata, *, visible=None, replay_start=None):
+    values = {name: getattr(operation, name)
+              for name in ("window_slots", "window_indices", "window_lengths")}
+    if hasattr(operation, "position"):
+        values["position"] = operation.position
+        values["ratios"] = {ratio: SimpleNamespace(**{name: value
+            for name, value in vars(planes).items()}) for ratio, planes in operation.ratios.items()}
+    output = SimpleNamespace(**values)
+    operation.functional()
+    def forward():
+        options = dict(visible=visible)
+        if replay_start is not None:
+            options["replay_start"] = replay_start
+        packet = operation(metadata, **options)
+        for name in ("window_slots", "window_indices", "window_lengths"):
+            getattr(output, name).copy_(getattr(packet, name))
+        if hasattr(output, "position"):
+            output.position.copy_(packet.position)
+            for ratio, planes in output.ratios.items():
+                for name, value in vars(planes).items():
+                    value.copy_(getattr(packet.ratios[ratio], name))
+    return output, forward
+
+
+def poison_outputs(indices):
+    poison(indices)
+    if hasattr(indices, "position"):
+        indices.position.fill_(-777)
+        for planes in indices.ratios.values():
+            for value in vars(planes).values():
+                value.fill_(-777)
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -47,19 +85,17 @@ def test_compiled_native_window_metadata(recipe, mode, tokens, rows, query_capac
                   torch.arange(tokens, device=device).flip(0) % 193) if visible else None
     replay_start = torch.zeros(rows, dtype=torch.int64, device=device) if mode == "prefill" and recipe == "deepseek41" else None
     if recipe == "deepseek4":
-        buffers = GraphBufferPool(device)
-        actual = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visibility, buffers=buffers.cursor())
+        actual = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visibility)
         reference = LiteralDeepSeek4WindowIndices
     else:
-        buffers = GraphBufferPool(device)
         actual = DeepSeek41Indices(metadata, mode=mode, tokens=tokens, page_size=page_size,
-            width=width, replay_start=replay_start, ratios=() if mode == "draft" else (1, 2),
-            buffers=buffers.cursor())
+            width=width, replay_start=replay_start, ratios=() if mode == "draft" else (1, 2))
         reference = LiteralDeepSeek41WindowIndices
     expected = reference(metadata, mode=mode, tokens=tokens, page_size=page_size, width=width,
                          visible=visibility, replay_start=replay_start)
     set_metadata(metadata, [127] * rows, [min(query_capacity, tokens // rows)] * rows)
-    call = compile_forward(actual)
+    actual, forward = observe_indices(actual, metadata, visible=visibility, replay_start=replay_start)
+    call = compile_forward(forward)
     call()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -78,19 +114,19 @@ def test_compiled_native_window_metadata(recipe, mode, tokens, rows, query_capac
             if replay_start is not None:
                 replay_start.copy_(metadata.starts if partial is False else torch.zeros_like(replay_start))
             expected()
-            poison(actual)
-            actual()
+            poison_outputs(actual)
+            forward()
             assert_metadata_equal(actual, expected)
             if recipe == "deepseek41":
                 from tests.recipes.test_deepseek41_indices import assert_compression
 
-                assert_compression(actual)
-            poison(actual)
+                assert_compression(actual, metadata)
+            poison_outputs(actual)
             call()
             assert_metadata_equal(actual, expected)
             if recipe == "deepseek41":
-                assert_compression(actual)
-            poison(actual)
+                assert_compression(actual, metadata)
+            poison_outputs(actual)
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             worker.submit(0)
@@ -99,7 +135,7 @@ def test_compiled_native_window_metadata(recipe, mode, tokens, rows, query_capac
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
             assert_metadata_equal(actual, expected)
             if recipe == "deepseek41":
-                assert_compression(actual)
+                assert_compression(actual, metadata)
     finally:
         worker.close()
         graph.reset()
@@ -114,12 +150,12 @@ def test_shared_window_metadata_preserves_layer_specific_attention(mode, tokens,
     metadata = Metadata.allocate(tokens, rows, 1, device, max_query_tokens=query_capacity)
     page_size = 128 + query_capacity
     width = page_size if mode == "draft" else 128
-    buffers = GraphBufferPool(device).cursor()
+    buffers = TensorExamples(device)
     shared = PreparedWindowIndices(metadata, mode=mode, tokens=tokens, page_size=page_size,
         width=width, buffers=buffers)
-    layer_buffers = [tuple(cursor.zeros((tokens, width), dtype)
-                           for dtype in (torch.int64, torch.int32))
-                     for cursor in (buffers.fork(), buffers.fork())]
+    layer_storage = tuple(torch.zeros((tokens, width), dtype=dtype, device=device)
+                          for dtype in (torch.int64, torch.int32))
+    layer_buffers = [tuple(value.view_as(value) for value in layer_storage) for _ in range(2)]
     assert layer_buffers[0][0].data_ptr() == layer_buffers[1][0].data_ptr()
     references = [LiteralDeepSeek41WindowIndices(metadata, mode=mode, tokens=tokens,
         page_size=page_size, width=width) for _ in range(2)]
@@ -150,8 +186,9 @@ def test_shared_window_metadata_preserves_layer_specific_attention(mode, tokens,
                     name=f"attention{arm}_{layer}", workspace=None))
         for writer, data in zip(history_writers, history_values):
             writer(data)
+        shared, update_shared = observe_indices(shared, metadata)
         def forward():
-            shared()
+            update_shared()
             for arm in range(2):
                 for layer in range(2):
                     if arm:
@@ -178,7 +215,7 @@ def test_shared_window_metadata_preserves_layer_specific_attention(mode, tokens,
                     lengths[0] = max(1, lengths[0] - 1)
                 set_metadata(metadata, [start + i for i in range(rows)], lengths)
                 for indices in (shared, *references):
-                    poison(indices)
+                    poison_outputs(indices)
                 for arm in outputs:
                     for output in arm:
                         output.fill_(float("nan"))

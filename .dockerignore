@@ -8,6 +8,12 @@ flare/**
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!flare-cli/
+flare-cli/**
+!flare-cli/Cargo.toml
+!flare-cli/Cargo.lock
+!flare-cli/src/
+!flare-cli/src/**
 !helios/
 helios/**
 !helios/Cargo.toml
@@ -18,6 +24,8 @@ helios/**
 !helios/proto/**
 !helios/native/
 !helios/native/**
+!helios/licenses/
+!helios/licenses/PyTorch.txt
 !eos/
 eos/**
 !eos/Cargo.toml

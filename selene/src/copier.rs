@@ -1,4 +1,9 @@
-//! The seam through which the GPU tier copies pages and rows to and from host slabs.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! The seam through which the GPU tier copies pages and rows to and from host slots.
 
 use std::{
     sync::{Arc, Mutex},
@@ -14,22 +19,24 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
-    /// GPU ids to host slabs.
+    /// GPU ids to host slots.
     Out,
-    /// Host slabs to GPU ids.
+    /// Host slots to GPU ids.
     In,
 }
 
 /// One window of a record: up to [`crate::slab::WINDOW_PAGES`] pages and
 /// optionally the row. `pages` pairs a GPU page id with the host address of
-/// the page slab holding that page's record across ranks.
+/// the page slot holding that page's record across ranks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub id: JobId,
     pub window: u32,
     pub direction: Direction,
+    /// Inbound pages and row contain one verified share, reused by every local rank.
+    pub replication: crate::record::Replication,
     pub pages: Vec<(PageId, usize)>,
-    pub row: Option<(StateSlotId, usize)>,
+    pub row: Option<(StateSlotId, Vec<usize>)>,
 }
 
 #[derive(Debug)]
@@ -44,9 +51,9 @@ pub struct Reply {
     pub elapsed: Duration,
 }
 
-/// Copies the pages and row a job names between GPU ids and host slabs.
+/// Copies the pages and row a job names between GPU ids and host slots.
 ///
-/// A job may not name a page id or a slab address twice. Memory and disk keep
+/// A job may not name a page id or a slot address twice. Memory and disk keep
 /// independent copiers, so one tier's queue never delays the other's.
 pub trait PageCopier: Send {
     /// The cross-rank record layout the copier moves.
@@ -70,7 +77,7 @@ pub trait PageCopier: Send {
 
     /// Wait up to [`CLOSE_TIMEOUT`] for outstanding jobs, discarding their
     /// replies, then stop the copier. `Err` means copies may still be running:
-    /// the caller must keep every slab and GPU id they reference alive.
+    /// the caller must keep every slot and GPU id they reference alive.
     fn close(&mut self) -> Result<()>;
 }
 

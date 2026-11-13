@@ -1,0 +1,2 @@
+License text omitted from the published crate; copied verbatim from its recorded upstream revision.
+https://github.com/dropbox/rust-alloc-no-stdlib/blob/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE

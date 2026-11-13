@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Attach a pool before the host allocates its final cache storage.
 use super::{
     AgentConfig, Budget, DeferredRecords, PoolClient, PoolConfig, PoolOptions, PoolPeers,

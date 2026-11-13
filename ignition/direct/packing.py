@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Diagnostic host uploads from the same semantic bindings consumed by Helios."""
 
 import numpy as np
 
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 
 def pack(layout, step):

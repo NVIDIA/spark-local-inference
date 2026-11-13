@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Stable mappings of the manager's shared arena and staging.
 
 use crate::{arena::Arena, data::invalid};

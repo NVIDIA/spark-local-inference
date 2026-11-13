@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Pipelined Windows file reads into a fixed, caller-owned registered buffer set.
 
 use std::{fs::File, io, os::windows::io::AsRawHandle, time::Instant};

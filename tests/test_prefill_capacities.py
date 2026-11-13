@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prefill graph capacities shared by recipes and Helios."""
 
 from ignition.components.capacity import prefill_capacities

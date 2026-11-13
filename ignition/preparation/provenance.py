@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact checkpoint provenance recorded where preparation copies weights.
 
 An entry exists only for transfers that know their logical source and ranges.

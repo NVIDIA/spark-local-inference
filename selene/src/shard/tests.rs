@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 
     use super::*;
 use std::net::TcpListener;
@@ -235,7 +240,7 @@ use std::net::TcpListener;
             events(&mut transport, 1).as_slice(),
             [TransportEvent::Stored {
                 id: JobId(7),
-                result: Err(_)
+                result: Err(_), ..
             }]
         ));
         assert!(seventh.exists());
@@ -277,7 +282,7 @@ use std::net::TcpListener;
         let zero_directory = directory("mirror-zero");
         let peer_directory = directory("mirror-peer");
         let (zero, peer) = connected();
-        let lock = record::DirectoryLock::acquire(&peer_directory).unwrap();
+        let lock = crate::testing::directory_lock(&peer_directory).unwrap();
         let service_directory = peer_directory.clone();
         let service = std::thread::spawn(move || {
             let mut peer = Peer {
@@ -370,7 +375,7 @@ use std::net::TcpListener;
     #[test]
     fn an_unconfirmed_drain_is_reported_so_the_peer_keeps_its_staging() {
         let directory = directory("drain");
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         let (zero, peer) = connected();
         let mut peer = Peer {
             staged: staged(),
@@ -412,7 +417,7 @@ use std::net::TcpListener;
     #[test]
     fn a_peer_rejects_a_header_from_another_layout() {
         let directory = directory("layout");
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         let (zero, peer) = connected();
         let peer = Peer {
             staged: staged(),
@@ -505,6 +510,42 @@ use std::net::TcpListener;
         other.header.bucket = [9; 16];
         let peers = [decode_summary(&summary(&[other]).unwrap()[5..]).unwrap()];
         assert!(agree(&zero, &peers).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agreement_compares_legacy_and_v3_headers_by_geometry() {
+        for (version, replication) in [
+            (1u32, record::Replication::default()),
+            (2u32, record::Replication { pages: true, row: true }),
+        ] {
+            let mut compact = scanned(key(128, 1), None, true, 0);
+            compact.header.set_replication(replication).unwrap();
+            let mut bytes = compact.header.encode().unwrap();
+            assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            // This fixture has one rank and one plane. Legacy entries retain
+            // an eight-byte plane size followed by the eight-byte row size.
+            bytes[181..189].copy_from_slice(&compact.header.ranks[0].planes[0].to_le_bytes());
+            bytes[189..197].copy_from_slice(&compact.header.ranks[0].row_bytes.to_le_bytes());
+            bytes[197..].fill(0);
+            let mut legacy = compact.clone();
+            legacy.header = Header::decode(&bytes).unwrap();
+            assert_eq!(legacy.header, compact.header);
+            assert_eq!(legacy.header.encode().unwrap(), bytes);
+
+            for (local, peer) in [(&compact, &legacy), (&legacy, &compact)] {
+                let peers = [decode_summary(&summary(std::slice::from_ref(peer)).unwrap()[5..]).unwrap()];
+                assert_eq!(
+                    agree(std::slice::from_ref(local), &peers).unwrap(),
+                    HashMap::from([(local.header.key, true)]),
+                );
+            }
+
+            let mut different = legacy;
+            different.header.ranks[0].row_bytes += 4096;
+            let peers = [decode_summary(&summary(&[different]).unwrap()[5..]).unwrap()];
+            assert!(agree(&[compact], &peers).unwrap().is_empty());
+        }
     }
 
     #[test]

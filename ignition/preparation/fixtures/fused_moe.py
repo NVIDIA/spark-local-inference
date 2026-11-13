@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Private activation and routing trials for prepared fused expert execution."""
 
 from functools import partial
@@ -53,7 +57,12 @@ class ExpertBenchmarkInputs:
                 dtype=self.route_inputs["router_logits"].dtype).neg().add_(top_k + 1)
                 .expand_as(self.router.ids).contiguous())
             self.long_routes = tuple(route.long() for route in self.routes)
-        self.producers = tuple(partial(self._synthetic_routes, index) for index in range(len(self.routes)))
+
+    @property
+    def producers(self):
+        # Bound methods belong to the trial calls. Storing them on this owner
+        # would keep its GPU tensors alive in a reference cycle after retirement.
+        return tuple(partial(self._synthetic_routes, index) for index in range(len(self.routes)))
 
     @property
     def nbytes(self):
@@ -84,8 +93,9 @@ def benchmark_call(state, *, source, experts, top_k, session, name, workspace,
     binding = state.bind(a=operands.source, topk_ids=operands.router.ids,
         topk_weights=operands.router.weights, output=operands.output,
         scratch=scratch, input_scales_static=True, **(precision or {}), **operands.route_inputs)
+    producers = operands.producers
     call = PreparedCall(run=lambda: state.run(binding), output=operands.output,
-        produce=operands.producers[0], benchmark_producers=operands.producers,
+        produce=producers[0], benchmark_producers=producers,
         owners=(operands, scratch, binding, experts))
     if experts.has_csf_blocks:
         from b12x.preparation._measurement import capture_benchmark_call
@@ -111,6 +121,7 @@ def scale_expansion_benchmark_call(state, *, source, experts, top_k, session, na
             top_k=top_k, allocate_router=allocate_router, router_plan=router_plan,
             integrated_query=integrated_query, output_template=output_template))
     call = scale_expansion_call(state, ids=operands.router.ids, experts=experts)
+    producers = operands.producers
     return capture_benchmark_call(replace(call,
-        produce=operands.producers[0], benchmark_producers=operands.producers,
+        produce=producers[0], benchmark_producers=producers,
         owners=(*call.owners, operands)))

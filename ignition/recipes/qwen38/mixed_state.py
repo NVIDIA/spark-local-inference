@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed target metadata with independent prompt and decode state updates."""
 
 from dataclasses import dataclass, fields, replace
@@ -9,6 +12,19 @@ from ignition.components.recurrent import DeltaMetadata
 
 from .attention import QSAMetadata
 from .ple import PLEMetadata, PLEScratch
+
+
+@dataclass
+class MixedRuntime:
+    gdn: object
+    qsa: object
+    ple: object
+    packing: object
+    prompt: object
+    decode: object
+    gdn_partitions: object
+    ple_partitions: object
+    injection_errors: object = None
 
 
 def role_inputs(inputs, tokens):
@@ -64,6 +80,20 @@ class MixedPacking:
         self.is_prompt = torch.zeros(self.tokens, dtype=torch.bool, device=device)
         self.row_ids = torch.zeros(self.tokens, dtype=torch.int64, device=device)
         self.cu = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+
+    def functional(self):
+        self.prompt = self.decode = None
+        self.rows = self.p = self.d = self.t = self.cu = None
+        self.prompt_indices = self.decode_indices = self.prompt_valid = self.decode_valid = None
+        self.prompt_source = self.decode_source = self.is_prompt = self.row_ids = None
+        return self
+
+    def runtime(self):
+        prompt = role_inputs(self.inputs, self.prefill)
+        decode = role_inputs(self.inputs, self.batch * self.width)
+        packing = MixedPacking(self.inputs, prompt, decode, self.batch, self.width, self.prefill)
+        packing.upload_roles()
+        return packing
 
     def upload_roles(self):
         i, p, d = self.inputs, self.prompt, self.decode
@@ -128,6 +158,41 @@ class StatePartitions:
     def combine(self, values, output):
         self.packing.combine(values, output)
 
+    def functional(self):
+        p = self.packing
+        parts = tuple(FunctionalStatePartition(part.mode, part.metadata, indices, valid)
+                      for part, indices, valid in zip(self.parts,
+                          (p.prompt_indices, p.decode_indices), (p.prompt_valid, p.decode_valid), strict=True))
+        return FunctionalStatePartitions(parts, p.is_prompt, p.prompt_source, p.decode_source)
+
+
+@dataclass(frozen=True)
+class FunctionalStatePartition:
+    """Gather one sequence role through persistent row maps into graph-local storage."""
+
+    mode: str
+    metadata: object
+    indices: torch.Tensor
+    valid: torch.Tensor
+
+    def gather(self, source):
+        return torch.where(self.valid.view((-1,) + (1,) * (source.ndim - 1)), source[self.indices], 0)
+
+
+@dataclass(frozen=True)
+class FunctionalStatePartitions:
+    """Combine prompt and decode results through persistent token-role maps."""
+
+    parts: tuple
+    is_prompt: torch.Tensor
+    prompt_source: torch.Tensor
+    decode_source: torch.Tensor
+
+    def combine(self, values):
+        prompt, decode = values
+        shape = (self.is_prompt.numel(),) + (1,) * (prompt.ndim - 1)
+        return torch.where(self.is_prompt.view(shape), prompt[self.prompt_source], decode[self.decode_source])
+
 
 class PreparedMixedState:
     """One target forward; prompt consumption and decode acceptance remain separate."""
@@ -166,43 +231,62 @@ class PreparedMixedState:
         self.prompt.prepare_residual(self.prompt_residual)
         self.decode.prepare_residual(self.decode_residual)
 
-    def begin(self):
-        p, d, m = self.prompt, self.decode, self.packing
-        p.begin()
-        d.begin()
-        m.bind_metadata(p, d)
-        m.combine((p.ple.token_ids, d.ple.token_ids), self.token_ids)
-        live = m.t < m.cu[-1]
-        self.token_ids.masked_fill_(~live, 248044)
-        self.gdn.query_start_loc.copy_(m.cu)
-        self.gdn.num_tokens.copy_(m.cu[-1:])
-        self.gdn.num_seqs.copy_(self.inputs.live_rows)
-        prompt_rows = m.rows == self.inputs.prefill_row[0]
-        for name in ("convolution_slots", "fresh", "accepted_tokens"):
-            getattr(self.gdn, name).copy_(torch.where(prompt_rows, getattr(p.gdn, name)[0], getattr(d.gdn, name)))
-        self.ple.committed_history.copy_(torch.where(prompt_rows[:, None], p.ple.committed_history, d.ple.committed_history))
-        q = self.qsa
-        for name in ("main_block_table", "raw_state_slot_ids", "sequence_lengths", "is_prefilling", "num_accepted_tokens"):
-            out, pv, dv = getattr(q, name), getattr(p.qsa, name), getattr(d.qsa, name)
-            out.copy_(torch.where(prompt_rows.view((-1,) + (1,) * (out.ndim - 1)), pv[0], dv))
-        q.query_start_loc.copy_(m.cu)
-        for name in ("query_positions", "rope_positions", "slot_mapping"):
-            out = getattr(q, name)
-            m.combine((getattr(p.qsa, name), getattr(d.qsa, name)), out)
-            out.masked_fill_(~live.view((-1,) + (1,) * (out.ndim - 1)), -1)
-        m.combine((p.qsa.request_ids, d.qsa.request_ids), q.request_ids)
-        active = torch.where(prompt_rows, p.token_state.active[0], d.token_state.active).bool()
-        valid = live & active[m.row_ids] & (q.request_ids >= 0)
-        q.request_ids.copy_(torch.where(valid, m.row_ids, -1))
-        q.query_positions.masked_fill_(~valid, -1)
-        q.rope_positions.masked_fill_(~valid[:, None], -1)
-        q.slot_mapping.masked_fill_(~valid, -1)
+    def functional(self):
+        self.prompt.functional(dynamic_inputs=True)
+        self.decode.functional(dynamic_inputs=True)
+        self.gdn = self.qsa = self.ple = self.token_ids = None
+        self.gdn_partitions = self.ple_partitions = None
+        self.prompt_hidden = self.decode_hidden = self.prompt_residual = self.decode_residual = None
+        self.hidden = self.residual = None
+        return self
 
-    def finish(self):
-        p, d = self.gdn_partitions.parts
-        p.gather(self.hidden, self.prompt_hidden)
-        d.gather(self.hidden, self.decode_hidden)
-        p.gather(self.residual, self.prompt_residual)
-        d.gather(self.residual, self.decode_residual)
-        self.prompt.finish()
-        self.decode.finish()
+    def combine_runtime(self, packing, prompt, decode):
+        m, p, d = packing, prompt, decode
+        m.bind_metadata(p, d)
+        token_ids = torch.empty((self.tokens,), dtype=torch.int64, device=self.inputs.token_ids.device)
+        m.combine((p.ple.token_ids, d.ple.token_ids), token_ids)
+        live = m.t < m.cu[-1]
+        token_ids.masked_fill_(~live, 248044)
+        prompt_rows = m.rows == self.inputs.prefill_row[0]
+        def roles(name):
+            return torch.where(prompt_rows, getattr(p.gdn, name)[0], getattr(d.gdn, name))
+        gdn = DeltaMetadata.allocate(self.rows, token_ids.device)
+        gdn = replace(gdn, query_start_loc=m.cu, num_tokens=m.cu[-1:], num_seqs=self.inputs.live_rows,
+                      convolution_slots=roles("convolution_slots"), fresh=roles("fresh"),
+                      accepted_tokens=roles("accepted_tokens"))
+        history = torch.where(prompt_rows[:, None], p.ple.committed_history, d.ple.committed_history)
+        ple = PLEMetadata(token_ids, gdn.query_start_loc, history, gdn.convolution_slots,
+                          gdn.fresh, gdn.accepted_tokens, gdn.num_seqs, gdn.num_tokens)
+        def qsa_rows(name):
+            pv, dv = getattr(p.qsa, name), getattr(d.qsa, name)
+            return torch.where(prompt_rows.view((-1,) + (1,) * (dv.ndim - 1)), pv[0], dv)
+        def qsa_tokens(name):
+            pv, dv = getattr(p.qsa, name), getattr(d.qsa, name)
+            output = torch.empty((self.tokens, *pv.shape[1:]), dtype=pv.dtype, device=pv.device)
+            m.combine((pv, dv), output)
+            return output
+        request_ids = qsa_tokens("request_ids")
+        active = torch.where(prompt_rows, p.values["active"][0], d.values["active"]).bool()
+        valid = live & active[m.row_ids] & (request_ids >= 0)
+        request_ids = torch.where(valid, m.row_ids, -1)
+        positions = qsa_tokens("query_positions").masked_fill(~valid, -1)
+        rope = qsa_tokens("rope_positions").masked_fill(~valid[:, None], -1)
+        mapping = qsa_tokens("slot_mapping").masked_fill(~valid, -1)
+        table = qsa_rows("main_block_table")
+        qsa = QSAMetadata(table, table, qsa_rows("raw_state_slot_ids"), request_ids, positions, rope,
+            qsa_rows("sequence_lengths"), m.cu, qsa_rows("num_accepted_tokens"),
+            qsa_rows("is_prefilling"), mapping)
+        def partitions(prompt_metadata, decode_metadata):
+            parts = (FunctionalStatePartition("prefill", prompt_metadata, m.prompt_indices, m.prompt_valid),
+                     FunctionalStatePartition("decode", decode_metadata, m.decode_indices, m.decode_valid))
+            return FunctionalStatePartitions(parts, m.is_prompt, m.prompt_source, m.decode_source)
+        return MixedRuntime(gdn, qsa, ple, m, p, d,
+            partitions(p.gdn, d.gdn), partitions(p.ple, d.ple))
+
+    def finish_runtime(self, runtime, hidden, residual):
+        prompt, decode = runtime.gdn_partitions.parts
+        prompt_hidden, decode_hidden = prompt.gather(hidden), decode.gather(hidden)
+        prompt_residual, decode_residual = prompt.gather(residual), decode.gather(residual)
+        prompt_sample = self.prompt.finish_runtime(runtime.prompt, prompt_hidden, prompt_residual)
+        decode_sample = self.decode.finish_runtime(runtime.decode, decode_hidden, decode_residual)
+        return torch.cat((decode_sample, prompt_sample), dim=0)

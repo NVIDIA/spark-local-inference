@@ -1,4 +1,8 @@
-"""Prepared-model ownership through package export and diagnostic execution."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prepared-model ownership through core export and diagnostic execution."""
 
 import json
 from threading import get_ident
@@ -17,9 +21,10 @@ class PreparedModel(PreparedExecution):
     them; it is None for recipes that do not retain them.
     """
 
-    def __init__(self, *, server_config, memory_report, session, close_resources=(), package_data=None,
+    def __init__(self, *, server_config, memory_report, session, close_resources=(), graph_resources=(), core_data=None,
                  forwards=None, embedding_catalog=None, rebuild_weights=None,
-                 benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None, **kwargs):
+                 benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None,
+                 benchmark_prefills=None, benchmark_observers=None, **kwargs):
         registry = getattr(session, "_startup_collectives", None)
         if registry is not None:
             buffers, tuners, bindings, owners = registry.catalog(kwargs["graphs"])
@@ -38,16 +43,26 @@ class PreparedModel(PreparedExecution):
             self.server_config["model_contract"] = contract
         self.memory_report = memory_report if registry is None else {**memory_report, **registry.memory_report()}
         self.session = session
-        self.package_data = package_data
+        self.core_data = core_data
         self.rebuild_weights = rebuild_weights
         self.forwards = None if forwards is None else MappingProxyType(dict(forwards))
         self.benchmark_state = None if benchmark_state is None else MappingProxyType(dict(benchmark_state))
         self.benchmark_pool = benchmark_pool
         self.benchmark_requests = benchmark_requests
         self.benchmark_rounds = None if benchmark_rounds is None else MappingProxyType(dict(benchmark_rounds))
+        self.benchmark_prefills = None if benchmark_prefills is None else MappingProxyType(dict(benchmark_prefills))
+        self.benchmark_observers = None if benchmark_observers is None else MappingProxyType(dict(benchmark_observers))
         self.embedding_catalog = embedding_catalog
         self.embedding_tables = self._embedding_binding = None
+        from .persistent import active_core_storage
+
+        storage = active_core_storage()
         self._close_resources = tuple(close_resources)
+        self._graph_resources = tuple(graph_resources)
+        if storage is not None:
+            if all(resource is not storage for resource in self._close_resources):
+                self._close_resources = (*self._close_resources, storage)
+            storage._persistent_model_owned = True
         self._rank_drained = False
         self.runtime = None
         self.closed = False
@@ -88,7 +103,7 @@ class PreparedModel(PreparedExecution):
 
         if not hasattr(flare_heliopause, "Server"):
             raise RuntimeError("in-process HTTP diagnostics require heliopause's qualification Cargo feature; "
-                               "use ignition export followed by flare run for package-based serving")
+                               "use ignition export followed by flare run for core-based serving")
         with self._handoff_lock:
             if self._consumed or self.closed:
                 raise RuntimeError("prepared model has already been consumed or closed")
@@ -142,6 +157,8 @@ class PreparedModel(PreparedExecution):
         torch.cuda.synchronize(self.device)
         for graph in self.graphs.values():
             graph.reset()
+        for resource in self._graph_resources:
+            resource.close()
         self.session.close()
         for resource in self._close_resources:
             resource.close()
@@ -152,8 +169,11 @@ class PreparedModel(PreparedExecution):
         self.serving_graphs = self.tuning_graphs = self.tuned_bindings = MappingProxyType({})
         self.forwards = None
         self.benchmark_state = self.benchmark_pool = self.benchmark_requests = self.benchmark_rounds = None
+        self.benchmark_prefills = None
+        self.benchmark_observers = None
         self.session = None
         self._close_resources = ()
+        self._graph_resources = ()
         self.runtime = None
         self._embedding_binding = self.embedding_tables = None
         self.closed = True

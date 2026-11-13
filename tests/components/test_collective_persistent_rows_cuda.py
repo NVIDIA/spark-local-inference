@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Persistent collective row ownership across changing CUDA graph shapes."""
 
 from datetime import timedelta
@@ -16,7 +19,7 @@ def _persistent_rows_rank(rank, world, rendezvous):
     from b12x.comm.pcie.pcie_oneshot import _eager_storage_shards
     from ignition.components.collectives import PreparedAllReduceRMSNorm
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -25,7 +28,7 @@ def _persistent_rows_rank(rank, world, rendezvous):
                             timeout=timedelta(minutes=5))
     graphs = []
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=4096,
                 hidden_size=6144, element_bytes=4, ipc=storage.peer_storage)
@@ -111,7 +114,7 @@ def _layer_handoff_rank(rank, world, rendezvous):
         MiniMaxM3VLDecoderLayer, MiniMaxM3VLRMSNorm,
     )
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.minimax_m3.decoder import PreparedDecoderLayer
 
@@ -130,7 +133,7 @@ def _layer_handoff_rank(rank, world, rendezvous):
                             timeout=timedelta(minutes=5))
     graphs = []
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=49,
                 hidden_size=6144, element_bytes=4, ipc=storage.peer_storage)

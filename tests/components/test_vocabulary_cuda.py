@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Sharded vocabulary projection and column gathering through native graph replay."""
 
 import os
@@ -48,7 +52,7 @@ def _rank(rank, world, rendezvous, vocab, indexed=False, output_dtype=torch.bflo
     graphs, heads, compiled = {}, {}, {}
     control = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-               "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device=device)}
+               "completion_records": torch.zeros((2, 4, 32), dtype=torch.int64, device=device)}
     worker = None
     try:
         with RecordedPreparationSession(device=device, checkpoint="vocabulary-test",

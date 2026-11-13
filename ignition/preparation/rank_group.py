@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Spawn preparation ranks and transfer their lifetime supervision to Rust."""
 
 import contextlib
@@ -37,32 +41,38 @@ def minimum_across_ranks(value, group):
     return result.item()
 
 
-def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepare, packaged, recording):
+def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepare, exporting, recording):
     import flare_heliopause
 
     flare_heliopause.bind_parent_lifetime(parent)
     # Rank zero coordinates shutdown; a terminal interrupt must not end a peer mid-drain.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
+        from ignition import runtime_patches
+
+        runtime_patches.apply()
         _use_loopback()
         dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=len(config.devices),
                                 timeout=_PREPARATION_TIMEOUT)
         recorder = storage = None
-        if packaged:
+        if exporting:
             from .module_images import ModuleImages
-            from .package_storage import PackageStorage
+            from .core_storage import CoreStorage
             import torch
 
             # Only an export needs module images; without one, a profiler may own CUPTI.
             recorder = ModuleImages() if recording else None
             with recorder if recording else contextlib.nullcontext():
                 torch.cuda.set_device(config.devices[rank])
-                storage = PackageStorage(rank=rank, world=len(config.devices), device=config.devices[rank])
+                storage = CoreStorage(rank=rank, world=len(config.devices), device=config.devices[rank])
                 with storage:
-                    model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, package_storage=storage)
+                    model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD, core_storage=storage)
         else:
             model = prepare(snapshot, config, rank=rank, group=dist.group.WORLD)
-        model.manifest()
+        if getattr(config, "retain_graphs", False):
+            model.export_manifest()
+        else:
+            model.manifest()
         control.send(model.memory_report)
         command = control.recv()
         if isinstance(command, tuple) and command[0] == "embedding_tables":
@@ -84,21 +94,21 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             control.send("embedding_tables_ready")
             command = control.recv()
         if isinstance(command, tuple) and command[0] == "export":
-            from .runtime_package import export_model
+            from .runtime_core import export_model
 
             if recorder is None:
                 raise RuntimeError("export requires module images recorded during preparation")
 
             from contextlib import nullcontext
-            from .package_snapshot import export_options
+            from .core_snapshot import export_options
             _, path, options, cache = command
             dist.barrier()
             storage.peer_storage.reset()
             dist.barrier()
             with export_options(cache.cache, no_weights=cache.no_weights, reuse_weights=cache.reuse_weights) if cache else nullcontext():
-                package = export_model(model, recorder, storage, path, options=options, sources=True)
+                core = export_model(model, recorder, storage, path, options=options, sources=True)
             control.send({"peer_memory": list(storage.peer_storage.owned.items()),
-                          "memory_inventory": package.memory_inventory})
+                          "memory_inventory": core.memory_inventory})
             command = control.recv()
         control.close()
         if command == "serve":
@@ -107,6 +117,10 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             from ignition.direct.executor import serve_peer
 
             serve_peer(model, connection, **command[1])
+        elif command == "benchmark":
+            from ignition.bench.executor import serve_peer
+
+            serve_peer(model, connection)
         elif command != "close":
             raise RuntimeError("invalid prepared rank handoff")
         connection.close()
@@ -198,6 +212,16 @@ class PreparedRankGroup:
         self._started = True
         return list(self.connections)
 
+    def start_benchmark(self):
+        """Hand every peer to restored CUDA graph measurements without native serving."""
+        if self._started or self._closed:
+            raise RuntimeError("prepared rank group has already been consumed or closed")
+        for control in self.controls:
+            control.send("benchmark")
+            control.close()
+        self._started = True
+        return list(self.connections)
+
     def close(self):
         if self._closed:
             return
@@ -230,25 +254,25 @@ class PreparedRankGroup:
         self.close()
 
 
-def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=None, ranks=None, checkpoint=None):
+def prepare_group(snapshot, config, prepare, *, progress=None, core_storage=None, ranks=None, checkpoint=None):
     """Prepare every rank before returning a root-owned native handoff.
 
     This function owns the process's Gloo group and must run in the main thread.
     Peer failure or unconfirmed CUDA drain terminates this process and its peers.
     `ranks` is rank zero's rendezvous when every rank runs on its own host; its
-    peers resolve `checkpoint` locally and, for export, prepare into their own package storage.
+    peers resolve `checkpoint` locally and, for export, prepare into their own core storage.
     """
     import flare_heliopause
 
     if ranks is not None:
         return ranks.prepare(snapshot, config, prepare, checkpoint=checkpoint, progress=progress,
-                             package_storage=package_storage)
+                             core_storage=core_storage)
 
     if dist.is_initialized():
         raise RuntimeError("rank preparation requires exclusive ownership of the control group")
     from .module_images import ModuleImages
 
-    recording = package_storage is not None and ModuleImages.active > 0
+    recording = core_storage is not None and ModuleImages.current() is not None
     rendezvous = TemporaryDirectory(prefix="flare-ranks-")
     address = Path(rendezvous.name, "gloo").as_uri()
     context = mp.get_context("spawn")
@@ -260,7 +284,7 @@ def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=N
             control, child_control = context.Pipe()
             controls.append(control)
             process = context.Process(target=_peer, args=(os.getpid(), snapshot, config, rank,
-                address, peer, child_control, prepare, package_storage is not None, recording),
+                address, peer, child_control, prepare, core_storage is not None, recording),
                 name=f"flare-rank-{rank}")
             try:
                 process.start()
@@ -283,8 +307,11 @@ def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=N
             dist.init_process_group("gloo", init_method=address, rank=0, world_size=len(config.devices),
                                     timeout=_PREPARATION_TIMEOUT)
         model = prepare(snapshot, config, rank=0, group=dist.group.WORLD, progress=progress,
-                        **({} if package_storage is None else {"package_storage": package_storage}))
-        model.manifest()
+                        **({} if core_storage is None else {"core_storage": core_storage}))
+        if getattr(config, "retain_graphs", False):
+            model.export_manifest()
+        else:
+            model.manifest()
         with phase(progress, "Wait for tensor-parallel ranks", total=len(controls)) as stage:
             reports = []
             for control in controls:

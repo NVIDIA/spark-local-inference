@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Kimi K3 attention residuals fused with the residual update and the following RMSNorm.
 
 One program per row updates the running block sum, optionally commits it as a residual block,

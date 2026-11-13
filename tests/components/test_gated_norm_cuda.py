@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused sigmoid-gated RMSNorm against the canonical FP32 computation."""
 
 import os
@@ -84,3 +88,130 @@ def test_prepared_gate_before_grouped_norm_graph(weight_dtype):
             assert not output[count:].any()
             del x, expected
             assert torch.cuda.memory_allocated() == allocated
+
+
+@pytest.mark.parametrize("encoded_only", [False, True])
+def test_gated_norm_mxfp8_prefill_graph_live_rows_and_storage(encoded_only):
+    from b12x.quantization import mxfp8
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+
+    torch.manual_seed(0)
+    rows, heads, dim = 4096, 48, 128
+    hidden = torch.randn((rows, heads, dim), device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn((rows, 16384), device="cuda", dtype=torch.bfloat16)
+    gate = packed[:, 10240:].view(rows, heads, dim)
+    weight = torch.ones(dim, device="cuda", dtype=torch.float32)
+    output = torch.empty_like(hidden)
+    live = torch.tensor([rows], device="cuda", dtype=torch.int32)
+    bases = tuple(torch.zeros(shape, dtype=dtype, device="cuda") for shape, dtype in zip(
+        mxfp8.dense_rows_storage_shapes(rows, heads * dim),
+        (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    encoded = mxfp8.dense_rows_from_bases(*bases)
+    output.fill_(17)
+    norm = PreparedGatedRMSNorm(hidden, gate, weight, None if encoded_only else output, live, eps=1e-6,
+        round_normalized=True, activation="silu", encoded=encoded)
+    norm()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        norm()
+    graph.replay()
+    torch.cuda.synchronize()
+    prior = encoded.values.clone()
+    hidden.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(prior.view(torch.uint8), encoded.values.view(torch.uint8))
+    assert torch.isfinite(encoded.values.float()).all()
+    del prior
+    allocated = torch.cuda.memory_allocated()
+    for count in (rows // 2, 0, rows):
+        live.fill_(count)
+        graph.replay()
+        torch.cuda.synchronize()
+        if encoded_only:
+            assert (output == 17).all()
+        else:
+            assert not output[count:].any()
+        assert not encoded.values.view(torch.uint8)[count:].any()
+        assert (encoded.scale_rows.view(torch.uint8).reshape(rows, -1)[count:] == 127).all()
+        assert torch.cuda.memory_allocated() == allocated
+
+
+def test_gdn_mxfp8_encodings_reuse_storage_across_captured_prefill_shapes():
+    from ignition.components.gated_delta import GDNScratch
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+    from b12x.quantization import mxfp8
+
+    scratch = GDNScratch.allocate(4096, torch.device("cuda:0"))
+    shared_bases = tuple(torch.zeros(shape, dtype=dtype, device="cuda:0")
+                         for shape, dtype in zip(mxfp8.dense_rows_storage_shapes(4096, 48 * 128),
+                             (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
+    shared_bases[1].fill_(127)
+    shared_bases[2].fill_(127)
+    weight = torch.ones(128, dtype=torch.float32, device="cuda:0")
+    live = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    graphs, outputs = [], []
+    for rows in (4096, 129, 1):
+        view = scratch.rows(rows)
+        hidden, gate = view.recurrence.view(rows, 48, 128), view.z.view(rows, 48, 128)
+        independent = view.mxfp8_output
+        shapes = mxfp8.dense_rows_storage_shapes(rows, 48 * 128)
+        shared = mxfp8.dense_rows_from_bases(*(base.reshape(-1)[:torch.Size(shape).numel()].view(shape)
+            for base, shape in zip(shared_bases, shapes, strict=True)))
+        norms = [PreparedGatedRMSNorm(hidden, gate, weight, None, live, eps=1e-6,
+            round_normalized=True, activation="silu", encoded=encoded)
+            for encoded in (independent, shared)]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for norm in norms:
+                norm()
+        graphs.append(graph)
+        outputs.append((independent, shared))
+    assert len({shared.values.data_ptr() for _, shared in outputs}) == 1
+    for index in (0, 2, 1, 0, 1, 2):
+        for tensor in shared_bases:
+            tensor.fill_(255 if tensor.dtype == torch.uint8 else 0)
+        rows = outputs[index][0].values.shape[0]
+        live.fill_(max(0, rows - 1))
+        scratch.recurrence.normal_()
+        scratch.projected_qkvz.normal_()
+        allocated = torch.cuda.memory_allocated()
+        graphs[index].replay()
+        torch.cuda.synchronize()
+        independent, shared = outputs[index]
+        assert torch.equal(shared.values.view(torch.uint8), independent.values.view(torch.uint8))
+        assert torch.equal(shared.scale_rows, independent.scale_rows)
+        def mma_rows(encoded):
+            return encoded.scale_mma.permute(2, 1, 0, 4, 3, 5).reshape(-1, 192)[:rows]
+        assert torch.equal(mma_rows(shared), mma_rows(independent))
+        assert torch.cuda.memory_allocated() == allocated
+
+
+def test_functional_gated_norm_replay_uses_runtime_live_count():
+    from ignition.components.gated_norm import PreparedGatedRMSNorm
+    from ignition.preparation.compilation import compile_forward
+
+    rows, heads, dim = 4, 4, 128
+    hidden = torch.randn((rows, heads, dim), device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(hidden)
+    weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    template_live = torch.zeros(1, dtype=torch.int32, device="cuda")
+    runtime_live = torch.zeros_like(template_live)
+    expected = torch.empty_like(hidden)
+    actual = torch.empty_like(hidden)
+    reference = PreparedGatedRMSNorm(hidden, gate, weight, expected, runtime_live,
+                                      eps=1e-6, round_normalized=True, activation="silu")
+    norm = PreparedGatedRMSNorm(hidden, gate, weight, torch.empty_like(hidden), template_live,
+                               eps=1e-6, round_normalized=True, activation="silu").functional(dynamic_live=True)
+    assert norm.live is None
+    forward = compile_forward(lambda: actual.copy_(norm(hidden, gate, live=runtime_live)))
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for count in (4, 1, 0, 3):
+        runtime_live.fill_(count)
+        graph.replay()
+        reference()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert not actual[count:].any()

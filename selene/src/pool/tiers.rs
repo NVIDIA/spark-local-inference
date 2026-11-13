@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! What a host tier holds, as the pool hears of it, and the pins and checksum
 //! thread an export from that tier needs.
 
@@ -112,9 +117,8 @@ impl TierView {
 pub(crate) struct HashJob {
     pub key: PrefixKey,
     pub pages: Vec<usize>,
-    pub page_bytes: usize,
-    pub row: Option<usize>,
-    pub row_bytes: usize,
+    pub row: Option<Vec<usize>>,
+    pub layout: Arc<crate::Layout>,
 }
 
 impl super::engine::hostfill::HostFiller<PrefixKey> {
@@ -123,7 +127,7 @@ impl super::engine::hostfill::HostFiller<PrefixKey> {
             owner: job.key,
             window: 0,
             work: Box::new(move || {
-                // The owner pins these slabs until it collects the result or joins the worker.
+                // The owner pins these slots until it collects the result or joins the worker.
                 let read = |address: usize, len: usize| unsafe {
                     std::slice::from_raw_parts(address as *const u8, len)
                 };
@@ -131,11 +135,13 @@ impl super::engine::hostfill::HostFiller<PrefixKey> {
                     pages: job
                         .pages
                         .iter()
-                        .map(|address| checksum(read(*address, job.page_bytes)))
+                        .map(|address| {
+                            checksum(read(*address, job.layout.page_record_bytes as usize))
+                        })
                         .collect(),
                     row: job
                         .row
-                        .map(|address| checksum(read(address, job.row_bytes))),
+                        .map(|slots| crate::record::row_checksum(&job.layout, &slots)),
                 })
             }),
         })
@@ -207,9 +213,19 @@ mod tests {
         assert!(hasher.submit_hash(HashJob {
             key: key(1),
             pages: vec![base, base + 64],
-            page_bytes: 64,
-            row: Some(base + 128),
-            row_bytes: 64,
+            row: Some(vec![base + 128]),
+            layout: Arc::new(crate::Layout {
+                page_tokens: 16,
+                page_record_bytes: 64,
+                row_record_bytes: 64,
+                ranks: vec![crate::geometry::RankLayout {
+                    page_offset: 0,
+                    plane_offsets: vec![0],
+                    plane_bytes: vec![64],
+                    row_bytes: 64,
+                    row_offset: 0
+                }]
+            }),
         }));
         let done = loop {
             let mut done = Vec::new();

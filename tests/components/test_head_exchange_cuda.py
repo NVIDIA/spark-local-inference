@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Context-parallel head combination across hosts matches an exact log-sum-exp merge."""
 
 import pytest

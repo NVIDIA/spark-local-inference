@@ -14,8 +14,8 @@ NVMe, then the manager. A handover drops the source only after the destination
 commits. Refusals, unavailable destinations and repeated failures keep records
 local and retry after progress; see [host retention](../docs/prefix-cache-offload.md#215-sharing-through-a-pool). GPU eviction does not initiate a late copy.
 The [shutdown drain](../docs/prefix-cache-offload.md#25-transfers-slabs-and-record-files)
-is opt-in and off by default; ordinary shutdown still drains accesses before releasing memory.
-A GPU cache hit refreshes an existing local host record's recency, but cannot
+is opt-in and off by default; shutdown without it drains accesses before releasing memory.
+A GPU cache hit refreshes a local host record's recency, but cannot
 recreate an evicted record or prevent checkpoint compaction.
 
 The protocol is `selene.v2` ([selene.proto](../selene/proto/selene.proto)); the state machines and
@@ -26,9 +26,11 @@ fencing rules are in [PROTOCOL.md](PROTOCOL.md). Running it is in
 
 ## Build and run
 
-Use Rust 1.88 or newer (validated with 1.94.1 on Linux). Serving is async on tokio and speaks
+Use Rust 1.88 or newer on Linux; the Dockerfiles build with 1.94.1. Serving is async on tokio and speaks
 gRPC through tonic and prost over a Unix socket; the crate also depends on `flare-selene` (by
 path, for shared record, index and wire types), `flare-eos` for host file I/O, and `blake2`.
+The `flare-selene` build script compiles `selene/proto/selene.proto`, so `protoc` must be on
+`PATH`.
 
 Run these commands from the `selene-manager/` directory.
 
@@ -53,7 +55,7 @@ Size options accept bytes with binary K/M/G/T suffixes.
 
 | Option | Default |
 |---|---|
-| `--name` | `default`; names the shared-memory instance and the default socket |
+| `--name` | `default`; 1 to 64 bytes of letters, digits, `.`, `_` or `-`; names the pool, its shared-memory directory and the default socket |
 | `--socket` | `/run/selene/<name>.sock` |
 | `--root` | none; records stay in DRAM until evicted |
 | `--memory` | 1 GiB |
@@ -62,15 +64,16 @@ Size options accept bytes with binary K/M/G/T suffixes.
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
-| `--rdma` | off; experimental, needs the `rdma` feature, not with TLS |
+| `--rdma` | off; experimental, needs the `rdma` feature and `--listen`, not with TLS |
+| `--max-age` | `off`; expires the manager's records a `DURATION` after last use (see [operating](docs/operating.md#deployment-model)) |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 
 See [address forms and startup warnings](docs/network-operations.md#addresses-and-startup-warnings)
 for network connection settings and diagnostics.
 
-The arena and staging are preallocated files under `/dev/shm/selene/<name>`, so the shared-memory
-mount must hold at least `--memory + --staging`. Budgets cover record and window extents, not total
-process RSS.
+The arena and staging are preallocated files under `/dev/shm/selene/<name>-<hash>`, where the hash
+is 32 hex digits derived from the absolute socket path, so the shared-memory mount must hold at
+least `--memory + --staging`. Budgets cover record and window extents, not total process RSS.
 
 ## Docker and systemd
 
@@ -100,8 +103,8 @@ libraries or privileges are required, and the image has no CUDA dependency.
 The disk threads use io_uring, which Docker's default seccomp profile blocks. Run the container
 with `deploy/seccomp-io-uring.json`: Docker's default profile with `io_uring_setup`,
 `io_uring_enter` and `io_uring_register` added to the allowed syscalls (diff it against moby's
-`default.json` to review). Disabling seccomp is not needed. Without the profile the manager exits
-at startup with an error naming io_uring.
+`default.json` to review). Disabling seccomp is not needed. Without the profile a manager started
+with `--root` exits at startup with an error naming io_uring.
 
 `deploy/` has a compose file for one host (`compose.yaml`), one that also serves other hosts over
 TLS (`compose-network.yaml`), and a systemd unit (`selene.service`). `Dockerfile.rdma` builds the
@@ -123,5 +126,5 @@ experimental RDMA variant. Configure clients using the
 ## Tests
 
 Run on Linux. See [qualification](docs/qualification.md) for the test ladder,
-commands and hardware requirements. The `selene` and `selene-manager` crates include client/manager tests
-and the process tests for SIGKILL; GPU integration is in Helios.
+commands and hardware requirements. `selene-manager/tests/` holds the client/manager tests and the
+process tests for SIGKILL; the `selene` crate has unit tests only; GPU integration is in Helios.

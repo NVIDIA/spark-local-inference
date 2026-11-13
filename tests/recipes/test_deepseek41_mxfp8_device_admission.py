@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """MXFP8 attention preserves the prepared SM103 projection path."""
 
 from types import SimpleNamespace
@@ -22,11 +25,15 @@ def test_attention_selects_architecture_compatible_mxfp8_preparation(monkeypatch
 
     calls = {}
 
+    class Component(SimpleNamespace):
+        def functional(self, **kwargs):
+            return self
+
     def projection(source, weight, output, **kwargs):
         calls[kwargs["name"].rsplit(".", 1)[-1]] = kwargs
-        return SimpleNamespace(plan=object(), output=output)
+        return Component(plan=object(), output=output)
 
-    class FusedNorm:
+    class FusedNorm(Component):
         def __init__(self, *args, **kwargs):
             self.encoded = object()
             self.plan = object()
@@ -36,11 +43,11 @@ def test_attention_selects_architecture_compatible_mxfp8_preparation(monkeypatch
     for name in ("PreparedRMSNorm", "PreparedGroupedOutputProjection",
                  "PreparedCompressedCacheWriter", "PreparedCompressedMLA"):
         monkeypatch.setattr(attention, name,
-                            lambda *args, **kwargs: SimpleNamespace(plan=object()))
+                            lambda *args, **kwargs: Component(plan=object()))
 
     metadata = Metadata.allocate(1, 1, 1, "cpu", max_query_tokens=1)
     scratch = AttentionScratch.allocate(1, 4, "cpu")
-    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-20},
+    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-20, "candidate_source_layer_id": 0},
                              source=lambda layer: None)
     pool = SimpleNamespace(config=config,
                            window=lambda *args, **kwargs: torch.zeros((2, 128 * 528), dtype=torch.uint8))

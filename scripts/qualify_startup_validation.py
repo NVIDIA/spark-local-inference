@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise installed native startup rejection before CUDA or socket operations.
 
 Manifest addresses are synthetic metadata, never valid allocation handles. Every
@@ -32,7 +35,7 @@ from ignition.preparation.qwen38 import (
 SNAPSHOT = Path.home() / ".cache/huggingface/hub" / (
     "models--" + MODEL_ID.replace("/", "--")
 ) / "snapshots" / REVISION
-ABI_VERSION = 4
+ABI_VERSION = 6
 GRAPH_CAPACITIES = {
     **{kind: ((1, 1), (2, 1), (4, 1)) for kind in ("init", "restore", "snapshot", "resume", "decode")},
     "prefill": tuple((1, n) for n in (128, 256, 512)),
@@ -132,7 +135,7 @@ def fixture(snapshot):
                 "prefill_capacity": 0, "confidence_width": 0,
                 "input_bindings": [deepcopy(b) for b in bindings if b["buffer_name"] in
                                    (*signatures[name].inputs, "frame_index", "submission_sequence")]})
-    manifest = {"abi_version": ABI_VERSION, "context": 1, "device": 0, "max_active": 4,
+    manifest = {"abi_version": ABI_VERSION, "completion_token_capacity": 8, "context": 1, "device": 0, "max_active": 4,
         "input_frame_bytes": host, "buffers": buffers, "graphs": graphs}
     from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
     from ignition.recipes.qwen38.recipe import RECIPE
@@ -150,7 +153,7 @@ def fixture(snapshot):
         "assets": {"tokenizer": {"path": str((snapshot / "tokenizer.json").resolve(strict=True)),
             "sha256": FRONTEND_SHA256["tokenizer.json"]},
             "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
-                ROOT / "ignition/recipes/qwen38/assets/chat_template.jinja")}}
+                ROOT / "ignition/recipes/qwen38/assets/chat_template.patch.json")}}
     return manifest, config
 
 

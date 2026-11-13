@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Concepts shared by instances and the manager: protocol messages and framing, record
 //! layouts and checksums, the index tree, identities, rank slices, tiers and limits.
 
@@ -21,7 +26,7 @@ pub use limits::{
 };
 pub use slice::{RankSlice, SliceLayout, SliceSums};
 
-/// Pages per slab transfer window.
+/// Pages per slot transfer window.
 pub const WINDOW_PAGES: usize = 64;
 pub const MAX_WINDOW_PAGES: u32 = WINDOW_PAGES as u32;
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """A prefix decision must not condition admission on the token it admits."""
 
 from fractions import Fraction

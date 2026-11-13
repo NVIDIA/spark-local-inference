@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared vision artifacts bind each rank's feature-column tensor."""
 
 import os
@@ -21,6 +24,14 @@ class _Merge(nn.Module):
         return values[:, :6144]
 
 
+class _SelectionForward:
+    def __init__(self, encoder, source, output):
+        self.encoder, self.source, self.output = encoder, source, output
+
+    def __call__(self):
+        self.output.copy_(self.encoder(dict(patches=self.source)))
+
+
 def _selection_fixture(rank, device):
     from ignition.recipes.minimax_m3.vision import PreparedVision
 
@@ -40,7 +51,7 @@ def _selection_fixture(rank, device):
     encoder.blocks = []
     encoder.merger = _Merge()
     encoder.output_columns = torch.arange(rank * 1536, (rank + 1) * 1536, device=device)
-    return encoder
+    return encoder, source, torch.empty(2, 1536, device=device, dtype=torch.bfloat16)
 
 
 @torch.no_grad()
@@ -60,7 +71,8 @@ def _rank(rank, rendezvous, cache):
         timeout=timedelta(minutes=10),
     )
     coordinator = CollectivePreparation(dist.group.WORLD)
-    encoder = _selection_fixture(rank, device)
+    encoder, source, output = _selection_fixture(rank, device)
+    forward = _SelectionForward(encoder, source, output)
     graphs = {}
     try:
         with PreparationSession(
@@ -71,7 +83,7 @@ def _rank(rank, rendezvous, cache):
         ) as session:
             session.requested_compile_workers = 4
             graphs, compiled = capture_forwards(
-                {"vision": encoder},
+                {"vision": forward},
                 {"vision": GraphSignature("vision", 1, 8)},
                 session=session,
                 device=device,
@@ -83,18 +95,18 @@ def _rank(rank, rendezvous, cache):
             assert getattr(encoder, "compilation_variant", "shared") == "shared"
             assert "vision" in compiled
             for iteration in range(3):
-                encoder.scratch.patches.add_(64)
+                source.add_(64)
                 if iteration == 1:
                     encoder.output_columns.copy_(encoder.output_columns.flip(0))
-                encoder.scratch.output.fill_(float("nan"))
+                output.fill_(float("nan"))
                 dist.barrier()
                 graphs["vision"].replay()
                 torch.cuda.synchronize(device)
-                expected = encoder.scratch.patches.reshape(2, 4, 6144)[
+                expected = source.reshape(2, 4, 6144)[
                     :, 0
                 ].index_select(1, encoder.output_columns)
                 torch.testing.assert_close(
-                    encoder.scratch.output, expected, rtol=0, atol=0
+                    output, expected, rtol=0, atol=0
                 )
             dist.barrier()
     finally:

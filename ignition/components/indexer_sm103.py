@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Sparse-attention index selection on SM103 through FlashInfer's paged FP8 MQA logits and top-k.
 
 b12x's indexer issues block-scaled MMA instructions that SM103 does not have.
@@ -17,8 +20,6 @@ import torch
 
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
-# Layers of every graph variant run serially and share logits storage of one shape.
-_LOGITS: dict[tuple, torch.Tensor] = {}
 _PAGE_RECORDS = 64
 _RECORD_BYTES = 132
 
@@ -68,10 +69,7 @@ class Sm103SparseIndexer:
         self.width = page_table.shape[1] * _PAGE_RECORDS
         if paged_mqa.paged_logits_stride(self.width) != self.width:
             raise ValueError("SM103 index selection needs a page table whose record width is a multiple of 256")
-        key = (query.device, rows, self.width)
-        if key not in _LOGITS:
-            _LOGITS[key] = torch.empty((rows, self.width), dtype=torch.float32, device=query.device)
-        self.logits = _LOGITS[key]
+        self.logits = torch.empty((rows, self.width), dtype=torch.float32, device=query.device)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
         self.rebind_cache(cache)
@@ -83,6 +81,8 @@ class Sm103SparseIndexer:
         if cache.dtype != torch.uint8 or cache.shape[1] != _PAGE_RECORDS * _RECORD_BYTES:
             raise ValueError("replacement index cache must keep the 64-record page layout")
         self.cache = cache
+        if self.query is None:
+            return
         rows = self.query.shape[0]
         # FlashInfer's admission rules mark where its route beats DeepGEMM's; correctness holds everywhere.
         self.plan = paged_mqa.PagedMqaPlan(self.query.view(rows, 1, -1, 128),
@@ -92,10 +92,27 @@ class Sm103SparseIndexer:
     def run(self, query, weights, cache, page_table, lengths, output, logits):
         import flashinfer
 
-        self.plan.run()
+        if self.query is None:
+            self.plan.run(query.view(query.shape[0], 1, -1, 128),
+                          cache.view(cache.shape[0], _PAGE_RECORDS, 1, _RECORD_BYTES), weights,
+                          lengths.view(-1, 1), page_table, output=logits)
+        else:
+            self.plan.run()
         flashinfer.top_k_varlen(logits, lengths, self.topk, out_indices=output)
 
-    def __call__(self):
-        _select(self.query, self.weights, self.cache, self.page_table, self.lengths, self.output, self.logits,
-                self.handle)
-        return self.output
+    def functional(self, *, session):
+        self.rows = self.query.shape[0]
+        self.plan.functional()
+        self.query = self.weights = self.page_table = self.lengths = self.output = self.logits = None
+        return self
+
+    def __call__(self, query=None, weights=None, page_table=None, lengths=None, active_width=None, *, cache=None):
+        if self.query is not None:
+            _select(self.query, self.weights, self.cache, self.page_table, self.lengths, self.output, self.logits,
+                    self.handle)
+            return self.output
+        output = torch.full((self.rows, self.topk), -1, dtype=torch.int32, device=query.device)
+        logits = torch.empty((self.rows, self.width), dtype=torch.float32, device=query.device)
+        pages = page_table.expand(self.rows, -1) if page_table.shape[0] == 1 else page_table
+        _select(query, weights, self.cache if cache is None else cache, pages, lengths, output, logits, self.handle)
+        return output

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from contextlib import closing
 from io import StringIO
 import pytest
@@ -25,7 +28,7 @@ def test_file_destination_keys(tmp_path):
     source.write_bytes(b"model")
     for destination, key in [
         ("s3://models", "model.flare"),
-        ("s3://models/packages/", "packages/model.flare"),
+        ("s3://models/cores/", "cores/model.flare"),
         ("s3://models/exact.flare", "exact.flare"),
     ]:
         assert destination_key(source, destination) == ("models", key)

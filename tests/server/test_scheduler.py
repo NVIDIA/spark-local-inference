@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Concurrent streams through a native service with four slots and 4096-token prefill.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_SCHEDULER_TEST_URL to an otherwise idle

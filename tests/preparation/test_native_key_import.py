@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native Ed25519 key import against independent PKCS#8 encoders."""
 
 import json
@@ -30,7 +33,7 @@ def _publish_with_key(tmp_path, monkeypatch, path, key):
 
 
 @pytest.mark.parametrize('encrypted', [False, True])
-def test_cryptography_pkcs8_keys_sign_native_packages(tmp_path, monkeypatch, encrypted):
+def test_cryptography_pkcs8_keys_sign_native_cores(tmp_path, monkeypatch, encrypted):
     key = Ed25519PrivateKey.from_private_bytes(bytes([23]) * 32)
     encryption = serialization.BestAvailableEncryption(PASSWORD) if encrypted else serialization.NoEncryption()
     path = tmp_path / 'signing-key.pem'
@@ -119,7 +122,7 @@ def test_signing_key_rotation_during_preparation_rejects_native_publication(tmp_
     _write(path, encode(first))
     signer = Publisher.load(path, 'flare-tests', 'https://huggingface.co/flare-tests/fixture')
     _write(path, encode(second))
-    output = tmp_path / 'package'
+    output = tmp_path / 'core'
     with pytest.raises(ValueError, match='signing key changed'):
         publish(tmp_path, signer)
     assert not output.exists()

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Mixed routing preserves live experts and excludes padded rows from expert work."""
 
 import os
@@ -10,7 +13,6 @@ import torch.nn.functional as F
 from ignition.components.moe import PreparedRouter, RouterScratch
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.deepseek4.decoder import PreparedRouting
 
@@ -33,12 +35,11 @@ def test_mixed_routing_matches_separate_text_and_image_selection(rows, token_rou
         token_experts=((torch.arange(129280, device=device)[:, None]
                         + torch.arange(6, device=device)) % 256).int() if token_routes else None)
     actual, text, image = [RouterScratch.allocate(rows, device, experts=256, top_k=6) for _ in range(3)]
-    buffers = GraphBufferPool(device, chunk_bytes=1 << 20)
     graphs, owners = {}, []
     with RecordedPreparationSession(device=device, checkpoint="deepseek4-routing",
             workload_schema="mixed-expert-routing.v1", numerical_policy="fp32") as session:
         routing = PreparedRouting(weights, SimpleNamespace(router_logits=logits, router=actual),
-            metadata, mode="prefill", session=session, name="mixed", buffers=buffers.cursor())
+            metadata, mode="prefill", session=session, name="mixed")
         options = dict(session=session, score_func="sqrtsoftplus", renormalize=True,
                        routed_scaling_factor=1.5)
         reference_text = (None if token_routes else PreparedRouter(logits, text, name="text",
@@ -58,8 +59,12 @@ def test_mixed_routing_matches_separate_text_and_image_selection(rows, token_rou
             text.ids.copy_(torch.where(mask, image.ids, text.ids))
             text.weights.copy_(torch.where(mask, image.weights, text.weights))
 
+        def mixed():
+            routes = routing(logits, metadata)
+            actual.ids.copy_(routes.ids)
+            actual.weights.copy_(routes.weights)
         session.tune()
-        for name, forward in (("reference", reference), ("mixed", lambda: routing(logits))):
+        for name, forward in (("reference", reference), ("mixed", mixed)):
             compiled = compile_forward(forward)
             compiled()
             graph = torch.cuda.CUDAGraph()
@@ -70,7 +75,7 @@ def test_mixed_routing_matches_separate_text_and_image_selection(rows, token_rou
         session.freeze()
         bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={"logits": logits},
             resources=(session, routing, reference_text, reference_image, actual, text, image,
-                       metadata, weights, buffers, owners))
+                       metadata, weights, owners))
         worker = bundle.start_worker()
         try:
             for images, valid in ((0, rows), (rows, rows), (rows // 2, max(0, rows - 7)), (0, 0), (0, rows)):
@@ -79,9 +84,6 @@ def test_mixed_routing_matches_separate_text_and_image_selection(rows, token_rou
                 metadata.positions.fill_(-1)
                 metadata.positions[:valid].copy_(torch.arange(valid, device=device))
                 logits.mul_(-.75)
-                for chunks in buffers.chunks.values():
-                    for chunk in chunks:
-                        chunk.view(torch.uint8).fill_(0xFF)
                 torch.cuda.synchronize()
                 before = torch.cuda.memory_stats()
                 for graph_index in (0, 1):

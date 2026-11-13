@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The pool protocol (`selene.v2`), manager side.
 //!
 //! One actor ([`core::Core`]) owns every piece of protocol state: sessions, the

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Model discovery uses the same effective configuration as request admission.
 
 use crate::model::ModelConfig;
@@ -25,7 +31,11 @@ struct ModelCatalog {
 }
 
 impl ModelCatalog {
-    fn new(model: &ModelConfig, served_names: &[String]) -> Self {
+    fn new(
+        model: &ModelConfig,
+        served_names: &[String],
+        thinking_token_budget: Option<u32>,
+    ) -> Self {
         // The timestamp describes this serving instance, not the source checkpoint.
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -41,7 +51,7 @@ impl ModelCatalog {
             .cloned()
             .collect();
         // One card represents the loaded model; its other names only resolve lookups.
-        // Bootstrap validated these capacities before serving; a text-only package has none.
+        // Bootstrap validated these capacities before serving; a text-only core has none.
         let limits = model
             .contract
             .vision
@@ -85,6 +95,7 @@ impl ModelCatalog {
                 "prefill_chunk_size": model.limits.prefill_chunk_size,
                 "default_max_tokens": model.max_new_tokens,
                 "sampling_defaults": model.sampling_defaults,
+                "thinking_token_budget": thinking_token_budget,
                 "sampling_ranges": model.sampling_ranges,
                 "max_images_per_prompt": limits.map_or(0, |l| l.max_images),
                 "max_image_tokens_per_prompt": limits.map_or(0, |l| l.max_image_tokens_per_prompt()),
@@ -148,7 +159,11 @@ impl ModelCatalog {
     }
 }
 
-pub(super) fn router<S>(model: &ModelConfig, served_names: &[String]) -> Router<S>
+pub(super) fn router<S>(
+    model: &ModelConfig,
+    served_names: &[String],
+    thinking_token_budget: Option<u32>,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -158,7 +173,11 @@ where
         .route("/v1/models/{*model}", get(retrieve))
         .route("/api/tags", get(ollama_list))
         .route("/api/show", post(ollama_show))
-        .with_state(Arc::new(ModelCatalog::new(model, served_names)))
+        .with_state(Arc::new(ModelCatalog::new(
+            model,
+            served_names,
+            thinking_token_budget,
+        )))
 }
 
 async fn ollama_list(State(catalog): State<Arc<ModelCatalog>>) -> Json<Value> {
@@ -243,6 +262,7 @@ mod tests {
 
     fn config() -> ModelConfig {
         ModelConfig {
+            completion_token_capacity: 16,
             max_top_logprobs: 0,
             logprob_token_id_capacity: 0,
             prepared_sequence_tokens: 16384,
@@ -282,12 +302,13 @@ mod tests {
     #[test]
     fn metadata_reports_effective_limits_and_prepared_modalities() {
         let mut model = config();
-        let text = ModelCatalog::new(&model, &[]).card;
+        let text = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(text["max_model_len"], 8192);
         assert_eq!(text["flare"]["max_concurrency"], 3);
         assert_eq!(text["flare"]["prefill_chunk_size"], 512);
         assert_eq!(text["flare"]["vocab_size"], 1024);
         assert_eq!(text["flare"]["default_max_tokens"], 2048);
+        assert_eq!(text["flare"]["thinking_token_budget"], Value::Null);
         assert_eq!(
             text["flare"]["sampling_defaults"],
             json!(model.sampling_defaults)
@@ -310,7 +331,7 @@ mod tests {
 
         assert_eq!(text["flare"]["max_top_logprobs"], 0);
         model.max_top_logprobs = crate::execution::MAX_TOP_LOGPROBS;
-        let logprobs = ModelCatalog::new(&model, &[]).card;
+        let logprobs = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(logprobs["permission"][0]["allow_logprobs"], true);
         assert_eq!(
             logprobs["flare"]["max_top_logprobs"],
@@ -324,7 +345,7 @@ mod tests {
             patches_per_feature: 4,
             patch_capacities: vec![1024],
         };
-        let vision = ModelCatalog::new(&model, &[]).card;
+        let vision = ModelCatalog::new(&model, &[], None).card;
         assert_eq!(vision["max_model_len"], 4096);
         assert_eq!(
             vision["flare"]["input_modalities"],
@@ -354,7 +375,7 @@ mod tests {
             (vec!["organization/model", "alias"], "organization/model"),
         ] {
             let aliases = aliases.into_iter().map(String::from).collect::<Vec<_>>();
-            let catalog = ModelCatalog::new(&config(), &aliases);
+            let catalog = ModelCatalog::new(&config(), &aliases, None);
             assert_eq!(catalog.card["id"], expected);
             assert_eq!(catalog.card["root"], "organization/model");
             assert!(catalog.names.contains("organization/model"));
@@ -421,7 +442,7 @@ mod tests {
                         wrapping_newlines: 0,
                         terminal_markers: vec![],
                     });
-                    let catalog = ModelCatalog::new(&model, &[]);
+                    let catalog = ModelCatalog::new(&model, &[], None);
                     let capabilities = catalog.ollama_info["capabilities"].as_array().unwrap();
                     assert!(capabilities.contains(&json!("completion")));
                     assert_eq!(capabilities.contains(&json!("vision")), vision);
@@ -439,22 +460,22 @@ mod tests {
     #[test]
     fn ollama_digest_invalidates_cached_metadata() {
         let mut model = config();
-        let original = ModelCatalog::new(&model, &[]).ollama_model["digest"].clone();
+        let original = ModelCatalog::new(&model, &[], None).ollama_model["digest"].clone();
         assert_eq!(
             original,
-            ModelCatalog::new(&model, &[]).ollama_model["digest"]
+            ModelCatalog::new(&model, &[], None).ollama_model["digest"]
         );
         model.limits.max_sequence_tokens /= 2;
-        let reduced = ModelCatalog::new(&model, &[]).ollama_model["digest"].clone();
+        let reduced = ModelCatalog::new(&model, &[], None).ollama_model["digest"].clone();
         assert_ne!(original, reduced);
         model.identity[0] = 1;
         assert_ne!(
             reduced,
-            ModelCatalog::new(&model, &[]).ollama_model["digest"]
+            ModelCatalog::new(&model, &[], None).ollama_model["digest"]
         );
         assert_ne!(
             original,
-            ModelCatalog::new(&config(), &["alias".into()]).ollama_model["digest"]
+            ModelCatalog::new(&config(), &["alias".into()], None).ollama_model["digest"]
         );
     }
 
@@ -468,8 +489,8 @@ mod tests {
             "alias with space",
         ]
         .map(String::from);
-        let router =
-            router::<()>(&config(), &aliases).layer(axum::extract::DefaultBodyLimit::max(1024));
+        let router = router::<()>(&config(), &aliases, None)
+            .layer(axum::extract::DefaultBodyLimit::max(1024));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -536,7 +557,7 @@ mod tests {
             "alias with space",
         ]
         .map(String::from);
-        let router = router::<()>(&config(), &aliases);
+        let router = router::<()>(&config(), &aliases, Some(1536));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -553,6 +574,7 @@ mod tests {
             assert_eq!(card["root"], "organization/model");
             assert_eq!(card.get("parent"), Some(&Value::Null));
             assert_eq!(card["max_model_len"], 8192);
+            assert_eq!(card["flare"]["thinking_token_budget"], 1536);
             assert_eq!(card["permission"][0]["object"], "model_permission");
             for path in [
                 "/v1/models/organization/model",

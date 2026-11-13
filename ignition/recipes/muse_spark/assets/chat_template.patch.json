@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
+    "revision": "4239e4db19376904f2e82c167e78f70abb5455fe",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "2341a2d3b1f1b0ac92b6237d46e2fff495109bd3305cacdea54726f5e98411db",
+  "result_sha256": "ea28c71c46b391d3066ab10ba7df8cc8786995fc1cf2430fbe0df89253ba1749",
+  "insertions": [
+    12567,
+    16200
+  ]
+}

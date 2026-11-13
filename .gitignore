@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+/.local-dev/
+/flare-cli/target/
+/flare-winui/bridge/target/
+/flare-winui/launcher/target/
 *.egg-info/
 /build/
 /dist/

@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Host prefix cache isolation measurements: serving latency with and without
 the host store under the copy-out and restore load the store creates.
 
 Each workload runs against a server without a host store (the baseline) and
-against a server with the configured host store, same package, flags, and GPU.
+against a server with the configured host store, same core, flags, and GPU.
 Per-token latency comes from the server's native completion timestamps
 (`return_token_timestamps`), prefill throughput from prompt tokens over the
 time from ingress to the first token, and restore latency from the first-token
@@ -207,7 +210,7 @@ def inbound_latency(server: Server, run, model_id: str, args, label: str) -> dic
 
 
 def measure(args, label: str, extra: list[str]) -> dict:
-    server = Server(args.flare, args.package, args.gpus, args.port, args.artifacts / f"{label}.log", extra)
+    server = Server(args.flare, args.core, args.gpus, args.port, args.artifacts / f"{label}.log", extra)
     try:
         server.wait_ready(args.startup_timeout)
         run = run_for(server, args.artifacts / label, args.timeout)
@@ -240,8 +243,8 @@ def compare(baseline: dict, offload: dict) -> list[tuple[str, float, float, floa
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flare", type=Path, default=ROOT / "flare/target/release/flare")
-    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--flare", type=Path, default=ROOT / "flare-cli/target/release/flare")
+    parser.add_argument("--core", type=Path, required=True)
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--port", type=int, default=8061)
     parser.add_argument("--artifacts", type=Path, required=True)
@@ -275,7 +278,7 @@ def main() -> int:
         measured = measure(args, f"offload{suffix}", offload)
         runs.append({"baseline": baseline, "offload": measured, "comparison": [
             {"metric": n, "baseline": b, "offload": v, "change": c, "within_2_percent": w} for n, b, v, c, w in compare(baseline, measured)]})
-    report = {"configuration": {"package": str(args.package), "gpus": args.gpus, "memory": args.memory,
+    report = {"configuration": {"core": str(args.core), "gpus": args.gpus, "memory": args.memory,
                                 "disk": str(args.disk) if args.disk else None, "disk_limit": args.disk_limit,
                                 "seconds": args.seconds, "concurrency": args.concurrency, "flare_options": common},
               "runs": runs}

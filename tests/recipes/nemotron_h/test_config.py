@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint structure and concrete continuation storage declarations."""
 
 from copy import deepcopy
@@ -81,7 +84,7 @@ def test_image_frontend_matches_checkpoint(checkpoint):
     from ignition.preparation.frontend import prepare_frontend
     from ignition.recipes.nemotron_h.vision import VisionConfig
     from ignition.recipes.nemotron_h.contract import FRONTEND, VISION
-    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.preparation import runtime_core_pb2 as p
 
     raw = json.loads((checkpoint / "config.json").read_text())
     vision = VisionConfig.from_dict(raw)

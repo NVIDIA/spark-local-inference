@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Bounded, direct-I/O row gathering into the same buffers used by resident tables.
 
 use super::{Stats, cache::RowCache};
@@ -74,7 +80,7 @@ impl Aligned {
 
 #[cfg(test)]
 pub(super) fn open_file(path: &Path) -> Result<File> {
-    crate::os::direct_file(path, false).map_err(|e| format!("open Engram package: {e}").into())
+    crate::os::direct_file(path, false).map_err(|e| format!("open Engram core: {e}").into())
 }
 
 pub(crate) struct Resident {

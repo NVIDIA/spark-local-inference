@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Host prefix cache qualification: launch Flare, publish a conversation's
 checkpoints, evict them from the GPU, and observe restores from host memory,
 from disk across a restart, and shared by concurrent continuations.
@@ -31,10 +35,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class Server:
     """A `flare run` process bound to a local port."""
 
-    def __init__(self, flare: Path, package: Path, gpus: str, port: int, log: Path, extra: list[str]):
+    def __init__(self, flare: Path, core: Path, gpus: str, port: int, log: Path, extra: list[str]):
         self.url = f"http://127.0.0.1:{port}"
         self.log = log.open("ab")
-        command = [str(flare), "run", str(package), "--gpus", gpus,
+        command = [str(flare), "run", str(core), "--gpus", gpus,
                    "--host", "127.0.0.1", "--port", str(port), *extra]
         self.log.write((" ".join(command) + "\n").encode())
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, cwd=ROOT)
@@ -177,7 +181,7 @@ def check_host_restore(run: Run, label: str, response: dict, delta: dict, prompt
 
 def memory_scenario(args, flare_extra: list[str], label: str, expected: dict | None) -> dict:
     nonce = args.nonce
-    server = Server(args.flare, args.package, args.gpus, args.port, args.artifacts / f"{label}.log", flare_extra)
+    server = Server(args.flare, args.core, args.gpus, args.port, args.artifacts / f"{label}.log", flare_extra)
     outputs = {}
     try:
         server.wait_ready(args.startup_timeout)
@@ -231,7 +235,7 @@ def disk_scenario(args, memory: str, label: str) -> None:
     directory = args.artifacts / f"{label}-records"
     extra = [part for option in args.flare_option for part in option.split("=", 1)]
     extra += ["--prefix-cache-disk", str(directory), "--prefix-cache-disk-limit", args.disk_limit, "--prefix-cache-memory", memory]
-    server = Server(args.flare, args.package, args.gpus, args.port, args.artifacts / f"{label}.log", extra)
+    server = Server(args.flare, args.core, args.gpus, args.port, args.artifacts / f"{label}.log", extra)
     try:
         server.wait_ready(args.startup_timeout)
         run = run_for(server, args.artifacts / label, args.timeout)
@@ -254,7 +258,7 @@ def disk_scenario(args, memory: str, label: str) -> None:
         (args.artifacts / f"{label}.json").write_text(json.dumps(run.results, indent=1))
     finally:
         server.stop()
-    server = Server(args.flare, args.package, args.gpus, args.port, args.artifacts / f"{label}-restart.log", extra)
+    server = Server(args.flare, args.core, args.gpus, args.port, args.artifacts / f"{label}-restart.log", extra)
     try:
         server.wait_ready(args.startup_timeout)
         run = run_for(server, args.artifacts / f"{label}-restart", args.timeout)
@@ -275,8 +279,8 @@ def disk_scenario(args, memory: str, label: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flare", type=Path, default=ROOT / "flare/target/release/flare")
-    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--flare", type=Path, default=ROOT / "flare-cli/target/release/flare")
+    parser.add_argument("--core", type=Path, required=True)
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--port", type=int, default=8031)
     parser.add_argument("--artifacts", type=Path, required=True)

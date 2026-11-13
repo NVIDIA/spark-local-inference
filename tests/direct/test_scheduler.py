@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Direct execution's scheduling, prefix bookkeeping and Helios-equivalent input packing, on the CPU."""
 
 import numpy as np
@@ -24,9 +28,9 @@ def layout(**overrides):
                    for batch in (1, 2, 4) for width in (1, 2, 3)})
     values = dict(capacity=4, max_active=4, context=4096, page_tokens=256, table_width=16, pages=64,
                   snapshots=2, prefill_chunk=512, vocabulary=VOCABULARY, eos=EOS, graphs=graphs,
-                  widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=24)
+                  widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=32)
     values.update(overrides)
-    from ignition.preparation import contract as c, runtime_package_pb2 as p
+    from ignition.preparation import contract as c, runtime_core_pb2 as p
     bindings = {name: list(c.text_inputs(key[0]).values()) for key, name in values["graphs"].items()}
     for name in values.get("confidence_widths", {}):
         bindings[name] = [b for b in bindings[name] if b["buffer"] != "query_lengths"]
@@ -358,7 +362,8 @@ def test_acceptance_follows_helios_depth_estimates():
     assert acceptance.depths[0][1] == 3
 
 
-def test_layout_selects_the_serving_variant_of_each_graph():
+@pytest.mark.parametrize("prefill_only", [False, True])
+def test_layout_selects_the_serving_variant_of_each_graph(prefill_only):
     from ignition.preparation.execution import GraphSignature
 
     def Signature(kind, batch, tokens, enabled):
@@ -378,12 +383,14 @@ def test_layout_selects_the_serving_variant_of_each_graph():
                       "decode4": Signature("decode", 4, 1, False), "init4": Signature("init", 4, 1, True),
                       "speculative4x2": Signature("speculative", 4, 2, True)}
         buffers = {"row_slot_ids": Tensor(4), "page_tables": Tensor(4, 32), "draft_page_tables": Tensor(4, 32),
-                   "completion_records": Tensor(2, 4, 24)}
+                   "completion_records": Tensor(2, 4, 32)}
         server_config = {"max_sequence_tokens": 8192, "page_tokens": 256, "pages": 100, "snapshots": 5,
                          "prefill_chunk_size": 128, "model_contract": {"vocabulary": VOCABULARY},
                          "frontend": {"eos_token_ids": [7, 8]}, "speculative_widths": [1, 2],
                          "speculative_fixed_width": None, "state_rows_per_request": 1}
 
+    if prefill_only:
+        del Model.signatures["speculative4x2"]
     fixture = layout(context=8192, table_width=32, graphs={
         (v.kind, v.batch_capacity, v.token_capacity): name for name, v in Model.signatures.items()
         if v.speculation_enabled in (None, True)})
@@ -395,8 +402,10 @@ def test_layout_selects_the_serving_variant_of_each_graph():
         tensor.dtype = dtype
         Model.buffers[name] = tensor
     result = Layout.of(Model())
-    assert result.graphs == {("prefill", 1, 128): "prefill128", ("init", 4, 1): "init4",
-                             ("speculative", 4, 2, 8, 1): "speculative4x2"}
+    expected = {("prefill", 1, 128): "prefill128", ("init", 4, 1): "init4"}
+    if not prefill_only:
+        expected[("speculative", 4, 2, 8, 1)] = "speculative4x2"
+    assert result.graphs == expected
     assert (result.capacity, result.max_active, result.table_width, result.draft_pages) == (4, 3, 32, 1)
     assert (result.execution_width, result.state_row(2), result.snapshot_row(1)) == (2, 3, 5)
 
@@ -577,7 +586,7 @@ def test_layout_reads_complete_catalog_and_retains_all_c32_p128_shapes():
                   for key, name in graphs.items()}
     buffers = {name: torch.from_numpy(np.zeros(shape, dtype=dtype))
                for name, (dtype, shape) in fixture.buffer_specs.items()}
-    buffers['completion_records'] = torch.zeros((2, 32, 24), dtype=torch.int64)
+    buffers['completion_records'] = torch.zeros((2, 32, 32), dtype=torch.int64)
     config = dict(max_sequence_tokens=4096, pages=64, snapshots=2, prefill_chunk_size=512,
                   speculative_widths=[1, 2, 3, 4, 5, 6], frontend=dict(eos_token_ids=[7]),
                   model_contract=dict(vocabulary=VOCABULARY,
@@ -620,3 +629,34 @@ def test_packed_completion_honors_explicit_absence_of_a_draft_cursor(bad_cursor)
     else:
         scheduler.complete(step, rows, confidence=np.full((4, 5), .75))
         assert [len(r.generated) for r in requests] == [3, 2, 2]
+
+
+@pytest.mark.parametrize("width", [8, 13, 16, 32])
+def test_core_token_capacity_bounds_packed_upload_and_publication(width):
+    graphs = {("speculative", b, 1): f"width-one-{b}" for b in (1, 2, 4)}
+    graphs[("speculative", 4, width, 4 * width, width - 1)] = "packed"
+    scheduler = Scheduler(layout(graphs=graphs, widths=(1, width), record_fields=16 + width,
+        confidence_widths={"packed": width - 1}, completion_cursors={"packed": 1}), prefix_cache=False)
+    requests = [request(0, [10, 11], limit=80), request(1, [10, 11], limit=min(width, 9) + 1)]
+    for current in requests:
+        scheduler.submit(current)
+    scheduler._admit()
+    for current in requests:
+        current.phase, current.consumed, current.generated = "decode", 2, [42]
+    for shape in graphs:
+        scheduler.policy.costs.observe(shape, 1_000 if len(shape) == 5 else 100_000_000)
+    step = scheduler.plan()
+    assert (step.width, step.draft_tokens, step.packed_tokens) == (width, width - 1, 4 * width)
+    assert [lane.tokens for lane in step.lanes] == [width, min(width, 9)]
+    assert uploads(scheduler, step)["speculative_prefix_limits"] == {0: [width, min(width, 9), 0, 0]}
+    tokens = list(range(100, 100 + width))
+    rows = records(scheduler, step, {
+        requests[0]: (1, 2 + width, tokens, 0, width - 1, width - 1),
+        requests[1]: (2, 2 + min(width, 9), tokens[:9], 0, min(width, 9) - 1, min(width, 9) - 1),
+    })
+    scheduler.complete(step, rows, confidence=[[1.] * (width - 1)] * 4)
+    assert requests[0].generated == [42] + tokens
+    assert requests[0].pending_token == 99 + width and requests[0].consumed == 2 + width
+    assert requests[1].generated == [42] + tokens[:9] and requests[1].done
+    assert requests[0].acceptance.expected(width) == width
+    assert len(requests[0].acceptance.expectations(width)) == width + 1

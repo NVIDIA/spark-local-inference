@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![allow(dead_code)]
 //! A minimal wire-level client for the pool protocol. It speaks `selene.v2` to a
 //! real manager; there is no model of the manager's state machine in here.

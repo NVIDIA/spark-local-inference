@@ -1,11 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Blocked vocabulary-shard projection and raw prompt-token statistics."""
 
 import torch
+
+from ignition.preparation.persistent import persistent_copy
 import triton
 import triton.language as tl
 
-from ignition.preparation.scratch import GraphBufferPool
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
 
 from .collectives import PreparedAllGather
 from .completion import MAX_TOP_LOGPROBS
@@ -124,7 +128,6 @@ class PromptOutputs:
     def __init__(self, capacity, device):
         self.targets = torch.full((capacity,), -1, dtype=torch.int32, device=device)
         self.values = torch.zeros((2, capacity, PROMPT_FIELDS), dtype=torch.int32, device=device)
-        self.scratch = GraphBufferPool(device, chunk_bytes=2 << 20)
 
     def buffers(self):
         return dict(prompt_target_tokens=self.targets, prompt_logprobs=self.values)
@@ -134,21 +137,25 @@ class PreparedPromptReduction:
     """Reduce one bounded row block; partial exchanges never contain vocabulary rows."""
 
     def __init__(self, logits, targets, output, frame, *, start, vocabulary, offset,
-                 runtime, session, coordinator, name, buffers):
+                 runtime, session, coordinator, name):
         rows, local = logits.shape
         if isinstance(offset, int):
-            offset = torch.tensor([offset], dtype=torch.int32, device=logits.device)
+            offset = persistent_copy(torch.tensor([offset], dtype=torch.int32, device=logits.device))
         world = 1 if runtime is None else runtime.world_size
         tiles = triton.cdiv(local, _TILE)
-        stats = buffers.zeros((rows, tiles, 2), torch.float32)
-        norm = buffers.zeros((rows, 2), torch.float32)
-        keys = buffers.zeros((rows, tiles, _CANDIDATES), torch.uint64)
-        counts = buffers.zeros((rows, tiles), torch.int32)
-        partial = buffers.zeros((rows, _PARTIAL_WORDS), torch.int32)
-        gathered = buffers.zeros((rows, world * _PARTIAL_WORDS), torch.int32)
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=logits.device)
+        stats = zeros((rows, tiles, 2), torch.float32)
+        norm = zeros((rows, 2), torch.float32)
+        keys = zeros((rows, tiles, _CANDIDATES), torch.uint64)
+        counts = zeros((rows, tiles), torch.int32)
+        partial = zeros((rows, _PARTIAL_WORDS), torch.int32)
+        gathered = zeros((rows, world * _PARTIAL_WORDS), torch.int32)
         self.gather = PreparedAllGather(partial.view(torch.bfloat16), gathered.view(torch.bfloat16),
             runtime=runtime, session=session, coordinator=coordinator, name=name + '.exchange')
         self.partial = partial
+        self.geometry = rows, local, tiles, world, vocabulary, start
+        self.outputs = targets, output, frame, offset
         self.operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
             for kernel, args, grid, warps in (
                 (_statistics, (logits, stats, vocabulary, local, offset, tiles, _TILE), (rows, tiles, 1), 4),
@@ -163,30 +170,52 @@ class PreparedPromptReduction:
                     triton.next_power_of_2(world), PROMPT_FIELDS), (rows, 1, 1), 4),
             ))
 
-    def __call__(self):
-        statistics, local_stats, global_stats, candidates, local_candidates, finish = self.operations
-        statistics()
-        local_stats()
-        self.gather(self.partial.view(torch.bfloat16))
-        global_stats()
-        candidates()
-        local_candidates()
-        self.gather(self.partial.view(torch.bfloat16))
-        finish()
+    def functional(self, *, session):
+        return _FunctionalPromptReduction(self, session=session)
+
+
+
+class _FunctionalPromptReduction:
+    def __init__(self, prepared, *, session):
+        self.geometry, self.outputs = prepared.geometry, prepared.outputs
+        self.gather = prepared.gather.functional(session=session)
+        self.operations = tuple((op.kernel, op.compiled, op.grid, op.options) for op in prepared.operations)
+
+    def __call__(self, logits):
+        rows, local, tiles, world, vocabulary, start = self.geometry
+        targets, output, frame, offset = self.outputs
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=logits.device)
+        stats, norm = zeros((rows, tiles, 2), torch.float32), zeros((rows, 2), torch.float32)
+        keys, counts = zeros((rows, tiles, _CANDIDATES), torch.uint64), zeros((rows, tiles), torch.int32)
+        partial = zeros((rows, _PARTIAL_WORDS), torch.int32)
+        def run(index, args):
+            kernel, compiled, grid, options = self.operations[index]
+            launch_triton(kernel, compiled, args, grid, **options)
+        run(0, (logits, stats, vocabulary, local, offset, tiles, _TILE))
+        run(1, (logits, targets, stats, partial, vocabulary, local, offset, start,
+                tiles, triton.next_power_of_2(tiles)))
+        gathered = self.gather(partial.view(torch.bfloat16)).view(torch.int32)
+        run(2, (gathered, norm, world, triton.next_power_of_2(world)))
+        run(3, (logits, norm, keys, counts, vocabulary, local, offset, tiles, _TILE))
+        run(4, (keys, counts, partial, tiles, triton.next_power_of_2(tiles * _CANDIDATES),
+                triton.next_power_of_2(tiles), MAX_TOP_LOGPROBS))
+        gathered = self.gather(partial.view(torch.bfloat16)).view(torch.int32)
+        run(5, (targets, gathered, norm, output, frame, vocabulary, start, output.shape[1], world,
+                MAX_TOP_LOGPROBS, triton.next_power_of_2(world * MAX_TOP_LOGPROBS),
+                triton.next_power_of_2(world), PROMPT_FIELDS))
 
 
 class PreparedPromptScoring:
     def __init__(self, source, weight, outputs, frame, *, vocabulary, rank=0,
-                 runtime=None, session, coordinator=None, name, copy_source=False, logits_dtype=torch.bfloat16):
+                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16):
         local = weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
-        buffers = outputs.scratch.cursor()
-        if copy_source:
-            source = buffers.zeros(source.shape, source.dtype)
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=source.device)
         self.source = source
         rows = min(BLOCK_ROWS, source.shape[0])
-        logits = buffers.zeros((rows, local), logits_dtype)
-        stage = buffers.fork()
-        self.offset = torch.tensor([rank * local], dtype=torch.int32, device=source.device)
+        logits = zeros((rows, local), logits_dtype)
+        self.offset = persistent_copy(torch.tensor([rank * local], dtype=torch.int32, device=source.device))
         self.parts = []
         projection_type = UnquantizedProjection if isinstance(weight, torch.Tensor) else QuantizedProjection
         options = {} if isinstance(weight, torch.Tensor) else dict(activation_mode="auto")
@@ -197,17 +226,28 @@ class PreparedPromptScoring:
                 name=f"{name}.head{start}", **options)
             reduction = PreparedPromptReduction(logits[:count], outputs.targets, outputs.values, frame,
                 start=start, vocabulary=vocabulary, offset=self.offset, runtime=runtime,
-                session=session, coordinator=coordinator, name=f'{name}.reduce{start}', buffers=stage.fork())
+                session=session, coordinator=coordinator, name=f'{name}.reduce{start}')
             self.parts.append((view, projection, reduction))
 
-    def __call__(self):
-        for source, projection, reduction in self.parts:
-            projection(source)
-            reduction()
+    def functional(self, *, session):
+        parts = tuple((start, view.shape[0], projection.functional(session=session), reduction.functional(session=session))
+                      for start, (view, projection, reduction) in zip(
+                          range(0, self.source.shape[0], BLOCK_ROWS), self.parts, strict=True))
+        self.source, self.parts = None, ()
+        return _FunctionalPromptScoring(parts)
+
+
+class _FunctionalPromptScoring:
+    def __init__(self, parts):
+        self.parts = parts
+
+    def __call__(self, source):
+        for start, count, projection, reduction in self.parts:
+            reduction(projection(source[start:start + count]))
 
 
 class PromptScoring:
-    """One package's optional outputs, communication channel, and serial scratch pool."""
+    """Prompt-logprob outputs and their prepared communication channel."""
 
     def __init__(self, capacity, device, *, frame, group=None, ipc=None, remote_runtime=None):
         self.outputs = PromptOutputs(capacity, device)
@@ -239,19 +279,19 @@ class PromptScoring:
         return scoring
 
     def memory_report(self):
-        return dict(prompt_scoring_scratch_bytes=self.outputs.scratch.nbytes,
-                    prompt_output_bytes=sum(t.nbytes for t in self.outputs.buffers().values()))
+        return dict(prompt_output_bytes=sum(t.nbytes for t in self.outputs.buffers().values()))
 
     def zero_ranges(self):
         from ignition.preparation.disposable import storage_ranges
 
-        return storage_ranges((self.outputs.buffers(), self.outputs.scratch.chunks))
+        return storage_ranges(self.outputs.buffers())
 
-    def prepare(self, source, weight, *, vocabulary, session, coordinator, name, copy_source=False,
+    def prepare(self, source, weight, *, vocabulary, session, coordinator, name,
                 logits_dtype=torch.bfloat16):
-        return PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
+        operation = PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
             rank=self.rank, runtime=self.runtime, session=session, coordinator=coordinator,
-            name=name, copy_source=copy_source, logits_dtype=logits_dtype)
+            name=name, logits_dtype=logits_dtype)
+        return operation.functional(session=session)
 
 
 def scored_prefill_capacities(chunk):

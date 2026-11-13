@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Qualify fatal model-worker HTTP propagation using malformed graph completions.
 
 The graph catalog implements the transport shapes but no model arithmetic. Its

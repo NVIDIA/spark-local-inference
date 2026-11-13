@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Identifiers and keys shared with the GPU tier that owns the checkpoints.
 
 /// Tokens per hash block; aligned boundaries and bucket digests use this unit.

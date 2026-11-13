@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Captured collective consumers and their prepared startup selector programs."""
 
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .execution import TunedBinding, TuningGraph
+from .runtime_core import capture_graph, instantiate_graph
 
 _CAPTURE = ContextVar("startup_tuning_capture", default=None)
 
@@ -81,6 +85,25 @@ def capture_consumers(session, graph):
         registry.captures[id(graph)] = consumers
 
 
+def resident_numeric_storage(numeric, *, device, minimum_bytes):
+    """The largest live checkpoint storage on the device that can displace L2."""
+    import torch
+
+    best = None
+    for reference, address, nbytes, _ in numeric.entries.values():
+        if nbytes < minimum_bytes:
+            continue
+        storage = torch.UntypedStorage._new_with_weak_ptr(reference.cdata)
+        if (storage is None or storage.device.type != "cuda" or storage.device != device
+                or (storage.data_ptr(), storage.nbytes()) != (address, nbytes)):
+            continue
+        if best is None or nbytes > best.nbytes():
+            best = storage
+    if best is None:
+        return None
+    return torch.empty(0, dtype=torch.uint8, device=best.device).set_(best, 0, (best.nbytes(),))
+
+
 class CollectiveStartupTuning:
     def __init__(self, session):
         self.session = session
@@ -89,19 +112,25 @@ class CollectiveStartupTuning:
         self.groups = {}
         self.owner_groups = {}
         self.group_selectors = {}
+        self.startup_storage = None
 
     def prepare(self):
-        from b12x.comm.pcie import joint_startup_spec, prepare_joint_startup_tuner
+        from b12x.comm.pcie import StartupTuningStorage, joint_startup_spec, prepare_joint_startup_tuner
 
         groups, owner_groups = {}, {}
         for owner in self.owners:
             spec = joint_startup_spec(owner.plan, profiles=owner.runtime_profiles)
-            groups.setdefault(spec.key, []).append(spec)
-            owner_groups[id(owner)] = spec.key
+            key = (spec.key, id(spec.state.runtime))
+            groups.setdefault(key, []).append(spec)
+            owner_groups[id(owner)] = key
         selectors = {key: tuple(spec.selector.data_ptr() for spec in specs) for key, specs in groups.items()}
         policies = {owner_groups[id(owner)]: owner.runtime_cache_policy for owner in self.owners}
+        if groups and self.startup_storage is None:
+            self.startup_storage = StartupTuningStorage(next(iter(groups.values()))[0].selector.device)
         self.groups = {key: self.groups[key] if self.group_selectors.get(key) == selectors[key]
-                       else prepare_joint_startup_tuner(specs, cache_policy=policies[key]) for key, specs in groups.items()}
+                       else prepare_joint_startup_tuner(specs, cache_policy=policies[key],
+                                                       storage=self.startup_storage)
+                       for key, specs in groups.items()}
         self.group_selectors = selectors
         self.owner_groups = owner_groups
 
@@ -120,8 +149,14 @@ class CollectiveStartupTuning:
                   if owner in self.owner_groups}
         storage = self.session.benchmark_storage
         if needed and storage is None:
-            raise RuntimeError("collective startup capture requires package storage")
+            raise RuntimeError("collective startup capture requires core storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
+        if any(self.groups[key].cache_policy == "cold" for key in needed):
+            # Cold races only read their L2 eviction input; resident weights serve.
+            source = resident_numeric_storage(storage.numeric_storage,
+                device=self.startup_storage.device, minimum_bytes=self.startup_storage.eviction_bytes)
+            if source is not None:
+                self.startup_storage.use_eviction(source)
         for index, (key, producer) in enumerate(self.groups.items()):
             if key not in needed:
                 continue
@@ -143,10 +178,10 @@ class CollectiveStartupTuning:
             with torch.cuda.device(device):
                 stream = torch.cuda.Stream(device=device)
                 stream.wait_stream(torch.cuda.current_stream(device))
-                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                graph = capture_graph(retain_graphs=True)
                 with self.session.capture(), torch.cuda.graph(graph, pool=storage.graph_pool.id, stream=stream):
                     producer.run()
-                graph.instantiate()
+                instantiate_graph(graph)
                 stream.synchronize()
             tuners[name] = TuningGraph(graph, tuple(outputs), status)
             resources.append(producer)

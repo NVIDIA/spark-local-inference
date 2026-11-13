@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native authoritative acceptance with divergent full proposal probabilities."""
 
 import json
@@ -88,7 +91,7 @@ def rank_main(rank, rendezvous, output):
         target = torch.full((b, d + 1, v), 1 / v, device=device)
         rng = SpeculativeRngState.allocate(device, capacity=c)
         rng.generation.fill_(7)
-        completion = CompletionOutputs.allocate((2, c, 24), device=device)
+        completion = CompletionOutputs.allocate((2, c, 32), device=device)
         frame = torch.zeros(1, device=device, dtype=torch.int32)
         sequence = torch.ones(1, device=device, dtype=torch.int64)
         poison = torch.zeros(1, device=device, dtype=torch.bool)

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Finite recurrent benchmark operands with serving layouts and serialized state reuse."""
 
 from functools import partial
@@ -131,11 +135,16 @@ class RecurrentBenchmarkInputs:
                 self.sources[name] = value.to(device=target.device, dtype=target.dtype)
             target.zero_()
         self._metadata(columns)
-        self.producers = (partial(self.produce, False), partial(self.produce, True)) if mode == "prefill" else (partial(self.produce, False),)
         self._owned_tensors = (
             self.initial_state, self.packed_source, self.packed_fixture, *self.sources.values(),
             *(value for name, value in self.args.items() if name not in immutable and name != self.state_name),
         )
+
+    @property
+    def producers(self):
+        # Trial calls retain these bound methods; the fixture must not retain itself.
+        fresh = (False, True) if self.mode == "prefill" else (False,)
+        return tuple(partial(self.produce, value) for value in fresh)
 
     @property
     def nbytes(self):
@@ -204,7 +213,8 @@ def benchmark_call(prepared, *, arguments, session, name, mode, scratch_specs,
     scratch = planned_scratch(scratch_specs(prepared), workspace)
     binding = getattr(prepared, bind_method)(scratch=scratch, **operands.args,
                             **({"plan": binding_plan} if binding_plan is not None else {}))
+    producers = operands.producers
     return PreparedCall(run=lambda: prepared.run(binding, **run_options),
-        output=operands.args[operands.output_name], produce=operands.producers[0],
-        benchmark_producers=operands.producers, reset=operands.reset,
+        output=operands.args[operands.output_name], produce=producers[0],
+        benchmark_producers=producers, reset=operands.reset,
         restore=operands.reset, owners=(operands, scratch, binding))

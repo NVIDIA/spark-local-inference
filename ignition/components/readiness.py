@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Frame-owned GPU timestamps around captured external readiness waits."""
 
 import torch
@@ -60,3 +63,14 @@ class PreparedReadinessWait:
         self.barrier = PreparedAllReduce(self.input, self.output, runtime=runtime, session=session,
                                         coordinator=coordinator, name=name)
         self.handle = 0 if self.barrier.single else self.barrier.handle + 1
+
+    def functional(self, *, session):
+        self.barrier.functional(session=session)
+        self.input = self.output = None
+        return self
+
+    def operands(self, source):
+        if self.input is not None:
+            return self.input, self.output
+        barrier_input = torch.zeros((1, 8), dtype=torch.bfloat16, device=source.device)
+        return barrier_input, torch.empty_like(barrier_input)

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Framed byte links shared by the rank record relay and pool protocol.
 use crate::{
     Error, InboundTicket, JobId, PageId, PrefixKey, PublishedCheckpoint, Result, SharedCopier,
@@ -459,7 +464,10 @@ impl Kind {
 
     fn of(event: &TransportEvent) -> (Self, JobId, Result<u64>) {
         match event {
-            TransportEvent::Stored { id, result } => (Self::Stored, *id, copy(result)),
+            TransportEvent::Stored { id, result, header } => {
+                debug_assert!(header.as_ref().is_none_or(|h| !h.replicated()));
+                (Self::Stored, *id, copy(result))
+            }
             TransportEvent::StoreInvalidated { id, error } => {
                 (Self::StoreInvalidated, *id, Err(error.clone()))
             }
@@ -475,7 +483,11 @@ impl Kind {
 
     fn event(self, id: JobId, result: Result<u64>) -> TransportEvent {
         match self {
-            Self::Stored => TransportEvent::Stored { id, result },
+            Self::Stored => TransportEvent::Stored {
+                id,
+                result,
+                header: None,
+            },
             Self::StoreInvalidated => TransportEvent::StoreInvalidated {
                 id,
                 error: result
@@ -808,6 +820,10 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
 }
 
 impl DiskTransport for Sharded {
+    fn staged(&self) -> Option<&Staged> {
+        Some(&self.local)
+    }
+
     fn store(
         &mut self,
         id: JobId,
@@ -815,7 +831,9 @@ impl DiskTransport for Sharded {
         temporary: PathBuf,
         path: PathBuf,
         checkpoint: &PublishedCheckpoint,
+        detect: bool,
     ) -> Result<()> {
+        debug_assert!(!detect);
         self.accept()?;
         let tail = header.tail_pages as usize;
         let chain = checkpoint.chain_pages.len();
@@ -845,6 +863,7 @@ impl DiskTransport for Sharded {
             path.clone(),
             pages.to_vec(),
             checkpoint.slot,
+            false,
         )?;
         self.begin(Kind::Stored, id, Some(path), &frame);
         Ok(())
@@ -1031,7 +1050,7 @@ impl Peer {
             reader.end()?;
             let result = self
                 .staged
-                .store_pages(id, header, temporary, path, pages, slot);
+                .store_pages(id, header, temporary, path, pages, slot, false);
             return Ok(result.err().map(|error| (Kind::Stored, id, error)));
         }
         if tag == FETCH {
@@ -1182,7 +1201,7 @@ fn shape(header: &Header) -> Result<[u8; 16]> {
     header.fingerprint = [0; 16];
     header.row_checksum = 0;
     let mut hash = Blake2b::<U16>::new();
-    hash.update(header.encode()?);
+    hash.update(header.canonical_encoding()?);
     Ok(hash.finalize().into())
 }
 
@@ -1266,11 +1285,36 @@ pub fn decode_agreed(payload: &[u8]) -> Result<HashMap<PrefixKey, bool>> {
 ///
 /// Failing here stops startup: a predictable token would let any host on the
 /// network claim a peer's record connection.
+#[cfg(unix)]
 pub fn nonce() -> Result<[u8; 16]> {
     let mut random = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut source| source.read_exact(&mut random))
         .map_err(|error| record::io_failure("read a prefix record token", error))?;
+    Ok(random)
+}
+
+/// Windows has no `/dev/urandom`; the system-preferred CSPRNG fills the same token.
+#[cfg(windows)]
+pub fn nonce() -> Result<[u8; 16]> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let mut random = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            random.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(record::io_failure(
+            "read a prefix record token",
+            std::io::Error::other(format!("BCryptGenRandom failed with NTSTATUS {status:#x}")),
+        ));
+    }
     Ok(random)
 }
 

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! State shared between the model worker and the pool's I/O thread: bounded
 //! queues in both directions, the status, and the lookup registry.
 

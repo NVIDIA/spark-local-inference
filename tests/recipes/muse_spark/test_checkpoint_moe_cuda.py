@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint MoE arithmetic across eight sequential intermediate shards on one assigned GPU."""
 
 from contextlib import ExitStack

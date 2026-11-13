@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint peers receive authenticated requested bytes and never weight files."""
 
 from array import array
@@ -16,7 +20,7 @@ import pytest
 
 from ignition.preparation import checkpoint_source as transport
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-from ignition.preparation.runtime_package import FileSource
+from ignition.preparation.runtime_core import FileSource
 
 
 def checkpoint(directory):
@@ -420,8 +424,8 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
     import signal
     import flare_heliopause
     import torch.distributed as dist
-    from ignition.preparation import host_ranks, runtime_package
-    from ignition.preparation.package_file import read_sources
+    from ignition.preparation import host_ranks, runtime_core
+    from ignition.preparation.core_file import read_sources
 
     events = []
     control_root, control_peer = socket.socketpair()
@@ -475,19 +479,19 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
             return "127.0.0.1", 0
         def fileno(self):
             assert "drained" in events and "owner-closed" not in events
-            events.append("package-send-started")
+            events.append("core-send-started")
             return control_peer.fileno()
         def close(self):
             control_peer.close()
     model = SimpleNamespace(memory_report={}, manifest=lambda: None, close=lambda: events.append("model-closed"))
     assignment = {"config": None, "prepare": lambda *args, **kwargs: model,
-                  "store": ("127.0.0.1", 1234), "packaged": False}
+                  "store": ("127.0.0.1", 1234), "exporting": False}
     source = tmp_path / "weights.bin"
     source.write_bytes(b"synthetic weights")
     commands = iter((("checkpoint-source", None), assignment, ("export", {}), "close"))
     def export(*args, **kwargs):
-        from ignition.preparation.package_file import write_sources
-        from ignition.preparation.runtime_package_pb2 import ModelIndex, BundleIndex, Span
+        from ignition.preparation.core_file import write_sources
+        from ignition.preparation.runtime_core_pb2 import ModelIndex, BundleIndex, Span
         size = source.stat().st_size
         index = ModelIndex(version=4, ranks=[BundleIndex(resources={'weights': Span(nbytes=size)})])
         write_sources(args[3], index, [(0, source, 0, size)])
@@ -499,7 +503,7 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
     monkeypatch.setattr(host_ranks, "_use_interface", lambda *args: None)
     monkeypatch.setattr(host_ranks, "receive_object", lambda *args: next(commands))
     monkeypatch.setattr(host_ranks, "send_object", lambda *args: None)
-    monkeypatch.setattr(runtime_package, "export_model", export)
+    monkeypatch.setattr(runtime_core, "export_model", export)
     monkeypatch.setattr(dist, "TCPStore", lambda *args, **kwargs: None)
     monkeypatch.setattr(dist, "init_process_group", lambda *args, **kwargs: None)
     monkeypatch.setattr(dist, "destroy_process_group", lambda: None)
@@ -523,9 +527,9 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
         for connection in (control_root, control_peer, data_root, data_peer):
             connection.close()
     assert events.count("owner-closed") == 1
-    assert events.index("drained") < events.index("package-send-started") < events.index("owner-closed")
+    assert events.index("drained") < events.index("core-send-started") < events.index("owner-closed")
     if not failed_send:
-        assert events.index("package-send-started") < events.index("transport-closed") < events.index("owner-closed")
+        assert events.index("core-send-started") < events.index("transport-closed") < events.index("owner-closed")
         index, locate = read_sources(destination)
         [(path, offset, size)] = locate(index.ranks[0].resources["weights"])
         with path.open("rb") as stream:

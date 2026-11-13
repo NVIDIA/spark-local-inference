@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Scheduler state a shared prefix pool needs: eviction notices, the export
 //! chain of a GPU checkpoint, and the read-only headroom check for pinning it.
 
@@ -8,8 +13,8 @@ use flare_selene::{ExportChain, ExportNode, ExportRefusal};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvictedCheckpoint {
     pub key: PrefixKey,
-    /// For a compaction, the child that kept its key and took
-    /// the removed checkpoint's parent and pages.
+    /// For a compaction, the first offered descendant with its updated parent
+    /// and pages.
     pub heir: Option<PublishedCheckpoint>,
 }
 
@@ -28,14 +33,46 @@ impl RequestScheduler {
         self.track_evictions = true;
     }
 
-    /// Retires cache entries under pressure, queueing a notice for each when
-    /// tracking is enabled. Every eviction in the scheduler goes through here.
+    /// Retire cache entries for mandatory execution resources and queue notices
+    /// when tracking is enabled.
     pub(super) fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let report = self.cache.evict(target);
+        self.record_evictions(&report);
+        report
+    }
+
+    pub(super) fn record_evictions(&mut self, report: &EvictionReport) {
+        for retired in &report.retired {
+            self.offered_publications.remove(&retired.checkpoint);
+        }
         if self.track_evictions {
             for retired in &report.retired {
-                let heir = retired
-                    .heir
+                let mut heir = retired.heir;
+                while let Some(id) = heir {
+                    if self.offered_publications.contains(&id) {
+                        break;
+                    }
+                    if self
+                        .cache
+                        .checkpoint(id)
+                        .is_ok_and(|node| node.ready() && node.child_count() > 1)
+                    {
+                        self.record_publication(id);
+                        let key = self.cache.checkpoint(id).unwrap().prefix();
+                        for child in &self.offered_publications {
+                            if !self.publications.contains(child)
+                                && self
+                                    .publication(*child)
+                                    .is_some_and(|node| node.parent == Some(key))
+                            {
+                                self.publications.push(*child);
+                            }
+                        }
+                        break;
+                    }
+                    heir = self.cache.single_child(id);
+                }
+                let heir = heir
                     .filter(|heir| self.cache.checkpoint(*heir).is_ok_and(|node| node.ready()))
                     .and_then(|heir| self.publication(heir));
                 // Bound queued notices when the store delays draining them.
@@ -49,7 +86,6 @@ impl RequestScheduler {
                 });
             }
         }
-        report
     }
 
     /// Evictions since tracking was enabled or the previous call, oldest first.
@@ -121,7 +157,7 @@ impl RequestScheduler {
         })
     }
 
-    fn decode_growth_pages(&self) -> usize {
+    pub(super) fn decode_growth_pages(&self) -> usize {
         self.slots
             .iter()
             .filter_map(|slot| slot.request.as_ref())

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Read-only CUDA graph-node attribution during explicitly scoped capture."""
 from contextlib import contextmanager
 import ctypes as C

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use flare_selene::{CacheGeometry, Result, pool::{Budget, PoolBuilder, PoolPeers, PreparedPool}};
 use flare_selene::{
     History,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared packed Q/K normalization, rotary embedding, and optional KV append."""
 
 from dataclasses import dataclass, replace
@@ -16,7 +19,7 @@ from b12x.attention.qsa._kernels import _prepare_index_query_kernel
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
-from ignition.preparation.tuning import benchmark_resource, declare
+from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
 from .native_operator import native_contract, native_plan
 from .selected_attention import metadata_tensor, tensor_facts
@@ -172,6 +175,24 @@ class PreparedQKNormRoPE:
             prepare_call=lambda state: replace(benchmark(state), owners=()),
             benchmark_call=benchmark),))
 
-    def __call__(self):
-        _execute(*self.arguments, self.plan.handle)
-        return self.output
+    def functional(self, *, session):
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        args = self.arguments
+        self.constants = args[1:5] + args[10:12]
+        self.layouts = tuple((tuple(t.shape), tuple(t.stride()), t.dtype) for t in args[7:10])
+        self.copy_value = bool(args[9].numel())
+        self.arguments = self.output = self.empty = None
+
+    def __call__(self, projected=None, metadata=None):
+        if self.arguments is not None:
+            _execute(*self.arguments, self.plan.handle)
+            return self.output
+        qw, kw, bias, inverse, key_cache, value_cache = self.constants
+        query, key, value = (torch.empty_strided(shape, stride, dtype=dtype, device=projected.device)
+                             for shape, stride, dtype in self.layouts)
+        _execute(projected, qw, kw, bias, inverse, metadata.requests, metadata.positions,
+                 query, key, value, key_cache, value_cache, metadata.page_table, self.plan.handle)
+        return query, key, value if self.copy_value else None

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Immutable terminal prefix metadata with explicit GPU readiness and retirement.
 
 mod hash;
@@ -6,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
 pub use flare_selene::{CheckpointId, PageId};
-pub use hash::{ConditioningEvent, HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey};
+pub use hash::{ConditioningEvent, PrefixHistory, PrefixKey, HASH_BLOCK_TOKENS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub u32);
@@ -14,6 +20,21 @@ pub struct SnapshotId(pub u32);
 /// Completion on one ordered timeline covering every relevant GPU stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fence(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RetentionRole {
+    #[default]
+    Endpoint,
+    Message,
+    Anchor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RetentionRank {
+    pub use_epoch: u64,
+    pub role: RetentionRole,
+    pub consumed_tokens: u64,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct StateSnapshot {
@@ -44,7 +65,7 @@ impl PublishResult {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Checkpoint {
     id: CheckpointId,
     parent: Option<CheckpointId>,
@@ -59,9 +80,18 @@ pub struct Checkpoint {
     direct_pins: u64,
     pins: u64,
     accessed: u64,
+    role: RetentionRole,
 }
 
 impl Checkpoint {
+    pub fn retention_rank(&self) -> RetentionRank {
+        RetentionRank {
+            use_epoch: self.accessed,
+            role: self.role,
+            consumed_tokens: self.prefix.consumed_tokens,
+        }
+    }
+
     pub fn id(&self) -> CheckpointId {
         self.id
     }
@@ -164,6 +194,7 @@ pub struct CacheStats {
 /// pending writes to unused duplicate resources still require caller retirement.
 /// Snapshot IDs cover the recipe's complete continuation state and saved hidden
 /// vector. Page IDs cover every layer's corresponding immutable cache storage.
+#[derive(Clone)]
 pub struct PrefixCheckpointCache {
     identity: [u8; 32],
     page_tokens: usize,
@@ -218,6 +249,16 @@ impl PrefixCheckpointCache {
         })
     }
 
+    pub(crate) fn single_child(&self, id: CheckpointId) -> Option<CheckpointId> {
+        if self.nodes.get(&id)?.child_count != 1 {
+            return None;
+        }
+        self.nodes
+            .values()
+            .find(|node| node.parent == Some(id))
+            .map(|node| node.id)
+    }
+
     /// The GPU-ready checkpoint published under `prefix`, if any.
     pub fn ready_by_prefix(&self, prefix: &PrefixKey) -> Option<CheckpointId> {
         let id = *self.prefixes.get(prefix)?;
@@ -243,10 +284,44 @@ impl PrefixCheckpointCache {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn publish(
         &mut self,
         history: &PrefixHistory,
         proposal: &Publication,
+    ) -> Result<PublishResult> {
+        self.publish_with_retention(history, proposal, RetentionRole::Endpoint, 0)
+    }
+
+    pub fn new_use_epoch(&mut self) -> Result<u64> {
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or("cache demand epoch exhausted")?;
+        Ok(self.clock)
+    }
+
+    pub fn touch(&mut self, id: CheckpointId, use_epoch: u64) -> Result<()> {
+        for ancestor in self.chain(id)? {
+            let node = self.nodes.get_mut(&ancestor).unwrap();
+            node.accessed = node.accessed.max(use_epoch);
+        }
+        Ok(())
+    }
+
+    pub fn promote(&mut self, id: CheckpointId, role: RetentionRole, use_epoch: u64) -> Result<()> {
+        self.touch(id, use_epoch)?;
+        let node = self.nodes.get_mut(&id).unwrap();
+        node.role = node.role.max(role);
+        Ok(())
+    }
+
+    pub fn publish_with_retention(
+        &mut self,
+        history: &PrefixHistory,
+        proposal: &Publication,
+        role: RetentionRole,
+        use_epoch: u64,
     ) -> Result<PublishResult> {
         self.history_matches(history)?;
         let prefix = history.key_at(proposal.consumed_tokens).ok_or(
@@ -309,15 +384,12 @@ impl PrefixCheckpointCache {
         {
             return Err("checkpoint snapshot is out of capacity or already owned".into());
         }
-        let tick = self
-            .clock
-            .checked_add(1)
-            .ok_or("cache access clock exhausted")?;
         if let Some(id) = self.prefixes.get(&prefix).copied() {
-            self.clock = tick;
             let existing = self.nodes.get_mut(&id).unwrap();
-            existing.accessed = tick;
+            existing.accessed = existing.accessed.max(use_epoch);
+            existing.role = existing.role.max(role);
             let ready = existing.ready;
+            self.touch(id, use_epoch)?;
             for ancestor in parent_chain {
                 let node = self.nodes.get_mut(&ancestor).unwrap();
                 node.last_use = node.last_use.max(proposal.ready_after);
@@ -343,10 +415,10 @@ impl PrefixCheckpointCache {
             child_count: 0,
             direct_pins: 0,
             pins: 0,
-            accessed: tick,
+            accessed: use_epoch,
+            role,
         };
         self.next_id = next_id;
-        self.clock = tick;
         self.owned_pages.extend(candidate_pages);
         self.owned_snapshots.insert(proposal.snapshot.id);
         if let Some(parent) = proposal.parent {
@@ -361,7 +433,7 @@ impl PrefixCheckpointCache {
         Ok(PublishResult::Created { id, ready })
     }
 
-    pub fn lookup(&mut self, history: &PrefixHistory) -> Result<Lookup> {
+    pub fn lookup(&self, history: &PrefixHistory) -> Result<Lookup> {
         self.history_matches(history)?;
         let selected = self
             .nodes
@@ -371,13 +443,6 @@ impl PrefixCheckpointCache {
             })
             .max_by_key(|node| node.prefix.consumed_tokens)
             .map(|node| node.id);
-        if let Some(id) = selected {
-            self.clock = self
-                .clock
-                .checked_add(1)
-                .ok_or("cache access clock exhausted")?;
-            self.nodes.get_mut(&id).unwrap().accessed = self.clock;
-        }
         match selected {
             None => Ok(Lookup {
                 checkpoint: None,
@@ -512,52 +577,46 @@ impl PrefixCheckpointCache {
         })
     }
 
-    /// Thin dense checkpoint chains before retiring endpoints under snapshot pressure.
+    pub(crate) fn eviction_candidate(
+        &self,
+        below: Option<RetentionRank>,
+        immediate: bool,
+    ) -> Option<CheckpointId> {
+        self.eviction_candidates()
+            .filter(|node| {
+                below.is_none_or(|rank| {
+                    (node.retention_rank(), node.id.value()) < (rank, self.next_id)
+                })
+            })
+            .filter(|node| !immediate || node.last_use.max(node.ready_after) <= self.completed)
+            .min_by_key(|node| (node.retention_rank(), node.id))
+            .map(|node| node.id)
+    }
+
+    pub(crate) fn evict_checkpoint(&mut self, id: CheckpointId) -> Result<RetiredResources> {
+        if !self.eviction_candidates().any(|node| node.id == id) {
+            return Err("checkpoint is pinned or required by cache branches".into());
+        }
+        Ok(if self.nodes[&id].child_count == 0 {
+            self.retire_leaf(id)
+        } else {
+            self.compact_ancestor(id)
+        })
+    }
+
+    /// Retire removable checkpoints in demand-recency and retention-role order.
     /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let mut report = EvictionReport::default();
         while report.pages_scheduled < target.pages || report.snapshots_scheduled < target.snapshots
         {
-            let interior = (target.pages == 0)
-                .then(|| {
-                    self.nodes
-                        .values()
-                        .filter_map(|child| {
-                            let parent = self.nodes.get(&child.parent?)?;
-                            (parent.ready && parent.direct_pins == 0 && parent.child_count == 1)
-                                .then_some((parent, child))
-                        })
-                        .min_by_key(|(node, child)| {
-                            let start = node
-                                .parent
-                                .map_or(0, |id| self.nodes[&id].prefix.consumed_tokens);
-                            (
-                                node.parent.is_none(),
-                                child.prefix.consumed_tokens - start,
-                                node.accessed,
-                                node.id,
-                            )
-                        })
-                        .map(|(node, _)| node.id)
-                })
-                .flatten();
-            let candidate = interior.or_else(|| {
-                self.eviction_candidates()
-                    .min_by_key(|node| (node.accessed, node.id))
-                    .map(|node| node.id)
-            });
-            let Some(id) = candidate else {
+            let Some(id) = self.eviction_candidate(None, false) else {
                 break;
             };
-            let retired = if self.nodes[&id].child_count == 0 {
-                self.retire_leaf(id)
-            } else {
-                self.compact_ancestor(id)
-            };
+            let retired = self.evict_checkpoint(id).unwrap();
             report.pages_scheduled += retired.pages.len();
             report.snapshots_scheduled += 1;
             report.retired.push(retired);
-            // Snapshot aliases can release KV pages; let the scheduler recheck actual backing.
             if target.pages != 0 && report.snapshots_scheduled >= target.snapshots {
                 break;
             }
@@ -685,3 +744,6 @@ impl PrefixCheckpointCache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

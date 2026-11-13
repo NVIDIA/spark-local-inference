@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the Gemma 4 recipe, configuration, pool layout, and numerical kernels."""
 
 import json
@@ -8,7 +12,7 @@ import pytest
 import torch
 
 from ignition import planning
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.recipes import resolve
 from ignition.recipes.gemma4.attention import (
@@ -458,8 +462,8 @@ def test_single_file_safetensors_checkpoint_resolution_and_inspection(tmp_path):
 def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
     seen = {}
 
-    def fake_prepare(snapshot, config, *, progress, package_storage):
-        seen.update(snapshot=snapshot, config=config, package_storage=package_storage)
+    def fake_prepare(snapshot, config, *, progress, core_storage):
+        seen.update(snapshot=snapshot, config=config, core_storage=core_storage)
         return "prepared"
 
     monkeypatch.setattr("ignition.recipes.gemma4.bootstrap.prepare", fake_prepare)
@@ -472,13 +476,13 @@ def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
         compile_forwards=True,
         kernel_cache=tmp_path / "cache",
         progress=None,
-        package_storage="storage",
+        core_storage="storage",
     ) == "prepared"
     assert seen["config"].max_active == 4
     assert seen["config"].context == 262144
     assert seen["config"].prefill_chunk_size == 4096
     assert seen["config"].compile_decoder is True
-    assert seen["package_storage"] == "storage"
+    assert seen["core_storage"] == "storage"
 
 
 def test_frontend_contract_and_cache_regions():
@@ -519,13 +523,18 @@ def test_frontend_contract_and_cache_regions():
         ("gemma-4-31b-nvfp4", _dense_31b_raw, "chat_template.google.jinja"),
     ],
 )
-def test_model_sizes_select_canonical_chat_templates(alias, raw_fn, filename):
+def test_model_sizes_select_canonical_chat_templates(alias, raw_fn, filename, monkeypatch):
+    import os
+    import huggingface_hub
+
+    directory = Path(os.environ["FLARE_TEST_TEMPLATE_DIR"]) / "gemma4"
+    source = directory / filename.replace(".jinja", ".source.jinja")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *args, **kwargs: str(source))
     assert resolve(alias).recipe is RECIPE
     config = ModelConfig.from_dict(raw_fn())
     asset = chat_template_asset(config.hidden)
-    path = Path(asset["path"])
-    assert path.name == filename
-    assert path.read_bytes().count(b"{%- mark -%}") == 2
+    assert asset["text"].encode() == (directory / filename).read_bytes()
+    assert asset["text"].count("{%- mark -%}") == 2
 
 
 @pytest.mark.parametrize(
@@ -540,7 +549,7 @@ def test_canonical_chat_templates_match_pinned_google_sources(checkpoint):
         pytest.skip("Google checkpoint configuration and chat template are not cached")
     source = (snapshot / "chat_template.jinja").read_bytes()
     config = ModelConfig.load(snapshot)
-    annotated = Path(chat_template_asset(config.hidden)["path"]).read_bytes()
+    annotated = chat_template_asset(config.hidden)["text"].encode()
     assert annotated.replace(b"{%- mark -%}", b"") == source
     assert annotated.count(b"{%- mark -%}") == 2
 
@@ -715,7 +724,7 @@ def test_gemma4_multi_rank_and_speculative_adapter(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
         "ignition.preparation.rank_group.prepare_group",
-        lambda snapshot, config, prepare, *, progress, package_storage=None, ranks=None, checkpoint=None: seen.append(
+        lambda snapshot, config, prepare, *, progress, core_storage=None, ranks=None, checkpoint=None: seen.append(
             (config, prepare, ranks, checkpoint)
         )
         or "group",

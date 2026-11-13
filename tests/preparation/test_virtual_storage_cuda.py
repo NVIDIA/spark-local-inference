@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """In-process runtime-sized storage keeps its full shape while only a prefix is backed."""
 
 import os

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture a chain of dense projections alongside independent main-stream work."""
 
 import torch
@@ -161,6 +165,8 @@ class ConcurrentProjectionChain:
         register_finalizer(session, self.refresh, workspace=workspace)
 
     def refresh(self):
+        if self.arena is None:
+            return
         main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in self.parallel_plans)
         if self.encoded_projection is not None:
             projection = self.encoded_projection
@@ -171,7 +177,57 @@ class ConcurrentProjectionChain:
             side_bytes = max(p.plan.memory_requirements().scratch_nbytes for p in self.projections)
         _, self.workspace = self.arena.views(((main_bytes,), torch.uint8), ((side_bytes,), torch.uint8))
 
-    def start(self, source):
+    def functional(self, *, session):
+        self.output_layouts = tuple((tuple(p.output.shape), tuple(p.output.stride()), p.output.dtype)
+                                   for p in self.projections)
+        projection = self.encoded_projection
+        self.encoded_layouts = None
+        if projection is not None:
+            self.encoded_layouts = tuple((tuple(t.shape), t.dtype) for t in projection.encoded_bases)
+            self.encoded_weights = projection.parts[:2]
+            self.quantizer_handle = None if projection.quantizer_plan is None else projection.quantizer_plan.handle
+            self.dense_handle = projection.plan.handle
+        self.side_plans = tuple(p.plan for p in self.projections)
+        if projection is not None and projection.quantizer_plan is not None:
+            self.side_plans += (projection.quantizer_plan,)
+        self.plan_owners = tuple(p.functional(session=session) for p in self.projections)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.side_plans = tuple(p.plan for p in self.plan_owners)
+        if self.encoded_layouts is not None:
+            projection = self.plan_owners[0]
+            self.dense_handle = projection.plan.handle
+            self.quantizer_handle = None if projection.quantizer_plan is None else projection.quantizer_plan.handle
+            if projection.quantizer_plan is not None:
+                self.side_plans += (projection.quantizer_plan,)
+        else:
+            self.plans = [p.plan.handle for p in self.plan_owners]
+        self.workspace_nbytes = max(plan.memory_requirements().scratch_nbytes for plan in self.side_plans)
+        self.projections = self.parallel_plans = self.encoded_projection = self.arena = self.workspace = None
+        self.outputs = None
+
+    def start(self, source, *, encoded_bases=None):
+        if self.projections is None:
+            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device).zero_()
+                       for shape, stride, dtype in self.output_layouts]
+            workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+            if self.encoded_layouts is not None:
+                if self.quantizer_handle is None:
+                    if encoded_bases is None:
+                        raise ValueError("preencoded projection overlap requires runtime encoded bases")
+                    _start_preencoded(source, *self.encoded_weights, outputs[0], *encoded_bases,
+                                      workspace, self.dense_handle, self.stream_handle)
+                else:
+                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
+                                          for shape, dtype in self.encoded_layouts)
+                    _start_encoded(source, *self.encoded_weights, outputs[0], *encoded_bases, workspace,
+                                   self.quantizer_handle, self.dense_handle, self.stream_handle)
+            else:
+                _start(source, self.weights, self.scales, self.gains, self.activation_scales,
+                       self.scale_kinds, outputs, workspace, self.plans, self.stream_handle)
+            return source, outputs, workspace, encoded_bases
         if self.encoded_projection is not None:
             projection = self.encoded_projection
             if projection.quantizer_plan is None:
@@ -186,6 +242,13 @@ class ConcurrentProjectionChain:
                self.outputs, self.workspace, self.plans, self.stream_handle)
 
     def finish(self, source, dependency):
+        if self.projections is None:
+            source, outputs, workspace, bases = source
+            if bases is not None:
+                _join_encoded(source, dependency, outputs[0], *bases, workspace, self.stream_handle)
+            else:
+                _join(source, dependency, outputs, workspace, self.stream_handle)
+            return outputs[-1]
         if self.encoded_projection is not None:
             projection = self.encoded_projection
             _join_encoded(source, dependency, projection.output, *projection.encoded_bases,

@@ -1,0 +1,47 @@
+name: Helios lifecycle
+
+on:
+  pull_request:
+    paths:
+      - 'helios/**'
+      - 'selene/**'
+      - 'selene-manager/**'
+      - 'eos/**'
+      - 'verification/helios-lifecycle/**'
+      - '.github/workflows/helios-lifecycle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9'
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Download TLA+ tools
+        run: curl --fail --location --retry 2 --output "$RUNNER_TEMP/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+      - name: Check lifecycle model and Rust conformance
+        run: python3 verification/helios-lifecycle/check.py --tlc-jar "$RUNNER_TEMP/tla2tools.jar"
+
+  kani:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Install Kani
+        run: cargo install --locked kani-verifier --version 0.68.0
+      - name: Set up Kani compiler
+        run: cargo kani setup
+      - name: Prove sequential validator properties
+        run: cargo kani --manifest-path helios/Cargo.toml --lib

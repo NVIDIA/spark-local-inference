@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Experimental RDMA build. The default Dockerfile does not link libibverbs.
 # Build from the Flare repository root:
 #   docker build -f selene-manager/Dockerfile.rdma -t selene:rdma .

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Complete hybrid-row transitions and admission ordering through native replay."""
 
 import os
@@ -42,7 +46,7 @@ def _staging():
         row_generations=torch.zeros(4, dtype=torch.int64, device="cuda"),
         live_rows=torch.zeros(1, dtype=torch.int32, device="cuda"),
         page_tables=torch.tensor([[0, 1, 2, 3]] * 4, dtype=torch.int32, device="cuda"))
-    records = torch.full((2, 4, 24), -22, dtype=torch.int64, device="cuda")
+    records = torch.full((2, 4, 32), -22, dtype=torch.int64, device="cuda")
     frame = torch.zeros(1, dtype=torch.int32, device="cuda")
     sequence = torch.ones(1, dtype=torch.int64, device="cuda")
     return metadata, admissions, inputs, records, frame, sequence

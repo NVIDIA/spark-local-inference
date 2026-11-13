@@ -1,8 +1,13 @@
-//! Host-tier tests that need a CUDA device and an exported package.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Host-tier tests that need a CUDA device and an exported core.
 //!
 //! Selene's own tests cover the stores against copiers that never touch a
 //! device; these run the stores over the real transfer threads. They are ignored
-//! unless `FLARE_OFFLOAD_TEST_PACKAGE` names a package a free GPU 0 can load.
+//! unless `FLARE_OFFLOAD_TEST_CORE` names a core a free GPU 0 can load.
 
 use flare_selene::{
     HostStore, StoreEvent,
@@ -13,12 +18,12 @@ fn seed(plane: usize, unit: u32) -> u64 {
     (plane as u64 + 1) * 1_000_003 + u64::from(unit)
 }
 
-fn load_test_model(package: &std::ffi::OsStr) -> crate::runtime_package::NativeModel {
+fn load_test_model(core: &std::ffi::OsStr) -> crate::runtime_core::NativeModel {
     unsafe {
-        crate::runtime_package::NativeModel::load(
-            crate::runtime_package::test_support::authorize(std::path::Path::new(package)),
+        crate::runtime_core::NativeModel::load(
+            crate::runtime_core::test_support::authorize(std::path::Path::new(core)),
             &[0],
-            &crate::runtime_package::LoadOptions::default(),
+            &crate::runtime_core::LoadOptions::default(),
             &crate::startup::StartupProgress::silent(),
         )
     }
@@ -57,16 +62,16 @@ mod memory {
     const IDENTITY: [u8; 32] = [7; 32];
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn memory_store_round_trips_a_multi_window_checkpoint() {
         use crate::cuda::Stream;
         use flare_selene::CacheGeometry;
 
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -109,7 +114,13 @@ mod memory {
             seed(row_plane, source_slot),
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(
+            &layout,
+            4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+                * layout.page_record_bytes,
+            flare_selene::offload::intake_slots(&layout, 1),
+        )
+        .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -195,16 +206,16 @@ mod memory {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn memory_store_round_trips_a_checkpoint_through_a_loaded_core() {
         use crate::cuda::Stream;
         use flare_selene::CacheGeometry;
 
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -262,7 +273,13 @@ mod memory {
             0xDD,
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(
+            &layout,
+            4 * (flare_selene::slab::WINDOW_PAGES + layout.row_slots()) as u64
+                * layout.page_record_bytes,
+            flare_selene::offload::intake_slots(&layout, 1),
+        )
+        .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -324,13 +341,24 @@ mod memory {
                     );
                 }
             }
-            let row_start = layout.ranks[0].row_offset as usize;
+            let slots: Vec<_> = record
+                .row
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&slot| pool.slot_address(slot))
+                .collect();
+            let actual: Vec<u8> = flare_selene::slab::row_pieces(&layout, &slots)
+                .flat_map(|(address, _, len)| {
+                    unsafe { std::slice::from_raw_parts(address as *const u8, len) }.to_vec()
+                })
+                .collect();
             let mut expected = vec![0u8; rank.row.unit_bytes as usize];
             fill(&mut expected, seed(row_plane, source_slot));
-            assert!(
-                pool.row(record.row.unwrap())[row_start..row_start + expected.len()]
-                    == expected[..],
-                "{label}: row slab bytes differ from the device"
+            assert_eq!(
+                &actual[..expected.len()],
+                &expected[..],
+                "{label}: row bytes differ from the device"
             );
         };
         check_record(&store, &checkpoint.key, "first record");
@@ -417,10 +445,8 @@ mod memory {
         // A pool holding one record evicts it when a second key is stored.
         let mut small = SlabPool::new(
             layout.page_record_bytes,
-            3,
-            layout.row_record_bytes,
-            1,
-            true,
+            layout.record_slots(3, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         small.register(&CudaRegistrar, context).unwrap();
@@ -433,8 +459,14 @@ mod memory {
             super::wait_event(&mut store, 60),
             StoreEvent::Stored { result: Ok(_), .. }
         ));
-        assert_eq!(store.pool().free_pages(), 0);
-        assert_eq!(store.pool().free_rows(), 0);
+        assert_eq!(
+            store.pool().free_slots(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
+        assert_eq!(
+            store.pool().free_slots(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         let mut other = PrefixHistory::new(IDENTITY);
         other.append(&tokens[..consumed as usize], &[]).unwrap();
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
@@ -452,7 +484,10 @@ mod memory {
         assert_eq!(store.store(&second).unwrap(), StoreOutcome::Queued);
         assert!(!store.index().contains(&checkpoint.key));
         assert!(store.index().contains(&second.key));
-        assert_eq!(store.pool().free_pages(), 0);
+        assert_eq!(
+            store.pool().free_slots(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         match super::wait_event(&mut store, 60) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, second.key);
@@ -539,9 +574,12 @@ mod composite {
         }
     }
 
-    fn gpu_transport(context: usize, device: i32, geometry: &[CacheGeometry]) -> Staged {
-        let mut pool = SlabPool::staging(&Layout::new(geometry).unwrap()).unwrap();
-        pool.register(&CudaRegistrar, context).unwrap();
+    fn gpu_transport(
+        context: usize,
+        device: i32,
+        geometry: &[CacheGeometry],
+        pool: SlabPool,
+    ) -> Staged {
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.to_vec(), &pool).unwrap(),
         ));
@@ -553,18 +591,18 @@ mod composite {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("composite", "gpu-child") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -599,25 +637,23 @@ mod composite {
         }
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
-            true,
+            4 * layout.record_slots(4, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
+            flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
             fingerprint,
             1 << 40,
             geometry.clone(),
             Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -790,24 +826,27 @@ mod composite {
         drop(store);
 
         // Restart: a fresh composite over the scanned directory and an empty memory pool.
-        let directory_lock = record::DirectoryLock::acquire(&directory).unwrap();
-        let scanned =
-            flare_selene::record::scan(&directory_lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &flare_selene::record::rank_sizes(&geometry))
-                .unwrap();
+        let directory_lock = flare_selene::testing::directory_lock(&directory).unwrap();
+        let scanned = flare_selene::record::scan(
+            &directory_lock,
+            &IDENTITY,
+            &fingerprint,
+            geometry[0].page_tokens,
+            &flare_selene::record::rank_sizes(&geometry),
+        )
+        .unwrap();
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
-            true,
+            4 * layout.record_slots(4, true) + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
             directory_lock,
             IDENTITY,
@@ -815,7 +854,7 @@ mod composite {
             1 << 40,
             geometry.clone(),
             scanned,
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -874,18 +913,18 @@ mod composite {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn composite_round_trips_through_memory_and_disk_on_a_loaded_core() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("composite", "gpu") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -947,25 +986,23 @@ mod composite {
         // one page to spare; a third record evicts the least recently used.
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            7,
-            layout.row_record_bytes,
-            2,
-            true,
+            2 * layout.record_slots(3, true) + 1 + flare_selene::offload::intake_slots(&layout, 1),
+            flare_selene::offload::intake_slots(&layout, 1),
         )
         .unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
         ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
+        let memory = MemoryStore::new_flat(IDENTITY, pool.clone(), transfers.clone()).unwrap();
         let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
+            flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
             fingerprint,
             1 << 40,
             geometry.clone(),
             Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
+            Box::new(gpu_transport(context, device, &geometry, pool)),
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
@@ -1210,10 +1247,8 @@ mod composite {
         let open_small = || {
             let mut pool = SlabPool::new(
                 layout.page_record_bytes,
-                1,
-                layout.row_record_bytes,
-                1,
-                true,
+                layout.record_slots(1, true) + flare_selene::offload::intake_slots(&layout, 1),
+                flare_selene::offload::intake_slots(&layout, 1),
             )
             .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
@@ -1221,19 +1256,11 @@ mod composite {
                 Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
             ));
             let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
-            let mut staging_pool = SlabPool::new(
-                layout.page_record_bytes,
-                3,
-                layout.row_record_bytes,
-                2,
-                true,
-            )
-            .unwrap();
-            staging_pool.register(&CudaRegistrar, context).unwrap();
+            let staging_pool = memory.pool().clone();
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
             ));
-            let lock = record::DirectoryLock::acquire(&directory).unwrap();
+            let lock = flare_selene::testing::directory_lock(&directory).unwrap();
             let scanned = record::scan(&lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
             let disk = DiskStore::new(
                 lock,
@@ -1286,7 +1313,10 @@ mod composite {
         assert_eq!(store.store(&large).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound_records(), 1);
         assert_eq!(store.disk().stats().outbound_in_flight, 1);
-        assert_eq!(store.memory().pool().free_pages(), 0);
+        assert_eq!(
+            store.memory().pool().free_slots(),
+            flare_selene::offload::intake_slots(&layout, 1)
+        );
         let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert!(!store.retains_chain(&hit.chain));
         store.fetch(hit, ticket()).unwrap();
@@ -1381,7 +1411,7 @@ mod disk_store {
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
         record::{self, Scanned},
-        slab::{STAGING_PAGE_SLABS, SlabPool},
+        slab::SlabPool,
     };
 
     use crate::{
@@ -1405,18 +1435,18 @@ mod disk_store {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn staged_store_round_trips_records_through_files_and_a_restart() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("disk-store", "round-trip") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -1505,15 +1535,21 @@ mod disk_store {
             source_slot,
         );
 
+        let intake = flare_selene::offload::intake_slots(&layout, 1);
         let open = |scanned: Vec<Scanned>, limit: u64| -> DiskStore {
-            let mut pool = SlabPool::staging(&layout).unwrap();
+            let mut pool = SlabPool::new(
+                layout.page_record_bytes,
+                intake,
+                intake,
+            )
+            .unwrap();
             pool.register(&CudaRegistrar, context).unwrap();
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
             ));
             let disk = DiskThread::start("flare-offload-disk").unwrap();
             DiskStore::new(
-                record::DirectoryLock::acquire(&directory).unwrap(),
+                flare_selene::testing::directory_lock(&directory).unwrap(),
                 IDENTITY,
                 fingerprint,
                 limit,
@@ -1524,15 +1560,15 @@ mod disk_store {
             .unwrap()
         };
 
-        fn staging_free(store: &mut DiskStore) -> (usize, usize) {
+        fn staging_free(store: &mut DiskStore) -> usize {
             let pool = store.transport_mut().staged_mut().unwrap().pool().unwrap();
-            (pool.free_pages(), pool.free_rows())
+            pool.free_slots()
         }
         let scan = |lock: &record::DirectoryLock| {
             record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()
         };
 
-        assert!(scan(&record::DirectoryLock::acquire(&directory).unwrap()).is_empty());
+        assert!(scan(&flare_selene::testing::directory_lock(&directory).unwrap()).is_empty());
         let mut store = open(Vec::new(), 1 << 40);
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
@@ -1563,7 +1599,7 @@ mod disk_store {
             (stats.stored, stats.bytes_out, stats.disk_bytes),
             (1, bytes, bytes)
         );
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
 
         // Poison the source pages and row, then restore into fresh ids and another slot.
         write_pages(&mut write_unit, &source_pages, &|plane, _| {
@@ -1594,7 +1630,7 @@ mod disk_store {
         };
         assert_eq!(key, root.key);
         assert_eq!(result.unwrap(), layout.record_bytes(u64::from(PAGES)));
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
         let stats = store.stats();
         assert_eq!((stats.fetched, stats.reused_tokens), (1, consumed));
         let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
@@ -1649,7 +1685,7 @@ mod disk_store {
         drop(store);
 
         // A store opened over a fresh scan serves the same record.
-        let scanned = scan(&record::DirectoryLock::acquire(&directory).unwrap());
+        let scanned = scan(&flare_selene::testing::directory_lock(&directory).unwrap());
         assert_eq!(scanned.len(), 1);
         let mut store = open(scanned, 1 << 40);
         assert_eq!(store.used(), header.length_with_row());
@@ -1703,7 +1739,7 @@ mod disk_store {
         );
         assert_eq!(child_bytes, child_header.length_with_row());
         assert_eq!(scan(&store.directory_lock).len(), 2);
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
 
         // Above a resident checkpoint five pages into the root, the chain
         // restores through both files: the root's remaining pages, then the
@@ -1756,7 +1792,7 @@ mod disk_store {
             child_slot,
             restored_slot,
         );
-        assert_eq!(staging_free(&mut store), (STAGING_PAGE_SLABS, 4));
+        assert_eq!(staging_free(&mut store), intake);
         assert_eq!(store.stats().fetched, 2);
         store.close().unwrap();
         drop(store);
@@ -1764,7 +1800,7 @@ mod disk_store {
         // Under a limit the two records fill, with the child pinned, a third
         // record of only a row cannot be placed, and making room compacts the
         // root: its file is truncated at the row segment.
-        let scanned = scan(&record::DirectoryLock::acquire(&directory).unwrap());
+        let scanned = scan(&flare_selene::testing::directory_lock(&directory).unwrap());
         assert_eq!(scanned.len(), 2);
         let mut store = open(scanned, bytes + child_bytes);
         assert_eq!(store.used(), store.limit());
@@ -1821,12 +1857,12 @@ mod disk_store {
 
 mod geometry {
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn package_geometry_lists_every_plane() {
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn core_geometry_lists_every_plane() {
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = manifest.cache.unwrap();
         eprintln!(

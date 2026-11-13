@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The in-process pool client: the instance side of the pool protocol.
 //!
 //! Nothing in this module runs unless a pool address is configured. Without

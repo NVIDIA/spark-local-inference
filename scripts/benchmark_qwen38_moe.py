@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Time a checkpoint-backed Qwen MoE shard with cold-cache CUDA graph replay.
 
 Loads one layer, including all routed experts and the shared expert, and uses

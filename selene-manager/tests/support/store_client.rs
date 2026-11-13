@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The L0 engine tests' vocabulary (store, put, fetch, get) over the pool protocol.
 //!
 //! A [`Client`] is one `selene.v2` session in the scope of a record descriptor. A put

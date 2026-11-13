@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Tuned sparse index selection preserves caller storage through native replay."""
 
 import os
@@ -35,9 +39,10 @@ def _assert_selection(actual, actual_scores, expected, expected_scores):
         assert all(b[index] == cutoff for index in b.keys() - a.keys())
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("mode,rows", [("decode", 2), ("prefill", 4096)])
 @torch.no_grad()
-def test_tuned_sparse_indexer_native_replay(mode, rows):
+def test_tuned_sparse_indexer_native_replay(mode, rows, functional):
     device = torch.device("cuda:0")
     pages, heads, topk = 32, 32, 512
     query = torch.randn((rows, heads, 128), device=device).to(torch.float8_e4m3fn)
@@ -65,16 +70,28 @@ def test_tuned_sparse_indexer_native_replay(mode, rows):
             old_storage = arena.tensor
             arena.reserve(arena.nbytes + 1024)
             saved = tuple(tensor.clone() for tensor in (query, weights, cache, table, lengths, width))
+            if functional:
+                indexer.functional(session=session)
             session.tune()
             for actual, expected in zip((query, weights, cache, table, lengths, width), saved, strict=True):
                 torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
-            assert indexer.binding.runtime.scratch.shared_scratch.data_ptr() == arena.tensor.data_ptr()
+            if functional:
+                assert indexer.binding is indexer.output is indexer.scores is None
+            else:
+                assert indexer.binding.runtime.scratch.shared_scratch.data_ptr() == arena.tensor.data_ptr()
             assert arena.tensor.data_ptr() != old_storage.data_ptr()
             del old_storage, saved
+            if functional:
+                arena.release_preparation()
 
             def forward():
-                observed.copy_(indexer())
-                observed_scores.copy_(scores)
+                if functional:
+                    result, result_scores = indexer(query, weights, table, lengths, width)
+                    observed.copy_(result)
+                    observed_scores.copy_(result_scores)
+                else:
+                    observed.copy_(indexer())
+                    observed_scores.copy_(scores)
                 arena.tensor.fill_(255)
 
             compiled = compile_forward(forward)

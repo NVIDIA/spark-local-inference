@@ -1,9 +1,14 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Actual Qwen selected-TP2 local cache acquisition from an externally combined
-//! TP1/TP2 package. The combined package is produced by the public HPP combine
+//! TP1/TP2 core. The combined core is produced by the public HPP combine
 //! path; this test only reads exports and drives the public Helios cache
 //! acquisition/materializer.
 
-#![cfg(feature = "runtime-package")]
+#![cfg(feature = "runtime-core")]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,10 +17,10 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use flare_helios::package::{
-    cache, derivation, naming, progress, protection, reader, schema::wire,
+use flare_helios::core::{
+    cache, derivation, naming, prepared_weights, progress, protection, reader, schema::wire,
 };
-use flare_helios::runtime_package::Publisher;
+use flare_helios::runtime_core::Publisher;
 use prost::Message as _;
 
 const CHUNK: usize = 8 << 20;
@@ -26,7 +31,7 @@ fn fixture_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/data/flare-qwen38-tp-qualification"))
 }
 
-fn package_path(root: &Path, name: &str) -> PathBuf {
+fn core_path(root: &Path, name: &str) -> PathBuf {
     let direct = root.join(name);
     if direct.is_file() {
         return direct;
@@ -56,7 +61,7 @@ fn tp_selection(
     assert_eq!(
         matches.len(),
         1,
-        "package {} must contain exactly one TP{tensor_parallel} deployment",
+        "core {} must contain exactly one TP{tensor_parallel} deployment",
         metadata.path.display()
     );
     let selection = protection::Selection::Deployment {
@@ -67,7 +72,7 @@ fn tp_selection(
     selection
 }
 
-fn payload_ids(verified: &protection::VerifiedPackage) -> BTreeSet<Vec<u8>> {
+fn payload_ids(verified: &protection::VerifiedCore) -> BTreeSet<Vec<u8>> {
     let mut ids = BTreeSet::new();
     for rank in verified.ranks() {
         for initializer in &rank.initializers {
@@ -96,7 +101,7 @@ fn payload_ids(verified: &protection::VerifiedPackage) -> BTreeSet<Vec<u8>> {
 
 fn open_payloads(
     metadata: &reader::Metadata,
-    verified: &protection::VerifiedPackage,
+    verified: &protection::VerifiedCore,
 ) -> reader::PayloadFiles {
     let ids = payload_ids(verified);
     metadata
@@ -169,7 +174,7 @@ struct InitializerRange {
 }
 
 fn initializer_ranges(
-    verified: &protection::VerifiedPackage,
+    verified: &protection::VerifiedCore,
 ) -> BTreeMap<(u32, String), Vec<InitializerRange>> {
     let mut ranges: BTreeMap<(u32, String), Vec<InitializerRange>> = BTreeMap::new();
     for rank in verified.ranks() {
@@ -214,7 +219,7 @@ fn initializer_ranges(
 }
 
 fn source_less_initializers(
-    verified: &protection::VerifiedPackage,
+    verified: &protection::VerifiedCore,
 ) -> BTreeMap<(u32, String, u64), usize> {
     let mut result = BTreeMap::new();
     for rank in verified.ranks() {
@@ -253,9 +258,9 @@ fn coverage(ranges: &[InitializerRange]) -> Vec<(u64, u64, i32)> {
 }
 
 fn compare_initializers(
-    expected_verified: &protection::VerifiedPackage,
+    expected_verified: &protection::VerifiedCore,
     expected_files: &reader::PayloadFiles,
-    actual_verified: &protection::VerifiedPackage,
+    actual_verified: &protection::VerifiedCore,
     actual_files: &reader::PayloadFiles,
     expected_buffer: &mut [u8],
     actual_buffer: &mut [u8],
@@ -346,9 +351,9 @@ fn compare_initializers(
 
 fn compare_rank_bytes(
     expected_files: &reader::PayloadFiles,
-    expected_verified: &protection::VerifiedPackage,
+    expected_verified: &protection::VerifiedCore,
     actual_files: &reader::PayloadFiles,
-    actual_verified: &protection::VerifiedPackage,
+    actual_verified: &protection::VerifiedCore,
 ) -> (usize, usize, u64, usize, u64) {
     let mut expected_buffer = vec![0u8; CHUNK];
     let mut actual_buffer = vec![0u8; CHUNK];
@@ -577,19 +582,19 @@ fn peak_rss_kib() -> Option<u64> {
 }
 
 #[test]
-#[ignore = "requires FLARE_QWEN38_TP_QUALIFICATION with signed TP1/TP2 and an externally combined package"]
+#[ignore = "requires FLARE_QWEN38_TP_QUALIFICATION with signed TP1/TP2 and an externally combined core"]
 fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let root = fixture_root();
-    let tp1_path = package_path(&root, "tp1");
-    let tp2_path = package_path(&root, "tp2");
+    let tp1_path = core_path(&root, "tp1");
+    let tp2_path = core_path(&root, "tp2");
     let combined = std::env::var_os("FLARE_QWEN38_COMBINED")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("combined"));
-    assert!(tp1_path.is_file(), "missing TP1 package {}", tp1_path.display());
-    assert!(tp2_path.is_file(), "missing TP2 package {}", tp2_path.display());
+    assert!(tp1_path.is_file(), "missing TP1 core {}", tp1_path.display());
+    assert!(tp2_path.is_file(), "missing TP2 core {}", tp2_path.display());
     assert!(
         combined.is_file() || combined.is_dir(),
-        "missing externally combined package {}",
+        "missing externally combined core {}",
         combined.display()
     );
     let profile_path = std::env::var_os("FLARE_QWEN38_PROFILE")
@@ -616,7 +621,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let mut empty_source_view_bytes = 0u64;
     let mut unavailable_views = Vec::new();
     for rank in tp2_verified.ranks() {
-        if let Some(catalog) = &rank.prepared_weights {
+        if let Some(catalog) = prepared_weights::catalog(rank).unwrap() {
             unavailable_views.extend(catalog.unavailable.iter().cloned());
             for view in &catalog.views {
                 weight_views += 1;
@@ -642,8 +647,8 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
                 .tensor_parallel
         })
         .collect();
-    assert_eq!(deployment_tps.first(), Some(&1), "combined package did not select TP1");
-    assert!(deployment_tps.contains(&2), "combined package lacks TP2");
+    assert_eq!(deployment_tps.first(), Some(&1), "combined core did not select TP1");
+    assert!(deployment_tps.contains(&2), "combined core lacks TP2");
     let combined_selection = tp_selection(&combined_metadata, &profiles, 2);
     let combined_verified =
         protection::verify(&combined_metadata.envelope, &profiles, combined_selection).unwrap();
@@ -663,7 +668,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
         cache_root.display()
     );
     let store = cache::Root::open(&cache_root).unwrap();
-    let model_key = cache::model_key(&combined_verified.package().model_identity).unwrap();
+    let model_key = cache::model_key(&combined_verified.core().model_identity).unwrap();
     assert_eq!(
         files_below(&cache_root.join("blobs")),
         0,
@@ -675,11 +680,11 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
         "TP2 qualification cache {} has existing versions",
         cache_root.display()
     );
-    let hardware = combined_verified.package().hardware_identity.clone();
+    let hardware = combined_verified.core().hardware_identity.clone();
     let candidate = naming::deployment_candidate(Some(&hardware), &[2], SystemTime::now())
         .expect("authenticated hardware and TP2 must produce a shared cache label");
     let staging = store.stage_named(&model_key, &candidate).unwrap();
-    let source = cache::PackageSource::open(&combined, &profiles, combined_selection).unwrap();
+    let source = cache::CoreSource::open(&combined, &profiles, combined_selection).unwrap();
     let progress = progress::AcquisitionProgress::new();
     let plan_started = Instant::now();
     let plan = match store.plan_acquisition_with(
@@ -718,7 +723,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
         "selected TP2 acquisition materialized no bytes"
     );
     let full_verify_started = Instant::now();
-    let full_verified = flare_helios::runtime_package::VerifiedPackage::open_tensor_parallel(
+    let full_verified = flare_helios::runtime_core::VerifiedCore::open_tensor_parallel(
         &entry.directory().join("model.safetensors"),
         &profiles,
         2,
@@ -845,16 +850,16 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let installed_verified =
         protection::verify(&installed_metadata.envelope, &profiles, installed_selection).unwrap();
     assert_eq!(
-        tp2_verified.package().assets,
-        installed_verified.package().assets,
-        "unchanged frontend assets differ from the independent TP2 package"
+        tp2_verified.core().assets,
+        installed_verified.core().assets,
+        "unchanged frontend assets differ from the independent TP2 core"
     );
     assert_eq!(
         tp2_verified.deployment().and_then(|deployment| deployment.engram.as_ref()),
         installed_verified
             .deployment()
             .and_then(|deployment| deployment.engram.as_ref()),
-        "unchanged Engram descriptors differ from the independent TP2 package"
+        "unchanged Engram descriptors differ from the independent TP2 core"
     );
     let (
         expected_initializer_count,
@@ -898,7 +903,7 @@ fn actual_qwen38_tp2_local_acquisition_matches_independent_export() {
     let mut view_independent_bytes = 0u64;
     let mut view_uninitialized_padding_bytes = 0u64;
     for rank in installed_verified.ranks() {
-        let Some(catalog) = &rank.prepared_weights else {
+        let Some(catalog) = prepared_weights::catalog(rank).unwrap() else {
             continue;
         };
         for view in &catalog.views {

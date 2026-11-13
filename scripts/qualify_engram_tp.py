@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare complete replicated and head-sharded Engram graphs across TP ranks."""
 
 import argparse

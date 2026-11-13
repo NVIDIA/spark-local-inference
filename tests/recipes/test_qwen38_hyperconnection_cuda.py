@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Caller-owned residual injection preserves BF16 values and graph storage."""
 
 import os
@@ -8,7 +11,7 @@ from b12x.norm import hyperconnection as hc
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 
 from ignition.preparation.compilation import compile_forward
-from ignition.preparation.scratch import GraphBufferPool
+from tests.tensor_examples import TensorExamples
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an assigned CUDA device")
@@ -18,7 +21,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 @torch.no_grad()
 def test_combine_provided_output_matches_functional_with_exact_alias(tokens):
     device = torch.device("cuda", 0)
-    buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
+    buffers = TensorExamples(device)
     residual = buffers.zeros((tokens, 10240), torch.bfloat16)
     block = buffers.zeros((tokens, 2560), torch.bfloat16)
     logits = buffers.zeros((tokens, 336), torch.bfloat16)[:, 320:324]

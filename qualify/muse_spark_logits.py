@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Read full-vocabulary teacher-forced logits from captured Muse Spark text graphs.
 
 This diagnostic prepares the complete TP8 catalog with 262144-token context,
@@ -252,7 +255,7 @@ def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
     return rows
 
 
-def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output,
+def prepare_and_read(snapshot, config, *, rank, group, core_storage, progress=None, tokens, output,
                      measure=False, profile=False, fence=False, layer_outputs=False, repeat=False,
                      log_errors=False, check_compiled=False, cache_outputs=False):
     import torch
@@ -260,7 +263,7 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
     from ignition.recipes.muse_spark.bootstrap import prepare_rank
 
     with log_warmup_errors(rank, log_errors), fence_operations(rank, fence):
-        model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
+        model = prepare_rank(snapshot, config, rank=rank, group=group, core_storage=core_storage,
                              progress=progress)
     diagnostics = {}
     try:
@@ -353,13 +356,33 @@ def compare_readbacks(compiled, uncompiled):
     return dict(equal=not differences, differences=differences)
 
 
-def capture_raw_forward(model, forward, rows, collective, *, stream=None):
+class TextReadback:
+    """Copy explicitly returned text values into qualification-owned destinations."""
+
+    def __init__(self, forward, outputs):
+        self.forward, self.outputs = forward, outputs
+
+    def __call__(self):
+        observed = self.forward.observe()
+        for name, output in self.outputs.items():
+            output.copy_(observed['target.' + name])
+
+
+def capture_readback(model, forward, rows, collective, *, compiled, stream=None):
     import torch
+    from ignition.preparation.compilation import compile_forward
     from ignition.preparation.startup_tuning import capture_consumers
 
     layers = forward.decoder.layers
     snapshots = (torch.empty((len(layers), rows, forward.decoder.weights.config.hidden),
                             device=model.device, dtype=torch.bfloat16) if rows is not None else None)
+    outputs = dict(token_ids=torch.empty((forward.batch.tokens,), device=model.device, dtype=torch.int64),
+        positions=torch.empty((forward.batch.tokens,), device=model.device, dtype=torch.int64),
+        hidden=torch.empty((forward.batch.rows, forward.decoder.weights.config.hidden),
+                           device=model.device, dtype=torch.bfloat16),
+        logits=torch.empty((forward.batch.rows, forward.decoder.weights.config.vocabulary),
+                           device=model.device, dtype=torch.bfloat16))
+    readback = TextReadback(forward, outputs)
     if stream is None:
         stream = torch.cuda.Stream(device=model.device)
     graph = torch.cuda.CUDAGraph()
@@ -368,11 +391,16 @@ def capture_raw_forward(model, forward, rows, collective, *, stream=None):
         for index, layer in enumerate(layers if rows is not None else ()):
             def copy_output(module, inputs, output, index=index):
                 snapshots[index].copy_(output[:rows])
-            handles.append(layer.register_forward_hook(copy_output))
+            handles.append(layer.post_feedforward_residual_gate.register_forward_hook(copy_output))
         stream.wait_stream(torch.cuda.current_stream(model.device))
+        with torch.cuda.stream(stream):
+            execute = compile_forward(readback) if compiled else readback
+            if not compiled:
+                execute()
+        stream.synchronize()
         with capture_consumers(model.session, graph), collective.capture(stream=stream), model.session.capture(), \
                 torch.cuda.graph(graph, stream=stream):
-            forward()
+            execute()
         stream.synchronize()
     except BaseException:
         graph.reset()
@@ -380,7 +408,7 @@ def capture_raw_forward(model, forward, rows, collective, *, stream=None):
     finally:
         for handle in handles:
             handle.remove()
-    return graph, snapshots, stream
+    return graph, dict(outputs, layers=snapshots, execution=execute), stream
 
 
 def read_prepared(model, *, rank, group, tokens, output, snapshot,
@@ -455,45 +483,39 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot,
     capacity = min(signature.token_capacity for signature in model.signatures.values()
                    if signature.kind == 'prefill' and signature.token_capacity >= len(tokens))
     whole_name = f'prefill{capacity}'
-    whole = forwards[whole_name]
-    raw_stream = None
-    if uncompiled:
-        raw_stream = torch.cuda.Stream(device=device)
-        for name in dict.fromkeys((whole_name, 'prefill128', 'decode1')):
+    compiled = bool(model.memory_report['compiled_decoder']) and not uncompiled
+    for name in dict.fromkeys((whole_name, 'prefill128', 'decode1')):
+        key = (name, compiled)
+        if key not in diagnostics:
             reset()
             buffers['live_rows'].zero_()
             buffers['query_lengths'].zero_()
             buffers['row_slot_ids'].fill_(-1)
             buffers['sample_enabled'].zero_()
-            raw_stream.wait_stream(torch.cuda.current_stream(device))
-            with torch.cuda.stream(raw_stream):
-                forwards[name]()
-            raw_stream.synchronize()
+            diagnostics[key] = capture_readback(model, forwards[name],
+                (min(4, len(tokens)) if name == whole_name else 1) if layer_outputs else None,
+                collective, compiled=compiled)
             dist.barrier(group=group)
-        reset()
-    def replay(name, forward, rows):
-        if not layer_outputs and not uncompiled:
-            model.graphs[name].replay()
-            return
-        if name not in diagnostics:
-            diagnostics[name] = capture_raw_forward(model, forward, rows if layer_outputs else None,
-                                                    collective, stream=raw_stream)
-        diagnostics[name][0].replay()
+    reset()
+    def replay(name):
+        graph, readback, _ = diagnostics[(name, compiled)]
+        graph.replay()
+        return readback
 
     buffers['query_lengths'][0] = len(tokens)
     buffers['token_ids'][:len(tokens)].copy_(torch.tensor(tokens, device=device))
     buffers['submission_sequence'].fill_(1)
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
-    replay(whole_name, whole, min(4, len(tokens)))
+    whole_readback = replay(whole_name)
     torch.cuda.synchronize(device)
     if int(requests.status[0]) != RUNNING or int(requests.consumed_tokens[0]) != len(tokens):
         raise RuntimeError('captured prefill rejected the complete recorded prompt')
-    if not torch.equal(whole.batch.metadata.token_ids[:len(tokens)].cpu(), torch.tensor(tokens)):
+    if not torch.equal(whole_readback['token_ids'][:len(tokens)].cpu(), torch.tensor(tokens)):
         raise AssertionError('captured prefill packed a different recorded prompt')
-    prefill_logits = whole.decoder.scratch.logits[0].cpu().clone() if rank == 0 else None
-    prefill_hidden = whole.decoder.scratch.hidden[0].cpu().clone() if rank == 0 else None
-    prefill_layers = diagnostics[whole_name][1].cpu().clone() if layer_outputs and rank == 0 else None
+    prefill_logits = whole_readback['logits'][0].cpu().clone() if rank == 0 else None
+    prefill_hidden = whole_readback['hidden'][0].cpu().clone() if rank == 0 else None
+    prefill_layers = whole_readback['layers'].cpu().clone() if layer_outputs and rank == 0 else None
     read_cache('whole_prefill', len(tokens))
     reset()
     logits, hidden, layers = [], [], []
@@ -506,24 +528,24 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot,
         buffers['submission_sequence'].fill_(index + 1)
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
-        replay(name, forward, 1)
+        endpoint = replay(name)
         torch.cuda.synchronize(device)
         if int(requests.status[0]) != RUNNING or int(requests.error_code[0]) != 0:
             raise RuntimeError(f'text graph rejected token endpoint {index + 1}: '
                 f'status={int(requests.status[0])}, error={int(requests.error_code[0])}')
         if int(requests.consumed_tokens[0]) != index + 1:
             raise AssertionError('captured text graph consumed a different causal endpoint')
-        if int(forward.batch.metadata.token_ids[0]) != token:
+        if int(endpoint['token_ids'][0]) != token:
             raise AssertionError('captured text graph packed a different recorded token')
-        if int(forward.batch.metadata.positions[0]) != index:
+        if int(endpoint['positions'][0]) != index:
             raise AssertionError('captured text graph packed a different token position')
         if index < 2:
             read_cache(f'endpoint{index + 1}', index + 1)
         if rank == 0:
-            logits.append(forward.decoder.scratch.logits[0].cpu().clone())
-            hidden.append(forward.decoder.scratch.hidden[0].cpu().clone())
+            logits.append(endpoint['logits'][0].cpu().clone())
+            hidden.append(endpoint['hidden'][0].cpu().clone())
             if layer_outputs:
-                layers.append(diagnostics[name][1][:, 0].cpu().clone())
+                layers.append(endpoint['layers'][:, 0].cpu().clone())
             if (index + 1) % 16 == 0 or index + 1 == len(tokens):
                 print(f'captured teacher-forced endpoints: {index + 1}/{len(tokens)}', flush=True)
     dist.barrier(group=group)
@@ -595,7 +617,7 @@ def main():
         autotune_effort=args.autotune_effort)
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import torch
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.rank_group import prepare_group
     from ignition.recipes.muse_spark.bootstrap import PreparationConfig
     config = PreparationConfig(collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
@@ -605,16 +627,16 @@ def main():
         devices=tuple(range(plan.world_size)), context=plan.context, max_active=plan.concurrency,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=not args.no_compile,
-        kernel_cache=configuration.directory('kernel_cache'), retain_graphs=args.measure_replay)
+        kernel_cache=configuration.directory('kernel_cache'))
     torch.cuda.set_device(0)
-    storage = PackageStorage(world=plan.world_size)
+    storage = CoreStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),
                      measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations,
                      layer_outputs=args.layer_outputs, repeat=args.repeat_readback,
                      log_errors=args.log_warmup_errors, check_compiled=args.check_compiled,
                      cache_outputs=args.cache_outputs)
     with storage:
-        prepared = prepare_group(args.snapshot.resolve(), config, runner, package_storage=storage,
+        prepared = prepare_group(args.snapshot.resolve(), config, runner, core_storage=storage,
                                  progress=lambda text: print(text, flush=True))
     prepared.close()
     for region in storage.host_regions:

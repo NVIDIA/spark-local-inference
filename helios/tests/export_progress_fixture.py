@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture and export a CUDA graph through the preparation CLI progress surface."""
 
 import argparse
@@ -11,10 +14,10 @@ from ignition.preparation.execution import GraphSignature
 from ignition.preparation.model import PreparedModel
 from b12x.preparation import PreparationSession
 from ignition.preparation.module_images import ModuleImages
-from ignition.preparation.package_storage import PackageStorage
-from ignition.preparation.runtime_package import export_model
-from ignition.preparation.model_package import export_package
-from ignition.preparation.package_snapshot import export_options
+from ignition.preparation.core_storage import CoreStorage
+from ignition.preparation.runtime_core import export_model
+from ignition.preparation.model_core import export_core
+from ignition.preparation.core_snapshot import export_options
 from ignition.progress import StartupProgress, phase
 
 
@@ -22,13 +25,13 @@ def export(root, rank):
     root.mkdir(parents=True)
     with ModuleImages() as images:
         torch.cuda.set_device(0)
-        with PackageStorage(rank=rank, world=rank + 1) as storage:
+        with CoreStorage(rank=rank, world=rank + 1) as storage:
             source = torch.arange(1024, dtype=torch.float32, device="cuda")
             output = torch.zeros_like(source)
             buffers = {
                 "frame_index": torch.zeros(1, dtype=torch.int32, device="cuda"),
                 "submission_sequence": torch.zeros(1, dtype=torch.int64, device="cuda"),
-                "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device="cuda"),
+                "completion_records": torch.zeros((2, 1, 32), dtype=torch.int64, device="cuda"),
                 "source": source, "output": output,
             }
             records = buffers["completion_records"]
@@ -49,14 +52,14 @@ def export(root, rank):
                 signatures={"decode": GraphSignature("decode", 1, 1, ("source",))}, max_active=1,
                 resources=(storage, source, output))
             prepared.server_config = server_config(root)
-            prepared.package_data = None
-    path = root / "package"
+            prepared.core_data = None
+    path = root / "core"
     if rank:
         export_model(prepared, images, storage, path, options={}, sources=True, bundle_only=True)
     else:
         progress = StartupProgress()
-        with export_options(root / "cache"), phase(progress, "Export native package", live=False) as stage:
-            result = export_package(prepared, images, storage, path, options={}, publisher=publisher(), progress=progress)
+        with export_options(root / "cache"), phase(progress, "Export native core", live=False) as stage:
+            result = export_core(prepared, images, storage, path, options={}, publisher=publisher(), progress=progress)
             stage.update(result.entry_path)
     assert path.is_file() if rank else (path / "model.safetensors").is_file()
     print(f"EXPORTED RANK {rank}", flush=True)

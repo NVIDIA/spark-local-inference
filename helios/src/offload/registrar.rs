@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Registration of host memory with the CUDA driver for the selene host tiers.
 
 use flare_selene::{HostRegistrar, Registration, Result, SplitMapping};

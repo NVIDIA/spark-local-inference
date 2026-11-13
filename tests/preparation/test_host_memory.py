@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Aggregate compiler concurrency beside mapped model storage."""
 
 import pytest
@@ -5,6 +9,55 @@ from types import SimpleNamespace
 
 from ignition.preparation import host_memory
 from ignition.preparation.host_memory import worker_limit
+
+
+def _cgroup_files(tmp_path, *, group="/tenant/ranks/job", mount_root="/tenant", limits=None):
+    mount = tmp_path / "cgroup mount"
+    mount.mkdir()
+    for name, (maximum, current) in (limits or {}).items():
+        directory = mount / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "memory.max").write_text(str(maximum))
+        (directory / "memory.current").write_text(str(current))
+    cgroups, mounts = tmp_path / "cgroup", tmp_path / "mountinfo"
+    cgroups.write_text(f"0::{group}\n")
+    escaped = str(mount).replace(" ", r"\040")
+    mounts.write_text(f"42 1 0:7 {mount_root} {escaped} rw - cgroup2 cgroup rw\n")
+    return cgroups, mounts
+
+
+def test_cgroup_memory_uses_tightest_remaining_ancestor_allowance(tmp_path):
+    files = _cgroup_files(tmp_path, limits={"": (1000, 700), "ranks": (700, 500),
+                                          "ranks/job": ("max", 100)})
+    assert host_memory._cgroup_available_bytes(*files) == 200
+
+
+@pytest.mark.parametrize("maximum,current,expected", [(1000, 500, 500), (1000, 1100, 0), ("max", 100, None)])
+def test_cgroup_memory_handles_finite_unlimited_and_exceeded_limits(tmp_path, maximum, current, expected):
+    files = _cgroup_files(tmp_path, limits={"ranks/job": (maximum, current)})
+    assert host_memory._cgroup_available_bytes(*files) == expected
+
+
+def test_cgroup_mount_for_unrelated_subtree_does_not_limit_process(tmp_path):
+    files = _cgroup_files(tmp_path, mount_root="/other", limits={"": (1000, 900)})
+    assert host_memory._cgroup_available_bytes(*files) is None
+
+
+def test_cgroup_v1_does_not_supply_a_unified_memory_limit(tmp_path):
+    cgroups, mounts = _cgroup_files(tmp_path)
+    cgroups.write_text("4:memory:/tenant/ranks/job\n")
+    assert host_memory._cgroup_available_bytes(cgroups, mounts) is None
+
+
+@pytest.mark.parametrize("remaining,expected", [(None, 8192), (16384, 8192), (4096, 4096), (0, 0)])
+def test_host_available_memory_is_bounded_by_cgroup_allowance(monkeypatch, remaining, expected):
+    from pathlib import Path
+
+    read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+                        "MemAvailable: 8 kB\n" if str(path) == "/proc/meminfo" else read_text(path, *args, **kwargs))
+    monkeypatch.setattr(host_memory, "_cgroup_available_bytes", lambda: remaining)
+    assert host_memory.available_bytes() == expected
 
 
 def test_loading_reclaims_promoted_cycles_when_host_headroom_is_low(monkeypatch):
@@ -107,6 +160,34 @@ def test_discrete_device_budget_is_independent_of_host_ram(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
     monkeypatch.setattr(host_memory, "available_bytes", lambda: pytest.fail("discrete VRAM must not use host capacity"))
     assert host_memory.device_memory_info("cuda:0") == (24 << 30, 32 << 30)
+
+
+@pytest.mark.parametrize("pools", [1, 16])
+def test_candidate_scratch_leaves_device_headroom_growth_and_pending_storage(monkeypatch, pools):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    assert host_memory.candidate_scratch_limit(0, pools=pools, headroom_bytes=1 << 30,
+        pending_persistent_bytes=512 << 20) == 2560 << 20
+
+
+def test_candidate_scratch_shares_integrated_memory_between_local_ranks(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(host_memory, "device_memory_info", lambda device: (40 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 40 << 30)
+    assert host_memory.candidate_scratch_limit(0, pools=4, headroom_bytes=1 << 30,
+        pending_persistent_bytes=512 << 20) == 6656 << 20
+
+
+def test_candidate_scratch_never_spends_reserved_memory(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1 << 30, 96 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    assert host_memory.candidate_scratch_limit(0, headroom_bytes=1 << 30) == 0
 
 
 @pytest.mark.parametrize("pools", [1, 2, 4])

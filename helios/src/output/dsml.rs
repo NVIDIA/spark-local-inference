@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Translate the official DeepSeek parser's actions into shared output events.
 
 use super::{
@@ -23,6 +29,7 @@ struct Call {
 
 pub struct DsmlOutput<const SPACED: bool> {
     consumed: usize,
+    reasoning_open: bool,
     spans: Vec<Option<std::ops::Range<usize>>>,
     machine: Option<OutputParser>,
     pending: String,
@@ -44,6 +51,13 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                 .pending
                 .get(consumed..end)
                 .ok_or("DeepSeek parser returned an invalid source span")?;
+            // The upstream parser skips leading newlines; other non-reasoning actions end reasoning.
+            if self.reasoning_open
+                && segment.action != OutputAction::Reasoning
+                && !(segment.action == OutputAction::Skip && source.bytes().all(|b| b == b'\n'))
+            {
+                self.reasoning_open = false;
+            }
             let repeated = self.last_action == segment.action;
             self.last_action = segment.action;
             match segment.action {
@@ -166,6 +180,10 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         Ok(())
     }
 
+    pub fn reasoning_open(&self) -> bool {
+        self.reasoning_open
+    }
+
     pub fn with_special_tokens(mut self, tokens: Vec<(u32, String)>) -> Self {
         self.special_tokens = tokens;
         self
@@ -208,6 +226,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
     fn new(config: OutputConfig) -> Self {
         Self {
             consumed: 0,
+            reasoning_open: config.start == OutputStart::Reasoning,
             spans: vec![],
             machine: Some(OutputParser::new(ParsingOptions {
                 parse_tool_calls: !config.tools.is_empty(),
@@ -241,6 +260,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             function: None,
             tool_ends_reasoning: false,
             response: None,
+            message_close: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })
     }
@@ -425,6 +445,83 @@ mod deepseek4_syntax_tests {
                 message["tool_calls"][1]["function"]["arguments"],
                 "{\"n\": 3}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_close_tests {
+    use super::*;
+    use crate::output::tagged::OutputConfig;
+    use crate::output::{Input, ModelOutput, Termination};
+    use crate::server::output::Accumulator;
+
+    /// The reported shape: reasoning, its close delimiter token, a short answer, a
+    /// second close delimiter token, and the rest of the answer. The DeepSeek
+    /// parser skips a thinking-end token outside reasoning, so no close delimiter
+    /// reaches content. A plain-text spelling is plain tokens and stays content.
+    fn check<const SPACED: bool>(feed: usize, spelled: bool) {
+        let close = (128822, "</think>".to_owned());
+        let mut parser = DsmlOutput::<SPACED>::new(OutputConfig {
+            structured: false,
+            start: OutputStart::Reasoning,
+            tools: vec![],
+        })
+        .with_special_tokens(vec![(128821, "<think>".to_owned()), close.clone()]);
+        let mut output = Accumulator::new("close".into());
+        let second = if spelled { None } else { Some(close.0) };
+        let pieces = [
+            (None, "Reason."),
+            (Some(close.0), close.1.as_str()),
+            (None, "Answer."),
+            (second, close.1.as_str()),
+            (None, "More."),
+        ];
+        for (token, text) in pieces {
+            if let Some(token) = token {
+                output
+                    .apply(parser.push(Input::Token(token)).unwrap())
+                    .unwrap();
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else if feed == 0 {
+                output
+                    .apply(parser.push(Input::Text(text)).unwrap())
+                    .unwrap();
+            } else {
+                for character in text.chars() {
+                    output
+                        .apply(parser.push(Input::Text(&character.to_string())).unwrap())
+                        .unwrap();
+                }
+            }
+        }
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        let message = output.message();
+        assert_eq!(message["reasoning_content"], "Reason.");
+        assert_eq!(
+            message["content"],
+            if spelled { "Answer.</think>More." } else { "Answer.More." }
+        );
+    }
+
+    #[test]
+    fn compact_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<false>(feed, false);
+            check::<false>(feed, true);
+        }
+    }
+
+    #[test]
+    fn spaced_close_delimiter_tokens_after_reasoning_never_become_content() {
+        for feed in 0..2 {
+            check::<true>(feed, false);
+            check::<true>(feed, true);
         }
     }
 }

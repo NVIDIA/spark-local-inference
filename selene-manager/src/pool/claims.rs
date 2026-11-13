@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Claims, exports, windows and fences (PROTOCOL.md sections 5 to 8).
 //!
 //! Every claim is one record, changed only by the actor, so "one authoritative

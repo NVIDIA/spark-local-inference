@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -94,10 +97,11 @@ def test_actual_packed_experts_use_a16_and_native_scales_in_up_gate_order(manife
             sources.update((name, handle.get_tensor(name).clone()) for name in names
                            if manifest.tensors[name].shard == filename)
     captured = {}
+    actual_plan_weights = fused_moe.plan_weights
 
     def plan_weights(**kwargs):
         captured.update(kwargs)
-        return object()
+        return actual_plan_weights(**kwargs)
 
     monkeypatch.setattr(fused_moe, "plan_weights", plan_weights)
     monkeypatch.setattr(fused_moe, "prepare_weights", lambda **kwargs: kwargs["weights"])

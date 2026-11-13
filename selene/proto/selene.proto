@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 // Selene pool protocol, version 2 (package selene.v2).
 //
 // The wire contract between an instance's in-process pool client (crate `selene`)
@@ -84,7 +89,7 @@ message RankPlanes {
   uint64 row_bytes = 2;
 }
 
-// The record geometry of one model package on one rank layout.
+// The record geometry of one model core on one rank layout.
 message Geometry {
   // Tokens per KV page. Nonzero.
   uint64 page_tokens = 1;
@@ -100,7 +105,7 @@ message Geometry {
 // What a session may share. Records are only ever shared between sessions with
 // byte-identical scopes. A manager keeps one index per scope_id.
 message Scope {
-  // 32-byte model package identity (weights, recipe and tokenizer).
+  // 32-byte model core identity (weights, recipe and tokenizer).
   bytes model_identity = 2;
   // 16-byte fingerprint of the cache layout (page size, plane order, dtype).
   bytes layout_fingerprint = 3;

@@ -1,9 +1,13 @@
-"""DFlash2 acceptance and complete prefix restore through an exported Qwen package.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""DFlash2 acceptance and complete prefix restore through an exported Qwen core.
 
 Set FLARE_RUN_CUDA_TESTS=1, FLARE_QWEN_DFLASH_TEST_URL, and
-FLARE_QWEN_DFLASH_SNAPSHOT. Serve a Qwen3.8-27B package with seven drafts,
-128 packed target tokens, fixed verification (--no-mtp-adaptive-verification),
-and concurrency four or greater through flare run.
+FLARE_QWEN_DFLASH_SNAPSHOT. Serve a Qwen3.8-27B core through flare run
+with fixed verification (--no-mtp-adaptive-verification). Set
+FLARE_QWEN_DFLASH_VERIFY_WIDTH to the prepared verification width, including
+the pending token: 8 by default, or 16 for fifteen drafts.
 Metric checks require an otherwise idle service.
 """
 
@@ -18,7 +22,7 @@ from tests.server.test_muse_spark_dflash import rounds, test_dflash_full_prompt_
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1" or not os.environ.get("FLARE_QWEN_DFLASH_TEST_URL"),
-    reason="requires an exported Qwen3.8-27B DFlash2 package running through flare run",
+    reason="requires an exported Qwen3.8-27B DFlash2 core running through flare run",
 )
 
 
@@ -28,6 +32,8 @@ class NativeQwen(NativeMuse):
         self.url = os.environ["FLARE_QWEN_DFLASH_TEST_URL"].rstrip("/")
         self.key = os.environ.get("FLARE_API_TEST_KEY", "local")
         self.snapshot = Path(os.environ["FLARE_QWEN_DFLASH_SNAPSHOT"])
+        self.verify_width = int(os.environ.get("FLARE_QWEN_DFLASH_VERIFY_WIDTH", "8"))
+        assert self.verify_width > 1
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(self.snapshot)
         self.template = (self.snapshot / "chat_template.jinja").read_text()
         cards = self.request("/v1/models")["data"]
@@ -50,7 +56,7 @@ def service():
     return NativeQwen()
 
 
-def test_dflash_short_tails_and_eight_token_rounds_commit_accepted_prefixes(service):
+def test_dflash_short_tails_and_fixed_rounds_commit_accepted_prefixes(service):
     prompt = (f"Counting request {time.time_ns()}. Count from 1 through 500, "
               "one integer per line, with no omissions.")
     before = service.metrics()
@@ -60,7 +66,7 @@ def test_dflash_short_tails_and_eight_token_rounds_commit_accepted_prefixes(serv
         assert choice["finish_reason"] == "length", result
         assert result["usage"]["completion_tokens"] == len(choice["token_ids"]) == budget
         after = service.metrics()
-        assert rounds(after, 8) > rounds(before, 8), (budget, before, after)
+        assert rounds(after, service.verify_width) > rounds(before, service.verify_width), (budget, before, after)
         accepted = after["flare_accepted_draft_tokens_total"] - before["flare_accepted_draft_tokens_total"]
         offered = after["flare_verification_draft_tokens_total"] - before["flare_verification_draft_tokens_total"]
         draft_rounds = after["flare_draft_request_rounds_total"] - before["flare_draft_request_rounds_total"]
@@ -69,7 +75,8 @@ def test_dflash_short_tails_and_eight_token_rounds_commit_accepted_prefixes(serv
         else:
             # The first output is sampled by prefill or resume; one output remains.
             assert accepted == offered == 0, (accepted, offered)
-        print(dict(output_budget=budget, width_eight_rounds=rounds(after, 8) - rounds(before, 8),
+        print(dict(output_budget=budget, verification_width=service.verify_width,
+            verification_rounds=rounds(after, service.verify_width) - rounds(before, service.verify_width),
             accepted_drafts=accepted, offered_drafts=offered, draft_rounds=draft_rounds))
         assert after["flare_requests_failed_total"] == before["flare_requests_failed_total"]
         before = after

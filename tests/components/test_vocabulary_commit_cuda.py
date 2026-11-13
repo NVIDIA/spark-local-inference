@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Committed conditional sequences exercise request state, RNG and raw logprobs."""
 
 import itertools
@@ -30,7 +33,7 @@ def assert_committed(model, checkpoint):
     state = model.requests
     slots = model.slots.cpu().tolist()
     for row, slot in enumerate(slots):
-        count = int(model.commit.emitted_count[row])
+        count = int(model.committed.emitted_count[row])
         if row >= int(model.live_rows) or int(model.epochs[row]) != int(state.generation[slot]):
             assert count == 0
             continue
@@ -45,18 +48,18 @@ def assert_committed(model, checkpoint):
             inputs = model.candidates[row, :count]
             history = torch.cat((before[id(state.ple_history)][slot], inputs))[-2:]
             torch.testing.assert_close(state.ple_history[slot], history)
-            assert state.pending_token[slot] == model.commit.emitted_ids[row, count - 1]
+            assert state.pending_token[slot] == model.committed.emitted_ids[row, count - 1]
             expected_histogram = before[id(state.histogram)][slot] + torch.bincount(
-                model.commit.emitted_ids[row, :count], minlength=model.vocabulary).to(torch.int32)
+                model.committed.emitted_ids[row, :count], minlength=model.vocabulary).to(torch.int32)
             torch.testing.assert_close(state.histogram[slot], expected_histogram)
             record = model.completion.records[int(model.frame), slot]
             assert int(record[8]) == count
-            torch.testing.assert_close(record[16:16 + count], model.commit.emitted_ids[row, :count])
+            torch.testing.assert_close(record[16:16 + count], model.committed.emitted_ids[row, :count])
             if int(model.completion.requested[slot]):
                 queried = model.completion.token_ids[slot, :int(model.completion.token_id_counts[slot])].tolist()
                 for col in range(count):
                     _assert_entry(model.completion.logprobs[int(model.frame), slot, col], model.logits[row, col],
-                                  int(model.commit.emitted_ids[row, col]), ids=queried or None)
+                                  int(model.committed.emitted_ids[row, col]), ids=queried or None)
 
 
 def test_causal_prefix_commit_offsets_rollback_stale_rows_and_slot_reuse():
@@ -78,10 +81,10 @@ def test_causal_prefix_commit_offsets_rollback_stale_rows_and_slot_reuse():
         assert (model.rng.target_offset == model.verify.draw_reservation).all()
         previous = model.candidates[:, 0]
         for step in range(model.width - 1):
-            scores = model.proposal.logits[:, step].double() + model.embedding[previous].double() @ model.head.double().T
+            scores = model.proposal_base[:, step].double() + model.embedding[previous].double() @ model.head.double().T
             torch.testing.assert_close(model.q[:, step].double(), scores.softmax(-1), rtol=3e-6, atol=1e-9)
             previous = model.drafts[:, step]
-        first_tokens = model.commit.emitted_ids.clone()
+        first_tokens = model.committed.emitted_ids.clone()
         first_q = model.q.clone()
         first_logprobs = model.completion.logprobs.clone()
         # The complete checkpoint includes all physical RNG domains and consumed
@@ -89,11 +92,9 @@ def test_causal_prefix_commit_offsets_rollback_stale_rows_and_slot_reuse():
         model.restore(before)
         model.q.fill_(float("nan"))
         model.p.fill_(float("nan"))
-        for tensor in model.proposal.scratch.values():
-            tensor.fill_(float("nan"))
         model.replay("round")
         assert_committed(model, before)
-        torch.testing.assert_close(model.commit.emitted_ids, first_tokens)
+        torch.testing.assert_close(model.committed.emitted_ids, first_tokens)
         torch.testing.assert_close(model.q, first_q)
         torch.testing.assert_close(model.completion.logprobs, first_logprobs)
         model.live_rows.fill_(1)
@@ -124,7 +125,7 @@ def test_causal_prefix_commit_offsets_rollback_stale_rows_and_slot_reuse():
         assert int(model.rng.generation[reused]) == 2
         assert int(model.rng.target_offset[reused]) == model.verify.draw_reservation
         # Reusing the seed and complete initial state restarts both streams.
-        torch.testing.assert_close(model.commit.emitted_ids[0], first_tokens[0])
+        torch.testing.assert_close(model.committed.emitted_ids[0], first_tokens[0])
     finally:
         model.close()
 
@@ -144,7 +145,7 @@ def test_budget_and_natural_stop_clip_commit_and_leave_rng_terminal(stop):
         before = model.checkpoint()
         model.replay("round")
         assert_committed(model, before)
-        assert (model.commit.emitted_count == 1).all()
+        assert (model.committed.emitted_count == 1).all()
         assert (model.requests.status == FINISHED).all()
         assert (model.requests.generated_tokens == 2).all()
         if stop == "eos":
@@ -153,7 +154,7 @@ def test_budget_and_natural_stop_clip_commit_and_leave_rng_terminal(stop):
         model.replay("round")
         for value, saved in before:
             torch.testing.assert_close(value, saved)
-        assert (model.commit.emitted_count == 0).all()
+        assert (model.committed.emitted_count == 0).all()
     finally:
         model.close()
 
@@ -179,7 +180,7 @@ class ConditionalTrial:
         self.sequence = torch.full((model.batch, 3), -1, device="cuda", dtype=torch.int64)
         self.counts = torch.zeros(model.batch, device="cuda", dtype=torch.int32)
         self.rounds = torch.zeros_like(self.counts)
-        self.observe = prepare_triton(_observe, (model.commit.emitted_ids, model.commit.emitted_count,
+        self.observe = prepare_triton(_observe, (model.committed.emitted_ids, model.committed.emitted_count,
             self.sequence, self.counts, self.rounds), (model.batch, 1, 1), B=model.batch, num_warps=4)
 
     def __call__(self):

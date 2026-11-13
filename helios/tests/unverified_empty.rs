@@ -1,14 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Unverified inspection of a structurally empty payload envelope must stay bounded.
 
-#![cfg(feature = "runtime-package")]
+#![cfg(feature = "runtime-core")]
 
 use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use flare_helios::package::{container, reader, schema, schema::wire};
-use flare_helios::runtime_package::{InspectionOptions, unverified_metadata};
+use flare_helios::core::{container, reader, schema, schema::wire};
+use flare_helios::runtime_core::{InspectionOptions, unverified_metadata};
 use prost::Message;
 
 #[test]
@@ -23,16 +28,16 @@ fn empty_payload_envelope_does_not_panic() {
     ));
     fs::create_dir(&directory).unwrap();
     let path = directory.join("empty.safetensors");
-    let package = wire::PackageBody {
+    let core = wire::CoreBody {
         model_identity: "empty".into(),
         hardware_identity: "sm120".into(),
         ..Default::default()
     };
-    let envelope = wire::ProtectedPackage {
+    let envelope = wire::ProtectedCore {
         version: schema::FORMAT_VERSION,
-        package_id: vec![7; 32],
+        core_id: vec![7; 32],
         signer: vec![8; 32],
-        package_body: package.encode_to_vec(),
+        core_body: core.encode_to_vec(),
         ..Default::default()
     };
     let locations = wire::LocationSet {
@@ -67,8 +72,8 @@ fn empty_payload_envelope_does_not_panic() {
             Some(0)
         );
         assert_eq!(value["ranks"].as_array().map(Vec::len), Some(0));
-        assert_eq!(value["package"]["signatures_verified"], false);
-        assert_eq!(value["package"]["metadata"], "unverified");
+        assert_eq!(value["core"]["signatures_verified"], false);
+        assert_eq!(value["core"]["metadata"], "unverified");
     }
     let _ = fs::remove_dir_all(directory);
 }

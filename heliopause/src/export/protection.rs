@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Publisher signatures and independently compressed executable resources.
 use pyo3::{exceptions::PyValueError, prelude::*};
 use super::{ExportResult as Result, invalid, wire};
@@ -23,11 +28,12 @@ pub(crate) fn fields(values: &[&[u8]]) -> Vec<u8> {
     }
     result
 }
-pub(crate) fn signature_message(package: &[u8], signer: &[u8], kind: u32, body: &[u8]) -> Vec<u8> {
+pub(crate) fn signature_message(core: &[u8], signer: &[u8], kind: u32, body: &[u8]) -> Vec<u8> {
+    // Match the authentication domain used by every compatible signed-core reader.
     fields(&[
         b"flare-package-signature-v6",
         &6u32.to_le_bytes(),
-        package,
+        core,
         signer,
         &kind.to_le_bytes(),
         body,

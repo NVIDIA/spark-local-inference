@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Trace exact-checkpoint vision arithmetic against pinned eager Transformers.
 
 This diagnostic materializes 256-token attention scores to inspect rounding.

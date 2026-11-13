@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Semantic weight declarations: grouping, aliases, tuned and unclassified views."""
 
 from dataclasses import dataclass
@@ -54,6 +57,30 @@ def test_layers_and_components_group_by_declaration():
     assert groups['weights.vision[\'patch\']'] == 'misc'
     assert groups['weights.draft'] == 'misc'
     assert all(storage == STABLE for _n, _o, _t, _g, storage in views)
+
+
+def test_named_draft_root_keeps_layers_in_its_component_once():
+    from ignition.components.dflash2_weights import DraftLayerWeights, DraftWeights
+    from ignition.components.weights import MLPWeights
+
+    def tensor():
+        return torch.zeros(2, 2)
+
+    layer = DraftLayerWeights(tensor(), tensor(), tensor(), tensor(), tensor(), tensor(),
+        MLPWeights(tensor(), tensor()), {"base": tensor()}, {"base": tensor()})
+    draft = DraftWeights(tensor(), tensor(), tensor(), tensor(), (layer,), {"projection": tensor()})
+    declaration = declare_weights({"weights": build(), "draft": draft},
+        components=COMPONENTS, tuned=("draft",))
+    views = list(declared_views(declaration))
+    names = [name for name, *_ in views]
+    assert len(names) == len(set(names)), [name for name in names if names.count(name) > 1]
+    groups = {name: (group, storage) for name, _owner, _tensor, group, storage in views}
+    assert groups["draft.layers[0].qkv"] == ("misc", TUNED)
+    assert groups["draft.layers[0].mlp.gate_up"] == ("misc", TUNED)
+    assert groups["weights.layers[0].attention['q']"] == ("layer-000", STABLE)
+    assert len([name for name in names if name.startswith("draft.")]) == 15
+    payload = weight_payload_declaration(declaration)
+    assert [view["name"] for view in payload["views"]] == names
 
 
 def test_undeclared_fields_are_not_weight_views():
@@ -506,7 +533,7 @@ def qwen_dense_weights(first_layer_seed=1.0):
     tree.norm = torch.nn.Parameter(torch.zeros(2))
     tree.layers = torch.nn.ModuleList([LayerModule(1), LayerModule(2)])
     return SimpleNamespace(
-        tree=tree, head=torch.zeros(2), draft=None,
+        tree=tree, head=torch.zeros(2), draft=None, draft_head=None,
         projections={
             'layers.0.self_attn.q_proj': torch.full((2, 2), first_layer_seed),
             'layers.1.self_attn.q_proj': torch.full((2, 2), 2.0),
@@ -641,3 +668,78 @@ def test_misc_preserves_stable_and_tuned_storage_classes():
     misc = {view['name']: view['storage'] for view in declaration['views'] if view['group'] == 'misc'}
     assert misc == {'weights.embedding': STABLE, 'weights.head': STABLE,
                     "weights.vision['patch']": STABLE, 'weights.draft': TUNED}
+
+
+@pytest.mark.parametrize('recipe', ['deepseek4', 'deepseek41'])
+@pytest.mark.parametrize('with_draft', [False, True])
+def test_deepseek_weight_catalog_preserves_recipe_fields(recipe, with_draft):
+    from importlib import import_module
+    from ignition.components.weights import MLPWeights
+
+    module = import_module(f'ignition.recipes.{recipe}.weights')
+
+    def tensor():
+        return torch.arange(4, dtype=torch.float32)
+
+    expert_args = dict(router=tensor(), correction=tensor(), experts={'packed': tensor()},
+                       shared=MLPWeights(tensor(), tensor()), vision_correction=tensor())
+    layer_args = dict(attention={'query': tensor()}, residual={'score': tensor()})
+    draft_args = dict(main_projection=tensor(), context_kv=tensor(), main_norm=tensor(),
+                      norm=tensor(), markov_embedding=tensor(), markov_head=tensor(),
+                      draft_head=tensor())
+    model_args = dict(config=None, shard=None, embedding=tensor(), norm=tensor(), head=tensor(),
+                      allocated_bytes=0, vision={'patch': tensor()})
+    if recipe == 'deepseek4':
+        expert_args['token_experts'] = tensor()
+        draft_args['head_mix'] = {'score': tensor()}
+        model_args['head_mix'] = {'score': tensor()}
+        components = ('embedding', 'norm', 'head', 'head_mix', 'draft', 'vision')
+    else:
+        layer_args['engram'] = {'embedding': tensor()}
+        draft_args['confidence_head'] = tensor()
+        components = ('embedding', 'norm', 'head', 'draft', 'vision')
+    layer = module.LayerWeights(experts=module.ExpertWeights(**expert_args), **layer_args)
+    draft = module.DSparkWeights(layers=(layer,), **draft_args) if with_draft else None
+    model = module.ModelWeights(layers=(layer,), draft=draft, **model_args)
+    catalog = rebuild_weights_metadata(declare_weights(model, components=components))
+    entries = {entry['name']: entry for entry in catalog['tensors']}
+    assert not catalog['unavailable']
+    assert entries["weights.layers[0].attention['query']"]['address'] == layer.attention['query'].data_ptr()
+    assert entries['weights.layers[0].experts.shared.gate_up']['address'] == layer.experts.shared.gate_up.data_ptr()
+    if recipe == 'deepseek4':
+        assert entries["weights.head_mix['score']"]['address'] == model.head_mix['score'].data_ptr()
+        if with_draft:
+            assert entries["weights.draft.head_mix['score']"]['address'] == draft.head_mix['score'].data_ptr()
+    else:
+        assert entries["weights.layers[0].engram['embedding']"]['address'] == layer.engram['embedding'].data_ptr()
+        if with_draft:
+            assert entries['weights.draft.confidence_head']['address'] == draft.confidence_head.data_ptr()
+    if with_draft:
+        assert entries['weights.draft.draft_head']['address'] == draft.draft_head.data_ptr()
+        assert entries["weights.draft.layers[0].attention['query']"]['address'] == layer.attention['query'].data_ptr()
+
+
+def test_declared_container_fields_exist_on_their_dataclasses():
+    """Every declared field of a recipe dataclass container must be a field of that class.
+
+    `declared_views` reads declared fields with `getattr`, so a field the class
+    does not define fails every export of that recipe at manifest time.
+    """
+    from dataclasses import fields, is_dataclass
+    import importlib
+
+    import ignition.components.weights  # noqa: F401  (registers the shared declarations)
+    from ignition.preparation.rebuild_manifest import CONTAINER_FIELDS
+
+    missing = {}
+    for key, declared in CONTAINER_FIELDS.items():
+        module, _, name = key.rpartition('.')
+        if not module.startswith('ignition.'):
+            continue
+        cls = getattr(importlib.import_module(module), name)
+        if not is_dataclass(cls):
+            continue
+        absent = [field for field in declared if field not in {f.name for f in fields(cls)}]
+        if absent:
+            missing[key] = absent
+    assert not missing, missing

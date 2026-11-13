@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The source role: serving exports of this instance's holdings.
 //!
 //! A GPU export is answered by the model worker, which pins the checkpoint;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Freeze exact token workloads and measure real HTTP token delivery.
 
 Run ``prepare`` once and reuse its corpus across server configurations. SSE

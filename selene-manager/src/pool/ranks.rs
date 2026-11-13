@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Rank agents: the attachments of the peer ranks of a multi-process instance.
 //!
 //! Rank 0 opens the instance's one session (with a `rank_secret`) and decides everything.

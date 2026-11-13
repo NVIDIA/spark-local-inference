@@ -1,8 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Request-local speculative acceptance and copy proposal metadata.
 
 use crate::{Result, execution::BATCH_CAPACITIES};
 
-pub const WIDTHS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+/// Copy provenance uses the nonnegative bits of its signed 64-bit mask.
+pub const COPY_DRAFT_CAPACITY: usize = i64::BITS as usize - 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProposalSource {
@@ -25,36 +32,25 @@ impl ProposalSource {
 #[derive(Clone, Debug)]
 pub struct CopyProposal {
     pub consumed: u64,
-    pub tokens: [i64; 7],
+    pub tokens: Vec<i64>,
     pub count: usize,
     pub grammar_masks: Vec<i32>,
 }
 
-pub fn graph_width_masks(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [u8; 7] {
-    let mask = fixed.map_or_else(
-        || {
-            widths
-                .iter()
-                .fold(0, |mask, width| mask | (1 << (width - 1)))
-        },
-        |width| 1 << (width - 1),
-    );
-    BATCH_CAPACITIES.map(|batch| if batch <= capacity { mask } else { 0 })
-}
-
 pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) -> [Vec<usize>; 7] {
-    graph_width_masks(widths, fixed, capacity)
-        .map(|mask| (1..=8).filter(|w| mask & (1 << (w - 1)) != 0).collect())
+    BATCH_CAPACITIES.map(|batch| if batch <= capacity {
+        fixed.map_or_else(|| widths.to_vec(), |width| vec![width])
+    } else { Vec::new() })
 }
 
 pub fn validate_widths(widths: &[usize]) -> Result<()> {
     if !widths.is_empty()
         && (widths[0] != 1
             || widths.windows(2).any(|w| w[0] >= w[1])
-            || widths.iter().any(|w| !WIDTHS.contains(w)))
+            || widths.iter().any(|w| *w == 0))
     {
         return Err(
-            "speculative widths must be sorted unique integers in 1..=8 including 1".into(),
+            "speculative widths must be sorted unique positive integers including 1".into(),
         );
     }
     Ok(())
@@ -91,19 +87,24 @@ impl PrefixEstimate {
 }
 
 /// Prefix survival of the complete proposal program, including copy overrides.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AcceptanceProfile {
-    prefixes: [[PrefixEstimate; 7]; 2],
+    prefixes: [Vec<PrefixEstimate>; 2],
     rounds: u64,
 }
 
 impl Default for AcceptanceProfile {
     fn default() -> Self {
-        Self { prefixes: [std::array::from_fn(|i| PrefixEstimate::new(0.5f64.powi(i as i32 + 1), 0)); 2], rounds: 0 }
+        Self::new(8)
     }
 }
 
 impl AcceptanceProfile {
+    pub fn new(token_capacity: usize) -> Self {
+        Self { prefixes: std::array::from_fn(|_| (0..token_capacity.saturating_sub(1))
+            .map(|i| PrefixEstimate::new(0.5f64.powi(i as i32 + 1), 0)).collect()), rounds: 0 }
+    }
+
     /// Depth zero is the first draft after the pending target token.
     pub fn prefix_probability(&self, source: ProposalSource, depth: usize) -> Option<f64> {
         self.prefixes[source as usize]
@@ -111,16 +112,16 @@ impl AcceptanceProfile {
             .map(|_| self.curve(source, 0, false)[depth])
     }
 
-    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> [f64; 7] {
+    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> Vec<f64> {
         let mut bound = 1.0f64;
-        self.prefixes[source as usize].map(|p| {
+        self.prefixes[source as usize].iter().map(|p| {
             bound = bound.min(if optimistic { p.upper(generated) } else { p.mean() });
             bound
-        })
+        }).collect()
     }
 
     pub fn expected_tokens(&self, source: ProposalSource, width: usize) -> f64 {
-        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(7)].iter().sum::<f64>()
+        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(self.prefixes[source as usize].len())].iter().sum::<f64>()
     }
 
     pub fn rounds(&self) -> u64 {
@@ -139,9 +140,9 @@ impl AcceptanceProfile {
         offered: usize,
         accepted: usize,
         rejected: bool,
-        survival: Option<&[f32; 7]>,
+        survival: Option<&[f32]>,
     ) {
-        debug_assert!(accepted <= offered && offered <= 7);
+        debug_assert!(accepted <= offered && offered <= self.prefixes[source as usize].len());
         if offered == 0 {
             return;
         }
@@ -191,7 +192,7 @@ mod tests {
     #[test]
     fn probability_feedback_replaces_the_binary_sample_and_respects_censoring() {
         let mut profile = AcceptanceProfile::default();
-        let survival = [0.8, 0.4, 0.2, 0.1, 0.05, 0.025, 0.01];
+        let survival = [0.8, 0.4, 0.2, 0.1, 0.05, 0.025, 0.01, -1., -1., -1., -1., -1., -1., -1., -1.];
         profile.observe(ProposalSource::Mtp, 0, 7, 0, true, Some(&survival));
         for depth in 0..7 {
             let expected = (2.0 * 0.5f64.powi(depth as i32 + 1) + f64::from(survival[depth])) / 3.0;
@@ -200,5 +201,27 @@ mod tests {
         let before = profile.curve(ProposalSource::Mtp, 0, false);
         profile.observe(ProposalSource::Mtp, 0, 7, 1, false, Some(&survival));
         assert_eq!(profile.curve(ProposalSource::Mtp, 0, false)[1..], before[1..]);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn arbitrary_width_catalog_preserves_declared_values() {
+    validate_widths(&[1, 8, 13, 16, 32]).unwrap();
+    assert!(validate_widths(&[1, 0]).is_err());
+    assert_eq!(graph_catalog(&[1, 8, 13, 16, 32], None, 1)[0], vec![1, 8, 13, 16, 32]);
+    assert_eq!(graph_catalog(&[1, 8, 32], Some(32), 1)[0], vec![32]);
+    assert!(graph_catalog(&[1, 8, 32], None, 1)[1].is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn acceptance_profiles_follow_core_capacity() {
+    for capacity in [1, 8, 13, 16, 32, 257] {
+        let mut profile = AcceptanceProfile::new(capacity);
+        assert_eq!(profile.curve(ProposalSource::Mtp, 0, false).len(), capacity - 1);
+        profile.observe(ProposalSource::Mtp, 0, capacity - 1, capacity - 1, false, None);
+        assert_eq!(profile.rounds(), u64::from(capacity > 1));
+        assert!(profile.prefix_probability(ProposalSource::Mtp, capacity - 1).is_none());
     }
 }

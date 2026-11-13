@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Typed prepared values preserve graph dataflow independently of model identity."""
 
 import importlib
@@ -8,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 from google.protobuf.json_format import ParseDict
 
-from ignition.preparation import contract as c, runtime_package_pb2 as p
+from ignition.preparation import contract as c, runtime_core_pb2 as p
 from ignition.preparation.execution import GraphSignature
 
 

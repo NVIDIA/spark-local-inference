@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Useful-work rates, proportional-fair service prices, and decode-age value.
 
 /// Marginal service price divided by its fairness coefficient, in log form.

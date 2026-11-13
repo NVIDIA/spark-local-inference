@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """A full-support proposal can verify a differently filtered target law."""
 
 from fractions import Fraction as F

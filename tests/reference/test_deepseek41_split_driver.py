@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native diagnostic timing retains all participating TP rank intervals."""
 
 from types import SimpleNamespace
@@ -8,7 +11,7 @@ from qualify.deepseek41_split import Driver
 
 
 def executor_completion(intervals):
-    value = SimpleNamespace(fence=7, graph_index=3, records=[[0] * 24],
+    value = SimpleNamespace(fence=7, graph_index=3, records=[[0] * 32],
         gpu_ns=intervals, wall_ns=95, queued=False)
     return SimpleNamespace(submit=lambda index, uploads: 7, poll=lambda: value)
 

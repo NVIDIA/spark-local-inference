@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The requester role: restores from other instances and the manager's store.
 //!
 //! A restore has one pool source. Its claim is a transfer that the manager

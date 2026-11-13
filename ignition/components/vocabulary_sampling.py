@@ -1,4 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
 """FP32 distributions and speculative block correction on vocabulary shards.
 
 Each rank retains its probabilities and exchanges compact reduction records.
@@ -12,7 +14,8 @@ import triton
 import triton.language as tl
 
 from ignition.preparation.scratch import bind_scratch
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from .collectives import PreparedAllGather
 from .markov_sampling import _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
@@ -244,24 +247,25 @@ def _selected_records(
     WIDTH: tl.constexpr,
     BLOCKS: tl.constexpr,
     PAD: tl.constexpr,
+    WORDS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    word = tl.arange(0, _WORDS)
-    tl.store(Summary + row * _WORDS + word, 0.0)
+    word = tl.arange(0, WORDS)
+    tl.store(Summary + row * WORDS + word, 0.0)
     tile = tl.arange(0, PAD)
     for step in tl.static_range(WIDTH):
         base = Partials + (row * WIDTH + step) * 3 * BLOCKS + tile
         pmass = tl.sum(tl.load(base, tile < BLOCKS, other=0.0), 0)
         qmass = tl.sum(tl.load(base + BLOCKS, tile < BLOCKS, other=0.0), 0)
-        tl.store(Summary + row * _WORDS + 16 + step, pmass)
-        tl.store(Summary + row * _WORDS + 24 + step, qmass)
+        tl.store(Summary + row * WORDS + 2 * (WORDS // 4) + step, pmass)
+        tl.store(Summary + row * WORDS + 3 * (WORDS // 4) + step, qmass)
         if step < WIDTH - 1:
             local_token = tl.load(Drafts + row * (WIDTH - 1) + step) - tl.load(VocabularyOffset)
             present = (local_token >= 0) & (local_token < LOCAL)
             p = tl.load(P + (row * WIDTH + step) * LOCAL + local_token, present, other=0.0)
             q = tl.load(Q + (row * (WIDTH - 1) + step) * LOCAL + local_token, present, other=0.0)
-            tl.store(Summary + row * _WORDS + step, p)
-            tl.store(Summary + row * _WORDS + 8 + step, q)
+            tl.store(Summary + row * WORDS + step, p)
+            tl.store(Summary + row * WORDS + WORDS // 4 + step, q)
 
 
 @triton.jit
@@ -287,12 +291,13 @@ def _correction_tiles(
     BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
+    WORDS: tl.constexpr,
 ):
     tile, row = tl.program_id(0), tl.program_id(1)
     rank = tl.arange(0, RANK_PAD)
     first_position = tl.program_id(2) * POS_PAD
     position = first_position + tl.arange(0, POS_PAD)
-    selected = Selected + (row * WORLD + rank) * _WORDS
+    selected = Selected + (row * WORLD + rank) * WORDS
     log_prefix = tl.full((), 0.0, tl.float32)
     prefix = tl.full((POS_PAD,), 0.0, tl.float32)
     for step in tl.static_range(WIDTH):
@@ -301,7 +306,7 @@ def _correction_tiles(
         if step < WIDTH - 1:
             if step < first_position + POS_PAD - 1:
                 p_chosen = tl.sum(tl.load(selected + step, rank < WORLD, other=0.0), 0)
-                q_chosen = tl.sum(tl.load(selected + 8 + step, rank < WORLD, other=0.0), 0)
+                q_chosen = tl.sum(tl.load(selected + WORDS // 4 + step, rank < WORLD, other=0.0), 0)
                 log_prefix = tl.minimum(log_prefix + tl.log(p_chosen) - tl.log(q_chosen), 0.0)
     local = tile * BLOCK + tl.arange(0, BLOCK)
     token = tl.load(VocabularyOffset) + local
@@ -329,7 +334,7 @@ def _correction_tiles(
 
 
 @triton.jit
-def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr):
+def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr, WORDS: tl.constexpr):
     distribution = tl.program_id(0)
     tile = tl.arange(0, PAD)
     base = Partials + distribution * 3 * BLOCKS + tile
@@ -338,11 +343,11 @@ def _correction_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constex
     ids = tl.load(base + 2 * BLOCKS, tile < BLOCKS, other=0.0)
     winner = tl.argmax(scores, 0, tie_break_left=True)
     token = tl.sum(tl.where(tile == winner, ids, 0.0), 0)
-    word = tl.arange(0, _WORDS)
+    word = tl.arange(0, WORDS)
     record = tl.where(
         word == 0, tl.sum(masses, 0), tl.where(word == 1, tl.max(scores, 0), tl.where(word == 2, token, 0.0))
     )
-    tl.store(Summary + distribution * _WORDS + word, record)
+    tl.store(Summary + distribution * WORDS + word, record)
 
 
 @triton.jit
@@ -377,10 +382,13 @@ def _complete_block(
     RUNNING: tl.constexpr,
     RESERVATION: tl.constexpr,
     HAS_LIMITS: tl.constexpr,
+    WORDS: tl.constexpr,
+    SURVIVAL: tl.constexpr,
+    POSITIONS: tl.constexpr,
 ):
     row = tl.program_id(0)
     rank = tl.arange(0, RANK_PAD)
-    records = Selected + (row * WORLD + rank) * _WORDS
+    records = Selected + (row * WORLD + rank) * WORDS
     limit = tl.load(Limits + row) if HAS_LIMITS else WIDTH
     valid = (
         (limit >= 1)
@@ -392,17 +400,17 @@ def _complete_block(
     offset = tl.where(tl.load(RngGeneration + slot) == tl.load(Generations + row), tl.load(RngOffset + slot), 0)
     log_prefix, survival = tl.full((), 0.0, tl.float32), tl.full((), 1.0, tl.float32)
     accepted = tl.full((), 0, tl.int32)
-    step_ids = tl.arange(0, 8)
-    survivals = tl.full((8,), -1.0, tl.float32)
+    step_ids = tl.arange(0, POSITIONS)
+    survivals = tl.full((POSITIONS,), -1.0, tl.float32)
     for step in tl.static_range(WIDTH):
         if step < limit:
-            mass = tl.sum(tl.load(records + 16 + step, rank < WORLD, other=0.0), 0)
+            mass = tl.sum(tl.load(records + 2 * (WORDS // 4) + step, rank < WORLD, other=0.0), 0)
             valid &= (tl.abs(mass - 1) <= 1e-4) & tl.load(TargetValid + row * WIDTH + step)
             if step < WIDTH - 1:
                 if step < limit - 1:
-                    qmass = tl.sum(tl.load(records + 24 + step, rank < WORLD, other=0.0), 0)
+                    qmass = tl.sum(tl.load(records + 3 * (WORDS // 4) + step, rank < WORLD, other=0.0), 0)
                     token = tl.load(Drafts + row * (WIDTH - 1) + step)
-                    q = tl.sum(tl.load(records + 8 + step, rank < WORLD, other=0.0), 0)
+                    q = tl.sum(tl.load(records + WORDS // 4 + step, rank < WORLD, other=0.0), 0)
                     p = tl.sum(tl.load(records + step, rank < WORLD, other=0.0), 0)
                     valid &= (
                         (tl.abs(qmass - 1) <= 1e-4)
@@ -415,7 +423,7 @@ def _complete_block(
                     prefix = tl.exp(log_prefix)
                     probability = prefix
                     if step < limit - 2:
-                        next_record = Residual + ((row * WIDTH + step + 1) * WORLD + rank) * _WORDS
+                        next_record = Residual + ((row * WIDTH + step + 1) * WORLD + rank) * WORDS
                         mass = tl.sum(tl.load(next_record, rank < WORLD, other=0.0), 0)
                         denominator = mass + 1.0 - prefix
                         probability = tl.where(denominator > 0, mass / denominator, 1.0)
@@ -425,7 +433,7 @@ def _complete_block(
                     accepted = tl.where(draw <= probability, step + 1, accepted)
                     survival *= tl.minimum(tl.div_rn(p, q), 1.0)
                     survivals = tl.where(step_ids == step, survival, survivals)
-    correction = Residual + ((row * WIDTH + accepted) * WORLD + rank) * _WORDS
+    correction = Residual + ((row * WIDTH + accepted) * WORLD + rank) * WORDS
     winners = tl.load(correction + 1, rank < WORLD, other=-float("inf"))
     selected_rank = tl.argmax(winners, 0, tie_break_left=True)
     ids = tl.load(correction + 2, rank < WORLD, other=0.0)
@@ -434,7 +442,7 @@ def _complete_block(
     draft = tl.load(Drafts + row * (WIDTH - 1) + step_ids, step_ids < WIDTH - 1, other=-1)
     output = tl.where(step_ids < accepted, draft, next_token)
     tl.store(Tokens + row * WIDTH + step_ids, tl.where(valid & (step_ids <= accepted), output, -1), step_ids < WIDTH)
-    tl.store(Survival + row * 7 + step_ids, tl.where(valid, survivals, -1.0), step_ids < 7)
+    tl.store(Survival + row * SURVIVAL + step_ids, tl.where(valid, survivals, -1.0), step_ids < SURVIVAL)
     tl.store(Valid + row, valid)
     tl.store(Offered + row, tl.minimum(tl.maximum(limit - 1, 0), WIDTH - 1))
     tl.store(Accepted + row, tl.where(valid, accepted, 0))
@@ -536,7 +544,7 @@ class PreparedVocabularySoftmax:
         )
         # Rank-local vocabulary placement is a binding, so TP peers reuse the
         # same compiled computation while retaining their own global token IDs.
-        self.vocabulary_offset = torch.tensor([start], dtype=torch.int32, device=device)
+        self.vocabulary_offset = persistent_copy(torch.tensor([start], dtype=torch.int32, device=device))
         self.embedding, self.head, self.scale, self.pending = embedding, values, scale, pending
         self.seeds, self.offsets, self.tokens, self.sample = seeds, offsets, tokens, sample
         summary_rows = b if sample else b * w
@@ -655,6 +663,47 @@ class PreparedVocabularySoftmax:
             steps.append((score, summary, normalize))
         self.steps = tuple(steps)
 
+    def functional(self, *, session):
+        if self.steps is None:
+            raise RuntimeError("vocabulary distributions require preparation before functional conversion")
+        values = dict(self.scratch, logits=self.logits, probabilities=self.probabilities,
+            valid=self.valid, candidates=self.candidates, pending=self.pending,
+            seeds=self.seeds, offsets=self.offsets, tokens=self.tokens)
+        self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()
+                             if value is not None}
+        names = {id(value): name for name, value in values.items() if value is not None}
+        for operations in self.steps:
+            for operation in operations:
+                operation.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                              if id(value) in names)
+                operation.args = tuple(None if id(value) in names else value for value in operation.args)
+        self.gather.functional(session=session)
+        self.logits = self.probabilities = self.valid = self.candidates = self.pending = None
+        self.seeds = self.offsets = self.tokens = self.scratch = None
+        return self
+
+    def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
+            probabilities=None, valid=None, tokens=None):
+        local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
+                 for name, (shape, dtype) in self.local_layout.items()
+                 if name not in ("logits", "candidates", "pending", "seeds", "offsets")}
+        local.update(logits=logits, candidates=candidates, pending=pending, seeds=seeds, offsets=offsets)
+        for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens)):
+            if value is not None:
+                local[name] = value
+        for score, summary, normalize in self.steps:
+            for operation in (score, summary):
+                args = list(operation.args)
+                for index, name in operation.local_slots:
+                    args[index] = local[name]
+                launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+            local["gathered"] = self.gather(local["summary"])
+            args = list(normalize.args)
+            for index, name in normalize.local_slots:
+                args[index] = local[name]
+            launch_triton(normalize.kernel, normalize.compiled, tuple(args), normalize.grid, **normalize.options)
+        return local["probabilities"], local["valid"], local.get("tokens")
+
     def __call__(self):
         if self.steps is None:
             raise RuntimeError("vocabulary distributions require preparation")
@@ -743,21 +792,23 @@ class PreparedVocabularyBlockVerification:
             rng,
         )
         self.draft_valid, self.target_valid, self.limits = draft_valid, target_valid, token_limits
+        self.has_token_limits = token_limits is not None
         self.batch, self.width, self.local, self.start, self.world = b, w, local, start, world
         # Rank-local vocabulary placement is a binding, so TP peers reuse the
         # same compiled computation while retaining their own global token IDs.
-        self.vocabulary_offset = torch.tensor([start], dtype=torch.int32, device=device)
+        self.vocabulary_offset = persistent_copy(torch.tensor([start], dtype=torch.int32, device=device))
         self.output = SpeculativeAcceptance.allocate(b, w, device) if output is None else output
         self.output.validate(b, w, device)
         self.draw_reservation = 4 * ((w + 1 + 3) // 4)
         blocks = triton.cdiv(local, 256)
+        self.summary_words = max(SUMMARY_WORDS, 4 * triton.next_power_of_2(w))
         self.scratch = bind_scratch(
             dict(
                 partials=((b, w, 3, blocks), torch.float32),
-                selected_summary=((b, SUMMARY_WORDS), torch.float32),
-                selected=((b, world * SUMMARY_WORDS), torch.float32),
-                residual_summary=((b * w, SUMMARY_WORDS), torch.float32),
-                residual=((b * w, world * SUMMARY_WORDS), torch.float32),
+                selected_summary=((b, self.summary_words), torch.float32),
+                selected=((b, world * self.summary_words), torch.float32),
+                residual_summary=((b * w, self.summary_words), torch.float32),
+                residual=((b * w, world * self.summary_words), torch.float32),
             ),
             device=device,
             workspace=workspace,
@@ -803,6 +854,7 @@ class PreparedVocabularyBlockVerification:
             WIDTH=w,
             BLOCKS=blocks,
             PAD=triton.next_power_of_2(blocks),
+            WORDS=self.summary_words,
             num_warps=4,
         )
         # Two positions share prefix work while retaining enough independent
@@ -834,6 +886,7 @@ class PreparedVocabularyBlockVerification:
             BLOCKS=blocks,
             BLOCK=256,
             HAS_LIMITS=self.limits is not None,
+            WORDS=self.summary_words,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -843,6 +896,7 @@ class PreparedVocabularyBlockVerification:
             (b * w, 1, 1),
             BLOCKS=blocks,
             PAD=triton.next_power_of_2(blocks),
+            WORDS=self.summary_words,
             num_warps=4,
         )
         finish = prepare_triton(
@@ -880,10 +934,56 @@ class PreparedVocabularyBlockVerification:
             RUNNING=RUNNING,
             RESERVATION=self.draw_reservation,
             HAS_LIMITS=self.limits is not None,
+            WORDS=self.summary_words,
+            SURVIVAL=out.survival.shape[1],
+            POSITIONS=triton.next_power_of_2(max(w, out.survival.shape[1])),
             num_warps=4,
             enable_fp_fusion=False,
         )
         self.kernels = partials, selected, residual, summary, finish
+
+    def functional(self, *, session):
+        if self.kernels is None:
+            raise RuntimeError("vocabulary verification requires preparation before functional conversion")
+        values = dict(self.scratch, p=self.p, q=self.q, drafts=self.drafts,
+            draft_valid=self.draft_valid, target_valid=self.target_valid)
+        if self.has_token_limits:
+            values["limits"] = self.limits
+        values.update({"output." + name: getattr(self.output, name) for name in self.output.__dataclass_fields__})
+        self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
+        names = {id(value): name for name, value in values.items()}
+        for operation in self.kernels:
+            operation.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                          if id(value) in names)
+            operation.args = tuple(None if id(value) in names else value for value in operation.args)
+        self.selected_gather.functional(session=session)
+        self.residual_gather.functional(session=session)
+        self.p = self.q = self.drafts = self.draft_valid = self.target_valid = self.output = self.scratch = self.limits = None
+        return self
+
+    def run(self, draft_probs, drafts, target_probs, draft_valid, target_valid, *, token_limits=None):
+        if (token_limits is not None) != self.has_token_limits:
+            raise ValueError("vocabulary verification token limits must match the prepared mask contract")
+        if token_limits is not None:
+            _tensor(token_limits, (self.batch,), torch.int32, target_probs.device, "token limits")
+        out = SpeculativeAcceptance.allocate(self.batch, self.width, target_probs.device)
+        local = {name: torch.empty(shape, dtype=dtype, device=target_probs.device)
+                 for name, (shape, dtype) in self.local_layout.items()
+                 if name not in ("p", "q", "drafts", "draft_valid", "target_valid", "limits") and not name.startswith("output.")}
+        local.update(p=target_probs, q=draft_probs, drafts=drafts,
+                     draft_valid=draft_valid, target_valid=target_valid, limits=token_limits)
+        local.update({"output." + name: getattr(out, name) for name in out.__dataclass_fields__})
+        partials, selected, residual, summary, finish = self.kernels
+        for operation in (partials, selected, residual, summary, finish):
+            if operation is residual:
+                local["selected"] = self.selected_gather(local["selected_summary"])
+            if operation is finish:
+                local["residual"] = self.residual_gather(local["residual_summary"])
+            args = list(operation.args)
+            for index, name in operation.local_slots:
+                args[index] = local[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        return out
 
     def __call__(self):
         if self.kernels is None:

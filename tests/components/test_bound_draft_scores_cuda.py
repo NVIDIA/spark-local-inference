@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Direct draft-head/bias inputs preserve the canonical proposal and RNG outputs."""
 import os
 
@@ -174,6 +177,7 @@ def test_parallel_draft_preparation_preserves_bias_and_selector_contract(bias_dt
         collectives=dict(vocabulary_runtime=None, coordinator=None))
     operation.batch, operation.width, operation.name = batch, width, 'bias-preparation'
     operation.proposal_only, operation.generate_proposals, operation.argmax = True, True, None
+    operation.vocabulary_parallel = False
     operation.operations, operation.buffers, operation.sampling_scratch = None, None, {}
     operation.draft_inputs = torch.zeros((batch, block), dtype=torch.int64, device='cuda')
     operation.draft = SimpleNamespace(scratch=SimpleNamespace(
@@ -181,6 +185,7 @@ def test_parallel_draft_preparation_preserves_bias_and_selector_contract(bias_dt
     operation.markov = None if bias_dtype is None else SimpleNamespace(
         logits=torch.zeros((batch, vocab), dtype=bias_dtype, device='cuda'))
     operation.selector = object() if selector else None
+    operation.shortlisted_selector = None
     operation.logits = torch.zeros((batch, 1, vocab), device='cuda')
     operation.drafts = torch.zeros((batch, width - 1), dtype=torch.int64, device='cuda')
     operation.seed = torch.zeros(batch, dtype=torch.int64, device='cuda')

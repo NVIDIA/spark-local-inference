@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Step-5 decoder semantics from StepFun's inference implementation.
 
 Reference: https://huggingface.co/stepfun-ai/Step-5-Preview/blob/main/inference/model.py.

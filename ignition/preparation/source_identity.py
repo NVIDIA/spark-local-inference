@@ -1,4 +1,8 @@
-"""Source compatibility identity for preparation and package rebuild metadata."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Source compatibility identity for preparation and core rebuild metadata."""
 
 import hashlib
 from pathlib import Path

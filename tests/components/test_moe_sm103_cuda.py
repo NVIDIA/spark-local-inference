@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint routed experts on SM103 through FlashInfer's native MoE kernels."""
 
 from __future__ import annotations

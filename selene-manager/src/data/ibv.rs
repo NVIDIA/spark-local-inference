@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Registered manager regions and one signalled RDMA write per window (experimental).
 
 use super::channel::{Pair, Rdma};

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! CPU request preparation with the canonical recipient-header checkpoint frontend.
 
 use super::*;
@@ -30,8 +35,7 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
             ))
             .unwrap(),
             chat_template: Some(asset(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../ignition/recipes/muse_spark/assets/chat_template.jinja"),
+                crate::template_fixtures::path("muse_spark", "chat_template"),
             )),
         },
         json!({"add_generation_prompt":true,"current_date":"2026-10-27"})

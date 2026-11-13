@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Layer-streamed Muse Spark text reference with checkpoint-native NVFP4 arithmetic.
 
 Attention, rotary positions, normalization, routing and residual gates use the

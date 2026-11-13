@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The gRPC `Pool` service: `Hello`, and one `Session` stream per instance process.
 
 use super::core::{Event, OpenPeer, PoolHandle};

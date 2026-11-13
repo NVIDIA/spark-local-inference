@@ -1,16 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Owner-process tuning freezes actual generated kernels across TP ranks and reloads."""
 
 import copy
+import gc
 import os
 import pickle
+import weakref
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
 
-from ignition.preparation.aot import ForwardCache
+from ignition.preparation.aot import BindingMismatch, ForwardCache
 from ignition.preparation.compilation import _OPTIONS
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation import inductor_tuning
@@ -88,7 +95,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
     from torch._inductor.async_compile import CompiledTritonKernels
     from torch._inductor.codecache import PyCodeCache
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.runtime_core import _Cuda
 
     coordinator = None
     root = tmp_path
@@ -102,16 +109,30 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
         root = Path(roots[0])
         coordinator = CollectivePreparation(dist.group.WORLD)
     device = torch.device('cuda', torch.cuda.current_device())
+    inventories = []
 
     class Probe(inductor_tuning.InductorSelections):
         def register(self, bound):
-            graph = bound.artifact._artifacts.compiled_fn.artifact._flare_graph
+            graph = bound.backend.artifact._flare_graph
             tuners = [value for value in inductor_tuning._kernel_globals(graph).values()
                       if isinstance(value, CachingAutotuner)]
             cooperative = [tuner for tuner in tuners if tuner.triton_meta.get('launch_cooperative_grid')]
             assert cooperative, 'the vision validation must generate a cooperative reduction'
             assert all(not tuner.triton_meta.get('launch_pdl', False) for tuner in cooperative)
             super().register(bound)
+
+        def freeze(self, bound):
+            super().freeze(bound)
+            results = {}
+            for identity, _, tuner in self.forwards[id(bound)][2].values():
+                result = inductor_tuning._selected(tuner)
+                results[identity] = result._flare_config_state, result.kernel.cubin_raw
+            assert results, 'the vision validation must retain a nonempty kernel inventory'
+            if coordinator is not None:
+                peers = [None] * dist.get_world_size()
+                dist.all_gather_object(peers, results)
+                assert all(peer == results for peer in peers)
+            inventories.append(results)
 
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', Probe)
     cache = ForwardCache(namespace={'model': 'cooperative-vision-validation'}, device=device,
@@ -124,19 +145,6 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
             return cache.prepare(forward, name='vision1024', signature=signature)
         return cache.prepare_many({'vision1024': forward}, {'vision1024': signature},
             coordinator=coordinator, materialize=lambda: None)['vision1024']
-
-    def selected(bound):
-        selections = Probe(device)
-        selections.register(bound)
-        results = {}
-        for identity, instances in selections.instances.items():
-            result = inductor_tuning._selected(next(iter(instances.values())))
-            results[identity] = result._flare_config_state, result.kernel.cubin_raw
-        if coordinator is not None:
-            peers = [None] * dist.get_world_size()
-            dist.all_gather_object(peers, results)
-            assert all(peer == results for peer in peers)
-        return results
 
     def replay(bound, forward):
         graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -177,7 +185,8 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
 
     forward = VisionPixelValidationForward()
     bound = prepare(forward)
-    winners = selected(bound)
+    winners, = inventories
+    inventories.clear()
     replay(bound, forward)
     CompiledTritonKernels.cache_clear()
     PyCodeCache.cache_clear()
@@ -190,7 +199,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
     fresh = VisionPixelValidationForward()
     restored = prepare(fresh)
     assert restored.cache_hit
-    assert selected(restored) == winners
+    assert inventories == [winners]
     replay(restored, fresh)
 
 
@@ -258,7 +267,7 @@ def test_input_reset_survives_tuning_and_frozen_warmup(tmp_path, request, deferr
             before_run=lambda name: forward.state.fill_(1))['decode']
         if restored:
             assert bound.cache_hit
-        assert bound.artifact._artifacts.compiled_fn._tuning_frozen
+        assert bound.backend._tuning_frozen
         torch.testing.assert_close(forward.state, torch.full_like(forward.state, 2), rtol=0, atol=0)
         torch.testing.assert_close(forward.output, torch.full_like(forward.output, 6), rtol=0, atol=0)
 
@@ -272,7 +281,7 @@ def test_single_rank_default_tuning_is_frozen_on_reload(tmp_path, monkeypatch):
     signature = GraphSignature('decode', 1, 1)
     forward = ArithmeticForward()
     bound = cache.prepare(forward, name='decode', signature=signature)
-    assert bound.artifact._artifacts.compiled_fn._tuning_frozen
+    assert bound.backend._tuning_frozen
     _replay(bound, forward)
 
     def forbidden(*args, **kwargs):
@@ -478,12 +487,61 @@ def test_long_generated_kernel_names_freeze_and_restore(tmp_path, monkeypatch):
     _replay(restored, fresh)
 
 
+@torch.no_grad()
+def test_unreferenced_bundled_candidates_are_dropped_and_named_kernels_still_bind(tmp_path, monkeypatch):
+    """Epilogue-fusion benchmarking can bundle a template candidate that final code never names."""
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+    from torch._inductor.utils import Placeholder
+
+    bundled = {}
+
+    def probe(candidate):
+        class Probe(inductor_tuning.InductorSelections):
+            def register(self, bound):
+                entries = bound.backend.artifact._flare_graph._triton_bundle.static_autotuners
+                if not bound.cache_hit:
+                    entries.append(candidate(entries[0]))
+                bundled[bound.cache_hit] = {entry.cache_key for entry in entries}
+                super().register(bound)
+        return Probe
+
+    def cache(name):
+        return ForwardCache(namespace={'model': name}, device='cuda:0', root=tmp_path / name, compile_workers=1,
+            options=dict(_OPTIONS, autotune_local_cache=False, autotune_remote_cache=False))
+
+    signature = GraphSignature('decode', 1, 1)
+    monkeypatch.setattr(inductor_tuning, 'InductorSelections', probe(lambda entry: replace(
+        entry, cache_key='unreferenced-candidate', kernel_name=str(Placeholder.DESCRIPTIVE_NAME))))
+    accepted = cache('unreferenced-candidate')
+    forward = ArithmeticForward()
+    bound = accepted.prepare(forward, name='decode', signature=signature)
+    assert 'unreferenced-candidate' in bundled[False]
+    _replay(bound, forward)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('frozen kernel compiled or benchmarked on restore')
+
+    with monkeypatch.context() as frozen:
+        frozen.setattr(CachingAutotuner, 'bench', forbidden)
+        frozen.setattr(CachingAutotuner, '_precompile_config', forbidden)
+        fresh = ArithmeticForward()
+        restored = accepted.prepare(fresh, name='decode', signature=signature)
+    assert restored.cache_hit
+    assert bundled[True] == bundled[False] - {'unreferenced-candidate'}
+    _replay(restored, fresh)
+
+    monkeypatch.setattr(inductor_tuning, 'InductorSelections', probe(lambda entry: replace(
+        entry, cache_key='named-unbound-kernel')))
+    with pytest.raises(ValueError, match='unbound static Inductor kernels'):
+        cache('named-unbound-kernel').prepare(ArithmeticForward(), name='decode', signature=signature)
+
+
 @pytest.fixture(scope='module')
 def distributed_group():
     import torch.distributed as dist
 
-    if int(os.environ.get('WORLD_SIZE', '1')) != 2:
-        pytest.skip('launch with torchrun --nproc-per-node=2 or two one-GPU nodes')
+    if int(os.environ.get('WORLD_SIZE', '1')) < 2:
+        pytest.skip('launch with torchrun and at least two ranks')
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     dist.init_process_group('gloo', timeout=timedelta(minutes=5))
     try:
@@ -496,7 +554,7 @@ def distributed_group():
 @pytest.mark.parametrize('distinct_variants', [False, True])
 def test_distributed_catalog_reconciles_real_conflicting_candidates(
         tmp_path, monkeypatch, distinct_variants, distributed_group):
-    """Run under torchrun with two ranks, on one host or one assigned GPU per host."""
+    """Run under torchrun across the assigned GPUs on one or more hosts."""
     import torch.distributed as dist
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
     from ignition.preparation.collectives import CollectivePreparation
@@ -512,10 +570,30 @@ def test_distributed_catalog_reconciles_real_conflicting_candidates(
             super().__init__(*args, **kwargs)
             self.candidates = {}
             self.injected = 0
+            self.portable_artifacts = []
+            self.guard_wrappers = []
+            self.diff_guard_roots = []
             probes.append(self)
 
         def register(self, bound):
             super().register(bound)
+            self.portable_artifacts.append(weakref.ref(bound.artifact))
+            wrapper = bound.artifact._artifacts.guard_manager
+            root = wrapper.root
+            self.guard_wrappers.append(weakref.ref(wrapper))
+            assert wrapper.diff_guard_root is not None
+            self.diff_guard_roots.append(weakref.ref(wrapper.diff_guard_root))
+            arguments = {"forward": bound.owner}
+            assert wrapper.check(arguments) == root.check(arguments) is True
+            source = bound.owner.source
+            try:
+                bound.owner.source = source[:-1]
+                assert wrapper.check(arguments) == root.check(arguments) is False
+                assert str(wrapper.check_verbose(arguments)) == str(root.check_verbose(arguments))
+            finally:
+                bound.owner.source = source
+            with torch.enable_grad():
+                assert wrapper.check(arguments) == root.check(arguments)
             for identity, _, tuner in self.forwards[id(bound)][2].values():
                 self.candidates.setdefault(identity, [_portable(result) for result in tuner.compile_results])
 
@@ -546,9 +624,27 @@ def test_distributed_catalog_reconciles_real_conflicting_candidates(
     forwards = {name: make_forward() for name in signatures}
     compiled = cache.prepare_many(forwards, signatures, coordinator=coordinator, materialize=lambda: None)
     assert len(probes[-1].winners) > 0
+    gc.collect()
+    assert all(reference() is None for reference in probes[-1].portable_artifacts)
+    assert all(reference() is None for reference in probes[-1].diff_guard_roots)
+    for reference in probes[-1].guard_wrappers:
+        wrapper = reference()
+        assert wrapper is not None
+        assert not wrapper.code_parts and not wrapper.diff_guard_sources
+        assert wrapper.verbose_code_parts is None
     for name in signatures:
-        assert compiled[name].artifact._artifacts.compiled_fn._tuning_frozen
+        assert compiled[name].backend._tuning_frozen
         _replay(compiled[name], forwards[name])
+        source = forwards[name].source
+        try:
+            forwards[name].source = source[:-1]
+            with pytest.raises(BindingMismatch, match='compiled guards'):
+                compiled[name]()
+            forwards[name].source = forwards[name].output.view_as(source)
+            with pytest.raises(BindingMismatch, match='storage aliases changed|compiled guards'):
+                compiled[name]()
+        finally:
+            forwards[name].source = source
 
     def forbidden(*args, **kwargs):
         raise AssertionError('distributed frozen restore reopened autotuning')

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Batch compilation and autotuning for grouped gated RMS normalization."""
 
 from dataclasses import dataclass, replace
@@ -71,9 +74,10 @@ def declare_norm(args, options, *, session, name):
     query = Query(tuple((tuple(t.shape), tuple(t.stride()), str(t.dtype).removeprefix("torch."))
                         for t in tensors), tuple((k, v) for k, v in options.items() if k != "num_warps"))
     payload = CONTRACT.encode_query(query)
+    ordinal = tensors[0].device.index
 
     def materialize(warps):
-        program = compile_norm(payload, warps, tensors[0].device.index)
+        program = compile_norm(payload, warps, ordinal)
         load_programs(program)
         return attach_programs(State(query, warps, program), program)
 

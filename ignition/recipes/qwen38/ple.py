@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compact PLE row delivery and prepared n-gram residual contribution."""
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from dataclasses import dataclass, fields
 import torch
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.sequence import ple_embedding, short_conv
+from b12x.sequence.short_conv.api import _pipeline as short_conv_out
 from safetensors import safe_open
 
 from ignition.components.linear import UnquantizedProjection
@@ -105,7 +110,8 @@ class PLETable:
     @classmethod
     def load(cls, manifest, device, *, tokens, progress=None, host_allocator=None):
         from b12x.sequence._shared.disk_table import MappedHostAllocation
-        from ignition.preparation.runtime_package import FileSource
+        from ignition.preparation.runtime_core import FileSource
+        from ignition.preparation.persistent import persistent_empty
 
         device = torch.device(device)
         config, layout = table_layout(manifest, device)
@@ -131,8 +137,10 @@ class PLETable:
                 mailbox.host_view.zero_()
                 ready = torch.cuda.Event(external=True)
                 ready.record(torch.cuda.current_stream(device))
-                table = cls(config, layout, ple_embedding.allocate_geometry(layout.geometry, device=device),
-                    scale.to(device), torch.zeros((tokens * heads, 80), dtype=torch.uint8, device=device),
+                table = cls(config, layout, ple_embedding.allocate_geometry(layout.geometry, device=device,
+                    allocate=persistent_empty),
+                    persistent_empty(scale.shape, scale.dtype, device).copy_(scale),
+                    torch.zeros((tokens * heads, 80), dtype=torch.uint8, device=device),
                     torch.zeros((tokens * heads, 10), dtype=torch.uint8, device=device),
                     torch.full((tokens, heads), -1, dtype=torch.int64, device=device), mailbox, ready, tuple(sources),
                     float(scale.item()))
@@ -218,13 +226,12 @@ class PLEScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens: int, device, *, buffers=None) -> PLEScratch:
+    def allocate(cls, tokens: int, device) -> PLEScratch:
         if type(tokens) is not int or tokens <= 0:
             raise ValueError("PLE token capacity must be positive")
         return cls(
             *(
-                (torch.zeros((tokens, width), dtype=torch.bfloat16, device=device) if buffers is None
-                 else buffers.zeros((tokens, width), torch.bfloat16))
+                torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
                 for width in (2560, 10240, 2560, 10240, 10240, 10240, 10240)
             )
         )
@@ -441,44 +448,57 @@ class PreparedPLE:
         register_finalizer(session, refresh, workspace=workspace)
         return getattr(self, attribute)
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        if source is not self.source and (
-            source.data_ptr() != self.source.data_ptr()
-            or source.shape != self.source.shape
-        ):
-            raise ValueError("prepared PLE requires its fixed source storage")
-        scratch, metadata = self.scratch, self.metadata
-        self.embedding_lookup(source)
-        self.key_projection(self.embedding_output)
-        self.value_projection(self.embedding_output)
-        key = self.module.norm_key(scratch.key).view(self.tokens, 4, 2560)
-        query = self.module.norm_query(source.view(self.tokens, 10240)).view(
-            self.tokens, 4, 2560
-        )
+    def functional(self, *, session):
+        self.embedding_lookup.functional(session=session)
+        self.key_projection.functional(session=session)
+        self.value_projection.functional(session=session)
+        if self.partitions is not None:
+            for convolution in self.convolutions:
+                convolution.functional(session=session)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        if self.partitions is None:
+            self.convolution_scratch = tuple((tuple(t.shape), tuple(t.stride()), t.dtype)
+                for t in (self.convolution_binding.gathered_state, self.convolution_binding.request_ids))
+            self.convolution_binding = None
+        self.scratch = self.source = self.metadata = None
+        self.embedding_output = self.partitions = None
+        self.token_rows = self.sequence_rows = None
+
+    def __call__(self, source: torch.Tensor, metadata, partitions=None) -> torch.Tensor:
+        embedding = self.embedding_lookup(source, metadata)
+        key = self.module.norm_key(self.key_projection(embedding)).view(self.tokens, 4, 2560)
+        value = self.value_projection(embedding)
+        query = self.module.norm_query(source.view(self.tokens, 10240)).view(self.tokens, 4, 2560)
         gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(2560)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        scratch.gated.copy_(
-            (torch.sigmoid(gate) * scratch.value.unsqueeze(1)).flatten(1)
-        )
-        scratch.normalized.copy_(self.module.norm_conv(scratch.gated))
-        live = (
-            (self.token_rows >= metadata.query_start_loc[:-1].view(1, -1))
-            & (self.token_rows < metadata.query_start_loc[1:].view(1, -1))
-            & (self.sequence_rows < metadata.num_seqs)
+        gated = (torch.sigmoid(gate) * value.unsqueeze(1)).flatten(1)
+        normalized = self.module.norm_conv(gated)
+        token_rows = torch.arange(self.tokens, dtype=torch.int32, device=source.device).view(-1, 1)
+        sequence_rows = torch.arange(metadata.query_start_loc.numel() - 1, dtype=torch.int32, device=source.device).view(1, -1)
+        live = ((token_rows >= metadata.query_start_loc[:-1].view(1, -1))
+            & (token_rows < metadata.query_start_loc[1:].view(1, -1))
+            & (sequence_rows < metadata.num_seqs)
             & (metadata.convolution_slots.view(1, -1) >= 0)
-            & (self.token_rows < metadata.num_tokens)
-        ).any(dim=1, keepdim=True)
-        scratch.gated.masked_fill_(~live, 0)
-        scratch.normalized.masked_fill_(~live, 0)
-        if self.partitions is None:
-            short_conv.run(self.convolution_binding)
+            & (token_rows < metadata.num_tokens)).any(dim=1, keepdim=True)
+        gated = gated.masked_fill(~live, 0)
+        normalized = normalized.masked_fill(~live, 0)
+        if partitions is None:
+            convolved = torch.empty_like(normalized)
+            gathered, request_ids = (torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                for shape, stride, dtype in self.convolution_scratch)
+            short_conv_out(normalized, self.module.conv1d.weight.squeeze(1), metadata.query_start_loc,
+                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.fresh,
+                metadata.num_seqs, metadata.num_tokens, self.state, convolved, gathered, request_ids,
+                None, self.convolution_plan.handle)
         else:
-            for part, convolution in zip(self.partitions.parts, self.convolutions):
-                part.gather(scratch.normalized, part.scratch.normalized)
-                convolution()
-            self.partitions.combine(tuple(part.scratch.convolved for part in self.partitions.parts), scratch.convolved)
-        torch.add(scratch.gated, scratch.convolved, out=scratch.output)
-        return scratch.output
+            values = tuple(convolution(part.gather(normalized), part.metadata)
+                for part, convolution in zip(partitions.parts, self.convolutions, strict=True))
+            convolved = partitions.combine(values)
+        return gated + convolved
+
 
 
 class PreparedPLEConvolution:
@@ -497,12 +517,28 @@ class PreparedPLEConvolution:
             num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens, conv_state=state,
             out=scratch.convolved)
         plan = short_conv.plan(caps, invocation=short_conv.invocation_from_tensors(**args))
+        self.plan, self.weight, self.state = plan, args["conv_weight"], state
         self.binding = prepare_sequence_binding(plan, args, session=session, name=name,
             public_bind=short_conv.bind, mode=mode, bind_plan=True, workspace=workspace,
             set_binding=lambda binding: setattr(self, "binding", binding))
 
-    def __call__(self):
-        short_conv.run(self.binding)
+    def functional(self, *, session):
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(t.shape), tuple(t.stride()), t.dtype)
+            for t in (self.binding.gathered_state, self.binding.request_ids))
+        self.binding = None
+
+    def __call__(self, source, metadata):
+        output = torch.empty_like(source)
+        gathered, request_ids = (torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            for shape, stride, dtype in self.scratch_layout)
+        short_conv_out(source, self.weight, metadata.query_start_loc, metadata.convolution_slots,
+            metadata.fresh, metadata.accepted_tokens, metadata.fresh, metadata.num_seqs,
+            metadata.num_tokens, self.state, output, gathered, request_ids, None, self.plan.handle)
+        return output
 
 
 __all__ = [

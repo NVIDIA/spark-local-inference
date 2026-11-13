@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Stored tensor contract for the pinned Qwen3.8 Flash Next checkpoint."""
 
 MODEL_ID = "nvidia/Qwen3.8-Flash-Next-FP4-Local"

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The session engine: every protocol decision of the pool client, with no I/O.
 //!
 //! The connection task feeds it server messages, worker commands and the

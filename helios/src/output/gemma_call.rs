@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Brace-delimited calls with bare keys and `<|"|>`-quoted strings.
 
 use crate::Result;

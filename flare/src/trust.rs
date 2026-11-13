@@ -1,32 +1,36 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Publisher acceptance and the persistent signing-key trust store.
 //!
-//! Loading a package: read its unverified claim, resolve the signer's identity from the
-//! publisher's repository whenever it can be consulted, verify the signatures, disclose
-//! publisher, identity, source, and license, and obtain the acceptance string. Helios
-//! requires it to match the signed publisher namespace exactly; it records trust and license
-//! acceptance but is not executable key material. Remembered acceptance suppresses the
-//! disclosure; it never skips the repository check.
+//! Core review reads its claim, resolves the signer through the publisher repository,
+//! verifies signatures, and returns the publisher, source, and license for disclosure.
+//! Explicit consent must match the signed fingerprint and publisher namespace. Remembered
+//! acceptance suppresses first-use prompting; it never skips the repository check.
 
 #[cfg(unix)]
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
-use flare_helios::runtime_package::{AuthorizedPackage, PackageClaim, Publisher, VerifiedPackage};
+use flare_helios::runtime_core::{AuthorizedCore, CoreClaim, Publisher, VerifiedCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::identity::{self, Resolution};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, IsTerminal, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const SLOT_SIZE: usize = 65536;
 
-pub(crate) fn publishers(
+pub fn publishers(
     paths: &[PathBuf],
     development: bool,
     home: impl FnOnce() -> io::Result<PathBuf>,
@@ -63,7 +67,7 @@ pub(crate) fn publishers(
 }
 
 fn unique_profiles(publishers: Vec<Publisher>) -> Result<Vec<Publisher>> {
-    // One key may be listed under several namespaces: a publisher promoting a package keeps the
+    // One key may be listed under several namespaces: a publisher promoting a core keeps the
     // key and changes the namespace. Identity is the (key, namespace) pair, so a differing display
     // name for the same pair is the only real conflict; namespaces never merge into one another.
     let mut unique = std::collections::HashMap::new();
@@ -125,17 +129,14 @@ impl Entry {
 }
 /// Public profiles remembered in an explicit trust store. Entries without a
 /// stored key cannot verify signatures themselves and are omitted.
-pub(crate) fn trusted_profiles(store: Option<&Path>) -> Result<Vec<Publisher>> {
+pub fn trusted_profiles(store: Option<&Path>) -> Result<Vec<Publisher>> {
     let store = load_store(&store_path(store)?)?;
     Ok(store.trusted.iter().filter_map(Entry::profile).collect())
 }
 
 /// The verification key remembered for the claim's signer and namespace when the store holds
-/// one, so a package accepted earlier verifies without a profile or a network request.
-pub(crate) fn remembered_profile(
-    claim: &PackageClaim,
-    store: Option<&Path>,
-) -> Result<Option<Publisher>> {
+/// one, so a core accepted earlier verifies without a profile or a network request.
+pub fn remembered_profile(claim: &CoreClaim, store: Option<&Path>) -> Result<Option<Publisher>> {
     let store = load_store(&store_path(store)?)?;
     Ok(store
         .trusted
@@ -279,7 +280,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// How the signing key's identity was established for the disclosure.
-enum Identity {
+#[derive(Debug, Clone, Serialize)]
+pub enum Identity {
     /// The publisher's repository lists this key under the claimed namespace.
     Verified,
     /// Signatures verify against a local profile; the publisher's repository did not confirm it.
@@ -287,13 +289,12 @@ enum Identity {
     Development,
 }
 
-/// Verify, disclose, and accept a package, returning it ready to load along with its publisher.
-/// Everything a package claim establishes before acceptance: the exact claim, the profiles that
+/// Everything a core claim establishes before acceptance: the exact claim, the profiles that
 /// can verify its signatures, the resolved publisher identity (including revocation), and the
-/// remembered trust entry. Acquisition uses this to authenticate a package and bind its metadata
-/// without accepting terms or decoding executables; acceptance stays in `load`/`authorize`.
-pub(crate) struct ResolvedIdentity {
-    pub claim: PackageClaim,
+/// remembered trust entry. Acquisition uses this to authenticate a core and bind its metadata
+/// without accepting terms or decoding executables; acceptance requires `Review::accept`.
+pub struct ResolvedIdentity {
+    pub claim: CoreClaim,
     pub profiles: Vec<Publisher>,
     identity: Identity,
     remembered: Option<Entry>,
@@ -301,10 +302,10 @@ pub(crate) struct ResolvedIdentity {
     pub store_path: PathBuf,
 }
 
-pub(crate) fn resolve_identity(
+pub fn resolve_identity(
     root: &Path,
     publisher_keys: &[PathBuf],
-    hub: &crate::cli::HubOptions,
+    hub: &crate::options::HubOptions,
     trust_store: Option<&Path>,
 ) -> Result<ResolvedIdentity> {
     resolve_identity_with(root, publisher_keys, &[], hub, trust_store)
@@ -312,14 +313,14 @@ pub(crate) fn resolve_identity(
 
 /// Resolve identity with profiles carried in an authenticated request. Profiles
 /// are public keys, never private material or controller-local paths.
-pub(crate) fn resolve_identity_with(
+pub fn resolve_identity_with(
     root: &Path,
     publisher_keys: &[PathBuf],
     supplied: &[Publisher],
-    hub: &crate::cli::HubOptions,
+    hub: &crate::options::HubOptions,
     trust_store: Option<&Path>,
 ) -> Result<ResolvedIdentity> {
-    let claim = PackageClaim::read(root)?;
+    let claim = CoreClaim::read(root)?;
     let path = store_path(trust_store)?;
     let store = load_store(&path)?;
     let remembered = store
@@ -379,333 +380,135 @@ pub(crate) fn resolve_identity_with(
     })
 }
 
-pub fn load(
-    root: &Path,
-    args: &crate::cli::Run,
-    progress: &mut flare_helios::startup::StartupProgress,
-    origin: Option<&str>,
-) -> Result<(AuthorizedPackage, Publisher)> {
-    load_with(root, args, progress, origin, true)
+/// Metadata and publisher identity retained until the caller makes a trust decision.
+pub struct Review {
+    core: VerifiedCore,
+    resolved: ResolvedIdentity,
+    pub disclosure: Disclosure,
 }
 
-/// Verify a package's signed metadata without reading payload bytes. A controller that mirrors a
-/// node-held package holds only the index and companion headers.
-pub fn load_metadata(
-    root: &Path,
-    args: &crate::cli::Run,
-    progress: &mut flare_helios::startup::StartupProgress,
-    origin: Option<&str>,
-) -> Result<(AuthorizedPackage, Publisher)> {
-    load_with(root, args, progress, origin, false)
+#[derive(Debug, Clone, Serialize)]
+pub struct Disclosure {
+    pub fingerprint: String,
+    pub namespace: String,
+    pub publisher: String,
+    pub official_source: String,
+    pub license_name: Option<String>,
+    pub license_url: Option<String>,
+    pub identity: Identity,
+    pub remembered: bool,
 }
 
-fn load_with(
-    root: &Path,
-    args: &crate::cli::Run,
-    progress: &mut flare_helios::startup::StartupProgress,
-    origin: Option<&str>,
-    verify_payloads: bool,
-) -> Result<(AuthorizedPackage, Publisher)> {
-    let phase = progress.phase("Verify package", None);
-    let ResolvedIdentity {
-        claim,
-        profiles,
-        identity,
-        remembered,
-        store_path: path,
-    } = resolve_identity(
+#[derive(Debug, Clone, Default)]
+pub struct ReviewOptions {
+    pub publisher_keys: Vec<PathBuf>,
+    pub hub: crate::options::HubOptions,
+    pub trust_store: Option<PathBuf>,
+    pub rank: Option<usize>,
+    pub tensor_parallel: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Acceptance {
+    pub fingerprint: String,
+    pub namespace: String,
+}
+
+/// Authenticate signed metadata and disclose identity without accepting terms or reading stdin.
+pub fn review(root: &Path, options: &ReviewOptions) -> Result<Review> {
+    let resolved = resolve_identity(
         root,
-        &args.publisher_keys,
-        &args.hub,
-        args.trust_store.as_deref(),
+        &options.publisher_keys,
+        &options.hub,
+        options.trust_store.as_deref(),
     )?;
-    // A peer of a multi-host package holds only its rank's bytes, so it verifies that rank alone.
-    let rank = args.rank.filter(|&rank| rank != 0);
-    // Signed topology selects the deployment. A single requested size is authoritative; without
-    // one, a single-host run may infer it from the selected GPU count, while a multi-host peer
-    // cannot (its local device count is not the world size) and must name it when the package
-    // holds several deployments.
-    let requested = match args.hub.tensor_parallel.as_slice() {
-        [size] => Some(*size),
-        [] => {
-            if args.rank.is_none() && !args.gpus.is_empty() {
-                u32::try_from(args.gpus.len()).ok()
-            } else {
-                None
-            }
+    let core = match options.tensor_parallel {
+        Some(size)
+            if matches!(
+                flare_helios::runtime_core::NativeResources::core_format(root),
+                Ok(flare_helios::runtime_core::CoreFormat::Payload)
+            ) =>
+        {
+            let rank = options
+                .rank
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "rank exceeds the core rank domain")?;
+            VerifiedCore::open_tensor_parallel(root, &resolved.profiles, size, rank)
         }
-        _ => None,
+        _ => VerifiedCore::open(root, &resolved.profiles, options.rank),
+    }?;
+    let disclosure = Disclosure {
+        fingerprint: resolved.claim.signer.clone(),
+        namespace: resolved.claim.namespace.clone(),
+        publisher: core.publisher().name.clone(),
+        official_source: core.official_source().to_owned(),
+        license_name: core.license().map(|license| license.name.clone()),
+        license_url: core.license().map(|license| license.link.clone()),
+        identity: resolved.identity.clone(),
+        remembered: resolved.remembered.is_some(),
     };
-    if args.hub.tensor_parallel.len() > 1 {
-        return Err(
-            "select one tensor-parallel size for a run; the package holds one deployment per size"
+    Ok(Review {
+        core,
+        resolved,
+        disclosure,
+    })
+}
+
+impl Review {
+    pub fn core(&self) -> &VerifiedCore {
+        &self.core
+    }
+
+    /// Bind explicit consent to the authenticated fingerprint and exact signed namespace.
+    pub fn accept(
+        self,
+        acceptance: &Acceptance,
+        verify_weights: bool,
+        verify_payloads: bool,
+        progress: Option<&flare_helios::startup::StartupProgress>,
+    ) -> Result<(AuthorizedCore, Publisher)> {
+        if acceptance.fingerprint != self.resolved.claim.signer
+            || acceptance.namespace != self.resolved.claim.namespace
+        {
+            return Err("publisher acceptance must exactly match the authenticated fingerprint and namespace".into());
+        }
+        let publisher = self.core.publisher().clone();
+        let authorized = self.core.authorize_with_progress(
+            &acceptance.namespace,
+            verify_weights,
+            verify_payloads,
+            progress,
+        )?;
+        let entry = Entry {
+            fingerprint: acceptance.fingerprint.clone(),
+            namespace: acceptance.namespace.clone(),
+            public_key: Some(hex(&publisher.public_key)),
+            name: Some(publisher.name.clone()),
+            identity: Some(
+                match self.resolved.identity {
+                    Identity::Verified => "huggingface.co",
+                    _ => "profile",
+                }
                 .into(),
-        );
-    }
-    let selected_rank = rank
-        .map(|rank| u32::try_from(rank).map_err(|_| "rank id exceeds the package rank domain"))
-        .transpose()?;
-    // Only payload packages describe several deployments in one file; a legacy package is already
-    // a single prepared size, so topology selection must not reroute it to the payload reader.
-    let payload_format = matches!(
-        flare_helios::runtime_package::NativeResources::package_format(root),
-        Ok(flare_helios::runtime_package::PackageFormat::Payload)
-    );
-    let package = match requested {
-        Some(size) if payload_format => {
-            VerifiedPackage::open_tensor_parallel(root, &profiles, size, selected_rank)
+            ),
+        };
+        let current = self.resolved.remembered.as_ref().is_some_and(|previous| {
+            previous.public_key == entry.public_key
+                && previous.name == entry.name
+                && previous.identity == entry.identity
+        });
+        if !current {
+            modify(&self.resolved.store_path, |store| {
+                store.trusted.retain(|previous| {
+                    !(previous.fingerprint == entry.fingerprint
+                        && previous.namespace == entry.namespace)
+                });
+                store.trusted.push(entry);
+            })?;
         }
-        _ => VerifiedPackage::open(root, &profiles, rank),
+        Ok((authorized, publisher))
     }
-    .map_err(|error| -> Box<dyn std::error::Error> {
-        if error.to_string().contains("unknown package publisher") {
-            if let Identity::Unverified(reason) = &identity {
-                return format!(
-                    "cannot verify signing key {}: {reason}; publish the key in publisher.json \
-                     at the root of {} or supply its profile with --publisher-keys",
-                    claim.signer, claim.official_source
-                )
-                .into();
-            }
-        }
-        error.into()
-    })?;
-    phase.finish("signatures");
-    if let Some(origin) = origin {
-        let downloaded = format!("https://huggingface.co/{origin}");
-        if downloaded != package.official_source() {
-            progress.finish_animation();
-            eprintln!(
-                "\nWarning: downloaded from {downloaded}; the publisher signed {} as its source.",
-                package.official_source()
-            );
-        }
-    }
-    let publisher = package.publisher().clone();
-    let authorized = authorize(
-        package,
-        &claim,
-        args,
-        progress,
-        &path,
-        remembered,
-        identity,
-        verify_payloads,
-    )?;
-    Ok((authorized, publisher))
-}
-
-fn authorize(
-    package: VerifiedPackage,
-    claim: &PackageClaim,
-    args: &crate::cli::Run,
-    progress: &mut flare_helios::startup::StartupProgress,
-    path: &Path,
-    remembered: Option<Entry>,
-    identity: Identity,
-    verify_payloads: bool,
-) -> Result<AuthorizedPackage> {
-    let fingerprint = &claim.signer;
-    let namespace = &claim.namespace;
-    // Publisher disclosure and exact namespace acceptance protect user safety
-    // before executing model package code.
-    let explicit = match (&args.dangerously_approve_key, &args.dangerously_accept_publisher) {
-        (Some(key), Some(owner)) if key == fingerprint && owner == namespace => Some(owner.clone()),
-        (None, None) => None,
-        _ => return Err("--dangerously-approve-key and --dangerously-accept-publisher must exactly match the authenticated key and namespace".into()),
-    };
-    if remembered.is_none() {
-        progress.finish_animation();
-        eprintln!(
-            "\n{}",
-            signing_info(&package, fingerprint, &identity, args.verify_weights)
-        );
-    }
-    let accepted = match (&remembered, explicit) {
-        (Some(entry), _) => entry.namespace.clone(),
-        (None, Some(owner)) => owner,
-        (None, None) => {
-            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-                return Err("unattended first use requires --dangerously-approve-key FINGERPRINT --dangerously-accept-publisher NAMESPACE".into());
-            }
-            match package.license() {
-                Some(license) => eprint!(
-                    "\nType \x1b[1m{namespace}\x1b[0m to agree to the {} terms and trust this signing key: ",
-                    license.name
-                ),
-                None => eprint!("\nType \x1b[1m{namespace}\x1b[0m to trust this signing key: "),
-            }
-            io::stderr().flush()?;
-            let response = acceptance_line(io::stdin().lock())?;
-            if &response != namespace {
-                return Err("publisher acceptance declined or did not match".into());
-            }
-            response
-        }
-    };
-    let publisher = package.publisher().clone();
-    let authorized = package.authorize_with_progress(
-        &accepted,
-        args.verify_weights,
-        verify_payloads,
-        Some(progress),
-    )?;
-    let entry = Entry {
-        fingerprint: fingerprint.clone(),
-        namespace: accepted,
-        public_key: Some(hex(&publisher.public_key)),
-        name: Some(publisher.name.clone()),
-        identity: Some(
-            match identity {
-                Identity::Verified => "huggingface.co",
-                _ => "profile",
-            }
-            .into(),
-        ),
-    };
-    let current = remembered.as_ref().is_some_and(|e| {
-        e.public_key == entry.public_key && e.name == entry.name && e.identity == entry.identity
-    });
-    if !current {
-        modify(path, |store| {
-            store.trusted.retain(|e| {
-                !(e.fingerprint == entry.fingerprint && e.namespace == entry.namespace)
-            });
-            store.trusted.push(entry);
-        })?;
-    }
-    if remembered.is_none() {
-        eprintln!("Signing key accepted for {namespace}.\n");
-    }
-    Ok(authorized)
-}
-
-fn signing_info(
-    package: &VerifiedPackage,
-    fingerprint: &str,
-    identity: &Identity,
-    verify_weights: bool,
-) -> String {
-    let publisher = package.publisher();
-    let mut lines = vec![
-        format!("Publisher:  {} ({})", publisher.name, publisher.namespace),
-        format!(
-            "Identity:   {}",
-            match identity {
-                Identity::Verified =>
-                    format!("Verified via huggingface.co/{}", publisher.namespace),
-                Identity::Unverified(reason) => format!("Unverified; {reason}"),
-                Identity::Development => "Local development key; verified by no publisher".into(),
-            }
-        ),
-        "Signature:  Valid".into(),
-        format!("Source:     {}", package.official_source()),
-    ];
-    if let Some(license) = package.license() {
-        lines.push(format!("License:    {}", license.name));
-        if !license.link.is_empty() {
-            lines.push(format!("            {}", license.link));
-        }
-    }
-    lines.extend([
-        format!(
-            "Stored data: {}",
-            if verify_weights {
-                "Verification enabled"
-            } else {
-                "Not checked (--verify-weights to check)"
-            }
-        ),
-        String::new(),
-        "Signing key:".into(),
-        fingerprint.to_owned(),
-        String::new(),
-        "Executable GPU code can access your process and data.".into(),
-    ]);
-    if matches!(identity, Identity::Unverified(_)) {
-        lines.push("A valid signature does not verify the claimed name or source.".into());
-    }
-    if publisher.development {
-        lines.push("Local development package; not an official published checkpoint.".into());
-    } else {
-        lines.push("Do not proceed if this package came from another source.".into());
-    }
-    if package.license().is_some() {
-        lines.push(
-            "Typing the publisher namespace agrees to the license terms at the link above.".into(),
-        );
-    }
-    lines.push("Only approve a signing key you independently trust.".into());
-    if !io::stderr().is_terminal() {
-        return format!("Signing key acceptance\n{}", lines.join("\n"));
-    }
-    #[cfg(windows)]
-    let columns = crate::windows::terminal_columns();
-    #[cfg(unix)]
-    let columns = {
-        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-        // SAFETY: ioctl writes terminal dimensions into a valid winsize.
-        unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) };
-        if size.ws_col == 0 {
-            80
-        } else {
-            usize::from(size.ws_col)
-        }
-    };
-    if columns < 28 {
-        return format!("Signing key acceptance\n{}", lines.join("\n"));
-    }
-    let width = columns.min(80) - 4;
-    // Only a publisher-confirmed identity earns the calm frame; development and unknown keys warn.
-    let color = if matches!(identity, Identity::Verified) {
-        "36"
-    } else {
-        "33"
-    };
-    let border = format!("\x1b[{color}m");
-    let title = " Signing key acceptance ";
-    let mut output = format!(
-        "{border}╭─{title}{}╮\x1b[0m\n",
-        "─".repeat(width + 1 - title.len())
-    );
-    for line in lines {
-        let mut remaining = line.as_str();
-        while remaining.chars().count() > width {
-            let end = remaining.char_indices().nth(width).unwrap().0;
-            let split = remaining[..end]
-                .rfind(' ')
-                .filter(|n| *n > width / 2)
-                .unwrap_or(end);
-            let row = remaining[..split].trim_end();
-            output.push_str(&format!(
-                "{border}│\x1b[0m {row}{} {border}│\x1b[0m\n",
-                " ".repeat(width - row.chars().count())
-            ));
-            remaining = remaining[split..].trim_start();
-        }
-        output.push_str(&format!(
-            "{border}│\x1b[0m {remaining}{} {border}│\x1b[0m\n",
-            " ".repeat(width - remaining.chars().count())
-        ));
-    }
-    output.push_str(&format!("{border}╰{}╯\x1b[0m", "─".repeat(width + 2)));
-    output
-}
-
-fn acceptance_line(input: impl BufRead) -> io::Result<String> {
-    let mut response = String::new();
-    input.take(256).read_line(&mut response)?;
-    if !response.ends_with('\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "publisher acceptance requires a complete line",
-        ));
-    }
-    response.pop();
-    if response.ends_with('\r') {
-        response.pop();
-    }
-    Ok(response)
 }
 
 pub fn revoke(fingerprint: &str, given: Option<&Path>) -> Result<()> {
@@ -717,7 +520,6 @@ pub fn revoke(fingerprint: &str, given: Option<&Path>) -> Result<()> {
             .trusted
             .retain(|entry| entry.fingerprint != fingerprint)
     })?;
-    eprintln!("Removed trust for signer {fingerprint}.");
     Ok(())
 }
 
@@ -735,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn development_packages_find_the_default_public_profile() {
+    fn development_cores_find_the_default_public_profile() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join(".config/flare/development-publisher.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -770,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_profiles_and_production_packages_skip_the_default_lookup() {
+    fn explicit_profiles_and_production_cores_skip_the_default_lookup() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("publisher.json");
         let publisher = development_publisher();
@@ -786,7 +588,7 @@ mod tests {
         }
         assert!(
             publishers(&[], false, || {
-                panic!("production packages must not resolve the default directory")
+                panic!("production cores must not resolve the default directory")
             })
             .unwrap()
             .is_empty()
@@ -857,25 +659,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("conflicting identities"), "{error}");
-    }
-
-    #[test]
-    fn acceptance_is_exact_and_requires_a_complete_bounded_line() {
-        assert_eq!(
-            acceptance_line(&b"example-publisher\n"[..]).unwrap(),
-            "example-publisher"
-        );
-        assert_eq!(
-            acceptance_line(&b"example-publisher\r\n"[..]).unwrap(),
-            "example-publisher"
-        );
-        assert_eq!(
-            acceptance_line(&b" example-publisher \n"[..]).unwrap(),
-            " example-publisher "
-        );
-        assert!(acceptance_line(&b"example-publisher"[..]).is_err());
-        assert!(acceptance_line([vec![b'x'; 256], vec![b'\n']].concat().as_slice()).is_err());
-        assert!(acceptance_line(&b""[..]).is_err());
     }
 }
 

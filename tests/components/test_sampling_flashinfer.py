@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import math
@@ -39,7 +43,7 @@ class CapturedSampler:
         self.slots = torch.arange(rows, device="cuda", dtype=torch.int32)
         self.epochs = torch.ones(rows, device="cuda", dtype=torch.int64)
         self.live = torch.zeros(1, device="cuda", dtype=torch.int32)
-        self.records = torch.full((2, 4, 24), -99, device="cuda", dtype=torch.int64)
+        self.records = torch.full((2, 4, 32), -99, device="cuda", dtype=torch.int64)
         self.frame = torch.zeros(1, device="cuda", dtype=torch.int32)
         self.sequence = torch.ones(1, device="cuda", dtype=torch.int64)
         self.enabled = torch.ones(rows, device="cuda", dtype=torch.int32)

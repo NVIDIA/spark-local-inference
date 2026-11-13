@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared MXFP8 projection owns its encoded rows through native replay."""
 
 import os
@@ -25,8 +28,9 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned GPU")
 
 
+@pytest.mark.parametrize("atomic", [None, False, True])
 @torch.no_grad()
-def test_default_tuned_mxfp8_rows_compile_and_replay_without_allocation():
+def test_default_tuned_mxfp8_rows_compile_and_replay_without_allocation(atomic):
     device = torch.device("cuda:0")
     rows, width, features = 8, 128, 128
     values = torch.ones((features, width), dtype=torch.float8_e4m3fn, device=device)
@@ -39,7 +43,9 @@ def test_default_tuned_mxfp8_rows_compile_and_replay_without_allocation():
             workload_schema="encoded-rows", numerical_policy="floor1e-4", compile_workers=2) as session:
         session.register_scratch(arena)
         projection = QuantizedProjection(source, weight, output, session=session, name="projection",
-            workspace=arena, activation_mode="auto", mxfp8_min_amax=1e-4, rhs_prefetch_ready=True)
+            workspace=arena, activation_mode="auto", mxfp8_min_amax=1e-4, rhs_prefetch_ready=True,
+            allow_bf16_atomic_reduction=atomic)
+        assert projection.plan.query.allow_bf16_atomic_reduction is (atomic is True)
         session.tune()
         forward = compile_forward(lambda: projection(source))
         source.fill_(1)
@@ -71,8 +77,9 @@ def test_default_tuned_mxfp8_rows_compile_and_replay_without_allocation():
             graph.reset()
 
 
+@pytest.mark.parametrize("atomic", [None, False, True])
 @torch.no_grad()
-def test_preencoded_rows_remain_live_through_projection_join():
+def test_preencoded_rows_remain_live_through_projection_join(atomic):
     device = torch.device("cuda:0")
     rows, width, features = 8, 128, 128
     weight = blockscaled.pack_weight(
@@ -97,7 +104,9 @@ def test_preencoded_rows_remain_live_through_projection_join():
         declare(session, (encoder.request(name="producer", prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(source, encoded.values, encoded.scale_rows, encoded.scale_mma))),))
         projection = QuantizedProjection(source, weight, output, session=session, name="projection",
-            workspace=arena, activation_mode="auto", encoded=encoded, rhs_prefetch_ready=True)
+            workspace=arena, activation_mode="auto", encoded=encoded, rhs_prefetch_ready=True,
+            allow_bf16_atomic_reduction=atomic)
+        assert projection.plan.query.allow_bf16_atomic_reduction is (atomic is True)
         assert projection.quantizer_plan is None
         norm = PreparedRMSNorm(independent, torch.ones(width, dtype=torch.bfloat16, device=device),
             normalized, eps=1e-6, session=session, name="independent_norm")
@@ -306,3 +315,42 @@ def test_checkpoint_query_projection_serial_and_overlap_match_exactly(with_produ
             worker.close()
             for graph in graphs.values():
                 graph.reset()
+
+
+@pytest.mark.parametrize("atomic", [None, False, True])
+@torch.no_grad()
+def test_packed_rows_reduction_permission(atomic):
+    device = torch.device("cuda:0")
+    source = torch.ones((16, 1024), dtype=torch.bfloat16, device=device)
+    output = torch.empty((16, 128), dtype=torch.bfloat16, device=device)
+    weight = blockscaled.pack_weight(
+        torch.ones((128, 1024), dtype=torch.float8_e4m3fn, device=device),
+        torch.full((128, 32), 127, dtype=torch.uint8, device=device), recipe="mxfp8")
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="mxfp8-packed-permission",
+            workload_schema="packed-rows", numerical_policy="default", autotune_effort="off") as session:
+        session.register_scratch(arena)
+        projection = QuantizedProjection(source, weight, output, session=session, name="packed",
+            workspace=arena, activation_mode="quantized", allow_bf16_atomic_reduction=atomic)
+        assert projection.plan.query.allow_bf16_atomic_reduction is (atomic is True)
+        session.tune(show_progress=False)
+        compiled = compile_forward(lambda: projection(source))
+        compiled()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        session.freeze()
+        for fill in (1, -0.5, 2):
+            source.fill_(fill)
+            output.fill_(float("nan"))
+            arena.tensor.fill_(165)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_stats()
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats()
+            for counter in ("allocation.all.allocated", "allocation.all.freed",
+                            "segment.all.allocated", "segment.all.freed"):
+                assert before[counter] == after[counter]
+            assert output.eq(fill * 1024).all()
+        graph.reset()

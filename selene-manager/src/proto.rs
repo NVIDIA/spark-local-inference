@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![allow(clippy::large_enum_variant)]
 
 //! The store's internal vocabulary lives at the top of this module; the pool protocol, the

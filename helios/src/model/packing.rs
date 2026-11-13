@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Resolve prepared value bindings once and pack bounded host uploads for each submission.
 
 use crate::{
@@ -45,6 +51,17 @@ pub struct Inputs {
 }
 
 impl Inputs {
+    pub(crate) fn copy_proposal_capacity(&self, vocabulary: usize) -> usize {
+        let words = vocabulary.div_ceil(32);
+        self.contract.graphs.iter().flat_map(|graph| &graph.inputs)
+            .filter_map(|input| match input.binding.source {
+                ValueSource::CopyTokenIds => Some(input.width),
+                ValueSource::CopyGrammarMask => Some((input.width / words).saturating_sub(1)),
+                _ => None,
+            })
+            .min().unwrap_or(0)
+    }
+
     pub fn new(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<Self> {
         config.contract.validate(manifest)?;
         let graphs = manifest
@@ -158,12 +175,29 @@ impl Inputs {
                         }
                         let expected_width = match binding.source {
                             ValueSource::SamplingParameters => 6,
-                            ValueSource::EosTokenIds | ValueSource::LiveStateRows => 8,
+                            ValueSource::EosTokenIds => 8,
+                            ValueSource::LiveStateRows => {
+                                if width < semantics.state_rows_per_request {
+                                    return Err("state-row input does not cover the graph storage extent".into());
+                                }
+                                width
+                            },
                             ValueSource::PromptHistogram => config.contract.vocabulary,
                             ValueSource::GrammarMask => config.contract.vocabulary.div_ceil(32),
-                            ValueSource::CopyTokenIds => 7,
+                            ValueSource::CopyTokenIds => {
+                                if width < graph.draft_tokens.max(1) {
+                                    return Err("copied-token input does not cover the graph draft extent".into());
+                                }
+                                width
+                            },
                             ValueSource::CopyGrammarMask => {
-                                8 * config.contract.vocabulary.div_ceil(32)
+                                let words = config.contract.vocabulary.div_ceil(32);
+                                let positions = width / words;
+                                let required = if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed) { graph.token_capacity } else { 1 };
+                                if !width.is_multiple_of(words) || positions < required {
+                                    return Err("copy grammar input does not cover the graph verification extent".into());
+                                }
+                                width
                             }
                             ValueSource::PromptPosition => {
                                 config.contract.frontend.position_dimensions
@@ -357,7 +391,7 @@ impl Inputs {
         // and graphs without that input may replace its contents.
         self.unconstrained_masks.retain(|(name, _, _)|
             graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
-        let mut history_proposals = [None; REQUEST_LANES];
+        let mut history_proposals: [Option<(Vec<i64>, usize)>; REQUEST_LANES] = std::array::from_fn(|_| None);
         if frame.config.history_drafts
             && frame.config.speculative_proposal_source
                 == crate::scheduler::speculation::ProposalSource::Mtp
@@ -673,17 +707,25 @@ impl Inputs {
                                 "copy proposal is shorter than the verification input".into()
                             );
                         }
-                        let history = history_proposals[row];
+                        let history = history_proposals[row].as_ref();
                         let count = copy
                             .map(|p| p.count)
                             .or_else(|| history.as_ref().map(|(_, n)| *n))
                             .unwrap_or(0);
                         match binding.source {
-                            CopyTokenIds => values.extend(
-                                copy.map(|p| p.tokens)
-                                    .or_else(|| history.map(|(t, _)| t))
-                                    .unwrap_or([-1; 7]),
-                            ),
+                            CopyTokenIds => {
+                                if count > input.width {
+                                    return Err("active copied-token proposal exceeds its input extent".into());
+                                }
+                                let tokens = copy.map(|p| p.tokens.as_slice())
+                                    .or_else(|| history.map(|(t, _)| t.as_slice()))
+                                    .unwrap_or(&[]);
+                                if count > tokens.len() {
+                                    return Err("copied-token proposal exceeds its host storage".into());
+                                }
+                                values.extend_from_slice(&tokens[..count]);
+                                values.resize(values.len() + input.width - count, -1);
+                            },
                             CopyTokenCount => values.push(count as i64),
                             CopyConsumedTokens => {
                                 values.push(if copy.is_some() || history.is_some() {
@@ -699,6 +741,9 @@ impl Inputs {
                             }),
                             CopyGrammarMask => {
                                 if let Some(copy) = copy {
+                                    if copy.grammar_masks.len() > input.width {
+                                        return Err("active copied-token grammar exceeds its input extent".into());
+                                    }
                                     values.extend(copy.grammar_masks.iter().map(|v| *v as i64));
                                 }
                             }

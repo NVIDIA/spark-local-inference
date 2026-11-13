@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A multi-process instance against the real manager, in process: rank 0 and the peer
 //! ranks' agents, each with its own simulated GPU, restore records a single-process
 //! instance of the same shape holds, slice by slice.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Model-specific preparation and graph construction, and the catalog of qualified checkpoints.
 
 A recipe serves any checkpoint of its architecture. Its declared checkpoints are
@@ -25,12 +29,13 @@ def recipes() -> tuple[Recipe, ...]:
     from .qwen38_dense.recipe import RECIPE as qwen38_dense
     from .mimo_v2.recipe import RECIPE as mimo_v2
     from .kimi3.recipe import RECIPE as kimi3
+    from .kimi31.recipe import RECIPE as kimi31
     from .step5.recipe import RECIPE as step5
     from .nemotron_h.recipe import RECIPE as nemotron_h
     from .minimax_m3.recipe import RECIPE as minimax_m3
     from .muse_spark.recipe import RECIPE as muse_spark
 
-    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, step5, nemotron_h, minimax_m3, gemma4, muse_spark
+    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark
 
 
 def snapshot_directory(hub_cache: Path, checkpoint: Checkpoint) -> Path:

@@ -1,4 +1,38 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
+
+#[test]
+fn unknown_checkpoint_cost_keeps_final_message_anchor_and_all_semantic_marks() {
+    let mut s = scheduler(2, false);
+    s.graph_durations(&super::tests::duration_graphs(4)).unwrap();
+    let mut request = spec(None, 700, 3);
+    request.message_boundaries = (1..700).collect();
+    let handle = s.admit(request).unwrap();
+    assert_eq!(s.request(handle).unwrap().message_boundaries.len(), 699);
+    run_step(&mut s);
+    assert_eq!(s.plan().unwrap().lanes[0].tokens, 512);
+    run_step(&mut s);
+    assert_eq!((s.plan().unwrap().kind, s.plan().unwrap().lanes[0].tokens, s.request(handle).unwrap().consumed_tokens), (GraphKind::Prefill, 187, 512));
+    run_step(&mut s);
+    assert_eq!(s.request(handle).unwrap().snapshot_consumed(), 699);
+    assert_eq!(s.plan().unwrap().kind, GraphKind::Snapshot);
+}
+
+#[test]
+fn atomic_spans_filter_capture_cuts_without_discarding_message_marks() {
+    let mut s = scheduler(2, false);
+    let mut request = spec(None, 700, 3);
+    request.message_boundaries = vec![300, 450];
+    let handle = s.admit(request).unwrap();
+    s.set_prefill_spans(handle, &[400..500]).unwrap();
+    assert_eq!(s.request(handle).unwrap().message_boundaries, [300, 450]);
+    stop_at_capture(&mut s, handle, 300);
+}
 
 fn scheduler(snapshots: u32, mtp: bool) -> RequestScheduler {
     scheduler_with_pages(snapshots, mtp, 64)
@@ -20,6 +54,7 @@ fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, act
             snapshots,
         },
         SchedulerCapabilities {
+            completion_token_capacity: 16,
             vocabulary: 248320,
             page_tokens,
             vision: crate::model::VisionCapabilities {
@@ -59,7 +94,7 @@ fn run_step(s: &mut RequestScheduler) -> ScheduledPlan {
     let step = s.plan().unwrap();
     let fence = Fence(s.submitted.0 + 1);
     s.commit(&step, fence).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); s.limits.request_capacity()];
     for lane in &step.lanes {
         let r = s.request(lane.request).unwrap();
         let end = lane.start_position + lane.tokens as u64;
@@ -128,45 +163,48 @@ fn finish(s: &mut RequestScheduler, h: RequestHandle) -> CheckpointId {
     panic!("request failed to finish");
 }
 
-#[test]
-fn checkpoint_targets_follow_token_distance_and_exclude_reused_prefixes() {
-    assert_eq!(
-        checkpoint_boundaries(vec![10, 11, 12, 240, 510, 760, 990], 0, 1000, 3),
-        [240, 510, 760]
-    );
-    assert_eq!(
-        checkpoint_boundaries(vec![10, 400, 410, 420, 421, 550, 690, 850, 950, 1000], 400, 1000, 2),
-        [550, 850]
-    );
-    assert_eq!(checkpoint_boundaries(vec![1, 2, 3, 4, 999], 0, 1000, 3), [4, 999]);
-    assert!(checkpoint_boundaries(vec![100, 1000], 1000, 1000, 3).is_empty());
-    assert!(checkpoint_boundaries(vec![10], 0, 100, 0).is_empty());
+fn linear_checkpoint_costs(s: &mut RequestScheduler, fraction: f64) {
+    let mut graphs = super::tests::duration_graphs(s.limits.max_active);
+    for graph in &mut graphs {
+        if graph.kind == GraphKind::Prefill { graph.estimated_duration_ns = graph.token_capacity as u64 * 1000; }
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s.configure_policy(PolicyConfig { checkpoint_extra_work_fraction: fraction, ..Default::default() }).unwrap();
 }
 
 #[test]
-fn small_snapshot_shares_prioritize_endpoints_and_allow_completion() {
+fn measured_work_can_fund_more_than_eight_checkpoint_cuts() {
+    let template = scheduler_with_concurrency(32, false, 64, 1);
+    let mut s = RequestScheduler::new([9; 32], SchedulerLimits {
+        max_active: 32, request_slots: 32, ..template.limits
+    }, template.capabilities.clone()).unwrap();
+    linear_checkpoint_costs(&mut s, 0.05);
+    let mut request = spec(None, 2048, 3);
+    request.message_boundaries = (128..2048).step_by(128).collect();
+    let handle = s.admit(request).unwrap();
+    finish(&mut s, handle);
+    assert_eq!(s.stats().message_checkpoints, 15);
+    assert_eq!(s.stats().prompt_checkpoints, 1);
+    assert!(s.request(handle).is_err());
+    assert!(s.stats().checkpoint_extra_work_ns <= 2048 * 1000 / 20);
+}
+
+#[test]
+fn snapshot_capacity_does_not_disable_prompt_fallback_anchor() {
     for snapshots in [0, 1, 2, 4, 8, 12] {
         for output in [1, 3] {
             let mut s = scheduler(snapshots, false);
-            let mut request = spec(None, 700, output);
-            request.message_boundaries = (1..=700).collect();
-            let handle = s.admit(request).unwrap();
+            let handle = s.admit(spec(None, 700, output)).unwrap();
             for _ in 0..50 {
-                if s.request(handle).unwrap().phase == RequestPhase::Finishing {
-                    break;
-                }
+                if s.request(handle).unwrap().phase == RequestPhase::Finishing { break; }
                 run_step(&mut s);
             }
             assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Finishing);
             assert_eq!(s.request(handle).unwrap().generated_tokens, output);
             s.finish(handle).unwrap();
-            let budget = if snapshots == 0 { 0 } else { (snapshots / 4).max(1) };
-            assert!(s.stats().snapshot_publications <= u64::from(budget));
-            if budget == 1 {
-                assert_eq!(s.stats().prompt_checkpoints, 0);
-                assert_eq!(s.stats().message_checkpoints, 0);
-                assert_eq!(s.stats().snapshot_publications, 1);
-            }
+            assert_eq!(s.stats().checkpoint_anchor_captures, u64::from(snapshots > 0));
+            assert_eq!(s.stats().prompt_checkpoints, u64::from(snapshots > 0));
+            assert!(s.stats().cached_checkpoints <= snapshots as usize);
         }
     }
 }
@@ -331,7 +369,7 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
     s.commit(&step, fence).unwrap();
     s.cancel(h).unwrap();
     assert_eq!(s.free_snapshot_count(), 2);
-    let mut record = [CompletionRecord::default(); 4];
+    let mut record = vec![CompletionRecord::default(); 4];
     record[h.slot as usize] = CompletionRecord {
         generation: h.generation as i64,
         submission_sequence: fence.0 as i64,
@@ -372,7 +410,7 @@ fn failed_boundary_copy_is_not_published_and_all_reservations_retire() {
     let step = s.plan().unwrap();
     let fence = Fence(s.submitted.0 + 1);
     s.commit(&step, fence).unwrap();
-    let mut records = [CompletionRecord::default(); 4];
+    let mut records = vec![CompletionRecord::default(); 4];
     records[h.slot as usize] = CompletionRecord {
         generation: h.generation as i64,
         submission_sequence: fence.0 as i64,
@@ -486,8 +524,7 @@ fn atomic_prefill_spans_reject_invalid_geometry_before_execution() {
     }
     let mut s = scheduler(8, false);
     let h = s.admit(spec(Some(512), 1024, 1)).unwrap();
-    assert!(s.set_prefill_spans(h, &[400..700]).is_err());
-    s.set_prefill_spans(h, &[512..700]).unwrap();
+    s.set_prefill_spans(h, &[400..700]).unwrap();
     run_step(&mut s);
     assert!(s.set_prefill_spans(h, &[800..900]).is_err());
 }
@@ -524,12 +561,14 @@ fn snapshot_pressure_retains_complete_conversations_until_endpoint_eviction() {
             s.finish(handle).unwrap();
             lengths.push(length);
         }
-        // The final request pins its message checkpoint until its terminal snapshot is published.
-        let retained = capacity - 1;
-        let pages: usize = lengths[lengths.len() - retained..].iter().map(|n| n / 64).sum();
-        assert_eq!(s.stats().cached_checkpoints, capacity);
-        assert_eq!(s.stats().cached_pages, pages);
-        assert_eq!(s.stats().snapshot_publications, (2 * turns) as u64);
+        assert!(s.stats().cached_checkpoints <= capacity);
+        let latest = *lengths.last().unwrap();
+        let mut latest_history = PrefixHistory::new([9; 32]);
+        let mut tokens: Vec<_> = (0..latest as u32).collect();
+        tokens[0] = turns as u32;
+        latest_history.append(&tokens, &[]).unwrap();
+        assert!(s.cache.lookup(&latest_history).unwrap().consumed_tokens >= (latest - 10) as u64);
+        assert!(s.stats().snapshot_publications >= turns as u64);
     }
 }
 
@@ -538,30 +577,33 @@ fn every_message_endpoint_can_restore_after_a_changed_following_turn() {
     let endpoints = vec![1, 7, 63, 64, 65, 129, 300, 514, 700];
     for page_tokens in [64, 128, 256, 2048] {
         for mtp in [false, true] {
-            let mut s = scheduler_with_concurrency(16, mtp, page_tokens, 1);
-            let mut request = spec(None, 901, 3);
-            request.message_boundaries = endpoints.clone();
-            let handle = s.admit(request).unwrap();
-            for &end in &endpoints {
-                stop_at_capture(&mut s, handle, end as u64);
-                assert_eq!(s.request(handle).unwrap().generated_tokens, 0);
-                run_step(&mut s);
-                assert_eq!(s.request(handle).unwrap().prefix_tokens, end as u64);
-            }
-            finish(&mut s, handle);
-            assert_eq!(s.stats().message_checkpoints, endpoints.len() as u64);
-            for &end in &endpoints {
-                let mut branch = spec(None, end + 10, 1);
-                branch.prompt[end..].fill(1000);
-                branch.message_boundaries = endpoints.iter().copied().filter(|&n| n <= end).collect();
-                let branch = s.admit(branch).unwrap();
-                assert_eq!(s.request(branch).unwrap().reused_prompt_tokens(), end as u64);
-                assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
-                let step = s.plan().unwrap();
-                assert_eq!(step.kind, GraphKind::Prefill);
-                assert_eq!(step.lanes[0].start_position, end as u64);
-                assert_eq!(step.lanes[0].tokens, 10);
-                s.cancel(branch).unwrap();
+            for endpoints in endpoints.chunks(6) {
+                let mut s = scheduler_with_concurrency(16, mtp, page_tokens, 1);
+                linear_checkpoint_costs(&mut s, 1.0);
+                let mut request = spec(None, 901, 3);
+                request.message_boundaries = endpoints.to_vec();
+                let handle = s.admit(request).unwrap();
+                for &end in endpoints {
+                    stop_at_capture(&mut s, handle, end as u64);
+                    assert_eq!(s.request(handle).unwrap().generated_tokens, 0);
+                    run_step(&mut s);
+                    assert_eq!(s.request(handle).unwrap().prefix_tokens, end as u64);
+                }
+                finish(&mut s, handle);
+                assert_eq!(s.stats().message_checkpoints, endpoints.len() as u64);
+                for &end in endpoints {
+                    let mut branch = spec(None, end + 10, 1);
+                    branch.prompt[end..].fill(1000);
+                    branch.message_boundaries = endpoints.iter().copied().filter(|&n| n <= end).collect();
+                    let branch = s.admit(branch).unwrap();
+                    assert_eq!(s.request(branch).unwrap().reused_prompt_tokens(), end as u64);
+                    assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
+                    let step = s.plan().unwrap();
+                    assert_eq!(step.kind, GraphKind::Prefill);
+                    assert_eq!(step.lanes[0].start_position, end as u64);
+                    assert_eq!(step.lanes[0].tokens, 10);
+                    s.cancel(branch).unwrap();
+                }
             }
         }
     }
@@ -649,5 +691,132 @@ fn message_boundaries_must_be_ordered_unique_and_within_the_prompt() {
         request.message_boundaries = endpoints;
         assert!(s.admit(request).is_err());
         assert_eq!(s.free_page_count(), 256);
+    }
+}
+
+#[test]
+fn completed_message_anchor_is_offered_immediately_near_prompt() {
+    for gap in [1, 63, 64] {
+        for output in [1, 3] {
+            let mut s = scheduler_with_concurrency(16, false, 64, 1);
+            s.enable_publications();
+            let message = 191;
+            let handle = s.admit(spec(Some(message), message + gap, output)).unwrap();
+            stop_at_capture(&mut s, handle, message as u64);
+            run_step(&mut s);
+            let message_id = s.request(handle).unwrap().prefix.unwrap();
+            let offered = s.take_publications();
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].id, message_id);
+            assert_eq!(offered[0].key.consumed_tokens, message as u64);
+            finish(&mut s, handle);
+            assert_eq!(s.cache.checkpoint(message_id).unwrap().retention_rank().role, RetentionRole::Anchor);
+        }
+    }
+}
+
+#[test]
+fn completed_message_is_offered_once_and_reuse_preserves_exact_endpoint() {
+    let mut s = scheduler_with_concurrency(16, false, 64, 1);
+    s.enable_publications();
+    let handle = s.admit(spec(Some(127), 129, 3)).unwrap();
+    stop_at_capture(&mut s, handle, 127);
+    run_step(&mut s);
+    let message = s.request(handle).unwrap().prefix.unwrap();
+    assert_eq!(s.take_publications()[0].id, message);
+    finish(&mut s, handle);
+    s.take_publications();
+    let handle = s.admit(spec(None, 127, 1)).unwrap();
+    assert_eq!(s.request(handle).unwrap().prefix, Some(message));
+    assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), 127);
+    assert!(s.take_publications().is_empty());
+    s.cancel(handle).unwrap();
+}
+
+#[test]
+fn completed_message_remains_offered_when_prompt_copy_storage_is_unavailable() {
+    let mut s = scheduler_with_concurrency(1, false, 64, 1);
+    s.enable_publications();
+    let handle = s.admit(spec(Some(127), 129, 3)).unwrap();
+    stop_at_capture(&mut s, handle, 127);
+    run_step(&mut s);
+    let message = s.request(handle).unwrap().prefix.unwrap();
+    assert_eq!(s.take_publications()[0].id, message);
+    assert_eq!(finish(&mut s, handle), message);
+    assert_eq!(s.stats().prompt_checkpoints, 0);
+    assert!(s.take_publications().is_empty());
+}
+
+#[test]
+fn supplementary_copy_work_is_spent_only_when_snapshot_is_committed() {
+    for submit_copy in [false, true] {
+        let mut s = scheduler_with_concurrency(8, false, 64, 1);
+        linear_checkpoint_costs(&mut s, 0.05);
+        let mut request = spec(None, 1024, 3);
+        request.message_boundaries = vec![128, 896];
+        let handle = s.admit(request).unwrap();
+        stop_at_capture(&mut s, handle, 128);
+        assert_eq!(s.request(handle).unwrap().checkpoint_accounting().extra_spent_ns, 0);
+        if submit_copy {
+            let copy = s.plan().unwrap();
+            let fence = Fence(s.submitted.0 + 1);
+            s.commit(&copy, fence).unwrap();
+            assert_eq!(s.request(handle).unwrap().checkpoint_accounting().extra_spent_ns, 1);
+            s.cancel(handle).unwrap();
+            assert!(s.free_snapshot_count() < 8);
+            let records = vec![CompletionRecord::default(); s.limits.request_capacity()];
+            s.complete(fence, &records, Default::default()).unwrap();
+        } else { s.cancel(handle).unwrap(); }
+        assert_eq!(s.stats().checkpoint_extra_work_ns, u64::from(submit_copy));
+        assert_eq!(s.free_snapshot_count(), 8);
+    }
+}
+
+#[test]
+fn stale_supplementary_quote_keeps_cut_and_reserves_anchor_without_copy() {
+    let mut s = scheduler_with_concurrency(3, false, 64, 1);
+    linear_checkpoint_costs(&mut s, 0.05);
+    let mut request = spec(None, 1024, 3);
+    request.message_boundaries = vec![128, 896];
+    let handle = s.admit(request).unwrap();
+    run_step(&mut s);
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.lanes[0].tokens, 128);
+    let held = s.reserve_snapshot(0).unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    assert!(s.request(handle).unwrap().checkpoint_capture.is_none());
+    assert!(s.request(handle).unwrap().anchor_guard.is_some());
+    let mut records = vec![CompletionRecord::default(); s.limits.request_capacity()];
+    records[handle.slot as usize] = CompletionRecord {
+        generation: handle.generation as i64, submission_sequence: fence.0 as i64,
+        consumed_tokens: 128, token_id: -1, status: 1, ..Default::default()
+    };
+    s.complete(fence, &records, Default::default()).unwrap();
+    assert_eq!(s.request(handle).unwrap().consumed_tokens, 128);
+    assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Prefill);
+    assert_eq!(s.stats().checkpoint_skip_storage, 1);
+    assert_eq!(s.stats().checkpoint_extra_work_ns, 0);
+    s.release_snapshot(held);
+    stop_at_capture(&mut s, handle, 896);
+    run_step(&mut s);
+    assert_eq!(s.cache.lookup(&history(896)).unwrap().consumed_tokens, 896);
+    s.cancel(handle).unwrap();
+}
+
+#[test]
+fn exhausted_storage_keeps_the_nearest_message_supplementaries() {
+    for snapshots in [2, 3] {
+        let mut s = scheduler_with_concurrency(snapshots, false, 64, 1);
+        linear_checkpoint_costs(&mut s, 0.05);
+        let mut request = spec(None, 1024, 3);
+        request.message_boundaries = (128..1024).step_by(128).collect();
+        let handle = s.admit(request).unwrap();
+        finish(&mut s, handle);
+        let latest_extra = 768;
+        assert_eq!(s.cache.lookup(&history(latest_extra)).unwrap().consumed_tokens, latest_extra as u64);
+        assert_eq!(s.cache.lookup(&history(896)).unwrap().consumed_tokens, 896);
+        assert_eq!(s.stats().snapshot_evictions, 0);
+        assert_eq!(s.stats().message_checkpoints, snapshots as u64);
     }
 }

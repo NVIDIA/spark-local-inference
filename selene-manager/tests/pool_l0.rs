@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Pool protocol, manager side: a real manager and a wire-level client.
 //! Section ids (H, I, L, C, ...) refer to the protocol's test list.
 

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate checkpoint metadata without importing torch or reading tensor payloads.
 
 Tensor transfer belongs to b12x.loader.DirectWeightSession. Its manifest reader
@@ -281,7 +285,11 @@ def _validate_config(config: dict) -> None:
                         f"quantized_layers.{name}: expected {recipe!r}, got {actual.get(name)!r}"
                     )
             else:
-                linear_format(actual, name)
+                storage = linear_format(actual, name)
+                if storage not in ("mxfp8", "mxfp4", "nvfp4"):
+                    raise CheckpointError(
+                        f"{name}: Qwen dense projections do not support {storage} storage"
+                    )
     except ValueError as exc:
         raise CheckpointError(str(exc)) from exc
     extra = actual.keys() - expected.keys()

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! One process of a multi-process pool test: a single-process source, rank 0 of a
 //! multi-process instance, or the agent of one of its peer ranks. Its harness
 //! (`tests/rank_processes.rs`) starts several, talks to them over stdin and stdout, and kills

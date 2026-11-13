@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Publish graph-produced row requests before an external table consumer waits."""
 
 import torch
@@ -97,13 +100,29 @@ class PreparedPLELookup:
                 table.scale, self.ids, metadata.num_tokens, output, token_count=tokens),
             owners=(table, self.requests))),))
 
-    def publish(self):
-        m, g = self.metadata, self.geometry
+    def functional(self, *, session):
+        self.output_shape = tuple(self.output.shape)
+        self.output_dtype = self.output.dtype
+        self.metadata = self.output = self.requests = None
+        self.wait.functional(session=session)
+        return self
+
+    def publish(self, metadata=None):
+        m, g = self.metadata if metadata is None else metadata, self.geometry
+        requests = self.requests
+        if requests is None:
+            requests = torch.empty(self.ids.shape[0], dtype=torch.int32, device=self.ids.device)
         _requests(m.token_ids, m.query_start_loc, m.committed_history, m.num_seqs, m.num_tokens,
             g.multipliers, g.prime_sizes, g.table_offsets,
-            self.ids, self.requests, self.mailbox, self.sequence, self.plan.handle)
+            self.ids, requests, self.mailbox, self.sequence, self.plan.handle)
 
-    def __call__(self, source):
+    def __call__(self, source, metadata=None):
+        metadata = self.metadata if metadata is None else metadata
+        output = self.output
+        barrier_input, barrier_output = self.wait.operands(source)
+        if output is None:
+            output = torch.empty(self.output_shape, dtype=self.output_dtype, device=source.device)
         _lookup(source, self.weights, self.scales, self.scale, self.ids,
-                self.metadata.num_tokens, self.output, self.wait.timings.timestamps, self.wait.timings.frame,
-                self.wait.input, self.wait.output, self.wait.handle, self.plan.handle, self.handle)
+                metadata.num_tokens, output, self.wait.timings.timestamps, self.wait.timings.frame,
+                barrier_input, barrier_output, self.wait.handle, self.plan.handle, self.handle)
+        return output

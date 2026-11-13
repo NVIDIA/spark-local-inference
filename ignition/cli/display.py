@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Preparation error and speculation formatting."""
 
 import sys
@@ -33,6 +37,8 @@ def speculation(settings, *, brief: bool = False) -> str:
     heads = [f"{head} head {getattr(settings, head + '_head_quantization').upper()}"
              for head in ("draft", "markov") if getattr(settings, head + '_head_quantization') is not None]
     precision = " · " + ", ".join(heads) if heads else ""
+    catalog = " · MTP-only graphs" if settings.mtp_only else ""
     if brief:
-        return depth + selection + precision + parallel
-    return f"{depth} per round · MTP module" + selection + precision + parallel
+        return depth + selection + precision + parallel + catalog
+    source = "DFlash2" if settings.method == "dflash2" else "MTP module"
+    return f"{depth} per round · {source}" + selection + precision + parallel + catalog

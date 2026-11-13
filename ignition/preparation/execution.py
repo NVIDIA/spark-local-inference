@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Typed graph I/O metadata for the native two-frame execution ABI."""
 
 from __future__ import annotations
@@ -8,6 +12,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ignition.components.capacity import BATCH_CAPACITIES, request_capacity
+from ignition.components.completion import validate_completion_buffers
 
 from .graphs import PreparedGraphBundle
 
@@ -46,13 +51,13 @@ class GraphSignature:
         if any(type(value) is not int or value <= 0 for value in (self.batch_capacity, self.token_capacity)):
             raise ValueError("graph capacities must be positive integers")
         if self.kind == "speculative" and (
-                self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity <= 8):
-            raise ValueError("speculative graphs require power-of-two batch capacities through 64 and width 1 through 8")
+                self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity < 1 << 31):
+            raise ValueError("speculative graphs require power-of-two batch capacities through 64 and positive Int32 verification widths")
         if type(self.prefill_capacity) is not int or self.prefill_capacity < 0:
             raise ValueError("prefill capacity must be a nonnegative integer")
         if self.kind == "mixed":
             if (self.batch_capacity not in BATCH_CAPACITIES[1:]
-                    or not 1 <= self.token_capacity <= 8
+                    or not 1 <= self.token_capacity < 1 << 31
                     or self.prefill_capacity < 64 or self.prefill_capacity % 64
                     or self.prefill_capacity + (self.batch_capacity - 1) * self.token_capacity >= 1 << 31
                     or self.speculation_enabled is None
@@ -60,6 +65,14 @@ class GraphSignature:
                 raise ValueError("mixed graphs require a prompt capacity, at least two rows, and an explicit decode mode")
             if "prefill_row" not in self.inputs:
                 raise ValueError("mixed graphs require the prefill_row input")
+            if self.speculation_enabled:
+                depth = self.token_capacity - 1 if self.draft_tokens is None else self.draft_tokens
+                if (type(depth) is not int or not 0 <= depth < (1 << 31) - 1
+                        or (self.token_capacity == 1 and depth != 0)):
+                    raise ValueError("speculative mixed graphs require nonnegative Int32 draft depth and width-one graphs require zero")
+                object.__setattr__(self, "draft_tokens", depth)
+            elif self.draft_tokens is not None:
+                raise ValueError("draft depth requires a speculation-enabled graph")
         elif self.prefill_capacity:
             raise ValueError("only mixed graphs declare a separate prefill capacity")
         if (type(self.packed_token_capacity) is not int or self.packed_token_capacity < 0
@@ -72,14 +85,15 @@ class GraphSignature:
                 raise ValueError("device prefix allocation requires explicit nonnegative draft depth and positive target capacity")
             depth = self.token_capacity - 1 if self.draft_tokens is None else self.draft_tokens
             packed = self.batch_capacity * self.token_capacity if not self.packed_token_capacity else self.packed_token_capacity
-            if type(depth) is not int or not 0 <= depth <= 7 or (self.token_capacity == 1 and depth != 0):
-                raise ValueError("speculative rounds require draft depth zero through seven and width-one rounds require zero")
+            if type(depth) is not int or not 0 <= depth < (1 << 31) - 1 or (self.token_capacity == 1 and depth != 0):
+                raise ValueError("speculative rounds require nonnegative Int32 draft depth and width-one rounds require zero")
             object.__setattr__(self, "draft_tokens", depth)
             object.__setattr__(self, "packed_token_capacity", packed)
             if "query_lengths" in self.inputs and "speculative_prefix_limits" in self.inputs:
                 raise ValueError("speculative rounds cannot bind both query lengths and prefix limits")
-        elif self.draft_tokens is not None:
-            raise ValueError("explicit draft depth belongs to speculative rounds")
+        elif self.draft_tokens is not None and not (
+                self.kind == "mixed" and self.speculation_enabled is True):
+            raise ValueError("draft depth requires a speculative graph")
         if (type(self.confidence_width) is not int or self.confidence_width < 0
                 or (self.confidence_width and (self.kind != "speculative"
                     or self.confidence_width != self.draft_tokens))):
@@ -151,13 +165,15 @@ class PreparedExecution(PreparedGraphBundle):
         required = {"frame_index", "submission_sequence", "completion_records"}
         if not required <= self.buffers.keys():
             raise ValueError("execution requires frame index, submission sequence, and completion buffers")
-        if self.buffers["completion_records"].shape[-1] != 24:
-            raise ValueError("execution requires 24-field completion vectors")
+        self.completion_token_capacity = validate_completion_buffers(self.buffers, request_capacity(max_active))
         for signature in signatures.values():
             if not set(signature.inputs) <= self.buffers.keys():
                 raise ValueError("graph signature references an unregistered input buffer")
-        from ignition.components.completion import validate_completion_buffers
-        validate_completion_buffers(self.buffers, request_capacity(max_active))
+        for signature in signatures.values():
+            if (signature.kind in ("speculative", "mixed") and signature.token_capacity > self.completion_token_capacity
+                    or signature.draft_tokens is not None and signature.draft_tokens >= self.completion_token_capacity
+                    or signature.confidence_width >= self.completion_token_capacity):
+                raise ValueError("graph width, draft depth, or confidence exceeds completion token capacity")
         uploads = {"frame_index", "submission_sequence", "logprob_requested", "logprob_token_ids", "logprob_token_id_counts"}
         uploads.update(field for signature in signatures.values() for field in signature.inputs)
         for name, tuner in tuners.items():
@@ -187,7 +203,15 @@ class PreparedExecution(PreparedGraphBundle):
         self.export_events = dict(export_events or {})
 
     def manifest(self, *, all_variants=False) -> dict[str, Any]:
-        context, handles, spans = self._validate_resources()
+        return self._manifest(all_variants=all_variants, export_graphs=False)
+
+    def export_manifest(self) -> dict[str, Any]:
+        """Validate export metadata and storage without requiring executable handles."""
+        return self._manifest(all_variants=True, export_graphs=True)
+
+    def _manifest(self, *, all_variants, export_graphs) -> dict[str, Any]:
+        context, handles, spans = (self._validate_resources(export_graphs=True) if export_graphs
+                                  else self._validate_resources())
         descriptors = []
         offsets = {}
         cursor = 0
@@ -207,7 +231,9 @@ class PreparedExecution(PreparedGraphBundle):
                 offsets[name] = (cursor, nbytes)
                 cursor += nbytes
         graphs = []
-        speculative = any(signature.kind == "speculative" for signature in self.signatures.values())
+        speculative = any(signature.kind == "speculative"
+                          or signature.kind == "mixed" and signature.speculation_enabled is True
+                          for signature in self.signatures.values())
         graph_handles = dict(zip(self.graphs, handles, strict=True))
         for name in self.serving_graphs:
             handle = graph_handles[name]
@@ -215,7 +241,8 @@ class PreparedExecution(PreparedGraphBundle):
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
             inputs = (*reserved, *signature.inputs)
-            graphs.append({"name": name, "kind": signature.kind, "handle": handle,
+            graphs.append({"name": name, "kind": signature.kind,
+                **({} if export_graphs else {"handle": handle}),
                 "sampling_mode": signature.sampling_mode,
                 "batch_capacity": signature.batch_capacity, "token_capacity": signature.token_capacity,
                 "prefill_capacity": signature.prefill_capacity,
@@ -232,11 +259,12 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
-        abi_version = 5
-        return {"abi_version": abi_version, "context": context, "device": self.device,
+        abi_version = 6
+        return {"abi_version": abi_version, "completion_token_capacity": self.completion_token_capacity,
+                "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
                 "buffers": descriptors, "graphs": graphs,
-                "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
+                "tuning_graphs": [dict(name=name, **({} if export_graphs else {"handle": graph_handles[name]}), outputs=list(value.outputs),
                                        status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):

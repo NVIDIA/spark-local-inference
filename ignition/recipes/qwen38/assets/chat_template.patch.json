@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+    "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "result_sha256": "5729d2fae851038121b626ee1deb921b80726abc936a7f93c4284c06191450f6",
+  "insertions": [
+    5051,
+    8686
+  ]
+}

@@ -1,4 +1,10 @@
-//! Rank zero's door for a package whose ranks run on separate hosts.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Rank zero's door for a core whose ranks run on separate hosts.
 //!
 //! Every host runs `flare run` on its own rank's file. Rank zero listens on the rendezvous address
 //! and each peer knocks there with its rank, the world size and its file's export identifier; rank

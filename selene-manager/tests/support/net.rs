@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A manager with a network listener and a data listener, started the way the binary
 //! starts it, for tests of sessions that reach it from another host.
 

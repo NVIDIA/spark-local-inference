@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """FP32 full-vocabulary proposal probabilities and independent Philox counters."""
 
 import os

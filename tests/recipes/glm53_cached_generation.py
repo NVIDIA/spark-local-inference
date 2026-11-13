@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Full-model cached-prefix branch execution through the native rank coordinator."""
 
 import time
@@ -9,8 +12,9 @@ from ignition.components.state_transfer import StateCommands
 from ignition.recipes.glm53.batch import BatchInputs
 
 
-def run_cached_generation(worker, bundle, pool, requests, scratch, resume, tokens, eos, capacity, progress):
+def run_cached_generation(worker, bundle, pool, requests, scratch, resume, tokens, eos, capacity, progress, *, resume_readback):
     host = BatchInputs.allocate(capacity, 64, "cpu")
+    host.request_state_rows[:, 0].copy_(torch.arange(1, 5))
     admission = AdmissionBuffers.allocate("cpu", vocab_size=154880)
     commands = StateCommands.allocate("cpu")
     staging = dict(host.buffers(), **commands.buffers(), **{
@@ -34,20 +38,22 @@ def run_cached_generation(worker, bundle, pool, requests, scratch, resume, token
         return completion
 
     def transfer(rows):
+        commands.request_slots.fill_(-1)
         commands.source_slots.fill_(-1)
         commands.destination_slots.fill_(-1)
         commands.expected_consumed.fill_(-1)
         commands.operation.zero_()
-        for row, (source, destination, operation, endpoint) in enumerate(rows):
+        for row, (slot, source, destination, operation, endpoint) in enumerate(rows):
+            commands.request_slots[row] = slot
             commands.source_slots[row], commands.destination_slots[row] = source, destination
             commands.operation[row], commands.expected_consumed[row] = operation, endpoint
         commands.num_ops.fill_(len(rows))
 
     admission.admission_count.fill_(1)
     admission.stage(0, 0, RequestAdmission(1, 13, max_new_tokens=32, eos_token_ids=tuple(eos)), tokens)
-    transfer([(-1, 1, 1, 0)])
+    transfer([(0, -1, 1, 1, 0)])
     result = submit("init")
-    assert result.records[0][:7] == [1, result.fence, 0, 0, -1, 1, 0]
+    assert result.records[0][:7] == [1, result.fence, 0, 0, -1, 1, 0], result.records[0][:7]
 
     host.row_slot_ids[0], host.row_generations[0] = 0, 1
     host.live_rows.fill_(1)
@@ -62,7 +68,7 @@ def run_cached_generation(worker, bundle, pool, requests, scratch, resume, token
     prefix_pages = (len(tokens) + 255) // 256
     physical = host.page_tables[0, :prefix_pages].to(device=device, dtype=torch.int64)
     original_cache = {name: cache[physical].clone() for name, cache in pool.partial_pages()}
-    transfer([(1, 5, 0, len(tokens))])
+    transfer([(0, 1, 5, 0, len(tokens))])
     result = submit("snapshot")
     assert result.records[0][:7] == [1, result.fence, len(tokens), 0, -1, 1, 0]
     immutable = pool.backing[5].clone()
@@ -72,7 +78,7 @@ def run_cached_generation(worker, bundle, pool, requests, scratch, resume, token
         admission.stage(row, slot, RequestAdmission(1, 13, max_new_tokens=32, eos_token_ids=tuple(eos)), tokens)
         host.page_tables[slot].copy_(host.page_tables[0])
         host.page_tables[slot, len(tokens) // 256] = row
-    transfer([(5, 2, 0, len(tokens)), (5, 3, 0, len(tokens))])
+    transfer([(1, 5, 2, 0, len(tokens)), (2, 5, 3, 0, len(tokens))])
     result = submit("restore")
     for slot in (1, 2):
         assert result.records[slot][:7] == [1, result.fence, len(tokens), 0, -1, 1, 0]
@@ -88,8 +94,8 @@ def run_cached_generation(worker, bundle, pool, requests, scratch, resume, token
         record = result.records[slot]
         assert record[:4] == [1, result.fence, len(tokens), 1]
         assert record[6] == 0 and record[5] in (1, 2)
-        torch.testing.assert_close(resume.state.hidden[0], prefix_hidden, rtol=0, atol=0)
-        torch.testing.assert_close(resume.logits, prefix_logits, rtol=0, atol=0)
+        torch.testing.assert_close(resume_readback[0][0], prefix_hidden, rtol=0, atol=0)
+        torch.testing.assert_close(resume_readback[1], prefix_logits, rtol=0, atol=0)
         assert torch.equal(pool.backing[slot + 1], immutable)
         generated[slot] = [record[4]]
         host.sample_enabled[0] = 1

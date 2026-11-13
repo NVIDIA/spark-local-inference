@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! CUDA registration and progress display for Selene startup.
 use super::registrar;
 use crate::{Result, startup::StartupProgress};
@@ -17,5 +22,5 @@ pub(crate) fn start(
     phase.finish(summary);
     Ok(charges)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

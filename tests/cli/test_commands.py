@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Command output and exit codes with injected GPUs and hub cache."""
 
 from pathlib import Path
@@ -117,8 +121,9 @@ def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_acce
         assert not preparation.stream_overlap(serial, resolve(model))
         assert preparation.stream_overlap(_parser().parse_args(["export", model]), resolve(model))
     # MiMo composes no concurrent branches, so serializing them is rejected rather than ignored.
-    assert export("mimo-v2.6-pro-mopd", "--no-stream-overlap") == 2
-    assert "--no-stream-overlap: mimo-v2.6-pro-mopd runs no branches concurrently" in failure(capsys)[0]
+    for alias in ("mimo-v2.6-pro-mopd", "mimo-v2.6-flash-rl"):
+        assert export(alias, "--no-stream-overlap") == 2
+        assert f"--no-stream-overlap: {alias} runs no branches concurrently" in failure(capsys)[0]
 
 
 def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
@@ -315,3 +320,11 @@ def test_collective_tuning_preparation_flag_is_explicit(command):
     assert _parser().parse_args([command, "qwen3.8-flash"]).collective_tuning is None
     for mode in ("static", "runtime"):
         assert _parser().parse_args([command, "qwen3.8-flash", "--collective-tuning", mode]).collective_tuning == mode
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+@pytest.mark.parametrize("flag,expected", [([], None), (["--force-moe-decode-a16"], True),
+                                          (["--no-force-moe-decode-a16"], False)])
+def test_moe_decode_a16_parser(command, flag, expected):
+    args = _parser().parse_args([command, "qwen3.8-flash", *flag])
+    assert args.force_moe_decode_a16 is expected

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Gemma 4 text preparation across dense, MoE, and Assistant MTP checkpoints."""
 
 from pathlib import Path
@@ -49,7 +53,7 @@ def prepare(
     kernel_cache,
     progress,
     retain_graphs=False,
-    package_storage=None,
+    core_storage=None,
     ranks=None,
 ):
     from ignition.preparation.rank_group import prepare_group
@@ -77,6 +81,7 @@ def prepare(
                 allow_patterns=("config.json", "model.safetensors"),
             )
     config = PreparationConfig(
+        mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
         collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder,
         prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, native_dense_activations=plan.native_dense_activations,
@@ -94,16 +99,17 @@ def prepare(
         compile_decoder=compile_forwards,
         retain_graphs=retain_graphs,
         kernel_cache=kernel_cache,
+        hub_cache=plan.hub_cache,
         **drafting,
     )
     if plan.world_size == 1:
-        return prepare_model(snapshot, config, progress=progress, package_storage=package_storage)
+        return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
     return prepare_group(
         snapshot,
         config,
         prepare_rank,
         progress=progress,
-        package_storage=package_storage,
+        core_storage=core_storage,
         ranks=ranks,
         checkpoint=plan.checkpoint,
     )

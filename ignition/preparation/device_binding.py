@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Bind single-device compiled forwards to a tensor-parallel rank's CUDA ordinal."""
 
 import ast
@@ -77,9 +81,12 @@ def _device_source(source, original, target, kernel_keys=None):
                 kernel_keys[CompiledTritonKernels.key(kernel.value)] = CompiledTritonKernels.key(rebound)
             replace(kernel, repr(rebound))
     data = source.encode()
-    for start, end, value in sorted(replacements, reverse=True):
-        data = data[:start] + value + data[end:]
-    return data.decode()
+    parts, offset = [], 0
+    for start, end, value in sorted(replacements):
+        parts.extend((data[offset:start], value))
+        offset = end
+    parts.append(data[offset:])
+    return b"".join(parts).decode()
 
 
 def _freeze_tuning_winners(bundle):

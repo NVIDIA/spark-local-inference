@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 pub(crate) struct OwnerLease<T>(pub(crate) Option<T>);
 
 impl<T> OwnerLease<T> {

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! What a host tier is asked to do and what it reports back.
 
 use crate::shared::Tier;
@@ -110,7 +115,10 @@ pub enum StoreEvent {
         result: Result<u64>,
     },
     /// No copy still reads the GPU checkpoint; retry its publication after progress.
-    Deferred { checkpoint: CheckpointId },
+    Deferred {
+        checkpoint: CheckpointId,
+        reason: StoreReason,
+    },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
     /// A manager asked this instance to export a GPU checkpoint. The worker
@@ -143,6 +151,14 @@ pub struct StoreStats {
     /// DRAM, NVMe holding events. Drops: each tier, then end_of_chain/oversize/io_error.
     pub held: [u64; 2],
     pub dropped: [u64; 6],
+    pub expired: [u64; 2],
+    /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
+    pub rows_thinned: [u64; 2],
+    /// Successfully stored records using at least one packed share, by DRAM/NVMe tier.
+    pub packed_records: [u64; 2],
+    pub per_rank_records: [u64; 2],
+    /// Disk-only stores abandoned when later pages disagree with the initial packed decision.
+    pub abandoned_stores: u64,
     pub fetched: u64,
     pub fetch_failed: u64,
     pub bytes_out: u64,
@@ -152,6 +168,9 @@ pub struct StoreStats {
     pub parked_records: usize,
     pub inbound_in_flight: usize,
     pub memory_records: usize,
+    pub slots_used: usize,
+    pub slots_total: usize,
+    pub intake_slots: usize,
     pub memory_bytes: u64,
     pub disk_records: usize,
     pub disk_bytes: u64,
@@ -300,10 +319,6 @@ pub trait TierStore: HostStore {
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         Err(ExportRefusal::NotFound)
     }
-    /// Join a pool: from now on a tier gives up a record only after the next
-    /// tier holds a committed copy, instead of writing every publication
-    /// through to the disk tier. Called once, before the first store.
-    fn cascade(&mut self) {}
     /// Whether the last tier may hand its records on to the pool's manager
     /// instead of dropping them. Set whenever the manager's availability changes.
     fn set_spill(&mut self, _enabled: bool) {}

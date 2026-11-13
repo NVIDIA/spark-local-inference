@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Multi-process instances in claims: peer participants, their data-channel legs, the
 //! assembly pass and the in-order delivery of windows.
 //!

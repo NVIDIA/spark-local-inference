@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native MiniMax M3 text, tools, images, and complete continuation requests.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_MINIMAX_TEST_URL to an idle TP4 service
 with concurrency four, a 4096-token prefill chunk, and image support. Run against
-both DSpark and ordinary decoding when validating a prepared package.
+both DSpark and ordinary decoding when validating a prepared core.
 """
 
 import base64

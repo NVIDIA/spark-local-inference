@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::{ImageLimits, RgbImage, orientation, tests::processor};
 use crate::{Error, FrontendError};
 use serde_json::Value;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Gathering latent records over a network, window by window, reproduces the slab CUDA IPC pulls on one host."""
 
 import pytest

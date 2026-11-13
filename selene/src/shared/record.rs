@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Record files: one checkpoint per file, self-describing, aligned for direct I/O.
 //!
 //! A record lives at `<directory>/<consumed>-<digest>.ckpt`, with the consumed
@@ -35,10 +41,13 @@
 //! | 173 | 4 | rank count, `u32` |
 //! | 177 | variable | rank entries |
 //!
-//! Each rank entry is a plane count as `u32`, that many plane unit sizes as
-//! `u64`, and the row unit size as `u64`. Unit sizes are the unpadded sizes
-//! the GPU geometry declares; padding is derived. The bytes after the last
-//! rank entry are zero. A geometry whose entries do not fit in the block is
+//! Each rank entry is a plane count as `u32`, that many plane unit sizes, and
+//! the row unit size as `u64`. Versions 1 and 2 encode plane sizes as `u64`;
+//! version 3 uses `u32` so large tensor-parallel geometries fit the same block.
+//! Unit sizes are the unpadded sizes the GPU geometry declares; padding is derived.
+//! Version 2 uses flag bit 31 for replicated pages and bit 30 for a replicated row.
+//! Version 3 permits both replicated and ordinary records. The bytes after
+//! the last rank entry are zero. A geometry whose entries do not fit in the block is
 //! rejected. The segment offsets are derived: the page segment starts after
 //! the checksum segment and the row segment after `tail_pages` page records.
 //!
@@ -65,7 +74,11 @@ use crate::{Error, PrefixKey, Result};
 use crate::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
+const LEGACY_VERSION: u32 = 1;
+const LEGACY_REPLICATED_VERSION: u32 = 2;
+const REPLICATED: u32 = 1 << 31;
+const REPLICATED_ROW: u32 = 1 << 30;
 pub const HEADER_BYTES: usize = BLOCK_BYTES as usize;
 pub const EXTENSION: &str = "ckpt";
 const SUFFIX: &str = ".ckpt";
@@ -88,13 +101,22 @@ impl RankSizes {
         padded(self.row_bytes)
     }
 
-    fn encoded_bytes(&self) -> usize {
-        4 + 8 * self.planes.len() + 8
+    fn encoded_bytes(&self, version: u32) -> usize {
+        let plane_bytes = if version == VERSION { 4 } else { 8 };
+        4 + plane_bytes * self.planes.len() + 8
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Replication {
+    pub pages: bool,
+    pub row: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Header {
+    /// Encoding version retained across legacy read/rewrite cycles; not semantic identity.
+    version: u32,
     pub identity: [u8; 32],
     pub fingerprint: [u8; 16],
     pub flags: u32,
@@ -110,6 +132,26 @@ pub struct Header {
     /// Seconds since the Unix epoch.
     pub created: u64,
 }
+
+impl PartialEq for Header {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.fingerprint == other.fingerprint
+            && self.flags == other.flags
+            && self.key == other.key
+            && self.parent == other.parent
+            && self.bucket == other.bucket
+            && self.page_tokens == other.page_tokens
+            && self.tail_pages == other.tail_pages
+            && self.ranks == other.ranks
+            && self.page_segment == other.page_segment
+            && self.row_segment == other.row_segment
+            && self.row_checksum == other.row_checksum
+            && self.created == other.created
+    }
+}
+
+impl Eq for Header {}
 
 impl Header {
     /// A header for a record under `layout`, with segment offsets derived from
@@ -155,6 +197,7 @@ impl Header {
         created: u64,
     ) -> Result<Self> {
         let mut header = Self {
+            version: Self::version_for_sizes(&ranks),
             identity,
             fingerprint,
             flags: 0,
@@ -177,11 +220,43 @@ impl Header {
     }
 
     pub fn encode(&self) -> Result<[u8; HEADER_BYTES]> {
-        self.validate()?;
+        let version = if self.version == VERSION {
+            VERSION
+        } else if self.replicated() {
+            LEGACY_REPLICATED_VERSION
+        } else {
+            LEGACY_VERSION
+        };
+        self.encode_version(version)
+    }
+
+    fn version_for_sizes(ranks: &[RankSizes]) -> u32 {
+        if ranks
+            .iter()
+            .any(|rank| rank.planes.iter().any(|size| *size > u64::from(u32::MAX)))
+        {
+            LEGACY_VERSION
+        } else {
+            VERSION
+        }
+    }
+
+    /// Equal header fields yield equal bytes regardless of the source file version.
+    pub(crate) fn canonical_encoding(&self) -> Result<[u8; HEADER_BYTES]> {
+        let version = Self::version_for_sizes(&self.ranks);
+        self.encode_version(if version == LEGACY_VERSION && self.replicated() {
+            LEGACY_REPLICATED_VERSION
+        } else {
+            version
+        })
+    }
+
+    fn encode_version(&self, version: u32) -> Result<[u8; HEADER_BYTES]> {
+        self.validate_version(version)?;
         let mut bytes = [0u8; HEADER_BYTES];
         let mut cursor = Cursor::new(&mut bytes);
         cursor.put(&MAGIC);
-        cursor.put(&VERSION.to_le_bytes());
+        cursor.put(&version.to_le_bytes());
         cursor.put(&self.flags.to_le_bytes());
         cursor.put(&self.identity);
         cursor.put(&self.fingerprint);
@@ -205,11 +280,21 @@ impl Header {
         for rank in &self.ranks {
             cursor.put(&(rank.planes.len() as u32).to_le_bytes());
             for size in &rank.planes {
-                cursor.put(&size.to_le_bytes());
+                if version == VERSION {
+                    cursor.put(&(*size as u32).to_le_bytes());
+                } else {
+                    cursor.put(&size.to_le_bytes());
+                }
             }
             cursor.put(&rank.row_bytes.to_le_bytes());
         }
         Ok(bytes)
+    }
+
+    #[cfg(test)]
+    fn encode_legacy_for_test(&self, version: u32) -> Result<[u8; HEADER_BYTES]> {
+        assert_ne!(version, VERSION);
+        self.encode_version(version)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -224,9 +309,9 @@ impl Header {
             return Err(invalid("record header magic is not FLARECKP"));
         }
         let version = cursor.u32("version")?;
-        if version != VERSION {
+        if ![LEGACY_VERSION, LEGACY_REPLICATED_VERSION, VERSION].contains(&version) {
             return Err(invalid(format!(
-                "record header version {version} is not the supported version {VERSION}"
+                "record header version {version} is unsupported; expected 1, 2, or 3"
             )));
         }
         let flags = cursor.u32("flags")?;
@@ -263,7 +348,11 @@ impl Header {
             let plane_count = cursor.u32("plane count")?;
             let mut planes = Vec::new();
             for _ in 0..plane_count {
-                planes.push(cursor.u64("plane size")?);
+                planes.push(if version == VERSION {
+                    u64::from(cursor.u32("plane size")?)
+                } else {
+                    cursor.u64("plane size")?
+                });
             }
             let row_bytes = cursor.u64("row size")?;
             if planes.is_empty() {
@@ -274,6 +363,7 @@ impl Header {
             ranks.push(RankSizes { planes, row_bytes });
         }
         let header = Self {
+            version,
             identity,
             fingerprint,
             flags,
@@ -288,8 +378,57 @@ impl Header {
             row_checksum,
             created,
         };
-        header.validate()?;
+        if (version == LEGACY_VERSION && header.replicated())
+            || (version == LEGACY_REPLICATED_VERSION && !header.replicated())
+        {
+            return Err(invalid("record version disagrees with replication flags"));
+        }
+        header.validate_version(version)?;
         Ok(header)
+    }
+
+    pub fn replicated(&self) -> bool {
+        self.replication() != Replication::default()
+    }
+
+    pub fn replication(&self) -> Replication {
+        Replication {
+            pages: self.flags & REPLICATED != 0,
+            row: self.flags & REPLICATED_ROW != 0,
+        }
+    }
+
+    pub fn set_replication(&mut self, replication: Replication) -> Result<()> {
+        self.flags = (self.flags & !(REPLICATED | REPLICATED_ROW))
+            | (u32::from(replication.pages) * REPLICATED)
+            | (u32::from(replication.row) * REPLICATED_ROW);
+        if self.version != VERSION {
+            self.version = if self.replicated() {
+                LEGACY_REPLICATED_VERSION
+            } else {
+                LEGACY_VERSION
+            };
+        }
+        let derived = self.derive()?;
+        self.page_segment = derived.page_segment;
+        self.row_segment = derived.row_segment;
+        Ok(())
+    }
+
+    pub fn stored_page_bytes(&self) -> u64 {
+        if self.replication().pages {
+            self.ranks[0].page_record_bytes()
+        } else {
+            self.page_record_bytes()
+        }
+    }
+
+    pub fn stored_row_bytes(&self) -> u64 {
+        if self.replication().row {
+            self.ranks[0].row_record_bytes()
+        } else {
+            self.row_record_bytes()
+        }
     }
 
     /// Every field agrees with the layout rules: nonzero sizes, a key that
@@ -298,10 +437,25 @@ impl Header {
     /// computed with overflow checks here, so the unchecked size accessors are
     /// safe on any header `new` or `decode` returned.
     fn validate(&self) -> Result<()> {
+        self.validate_version(self.version)
+    }
+
+    fn validate_version(&self, version: u32) -> Result<()> {
         if self.ranks.is_empty() {
             return Err(invalid("record header rank count is zero"));
         }
-        let entry_bytes: usize = self.ranks.iter().map(RankSizes::encoded_bytes).sum();
+        if self.ranks.iter().any(|r| {
+            (self.replication().pages && r.planes != self.ranks[0].planes)
+                || (self.replication().row && r.row_bytes != self.ranks[0].row_bytes)
+        }) {
+            return Err(invalid("record replication disagrees with rank sizes"));
+        }
+        if version == VERSION
+            && self.ranks.iter().any(|rank| rank.planes.iter().any(|size| *size > u32::MAX as u64))
+        {
+            return Err(invalid("record header plane size does not fit the version 3 u32 encoding"));
+        }
+        let entry_bytes: usize = self.ranks.iter().map(|rank| rank.encoded_bytes(version)).sum();
         if FIXED_FIELD_BYTES + entry_bytes > HEADER_BYTES {
             return Err(invalid(format!(
                 "record header for {} ranks and {} planes needs {} bytes, more than the \
@@ -398,6 +552,8 @@ impl Header {
                     ))
                 })?;
         }
+        let page_record_bytes = self.stored_page_bytes();
+        let row_record_bytes = self.stored_row_bytes();
         let page_segment = self.checksum_segment() + self.checksum_bytes();
         let row_segment = (self.tail_pages as u64)
             .checked_mul(page_record_bytes)
@@ -444,11 +600,11 @@ impl Header {
 
     /// File length with or without the state row.
     pub fn length(&self, row: bool) -> u64 {
-        self.row_segment + if row { self.row_record_bytes() } else { 0 }
+        self.row_segment + if row { self.stored_row_bytes() } else { 0 }
     }
 
     pub fn length_with_row(&self) -> u64 {
-        self.row_segment + self.row_record_bytes()
+        self.row_segment + self.stored_row_bytes()
     }
 
     pub fn row_present(&self, file_length: u64) -> bool {
@@ -485,6 +641,8 @@ impl Header {
             ranks.push(RankLayout {
                 page_offset: page_record_bytes,
                 plane_offsets,
+                plane_bytes: rank.planes.clone(),
+                row_bytes: rank.row_bytes,
                 row_offset: row_record_bytes,
             });
             page_record_bytes += offset;
@@ -800,12 +958,14 @@ pub fn scan(
     }
     loop {
         let keys: HashSet<PrefixKey> = records.iter().map(|record| record.header.key).collect();
+        let parents: HashSet<PrefixKey> = records.iter().filter_map(|r| r.header.parent).collect();
         let (kept, orphans): (Vec<Scanned>, Vec<Scanned>) =
             records.into_iter().partition(|record| {
-                record
-                    .header
-                    .parent
-                    .is_none_or(|parent| keys.contains(&parent))
+                (record.row || parents.contains(&record.header.key))
+                    && record
+                        .header
+                        .parent
+                        .is_none_or(|parent| keys.contains(&parent))
             });
         records = kept;
         if orphans.is_empty() {
@@ -897,6 +1057,92 @@ fn remove(path: &Path) -> Result<()> {
 pub fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
     let message = message.into();
     Error::caused_by(format!("{message}: {error}"), error)
+}
+
+/// Hash scattered row bytes in persisted record order. The caller retains every piece.
+pub(crate) fn row_checksum(layout: &Layout, slots: &[usize]) -> u64 {
+    checksum_pieces(crate::slab::row_pieces(layout, slots).map(|(a, _, n)| (a, n)))
+}
+
+/// Copy rank zero's padded row into the target layout in the same owned slots.
+pub(crate) fn copy_row(layout: &Layout, slots: &[usize], target: &Layout) {
+    let share = layout.page_share(0) as usize;
+    for (rank, part) in target.ranks.iter().enumerate() {
+        let stride = target.page_share(rank) as usize;
+        for offset in (0..layout.row_share(0) as usize).step_by(BLOCK_BYTES as usize) {
+            let from = slots[offset / share] + offset % share;
+            let to = slots[offset / stride] + part.page_offset as usize + offset % stride;
+            // SAFETY: The caller owns both complete blocks; packing moves backwards.
+            unsafe { std::ptr::copy(from as *const u8, to as *mut u8, BLOCK_BYTES as usize) };
+        }
+    }
+}
+
+/// Compare only live unit bytes; padding in reused slots is unspecified.
+/// The caller owns CPU-readable buffers through this comparison.
+pub(crate) fn identical(layout: &Layout, pages: &[usize], row: Option<&[usize]>) -> Replication {
+    let first = &layout.ranks[0];
+    let equal = |a, b, n| {
+        // SAFETY: Both unit ranges belong to the caller's pinned record buffers.
+        unsafe {
+            std::slice::from_raw_parts(a as *const u8, n)
+                == std::slice::from_raw_parts(b as *const u8, n)
+        }
+    };
+    let mut same = Replication {
+        pages: layout.ranks.len() > 1 && !pages.is_empty(),
+        row: layout.ranks.len() > 1 && row.is_some(),
+    };
+    for (i, rank) in layout.ranks.iter().enumerate().skip(1) {
+        if same.pages {
+            same.pages = rank.plane_bytes == first.plane_bytes
+                && pages.iter().all(|address| {
+                    first
+                        .plane_offsets
+                        .iter()
+                        .zip(&first.plane_bytes)
+                        .all(|(offset, n)| {
+                            equal(
+                                *address + *offset as usize,
+                                *address + (rank.page_offset + offset) as usize,
+                                *n as usize,
+                            )
+                        })
+                });
+        }
+        if let Some(slots) = row.filter(|_| same.row) {
+            let a = layout.page_share(0) as usize;
+            let b = layout.page_share(i) as usize;
+            same.row = rank.row_bytes == first.row_bytes
+                && (0..first.row_bytes as usize)
+                    .step_by(BLOCK_BYTES as usize)
+                    .all(|offset| {
+                        equal(
+                            slots[offset / a] + offset % a,
+                            slots[offset / b] + rank.page_offset as usize + offset % b,
+                            (first.row_bytes as usize - offset).min(BLOCK_BYTES as usize),
+                        )
+                    });
+        }
+    }
+    same
+}
+
+pub(crate) fn checksum_pieces(pieces: impl IntoIterator<Item = (usize, usize)>) -> u64 {
+    use std::hash::Hasher;
+    let mut hash = twox_hash::XxHash3_64::new();
+    for (address, length) in pieces {
+        // SAFETY: Callers pin these CPU-readable pieces until this pass completes.
+        hash.write(unsafe { std::slice::from_raw_parts(address as *const u8, length) });
+    }
+    hash.finish()
+}
+
+pub(crate) fn replicated_row_layout(layout: &Layout) -> Layout {
+    let mut packed = layout.clone();
+    packed.ranks.truncate(1);
+    packed.row_record_bytes = layout.row_share(0);
+    packed
 }
 
 /// 64-bit xxh3 over `bytes`.
@@ -997,6 +1243,148 @@ mod tests {
     }
 
     #[test]
+    fn compact_v3_supports_sixteen_ranks_and_reads_legacy_headers() {
+        let ranks = (0..16)
+            .map(|_| RankSizes {
+                planes: vec![4096; 48],
+                row_bytes: 4096,
+            })
+            .collect::<Vec<_>>();
+        let compact = Header::from_sizes(
+            2048,
+            ranks,
+            IDENTITY,
+            FINGERPRINT,
+            key(640, 1),
+            Some(key(100, 2)),
+            [0; 16],
+            0,
+            0,
+        )
+        .unwrap();
+        let encoded = compact.encode().unwrap();
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), VERSION);
+        assert_eq!(Header::decode(&encoded).unwrap(), compact);
+        assert!(
+            compact
+                .encode_legacy_for_test(LEGACY_VERSION)
+                .unwrap_err()
+                .to_string()
+                .contains("6513")
+        );
+
+        let small = Header::from_sizes(
+            2048,
+            compact.ranks[..1].to_vec(),
+            IDENTITY,
+            FINGERPRINT,
+            key(640, 1),
+            Some(key(100, 2)),
+            [0; 16],
+            0,
+            0,
+        )
+        .unwrap();
+        let legacy = small.encode_legacy_for_test(LEGACY_VERSION).unwrap();
+        assert_eq!(Header::decode(&legacy).unwrap(), small);
+        let mut replicated = small.clone();
+        replicated
+            .set_replication(Replication {
+                pages: true,
+                row: false,
+            })
+            .unwrap();
+        let legacy_replicated = replicated
+            .encode_legacy_for_test(LEGACY_REPLICATED_VERSION)
+            .unwrap();
+        assert_eq!(Header::decode(&legacy_replicated).unwrap(), replicated);
+
+        let mut oversized = compact.clone();
+        oversized.ranks[0].planes[0] = u64::MAX;
+        assert!(oversized.encode().unwrap_err().to_string().contains("u32"));
+    }
+
+    #[test]
+    fn legacy_wide_planes_preserve_layout_and_encoded_bytes() {
+        let wide_plane = u64::from(u32::MAX) + 1;
+        for (version, replication) in [
+            (LEGACY_VERSION, Replication::default()),
+            (
+                LEGACY_REPLICATED_VERSION,
+                Replication { pages: true, row: true },
+            ),
+        ] {
+            let mut header = Header::from_sizes(
+                64,
+                vec![RankSizes { planes: vec![4096], row_bytes: 4096 }; 2],
+                IDENTITY,
+                FINGERPRINT,
+                key(64, 1),
+                None,
+                [0; 16],
+                1,
+                0,
+            )
+            .unwrap();
+            for rank in &mut header.ranks {
+                rank.planes[0] = wide_plane;
+            }
+            header.set_replication(replication).unwrap();
+            let bytes = header.encode_legacy_for_test(version).unwrap();
+
+            let decoded = Header::decode(&bytes).unwrap();
+
+            assert_eq!(decoded.encode().unwrap(), bytes);
+            let layout = decoded.layout().unwrap();
+            assert_eq!(layout.page_record_bytes, wide_plane * 2);
+            assert_eq!(layout.ranks[0].plane_bytes, [wide_plane]);
+            assert_eq!(layout.ranks[1].page_offset, wide_plane);
+            assert_eq!(decoded.replication(), replication);
+        }
+    }
+
+    #[test]
+    fn fresh_wide_planes_use_a_lossless_legacy_encoding() {
+        let wide_plane = u64::from(u32::MAX) + 1;
+        let header = Header::from_sizes(
+            64,
+            vec![RankSizes { planes: vec![wide_plane], row_bytes: 4096 }],
+            IDENTITY,
+            FINGERPRINT,
+            key(64, 1),
+            None,
+            [0; 16],
+            1,
+            0,
+        )
+        .unwrap();
+        let bytes = header.encode().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), LEGACY_VERSION);
+        let decoded = Header::decode(&bytes).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(decoded.layout().unwrap().page_record_bytes, wide_plane);
+    }
+
+    #[test]
+    fn legacy_public_replication_flags_select_a_decodable_encoding() {
+        let header = header(&geometries().remove(0), 64, None);
+        let original = header.encode_legacy_for_test(LEGACY_VERSION).unwrap();
+        let mut decoded = Header::decode(&original).unwrap();
+        decoded.flags |= REPLICATED_ROW;
+        let replicated = decoded.encode().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(replicated[8..12].try_into().unwrap()),
+            LEGACY_REPLICATED_VERSION,
+        );
+        decoded = Header::decode(&replicated).unwrap();
+        assert_eq!(decoded.encode().unwrap(), replicated);
+        decoded.flags &= !REPLICATED_ROW;
+        assert_eq!(decoded.encode().unwrap(), original);
+        assert_eq!(Header::decode(&decoded.encode().unwrap()).unwrap(), header);
+    }
+
+    #[test]
     fn row_presence_follows_the_file_length() {
         let geometry = geometries().remove(0);
         let paged = header(&geometry, 64 * 3, None);
@@ -1046,7 +1434,7 @@ mod tests {
             Header::decode(&bytes).unwrap_err().to_string()
         };
         assert!(corrupt(0, b'X').contains("magic"));
-        assert!(corrupt(8, 2).contains("version"));
+        assert!(corrupt(8, 4).contains("version"));
         assert!(corrupt(88, 2).contains("parent presence"));
         assert!(corrupt(142, 0).contains("page segment"));
         assert!(corrupt(150, 0).contains("row segment"));
@@ -1065,7 +1453,7 @@ mod tests {
         let mut wide = header.clone();
         wide.ranks = vec![
             RankSizes {
-                planes: vec![4096; 500],
+                planes: vec![4096; 2000],
                 row_bytes: 4096,
             };
             1
@@ -1079,7 +1467,7 @@ mod tests {
         let mut too_many = header.clone();
         too_many.ranks = vec![
             RankSizes {
-                planes: vec![4096; 100],
+                planes: vec![4096; 200],
                 row_bytes: 4096,
             };
             5
@@ -1131,7 +1519,7 @@ mod tests {
         let geometry = geometries().remove(0);
         let header = header(&geometry, 640, Some(100));
         assert_eq!(header.tail_pages, 9);
-        let encoded = header.encode().unwrap();
+        let encoded = header.encode_legacy_for_test(LEGACY_VERSION).unwrap();
         let patched = |fields: &[(usize, u64)]| {
             let mut bytes = encoded;
             for (offset, value) in fields {
@@ -1255,7 +1643,7 @@ mod tests {
         )
         .unwrap();
 
-        let lock = DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
@@ -1270,13 +1658,13 @@ mod tests {
             )
         };
         keep(&root);
-        keep(&child);
         let compacted = write_record(
             &directory,
-            &grandchild,
-            &file_name(&grandchild.key),
-            grandchild.row_segment,
+            &child,
+            &file_name(&child.key),
+            child.row_segment,
         );
+        keep(&grandchild);
         keep(&sibling);
         let deleted = vec![
             keep(&orphan),
@@ -1301,7 +1689,9 @@ mod tests {
             directory.join(file_name(&key(290, 29))),
         ];
         fs::write(&deleted[8], b"not a record").unwrap();
-        let mut overflowing = header(&geometry, 290, None).encode().unwrap();
+        let mut overflowing = header(&geometry, 290, None)
+            .encode_legacy_for_test(LEGACY_VERSION)
+            .unwrap();
         overflowing[PLANE_0..PLANE_0 + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         fs::write(&deleted[9], overflowing).unwrap();
         let foreign = directory.join("README");
@@ -1324,9 +1714,9 @@ mod tests {
         assert_eq!(records[0].header, root);
         assert!(records[0].row);
         assert_eq!(records[0].bytes, root.length_with_row());
-        assert!(!records[3].row);
-        assert_eq!(records[3].path, compacted);
-        assert_eq!(records[3].bytes, grandchild.row_segment);
+        assert!(!records[2].row);
+        assert_eq!(records[2].path, compacted);
+        assert_eq!(records[2].bytes, child.row_segment);
         for path in &deleted {
             assert!(!path.exists(), "{} survived", path.display());
         }
@@ -1370,8 +1760,8 @@ mod tests {
             vec![
                 (root.key, None, 3, true, 2),
                 (sibling.key, Some(root.key), 2, true, 0),
-                (child.key, Some(root.key), 3, true, 1),
-                (grandchild.key, Some(child.key), 3, false, 0),
+                (child.key, Some(root.key), 3, false, 1),
+                (grandchild.key, Some(child.key), 3, true, 0),
             ]
         );
 
@@ -1386,9 +1776,52 @@ mod tests {
 
         let file = directory.join("file");
         fs::write(&file, b"").unwrap();
-        assert!(DirectoryLock::acquire(&file).is_err());
+        assert!(crate::testing::directory_lock(&file).is_err());
         drop(lock);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn scan_prunes_page_only_leaves_left_by_an_incomplete_spill_chain() {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-record-page-only-leaves-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let lock = crate::testing::directory_lock(&directory).unwrap();
+        let geometry = geometries().remove(0);
+        let root = header(&geometry, 64, None);
+        write_record(
+            &directory,
+            &root,
+            &file_name(&root.key),
+            root.length_with_row(),
+        );
+        let dead = [
+            header(&geometry, 128, Some(64)),
+            header(&geometry, 192, Some(128)),
+            header(&geometry, 256, None),
+        ]
+        .map(|header| {
+            write_record(
+                &directory,
+                &header,
+                &file_name(&header.key),
+                header.row_segment,
+            )
+        });
+        let records = scan(
+            &lock,
+            &IDENTITY,
+            &FINGERPRINT,
+            geometry[0].page_tokens,
+            &rank_sizes(&geometry),
+        )
+        .unwrap();
+        assert_eq!(names(&records), [file_name(&root.key)]);
+        assert!(dead.iter().all(|path| !path.exists()));
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1406,7 +1839,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let lock = DirectoryLock::acquire(&directory).unwrap();
+        let lock = crate::testing::directory_lock(&directory).unwrap();
         let geometry = geometries().remove(0);
         let root = header(&geometry, 200, None);
         let path = write_record(
@@ -1437,7 +1870,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         let geometry = geometries().remove(0);
-        let owner = DirectoryLock::acquire(&directory).unwrap();
+        let owner = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&owner, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
@@ -1446,15 +1879,17 @@ mod tests {
         let temporary = directory.join(temporary_name(&key(200, 17)));
         fs::write(&temporary, b"pending record").unwrap();
 
-        let error = DirectoryLock::acquire(&directory).unwrap_err().to_string();
+        let error = crate::testing::directory_lock(&directory)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already in use"), "{error}");
         assert!(error.contains(directory.to_str().unwrap()), "{error}");
         assert_eq!(fs::read(&temporary).unwrap(), b"pending record");
         let alias = directory.join(".");
-        assert!(DirectoryLock::acquire(&alias).is_err());
+        assert!(crate::testing::directory_lock(&alias).is_err());
 
         drop(owner);
-        let next = DirectoryLock::acquire(&directory).unwrap();
+        let next = crate::testing::directory_lock(&directory).unwrap();
         assert!(
             scan(&next, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
@@ -1463,5 +1898,55 @@ mod tests {
         assert!(!temporary.exists());
         drop(next);
         fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn replication_header_preserves_geometry_and_old_records() {
+        let geometry = vec![geometry(64, &[("kv", 4096)], 12288); 4];
+        let mut h = header(&geometry, 640, None);
+        let old = h.clone();
+        h.set_replication(Replication {
+            pages: true,
+            row: true,
+        })
+        .unwrap();
+        assert_eq!(h.layout().unwrap(), old.layout().unwrap());
+        assert_eq!(h.fingerprint, old.fingerprint);
+        assert_eq!(Header::decode(&h.encode().unwrap()).unwrap(), h);
+        assert_eq!(h.stored_page_bytes(), 4096);
+        assert_eq!(h.row_segment, h.page_segment + 10 * 4096);
+        assert_eq!(h.stored_row_bytes(), 12288);
+        assert_eq!(Header::decode(&old.encode().unwrap()).unwrap(), old);
+        h.ranks[1].planes[0] += BLOCK_BYTES;
+        assert!(h.encode().is_err());
+    }
+    #[test]
+    fn comparison_handles_unequal_page_strides_and_partial_row_pieces() {
+        let geometry = [
+            geometry(64, &[("kv", 4095)], 10001),
+            geometry(64, &[("kv", 8000)], 10001),
+        ];
+        let layout = Layout::new(&geometry).unwrap();
+        let pool =
+            crate::slab::SlabPool::new(layout.page_record_bytes, layout.row_slots(), 0).unwrap();
+        let slots = pool.allocate(layout.row_slots()).unwrap();
+        let addresses = pool.addresses(&slots);
+        for (address, offset, n) in crate::slab::row_pieces(&layout, &addresses) {
+            let local = offset % layout.row_share(0);
+            let n = n.min(10001usize.saturating_sub(local as usize));
+            // SAFETY: The test owns these mapped row pieces and retains them through comparison.
+            for (i, byte) in unsafe { std::slice::from_raw_parts_mut(address as *mut u8, n) }
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (local as usize + i) as u8;
+            }
+        }
+        assert!(identical(&layout, &[], Some(&addresses)).row);
+        // SAFETY: This is the last live byte of rank one's owned row, in its second piece.
+        unsafe {
+            *((addresses[1] + layout.ranks[1].page_offset as usize + 1808) as *mut u8) ^= 1;
+        }
+        assert!(!identical(&layout, &[], Some(&addresses)).row);
+        pool.release(slots);
     }
 }

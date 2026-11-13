@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared b12x reductions and gathers embedded in compiled CUDA graphs.
 
 Ranks on one host communicate through b12x PCIe runtimes; ranks on separate
@@ -97,7 +101,7 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return PreparedCall(run=lambda: state.all_reduce(source, out=output), output=output,
-                                    owners=(runtime, source, output))
+                                    owners=(runtime,))
         elif isinstance(runtime, pcie.DmaAllReduce):
             # Copy-engine ring for prefill-sized activations.
             from b12x.comm.pcie._dma_preparation import query_from_metadata
@@ -108,7 +112,7 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return PreparedCall(run=lambda: state.run(source, out=output), output=output,
-                                    owners=(runtime, source, output))
+                                    owners=(runtime,))
         elif runtime.algorithm == "hierarchical":
             from b12x.comm.pcie._owner_preparation import prepared_call
 
@@ -139,10 +143,15 @@ class PreparedAllReduce:
                              inplace=source.data_ptr() == output.data_ptr())
                 self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
                 self.runtime_cache_policy = ladder["cache_policy"]
-                # One active CTA is legal at every payload; runtime selects from the supplied profiles.
+                cluster_size = row.get("cluster_size", 1)
+                mode, active = self.runtime_profiles[0]
+                # Phased modes need a complete cluster, so use a declared clustered profile.
+                initial_active = active if cluster_size > 1 else 1
                 plan_options = dict(joint_only=True, override=CollectiveConfig(
                     implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
-                    submode=self.runtime_profiles[0][0], active_blocks=1))
+                    submode=mode, active_blocks=initial_active))
+                if cluster_size > 1:
+                    plan_options["joint_cluster_size"] = cluster_size
             self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
 
@@ -153,7 +162,7 @@ class PreparedAllReduce:
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
                 return PreparedCall(run=lambda: state.run_plain(source, output),
-                                    output=output, owners=(runtime, source, output))
+                                    output=output, owners=(runtime,))
 
         ranks = tuple(dist.get_process_group_ranks(group))
         request = self.plan.request(name=name, prepare_call=prepare,
@@ -165,12 +174,24 @@ class PreparedAllReduce:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source):
+    def functional(self, *, session):
+        """Allocate the reduction destination inside the traced forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
-            self.output.copy_(source)
-            return self.output
-        _all_reduce(source, self.output, self.handle)
-        return self.output
+            output.copy_(source)
+        else:
+            _all_reduce(source, output, self.handle)
+        return output
 
 
 class PreparedChunkedAllGather:
@@ -189,16 +210,33 @@ class PreparedChunkedAllGather:
                       for index, (begin, end) in enumerate(self.bounds)]
         self.output = output
 
+    def functional(self, *, session):
+        """Allocate one destination shared by the ordered row chunks."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            for part in self.parts:
+                part.functional(session=session)
+        return self
+
     def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part(source[begin:end])
-        return self.output
+            part(source[begin:end], output[begin:end])
+        return output
 
     def run_eager(self, source):
         """Gather on the current stream from inside another eager operation."""
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part.run_eager(source[begin:end])
-        return self.output
+            part.run_eager(source[begin:end], output[begin:end])
+        return output
 
 
 class PreparedChunkedAllReduce:
@@ -231,10 +269,23 @@ class PreparedChunkedAllReduce:
                       for index, (begin, end) in enumerate(self.bounds)]
         self.output = output
 
+    def functional(self, *, session):
+        """Allocate one destination shared by the ordered row chunks."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            for part in self.parts:
+                part.functional(session=session)
+        return self
+
     def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part(source[begin:end])
-        return self.output
+            part(source[begin:end], output[begin:end])
+        return output
 
 
 @dataclass(frozen=True)
@@ -327,10 +378,20 @@ class PreparedAllReduceRMSNorm:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_rmsnorm(source, residual, self.weight, self.output, self.handle, self.input_addend,
-                           self.group_weights, self.group_ids)
-        return self.output
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = self.residual = self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=source.device)
+        else:
+            input_addend, group_weights, group_ids = self.input_addend, self.group_weights, self.group_ids
+        _all_reduce_rmsnorm(source, residual, self.weight, output, self.handle, input_addend,
+                           group_weights, group_ids)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_all_reduce_add", mutates_args=("residual",))
@@ -380,8 +441,16 @@ class PreparedAllReduceAdd:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_add(source, residual, self.handle, self.input_addend, self.group_weights, self.group_ids)
+    def functional(self, *, session):
+        self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        _all_reduce_add(source, residual, self.handle,
+                        self.input_addend if input_addend is None else input_addend,
+                        self.group_weights if group_weights is None else group_weights,
+                        self.group_ids if group_ids is None else group_ids)
+        return residual
 
 
 def _gather_transport_view(tensor):
@@ -392,6 +461,8 @@ def _gather_transport_view(tensor):
 def _gather_columns(source, output, handle):
     source, output = _gather_transport_view(source), _gather_transport_view(output)
     owner = _OWNERS[handle]
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
     runtime = owner.runtime
     if owner.roce:
         runtime.all_gather(source, dim=-1, out=output, plan=owner.plan)
@@ -403,15 +474,91 @@ def _gather_columns(source, output, handle):
 
 
 @torch.library.custom_op("flare::pcie_all_gather", mutates_args=("output",))
-def _all_gather(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+def _all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor], handle: int) -> None:
     _gather_columns(source, output, handle)
 
 
 @_all_gather.register_fake
-def _fake_all_gather(source, output, handle):
+def _fake_all_gather(source, output, dependencies, handle):
     pass
 
 
+@torch.library.custom_op("flare::start_all_gather", mutates_args=("output",))
+def _start_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                      handle: int, stream: int) -> None:
+    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
+    with torch.cuda.stream(auxiliary):
+        _gather_columns(source, output, handle)
+
+
+@_start_all_gather.register_fake
+def _fake_start_all_gather(source, output, dependencies, handle, stream):
+    pass
+
+
+@torch.library.custom_op("flare::join_all_gather", mutates_args=("output",))
+def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                     dependency: torch.Tensor, stream: int) -> None:
+    torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
+
+
+@_join_all_gather.register_fake
+def _fake_join_all_gather(source, output, dependencies, dependency, stream):
+    pass
+
+
+@dataclass(frozen=True)
+class PendingAllGather:
+    source: torch.Tensor
+    output: torch.Tensor
+    dependencies: list[torch.Tensor]
+
+
+class ConcurrentAllGather:
+    """Overlap a prepared PCIe gather with local work, joining before channel reuse.
+
+    The join retains the source through its asynchronous read and follows a local
+    output dependency. A subsequent collective must read the joined output as a
+    dependency, keeping communication serialized through compilation.
+    """
+
+    def __init__(self, gather, *, workspace, session, parallel_plans):
+        from ignition.preparation.scratch import ScratchArena
+
+        plans = tuple(parallel_plans)
+        if gather.single or gather.roce:
+            raise ValueError("concurrent column gather requires a prepared PCIe channel")
+        if not isinstance(workspace, ScratchArena) or not workspace.overlap or not plans:
+            raise ValueError("concurrent column gather requires an overlap arena and local plans")
+        self.gather = gather
+        self.stream = workspace.auxiliary_stream
+        self.stream_handle = self.stream.cuda_stream
+        for plan in plans:
+            workspace.register_parallel(gather.plan, plan)
+        register_finalizer(session, self.validate_scratch)
+
+    def validate_scratch(self):
+        # PCIe gather scratch belongs to its persistent channel, outside the shared arena.
+        if self.gather.plan.memory_requirements().scratch_nbytes:
+            raise ValueError("concurrent column gather requires a plan without caller scratch")
+
+    def functional(self, *, session):
+        self.gather.functional(session=session)
+        return self
+
+    def start(self, source, *, dependencies=()):
+        output = self.gather.output
+        if output is None:
+            shape, stride, dtype = self.gather.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        dependencies = [*self.gather.dependencies, *dependencies]
+        _start_all_gather(source, output, dependencies, self.gather.handle, self.stream_handle)
+        return PendingAllGather(source, output, dependencies)
+
+    def finish(self, pending, dependency):
+        _join_all_gather(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+        return pending.output
 
 
 @triton.jit
@@ -521,6 +668,8 @@ class PreparedBroadcast:
     def prepare(self):
         from ignition.preparation.triton import prepare_triton
 
+        if self._byte_views is None:
+            return
         options = dict(OFFSETS=self._offsets, SIZES=self._sizes, BOOLS=self._bools, BLOCK=256, num_warps=4)
         grid = (triton.cdiv(max(self._sizes), 256), 1, 1)
         self._pack = prepare_triton(_broadcast_pack, (self._byte_views, self.send), grid, **options)
@@ -533,15 +682,33 @@ class PreparedBroadcast:
             ROW_BYTES=self._row_bytes, WORLD=self._world, BLOCK=256, num_warps=4)
             for group in self._unpack_groups)
 
-    def __call__(self):
+    def functional(self, *, session):
+        """Accept runtime payloads and allocate transport scratch in the forward."""
+        if not self.single and not hasattr(self, "send_shape"):
+            self.send_shape = tuple(self.send.shape)
+            self.gather.functional(session=session)
+            register_finalizer(session, self._release_buffers)
+        return self
+
+    def _release_buffers(self):
+        self.send = self.received = self._tensors = self._byte_views = None
+        self._pack.args = ()
+        for operation in self._unpacks:
+            operation.args = ()
+
+    def __call__(self, tensors=None):
         if self.single:
             return
-        _broadcast_pack_call(list(self._tensors), self.send, self.handle)
-        self.gather(self.send.view(torch.bfloat16))
+        tensors = self._tensors if tensors is None else tuple(tensors)
+        send = self.send
+        if send is None:
+            send = torch.zeros(self.send_shape, dtype=torch.uint8, device=tensors[0].device)
+        _broadcast_pack_call(list(tensors), send, self.handle)
+        received = self.gather(send.view(torch.bfloat16)).view(torch.uint8)
         # Aliased destinations keep their field order across separate stream-ordered launches.
         # Disjoint fields share one launch, including the ordinary sampling payload.
         for index, group in enumerate(self._unpack_groups):
-            _broadcast_unpack_call(self.received, [self._tensors[field] for field in group], self.handle, index)
+            _broadcast_unpack_call(received, [tensors[field] for field in group], self.handle, index)
 
 
 class PreparedAllGather:
@@ -549,13 +716,15 @@ class PreparedAllGather:
 
     Each output row contains rank zero's columns, then rank one's, and so on.
     Operations sharing the channel must execute serially on every rank.
+    Dependencies order storage writes before the collective publishes them to peers.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, dependencies=()):
         import torch.distributed as dist
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        self.dependencies = list(dependencies)
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -581,7 +750,7 @@ class PreparedAllGather:
             declare(session, (self.plan.request(name=name,
                 prepare_call=lambda state: PreparedCall(
                     run=lambda: runtime._run_prepared_all_gather(transport_source, prepared=state, dim=-1, out=transport_output),
-                    output=output, owners=(runtime, source, output)),
+                    output=output, owners=(runtime,)),
                 collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
             self.handle = next(_HANDLES)
             _OWNERS[self.handle] = self
@@ -599,39 +768,79 @@ class PreparedAllGather:
         call = {"local_input": transport_source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
                 "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
+        startup = False
+        if getattr(session, "collective_tuning", "static") == "runtime":
+            from dataclasses import replace
+            from b12x.preparation import FrozenMapping
+            from ignition.preparation.collective_ladder import select_gather
+
+            ladder = session.collective_ladder
+            if ladder is None:
+                raise ValueError("runtime collective tuning requires a collective ladder")
+            if ladder["all_gather"] is not None:
+                row = select_gather(ladder, source.numel() * source.element_size(),
+                    world_size=runtime.world_size, capability=torch.cuda.get_device_capability(source.device))
+                self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
+                self.runtime_cache_policy = ladder["cache_policy"]
+                query = replace(query, call=FrozenMapping(dict(query.call,
+                    gather_transport=row["implementation"].removeprefix("gather_"),
+                    threads=row["threads"], block_limit=row["blocks"],
+                    submode=self.runtime_profiles[0][0], active_blocks=1)))
+                startup = True
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(**call), output=output,
-                                                    owners=(runtime, source, output)),
+                                                    owners=(runtime,)),
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        if startup:
+            from ignition.preparation.startup_tuning import register_collective
+            register_collective(self, session)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source):
-        if self.single:
-            self.output.copy_(source)
-            return self.output
-        _all_gather(source, self.output, self.handle)
-        return self.output
+    def functional(self, *, session):
+        """Allocate the gathered destination inside the traced forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        self.dependencies = []
+        return self
 
-    def run_eager(self, source):
-        """Gather on the current stream from inside another eager operation."""
+    def __call__(self, source, output=None, *, dependencies=()):
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
-            self.output.copy_(source)
-            return self.output
-        _gather_columns(source, self.output, self.handle)
-        return self.output
+            output.copy_(source)
+        else:
+            _all_gather(source, output, [*self.dependencies, *dependencies], self.handle)
+        return output
+
+    def run_eager(self, source, output=None):
+        """Gather on the current stream from inside another eager operation."""
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        if self.single:
+            output.copy_(source)
+        else:
+            _gather_columns(source, output, self.handle)
+        return output
 
 
 @torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
-def _all_gather_varlen(counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+def _all_gather_varlen(source: torch.Tensor, counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    owner.runtime.all_gather_varlen(owner.source, counts, out=output, plan=owner.plan)
+    owner.runtime.all_gather_varlen(source, counts, out=output, plan=owner.plan)
 
 
 @_all_gather_varlen.register_fake
-def _fake_all_gather_varlen(counts, output, handle):
+def _fake_all_gather_varlen(source, counts, output, handle):
     pass
 
 
@@ -655,7 +864,8 @@ class PreparedVarlenGather:
             raise ValueError("variable-length gathers require one contiguous 16-byte-multiple row per rank")
         self.runtime, self.output, self.counts = runtime, output, counts
         # A rank's own row is its source, so the gather leaves it in place.
-        self.source = output[ranks.index(dist.get_rank())]
+        self.local_rank = ranks.index(dist.get_rank())
+        self.source = output[self.local_rank]
         self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather_varlen")
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(
@@ -665,9 +875,18 @@ class PreparedVarlenGather:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self):
-        _all_gather_varlen(self.counts, self.output, self.handle)
-        return self.output
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.source = self.counts = self.output = None
+
+    def __call__(self, output=None, counts=None):
+        output = self.output if output is None else output
+        counts = self.counts if counts is None else counts
+        _all_gather_varlen(output[self.local_rank], counts, output, self.handle)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_lse_reduce_scatter", mutates_args=("output",))
@@ -692,7 +911,8 @@ class PreparedLseReduceScatter:
     `rank` is this rank as a one-element device tensor.
     """
 
-    def __init__(self, partial, lse, output, *, runtime, session, coordinator, name, staging=None, rank=None):
+    def __init__(self, partial, lse, output, *, runtime, session, coordinator, name, staging=None, rank=None,
+                 threads=None, block_limit=None):
         import torch.distributed as dist
         from b12x.comm import pcie
 
@@ -724,7 +944,9 @@ class PreparedLseReduceScatter:
             raise ValueError("LSE reduce-scatter requires BF16 partials, FP32 LSE and a head shard of its channel")
         self.runtime, self.output = runtime, output
         call = {"partial_output": partial, "partial_lse": lse, "out": output, "is_lse_base_on_e": True}
-        query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.lse_reduce_scatter", call=call)
+        geometry = {key: value for key, value in (("threads", threads), ("block_limit", block_limit))
+                    if value is not None}
+        query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.lse_reduce_scatter", call={**call, **geometry})
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
@@ -734,55 +956,28 @@ class PreparedLseReduceScatter:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = None
+        if self.roce:
+            self.send_layout = tuple(self.send.shape), self.send.dtype
+            self.send = self.received = None
+            self.gather.functional(session=session)
+        return self
+
     def __call__(self, partial, lse):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=partial.device).zero_()
         if self.roce:
             from .head_exchange import merge, pack
 
-            pack(partial, lse, self.send, self.rank, self.world)
-            self.gather(self.send)
-            merge(self.received, partial, lse, self.output, self.rank, self.world)
-            return self.output
-        _lse_reduce_scatter(partial, lse, self.output, self.handle)
-        return self.output
-
-
-@torch.library.custom_op("flare::pcie_vocabulary_argmax", mutates_args=("out",))
-def _vocabulary_argmax(base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor, handle: int) -> None:
-    owner = _OWNERS[handle]
-    owner.runtime.fused_add_argmax(base, bias, out=out, plan=owner.plan)
-
-
-@_vocabulary_argmax.register_fake
-def _fake_vocabulary_argmax(base, bias, out, handle):
-    pass
-
-
-class PreparedVocabularyArgmax:
-    """Exact greedy tokens of BF16 vocabulary-shard logits plus a matching shard bias, without a gather.
-
-    Each rank holds contiguous vocabulary partitions; b12x's PCIe vocabulary-parallel argmax exchanges
-    every row's local maximum of the BF16-rounded sum. Every rank must run each call in the same order
-    with the same rows. Calls may pass other views with the prepared geometry, such as further rows
-    of the same base storage.
-    """
-
-    def __init__(self, base, bias, out, *, runtime, session, coordinator, name):
-        from b12x.comm.pcie import _owner_preparation
-
-        if (base.ndim != 2 or base.dtype != torch.bfloat16 or bias.shape != base.shape or bias.dtype != base.dtype
-                or base.stride(-1) != 1 or bias.stride(-1) != 1 or out.shape != (base.shape[0],)
-                or out.dtype != torch.int64 or not out.is_contiguous()
-                or base.shape[1] != runtime.local_vocab_size or not 0 < base.shape[0] <= runtime.max_batch_size):
-            raise ValueError("vocabulary argmax requires matching BF16 [rows, local vocabulary] shards and int64 rows")
-        self.runtime = runtime
-        call = dict(base=base, bias=bias, out=out)
-        self.plan = _owner_preparation.plan(_owner_preparation.query_from_runtime(runtime, call=call), runtime=runtime)
-        declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: _owner_preparation.prepared_call(state, **call),
-            collective=_owner_preparation.collective(runtime, key=name)),), coordinator=coordinator)
-        self.handle = next(_HANDLES)
-        _OWNERS[self.handle] = self
-
-    def __call__(self, base, bias, out):
-        _vocabulary_argmax(base, bias, out, self.handle)
-        return out
+            send = self.send
+            if send is None:
+                send = torch.zeros(self.send_layout[0], dtype=self.send_layout[1], device=partial.device)
+            pack(partial, lse, send, self.rank, self.world)
+            received = self.gather(send)
+            merge(received, partial, lse, output, self.rank, self.world)
+            return output
+        _lse_reduce_scatter(partial, lse, output, self.handle)
+        return output

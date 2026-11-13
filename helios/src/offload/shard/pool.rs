@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use crate::execution::RankStream;
 use flare_selene::{Result, record};
 pub use flare_selene::pool::{PoolOffer, PoolPeers};

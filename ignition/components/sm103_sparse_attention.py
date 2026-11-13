@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Sparse paged GQA over QSA-selected positions for prefill-sized row counts on SM103.
 
 QSA selection leaves each query row's original-token positions in a padded
@@ -234,7 +238,33 @@ class PreparedSparseAttention:
             return (*operands, self.output, *common, self.output.stride(0))
         return (*operands, self.partial, self.partial_lse, *common)
 
-    def __call__(self, key_cache, value_cache):
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.partial_shape = None if self.splits == 1 else (self.splits * self.output.shape[0], *self.output.shape[1:])
+        self.query = self.selected = self.block_table = self.requests = self.positions = self.output = None
+        if self.splits > 1:
+            self.partial = self.partial_lse = self.merge_args = None
+        return self
+
+    def __call__(self, key_cache, value_cache, *, query=None, selected=None, block_table=None,
+                 requests=None, positions=None):
+        if self.output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+            common = (query.stride(0), key_cache.stride(0), key_cache.stride(1), value_cache.stride(0),
+                      value_cache.stride(1), selected.stride(0), block_table.stride(0))
+            operands = (query, key_cache, value_cache, selected, block_table, requests, positions)
+            if self.splits == 1:
+                args = (*operands, output, *common, output.stride(0))
+            else:
+                partial = torch.zeros(self.partial_shape, dtype=torch.float32, device=query.device)
+                lse = torch.zeros(self.partial_shape[:-1], dtype=torch.float32, device=query.device)
+                args = (*operands, partial, lse, *common)
+            launch_triton(self._kernel(), self.compiled, args, self.grid, **self.options)
+            if self.splits > 1:
+                launch_triton(_merge_splits, self.merge, (partial, lse, output, output.stride(0)),
+                              self.merge_grid, **self.merge_options)
+            return output
         launch_triton(self._kernel(), self.compiled, self._args(key_cache, value_cache), self.grid, **self.options)
         if self.splits > 1:
             launch_triton(_merge_splits, self.merge, self.merge_args, self.merge_grid, **self.merge_options)

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Compact b12x Engram lookup behind a captured external readiness event."""
 
 from dataclasses import dataclass
@@ -70,12 +74,23 @@ class PreparedEngramLookup:
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run_lookup(binding, tokens, clear_tail=True), owners=(inputs, binding))),))
 
-    def __call__(self, source):
-        _lookup(source, self.weights, self.scales, self.hashes, self.count,
-                self.output, self.wait.timings.timestamps, self.wait.timings.frame,
-                self.wait.input, self.wait.output, self.wait.interval, self.wait.handle,
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), self.output.dtype
+        self.count = self.output = None
+        self.wait.functional(session=session)
+        return self
+
+    def __call__(self, source, count=None):
+        output = self.output
+        if output is None:
+            shape, dtype = self.output_layout
+            output = torch.zeros(shape, dtype=dtype, device=source.device)
+        barrier_input, barrier_output = self.wait.operands(source)
+        _lookup(source, self.weights, self.scales, self.hashes, self.count if count is None else count,
+                output, self.wait.timings.timestamps, self.wait.timings.frame,
+                barrier_input, barrier_output, self.wait.interval, self.wait.handle,
                 self.plan.handle, self.handle)
-        return self.output
+        return output
 
 
 class PreparedEngramRequests:
@@ -105,8 +120,21 @@ class PreparedEngramRequests:
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(binding, tokens), owners=(binding,))),))
 
-    def __call__(self):
-        hash_op(self.plan.handle, *self.args)
+    def functional(self):
+        self.mask = self.slots = self.compressed = self.requests = self.args = None
+        return self
+
+    def __call__(self, token_ids=None, starts=None, history=None, counts=None):
+        args = self.args
+        if args is None:
+            tokens, rows = token_ids.numel(), history.shape[0]
+            mask = torch.ones(tokens, dtype=torch.bool, device=token_ids.device)
+            slots = torch.arange(rows, dtype=torch.int32, device=token_ids.device)
+            compressed = torch.empty(tokens, dtype=torch.int64, device=token_ids.device)
+            requests = torch.empty(tokens, dtype=torch.int32, device=token_ids.device)
+            args = (token_ids, mask, starts, slots, history, counts[1:], counts[:1],
+                    self.hashes, compressed, requests, tokens)
+        hash_op(self.plan.handle, *args)
         if self.row_mapping is not None:
             # Preserve canonical hash geometry; remap only the storage rows of owned heads.
             start, end, destination = self.row_mapping.unbind(1)

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The I/O thread: connect, check Hello, open the session, and run the engine
 //! until the session ends; then drain and reconnect.
 
@@ -289,6 +294,9 @@ pub(crate) async fn connect(
     Unreachable,
 > {
     match &link.address {
+        #[cfg(not(unix))]
+        PoolAddress::Unix(_) => Err("Unix-socket pool addresses need a Unix host".to_string().into()),
+        #[cfg(unix)]
         PoolAddress::Unix(path) => {
             let path = path.clone();
             let channel = Endpoint::try_from("http://selene.local")

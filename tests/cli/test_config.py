@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Configuration file validation and precedence."""
 
 import pytest
@@ -14,10 +18,12 @@ def load(tmp_path, text):
 
 def test_absent_default_file_yields_built_in_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     configuration = Configuration.load()
     assert not configuration.exists and configuration.path == tmp_path / ".config/flare/config.toml"
     assert configuration.get("server.host") == Setting("127.0.0.1", "default")
     assert configuration.get("server.port") == Setting(8000, "default")
+    assert configuration.get("server.thinking_token_budget") == Setting(None, "default")
     assert configuration.reserve_bytes == 0 and configuration.model is None
     assert configuration.directory("hub_cache") == tmp_path / ".cache/huggingface/hub"
     assert configuration.directory("kernel_cache") == tmp_path / ".cache/flare/kernels"
@@ -29,11 +35,39 @@ def test_an_explicit_missing_file_is_a_usage_error(tmp_path):
         Configuration.load(tmp_path / "absent.toml")
 
 
+def test_core_cache_accepts_legacy_setting_without_moving_files(tmp_path):
+    cache = tmp_path / "downloaded"
+    cache.mkdir()
+    artifact = cache / "model.safetensors"
+    artifact.write_bytes(b"retained model")
+    configuration = load(tmp_path, f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    assert configuration.directory("core_cache") == cache
+    assert artifact.read_bytes() == b"retained model"
+    with pytest.raises(UsageError, match="use only core_cache"):
+        load(tmp_path, '[paths]\ncore_cache = "one"\npackage_cache = "two"\n')
+
+
+def test_core_cache_defaults_find_existing_downloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    configuration = Configuration.load()
+    canonical = tmp_path / ".cache/flare/cores"
+    legacy = canonical.with_name("packages")
+    assert configuration.directory("core_cache") == canonical
+    legacy.mkdir(parents=True)
+    assert configuration.directory("core_cache") == legacy
+    canonical.mkdir()
+    assert configuration.directory("core_cache") == canonical
+    explicit = load(tmp_path, '[paths]\ncore_cache = "D:/FlareCores"\n')
+    assert explicit.directory("core_cache").as_posix() == "D:/FlareCores"
+
+
 def test_flags_override_the_file_which_overrides_the_recipe(tmp_path):
     configuration = load(tmp_path, """
 [server]
 host = "0.0.0.0"
 port = 9000
+thinking_token_budget = 1536
 
 [defaults]
 model = "qwen3.8-flash"
@@ -50,6 +84,7 @@ speculative_token_capacity = 8
     assert configuration.get("server.host") == Setting("0.0.0.0", "[server]")
     assert configuration.get("server.port") == Setting(9000, "[server]")
     assert configuration.get("server.port", 7000) == Setting(7000, "flag")
+    assert configuration.get("server.thinking_token_budget") == Setting(1536, "[server]")
     assert configuration.model == "qwen3.8-flash" and configuration.reserve_bytes == 16 << 30
 
     assert configuration.max_concurrency("qwen3.8-flash", 4) == Setting(2, '[models."qwen3.8-flash"]')
@@ -69,6 +104,13 @@ def test_prefix_cache_settings_validate(tmp_path):
     for transport in ("nvme", "staged", "direct"):
         with pytest.raises(UsageError, match="disk_transport"):
             load(tmp_path, f'[prefix_cache]\ndisk_transport = "{transport}"\n')
+
+    assert configuration.get("prefix_cache.max_age") == Setting("off", "default")
+    for value in ("off", "2h", "0.5s"):
+        assert load(tmp_path, f'[prefix_cache]\nmax_age="{value}"\n').get("prefix_cache.max_age").value == value
+    for value in ("on", "0", "-1s", "NaN", "2d"):
+        with pytest.raises(UsageError, match="max_age"):
+            load(tmp_path, f'[prefix_cache]\nmax_age="{value}"\n')
 
 
 def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):
@@ -111,6 +153,12 @@ def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
     ("[engine]\npages = 4\n", "unknown section"),
     ("[server]\nport = \"8000\"\n", "port in .* must be int"),
     ("[server]\nport = 70000\n", "1 through 65535"),
+    ("[server]\nthinking_token_budget = 0\n", "positive 32-bit integer"),
+    ("[server]\nthinking_token_budget = -1\n", "positive 32-bit integer"),
+    ("[server]\nthinking_token_budget = 4294967296\n", "positive 32-bit integer"),
+    ("[server]\nthinking_token_budget = 1.5\n", "must be int"),
+    ("[server]\nthinking_token_budget = true\n", "must be int"),
+    ("[server]\nthinking_token_budget = \"1536\"\n", "must be int"),
     ("[defaults]\nmax_concurrency = true\n", "must be int"),
     ("[defaults]\nmax_concurrency = 0\n", "at least 1"),
     ("[defaults]\nspeculative_token_capacity = 0\n", "at least 1"),
@@ -190,3 +238,17 @@ def test_shutdown_drain_configuration(tmp_path, value):
 def test_invalid_shutdown_drain_configuration(tmp_path, value):
     with pytest.raises(UsageError, match="drain_on_shutdown"):
         load(tmp_path, f'[prefix_cache]\ndrain_on_shutdown = "{value}"\n')
+
+
+@pytest.mark.parametrize("value", [0, 0.05, 1])
+def test_checkpoint_extra_work_fraction_configuration(tmp_path, value):
+    key = "server.scheduler_checkpoint_extra_work_fraction"
+    configuration = load(tmp_path, f"[server]\nscheduler_checkpoint_extra_work_fraction = {value}\n")
+    assert configuration.get(key) == Setting(value, "[server]")
+    assert configuration.get(key, 0) == Setting(0, "flag")
+
+
+@pytest.mark.parametrize("value", ["-0.01", "1.01", "nan", "inf", "true", '\"0.05\"'])
+def test_checkpoint_extra_work_fraction_rejects_invalid_configuration(tmp_path, value):
+    with pytest.raises(UsageError, match="scheduler_checkpoint_extra_work_fraction"):
+        load(tmp_path, f"[server]\nscheduler_checkpoint_extra_work_fraction = {value}\n")

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Preparation and assembly of local and pooled checkpoint stores.
 pub mod sharded;
 use crate::{
@@ -12,7 +18,7 @@ pub trait CopierFactory {
         &self,
         contexts: &[(usize, i32)],
         geometry: Vec<CacheGeometry>,
-        slabs: &slab::SlabPool,
+        slots: &slab::SlabPool,
     ) -> Result<crate::SharedCopier>;
     fn unmapped(
         &self,
@@ -37,6 +43,7 @@ pub struct PrefixCacheOffload {
     pub disk_limit: Option<u64>,
     /// Zero disables shutdown persistence; MAX drains without a time limit.
     pub drain_on_shutdown: Duration,
+    pub max_age: Duration,
     /// Pool manager through which this instance shares prefix checkpoints.
     pub pool: Option<PoolOptions>,
 }
@@ -48,17 +55,11 @@ impl PrefixCacheOffload {
             || self.pool.is_some()
     }
 
-    /// Future device and host bytes, sized from the actual record layout. A registered host
-    /// pool costs each device about 2 MiB per GiB, plus transfer streams and events. Without
-    /// a disk tier the retaining pool is split by rank; disk staging is shared by all ranks.
-    pub fn headroom_bytes(&self, ranks: usize, layout: &Layout) -> Result<(u64, u64)> {
-        self.headroom_with_inputs(ranks, layout, false)
-    }
-
     pub fn headroom_with_inputs(
         &self,
         ranks: usize,
         layout: &Layout,
+        max_active: usize,
         inputs: bool,
     ) -> Result<(u64, u64)> {
         if !self.enabled() {
@@ -66,32 +67,24 @@ impl PrefixCacheOffload {
         }
         let memory = self.memory_bytes.unwrap_or(0);
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
-        let staging = if disk {
-            layout
-                .page_record_bytes
-                .checked_mul(slab::STAGING_PAGE_SLABS as u64)
-                .and_then(|n| {
-                    layout
-                        .row_record_bytes
-                        .checked_mul(slab::STAGING_ROW_SLABS as u64)
-                        .and_then(|rows| n.checked_add(rows))
-                })
-                .ok_or("prefix cache staging memory overflows the device budget")?
+        let intake = if memory != 0 || disk {
+            intake_slots(layout, max_active)
+                .min((host_pool_budget(memory)? / layout.page_record_bytes) as usize)
+                .max(intake_slots(layout, 1)) as u64
         } else {
             0
         };
+        let intake = intake
+            .checked_mul(layout.page_record_bytes)
+            .ok_or("prefix cache intake memory overflows the device budget")?;
         let host = memory
-            .checked_add(staging)
+            .checked_add(intake)
             .ok_or("prefix cache host memory overflows the device budget")?;
-        let ordinary = input_memory_bytes(memory, slab::SlabPool::minimum_bytes(layout), inputs);
-        let pinned = memory - ordinary;
-        let mapped = if disk {
-            pinned + staging
-        } else if self.pool.is_some() {
-            // Records a pool shares must be readable by the CPU, so the pool is not split.
-            pinned
+        let pinned = memory - input_memory_bytes(memory, inputs);
+        let mapped = if disk || self.pool.is_some() {
+            pinned + intake
         } else {
-            pinned.div_ceil(ranks.max(1) as u64)
+            (pinned + intake).div_ceil(ranks.max(1) as u64)
         };
         // Pool copy streams and events are fixed headroom. Hello's shared regions or
         // remote data staging are budgeted separately before sizing GPU caches.
@@ -107,6 +100,11 @@ impl PrefixCacheOffload {
         };
         Ok((tiers + pool, host))
     }
+}
+
+/// Slots for two publication bursts and two streaming windows.
+pub fn intake_slots(layout: &Layout, max_active: usize) -> usize {
+    2 * max_active * layout.row_slots() + 2 * slab::WINDOW_PAGES
 }
 
 /// Transfer streams, events, and their driver allocations on each GPU; eight streams
@@ -160,6 +158,13 @@ pub fn parse_drain_on_shutdown(text: &str) -> std::result::Result<Duration, Stri
         .ok_or_else(|| "shutdown drain must be on, off, or a positive duration such as 90s".into())
 }
 
+pub fn parse_max_age(text: &str) -> std::result::Result<Duration, String> {
+    parse_drain_on_shutdown(text)
+        .ok()
+        .filter(|d| *d != Duration::MAX && (!d.is_zero() || text.trim() == "off"))
+        .ok_or_else(|| "max age must be off or a positive duration such as 2h".into())
+}
+
 fn invalid_size(text: &str) -> String {
     format!("size {text:?} must be a number with an optional K, M, G, or T suffix, such as \"16G\"")
 }
@@ -187,7 +192,7 @@ pub struct Prepared {
     /// Each rank's CUDA context handle and local device ordinal.
     pub contexts: Vec<(usize, i32)>,
     pub memory_pool: Option<slab::SlabPool>,
-    pub staging_pool: Option<slab::SlabPool>,
+    pub warm_bytes: u64,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
@@ -195,6 +200,7 @@ pub struct Prepared {
     pub shards: Vec<crate::shard::Link>,
     pub pool: Option<pool::PreparedPool>,
     pub drain_on_shutdown: Duration,
+    pub max_age: Duration,
 }
 
 /// The loader's result: either prepared resources or the reason no store exists.
@@ -224,14 +230,15 @@ impl Preparation {
 }
 
 impl Prepared {
-    pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
-        let rows = self.memory_pool.as_ref()?.row_count();
-        let recommended = max_concurrency.saturating_mul(2);
-        (rows < recommended).then(|| {
+    pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
+        let pool = self.memory_pool.as_ref()?;
+        let required = intake_slots(&self.layout, max_concurrency);
+        (pool.intake_slots() < required).then(|| {
+            let bytes = required as u64 * self.layout.page_record_bytes;
             format!(
-                "pooled host memory has {rows} rows, fewer than twice max concurrency ({recommended}); \
-             publications may be skipped while older records wait for pool persistence; \
-             increase --prefix-cache-memory or reduce --max-concurrency"
+                "host prefix intake shrunk to {} slots to fit the host budget; \
+                 full intake at max concurrency {max_concurrency} needs {bytes} bytes ({}) of host memory",
+                pool.intake_slots(), gibibytes(bytes)
             )
         })
     }
@@ -240,10 +247,14 @@ impl Prepared {
         let mut parts = Vec::new();
         if let Some(pool) = &self.memory_pool {
             parts.push(format!(
-                "memory {} ({} pages + {} rows{})",
+                "{} {} ({} slots{})",
+                if self.warm_bytes != 0 {
+                    "memory"
+                } else {
+                    "intake"
+                },
                 gibibytes(pool.bytes()),
-                pool.page_count(),
-                pool.row_count(),
+                pool.slot_count(),
                 if pool.rank_parts().is_some() {
                     ", split by rank"
                 } else {
@@ -257,9 +268,6 @@ impl Prepared {
                 gibibytes(inputs.stats().memory_limit),
                 gibibytes(inputs.stats().staging_limit)
             ));
-        }
-        if let Some(pool) = &self.staging_pool {
-            parts.push(format!("staging {}", gibibytes(pool.bytes())));
         }
         if let Some(directory) = &self.resolved.directory {
             parts.push(format!(
@@ -349,32 +357,33 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-/// Resolve the settings against the package and host, map and register the
+/// Resolve the settings against the core and host, map and register the
 /// pools with rank zero's context current, and scan the record directory.
 /// Without a disk tier the CPU never reads a record, so the memory pool is
 /// split by rank and each device maps only its part.
 ///
-/// `package` is the package file, beside which the default record directory
+/// `core` is the core file, beside which the default record directory
 /// would be created once derived defaults are enabled.
 pub fn prepare(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     prepare_with_inputs(
-        options, package, identity, geometry, contexts, 0, None, registrar,
+        options, core, identity, geometry, contexts, 1, 0, None, registrar,
     )
 }
 
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
+    max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
     registrar: &dyn crate::HostRegistrar,
@@ -382,27 +391,19 @@ pub fn prepare_with_inputs(
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
-    let _ = package;
+    let _ = core;
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
         (Some((rank, world)), [local]) => geometry::shard_fingerprint(local, rank, world),
         (Some(_), _) => {
-            return Err("a rank process of a multi-host package holds exactly one rank".into());
+            return Err("a rank process of a multi-host core holds exactly one rank".into());
         }
     };
     let memory_bytes = options.memory_bytes.unwrap_or(0);
     if shard.is_some() && memory_bytes != 0 {
-        return Err("a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
+        return Err("a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
-    let minimum = slab::SlabPool::minimum_bytes(&layout);
-    if memory_bytes != 0 && memory_bytes < minimum {
-        return Err(format!(
-            "host prefix cache memory {memory_bytes} is below the {minimum} bytes this package needs for one outbound and one inbound window"
-        )
-        .into());
-    }
-
     let mut notes = Vec::new();
     let directory = match options
         .disk
@@ -444,29 +445,27 @@ pub fn prepare_with_inputs(
         .first()
         .ok_or("the host prefix store requires at least one rank")?
         .0;
-    let input_memory = input_memory_bytes(memory_bytes, minimum, input_staging != 0);
+    let input_memory = input_memory_bytes(memory_bytes, input_staging != 0);
     let checkpoint_memory = memory_bytes - input_memory;
-    let memory_pool = (checkpoint_memory != 0)
+    let memory_pool = (checkpoint_memory != 0 || directory.is_some())
         .then(|| {
-            // A pool shares what the CPU can read, so its memory is never split by rank.
-            if directory.is_none() && options.pool.is_none() {
-                return Ok(slab::SlabPool::sized_by_rank(
-                    &layout,
-                    checkpoint_memory,
-                    &contexts,
-                    registrar,
-                )?);
-            }
-            let mut pool = slab::SlabPool::sized(&layout, checkpoint_memory)?;
-            pool.register(registrar, context)?;
-            Ok::<_, crate::Error>(pool)
-        })
-        .transpose()?;
-    let staging_pool = directory
-        .is_some()
-        .then(|| {
-            let mut pool = slab::SlabPool::staging(&layout)?;
-            pool.register(registrar, context)?;
+            let (_, host) = options.headroom_with_inputs(
+                contexts.len(),
+                &layout,
+                max_active,
+                input_staging != 0,
+            )?;
+            let intake = ((host - memory_bytes) / layout.page_record_bytes) as usize;
+            let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
+                * layout.page_record_bytes;
+            // Shared records must be readable by the CPU.
+            let pool = if directory.is_none() && options.pool.is_none() {
+                slab::SlabPool::sized_by_rank(&layout, bytes, intake, &contexts, registrar)?
+            } else {
+                let mut pool = slab::SlabPool::sized(&layout, bytes, intake)?;
+                pool.register(registrar, context)?;
+                pool
+            };
             Ok::<_, crate::Error>(pool)
         })
         .transpose()?;
@@ -491,6 +490,7 @@ pub fn prepare_with_inputs(
     Ok(Preparation::Store(Box::new(Prepared {
         inputs,
         drain_on_shutdown: options.drain_on_shutdown,
+        max_age: options.max_age,
         disk_budget,
         resolved: Resolved {
             memory_bytes,
@@ -503,7 +503,7 @@ pub fn prepare_with_inputs(
         layout,
         contexts,
         memory_pool,
-        staging_pool,
+        warm_bytes: checkpoint_memory,
         scanned,
         directory_lock,
         shards: Vec::new(),
@@ -512,11 +512,11 @@ pub fn prepare_with_inputs(
 }
 
 /// Ordinary CPU retention leaves enough registered memory for checkpoint transfers.
-pub fn input_memory_bytes(memory: u64, checkpoint_minimum: u64, enabled: bool) -> u64 {
+pub fn input_memory_bytes(memory: u64, enabled: bool) -> u64 {
     if !enabled {
         return 0;
     }
-    (memory / 8).min(memory.saturating_sub(checkpoint_minimum)) / 4096 * 4096
+    (memory / 8) / 4096 * 4096
 }
 
 /// Free bytes on the filesystem holding `path`.
@@ -531,6 +531,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     let Prepared {
         inputs: _,
         drain_on_shutdown,
+        max_age,
         disk_budget,
         resolved,
         identity,
@@ -539,7 +540,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         layout: _,
         contexts,
         memory_pool,
-        staging_pool,
+        warm_bytes,
         scanned,
         directory_lock,
         shards,
@@ -548,39 +549,35 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     if let Some(pool) = &pool {
         pool.start_copies(&contexts, geometry.clone(), factory)?;
     }
-    let transfers: Option<crate::SharedCopier> = memory_pool
+    // Inside a composite the disk index owns the tree; memory nodes are flat.
+    let memory = memory_pool
         .as_ref()
-        .or(staging_pool.as_ref())
-        .map(|slabs| factory.mapped(&contexts, geometry.clone(), slabs))
+        .filter(|_| warm_bytes != 0)
+        .map(|pool| {
+            let transfers = factory.mapped(&contexts, geometry.clone(), pool)?;
+            let mut store = if directory_lock.is_some() {
+                memory::MemoryStore::new_flat(identity, pool.clone(), transfers)?
+            } else {
+                memory::MemoryStore::new(identity, pool.clone(), transfers)?
+            };
+            store.index_mut().max_age = max_age;
+            Ok::<_, crate::Error>(store)
+        })
         .transpose()?;
-    let tier_transfers = || {
-        transfers
-            .clone()
-            .ok_or_else(|| crate::Error::new("prefix transfers require a slab pool"))
-    };
     let disk = directory_lock
         .map(|directory| {
-            let disk_transfers: crate::SharedCopier = if memory_pool.is_some() {
-                factory.mapped(
-                    &contexts,
-                    geometry.clone(),
-                    staging_pool
-                        .as_ref()
-                        .ok_or("disk transfers require a staging pool")?,
-                )?
-            } else {
-                tier_transfers()?
-            };
+            let disk_transfers = factory.mapped(
+                &contexts,
+                geometry.clone(),
+                memory_pool
+                    .as_ref()
+                    .ok_or("disk transfers require a slot pool")?,
+            )?;
             let transport: Box<dyn disk_store::DiskTransport> = if !shards.is_empty() {
-                if memory_pool.is_some() {
-                    return Err(
-                        "a multi-host package keeps host prefix records on disk only".into(),
-                    );
-                }
-                shard::transport(staging_pool, disk_transfers, shards)?
+                shard::transport(memory_pool.clone(), disk_transfers, shards)?
             } else {
                 Box::new(disk_store::Staged::new(
-                    staging_pool,
+                    memory_pool.clone(),
                     disk_transfers,
                     disk::DiskThread::start("flare-offload-disk")?,
                 ))
@@ -594,18 +591,9 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
                 scanned,
                 transport,
             )?;
+            store.index_mut().max_age = max_age;
             store.share_budget(disk_budget.clone());
             Ok::<_, crate::Error>(store)
-        })
-        .transpose()?;
-    // Inside a composite the disk index owns the tree; memory nodes are flat.
-    let memory = memory_pool
-        .map(|pool| {
-            if disk.is_some() {
-                memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)
-            } else {
-                memory::MemoryStore::new(identity, pool, tier_transfers()?)
-            }
         })
         .transpose()?;
     let local: Option<Box<dyn crate::store::TierStore>> = match (memory, disk) {
@@ -637,7 +625,6 @@ mod tests;
 
 pub const HOST_SERVICE_HEADROOM_BYTES: u64 = 2 << 30;
 pub const HOST_SYSTEM_SHARE: u64 = 20;
-#[cfg(any(unix, test))]
 pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
     let available = meminfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -665,7 +652,7 @@ pub fn host_pool_budget(future: u64) -> Result<u64> {
                 (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
             })
             .ok_or_else(|| {
-                crate::Error::new("Linux MemTotal is required to budget pool host memory")
+                crate::Error::new("Linux MemTotal is required to budget local intake memory")
             })?;
         (available_memory(&info, usize::MAX)? as u64, total)
     };

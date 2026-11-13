@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Render GLM request cases with the checkpoint's canonical Transformers template."""
 
 import argparse
@@ -9,6 +13,8 @@ from pathlib import Path
 
 from transformers import AutoProcessor, AutoTokenizer
 from PIL import Image
+
+from ignition.preparation.frontend import annotated_template_asset
 
 
 def generate(snapshot):
@@ -25,7 +31,8 @@ def generate(snapshot):
         effective = {"add_generation_prompt": not continuation, **options}
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, **effective)
         ids = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, **effective)
-        source = (Path(__file__).resolve().parents[2] / "ignition/recipes/glm53/assets/chat_template.jinja").read_text()
+        source = annotated_template_asset(tokenizer.get_chat_template().encode(),
+            Path(__file__).resolve().parents[2] / "ignition/recipes/glm53/assets/chat_template.patch.json")["text"]
         assert source.replace("{%- mark -%}", "") == tokenizer.get_chat_template()
         marker = "\0message-position\0"
         while marker in rendered:

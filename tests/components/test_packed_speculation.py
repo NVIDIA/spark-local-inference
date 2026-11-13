@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared round metadata must outlive both sequential sampling workspaces."""
 
 from types import SimpleNamespace
@@ -6,19 +9,17 @@ import pytest
 import torch
 
 from ignition.components.packed_speculation import PreparedPackedSpeculativeRound
-from ignition.preparation.scratch import GraphBufferPool
 
 
-def operands(pool=None):
+def operands():
     b = 4
     owner = SimpleNamespace(inputs=SimpleNamespace(query_lengths=torch.zeros(b, dtype=torch.int32)),
-        requests=SimpleNamespace(capacity=b), weights=SimpleNamespace(shard=SimpleNamespace(world_size=1), draft=SimpleNamespace(confidence_head=None)),
+        requests=SimpleNamespace(capacity=b), pool=SimpleNamespace(backing=torch.empty(0)), weights=SimpleNamespace(shard=SimpleNamespace(world_size=1), draft=SimpleNamespace(confidence_head=None)),
         collectives=dict(runtime=None, vocabulary_runtime=None, coordinator=None), session=None)
     source = SimpleNamespace(batch=b, width=3, owner=owner, active=torch.zeros(b, dtype=torch.bool),
-        rows=torch.arange(b), buffers=None if pool is None else pool.cursor(),
+        rows=torch.arange(b),
         validator=SimpleNamespace(validation_input=torch.zeros((1, 8), dtype=torch.bfloat16)))
-    target = SimpleNamespace(batch=b, width=6, owner=owner, target_token_capacity=8,
-        buffers=None if pool is None else pool.cursor())
+    target = SimpleNamespace(batch=b, width=6, owner=owner, target_token_capacity=8)
     return source, target
 
 
@@ -34,42 +35,3 @@ def test_prefix_limits_cannot_alias_mutable_query_lengths(independent_descriptor
     source.owner.inputs.query_lengths = queries
     with pytest.raises(ValueError, match="must not overlap"):
         PreparedPackedSpeculativeRound(source, target, limits, torch.zeros((2, 4, 2)), name="round")
-
-
-def test_round_cursor_reserves_both_sampling_lifetimes_and_reuses_sequential_storage(monkeypatch):
-    # This test exercises host storage planning only. Numerical CUDA allocation
-    # is covered by the eager/captured component oracle on an assigned device.
-    monkeypatch.setattr("ignition.components.packed_speculation.PreparedCausalPrefixAllocation",
-                        lambda *args, **kwargs: None)
-    class Confidence:
-        def __init__(self, source, weight, output, *, buffers, **options):
-            self.output = output
-            self.features = buffers.zeros((source.batch, 64), torch.float32)
-
-    monkeypatch.setattr("ignition.components.packed_speculation.PreparedDraftConfidence", Confidence)
-    pool = GraphBufferPool("cpu", chunk_bytes=4096)
-    source, target = operands(pool)
-    scratch = []
-    for cursor, count in ((source.buffers, 129), (target.buffers, 513)):
-        if cursor is target.buffers:
-            cursor.join(source.buffers)
-        for dtype in (torch.float32, torch.bool, torch.int64, torch.bfloat16):
-            scratch.append(cursor.zeros((count,), dtype))
-    limits = torch.full((4,), 3, dtype=torch.int32)
-    round_ = PreparedPackedSpeculativeRound(source, target, limits, torch.zeros((2, 4, 2)), name="round", buffers=pool.cursor())
-    fields = ("submitted", "source_valid", "admitted", "slots", "confidence", "validation_input", "validation_sum")
-    retained = [getattr(round_, field) for field in fields] + [round_.confidence_head.output, round_.confidence_head.features]
-    for value in retained:
-        value.fill_(1)
-    snapshots = [value.clone() for value in retained]
-    for value in scratch:
-        value.fill_(0)
-    assert all(torch.equal(value, before) for value, before in zip(retained, snapshots))
-    for i, left in enumerate(retained):
-        for right in retained[i + 1:] + scratch:
-            assert not (left.data_ptr() < right.data_ptr() + right.nbytes
-                        and right.data_ptr() < left.data_ptr() + left.nbytes)
-    allocated = pool.nbytes
-    another = PreparedPackedSpeculativeRound(source, target, limits, torch.zeros((2, 4, 2)), name="another", buffers=pool.cursor())
-    assert pool.nbytes == allocated
-    assert all(getattr(another, field).data_ptr() == getattr(round_, field).data_ptr() for field in fields)

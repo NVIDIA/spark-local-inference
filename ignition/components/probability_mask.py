@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared masked stores into caller-owned verification probability buffers."""
 
 import torch
 import triton
 import triton.language as tl
 
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
 
 
 @triton.jit
@@ -68,3 +71,11 @@ class PreparedProbabilityMask:
             raise RuntimeError("probability masking requires prepare() before capture")
         if self.kernel is not None:
             self.kernel()
+
+    def run_disjoint(self, source, destination, valid, limits, dummy):
+        if not self.prepared:
+            raise RuntimeError("probability masking requires prepare() before capture")
+        if self.kernel is not None:
+            args = (source, destination, valid, valid if limits is None else limits, dummy)
+            launch_triton(self.kernel.kernel, self.kernel.compiled, args, self.kernel.grid,
+                          **self.kernel.options)

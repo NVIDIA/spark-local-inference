@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Vocabulary-tiled normalization preserves filtering and row validity under native replay."""
 
 import os

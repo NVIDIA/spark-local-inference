@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Manager configuration: command line and validation.
 //!
 //! This module is self-contained so it can be unit-tested without starting a manager.
@@ -35,6 +40,7 @@ pub struct Config {
     /// cannot be combined with TLS.
     pub rdma: bool,
     pub metrics: Option<SocketAddr>,
+    pub max_age: std::time::Duration,
     #[cfg(any(test, feature = "test-support"))]
     pub faults: crate::disk::Faults,
     #[cfg(any(test, feature = "test-support"))]
@@ -84,6 +90,7 @@ impl Config {
             tls_key: None,
             rdma: false,
             metrics: None,
+            max_age: std::time::Duration::ZERO,
             #[cfg(any(test, feature = "test-support"))]
             faults: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -233,6 +240,7 @@ pub fn help_text() -> String {
      --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
      --tls-cert PATH --tls-key PATH  TLS for --listen (clients verify against their CA)\n\
      --rdma                          offer RDMA (experimental; not with TLS)\n\
+     --max-age DURATION|off          Last-use expiry [default: off]\n\
      --metrics ADDR:PORT\n\
      \n\
      Sizes accept binary K, M, G and T suffixes."
@@ -308,6 +316,11 @@ where
             "--rdma" => {
                 config.rdma = true;
                 index += 1;
+            }
+            "--max-age" => {
+                config.max_age =
+                    flare_selene::offload::parse_max_age(value(index)?).map_err(invalid)?;
+                index += 2;
             }
             "--metrics" => {
                 config.metrics = Some(parse_address(value(index)?)?);
@@ -424,6 +437,16 @@ mod tests {
         assert_eq!(config.nvme, 1 << 30);
         assert_eq!(config.memory, 2 << 30);
         assert_eq!(config.staging, 16 << 20);
+        assert_eq!(config.max_age, std::time::Duration::ZERO);
+        assert_eq!(
+            run(&["--max-age", "off"]).max_age,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            run(&["--max-age", "3m"]).max_age,
+            std::time::Duration::from_secs(180)
+        );
+        assert!(parse_args(args(&["--max-age", "on"])).is_err());
     }
 
     #[test]

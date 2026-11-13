@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 use std::sync::Mutex;
@@ -152,6 +158,7 @@ fn current_context() -> PyResult<(usize, i32)> {
 #[pyfunction]
 fn validate_prepared_contract(manifest: &Bound<'_, PyAny>, contract_json: &str) -> PyResult<()> {
     let manifest = execution_manifest(manifest)?;
+    manifest.validate().map_err(|error| PyValueError::new_err(error.to_string()))?;
     let contract: crate::model::PreparedContract = serde_json::from_str(contract_json)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     contract
@@ -246,6 +253,11 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         cache: None,
         offload: None,
         abi_version: field!(value, "abi_version", u32),
+        completion_token_capacity: helios_core::execution::resolve_completion_token_capacity(match value.get_item("completion_token_capacity") {
+            Ok(value) => value.extract::<u32>()?,
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyKeyError>(value.py()) => 0,
+            Err(error) => return Err(error),
+        }),
         context: field!(value, "context", usize),
         device: field!(value, "device", i32),
         max_active: field!(value, "max_active", usize),
@@ -263,9 +275,9 @@ struct ExecutionCompletion {
     #[pyo3(get)]
     graph_index: usize,
     #[pyo3(get)]
-    proposal_confidence: Option<Vec<[f32; 7]>>,
+    proposal_confidence: Option<Vec<Vec<f32>>>,
     #[pyo3(get)]
-    speculative_survival: Option<Vec<[f32; 7]>>,
+    speculative_survival: Option<Vec<Vec<f32>>>,
     #[pyo3(get)]
     records: Vec<Vec<i64>>,
     #[pyo3(get)]
@@ -594,7 +606,7 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Snapshot device-wide usage and the package allocator's physical mappings.
+/// Snapshot device-wide usage and the core allocator's physical mappings.
 ///
 /// Call after preparation has materialized scratch. Imported peer mappings,
 /// dynamically backed caches, and allocations outside this allocator are not

@@ -1,28 +1,33 @@
-//! Native graph timings for an explicitly supplied, trusted TP1 package.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Native graph timings for an explicitly supplied, trusted TP1 core.
 
 use super::*;
 
 #[test]
-#[ignore = "requires CUDA and FLARE_PROMPT_TEST_PACKAGE plus FLARE_PROMPT_TEST_PUBLISHERS"]
+#[ignore = "requires CUDA and FLARE_PROMPT_TEST_CORE plus FLARE_PROMPT_TEST_PUBLISHERS"]
 fn prompt_prefill_gpu_and_native_costs() {
-    use crate::runtime_package::{LoadOptions, NativeModel, Publisher, VerifiedPackage};
+    use crate::runtime_core::{LoadOptions, NativeModel, Publisher, VerifiedCore};
     use serde_json::json;
     use std::{collections::VecDeque, time::Instant};
 
-    let path = std::env::var("FLARE_PROMPT_TEST_PACKAGE").unwrap();
+    let path = std::env::var("FLARE_PROMPT_TEST_CORE").unwrap();
     let profiles = std::env::var("FLARE_PROMPT_TEST_PUBLISHERS").unwrap();
     let publishers: Vec<Publisher> = serde_json::from_slice(&std::fs::read(profiles).unwrap()).unwrap();
-    let verified = VerifiedPackage::open(std::path::Path::new(&path), &publishers, None).unwrap();
+    let verified = VerifiedCore::open(std::path::Path::new(&path), &publishers, None).unwrap();
     let namespace = verified.publisher().namespace.clone();
     let authorized = verified.authorize(&namespace, false).unwrap();
-    // The test's explicit publisher file authorizes this package's captured code.
+    // The test's explicit publisher file authorizes this core's captured code.
     let owner = unsafe { NativeModel::load(authorized, &[0], &LoadOptions::default(),
         &crate::startup::StartupProgress::silent()).unwrap() };
     let manifest = owner.manifests().unwrap().remove(0);
     let bootstrap = crate::server::Bootstrap::load(&owner.server_config().to_string(), &manifest).unwrap();
     let frontend = Arc::new(bootstrap.frontend);
     let config = bootstrap.model;
-    println!("{}", json!({"package":path,"pages":config.limits.pages,
+    println!("{}", json!({"core":path,"pages":config.limits.pages,
         "page_tokens":config.contract.cache.page_tokens,"graphs":manifest.graphs.len()}));
     let scoring = manifest.prompt_logprob_capacity().unwrap() > 0;
     let runtime = unsafe { ModelRuntime::start(manifest, config, 16, 256, frontend,
@@ -45,7 +50,7 @@ fn prompt_prefill_gpu_and_native_costs() {
                             vision_token_indices: vec![-1; length], spans: vec![] },
                         conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
                             top_k: 1, ..Default::default()
-                        }, max_new_tokens: budget, stop_sequences: vec![], stop_strings: vec![],
+                        }, max_new_tokens: budget, reasoning_cut: None, stop_sequences: vec![], stop_strings: vec![],
                         grammar: None, ignore_eos: false, logprobs: false,
                         logprob_token_ids: vec![], prompt_logprobs: scored,
                     };

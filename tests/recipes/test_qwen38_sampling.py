@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import os
@@ -124,7 +128,7 @@ CUDA = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
     reason="requires FLARE_RUN_CUDA_TESTS=1 and an explicitly assigned CUDA_VISIBLE_DEVICES")
 
 
-def _metadata(rows=4, fields=8):
+def _metadata(rows=4, fields=32):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"
     return (torch.arange(rows, dtype=torch.int32, device="cuda"),
             torch.ones(rows, dtype=torch.int64, device="cuda"),
@@ -206,7 +210,7 @@ def test_native_categorical_distribution_and_exact_seed_progression():
 
 @CUDA
 @pytest.mark.parametrize("temperature", [1., .8])
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [32])
 def test_native_sampling_full_vocabulary_batch_reordering_and_pending_consumption(temperature, fields):
     state = DeviceRequestState.allocate("cuda")
     metadata = _metadata(fields=fields)
@@ -250,9 +254,9 @@ def test_native_sampling_full_vocabulary_batch_reordering_and_pending_consumptio
             for slot in range(4):
                 expected = _reference(cpu_logits[slot], cpu_counts[slot], params[slot], params[slot].seed, iteration)
                 assert result[slot, :8].tolist() == [1, iteration + 41, 3 + iteration, iteration + 1, expected, 1, 0, 0]
-                if fields == 24:
+                if fields == 32:
                     assert result[slot, 8:].tolist() == [1, 0, 0, 0, -1, 2 + iteration,
-                        0, 1, expected, -1, -1, -1, -1, -1, -1, -1]
+                        0, 1, expected] + [-1] * 15
                 cpu_counts[slot, expected] += 1
                 assert state.pending_token[slot].item() == expected
                 if iteration:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Muse Spark text contracts retain device tokens and complete cache row storage."""
 
 from types import SimpleNamespace
@@ -6,7 +9,7 @@ from google.protobuf.json_format import ParseDict
 
 from ignition.components.paged_batch import BatchInputs
 from ignition.components.parallel import TensorParallelShard
-from ignition.preparation import contract as c, runtime_package_pb2 as p
+from ignition.preparation import contract as c, runtime_core_pb2 as p
 from ignition.preparation.execution import GraphSignature
 from ignition.recipes.muse_spark.contract import prepare
 from ignition.recipes.muse_spark.pool import ContinuationPool

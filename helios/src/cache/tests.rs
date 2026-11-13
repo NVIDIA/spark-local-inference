@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
 
 fn history(blocks: u32, offset: u32) -> PrefixHistory {
@@ -488,7 +494,7 @@ fn compacted_pending_child_retains_parent_pages_until_cancellation_completes() {
 }
 
 #[test]
-fn snapshot_pressure_thins_history_without_discarding_endpoints_or_pages() {
+fn snapshot_pressure_compacts_equal_rank_ancestors_in_endpoint_order() {
     let mut cache = cache();
     let history = history(8, 0);
     let mut parent = None;
@@ -507,9 +513,9 @@ fn snapshot_pressure_thins_history_without_discarding_endpoints_or_pages() {
     assert_eq!(report.snapshots_scheduled, 4);
     assert_eq!(
         report.retired.iter().map(|r| r.checkpoint).collect::<Vec<_>>(),
-        [checkpoints[1], checkpoints[3], checkpoints[5], checkpoints[6]]
+        [checkpoints[0], checkpoints[1], checkpoints[2], checkpoints[3]]
     );
-    for index in [0, 2, 4, 7] {
+    for index in [4, 5, 6, 7] {
         assert!(cache.checkpoint(checkpoints[index]).is_ok());
     }
     assert_eq!(cache.lookup(&history).unwrap().consumed_tokens, 512);
@@ -520,21 +526,22 @@ fn snapshot_pressure_thins_history_without_discarding_endpoints_or_pages() {
 }
 
 #[test]
-fn snapshot_pressure_removes_a_dense_recent_checkpoint_before_a_sparse_older_one() {
+fn snapshot_pressure_prefers_demand_recency_over_checkpoint_spacing() {
     let mut cache = cache();
     let history = history(5, 0);
     let root = created(&mut cache, &history, &proposal(None, 64, &[0], 0, 0));
     let sparse = created(&mut cache, &history, &proposal(Some(root), 256, &[1, 2, 3], 1, 0));
-    let dense = created(&mut cache, &history, &proposal(Some(sparse), 272, &[], 2, 0));
+    let dense = cache.publish_with_retention(&history, &proposal(Some(sparse), 272, &[], 2, 0), RetentionRole::Endpoint, 2).unwrap().id();
     let end = created(&mut cache, &history, &proposal(Some(dense), 288, &[], 3, 0));
+    cache.promote(root, RetentionRole::Anchor, 1).unwrap();
     let report = cache.evict(EvictionTarget { pages: 0, snapshots: 1 });
-    assert_eq!(report.retired[0].checkpoint, dense);
-    assert_eq!(cache.checkpoint(end).unwrap().parent(), Some(sparse));
-    assert!(cache.checkpoint(root).is_ok());
+    assert_eq!(report.retired[0].checkpoint, sparse);
+    assert_eq!(cache.checkpoint(dense).unwrap().parent(), Some(root));
+    assert_eq!(cache.checkpoint(end).unwrap().parent(), Some(dense));
 }
 
 #[test]
-fn eviction_uses_leaf_lru_and_honors_separate_snapshot_pressure() {
+fn eviction_uses_admission_recency_and_honors_separate_snapshot_pressure() {
     let mut cache = cache();
     let first_history = history(1, 0);
     let first = created(&mut cache, &first_history, &proposal(None, 64, &[0], 0, 0));
@@ -548,7 +555,8 @@ fn eviction_uses_leaf_lru_and_honors_separate_snapshot_pressure() {
         &history(1, 2000),
         &proposal(None, 64, &[2], 2, 0),
     );
-    cache.lookup(&first_history).unwrap();
+    let epoch = cache.new_use_epoch().unwrap();
+    cache.touch(first, epoch).unwrap();
     let report = cache.evict(EvictionTarget {
         pages: 1,
         snapshots: 0,
@@ -1060,7 +1068,7 @@ fn projection_counts_running_pins_and_leaves_the_cache_untouched() {
 }
 
 #[test]
-fn eviction_keeps_lru_leaf_and_compaction_rules() {
+fn eviction_preserves_direct_pins_and_compaction_rules() {
     let mut cache = cache();
     let h = history(3, 0);
     let parent = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
@@ -1075,8 +1083,8 @@ fn eviction_keeps_lru_leaf_and_compaction_rules() {
         pages: 0,
         snapshots: 1,
     };
-    // Touch the ancestor so the independent leaf is oldest.
-    cache.lookup(&history(1, 0)).unwrap();
+    let epoch = cache.new_use_epoch().unwrap();
+    cache.touch(parent, epoch).unwrap();
     assert_eq!(
         cache
             .evict(EvictionTarget {
@@ -1120,4 +1128,46 @@ fn reclamation_excludes_pins_branches_and_unready_checkpoints() {
     let mut reclaimed = cache.reclaimable(&[]).pages;
     reclaimed.sort();
     assert_eq!(reclaimed, [PageId(0), PageId(1), PageId(2)]);
+}
+
+#[test]
+fn retention_prioritizes_demand_epoch_before_role_and_promotes_duplicates() {
+    let mut cache = cache();
+    let a_history = history(1, 0);
+    let b_history = history(1, 1000);
+    let a = cache.publish_with_retention(&a_history, &proposal(None, 64, &[0], 0, 0), RetentionRole::Anchor, 1).unwrap().id();
+    let b = cache.publish_with_retention(&b_history, &proposal(None, 64, &[1], 1, 0), RetentionRole::Endpoint, 2).unwrap().id();
+    let result = cache.publish_with_retention(&b_history, &proposal(None, 64, &[2], 2, 0), RetentionRole::Message, 1).unwrap();
+    assert_eq!(result.id(), b);
+    assert_eq!(cache.checkpoint(b).unwrap().retention_rank(), RetentionRank { use_epoch: 2, role: RetentionRole::Message, consumed_tokens: 64 });
+    assert_eq!(cache.evict(EvictionTarget { pages: 0, snapshots: 1 }).retired[0].checkpoint, a);
+}
+
+#[test]
+fn lookup_is_read_only_and_admission_touch_refreshes_ancestors() {
+    let mut cache = cache();
+    let history = history(2, 0);
+    let parent = cache.publish_with_retention(&history, &proposal(None, 64, &[0], 0, 0), RetentionRole::Anchor, 1).unwrap().id();
+    let child = cache.publish_with_retention(&history, &proposal(Some(parent), 128, &[1], 1, 0), RetentionRole::Endpoint, 1).unwrap().id();
+    cache.lookup(&history).unwrap();
+    assert_eq!(cache.checkpoint(child).unwrap().retention_rank().use_epoch, 1);
+    cache.new_use_epoch().unwrap();
+    let epoch = cache.new_use_epoch().unwrap();
+    cache.touch(child, epoch).unwrap();
+    assert_eq!(cache.checkpoint(parent).unwrap().retention_rank().use_epoch, epoch);
+    assert_eq!(cache.checkpoint(child).unwrap().retention_rank().use_epoch, epoch);
+}
+
+#[test]
+fn equal_epoch_victims_use_role_and_preserve_direct_pins() {
+    let mut cache = cache();
+    let history = history(3, 0);
+    let anchor = cache.publish_with_retention(&history, &proposal(None, 64, &[0], 0, 0), RetentionRole::Anchor, 7).unwrap().id();
+    let message = cache.publish_with_retention(&history, &proposal(Some(anchor), 128, &[1], 1, 0), RetentionRole::Message, 7).unwrap().id();
+    let endpoint = cache.publish_with_retention(&history, &proposal(Some(message), 192, &[2], 2, 0), RetentionRole::Endpoint, 7).unwrap().id();
+    cache.pin(endpoint).unwrap();
+    assert_eq!(cache.evict(EvictionTarget { pages: 0, snapshots: 1 }).retired[0].checkpoint, message);
+    assert_eq!(cache.page_chain(endpoint).unwrap(), [PageId(0), PageId(1), PageId(2)]);
+    assert_eq!(cache.evict(EvictionTarget { pages: 0, snapshots: 1 }).retired[0].checkpoint, anchor);
+    assert!(cache.evict(EvictionTarget { pages: 0, snapshots: 1 }).retired.is_empty());
 }

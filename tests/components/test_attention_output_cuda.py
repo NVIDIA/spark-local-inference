@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared grouped attention projection with compiled, allocation-stable replay."""
 
 import os
@@ -15,10 +18,11 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("tokens", [1, 4, 17, 4096])
 @pytest.mark.parametrize("groups", [2, 3])
 @torch.no_grad()
-def test_grouped_output_compiled_replay(tokens, groups):
+def test_grouped_output_compiled_replay(tokens, groups, functional):
     device = torch.device("cuda:0")
     generator = torch.Generator(device=device).manual_seed(4123)
     width, rank, hidden = 4096, 1024, 5120
@@ -35,7 +39,9 @@ def test_grouped_output_compiled_replay(tokens, groups):
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         operation = PreparedGroupedOutputProjection(source, packed, output,
             session=session, name="wo", workspace=None)
-        forward = compile_forward(lambda: operation(source))
+        if functional:
+            operation.functional(session=session)
+        forward = compile_forward(lambda: output.copy_(operation(source)))
         forward()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
@@ -43,7 +49,8 @@ def test_grouped_output_compiled_replay(tokens, groups):
         torch.cuda.synchronize()
         for gain in (1, -.5, 2):
             source.mul_(gain)
-            operation.scratch.fill_(255)
+            if not functional:
+                operation.scratch.fill_(255)
             output.fill_(float("nan"))
             allocated = torch.cuda.memory_allocated()
             graph.replay()

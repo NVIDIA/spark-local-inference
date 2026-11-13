@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint tokenizer parity for recipient headers, escaping, and ATEM history."""
 
 import copy
@@ -28,7 +31,7 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     tokenizer = Tokenizer.from_file(str(SNAPSHOT / 'tokenizer.json'))
     hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(SNAPSHOT)
     source = (SNAPSHOT / 'chat_template.jinja').read_text()
-    annotated = Path(assets['chat_template']['path']).read_text()
+    annotated = assets['chat_template']['text']
     assert annotated.replace('{%- mark -%}', '') == source
     template = _compile_jinja_template(source)
     marked_template = _compile_jinja_template(annotated.replace('{%- mark -%}', '{{- message_position() -}}'))
@@ -138,7 +141,7 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     runtime.mkdir()
     for name in ['tokenizer.json', 'tokenizer_config.json']:
         (runtime / name).symlink_to(SNAPSHOT / name)
-    (runtime / 'chat_template.jinja').symlink_to(assets['chat_template']['path'])
+    (runtime / 'chat_template.jinja').write_text(assets['chat_template']['text'])
     fingerprints = {'tokenizer.json': assets['tokenizer']['sha256'],
                     'chat_template.jinja': assets['chat_template']['sha256'],
                     'tokenizer_config.json': hashlib.sha256((runtime / 'tokenizer_config.json').read_bytes()).hexdigest()}

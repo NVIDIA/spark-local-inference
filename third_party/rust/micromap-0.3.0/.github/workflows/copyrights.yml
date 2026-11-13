@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 Yegor Bugayenko
+# SPDX-License-Identifier: MIT
+---
+# yamllint disable rule:line-length
+name: copyrights
+'on':
+  push:
+  pull_request:
+jobs:
+  copyrights:
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: yegor256/copyrights-action@0.0.12

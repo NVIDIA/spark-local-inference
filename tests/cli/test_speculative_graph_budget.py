@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Packed graph-count budgets and their independent preparation settings."""
 
 from dataclasses import replace
@@ -41,7 +44,7 @@ def test_graph_budget_precedence_and_token_capacity_are_independent(tmp_path):
         default, graph_budget=32, token_capacity=192)
 
 
-@pytest.mark.parametrize("alias", ["qwen3.8-flash", "glm-5.3-flash", "step5-preview-nvfp4", "qwen3.8-27b"])
+@pytest.mark.parametrize("alias", ["qwen3.8-flash", "glm-5.3-flash", "step5-preview-nvfp4"])
 def test_explicit_graph_budget_rejects_recipes_without_packed_rounds(alias):
     with pytest.raises(UsageError, match="--speculative-graph-budget"):
         selected("--speculative-graph-budget", "32", alias=alias)
@@ -70,12 +73,11 @@ def test_global_graph_budget_is_scoped_to_active_packed_speculation(tmp_path):
     assert selected(configuration=config).graph_budget == 48
     assert selected("--mtp-draft-tokens", "0", configuration=config).graph_budget is None
     assert selected("--no-mtp", configuration=config) is None
-    for alias in ("qwen3.8-flash", "qwen3.8-27b"):
-        assert selected(alias=alias, configuration=config) == resolve(alias).recipe.speculation
+    assert selected(alias="qwen3.8-flash", configuration=config) == resolve("qwen3.8-flash").recipe.speculation
 
 
 @pytest.mark.parametrize("alias,flags", [
-    ("qwen3.8-flash", ()), ("qwen3.8-27b", ()),
+    ("qwen3.8-flash", ()),
     ("deepseek-v4.1-flash", ("--no-mtp",)),
     ("deepseek-v4.1-flash", ("--mtp-draft-tokens", "0")),
 ])
@@ -133,7 +135,7 @@ def test_graph_budget_preserves_cpu_fixed_width_mode():
         Speculation(5, adaptive=False, packed_verification=True, draft_prefix_selection="gpu", graph_budget=64)
 
 
-@pytest.mark.parametrize("alias", ["deepseek-v4-flash", "mimo-v2.6-pro-mopd", "kimi-k3-mxfp4-csf"])
+@pytest.mark.parametrize("alias", ["deepseek-v4-flash", "mimo-v2.6-pro-mopd", "mimo-v2.6-flash-rl", "kimi-k3-mxfp4-csf", "qwen3.8-27b", "qwen3.8-27b-qad"])
 def test_cpu_packed_recipe_accepts_fixed_width_and_explicit_graph_budget(alias):
     value = selected("--no-mtp-adaptive-verification", "--speculative-graph-budget", "32", alias=alias)
     assert value.packed_verification and value.draft_prefix_selection == "cpu"
@@ -145,7 +147,7 @@ def test_rebuild_metadata_preserves_the_selected_physical_graph_catalog(monkeypa
     from types import SimpleNamespace
     from google.protobuf.json_format import ParseDict
     from ignition.components.capacity import packed_speculative_shapes
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from tests.cli.test_planning import derive, gpu
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
@@ -188,3 +190,20 @@ def test_vocabulary_parallel_sampling_is_an_explicit_preparation_choice():
             selected(*flags, "--vocabulary-parallel-sampling")
     with pytest.raises(UsageError, match="DeepSeek V4.1"):
         derive(speculation=settings)
+
+
+@pytest.mark.parametrize("alias", ["qwen3.8-27b", "qwen3.8-27b-qad"])
+def test_qwen_dense_packed_budget_precedence_preserves_token_capacity(tmp_path, alias):
+    default = resolve(alias).recipe.speculation
+    assert default.packed_verification and default.graph_budget == 64
+    path = tmp_path / "flare.toml"
+    path.write_text('[defaults]\nspeculative_graph_budget=48\n')
+    config = Configuration.load(path)
+    assert selected(alias=alias, configuration=config) == replace(default, graph_budget=48)
+    path.write_text(path.read_text() + f'[models."{alias}"]\nspeculative_graph_budget=32\n')
+    config = Configuration.load(path)
+    assert selected(alias=alias, configuration=config) == replace(default, graph_budget=32)
+    assert selected("--speculative-graph-budget", "24", alias=alias, configuration=config) == replace(
+        default, graph_budget=24)
+    assert selected("--speculative-token-capacity", "64", alias=alias, configuration=config) == replace(
+        default, graph_budget=32, token_capacity=64)

@@ -1,4 +1,8 @@
-"""Complete GLM text forwards with shared layer scratch and sharded vocabulary weights."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Complete GLM text forwards with invocation-local tensors and sharded vocabulary weights."""
 
 from dataclasses import dataclass
 
@@ -38,12 +42,8 @@ class DecoderScratch:
 
     @classmethod
     def allocate(cls, tokens, blocks, mode, device, *, shard: TensorParallelShard, sample_rows, context_ranks=1,
-                 overlay_layers=False, remote=False):
-        """Allocate layer scratch; with overlay_layers, KDA, MLA and MLP intermediates share storage.
-
-        A layer runs attention then its MLP, and layers run serially, so their intermediates are
-        never live together. Index scratch and router weights keep their own prepared constants.
-        """
+                 remote=False):
+        """Allocate declaration examples for each operator's layouts and tuning."""
         if type(sample_rows) is not int or not 0 < sample_rows <= tokens:
             raise ValueError("GLM sampling capacity must be positive and fit the token capacity")
         def buffer(*shape):
@@ -53,20 +53,13 @@ class DecoderScratch:
                                 remote=remote),
             MLPScratch.allocate(tokens, 4096, 12288 // shard.world_size, device),
             MoeScratch.allocate(tokens, shard.world_size, device))
-        if overlay_layers:
-            from ignition.components.moe import RouterScratch
-            from ignition.preparation.scratch import overlay
-
-            from .indexer import IndexScratch
-
-            layers = overlay(layers, keep=(IndexScratch, RouterScratch))
         return cls(buffer(tokens, 4096), buffer(tokens, 4, 4096), buffer(sample_rows, 4, 4096),
             buffer(sample_rows, 4096), buffer(sample_rows, 154880 // shard.world_size), buffer(sample_rows, 154880),
             MHCScratch.allocate(tokens, 4096, device), MHCScratch.allocate(tokens, 4096, device),
             *layers, buffer(tokens, 4096), buffer(tokens, 4096))
 
     def rows(self, tokens, mode, *, sample_rows):
-        """Bind a graph variant to storage shared by serial decoder replays."""
+        """Select declaration examples with the graph variant's shapes and strides."""
         if type(tokens) is not int or not 0 < tokens <= self.embedding.shape[0]:
             raise ValueError("GLM decoder rows exceed scratch capacity")
         if type(sample_rows) is not int or not 0 < sample_rows <= min(tokens, self.hidden.shape[0]):
@@ -90,7 +83,7 @@ class PreparedDecoder:
     """Prepare all 45 layers into a serial forward owned by one TP rank.
 
     Layers carry MLP output and mixing coefficients into the following fused
-    mHC post/pre operation. They reuse residual, attention and MLP intermediates.
+    mHC post/pre operation. Inductor manages invocation-local intermediates.
     Each layer's cache and recurrent state have separate owners. Canonical final stream
     averaging and RMSNorm operate only on selected output rows. Vocabulary
     projection shards run on every rank before gathering logits for sampling.
@@ -108,10 +101,15 @@ class PreparedDecoder:
         if metadata.sample_indices.shape != scratch.hidden.shape[:1]:
             raise ValueError("GLM sample indices and hidden-output capacities differ")
         self.weights, self.scratch, self.state, self.metadata = weights, scratch, state, metadata
+        self.tokens, self.blocks, self.sample_rows = (scratch.embedding.shape[0],
+            scratch.mla.index.page_table.shape[1], scratch.hidden.shape[0])
+        self.mode = mode
+        self.device, self.context, self.kda_records = metadata.token_ids.device, context, kda_records
+        self.full_feedback = feedback is not None
         self.vision = vision if mode == "prefill" else None
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
-            vocabulary=154880, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True)
-        self.feedback = feedback if self.scoring is None else self.scoring.source
+            vocabulary=154880, session=session, coordinator=coordinator, name=name + ".prompt")
+        self.feedback = feedback
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, metadata.token_ids, scratch.embedding,
             num_rows=metadata.recurrent.num_tokens, session=session, name=f"{name}.embedding")
         self.layers = []
@@ -129,14 +127,17 @@ class PreparedDecoder:
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
-        # Sparse-attention layers share index scratch, which no other layer overlays, and the same metadata,
-        # so the first layer's pool lengths and page tables serve every later one.
-        indexers = [layer.attention.indexer for layer in self.layers if hasattr(layer.attention, "indexer")]
-        for indexer in indexers[1:]:
-            indexer.prepares_tables = False
         self.lm_head = PreparedVocabularyProjection(scratch.hidden, weights.head,
             scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator,
-            session=session, name=f"{name}.lm_head")
+            session=session, name=f"{name}.lm_head", workspace=workspace)
+
+    def functional(self, *, session):
+        self.embedding.functional(session=session, dynamic_inputs=True)
+        for layer in self.layers:
+            layer.release_outputs(session=session)
+        self.lm_head.functional(session=session)
+        self.scratch = self.metadata = self.feedback = self.kda_records = None
+        return self
 
     def rebind_pages(self):
         """Rebind every sparse-attention layer to the continuation pool's current page pools."""
@@ -144,26 +145,31 @@ class PreparedDecoder:
             if hasattr(layer.attention, "rebind_pages"):
                 layer.attention.rebind_pages()
 
-    def __call__(self):
-        s, language = self.scratch, self.weights.tree.model.language_model
-        self.embedding()
+    def __call__(self, metadata, *, records=None):
+        language = self.weights.tree.model.language_model
+        embedded = self.embedding(token_ids=metadata.token_ids, num_rows=metadata.recurrent.num_tokens)
         if self.vision is not None:
-            self.vision.inject(self.metadata, s.embedding)
-        s.residual.copy_(s.embedding[:, None, :])
-        value = s.residual
-        for layer in self.layers:
-            value = layer(value)
-        if self.feedback is None:
-            torch.index_select(s.residual, 0, self.metadata.sample_indices, out=s.selected_residual)
-            collapsed = language.hc_head(s.selected_residual[:, None]).squeeze(1)
-            rms_norm(collapsed, language.norm.weight, s.hidden, language.norm.variance_epsilon,
+            self.vision.inject(metadata, embedded)
+        value, carry = embedded[:, None, :].expand(-1, 4, -1).contiguous(), None
+        for index, layer in enumerate(self.layers):
+            layer_records = None if records is None or index not in records.layers else records.layer(index)
+            attention_metadata = metadata.indexed if layer.module.block_type == "indexed_attention" else metadata.recurrent
+            value, carry = layer(value, attention_metadata, carry, records=layer_records)
+        auxiliary = None
+        if not self.full_feedback and self.scoring is None:
+            selected = value[metadata.sample_indices]
+            collapsed = language.hc_head(selected[:, None]).squeeze(1)
+            hidden = torch.empty_like(collapsed)
+            rms_norm(collapsed, language.norm.weight, hidden, language.norm.variance_epsilon,
                 round_before_weight=True)
         else:
-            collapsed = language.hc_head(s.residual[:, None]).squeeze(1)
-            rms_norm(collapsed, language.norm.weight, self.feedback, language.norm.variance_epsilon,
+            collapsed = language.hc_head(value[:, None]).squeeze(1)
+            normalized = torch.empty_like(collapsed)
+            rms_norm(collapsed, language.norm.weight, normalized, language.norm.variance_epsilon,
                 round_before_weight=True)
-            torch.index_select(self.feedback, 0, self.metadata.sample_indices, out=s.hidden)
+            auxiliary = normalized if self.full_feedback or self.scoring is not None else None
+            hidden = normalized[metadata.sample_indices]
         if self.scoring is not None:
-            self.scoring()
-        self.lm_head(s.hidden)
-        return s.hidden
+            self.scoring(auxiliary)
+        logits = self.lm_head(hidden)
+        return hidden, logits, auxiliary, records

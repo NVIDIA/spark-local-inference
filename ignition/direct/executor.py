@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Run one rank's share of rank zero's direct steps: copy inputs, then replay a graph or call its forward.
 
 A step is a plain message: the graph's name, the input byte ranges to write

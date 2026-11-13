@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pinned DFlash2 configuration and rank-local BF16 checkpoint transfers."""
 
 from dataclasses import replace

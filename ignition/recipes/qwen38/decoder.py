@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact-checkpoint decoder weight ownership and canonical module parameters."""
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 from ignition.preparation.checkpoint import CheckpointManifest
 from ignition.preparation.host_memory import device_memory_info
+from ignition.preparation.persistent import allocated_tensor_bytes
 from ignition.preparation.qwen38 import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 
@@ -25,6 +30,27 @@ from .weights import QwenWeightLoader
 class DecoderLayerWeights:
     attention: dict[str, object]
     moe: QwenMoeWeights
+
+
+@dataclass(frozen=True)
+class DecoderAuxiliary:
+    residual: torch.Tensor
+    draft_features: torch.Tensor | None
+
+
+torch.utils._pytree.register_dataclass(DecoderAuxiliary)
+
+
+class PreparedDecoderForward:
+    def __init__(self, decoder):
+        self.decoder = decoder
+
+    def __call__(self):
+        decoder = self.decoder
+        errors = None if decoder.embedding_injection is None else decoder.embedding_injection.validate()
+        runtime = decoder.state.begin_runtime()
+        runtime.injection_errors = errors
+        decoder(runtime)
 
 
 @dataclass(frozen=True)
@@ -47,13 +73,15 @@ class ModelWeights:
     def load(cls, manifest: CheckpointManifest, device: torch.device,
              *, progress: Callable[[str], None] | None = None,
              shard: TensorParallelShard = TensorParallelShard(0, 1),
-             shard_hyperconnections: bool = False) -> ModelWeights:
+             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False) -> ModelWeights:
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("model weights require a CUDA device")
         device = torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
         if torch.cuda.get_device_capability(device) not in SUPPORTED_CAPABILITIES:
             raise ValueError(f"the Qwen recipe requires {SUPPORTED_ARCHITECTURES}")
+        if force_moe_decode_a16 and torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
+            raise ValueError("force_moe_decode_a16 requires SM120/121 packed NVFP4 experts")
         free_bytes, _ = device_memory_info(device)
         stored = sum(tensor.nbytes for tensor in manifest.tensors.values()
                      if tensor.component not in ("mtp", "ple_tables"))
@@ -61,11 +89,12 @@ class ModelWeights:
         if free_bytes < stored // shard.world_size + (8 << 30):
             raise MemoryError(f"model weight loading requires at least {stored // shard.world_size + (8 << 30)} free CUDA bytes; found {free_bytes}")
         tree = create_model_tree(manifest)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         layers = []
-        with QwenWeightLoader(manifest, device, progress=progress, shard=shard) as loader:
-            def parameters(paths, extents=None):
-                for path, value in zip(paths, loader.load_tensors(paths, extents=extents), strict=True):
+        with QwenWeightLoader(manifest, device, progress=progress, shard=shard,
+                              force_moe_decode_a16=force_moe_decode_a16) as loader:
+            def parameters(paths, extents=None, *, temporary=False):
+                for path, value in zip(paths, loader.load_tensors(paths, extents=extents, temporary=temporary), strict=True):
                     parent, _, attribute = path.rpartition(".")
                     setattr(tree.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))
 
@@ -74,8 +103,13 @@ class ModelWeights:
                 if tree.get_submodule(prefix).block_inject_weight is not None:
                     names += ("block_inject_weight",)
                 extents = hyperconnection_extents(shard, shard_hyperconnections)
-                parameters(tuple(f"{prefix}.{name}.weight" for name in names),
-                           tuple(extents.get(f"{name}.weight") for name in names))
+                packed = tree.get_submodule(prefix).block_inject_weight is not None
+                for temporary in (False, True):
+                    selected = tuple(name for name in names
+                        if (packed and name in ("input_mix_weight_down", "block_inject_weight")) == temporary)
+                    if selected:
+                        parameters(tuple(f"{prefix}.{name}.weight" for name in selected),
+                                   tuple(extents.get(f"{name}.weight") for name in selected), temporary=temporary)
                 packed_down_projection(tree.get_submodule(prefix))
 
             parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
@@ -101,8 +135,10 @@ class ModelWeights:
                     parameters(tuple(f"{attention_prefix}.{name}" for name in ("A_log", "dt_bias", "norm.weight")),
                                (heads, heads, None))
                     channels = shard.fused_partitions((2048, 2048, 6144))
-                    convolution = torch.cat(loader.load_tensors((f"{attention_prefix}.conv1d.weight",) * 3,
-                        extents=tuple(slice(*part) for part in channels)))
+                    from ignition.preparation.persistent import persistent_cat
+
+                    convolution = persistent_cat(loader.load_tensors((f"{attention_prefix}.conv1d.weight",) * 3,
+                        extents=tuple(slice(*part) for part in channels), temporary=True))
                     module = tree.get_submodule(attention_prefix)
                     module.conv1d.weight = torch.nn.Parameter(convolution, requires_grad=False)
                     module.num_k_heads //= shard.world_size
@@ -122,12 +158,12 @@ class ModelWeights:
             vision = VisionWeights.load(tree.model.visual, loader)
         torch.cuda.synchronize(device)
         return cls(tree, tuple(layers), vision,
-                   torch.cuda.memory_allocated(device) - before, shard)
+                   allocated_tensor_bytes(device) - before, shard)
 
 
 @dataclass(frozen=True)
 class DecoderScratch:
-    """Shared intermediates for serialized complete-forward graph variants."""
+    """Tensor examples used to declare and tune decoder operations."""
 
     embedding: torch.Tensor
     residual: torch.Tensor
@@ -142,7 +178,7 @@ class DecoderScratch:
     local_logits: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens: int, device, *, sample_rows: int = 4, world_size: int = 1, buffers=None,
+    def allocate(cls, tokens: int, device, *, sample_rows: int = 4, world_size: int = 1,
                  hyperconnection_lowrank: int = 320):
         if type(tokens) is not int or tokens <= 0:
             raise ValueError("decoder token capacity must be a positive integer")
@@ -155,28 +191,19 @@ class DecoderScratch:
         from .ple import PLEScratch
 
         def zeros(*shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if buffers is None
-                    else buffers.zeros(shape, torch.bfloat16))
-
-        if buffers is None:
-            from ignition.preparation.scratch import GraphBufferPool
-
-            buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
+            return torch.zeros(shape, dtype=torch.bfloat16, device=device)
         embedding, residual, hidden = zeros(tokens, 2560), zeros(tokens, 10240), zeros(tokens, 2560)
         sample_hidden, logits = zeros(sample_rows, 2560), zeros(sample_rows, 248320)
         local_logits = zeros(sample_rows, 248320 // world_size) if world_size > 1 else None
         block_input, block_output = zeros(tokens, 2560), zeros(tokens, 2560)
         projected = zeros(tokens, (hyperconnection_lowrank + 4 + 15) // 16 * 16)
-        stages = [buffers.fork() for _ in range(5)]
-        # Reserve PLE's wide buffers before other stages divide the shared chunks.
-        ple = PLEScratch.allocate(tokens, device, buffers=stages[2])
-        gdn = GDNScratch.allocate(tokens, device, world_size=world_size, buffers=stages[0], output=block_output)
-        qsa = QSAScratch.allocate(tokens, device, world_size=world_size, buffers=stages[1], output=block_output)
+        ple = PLEScratch.allocate(tokens, device)
+        gdn = GDNScratch.allocate(tokens, device, world_size=world_size, output=block_output)
+        qsa = QSAScratch.allocate(tokens, device, world_size=world_size, output=block_output)
         moe = QwenMoeScratch.allocate(tokens, device, intermediate=640 // world_size,
-                                    buffers=stages[3], output=block_output)
-        hc = HyperconnectionScratch.allocate(tokens, device, buffers=stages[4],
+                                    output=block_output)
+        hc = HyperconnectionScratch.allocate(tokens, device,
                                             projected=projected, block_input=block_input, lowrank=hyperconnection_lowrank)
-        buffers.join(*stages)
         return cls(embedding, residual, hidden, sample_hidden, logits, hc, gdn, qsa, ple, moe, local_logits)
 
     def rows(self, tokens: int, sequences: int):
@@ -209,7 +236,6 @@ class PreparedDecoder:
                  completion, frame_index, submission_sequence,
                  *, session, name: str, progress=None,
                  layer_outputs: torch.Tensor | None = None, embedding_injection=None,
-                 stage_outputs: dict[str, torch.Tensor] | None = None,
                  max_cache_pages: int | None = None,
                  residual_output: torch.Tensor | None = None, verification: bool = False,
                  gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None, coordinator=None,
@@ -223,11 +249,12 @@ class PreparedDecoder:
         from .moe import PreparedQwenMoe
         from .ple import PreparedPLE
 
-        if verification:
-            if scratch.sample_hidden.shape != scratch.hidden.shape:
-                raise ValueError("verification requires one sample row per hidden row")
+        if verification and scratch.sample_hidden.shape == scratch.hidden.shape:
             scratch = replace(scratch, sample_hidden=scratch.hidden)
         self.weights, self.scratch, self.state = weights, scratch, state
+        self.record_layout = None if gdn_records is None else (
+            gdn_records.layers, gdn_records.delta.shape[1], gdn_records.keys.shape[2],
+            gdn_records.delta.shape[2], gdn_records.delta.shape[3])
         self.verification = verification
         if residual_output is not None and (
                 residual_output.shape != scratch.residual.shape
@@ -239,8 +266,8 @@ class PreparedDecoder:
                 or layer_outputs.dtype != torch.bfloat16 or layer_outputs.device != scratch.hidden.device):
             raise ValueError("layer trace requires BF16 [48,token_capacity,10240] on the model device")
         self.layer_outputs = layer_outputs
+        self.context_capture, self.context_layers = None, ()
         self.embedding_injection = embedding_injection
-        self.stage_outputs = {} if stage_outputs is None else stage_outputs
         self.workspaces, self.ple_table, self.qsa_states = workspaces, ple_table, qsa_states
         source = scratch.hyperconnection.block_input
         language = weights.tree.model.language_model
@@ -269,7 +296,7 @@ class PreparedDecoder:
                     partitions=getattr(state, "gdn_partitions", None))
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=scratch.moe, workspace=workspaces,
-                projection_workspace=workspaces)
+                projection_workspace=workspaces, prefill=state.mode == "prefill")
             self.layers.append((attn_hc, attention, mlp_hc, moe))
             if runtime is not None:
                 from ignition.components.collectives import PreparedAllReduce
@@ -321,68 +348,96 @@ class PreparedDecoder:
             self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
                 coordinator=coordinator, name=name + ".sampling")
 
-    def __call__(self):
-        sampler = self.sampler
-        s = self.scratch
+    def capture_context(self, metadata, draft_config, *, compact_prefill=False):
+        from ignition.components.dflash2 import PreparedContextCapture
+
+        self.context_layers = draft_config.target_layers
+        self.context_capture = PreparedContextCapture(metadata,
+            2560 * len(self.context_layers), draft_config.attention.window,
+            compact_prefill=compact_prefill)
+        self.auxiliary = torch.empty(self.context_capture.shape, dtype=torch.bfloat16,
+                                     device=self.context_capture.device)
+
+    def functional(self, *, session):
+        if getattr(self, "_functional_requested", False):
+            return self
+        self._functional_requested = True
+        self.embedding.functional(session=session, dynamic_inputs=True)
+        for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
+            attn_hc.functional(session=session)
+            if index % 4 != 3:
+                attention.functional(session=session, dynamic_metadata=True)
+            else:
+                attention.functional(session=session)
+            mlp_hc.functional(session=session)
+            moe.functional(session=session)
+        for pair in self.reductions:
+            for reduction in pair:
+                reduction.functional(session=session)
+        self.ple.functional(session=session)
+        self.final_mixer.functional(session=session)
+        self.lm_head.functional(session=session)
+        if self.sampler is not None:
+            self.sampler.functional(session=session)
+        if self.context_capture is not None:
+            self.context_capture = self.context_capture.functional()
         if self.embedding_injection is not None:
-            self.embedding_injection.validate()
-        self.state.begin()
-        self.ple.embedding_lookup.publish()
-        self.embedding()
+            self.embedding_injection.functional()
+        return self
+
+    def release_outputs(self):
+        self.state.functional()
+        self.scratch = self.residual_output = None
+        self.auxiliary = None
+
+    def __call__(self, runtime):
+        from ignition.components.gdn_recovery import GDNLayerRecords
+        self.ple.embedding_lookup.publish(runtime.ple)
+        embedding = self.embedding(token_ids=runtime.ple.token_ids, num_rows=runtime.gdn.num_tokens)
         if self.embedding_injection is not None:
-            self.embedding_injection.inject()
-        if self.stage_outputs:
-            self.stage_outputs["embedding"].copy_(s.embedding)
-        s.residual.view(-1, 4, 2560).copy_(s.embedding[:, None, :])
-        if self.stage_outputs:
-            self.stage_outputs["residual_in"].copy_(s.residual)
+            self.embedding_injection.inject(embedding, runtime.injection_errors)
+        residual = torch.empty((embedding.shape[0], 10240), dtype=embedding.dtype, device=embedding.device)
+        residual.view(-1, 4, 2560).copy_(embedding[:, None, :])
+        records = None
+        if self.record_layout is not None:
+            layers, rows, key_heads, value_heads, width = self.record_layout
+            records = GDNLayerRecords.allocate(layers, rows, embedding.device,
+                key_heads=key_heads, value_heads=value_heads, width=width)
+        capture = None if self.context_capture is None else self.context_capture.begin(runtime.capture_metadata)
+        normalized = None
         for index, (attn_hc, attention, mlp_hc, moe) in enumerate(self.layers):
             if index == 1:
-                s.residual.add_(self.ple(s.residual))
-            mixed = attn_hc.mix(s.residual, pre_normalized=index not in (0, 1))
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["attn_mix"].copy_(mixed)
-                for field, value in attn_hc.trace_intermediates().items():
-                    self.stage_outputs[f"attn_{field}"].copy_(value)
-            block = attention(mixed)
+                residual.add_(self.ple(residual, runtime.ple, getattr(runtime, "ple_partitions", None)))
+                normalized = None
+            mixed, injection = attn_hc.mix_runtime(residual, normalized)
+            if index % 4 != 3:
+                layer_records = None if records is None or index not in records.layers else records[index]
+                block = attention(mixed, records=layer_records, metadata=runtime.gdn,
+                                  partitions=getattr(runtime, "gdn_partitions", None))
+            else:
+                block = attention(mixed, runtime.qsa)
             if self.reductions:
                 block = self.reductions[index][0](block)
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["attn_output"].copy_(block)
-                for field in ("projected_qkv", "convolved_qkv", "recurrence", "gated"):
-                    self.stage_outputs[f"gdn_{field}"].copy_(getattr(s.gdn, field))
-            attn_hc.combine_norm(s.residual, block)
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["attn_residual"].copy_(s.residual)
-            mixed = mlp_hc.mix(s.residual, pre_normalized=True)
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["mlp_mix"].copy_(mixed)
-                for field, value in mlp_hc.trace_intermediates().items():
-                    self.stage_outputs[f"mlp_{field}"].copy_(value)
+            residual, normalized = attn_hc.combine_norm_runtime(residual, block, injection)
+            mixed, injection = mlp_hc.mix_runtime(residual, normalized)
             block = moe(mixed)
             if self.reductions:
                 block = self.reductions[index][1](block)
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["mlp_output"].copy_(block)
-                self.stage_outputs["moe_router_logits"].copy_(moe.router_logits)
-                self.stage_outputs["moe_ids"].copy_(moe.router.ids)
-                self.stage_outputs["moe_weights"].copy_(moe.router.weights)
-                self.stage_outputs["moe_shared"].copy_(moe.shared.finish())
-                self.stage_outputs["moe_routed"].copy_(moe.routed_output)
             if index == 0:
-                mlp_hc.combine(s.residual, block)
+                residual = mlp_hc.combine_runtime(residual, block, injection)
+                normalized = None
             else:
-                mlp_hc.combine_norm(s.residual, block)
-            if index == 0 and self.stage_outputs:
-                self.stage_outputs["mlp_residual"].copy_(s.residual)
+                residual, normalized = mlp_hc.combine_norm_runtime(residual, block, injection)
             if self.layer_outputs is not None:
-                self.layer_outputs[index].copy_(s.residual)
-        if self.residual_output is not None:
-            self.residual_output.copy_(s.residual)
-        self.final_mixer.mix(s.residual, pre_normalized=True)
+                self.layer_outputs[index].copy_(residual)
+            if index in self.context_layers:
+                features = residual.view(-1, 4, 2560).mean(dim=1)
+                self.context_capture(capture, features, self.context_layers.index(index) * 2560)
+        hidden, _ = self.final_mixer.mix_runtime(residual, normalized)
         if self.scoring is not None:
-            self.scoring()
-        self.state.finish()
-        self.lm_head(s.sample_hidden)
-        if sampler is not None:
-            sampler()
+            self.scoring(hidden)
+        sample = self.state.finish_runtime(runtime, hidden, residual)
+        logits = self.lm_head(sample)
+        if self.sampler is not None:
+            self.sampler.run(logits)
+        return sample, logits, DecoderAuxiliary(residual, None if capture is None else capture[0]), records

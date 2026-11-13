@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+    "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "11ea52e156de38a458e6b7720ad45915d65b97d4ec979a09f55e3c9bd1b4d059",
+  "result_sha256": "fa9a8e2ab314c5d2ffca30fb7374ca7df8010e116186ad27636e6943f0f3e1af",
+  "insertions": [
+    3106,
+    3674
+  ]
+}

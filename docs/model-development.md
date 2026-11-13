@@ -2,7 +2,11 @@
 
 Recipes in `ignition/recipes/` own model composition, checkpoint mapping, state
 layouts, and graph preparation. Shared execution mechanisms belong in
-`ignition/components/`. Follow [repository guidance](../AGENTS.md),
+`ignition/components/`. Each recipe package's `recipe.py` defines `RECIPE`, a
+`Recipe` from [the declaration module](../ignition/recipes/declaration.py) that
+names its checkpoints, serving range, memory costs, speculation, and sampling
+defaults; `recipes()` in `ignition/recipes/__init__.py` lists the declarations
+the Ignition CLI offers. Follow [repository guidance](../AGENTS.md),
 [preparation development](preparation-development.md), and the relevant
 [model preparation and serving instructions](model-preparation.md).
 Performance changes also require [GPU performance work](performance-work.md).
@@ -34,24 +38,41 @@ Performance changes also require [GPU performance work](performance-work.md).
 
 - Agents adding or changing a recipe must read the model card and manually verify
   its recommended sampling parameters for the default serving mode. Declare the
-  complete defaults in the Ignition recipe and cite the recommendation at that
+  complete defaults as the recipe's `SamplingDefaults` (`Recipe.sampling_defaults`)
+  and cite the recommendation at that
   declaration. Never infer sampling policy from `generation_config.json`,
   `config.json`, Transformers defaults, or another model. Model-card recommendations
   take precedence over conflicting config files; unspecified filters are disabled
-  and penalties are neutral. Declare optional inclusive sampling ranges only from
+  and penalties are neutral. Declare optional inclusive sampling ranges
+  (`SamplingRange` entries in `SamplingDefaults.ranges`) only from
   the model author's recommendations. Clamp request distribution parameters to
   those ranges; an absent range fixes the parameter at its declared default.
   Seed remains request-controlled.
 - Ignition validates checkpoint configuration for structural data, including
   EOS and template tokens, image preprocessing, and vision position geometry.
   Export only the fields Helios consumes in first-class Protobuf messages.
-  Runtime assets are the tokenizer and chat template; do not package raw generation,
-  tokenizer, processor, or model configuration files. Helios consumes prepared
+  Runtime assets are the tokenizer and chat template; do not export raw generation,
+  tokenizer, processor, or model configuration files in a core. Helios consumes prepared
   settings without per-model sampling policy or config-file interpretation.
 
-Gemma 4 exports Google's canonical chat templates for every supported publisher
-and quantization. `ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja`
-serves E2B/E4B; `chat_template.google.jinja` serves 12B/26B-A4B/31B. The sources are
+Ignition obtains upstream chat templates from the user's downloaded Hugging Face
+checkpoint. Bundled `assets/*.patch.json` files contain only message-mark insertion
+offsets and exact source/result SHA-256 hashes, plus the pinned HF source location.
+They contain no upstream template text. `annotated_template_asset` in
+`ignition/preparation/frontend.py` rejects changed source bytes
+and supplies the annotated text to native export without modifying the checkpoint.
+Step's inference transformation (`ignition/recipes/step5/frontend.py`) replaces
+the template's `generation`/`endgeneration` training-span tags before applying
+its insertion patch. Kimi K3 and K3.1 bundle their segmented XTML templates as
+project code in `ignition/recipes/kimi3/assets/chat_template.jinja` and
+`ignition/recipes/kimi31/assets/chat_template.jinja`;
+their upstream reference is a Python encoder, not a Jinja template. DeepSeek V4
+and V4.1 use programmatic Rust encoders and have no template asset.
+
+Gemma 4 fetches Google's canonical chat templates for every supported publisher
+and quantization using the configured hub cache.
+`ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.patch.json`
+serves E2B/E4B; `chat_template.google.patch.json` serves 12B/26B-A4B/31B. The sources are
 [Google E4B at ee0ef602](https://huggingface.co/google/gemma-4-E4B-it/blob/ee0ef6023621cff504d758262d4e04895a5af4a2/chat_template.jinja)
 and [Google 26B-A4B at 4d7ae498](https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/chat_template.jinja),
 with message-boundary annotations. Preparation selects by model hidden size:
@@ -60,6 +81,22 @@ append an empty thought channel when thinking is disabled. Publisher-supplied
 templates do not select rendering behavior. Helios normalizes JSON-string tool
 arguments into objects before rendering. Tests compare the assets with the pinned
 Google sources and exercise prompt bytes, reasoning, tool rounds, and cache boundaries.
+
+Frontend tests use externally prepared templates instead of redistributing upstream
+sources as test fixtures. Fetch the pinned files with your Hugging Face access and
+prepare them before running the recipe template tests (no model weights are fetched):
+
+```sh
+python tests/frontend/prepare_templates.py --output /tmp/flare-test-templates
+export FLARE_TEST_TEMPLATE_DIR=/tmp/flare-test-templates
+pytest tests/preparation/test_template_patches.py
+cargo test --manifest-path helios/Cargo.toml --features server --lib frontend::
+cargo test --manifest-path helios/Cargo.toml --features server --test message_boundaries
+```
+
+Use `--hub-cache PATH` for a different HF cache and `--recipe NAME` to prepare
+selected recipes. `FLARE_TEST_TEMPLATE_DIR` is read only by tests. Actual checkpoint
+tokenizer comparisons require their documented checkpoint assets.
 
 ## Prompt renderers and checkpoint boundaries
 
@@ -85,9 +122,9 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   normalization reorders tool results, move each result's images with its text.
   Preserve the tokenizer's distinction between ordinary text and special tokens,
   including literal special-token spellings in user and tool content.
-- Explicit request options override packaged defaults. Validate unsupported
+- Explicit request options override prepared defaults. Validate unsupported
   options and malformed content explicitly. Preserve previously exported
-  packages' renderer selection, absent-field defaults, and packaged semantics.
+  cores' renderer selection, absent-field defaults, and prepared semantics.
 
 ### Complete-message endpoints
 
@@ -114,7 +151,7 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 
 ### Jinja integration
 
-- Package an annotated recipe template. Removing its mark annotations must
+- Export an annotated recipe template in the core. Removing its mark annotations must
   reproduce the authoritative template bytes, including any explicitly supported
   inference transformation. Preserve Jinja whitespace-control behavior and test
   actual rendered output; source equality alone does not validate placement.
@@ -123,6 +160,10 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
   expression is the number of completed segments. For example,
   `{% mark ns.segments | length %}` refers to segment entries, not bytes in the
   serialized JSON representation. Preserve each segment's `allow_special` value.
+- Normalized image blocks carry `image_index`. A token-segment template that
+  reorders images must emit that index on each image segment, covering every
+  source exactly once. Helios applies the same order to image sources and their
+  checkpoint hints. Templates without image indices retain input image order.
 - Place marks at root output sites after a completed preamble or message.
   Marks inside macros, captured assignments, or filter blocks are forbidden;
   mark the root call site after the helper returns. Handle each output branch,
@@ -130,7 +171,7 @@ and [native frontend interfaces](../helios/README.md#native-frontend).
 - Verify the recipe exports the annotated asset and Helios loads it through the
   shared compiler. Do not bypass the missing-annotation error or add a broad
   template fallback. Compatibility substitutions must match the exact template
-  bytes of an existing supported package.
+  bytes of an existing supported core.
 
 ### Programmatic encoder integration
 
@@ -189,8 +230,8 @@ satisfy these requirements:
    segmented and image paths where supported. Synthetic tokenizers are useful
    edge-case tests but do not establish checkpoint-tokenizer parity.
 3. Exercise the native request preparation used by each supported HTTP protocol
-   and load the exported package's frontend assets/settings. Validate older
-   packages when changing their loading or default semantics.
+   and load the exported core's frontend assets/settings. Validate older
+   cores when changing their loading or default semantics.
 4. Demonstrate repeated-prompt and changed-suffix cache reuse through the actual
    service, including ordinary and speculative execution where supported. Check
    consumed-prefix accounting and continuation correctness. Frontend CPU tests
@@ -211,9 +252,10 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   Ordinary NVFP4, CSF NVFP4, and MXFP4 expert storage use the same b12x MoE
   execution API. Dense weight formats likewise share `blockscaled.mm`; format
   handling belongs in loading and preparation, not recipe inference branches.
-  Reject fusion of NVFP4 projections except routed MoE w1/w3, whose dedicated
-  loader validates the shared scales. Never silently rescale or requantize
-  weights to make a fusion possible.
+  Group NVFP4 projections only when their weight and activation global scales
+  match exactly; concatenate the original packed rows and block scales without
+  changing calibration. Reject incompatible groups or retain separate projections.
+  Never silently rescale or requantize weights to make a fusion possible.
 - **Separate weight storage from arithmetic precision.** Keep BF16 weights in
   BF16 when the required accumulation/output is FP32; use
   [UnquantizedProjection](../ignition/components/linear.py) for that contract. Do not
@@ -237,11 +279,17 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   DeepSeek V4 and V4.1 pack all draft layers' context KV projections into one
   projection of the normalized target feedback. Per-layer normalization, rotary
   embedding, and accepted-token cache writes consume slices of the packed output.
+- **Allocate temporary values in the forward.** Pass local activations, metadata,
+  outputs, and workspaces explicitly between prepared components. Expose custom
+  operator reads, writes, and aliases so Inductor can plan reuse. Keep weights,
+  native inputs and outputs, cache history, and transport storage under explicit
+  ownership. Release declaration examples and tuning workspace before compilation.
+  Follow [serving temporary lifetimes](preparation-development.md#serving-temporaries-and-concurrent-lifetimes).
 - **Respect layouts after fusion.** A column slice of a fused output can be
   contiguous for batch one and strided for multiple rows. Check downstream b12x
   input, output, stride, and alignment contracts for every graph capacity.
-  Allocate reusable staging storage where needed; do not introduce runtime
-  allocation through an implicit `.contiguous()`.
+  Allocate required staging tensors in the forward and pass them to the operator.
+  Keep layout conversions visible to compilation.
 - **Overlap independent branches.** Shared experts should be considered for
   overlap with routing and routed experts; recurrent output-gate projections
   can overlap independent input projections. Use
@@ -254,16 +302,16 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   join dependencies; measure this ordering in the complete model graph.
   DeepSeek V4.1 records shared kernels first at capacities of one through four
   rows, and routed kernels first at larger overlapping decode, verification,
-  and draft capacities. Other recipes retain their shape- and kernel-dependent
+  and draft capacities. Other recipes use their own shape- and kernel-dependent
   ordering; a crossover measured for one expert geometry does not establish
   another geometry's crossover.
-- **Make overlap safe through compilation.** Declare every concurrently live
-  plan with [ScratchArena.register_parallel](../ignition/preparation/scratch.py).
-  Sequential work reuses storage; concurrent work gets disjoint storage sized
-  from the tuned plans. Refresh bindings after arena resizing. The fork must
-  follow input production, and the join must precede output consumption or
-  input/scratch reuse. Custom ops must expose reads, writes, aliases, and join
-  dependencies so compilation preserves those lifetimes.
+- **Make overlap safe through compilation.** Carry each branch's source, outputs,
+  encoded planes, and workspaces in an explicit pending record through its join.
+  The fork waits for input production, and the join precedes output consumption
+  or storage reuse. Pass the main-stream dependency to the join and expose every
+  operand's reads, writes, and aliases to Inductor. Use
+  [ScratchArena.register_parallel](../ignition/preparation/scratch.py) to size
+  concurrent preparation workspaces. Allocate serving temporaries in the forward.
 - **Shard the vocabulary projection under TP.** Use
   [PreparedVocabularyProjection](../ignition/components/vocabulary.py) to project
   contiguous vocabulary partitions and gather logits before designated-rank
@@ -286,5 +334,5 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   context updates and recurrent metadata required to alternate with wider rounds.
   Compare the complete width-one graph against ordinary decode, attribute any
   extra cost, and test transitions in both directions with partial/inactive rows
-  and cache-boundary crossings. Apply this check in each recipe's existing
+  and cache-boundary crossings. Apply this check in each recipe's
   preparation and tests.

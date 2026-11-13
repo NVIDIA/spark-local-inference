@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use crate::store::TierStore;
 use crate::{
     ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, StoreOutcome,
@@ -90,11 +95,6 @@ impl crate::store::TierStore for Tiers {
         match &mut self.0 {
             Some(tiers) => tiers.pin_export(tier, key, begin_tokens, want_row),
             None => Err(ExportRefusal::NotFound),
-        }
-    }
-    fn cascade(&mut self) {
-        if let Some(tiers) = &mut self.0 {
-            tiers.cascade();
         }
     }
     fn set_spill(&mut self, enabled: bool) {

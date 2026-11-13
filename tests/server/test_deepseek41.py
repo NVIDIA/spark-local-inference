@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """DeepSeek V4.1 C32 native replay with shared text, vision, and speculative scratch.
 
 Set FLARE_RUN_CUDA_TESTS=1 and FLARE_DEEPSEEK41_TEST_URL to a TP4 service

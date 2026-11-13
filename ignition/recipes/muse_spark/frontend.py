@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Recipient-header prompt syntax and ATEM tools for text-only Muse Spark."""
 
 import hashlib
@@ -6,7 +9,7 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend as _prepare_frontend
 
 
@@ -46,4 +49,4 @@ def runtime_assets(snapshot):
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     return {"tokenizer": {"path": str(tokenizer), "sha256": digest},
             "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
-                Path(__file__).with_name("assets") / "chat_template.jinja")}
+                Path(__file__).with_name("assets") / "chat_template.patch.json")}

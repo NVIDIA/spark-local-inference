@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! RDMA handshake and libibverbs device and queue-pair lifecycle (experimental).
 use std::io;
 

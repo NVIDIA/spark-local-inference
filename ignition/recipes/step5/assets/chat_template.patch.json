@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "stepfun-ai/Step-5-Preview-NVFP4",
+    "revision": "bc246cc2848e17b37f377eda8fd825c5b3018d1f",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "a74bb4bc8ff06941cbfc5454c22992144c923144794db20bf2a4f33672e1b450",
+  "result_sha256": "db7df5f23450584b9aded2c683b8573d87c396d71b20f3f5742d226405aa738e",
+  "insertions": [
+    2298,
+    5890
+  ]
+}

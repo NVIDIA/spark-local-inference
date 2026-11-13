@@ -1,11 +1,16 @@
-//! Reload package-owned TP4 transports after the Python preparation process exits.
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Reload core-owned TP4 transports after the Python preparation process exits.
 
 #[path = "allocation_watch.rs"]
 mod allocation_watch;
 
 use flare_helios::{
     execution::{BufferDescriptor, ExecutionManifest, ExecutionWorker},
-    runtime_package::{KvCacheLimit, LoadOptions, NativeModel, test_support},
+    runtime_core::{KvCacheLimit, LoadOptions, NativeModel, test_support},
     startup::StartupProgress,
 };
 use serde::Deserialize;
@@ -19,7 +24,9 @@ struct Expected {
 #[derive(Deserialize)]
 struct Process { pid: u32, start_ticks: u64 }
 #[derive(Deserialize)]
-struct Rank { cases: Vec<Case> }
+struct Rank { cases: Vec<Case>, #[serde(default)] profiles: Vec<Profile> }
+#[derive(Deserialize)]
+struct Profile { buffer: String, status: String, allowed: Vec<i32> }
 #[derive(Deserialize)]
 struct Case { graph: String, source: String, output: String, input: String, expected: String, step: usize }
 
@@ -97,13 +104,23 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // Bound the toy cache to its declared 128-token context. Memory mode's
     // 8192-token minimum is intended for model-serving memory allocation.
     let options = LoadOptions { kv_cache_limit: KvCacheLimit::Context, ..LoadOptions::default() };
-    let owner = unsafe { NativeModel::load(test_support::authorize(root.join("package")),
+    let owner = unsafe { NativeModel::load(test_support::authorize(root.join("core")),
         &[0, 1, 2, 3], &options, &StartupProgress::silent())? };
     let manifests = owner.manifests()?;
     assert_eq!(manifests.len(), 4);
     let driver = Driver::new()?;
     let fail_startup = std::env::args().any(|argument| argument == "--startup-failure");
-    let workers = if expected.startup_tuning {
+    let collective_profiles = !expected.ranks[0].profiles.is_empty();
+    let workers = if collective_profiles {
+        assert!(!fail_startup);
+        for (rank, manifest) in manifests.iter().enumerate() {
+            for profile in &expected.ranks[rank].profiles {
+                assert_eq!(scalar(&driver, manifest, &profile.buffer)?, -1);
+                assert_eq!(scalar(&driver, manifest, &profile.status)?, -1);
+            }
+        }
+        vec![unsafe { ExecutionWorker::new_threaded(manifests[0].clone(), manifests[1..].to_vec())? }]
+    } else if expected.startup_tuning {
         for manifest in &manifests {
             assert_eq!(scalar(&driver, manifest, "startup-count")?, 0);
             assert_eq!(scalar(&driver, manifest, "startup-selector")?, 0);
@@ -139,6 +156,18 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         manifests.iter().map(|manifest| unsafe { ExecutionWorker::new(manifest.clone()) })
             .collect::<Result<Vec<_>, _>>()?
     };
+    let mut selected = Vec::new();
+    for (rank, manifest) in manifests.iter().enumerate() {
+        let mut values = Vec::new();
+        for profile in &expected.ranks[rank].profiles {
+            let value = scalar(&driver, manifest, &profile.buffer)?;
+            assert!(profile.allowed.contains(&value), "startup selected an unlisted profile: {value}");
+            assert_eq!(scalar(&driver, manifest, &profile.status)?, 0);
+            values.push(value);
+        }
+        selected.push(values);
+    }
+    assert!(selected.iter().all(|values| values == &selected[0]), "startup profiles differ across ranks");
     let baseline = allocations.count();
     for case in &expected.ranks[0].cases {
         let mut inputs = Vec::new();
@@ -190,6 +219,11 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if expected.startup_tuning { check_startup(&driver, &manifests)?; }
+        for (rank, manifest) in manifests.iter().enumerate() {
+            for (profile, value) in expected.ranks[rank].profiles.iter().zip(&selected[rank]) {
+                assert_eq!(scalar(&driver, manifest, &profile.buffer)?, *value, "serving mutated its profile");
+            }
+        }
     }
     assert_eq!(allocations.count(), baseline, "CUDA allocation during native collective replay");
     for worker in &workers {
@@ -198,9 +232,9 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(error) = shutdown.error { return Err(error.into()); }
     }
     let maps = std::fs::read_to_string("/proc/self/maps")?;
-    assert!(!maps.contains("libpython") && !maps.contains("libtorch") && !maps.contains("site-packages"));
+    assert!(!maps.contains("libpython") && !maps.contains("libtorch") && !maps.contains("site-cores"));
     drop(workers);
     drop(owner);
-    println!("native TP4 collective package replay passed after Python exit: changed inputs, poisoned outputs, exact FP32-order BF16 bytes, source preservation, allocation stability, all-rank drain");
+    println!("native TP4 collective core replay passed after Python exit: changed inputs, poisoned outputs, exact payload bytes, source preservation, allocation stability, all-rank drain");
     Ok(())
 }

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
@@ -157,12 +163,28 @@ impl<'a> Reader<'a> {
     }
 }
 
+pub(super) fn validate_completion_packet(manifest: &ExecutionManifest) -> Result<()> {
+    let readiness = manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
+        .map_or(0, |buffer| buffer.shape[1] / 3);
+    let sidecars = usize::from(manifest.graphs.iter().any(|graph| graph.confidence_width > 0))
+        + usize::from(manifest.buffers.iter().any(|buffer| buffer.name == "completion_speculative_survival"));
+    let bytes = manifest.request_capacity().checked_mul(manifest.completion_fields())
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| manifest.request_capacity().checked_mul(manifest.completion_token_capacity - 1)
+            .and_then(|sidecar| sidecar.checked_mul(4 * sidecars)).and_then(|sidecar| n.checked_add(sidecar)))
+        .and_then(|n| n.checked_add((9 + 2 * readiness) * 8));
+    if bytes.is_none_or(|bytes| bytes > MAX_PACKET) {
+        return Err(invalid("prepared completion frame exceeds the tensor-parallel control packet capacity"));
+    }
+    Ok(())
+}
+
 /// Logical I/O schema only; CUDA addresses and handles never cross processes.
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
         6,
-        manifest.abi_version as usize,
+        manifest.completion_token_capacity,
         manifest.max_active,
         manifest.input_frame_bytes,
         manifest.buffers.len(),
@@ -384,11 +406,11 @@ pub(super) fn completion(value: &FrameCompletion) -> Vec<u8> {
     bytes
 }
 
-pub(super) fn proposal_confidence(reader: &mut Reader<'_>) -> Result<Option<[[f32; 7]; 64]>> {
+pub(super) fn proposal_confidence(reader: &mut Reader<'_>, slots: usize, token_capacity: usize) -> Result<Option<Vec<Vec<f32>>>> {
     match reader.number()? {
         0 => Ok(None),
         1 => {
-            let mut rows = [[0.0; 7]; 64];
+            let mut rows = vec![vec![0.0; token_capacity - 1]; slots];
             for value in rows.iter_mut().flatten() {
                 *value = f32::from_le_bytes(reader.bytes(4)?.try_into().unwrap());
             }
@@ -398,11 +420,11 @@ pub(super) fn proposal_confidence(reader: &mut Reader<'_>) -> Result<Option<[[f3
     }
 }
 
-pub(super) fn speculative_survival(reader: &mut Reader<'_>) -> Result<Option<[[f32; 7]; 64]>> {
+pub(super) fn speculative_survival(reader: &mut Reader<'_>, slots: usize, token_capacity: usize) -> Result<Option<Vec<Vec<f32>>>> {
     match reader.number()? {
         0 => Ok(None),
         1 => {
-            let mut rows = [[-1.0; 7]; 64];
+            let mut rows = vec![vec![-1.0; token_capacity - 1]; slots];
             for value in rows.iter_mut().flatten() {
                 *value = f32::from_le_bytes(reader.bytes(4)?.try_into().unwrap());
             }

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepare the pinned Qwen checkpoint for b12x without dequantizing weights."""
 
 from __future__ import annotations
@@ -89,6 +92,8 @@ def _expert_scale_vectors(sources: Mapping[str, torch.Tensor], layer: int, ids: 
         for projection in ("gate_proj", "up_proj", "down_proj"):
             for suffix in ("weight_scale_2", "input_scale"):
                 name = f"{prefix}.{projection}.{suffix}"
+                if name not in sources:
+                    raise ValueError(f"{name} is required for calibrated NVFP4 activations")
                 value = sources[name]
                 if value.device.type != "cpu" or value.dtype != torch.float32 or value.numel() != 1:
                     raise ValueError(f"{name} requires a CPU float32 scalar")
@@ -122,9 +127,10 @@ class QwenWeightLoader(DirectWeightLoader):
     layer of GPU staging for partitioning and native-layout preparation.
     """
 
-    def __init__(self, *args, shard=TensorParallelShard(0, 1), **kwargs):
+    def __init__(self, *args, shard=TensorParallelShard(0, 1), force_moe_decode_a16=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.shard = shard
+        self.force_moe_decode_a16 = force_moe_decode_a16
 
     def _selected_names(self):
         return {
@@ -160,7 +166,7 @@ class QwenWeightLoader(DirectWeightLoader):
         self, layer: int, *, expert_ids: Sequence[int] | None = None,
         scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> PreparedExperts:
-        """Prepare A4 routed experts; subset IDs define local ordering in tests.
+        """Prepare routed experts; subset IDs define local ordering in tests.
 
         Complete model layers require all 512 experts. Reusing ``scale_scratch``
         across layers requires serialized execution on one CUDA stream.
@@ -171,15 +177,24 @@ class QwenWeightLoader(DirectWeightLoader):
         ids = _expert_ids(layer, expert_ids)
         prefix = f"{TEXT_PREFIX}.layers.{layer}.mlp.experts"
         fmt, mode = expert_format(self.quantization, prefix)
+        activation_options = {}
+        if self.force_moe_decode_a16:
+            if fmt not in ("nvfp4", "nvfp4_csf"):
+                raise ValueError("force_moe_decode_a16 requires calibrated NVFP4 routed experts")
+            if (640 // self.shard.world_size) % 64:
+                raise ValueError("force_moe_decode_a16 requires rank-local expert intermediate width divisible by 64")
+            mode = "a16"
+            activation_options["a4_prefill"] = True
         if fmt != "nvfp4_csf":
             return self.load_fp4_experts(
                 tuple(f"{prefix}.{expert}" for expert in ids), hidden_size=2560, intermediate_size=640,
                 format=fmt, activation_mode=mode, intermediate_range=self.shard.partition(640, alignment=32 if fmt == "mxfp4" else 16),
-                scale_vectors=_expert_scale_vectors(self._sources, layer, ids) if mode == "a4" else None)
+                scale_vectors=_expert_scale_vectors(self._sources, layer, ids) if mode == "a4" or self.force_moe_decode_a16 else None,
+                **activation_options)
         return self.load_nvfp4_experts(
             tuple(f"{TEXT_PREFIX}.layers.{layer}.mlp.experts.{expert}" for expert in ids),
             hidden_size=2560, intermediate_size=640,
             intermediate_range=self.shard.partition(640, alignment=16),
             scale_vectors=_expert_scale_vectors(self._sources, layer, ids),
-            scale_scratch=scale_scratch,
+            scale_scratch=scale_scratch, activation_mode=mode, **activation_options,
         )

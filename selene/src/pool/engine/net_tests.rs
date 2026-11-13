@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The engine on a session without shared memory: windows pass through staging
 //! slots and the data-channel tasks, played here by the test, report what they did.
 

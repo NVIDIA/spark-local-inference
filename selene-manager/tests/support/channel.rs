@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A scripted instance on the data channel: it dials the grant's address, presents the
 //! token, and reads a claim's windows or fills a put's, byte for byte as a real client
 //! would. It shares the framing with the client crate and nothing else.

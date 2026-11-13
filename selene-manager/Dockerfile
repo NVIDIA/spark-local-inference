@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Build from the Flare repository root:
 #   docker build -f selene-manager/Dockerfile -t selene .
 FROM rust:1.94.1-bookworm AS build

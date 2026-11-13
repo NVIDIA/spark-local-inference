@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Native rank coordination over process-local CUDA executors and control sockets.
 
 #[cfg(test)]
@@ -94,6 +100,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor parallelism requires at least two ranks"));
         }
         manifest.validate()?;
+        wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
         let mut peers = Vec::new();
         for (index, socket) in sockets.into_iter().enumerate() {
@@ -111,7 +118,6 @@ impl TensorParallelExecutor {
         }
         // SAFETY: The caller retains all rank-local prepared resources through drain.
         let mut local = unsafe { GraphExecutor::new_unstarted(manifest)? };
-        let tuning_started = Instant::now();
         let startup = (|| -> Result<()> {
             for index in local.manifest().referenced_tuning_graphs() {
                 let mut bytes = Vec::new();
@@ -173,7 +179,6 @@ impl TensorParallelExecutor {
             }
             return Err(error);
         }
-        local.report_startup(tuning_started);
         Ok(Self {
             local,
             peers,
@@ -185,6 +190,12 @@ impl TensorParallelExecutor {
 
     pub fn outstanding(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Park on rank zero's own running frame; peers' completions arrive over their sockets
+    /// and are polled by the caller as before. See [`GraphExecutor::park`].
+    pub fn park(&self) -> bool {
+        self.local.park()
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
@@ -290,8 +301,8 @@ impl TensorParallelExecutor {
                         let graph = reader.number()?;
                         let frame = completion_frame(&mut self.pending, index, fence, graph)?;
                         let timing = wire::timing(&mut reader)?;
-                        let proposal_confidence = wire::proposal_confidence(&mut reader)?;
-                        let speculative_survival = wire::speculative_survival(&mut reader)?;
+                        let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
+                        let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
                         if reader.0.len() != self.local.manifest().completion_bytes() {
                             return Err(invalid("rank completion size differs from its ABI"));
                         }
@@ -399,6 +410,12 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
     match (&root.proposal_confidence, &peer.proposal_confidence) {
         (None, None) => {}
         (Some(root_values), Some(peer_values)) => {
+            for (values, records) in [(root_values, &root.records), (peer_values, &peer.records)] {
+                if values.len() != records.len() || values.iter().zip(records.iter()).any(|(row, record)|
+                    record.vector.as_ref().is_none_or(|vector| row.len() + 1 != vector.tokens.len())) {
+                    return Err(invalid("proposal confidence geometry differs from completion capacity"));
+                }
+            }
             // Only the root completion is returned to the shared scheduler.
             // Peer estimates do not select execution or enter the root's curve;
             // their floating-point agreement is not a control-plane invariant.
@@ -490,6 +507,9 @@ pub unsafe fn serve_rank(
     rank: usize,
     world: usize,
 ) -> Shutdown {
+    if let Err(error) = manifest.validate().and_then(|_| wire::validate_completion_packet(&manifest)) {
+        return Shutdown { drained: true, error: Some(error) };
+    }
     let mut executor = match unsafe { GraphExecutor::new_unstarted(manifest) } {
         Ok(executor) => executor,
         Err(error) => {
@@ -593,7 +613,13 @@ pub unsafe fn serve_rank(
                 if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
                     return Err(invalid("rank graph completion deadline expired"));
                 }
-                if active { std::thread::yield_now(); }
+                // A peer waiting only on its own running frame parks on it; a prepared frame waits
+                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
+                // the old loop's cooperative handoff after either.
+                if active {
+                    if prepared.is_none() { executor.park(); }
+                    std::thread::yield_now();
+                }
             }
         })();
         if let Err(error) = &result {

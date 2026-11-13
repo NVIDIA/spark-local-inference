@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared caller-owned replay schedules for equivalent paged attention geometry."""
 
 import torch
@@ -39,12 +42,12 @@ def _fake_update_schedules(lengths, cu, storage, handles):
 class PreparedPagedSchedules:
     """Keep scheduling storage outside numerical workspaces for a complete layer loop."""
 
-    def __init__(self, lengths, cu, layers, *, buffers):
+    def __init__(self, lengths, cu, layers):
         if any(t.dtype != torch.int32 or not t.is_contiguous() for t in (lengths, cu)):
             raise ValueError(
                 "shared attention schedules require contiguous int32 live metadata"
             )
-        self.lengths, self.cu, self.layers, self.buffers = lengths, cu, layers, buffers
+        self.lengths, self.cu, self.layers = lengths, cu, layers
         self.storage, self.counts = None, None
         self.components, self.groups = [], ()
 
@@ -66,9 +69,8 @@ class PreparedPagedSchedules:
         counts = schedule_counts(caps)
         if self.storage is None:
             self.counts = counts
-            self.storage = self.buffers.zeros(
-                (self.layers, schedule_nbytes(caps)), torch.uint8
-            )
+            shape = (self.layers, schedule_nbytes(caps))
+            self.storage = torch.zeros(shape, dtype=torch.uint8, device=self.lengths.device)
         elif counts != self.counts:
             raise ValueError(
                 "shared attention schedule capacities must match across layers"
@@ -88,11 +90,26 @@ class PreparedPagedSchedules:
                 owners.append(schedule)
         self.groups = tuple(owners)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.storage_shape = None if self.storage is None else tuple(self.storage.shape)
+        register_finalizer(session, self.release_examples)
+        self.local = True
+        return self
+
+    def release_examples(self):
+        self.handles = tuple(component.plan.handle for component in self.components)
+        for component in self.components:
+            component.schedule_storage = None
+        self.storage = self.lengths = self.cu = None
+        self.components, self.groups = [], ()
+
+    def __call__(self, lengths=None, cu=None):
+        if getattr(self, "local", False):
+            if self.storage_shape is None:
+                return None
+            storage = torch.zeros(self.storage_shape, dtype=torch.uint8, device=lengths.device)
+            _update_schedules(lengths, cu, storage, list(self.handles))
+            return storage
         if self.storage is not None:
-            _update_schedules(
-                self.lengths,
-                self.cu,
-                self.storage,
-                [component.plan.handle for component in self.components],
-            )
+            _update_schedules(self.lengths, self.cu, self.storage,
+                              [component.plan.handle for component in self.components])

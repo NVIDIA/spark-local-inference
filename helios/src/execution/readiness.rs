@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use crate::{Error, ExecutionError, Result};
 
 pub const MAX_READINESS_INTERVALS: usize = 64;

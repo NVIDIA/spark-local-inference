@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Bounded proposals retain strictly better scores when cutoff ties fill a block."""
 
 from contextlib import contextmanager

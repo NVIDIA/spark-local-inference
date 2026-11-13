@@ -1,4 +1,8 @@
-"""Prepare one checkpoint for native serving or runtime-package export."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prepare one checkpoint for native serving or runtime-core export."""
 
 import ipaddress
 import json
@@ -58,7 +62,7 @@ def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
     return {
-        "model_id": model.model_id, "served_names": [recipe.served_model_name],
+        "model_id": model.model_id, "served_names": [recipe.served_name(checkpoint)],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
@@ -119,7 +123,7 @@ def _check_host_shape(args) -> None:
 
 
 def export(args) -> int:
-    from ignition.preparation.package_snapshot import export_options
+    from ignition.preparation.core_snapshot import export_options
     from .publishing import validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
@@ -130,9 +134,9 @@ def export(args) -> int:
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
-    cache = configuration.directory('package_cache')
+    cache = configuration.directory('core_cache')
     if getattr(args, 'no_weights', False) and not (cache / 'blobs').is_dir():
-        raise UsageError('--no-weights requires an existing blob cache; export or convert a package first')
+        raise UsageError('--no-weights requires an existing blob cache; export or convert a core first')
     weight_source = reuse_weights = None
     if getattr(args, 'reuse_weights', False):
         import flare_heliopause
@@ -157,7 +161,7 @@ def export(args) -> int:
 
 
 def _export_hosts(args):
-    """Prepare one rank per host and collect a shared package snapshot on rank zero."""
+    """Prepare one rank per host and collect a shared core snapshot on rank zero."""
     import uuid
 
     from ignition.progress import phase
@@ -190,7 +194,8 @@ def _export_hosts(args):
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
@@ -202,6 +207,7 @@ def _export_hosts(args):
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
@@ -215,19 +221,19 @@ def _export_hosts(args):
         import torch
 
         from ignition.preparation.module_images import ModuleImages
-        from ignition.preparation.package_storage import PackageStorage
+        from ignition.preparation.core_storage import CoreStorage
 
         recorder = ModuleImages()
         with recorder:
             torch.cuda.set_device(0)
-            storage = PackageStorage(world=plan.world_size, local_ranks=1)
+            storage = CoreStorage(world=plan.world_size, local_ranks=1)
             with storage:
                 prepared = model.recipe.prepare(
                     model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
                     kernel_cache=configuration.directory("kernel_cache"), progress=progress,
-                    retain_graphs=True, package_storage=storage, ranks=rendezvous)
+                    retain_graphs=True, core_storage=storage, ranks=rendezvous)
         with prepared:
-            with phase(progress, "Export native packages", live=False) as stage:
+            with phase(progress, "Export native cores", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
                 options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
@@ -268,10 +274,12 @@ def _prepare(args):
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                      force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                      context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                      context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
@@ -295,11 +303,13 @@ def _prepare(args):
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
                      f" · mixed prefill {'on' if plan.mixed_prefill else 'off'}"
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
-                     f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
+                     f"{(' · online MXFP8 ' + plan.online_mxfp8_scope) if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
                      f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
+                     f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
+                     f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
                      f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}")
     if args.config is None and not configuration.exists:
@@ -326,11 +336,11 @@ def _prepare(args):
             preparation_options = {"retain_graphs": True}
             with recorder:
                 import torch
-                from ignition.preparation.package_storage import PackageStorage
+                from ignition.preparation.core_storage import CoreStorage
 
                 torch.cuda.set_device(0)
-                storage = PackageStorage(world=plan.world_size)
-                preparation_options["package_storage"] = storage
+                storage = CoreStorage(world=plan.world_size)
+                preparation_options["core_storage"] = storage
                 with storage:
                     prepared = prepare_recipe(model.recipe.prepare,
                         model.snapshot(hub_cache), plan, compile_forwards=not args.no_compile,
@@ -349,22 +359,22 @@ def _prepare(args):
             usage = model.recipe.usage(prepared)
             _keep_reserve(plan, usage)
             options = _server_options(configuration, model, plan)
-            from ignition.preparation.model_package import export_package
+            from ignition.preparation.model_core import export_core
 
             publisher = _publisher(configuration, args, model, hub_cache)
-            with phase(progress, "Export native package", live=False) as stage:
+            with phase(progress, "Export native core", live=False) as stage:
                 try:
                     options.pop("api_key")
                     from ignition.preparation.rebuild_manifest import from_plan
 
                     options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
-                    result = export_package(prepared, recorder, storage, None, options=options, publisher=publisher,
+                    result = export_core(prepared, recorder, storage, None, options=options, publisher=publisher,
                                  progress=progress, console=progress.console,
                                  staging=configuration.directory("export_staging"))
                 except Exception as error:
                     if args.verbose:
                         traceback.print_exc()
-                    raise PreparationError(f"native package export failed: {error}") from error
+                    raise PreparationError(f"native core export failed: {error}") from error
                 stage.update(str(result.entry_path))
             return 0, result
     finally:
@@ -388,7 +398,7 @@ def debug_serve(args) -> int:
 
     Requires heliopause's qualification build, which embeds the HTTP server in Python. With
     --direct, Ignition's diagnostic step loop serves instead, without Helios or that build.
-    Actual serving and comparisons against other runtimes use exported packages with flare run.
+    Actual serving and comparisons against other runtimes use exported cores with flare run.
     """
     from ignition.progress import phase
 
@@ -449,7 +459,8 @@ def debug_serve(args) -> int:
                          concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes,
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
+                         context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
+                         stream_overlap=stream_overlap(args, model),
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
@@ -460,12 +471,15 @@ def debug_serve(args) -> int:
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
+    options["thinking_token_budget"] = configuration.get("server.thinking_token_budget").value
+    options["scheduler_checkpoint_extra_work_fraction"] = configuration.get("server.scheduler_checkpoint_extra_work_fraction").value
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     if args.history_drafts is not None:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):
@@ -475,11 +489,11 @@ def debug_serve(args) -> int:
     storage = None
     if rendezvous is None:
         import torch
-        from ignition.preparation.package_storage import PackageStorage
+        from ignition.preparation.core_storage import CoreStorage
 
         torch.cuda.set_device(0)
-        storage = PackageStorage(world=plan.world_size)
-        preparation_options["package_storage"] = storage
+        storage = CoreStorage(world=plan.world_size)
+        preparation_options["core_storage"] = storage
     elif rendezvous is not None:
         preparation_options["ranks"] = rendezvous
     from contextlib import nullcontext
@@ -506,7 +520,7 @@ def debug_serve(args) -> int:
                             served_names=(*options["served_names"], options["model_id"]))
     else:
         code = _serve_prepared(prepared, bind, options)
-    # Native replay has drained before package-backed host mappings are released.
+    # Native replay has drained before core-backed host mappings are released.
     if storage is not None:
         for region in storage.host_regions:
             region.close()
@@ -580,6 +594,6 @@ def join(args) -> int:
                               topology=local_topology(gpu), report=progress)
     serve_peer(control, executor, args.rank, args.ranks, hub_cache=hub_cache, progress=progress,
                export_staging=configuration.directory("export_staging"), identity=identity,
-               package_cache=configuration.directory("package_cache"),
+               core_cache=configuration.directory("core_cache"),
                checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
     return 0

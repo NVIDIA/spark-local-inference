@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Pool protocol over the network listener: sessions without shared memory, TLS, RDMA
 //! and the startup warnings. What moves bytes over the data channel is in `pool_channel`.
 

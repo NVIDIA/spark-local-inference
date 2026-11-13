@@ -1,9 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Symmetric VMM mappings for b12x collectives during rank preparation."""
 
 import ctypes as C
-from multiprocessing.reduction import DupFd
+from copy import copy
 import os
 import pickle
+
+try:
+    from multiprocessing.reduction import DupFd
+except ImportError:
+    # The forward pickler imports this module on Windows; descriptor passing is POSIX-only.
+    DupFd = None
 
 from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
 
@@ -22,14 +31,15 @@ class PeerStorage(CudaRTLibrary):
     def __init__(self, storage):
         super().__init__()
         self.storage = storage
+        self._export_ranks = tuple(range(storage.world))
         self.owned = {}
         self.imported = {}
         self.imported_mappings = {}
         self.dynamic = {}
-        storage.library.flare_package_allocate.restype = C.c_void_p
+        storage.library.flare_core_allocate.restype = C.c_void_p
 
     def cudaMalloc(self, size):
-        pointer = self.storage.library.flare_package_allocate(
+        pointer = self.storage.library.flare_core_allocate(
             C.c_size_t(size), C.c_int(self.storage.device), None)
         if pointer is None:
             raise self.storage.error or MemoryError("collective allocation failed")
@@ -37,14 +47,29 @@ class PeerStorage(CudaRTLibrary):
         return pointer
 
     def cudaFree(self, pointer):
-        self.storage.library.flare_package_free(C.c_void_p(pointer), C.c_size_t(0),
+        self.storage.library.flare_core_free(C.c_void_p(pointer), C.c_size_t(0),
                                                C.c_int(self.storage.device), None)
         if self.storage.error:
             raise self.storage.error
         del self.owned[pointer]
 
-    def cudaIpcGetMemHandleBytes(self, pointer):
+    def for_group(self, group):
+        """Share allocation ownership while exporting descriptors only to group members."""
+        import torch.distributed as dist
+
+        ranks = tuple(dist.get_process_group_ranks(group))
+        if (not ranks or self.storage.rank not in ranks or len(set(ranks)) != len(ranks)
+                or any(rank < 0 or rank >= self.storage.world for rank in ranks)):
+            raise ValueError("peer storage group must contain the local rank and valid global ranks")
+        scoped = copy(self)
+        scoped._export_ranks = ranks
+        return scoped
+
+    def cudaIpcGetMemHandleBytes(self, pointer, *, ranks=None):
+        if DupFd is None:
+            raise RuntimeError("peer storage requires POSIX descriptor passing")
         cuda = self.storage.cuda
+        ranks = self._export_ranks if ranks is None else tuple(ranks)
         region = self.dynamic.get(pointer)
         mappings = [(pointer, self.owned[pointer])] if region is None else region.mappings
         parts = []
@@ -57,7 +82,7 @@ class PeerStorage(CudaRTLibrary):
             finally:
                 cuda.call("cuMemRelease", physical)
             try:
-                descriptors = [None if rank == self.storage.rank else DupFd(descriptor.value)
+                descriptors = [None if rank == self.storage.rank or rank not in ranks else DupFd(descriptor.value)
                                for rank in range(self.storage.world)]
                 parts.append((address, size, descriptors))
             finally:
@@ -102,20 +127,21 @@ class PeerStorage(CudaRTLibrary):
         """Map every rank's backed cache prefixes, retaining their full virtual extents for export."""
         import torch.distributed as dist
 
+        global_ranks = dist.get_process_group_ranks(group)
         payloads = []
         for region in regions:
             self.dynamic[region.address] = region
             self.owned[region.address] = region.extent
-            payloads.append(self.cudaIpcGetMemHandleBytes(region.address))
-        ranks = [None] * self.storage.world
-        dist.all_gather_object(ranks, payloads, group=group)
-        addresses = [[region.address] * self.storage.world for region in regions]
-        for rank, payloads in enumerate(ranks):
+            payloads.append(self.cudaIpcGetMemHandleBytes(region.address, ranks=global_ranks))
+        gathered = [None] * len(global_ranks)
+        dist.all_gather_object(gathered, payloads, group=group)
+        addresses = [[region.address] * len(global_ranks) for region in regions]
+        for group_rank, (global_rank, payloads) in enumerate(zip(global_ranks, gathered, strict=True)):
             if len(payloads) != len(regions):
                 raise ValueError("ranks must share the same cache regions")
-            if rank != self.storage.rank:
+            if global_rank != self.storage.rank:
                 for index, payload in enumerate(payloads):
-                    addresses[index][rank] = self.cudaIpcOpenMemHandleBytes(payload)
+                    addresses[index][group_rank] = self.cudaIpcOpenMemHandleBytes(payload)
         return addresses
 
     def reset(self):

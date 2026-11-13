@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import FrozenInstanceError
 from math import atan, exp, inf, log1p, pi, sqrt
 from random import Random

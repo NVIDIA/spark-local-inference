@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Terminal rendering consumes bounded telemetry independently of execution.
 
 mod scheduler;
@@ -337,7 +343,7 @@ pub struct Rates {
     /// Allocated draft positions per progressing generation request round.
     pub depth: Option<f64>,
     /// Weight bytes read per second: complete speculative programs per second times the bytes one decode
-    /// step reads, as the package declares; zero when it declares none.
+    /// step reads, as the core declares; zero when it declares none.
     pub weights: f64,
 }
 
@@ -441,7 +447,7 @@ pub fn gibibytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
-/// Weight bandwidth as `N GB/s`, or a dash when the package declares no decode weight bytes.
+/// Weight bandwidth as `N GB/s`, or a dash when the core declares no decode weight bytes.
 pub fn weight_bandwidth(s: Snapshot, r: Rates) -> String {
     if s.decode_weight_bytes == 0 {
         "—".into()
@@ -802,7 +808,7 @@ mod tests {
     #[test]
     fn terminal_renders_braille_and_handles_resize_without_nonfinite_rates() {
         let start = Instant::now();
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 16);
         metrics.scheduler(crate::scheduler::SchedulerStats {
             cached_pages: 3,
             free_pages: 20,

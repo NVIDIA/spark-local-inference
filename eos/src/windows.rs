@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::{
     fs::{File, OpenOptions},
     io,
@@ -90,9 +96,10 @@ fn check_alignment(file: File) -> io::Result<File> {
         {
             return Err(io::Error::last_os_error());
         }
+        // The performance sector size is a hint, not an unbuffered-I/O alignment requirement.
         for sector in [
             info.LogicalBytesPerSector,
-            info.PhysicalBytesPerSectorForPerformance,
+            info.PhysicalBytesPerSectorForAtomicity,
         ] {
             if sector == 0 || 4096 % sector != 0 {
                 return Err(io::Error::new(
@@ -120,7 +127,7 @@ pub fn direct_reopen(file: &File) -> io::Result<File> {
     reopen_direct(file, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
 }
 
-/// Keep a package immutable without retaining a buffered handle alongside its direct readers.
+/// Keep a core immutable without retaining a buffered handle alongside its direct readers.
 pub fn direct_read_guard(file: &File) -> io::Result<File> {
     reopen_direct(file, FILE_SHARE_READ)
 }
@@ -210,9 +217,9 @@ mod tests {
     use crate::{FileReadAt, completion::Queue};
 
     #[test]
-    fn direct_package_guard_preserves_immutability_after_buffered_reader_closes() {
+    fn direct_core_guard_preserves_immutability_after_buffered_reader_closes() {
         let path =
-            std::env::temp_dir().join(format!("flare-package-guard-{}.bin", std::process::id()));
+            std::env::temp_dir().join(format!("flare-core-guard-{}.bin", std::process::id()));
         std::fs::write(&path, [0x39; 4096]).unwrap();
         let source = OpenOptions::new()
             .read(true)

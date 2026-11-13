@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The seam through which the GPU tier makes host memory addressable by its devices.
 
 use crate::Result;
@@ -17,20 +22,20 @@ pub trait HostRegistrar {
     /// Reserve one range of pinned host memory made of one part per
     /// `(context, device, bytes)` request, in request order, each accessible
     /// to its own device and the host only. The host cannot address a record
-    /// across parts, so slab addresses in such a pool are identities.
+    /// across parts, so slot addresses in such a pool are identities.
     fn map_split(&self, requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>>;
 }
 
 /// An owned registration. Dropping it unregisters the range; the caller
 /// unmaps the range only afterwards. A failed drain keeps the handle, and so
 /// the registered range, alive.
-pub trait Registration: Send {
+pub trait Registration: Send + Sync {
     /// The address devices use for the start of the registered range.
     fn device_address(&self) -> u64;
 }
 
 /// An owned split mapping. Dropping it unmaps the parts and releases the range.
-pub trait SplitMapping: Send {
+pub trait SplitMapping: Send + Sync {
     /// First address of the reserved range.
     fn address(&self) -> usize;
     /// Bytes of the reserved range, including each part's rounding.

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The registration window: the one time a pool client may register host memory.
 //!
 //! Registering host memory with the GPU consumes device memory, which a serving

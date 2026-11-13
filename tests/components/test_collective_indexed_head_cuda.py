@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Final residual reduction and indexed head normalization preserve canonical boundaries."""
 
 from datetime import timedelta
@@ -17,7 +20,7 @@ def _rank(rank, world, rendezvous):
     from ignition.components.rms_norm import PreparedIndexedRMSNorm, PreparedRMSNorm
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -26,7 +29,7 @@ def _rank(rank, world, rendezvous):
                             timeout=timedelta(minutes=5))
     graphs = []
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=4096,
                 hidden_size=6144, element_bytes=4, ipc=storage.peer_storage)

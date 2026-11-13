@@ -1,15 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Raw generation logprobs from vocabulary shards and bounded statistic exchanges."""
 
 import torch
 import triton
 import triton.language as tl
 
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
+from ignition.preparation.persistent import persistent_copy
 
 from .collectives import PreparedAllGather
 from .completion import (
     LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_LOGPROB_TOKEN_IDS,
-    MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS,
+    MAX_TOP_LOGPROBS, validate_completion_buffers,
 )
 from .logprobs import _position, _sort_key, _sort_pair
 
@@ -169,29 +173,31 @@ class PreparedVocabularyParallelLogprobs:
 
     def __init__(self, logits, completion, slots, epochs, live, frame, *, vocabulary,
                  offset, runtime, session, coordinator, name):
+        validate_completion_buffers(completion.buffers(), completion.records.shape[1])
         if logits.ndim == 2:
             logits = logits[:, None, :]
         if logits.ndim != 3 or not logits.is_contiguous() or logits.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("vocabulary-sharded raw logits require contiguous BF16 or FP32 rows")
         batch, width, local = logits.shape
         world = 1 if runtime is None else runtime.world_size
-        if (min(batch, width, local, vocabulary) <= 0 or width > MAX_OUTPUT_TOKENS
+        if (min(batch, width, local, vocabulary) <= 0 or width > completion.token_capacity
                 or offset < 0 or offset % local
                 or offset >= world * local or vocabulary > world * local
                 or (world - 1) * local >= vocabulary):
             raise ValueError("raw logprob shards require equal partitions with padding on the final rank")
         tiles = triton.cdiv(local, _TILE)
-        self.offset = torch.tensor([offset], dtype=torch.int32, device=logits.device)
-        cursor = completion.scratch.cursor()
-        self.stats = cursor.zeros((batch, width, tiles, 2), torch.float32)
-        self.lse = cursor.zeros((batch, width), torch.float32)
-        self.keys = cursor.zeros((batch, width, tiles, _CANDIDATES), torch.uint64)
-        self.summary = cursor.zeros((batch * width, _SUMMARY), torch.float32)
-        self.gathered = cursor.zeros((batch * width, world * _SUMMARY), torch.float32)
+        self.offset = persistent_copy(torch.tensor([offset], dtype=torch.int32, device=logits.device))
+        self.stats = torch.zeros((batch, width, tiles, 2), dtype=torch.float32, device=logits.device)
+        self.lse = torch.zeros((batch, width), dtype=torch.float32, device=logits.device)
+        self.keys = torch.zeros((batch, width, tiles, _CANDIDATES), dtype=torch.uint64, device=logits.device)
+        self.summary = torch.zeros((batch * width, _SUMMARY), dtype=torch.float32, device=logits.device)
+        self.gathered = torch.zeros((batch * width, world * _SUMMARY), dtype=torch.float32, device=logits.device)
         self.summary_bits = self.summary.view(torch.bfloat16)
         self.gathered_bits = self.gathered.view(torch.bfloat16)
         self.exchange = PreparedAllGather(self.summary_bits, self.gathered_bits,
             runtime=runtime, session=session, coordinator=coordinator, name=name + ".exchange")
+        self.logits = logits
+        self.row_inputs = dict(slots=slots, generations=epochs, live_rows=live)
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         geometry = (local, vocabulary, self.offset, width, tiles, completion.records.shape[1], completion.records.shape[2])
         rows = (batch, width, 1)
@@ -210,7 +216,7 @@ class PreparedVocabularyParallelLogprobs:
                 self.gathered, self.lse, completion.logprobs, local, vocabulary, width,
                 *geometry[5:], world, _SUMMARY, _CANDIDATES,
                 triton.next_power_of_2(world * _CANDIDATES), MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS,
-                _CHOSEN, _REQUESTED, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
+                _CHOSEN, _REQUESTED, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
         )
         self.operations = ()
 
@@ -219,6 +225,41 @@ class PreparedVocabularyParallelLogprobs:
             self.operations = tuple(prepare_triton(kernel, args, grid, num_warps=warps)
                                     for kernel, args, grid, warps in self._preparation)
             self._preparation = ()
+
+    def functional(self, *, session, dynamic_inputs=False):
+        if not self.operations:
+            raise RuntimeError("vocabulary logprobs require preparation before functional conversion")
+        values = {name: getattr(self, name) for name in ("logits", "stats", "lse", "keys", "summary", "gathered")}
+        self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
+        names = {id(value): name for name, value in {**values, **self.row_inputs}.items()}
+        for operation in self.operations:
+            operation.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                          if id(value) in names)
+            operation.args = tuple(None if id(value) in names else value for value in operation.args)
+        self.exchange.functional(session=session)
+        if dynamic_inputs:
+            self.row_inputs = dict.fromkeys(self.row_inputs)
+        for name in (*values, "summary_bits", "gathered_bits"):
+            setattr(self, name, None)
+        return self
+
+    def run(self, logits, *, slots=None, generations=None, live_rows=None):
+        if logits.ndim == 2:
+            logits = logits[:, None, :]
+        local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
+                 for name, (shape, dtype) in self.local_layout.items() if name != "logits"}
+        local["logits"] = logits
+        for name, value in (("slots", slots), ("generations", generations), ("live_rows", live_rows)):
+            local[name] = self.row_inputs[name] if value is None else value
+            if local[name] is None:
+                raise ValueError("vocabulary logprobs require runtime row operands")
+        for index, operation in enumerate(self.operations):
+            if index in (2, 5):
+                local["gathered"] = self.exchange(local["summary"].view(torch.bfloat16)).view(torch.float32)
+            args = list(operation.args)
+            for slot, name in operation.local_slots:
+                args[slot] = local[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
 
     def __call__(self):
         if not self.operations:

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The manager's stream and experimental write-only RDMA data channels.
 
 use flare_selene::shared::region::Region;

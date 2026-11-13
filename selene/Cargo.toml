@@ -31,10 +31,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
-twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64", "alloc"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

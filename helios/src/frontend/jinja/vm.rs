@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -699,8 +705,53 @@ fn slice<'a>(
     }
 }
 
+#[cfg(not(windows))]
+use libc::strftime;
+// The libc crate declares no strftime for Windows; the C runtime provides it.
+#[cfg(windows)]
+unsafe extern "C" {
+    fn strftime(s: *mut libc::c_char, max: libc::size_t, format: *const libc::c_char, tm: *const libc::tm) -> libc::size_t;
+}
+
+fn json_object_members(source: &str) -> Result<Vec<(String, serde_json::Value, String)>> {
+    use serde::de::{MapAccess, Visitor};
+    use serde::Deserializer;
+
+    struct Members;
+    impl<'de> Visitor<'de> for Members {
+        type Value = Vec<(String, serde_json::Value, String)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+            let mut members = Vec::new();
+            while let Some((key, raw)) = map.next_entry::<String, Box<serde_json::value::RawValue>>()? {
+                let value: serde_json::Value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                members.push((key, value, raw.get().to_owned()));
+            }
+            Ok(members)
+        }
+    }
+
+    let mut decoder = serde_json::Deserializer::from_str(source);
+    let members = decoder.deserialize_map(Members).map_err(|error| Error::new(format!("invalid JSON object: {error}")))?;
+    decoder.end().map_err(|error| Error::new(format!("invalid JSON object: {error}")))?;
+    Ok(members)
+}
+
 fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Result<Value<'a>> {
     match name {
+        "json_object_members" => {
+            if args.len() != 1 || !kw.is_empty() {
+                return Err(Error::new("json_object_members expects one JSON object string"));
+            }
+            let source = args[0].as_str().ok_or_else(|| Error::new("json_object_members expects a JSON object string"))?;
+            Ok(Value::list(json_object_members(source)?.into_iter().map(|(key, value, raw)| {
+                Value::list(vec![Value::string(key), Value::owned(value), Value::string(raw)])
+            }).collect()))
+        }
         "strftime_now" => {
             let format = args.first().and_then(Value::as_str).ok_or_else(|| Error::new("strftime_now requires a format string"))?;
             let format = std::ffi::CString::new(format).map_err(|_| Error::new("strftime_now format contains NUL"))?;
@@ -712,7 +763,7 @@ fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Res
                 if libc::localtime_r(&now, local.as_mut_ptr()).is_null() { return Err(Error::new("local time is unavailable")); }
                 #[cfg(windows)]
                 if libc::localtime_s(local.as_mut_ptr(), &now) != 0 { return Err(Error::new("local time is unavailable")); }
-                libc::strftime(output.as_mut_ptr().cast(), output.len(), format.as_ptr(), local.as_ptr())
+                strftime(output.as_mut_ptr().cast(), output.len(), format.as_ptr(), local.as_ptr())
             };
             if length == 0 && !format.as_bytes().is_empty() { return Err(Error::new("strftime_now output exceeds 4095 bytes")); }
             output.truncate(length);

@@ -1,4 +1,8 @@
-"""Prepared b12x projections with caller-owned output and scratch storage."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prepared b12x projections with bound or forward-local output and scratch storage."""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ from b12x.gemm import bf16_gemv, blockscaled
 from b12x.preparation import PreparationSession, PreparedCall
 
 from ignition.components import sm103_projection
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.fixtures import bf16_gemv as bf16_fixtures
 from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
 from ignition.preparation.fixtures.projection import input_factory
@@ -41,6 +46,7 @@ class PreparedProjectionGroup:
         from .block_fp8 import BlockFP8Weight
 
         self.output = output
+        self.widths = weight.widths
         self.projections, self.copies = [], []
         for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
             destination = target
@@ -54,7 +60,22 @@ class PreparedProjectionGroup:
             self.copies.append(None if destination is target else target)
         self.plans = tuple(projection.plan for projection in self.projections)
 
+    def functional(self, *, session):
+        """Keep grouped weight formats while allocating projection results locally."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = self.copies = None
+            for projection in self.projections:
+                projection.functional(session=session)
+        return self
+
     def __call__(self, source):
+        if self.output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            for projection, target in zip(self.projections, output.split(self.widths, dim=-1), strict=True):
+                target.copy_(projection(source))
+            return output
         for projection, destination in zip(self.projections, self.copies, strict=True):
             value = projection(source)
             if destination is not None:
@@ -78,9 +99,29 @@ class BatchedUnquantizedProjection:
         record_numeric_tensor(weight)
         self.output = output
 
-    def __call__(self, source):
-        _bmm_out(source, self.weight, self.output)
-        return self.output
+    def functional(self, *, session):
+        """Allocate each batched result with the prepared output layout."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("batched output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        _bmm_out(source, self.weight, output)
+        return output
 
 
 @torch.library.custom_op("flare::bmm_out", mutates_args=("out",))
@@ -124,7 +165,8 @@ class UnquantizedProjection:
             declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
                 run=lambda: state.run(source, weight, out=output)),
                 benchmark_call=partial(bf16_fixtures.benchmark_call,
-                    inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)), weight=weight,
+                    inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None),
+                                         session=session), weight=weight,
                                        bias=None)),))
             return
         query = bf16_gemv.query_from_call(source, weight, out=output, bias=bias)
@@ -136,15 +178,27 @@ class UnquantizedProjection:
             name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(source, weight, out=output, bias=bias)),
             benchmark_call=partial(bf16_fixtures.benchmark_call,
-                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)),
+                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None), session=session),
                                    weight=weight, bias=bias),
         ),))
 
+    def functional(self, *, session):
+        """Allocate the selected projection's output inside each forward."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.dense:
-            torch.ops.flare.sm103_dense_out(source, self.weight, self.output, self.plan.handle)
-            return self.output
-        return bf16_gemv.mm(source, self.weight, out=self.output, plan=self.plan, bias=self.bias)
+            sm103_projection.bf16_out(source, self.weight, output, self.plan.handle)
+            return output
+        return bf16_gemv.mm(source, self.weight, out=output, plan=self.plan, bias=self.bias)
 
 
 class QuantizedProjection:
@@ -157,21 +211,32 @@ class QuantizedProjection:
         session: PreparationSession,
         name: str,
         activation_mode: str = "quantized",
+        source_activation: str = "identity",
         bias: torch.Tensor | None = None,
         workspace: ScratchArena | torch.Tensor | None = None,
         mxfp8_min_amax: float | None = None,
         encoded=None,
         rhs_prefetch_ready: bool = False,
-        allow_bf16_atomic_reduction: bool = True,
+        allow_bf16_atomic_reduction: bool | None = None,
         buffers=None,
+        examples=None,
+        example_role=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight, _validate_bias
+
+        if examples is not None and (not isinstance(example_role, str) or not example_role):
+            raise ValueError("shared projection declarations require an explicit operand role")
 
         # Address-dependent bias checks run before metadata-only forward compilation.
         _validate_bias(bias, out_features=weight.out_features, out_dtype=output.dtype, device=source.device)
         if bias is not None and _overlap(output, bias):
             raise ValueError("projection output must not overlap bias")
+
+        if allow_bf16_atomic_reduction is None:
+            allow_bf16_atomic_reduction = not isinstance(weight, MXFP8LinearWeight)
+        elif type(allow_bf16_atomic_reduction) is not bool:
+            raise TypeError("BF16 atomic reduction permission must be a boolean or None")
 
         self.weight = weight
         self.output = output
@@ -186,8 +251,12 @@ class QuantizedProjection:
         self.activation_mode = activation_mode
         self.bias = bias
         self.workspace = workspace
+        self.preparation_arena = workspace if isinstance(workspace, ScratchArena) else None
         self.encoded = self.quantizer_plan = None
+        self.encoded_layout = None
         self.sm103 = sm103_projection.is_sm103(source.device)
+        if source_activation != "identity" and (self.sm103 or not isinstance(weight, NVFP4LinearWeight)):
+            raise ValueError("rounded SwiGLU projection requires b12x NVFP4 execution")
         if mxfp8_min_amax is not None or encoded is not None:
             from b12x.quantization import mxfp8
 
@@ -203,14 +272,17 @@ class QuantizedProjection:
                                  " BF16 output, and caller-owned scratch")
             self.activation_mode = "quantized"
             rows, columns = source.shape
-            def allocate(shape, dtype):
+            def allocate(role, shape, dtype):
+                if examples is not None:
+                    return declaration_tensor(examples, example_role + "." + role, shape, dtype, source.device)
                 return (torch.zeros(shape, dtype=dtype, device=source.device) if buffers is None
                         else buffers.zeros(shape, dtype))
 
             values_shape, row_shape, mma_shape = mxfp8.dense_rows_storage_shapes(rows, columns)
             if encoded is None:
-                self.encoded_bases = (allocate(values_shape, torch.float8_e4m3fn),
-                                      allocate(row_shape, torch.uint8), allocate(mma_shape, torch.uint8))
+                self.encoded_bases = (allocate("values", values_shape, torch.float8_e4m3fn),
+                                      allocate("scale_rows", row_shape, torch.uint8),
+                                      allocate("scale_mma", mma_shape, torch.uint8))
                 self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
                 self.quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
                     source, self.encoded.values, self.encoded.scale_rows, self.encoded.scale_mma,
@@ -226,10 +298,10 @@ class QuantizedProjection:
             self.parts = packed.values, mxfp8.dense_scale_storage(packed.scale_mma), None
             for tensor in (packed.values, packed.scale_rows, packed.scale_mma):
                 record_numeric_tensor(tensor)
-            self.raw_source = encoded.values.view(rows, columns, 1), encoded.scale_mma
-            self.raw_weight = packed.values.view(weight.out_features, columns, 1), packed.scale_mma
-            self.raw_output = output.view(rows, weight.out_features, 1)
-            query = blockscaled.query_from_call(self.raw_source, self.raw_weight, out=self.raw_output,
+            raw_source = encoded.values.view(rows, columns, 1), encoded.scale_mma
+            raw_weight = packed.values.view(weight.out_features, columns, 1), packed.scale_mma
+            raw_output = output.view(rows, weight.out_features, 1)
+            query = blockscaled.query_from_call(raw_source, raw_weight, out=raw_output,
                 ab_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu", sf_vec_size=32,
                 rhs_prefetch_ready=rhs_prefetch_ready,
                 allow_bf16_atomic_reduction=allow_bf16_atomic_reduction)
@@ -249,12 +321,12 @@ class QuantizedProjection:
 
             def prepare_quantizer(state):
                 return PreparedCall(run=lambda: state.run(source, encoded.values, encoded.scale_rows,
-                                                          encoded.scale_mma), owners=(encoded,))
+                                                          encoded.scale_mma))
 
             def prepare_projection(state):
                 storage = candidate_workspace()
-                return PreparedCall(run=lambda: state.run(*self.raw_source, *self.raw_weight, None,
-                    self.raw_output, storage.view(torch.float32), torch.bfloat16, None),
+                return PreparedCall(run=lambda: state.run(*raw_source, *raw_weight, None,
+                    raw_output, storage.view(torch.float32), torch.bfloat16, None),
                     owners=prime_owners(workspace, storage, encoded))
 
             def benchmark_projection(state):
@@ -277,7 +349,7 @@ class QuantizedProjection:
                     trial.scale_rows.view(torch.uint8).copy_(seeds[1])
                     trial.scale_mma.view(torch.uint8).copy_(seeds[2])
 
-                return PreparedCall(run=lambda: state.run(*lhs, *self.raw_weight, None,
+                return PreparedCall(run=lambda: state.run(*lhs, *raw_weight, None,
                     out, storage.view(torch.float32), torch.bfloat16, None),
                     produce=produce, output=trial_output,
                     owners=(trial, trial_output, seeds, *prime_owners(workspace, storage)))
@@ -304,6 +376,8 @@ class QuantizedProjection:
                 weight=parts(weight)[:2])
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,
+                                               source_activation=source_activation,
+                                               allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
@@ -337,32 +411,71 @@ class QuantizedProjection:
             name=name,
             prepare_call=prepare,
             benchmark_call=partial(gemm_fixtures.benchmark_call,
-                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None)),
+                inputs=input_factory(source, output, storage=getattr(session, "benchmark_storage", None), session=session),
                 values=values, scales=scales, gain=gain, bias=bias, weight=weight,
                 activation_scale=self.activation_scale,
                 selected_workspace=selected_workspace),
         ),))
         register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        if self.encoded is not None:
+    def functional(self, *, session):
+        """Keep selected plans while moving private storage into the forward.
+
+        Preencoded activations must be supplied through ``encoded_bases`` on each
+        call. Projection-owned quantization allocates and fills its own bases.
+        """
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            self.workspace = None
+            self.workspace_nbytes = None
+            if self.encoded is not None:
+                self.encoded_layout = tuple((tuple(base.shape), base.dtype) for base in self.encoded_bases)
+                self.encoded = self.encoded_bases = None
+            register_finalizer(session, self._finalize_functional, workspace=self.preparation_arena)
+        return self
+
+    def _finalize_functional(self):
+        self.workspace_nbytes = self.plan.memory_requirements().scratch_nbytes
+        self.workspace = None
+        self.preparation_arena = None
+
+    def __call__(self, source: torch.Tensor, *, encoded_bases=None) -> torch.Tensor:
+        output, workspace = self.output, self.workspace
+        if output is None:
+            if self.workspace_nbytes is None:
+                raise RuntimeError("functional projection requires preparation before execution")
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+        if self.encoded is not None or self.encoded_layout is not None:
             from b12x import gemm
             from b12x.quantization import mxfp8
 
+            if encoded_bases is None:
+                if self.encoded is not None:
+                    encoded_bases = self.encoded_bases
+                elif self.quantizer_plan is not None:
+                    encoded_bases = tuple(torch.zeros(shape, dtype=dtype, device=source.device)
+                                          for shape, dtype in self.encoded_layout)
+                else:
+                    raise ValueError("functional preencoded projection requires encoded_bases")
             if self.quantizer_plan is not None:
-                mxfp8.quantize_dense_rows(source, *self.encoded_bases, plan=self.quantizer_plan)
-            gemm.mxfp8_mm_bases(self.encoded_bases[0], self.encoded_bases[2],
-                self.parts[0], self.parts[1], self.output, self.workspace, plan=self.plan)
-            return self.output
+                mxfp8.quantize_dense_rows(source, *encoded_bases, plan=self.quantizer_plan)
+            gemm.mxfp8_mm_bases(encoded_bases[0], encoded_bases[2],
+                self.parts[0], self.parts[1], output, workspace, plan=self.plan)
+            return output
+        if encoded_bases is not None:
+            raise ValueError("encoded_bases requires a prepared MXFP8 activation projection")
         if self.sm103:
             values, scales, gain = self.parts
-            torch.ops.flare.sm103_packed_out(source, values, scales, gain, self.output, self.workspace,
+            torch.ops.flare.sm103_packed_out(source, values, scales, gain, output, workspace,
                                              self.plan.handle)
         else:
-            blockscaled.mm(source, self.weight, out=self.output, plan=self.plan, workspace=self.workspace)
+            blockscaled.mm(source, self.weight, out=output, plan=self.plan, workspace=workspace)
         if self.bias is not None:
-            self.output.add_(self.bias)
-        return self.output
+            output.add_(self.bias)
+        return output
 
 
 _EXPANDED_BMM_WEIGHTS = {}
@@ -431,17 +544,37 @@ class BatchedQuantizedProjection:
                     run=lambda: state.run(rows_in, weight, rows_out, b_major=major, sf_axis=major))),))
             self.plans.append(plan)
 
-    def __call__(self, source):
+    def functional(self, *, session):
+        """Allocate each batched result with the prepared output layout."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
         from b12x import gemm
 
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("batched output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.expanded is not None:
-            torch.ops.flare.sm103_bmm_out(source, self.expanded, self.output)
-            return self.output
+            torch.ops.flare.sm103_bmm_out(source, self.expanded, output)
+            return output
         for (start, end), plan in zip(self.slices, self.plans, strict=True):
-            gemm.bmm(source[:, start:end], self.weight, self.output[:, start:end], plan=plan,
+            gemm.bmm(source[:, start:end], self.weight, output[:, start:end], plan=plan,
                 a_dtype="bfloat16", b_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu",
                 c_dtype="bfloat16", sf_vec_size=32, b_major=self.major, sf_axis=self.major)
-        return self.output
+        return output
 
 
 # cuBLAS writes strided-batched results straight into the caller's per-head views; traced copies would
@@ -508,10 +641,39 @@ class ParallelProjections:
         register_finalizer(session, self.refresh, workspace=workspace)
 
     def refresh(self):
+        if self.outputs is None:
+            self._finalize_functional()
+            return
         self.workspaces = list(self.arena.views(*(
             ((projection.plan.memory_requirements().scratch_nbytes,), torch.uint8)
             for projection in self.projections)))
 
     def __call__(self, source):
-        _parallel_mx_projections(source, self.values, self.scales, self.outputs,
-                                   self.workspaces, self.plans, self.stream_handle)
+        outputs, workspaces = self.outputs, self.workspaces
+        if outputs is None:
+            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                       for shape, stride, dtype in self.output_layouts]
+            workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
+                          for size in self.workspace_sizes]
+        _parallel_mx_projections(source, self.values, self.scales, outputs,
+                                workspaces, self.plans, self.stream_handle)
+        if self.outputs is None:
+            return tuple(outputs)
+
+    def functional(self, *, session):
+        """Allocate disjoint branch buffers while preserving the prepared fork and join."""
+        if self.outputs is not None:
+            self.output_layouts = tuple((tuple(output.shape), output.stride(), output.dtype)
+                                        for output in self.outputs)
+            self.outputs = self.workspaces = None
+            for projection in self.projections:
+                projection.functional(session=session)
+            register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.workspace_sizes = tuple(projection.plan.memory_requirements().scratch_nbytes
+                                     for projection in self.projections)
+        self.plans = [projection.plan.handle for projection in self.projections]
+        self.workspaces = None
+        self.arena = None

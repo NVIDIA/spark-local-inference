@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Independent prepared syntax selection for streamed reasoning and tool calls.
 
 use super::{
@@ -127,7 +133,7 @@ impl OutputPipeline {
                     start: config.content.start,
                     tools: config.content.tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect(),
                 }), reasoning_end: None, tool: None, function: None,
-                tool_ends_reasoning: false, response: None, tool_body_start: false,
+                tool_ends_reasoning: false, response: None, message_close: None, tool_body_start: false,
             }),
             Some((ToolParserKind::QwenCoder, 0, _)) => {
                 TaggedOutput::<super::chatml::FunctionTags<false>>::grammar_envelope(
@@ -160,6 +166,7 @@ impl OutputPipeline {
                 function: None,
                 tool_ends_reasoning: false,
                 response: Some(("", super::xtml::RESPONSE_CLOSE)),
+                message_close: Some(super::xtml::MESSAGE_CLOSE),
                 tool_body_start: false,
             }),
             Some((ToolParserKind::MiniMaxXml, _, _)) => {
@@ -176,6 +183,7 @@ impl OutputPipeline {
                 function: None,
                 tool_ends_reasoning: false,
                 response: None,
+                message_close: None,
                 tool_body_start: false,
             }),
         }?;
@@ -194,6 +202,10 @@ impl OutputPipeline {
                 .is_some_and(|(open, _)| r.terminal_markers.iter().any(|m| m == open))
         });
         Some(envelope)
+    }
+
+    pub fn reasoning_open(&self) -> bool {
+        dispatch!(self, parser => parser.reasoning_open())
     }
 
     pub fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
@@ -259,6 +271,61 @@ mod tests {
             .unwrap();
         output.finish().unwrap();
         output.message()
+    }
+
+    #[test]
+    fn reasoning_state_follows_recognized_closes_and_tool_boundaries() {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ThinkTags,
+            open: "<think>".into(),
+            close: "</think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec!["<tool_call>".into()],
+        });
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::QwenCoder,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        let config = |syntax| OutputConfig {
+            syntax,
+            control_tokens: vec![],
+            content: TaggedConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Reasoning,
+                tools: vec![json!({"function":{"name":"lookup"}})],
+            },
+        };
+        let mut parser = OutputPipeline::new(config(syntax.clone()));
+        assert!(parser.reasoning_open());
+        parser.push(Input::Text("plan<tool_call>")).unwrap();
+        parser.push(Input::Text("\n<funct")).unwrap();
+        parser.push(Input::Text("ion=lookup></function>")).unwrap();
+        parser.push(Input::Text("</tool_call>")).unwrap();
+        assert!(!parser.reasoning_open());
+        let mut parser = OutputPipeline::new(config(syntax.clone()));
+        parser.push(Input::Text("mention <tool_call>")).unwrap();
+        assert!(!parser.reasoning_open());
+        parser.push(Input::Text(" in prose")).unwrap();
+        assert!(parser.reasoning_open());
+        parser.push(Input::Text("</think>")).unwrap();
+        assert!(!parser.reasoning_open());
+        for (separator, opener) in [("", "<｜DSML｜tool_calls>"), (" ", "<｜DSML｜ calls>")] {
+            syntax.tools = Some(ToolParser {
+                kind: ToolParserKind::Dsml,
+                wrapping_newlines: 0,
+                tag_separator: separator.into(),
+            });
+            for boundary in ["</think>", opener] {
+                let mut parser = OutputPipeline::new(config(syntax.clone()));
+                assert!(parser.reasoning_open());
+                parser.push(Input::Text("\n")).unwrap();
+                assert!(parser.reasoning_open());
+                parser.push(Input::Text(boundary)).unwrap();
+                assert!(!parser.reasoning_open(), "{boundary}");
+            }
+        }
     }
 
     #[test]
@@ -543,6 +610,321 @@ mod tests {
         output.message()
     }
 
+    /// Each entry is an optional control-token ID and the text it decodes to.
+    /// Feed 0 pushes each entry separately, feed 1 splits every text into single
+    /// characters, and feed 2 pushes every token first and all text in one piece.
+    fn pushes_message(
+        syntax: &FrontendContract,
+        control_tokens: &[(u32, String)],
+        start: crate::output::tagged::OutputStart,
+        tools: &[serde_json::Value],
+        pushes: &[(Option<u32>, &str)],
+        feed: usize,
+    ) -> serde_json::Value {
+        let mut parser = OutputPipeline::new(OutputConfig {
+            syntax: syntax.clone(),
+            control_tokens: control_tokens.to_vec(),
+            content: TaggedConfig {
+                structured: false,
+                start,
+                tools: tools.to_vec(),
+            },
+        });
+        let mut output = Accumulator::new("delimiters".into());
+        let mut send = |parser: &mut OutputPipeline, input: Input<'_>| {
+            output.apply(parser.push(input).unwrap()).unwrap();
+        };
+        if feed == 2 {
+            for (token, _) in pushes {
+                if let Some(token) = token {
+                    send(&mut parser, Input::Token(*token));
+                }
+            }
+            let text: String = pushes.iter().map(|(_, text)| *text).collect();
+            send(&mut parser, Input::Text(&text));
+        } else {
+            for (token, text) in pushes {
+                if let Some(token) = token {
+                    send(&mut parser, Input::Token(*token));
+                }
+                if feed == 0 {
+                    send(&mut parser, Input::Text(text));
+                } else {
+                    for character in text.chars() {
+                        send(&mut parser, Input::Text(&character.to_string()));
+                    }
+                }
+            }
+        }
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        output.message()
+    }
+
+    fn contract(source: &str) -> FrontendContract {
+        serde_json::from_str::<crate::model::PreparedContract>(source)
+            .unwrap()
+            .frontend
+    }
+
+    /// The reported GLM-5.3 shape: reasoning, its close delimiter token, a short
+    /// answer, a second close delimiter token, then the rest of the answer. The
+    /// model's template treats every close delimiter in an assistant message as a
+    /// reasoning boundary, so a delimiter generated as its token never reaches
+    /// content. Every parser that gates reasoning delimiters by token identity
+    /// follows the same rule.
+    #[test]
+    fn close_delimiter_tokens_after_reasoning_never_become_content() {
+        use crate::output::tagged::OutputStart;
+        let qwen = contract(include_str!("../../tests/support/contracts/qwen38.json"));
+        let glm = contract(include_str!("../../tests/support/contracts/glm53.json"));
+        let mimo = contract(include_str!("../../tests/support/contracts/mimo_v2.json"));
+        let control = [(1, "<think>".to_owned()), (2, "</think>".to_owned())];
+        let text = |text| (None, text);
+        let close = (Some(2), "</think>");
+        let pieces = [
+            text("Reason."),
+            close,
+            text("**CFM6HF6M, 11."),
+            close,
+            text("**CFM6HF6M, 11**\n\nThe vault access code is CFM6HF6M."),
+        ];
+        let reasoning = "Reason.";
+        let content = "**CFM6HF6M, 11.**CFM6HF6M, 11**\n\nThe vault access code is CFM6HF6M.";
+        for (name, syntax) in [("glm", &glm), ("qwen", &qwen), ("mimo", &mimo)] {
+            for feed in 0..3 {
+                let message =
+                    pushes_message(syntax, &control, OutputStart::Reasoning, &[], &pieces, feed);
+                assert_eq!(message["reasoning_content"], reasoning, "{name} feed {feed}");
+                assert_eq!(message["content"], content, "{name} feed {feed}");
+            }
+        }
+        // Without a tool parser the pipeline still gates the declared delimiters.
+        let mut plain = glm.clone();
+        plain.tools = None;
+        for feed in 0..3 {
+            let message =
+                pushes_message(&plain, &control, OutputStart::Reasoning, &[], &pieces, feed);
+            assert_eq!(message["reasoning_content"], reasoning, "feed {feed}");
+            assert_eq!(message["content"], content, "feed {feed}");
+        }
+
+        let mut minimax = qwen.clone();
+        minimax.tools = Some(ToolParser {
+            kind: ToolParserKind::MiniMaxXml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        minimax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::MmThink,
+            open: "<mm:think>".into(),
+            close: "</mm:think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let minimax_control = [
+            (1, "<mm:think>".to_owned()),
+            (2, "</mm:think>".to_owned()),
+        ];
+        let minimax_pieces = [
+            text("Reason."),
+            (Some(2), "</mm:think>"),
+            text("**CFM6HF6M, 11."),
+            (Some(2), "</mm:think>"),
+            text("**CFM6HF6M, 11**\n\nThe vault access code is CFM6HF6M."),
+        ];
+        for feed in 0..3 {
+            let message = pushes_message(
+                &minimax,
+                &minimax_control,
+                OutputStart::Reasoning,
+                &[],
+                &minimax_pieces,
+                feed,
+            );
+            assert_eq!(message["reasoning_content"], reasoning, "feed {feed}");
+            assert_eq!(message["content"], content, "feed {feed}");
+        }
+
+        let mut gemma = qwen.clone();
+        gemma.tools = Some(ToolParser {
+            kind: ToolParserKind::GemmaCall,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        gemma.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ChannelThought,
+            open: "<|channel>thought".into(),
+            close: "<channel|>".into(),
+            wrapping_newlines: 1,
+            terminal_markers: vec!["<|tool_call>".into()],
+        });
+        let gemma_control = [(2, "<channel|>".to_owned())];
+        let gemma_pieces = [
+            text("<|channel>thought\nReason.\n"),
+            (Some(2), "<channel|>"),
+            text("Answer. "),
+            (Some(2), "<channel|>"),
+            text("More."),
+        ];
+        for feed in 0..3 {
+            let message = pushes_message(
+                &gemma,
+                &gemma_control,
+                OutputStart::Content,
+                &[],
+                &gemma_pieces,
+                feed,
+            );
+            assert_eq!(message["reasoning_content"], reasoning, "feed {feed}");
+            assert_eq!(message["content"], "Answer. More.", "feed {feed}");
+        }
+    }
+
+    /// The same shape with a plain-text close delimiter spelling: only the token
+    /// is protocol markup, so the spelling stays answer text.
+    #[test]
+    fn plain_close_delimiter_spellings_remain_content() {
+        use crate::output::tagged::OutputStart;
+        let glm = contract(include_str!("../../tests/support/contracts/glm53.json"));
+        let control = [(1, "<think>".to_owned()), (2, "</think>".to_owned())];
+        let pieces = [
+            (None, "Reason."),
+            (Some(2), "</think>"),
+            (None, "The answer is 42. Write </think> to close."),
+        ];
+        for feed in 0..3 {
+            let message =
+                pushes_message(&glm, &control, OutputStart::Reasoning, &[], &pieces, feed);
+            assert_eq!(message["reasoning_content"], "Reason.", "feed {feed}");
+            assert_eq!(
+                message["content"], "The answer is 42. Write </think> to close.",
+                "feed {feed}"
+            );
+        }
+    }
+
+    /// Dropping the delimiter token leaves content spans on the emitted answer
+    /// bytes and counts the dropped bytes as consumed.
+    #[test]
+    fn dropped_close_delimiters_keep_content_spans_and_consumed_bytes() {
+        use crate::output::tagged::OutputStart;
+        let glm = contract(include_str!("../../tests/support/contracts/glm53.json"));
+        let control = [(1, "<think>".to_owned()), (2, "</think>".to_owned())];
+        let pushes = [
+            (None, "Reason."),
+            (Some(2), "</think>"),
+            (None, "Answer."),
+            (Some(2), "</think>"),
+            (None, "More."),
+        ];
+        let mut parser = OutputPipeline::new(OutputConfig {
+            syntax: glm,
+            control_tokens: control.to_vec(),
+            content: TaggedConfig {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![],
+            },
+        });
+        let mut composer = String::new();
+        let mut spans = vec![];
+        let mut content = String::new();
+        for (token, text) in pushes {
+            if let Some(token) = token {
+                assert!(parser.push(Input::Token(token)).unwrap().is_empty());
+            }
+            composer.push_str(text);
+            let events = parser.push(Input::Text(text)).unwrap();
+            let mut emitted = parser.content_spans().into_iter();
+            for event in events {
+                if let Event::Content(fragment) = event {
+                    let range = emitted.next().flatten().expect("content lacks a span");
+                    assert_eq!(&composer[range.clone()], fragment);
+                    content.push_str(&fragment);
+                    spans.push(range);
+                }
+            }
+            assert_eq!(parser.consumed_bytes(), composer.len());
+        }
+        assert_eq!(content, "Answer.More.");
+        assert_eq!(parser.consumed_bytes(), composer.len());
+        let close = composer.rfind("</think>").unwrap();
+        assert!(
+            spans.iter().all(|range| !range.contains(&close)),
+            "{spans:?} covers the dropped delimiter at {close}"
+        );
+        assert!(spans.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    }
+
+    /// XTML channels carry their own control tokens. A reasoning close delimiter
+    /// generated as its control tokens in the response channel is protocol
+    /// markup, not answer text, and ordinary text escapes its `<` bytes so only
+    /// control-token text matches a raw marker.
+    #[test]
+    fn xml_reasoning_close_after_reasoning_never_becomes_content() {
+        use crate::output::tagged::OutputStart;
+        let mut syntax = contract(include_str!("../../tests/support/contracts/qwen38.json"));
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::Xtml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::XtmlThink,
+            open: "<|open|>think<|sep|>".into(),
+            close: "<|close|>think<|sep|>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let control = [
+            (101, "<|open|>".to_owned()),
+            (102, "<|close|>".to_owned()),
+            (103, "<|sep|>".to_owned()),
+        ];
+        let pieces = [
+            (None, "Reason."),
+            (Some(102), "<|close|>"),
+            (None, "think"),
+            (Some(103), "<|sep|>"),
+            (Some(101), "<|open|>"),
+            (None, "response"),
+            (Some(103), "<|sep|>"),
+            (None, "Answer. "),
+            (Some(102), "<|close|>"),
+            (None, "think"),
+            (Some(103), "<|sep|>"),
+            (None, "More."),
+        ];
+        for feed in 0..3 {
+            let message =
+                pushes_message(&syntax, &control, OutputStart::Reasoning, &[], &pieces, feed);
+            assert_eq!(message["reasoning_content"], "Reason.", "feed {feed}");
+            assert_eq!(message["content"], "Answer. More.", "feed {feed}");
+        }
+        // A spelled close delimiter stays answer text.
+        let pieces = [
+            (None, "Reason."),
+            (Some(102), "<|close|>"),
+            (None, "think"),
+            (Some(103), "<|sep|>"),
+            (Some(101), "<|open|>"),
+            (None, "response"),
+            (Some(103), "<|sep|>"),
+            (None, "Write <|close|>think<|sep|> to close."),
+        ];
+        for feed in 0..3 {
+            let message =
+                pushes_message(&syntax, &control, OutputStart::Reasoning, &[], &pieces, feed);
+            assert_eq!(
+                message["content"], "Write <|close|>think<|sep|> to close.",
+                "feed {feed}"
+            );
+        }
+    }
+
     #[test]
     fn finish_releases_text_held_for_a_delimiter_token() {
         use crate::output::tagged::OutputStart;
@@ -735,6 +1117,41 @@ mod tests {
                         "{pieces:?} feed {feed}"
                     );
                 }
+            }
+        }
+
+        // A prose mention of the opener is not a call, so it does not own a later
+        // close delimiter token: that token is still protocol markup and must not
+        // become content. The mention stays buffered until the delimiter token
+        // resolves it as prose, which is the state the opener check inspects. Both
+        // the Qwen function-tag and GLM argument-tag dialects run the shape:
+        // reasoning, the first close token, the mention, a second close token, then
+        // the rest of the sentence.
+        let prose = "Mention <tool_call> ";
+        let prose_cases: &[(&str, &FrontendContract)] = &[("qwen", &qwen), ("glm", &glm)];
+        for (name, syntax) in prose_cases {
+            for feed in 0..3 {
+                let message = delimited(
+                    syntax,
+                    OutputStart::Reasoning,
+                    &tools,
+                    &[text("Plan."), close, text(prose), close, text("in prose.")],
+                    feed,
+                );
+                let content = message["content"].as_str().unwrap_or_default();
+                assert_eq!(message["reasoning_content"], "Plan.", "{name} feed {feed}");
+                assert_eq!(
+                    content, "Mention <tool_call> in prose.",
+                    "{name} feed {feed}"
+                );
+                assert!(!content.contains("</think>"), "{name} feed {feed}");
+                assert_eq!(
+                    message
+                        .get("tool_calls")
+                        .map_or(0, |c| c.as_array().unwrap().len()),
+                    0,
+                    "{name} feed {feed}"
+                );
             }
         }
 

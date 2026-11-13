@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The instance's end of an RDMA data channel (experimental).
 //!
 //! The manager does every transfer: it writes a claim's windows into slots of this

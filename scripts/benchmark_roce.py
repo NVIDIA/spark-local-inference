@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure b12x RoCEnante graph replay between GPU ranks on separate hosts.
 
 Defaults match Qwen TP2 transport capacities and BF16 hidden reductions.
 The primary CUDA-event interval follows one untimed collective inside the graph
 to reduce launch skew. Samples include staging, proxy progress, and peer waits;
 they are amortized communication latency, not pure wire latency. This component
-diagnostic does not execute a Flare runtime package.
+diagnostic does not execute a Flare runtime core.
 """
 
 import argparse

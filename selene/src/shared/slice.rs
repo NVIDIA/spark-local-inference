@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Rank slices of windows.
 //!
 //! A window holds whole page records, then optionally the row record. Within a page record

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact-weight MTP operator and graph checks on an explicitly assigned GPU."""
 
 import os
@@ -8,7 +11,7 @@ import torch
 
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.qwen38 import TEXT_PREFIX
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.qwen38.attention import QSAMetadata, QSAState, RotaryTables
 from ignition.recipes.qwen38.mtp import MTPScratch, PreparedMTP, PreparedMTPFeedback
 from ignition.recipes.qwen38.mtp_weights import MTPWeights
@@ -54,16 +57,18 @@ def test_exact_weight_feedback_matches_published_operator_reference(weights):
     arena = ScratchArena("cuda:0")
     with PreparationSession(device="cuda:0", autotune=False, compile_workers=0) as session:
         op = PreparedMTPFeedback(weights.module, embedding, hidden, output, arena, session=session, name="mtp.feedback")
-        arena.finalize(); arena.freeze()
+        arena.finalize()
+        op.functional(session=session)
+        arena.freeze()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.stream(stream):
-                op()
+                output.copy_(op(embedding, hidden))
             stream.synchronize()
             with session.capture(), torch.cuda.graph(graph, stream=stream):
-                op()
+                output.copy_(op(embedding, hidden))
             session.freeze()
             expected = mtp_feedback.reference.feedback(embedding, hidden.view(-1, 4, 2560),
                 weights.module.pre_fc_norm_embedding.weight, weights.module.pre_fc_norm_hidden.weight,
@@ -85,8 +90,7 @@ def test_exact_weight_mtp_capture_replay_preserves_inputs_and_persistent_outputs
 
     host_hidden, host_tokens = inputs()
     live, capacity = len(host_tokens), 8
-    buffers = GraphBufferPool("cuda:0", chunk_bytes=2 << 20)
-    scratch = MTPScratch.allocate(capacity, 1, "cuda:0", buffers=buffers.cursor())
+    scratch = MTPScratch.allocate(capacity, 1, "cuda:0")
     hidden = torch.zeros_like(scratch.residual)
     tokens = torch.full((capacity,), -1, dtype=torch.int64, device="cuda")
     selected = torch.tensor([live - 1], dtype=torch.int64, device="cuda")
@@ -97,21 +101,30 @@ def test_exact_weight_mtp_capture_replay_preserves_inputs_and_persistent_outputs
     with PreparationSession(device="cuda:0", autotune=False, compile_workers=0) as session:
         op = PreparedMTP(weights, scratch, tokens, hidden, state, metadata, rotary, arena,
             output_indices=selected, session=session, name="mtp", max_cache_pages=2)
-        arena.finalize(); arena.freeze()
-        forward = op
+        arena.finalize()
+        op.functional(session=session)
+        op.release_outputs()
+        outputs = tuple(torch.empty_like(value) for value in (scratch.residual, scratch.hidden, scratch.logits))
+        def execute():
+            result = op(tokens, hidden, metadata, selected)
+            for destination, value in zip(outputs, (result.residual, result.hidden, result.logits), strict=True):
+                destination.copy_(value)
+
+        arena.freeze()
+        forward = execute
         if compiled == "aot":
             import io
             from ignition.preparation.aot import aot_forward
 
-            artifact = aot_forward(op)
-            artifact(op)
+            artifact = aot_forward(execute)
+            artifact(execute)
             data = type(artifact).serialize(artifact).serialized_data
             restored = torch.compiler.load_compiled_function(io.BytesIO(data))
-            forward = lambda: restored(op)
+            forward = lambda: restored(execute)
         elif compiled:
             from ignition.preparation.compilation import compile_forward
 
-            forward = compile_forward(op)
+            forward = compile_forward(execute)
         stream = torch.cuda.Stream(); stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
         try:
@@ -133,9 +146,16 @@ def test_exact_weight_mtp_capture_replay_preserves_inputs_and_persistent_outputs
             metadata.slot_mapping[:live].copy_(torch.arange(64, 64 + live, device="cuda"))
             observed = []
             for poison in (0xA5, 0x5A):
-                for chunks in buffers.chunks.values():
-                    for chunk in chunks:
-                        chunk.view(torch.uint8).fill_(poison)
+                from dataclasses import fields, is_dataclass
+
+                def poison_examples(value):
+                    if isinstance(value, torch.Tensor):
+                        value.view(torch.uint8).fill_(poison)
+                    elif is_dataclass(value):
+                        for field in fields(value):
+                            poison_examples(getattr(value, field.name))
+
+                poison_examples(scratch)
                 for field in state.__dataclass_fields__:
                     value = getattr(state, field)
                     value.fill_(-1 if value.dtype == torch.int64 else 0)
@@ -144,7 +164,7 @@ def test_exact_weight_mtp_capture_replay_preserves_inputs_and_persistent_outputs
                 before = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay(); torch.cuda.synchronize()
                 assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-                result = tuple(x.cpu().clone() for x in (scratch.residual, scratch.hidden, scratch.logits))
+                result = tuple(x.cpu().clone() for x in outputs)
                 assert all(torch.isfinite(x).all() for x in result)
                 assert torch.count_nonzero(result[0][live:]) == 0
                 assert torch.count_nonzero(result[1][live:]) == 0
@@ -168,6 +188,7 @@ def test_cache_only_absorption_matches_full_mtp_cache_under_replay(weights, comp
     hidden = host_hidden.repeat((capacity + len(host_tokens) - 1) // len(host_tokens), 1)[:capacity].to(device)
     tokens = host_tokens.repeat((capacity + len(host_tokens) - 1) // len(host_tokens))[:capacity].to(device)
     selected = torch.zeros(1, dtype=torch.int64, device=device)
+    shared_hidden = torch.empty_like(hidden)
     metadata = QSAMetadata.allocate(tokens=capacity, batch=1, context=128, device=device)
     state = QSAState.allocate(pages=2, slots=1, device=device, draft_tokens=7)
     rotary = RotaryTables.allocate(weights.module.config, 128, device)
@@ -176,24 +197,34 @@ def test_cache_only_absorption_matches_full_mtp_cache_under_replay(weights, comp
     with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
         variants = [(False, False), (True, False), (False, True), (True, True)]
         operators = [PreparedMTP(weights, scratch, tokens,
-            scratch.hyperconnection.normalized if shared else hidden, state, metadata, rotary, arena,
+            shared_hidden if shared else hidden, state, metadata, rotary, arena,
             output_indices=selected, session=session, name=f"mtp.cache_only.{cache_only}.shared.{shared}",
             max_cache_pages=2, cache_only=cache_only) for cache_only, shared in variants]
         assert not hasattr(operators[1], "moe") and not hasattr(operators[1], "lm_head")
-        arena.finalize(); arena.freeze()
+        arena.finalize()
+        for op in operators:
+            op.functional(session=session)
+            op.release_outputs()
+        outputs = tuple(torch.empty_like(value) for value in (scratch.residual, scratch.hidden, scratch.logits))
+        arena.freeze()
         stream = torch.cuda.Stream(); stream.wait_stream(torch.cuda.current_stream())
         try:
-            for op in operators:
-                forward = op
+            for op, (cache_only, shared) in zip(operators, variants, strict=True):
+                def execute(op=op, shared=shared):
+                    result = op(tokens, shared_hidden if shared else hidden, metadata, selected)
+                    if result is not None:
+                        for destination, value in zip(outputs, (result.residual, result.hidden, result.logits), strict=True):
+                            destination.copy_(value)
+                forward = execute
                 if compiled:
                     import io
                     from ignition.preparation.aot import aot_forward
 
-                    artifact = aot_forward(op)
-                    artifact(op)
+                    artifact = aot_forward(execute)
+                    artifact(execute)
                     data = type(artifact).serialize(artifact).serialized_data
                     restored = torch.compiler.load_compiled_function(io.BytesIO(data))
-                    forward = lambda op=op, restored=restored: restored(op)
+                    forward = lambda execute=execute, restored=restored: restored(execute)
                 with torch.cuda.stream(stream):
                     forward()
                 stream.synchronize()
@@ -226,16 +257,15 @@ def test_cache_only_absorption_matches_full_mtp_cache_under_replay(weights, comp
                 initial = {field: getattr(state, field).clone() for field in state.__dataclass_fields__}
                 graphs[0].replay()
                 expected = {field: getattr(state, field).clone() for field in state.__dataclass_fields__}
-                outputs = (scratch.residual, scratch.hidden, scratch.logits)
                 expected_outputs = tuple(value.clone() for value in outputs)
                 for index, (cache_only, shared) in enumerate(variants[1:], 1):
                     for field, value in initial.items():
                         getattr(state, field).copy_(value)
-                    scratch.hidden.fill_(19); scratch.logits.fill_(23)
+                    outputs[1].fill_(19); outputs[2].fill_(23)
                     scratch.qsa.attended.fill_(29); scratch.qsa.selected_positions.fill_(-17)
                     arena.tensor.fill_(0xA5 if step % 2 else 0x5A)
                     if shared:
-                        scratch.hyperconnection.normalized.copy_(hidden)
+                        shared_hidden.copy_(hidden)
                     torch.cuda.synchronize()
                     allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
                     graphs[index].replay(); torch.cuda.synchronize()
@@ -243,7 +273,7 @@ def test_cache_only_absorption_matches_full_mtp_cache_under_replay(weights, comp
                     for field, value in expected.items():
                         assert torch.equal(getattr(state, field), value), (compiled, start, field, shared)
                     if cache_only:
-                        assert (scratch.hidden == 19).all() and (scratch.logits == 23).all()
+                        assert (outputs[1] == 19).all() and (outputs[2] == 23).all()
                         assert (scratch.qsa.attended == 29).all() and (scratch.qsa.selected_positions == -17).all()
                     else:
                         for observed, expected_output in zip(outputs, expected_outputs, strict=True):

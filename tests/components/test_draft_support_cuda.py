@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Sparse broadcast support preserves dense proposal bytes and clears divergent local support."""
 import os
 
@@ -9,8 +12,9 @@ pytestmark = pytest.mark.skipif(not (os.environ.get('FLARE_RUN_CUDA_TESTS') and 
 
 
 @pytest.mark.parametrize('batch,vocab', [(1, 257), (4, 129280)])
+@pytest.mark.parametrize("shortlist", [False, True])
 @torch.no_grad()
-def test_support_emission_and_sparse_restore_native_replay(batch, vocab):
+def test_support_emission_and_sparse_restore_native_replay(batch, vocab, shortlist):
     from ignition.components.draft_sampling import PreparedDraftDistribution, DRAFT_CANDIDATES
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from ignition.preparation.graphs import PreparedGraphBundle
@@ -29,6 +33,10 @@ def test_support_emission_and_sparse_restore_native_replay(batch, vocab):
     op = PreparedDraftDistribution(logits, state, slots, epochs, live, candidates,
         seed=seed, offset=offset,
         sampled=torch.zeros(batch, dtype=torch.int64, device='cuda'))
+    if shortlist:
+        support = torch.arange(16, dtype=torch.int64, device='cuda').expand(batch, -1).contiguous()
+        logits[:, :, 16:] = -torch.inf
+        op.bind_shortlist(support)
     op.prepare()
     reference = PreparedDraftDistribution(logits, state, slots, epochs, live, candidates,
         seed=seed, offset=offset, sampled=torch.zeros_like(seed))
@@ -54,6 +62,8 @@ def test_support_emission_and_sparse_restore_native_replay(batch, vocab):
             logits[:, :, 0] = 2.
             logits[:, :, 4] = 1.
             logits[:, :, 7] = .5
+        if shortlist:
+            logits[:, :, 16:] = -torch.inf
         reference()
         op()
         assert torch.equal(op.probabilities.view(torch.int32), reference.probabilities.view(torch.int32))
@@ -89,6 +99,8 @@ def test_support_emission_and_sparse_restore_native_replay(batch, vocab):
             state.parameters[:, 1] = 1.
             if mode == 'local_invalid':
                 logits.fill_(float('nan'))
+            if shortlist:
+                logits[:, :, 16:] = -torch.inf
             root_ids.zero_()
             root_ids[:, :4] = torch.tensor([0, 4, 7, 11], device='cuda')
             root_probabilities.zero_()

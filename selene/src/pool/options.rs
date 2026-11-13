@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use crate::{CacheGeometry, geometry};
 
 /// The manager an instance shares prefix checkpoints with.

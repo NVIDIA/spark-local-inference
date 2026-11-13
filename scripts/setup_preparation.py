@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Update FlashInfer, install preparation dependencies, and rebuild native extensions."""
 
 from __future__ import annotations
@@ -18,10 +21,6 @@ def main() -> int:
             ["uv", "sync", "--upgrade-package", "flashinfer-python", "--extra", "prepare", "--extra", "test",
              "--reinstall-package", "flashinfer-python", "--reinstall-package", "flare-heliopause"],
             cwd=ROOT, env=environment, check=True,
-        )
-        subprocess.run(
-            ["uv", "run", "--no-sync", "python", "-m", "ignition.patches"],
-            cwd=ROOT, check=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"preparation environment setup failed: {exc}", file=sys.stderr)

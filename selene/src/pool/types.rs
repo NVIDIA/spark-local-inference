@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The pool's vocabulary in selene's own types. The wire messages stay inside
 //! the codec; nothing here depends on them.
 

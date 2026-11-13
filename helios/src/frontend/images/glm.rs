@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! GLM5Next aligned canvas resize, black padding, and CLIP normalization profile.
 
 use super::{ImageGeometry, ImageLimits, ProcessedImages, RgbImage, resize as bicubic};

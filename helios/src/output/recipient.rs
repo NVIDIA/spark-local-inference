@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Recipient headers with internal message boundaries and ATEM function arguments.
 
 use super::{Event, Input, Termination, tagged::OutputConfig};
@@ -72,6 +77,10 @@ impl RecipientOutput {
             pending_text: String::new(),
         }
     }
+    pub fn reasoning_open(&self) -> bool {
+        matches!(self.state, State::Reasoning)
+    }
+
     pub fn content_spans(&self) -> Vec<Option<std::ops::Range<usize>>> {
         self.spans.clone()
     }

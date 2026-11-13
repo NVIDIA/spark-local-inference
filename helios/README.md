@@ -1,24 +1,27 @@
 # Helios
 
 Helios (`flare-helios`) is Flare's Rust runtime library. It supplies a native
-frontend, prefix cache, live-request scheduler, CUDA package loader, and graph
-execution through direct driver calls. The `flare/` crate's binary links this library
-and serves a prepared package in the same process. Neither depends on Python
-or the internal preparation tools.
+frontend, prefix cache, live-request scheduler, CUDA core loader, and graph
+execution through direct driver calls. The `flare/` shared application library
+links Helios; `flare-cli/` provides the terminal client and `flare-winui/` the
+native Windows client. Prepared-core serving runs in each client's process.
+These application and runtime libraries do not depend on Python or the internal
+preparation tools.
 
 The internal `ignition` command imports the `flare_heliopause` CPython extension
 to prepare and export a model in its own process. Heliopause depends on Helios;
 its crate owns the Python bindings and export allocator and builds no executable.
-`ignition export` writes the package and closes the prepared model.
-`flare run PACKAGE` loads it in a separate serving process. See
-[runtime packages](../docs/runtime-package-design.md) for the resource contract.
+`ignition export` writes the core and closes the prepared model.
+`flare run CORE` loads it in a separate serving process. See
+[runtime cores](../docs/runtime-core-design.md) for the resource contract.
 
-The `server` feature supplies HTTP/SSE and model scheduling. Native package
+The `server` feature supplies HTTP/SSE and model scheduling; the `runtime-core`
+feature supplies core loading. `flare/` and `flare-cli/` enable both. Native core
 serving uses the typed prepared contract for single-rank and tensor-parallel
 execution. Raw replay and two-frame graph execution are available through
 Rust APIs and heliopause's diagnostic Python bindings. In-process HTTP
 bindings require heliopause's `qualification` feature; normal installations
-serve only through a package.
+serve only through a core.
 
 During export, Ctrl-C and SIGTERM terminate Ignition directly, bypassing
 Python finalizers and CUDA graph destruction. While serving, `flare run`
@@ -29,24 +32,32 @@ terminal dashboard reads native metrics without contacting the GPU.
 output remains plain startup logs.
 
 Left/right arrows or Tab switch between the throughput overview and scheduler
-details. The scheduler pane groups graph completions over two seconds by graph
-kind, captured batch capacity (`b`), prefill/token capacity (`t`), or actual
-speculative proposal depth (`d`), independently of target width and packed rows.
-It shows call counts, mean and
-maximum GPU duration, and each shape's share of observed graph time. Wider
-terminals also show actual requests per call, which can be below the captured
-batch capacity. GPU duration is the maximum participating rank's CUDA event
+details. The scheduler pane totals graph completions over two seconds for each
+captured graph. A row's label gives the graph kind, batch capacity (`b`), and
+token capacity (`t`). In place of `t`, a speculative graph shows its target
+width (`w`) and packed target rows (`rows`), and a mixed graph shows its prompt
+capacity (`p`) and decode width (`w`).
+Each row shows the call count, mean GPU duration, and the graph's share of
+observed graph time. Wider
+terminals also show the maximum GPU duration and actual requests per call, which
+can be below the captured batch capacity. GPU duration is the maximum participating rank's CUDA event
 interval; these shares are not device utilization. Missing timings are counted
 as untimed and excluded from duration averages.
 
 Request rows identify the native slot and generation, keeping reused slots
 separate. Their ten-second history marks completion observations, not GPU start
-or end timestamps. Each cell shows the latest model-work completion; setup is
-shown only when the cell contains no model work. Up/down arrows scroll requests.
-Wide terminals show consumed prompt tokens, generated tokens, time since model
-progress (`Gap ms`), time since visible output (`Out ms`), and useful-progress
-deficit (`Debt ms`). Retired requests remain visible while their history remains.
-Gaps and deficits refer to the request-state sample, whose age is displayed.
+or end timestamps. Each cell shows the latest prefill, decode, speculative, or
+vision completion in its interval; a completion of another graph kind is shown
+only when the cell contains none of those. Up/down arrows scroll requests.
+Every row shows `Request` (`slot.generation`), `Phase` (the scheduler's request
+phase), and `Gap ms`, the time since the request last committed prompt or output
+tokens, or since its arrival. A request pane at least 100 columns wide adds
+`Prompt` (consumed prompt tokens over prompt length), `Output` (generated
+tokens), `Out ms` (time since output was last published, `—` before the first
+publication), and `Bursts` (completed submissions whose output was published; a
+multi-token speculative round counts once). Retired requests remain visible
+while their history remains.
+Both gaps are measured at the request-state sample, whose age is displayed.
 The last submitted graph displays its frozen estimate; `?` means indeterminate.
 
 Dashboard telemetry is enabled only while the dashboard runs. The execution
@@ -84,11 +95,32 @@ the context. Exhausted HTTP ingress capacity returns 429; exhausted model
 admission capacity and unavailable workers return 503. Context and capacity
 rejections append the configured `context_hint` or `capacity_hint`, which names
 the setting that raises the limit. A missing or wrong bearer token returns 401
-when the server configuration sets `api_key`; `/health` needs no token.
+when the server configuration sets `api_key`; `/health` and `/metrics` need no
+token.
 Execution and presentation failures return 500. SSE terminal failures and diagnostic Python exceptions serialize the same display
 messages. Failed CUDA drains retain prepared resources. Worker recovery is unsupported.
 
-The server exposes `/health`, `/v1/models`, `/v1/chat/completions`, and `/metrics`.
+The server exposes `/health` and `/metrics`; model discovery at `/v1/models`,
+`/v1/models/{model}`, `/api/tags`, and `/api/show`; and generation at
+`/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+`/v1/messages/count_tokens`, `/v1/responses`, `/v1/systemone`, and
+`/v1/decisions`.
+Embedded Rust applications can move a loaded `NativeModel` into
+`server::LoadedSession`, adjust its `ServerConfig`, and start a `ServingSession`.
+The session retains every local rank's native resources through confirmed GPU
+drain and releases them when the closed session is dropped. Failed startup or
+shutdown drain retains those resources until process exit. Multi-host rank
+coordination uses the explicit `Server::start` interface.
+`StartupProgress::observed` exposes a bounded latest-stage snapshot without
+terminal output, and owned sessions disable stderr diagnostics by default.
+`Server::snapshot` reads typed runtime and HTTP/frontend gauges with a session
+identifier and monotonic sample time. These independently read counters do not
+form a transactional sample. `pause_admission` rejects subsequent generation
+requests with 503 while admitted responses finish; `wait_for_requests` waits up
+to the caller's timeout. `resume_admission` reopens a healthy listener after a
+cancelled model switch. Closing a server allows the five-second HTTP grace
+period before stopping and draining native execution.
+
 `/v1/models` lists one card, using the first nonempty `served_names` entry as its
 `id`, or the checkpoint identifier when none is set. The card includes the
 effective context limit in `max_model_len` and prepared capabilities, with the
@@ -98,12 +130,17 @@ Unknown names return a JSON 404.
 See [the API reference](../docs/api.md) for discovery fields and generation routes.
 HTTP admission reserves at most `queue_capacity + max_active` requests before
 reading JSON bodies. Admitted requests await a bounded CPU preparation worker;
-the default two workers can prepare four simultaneous generation requests.
-`ignition` packages set the queue to four times the concurrency limit, one worker per
-concurrent request, and a body limit of the recipe's images plus 1 MiB.
+each of the `frontend_workers` permits, two by default, prepares one request at
+a time.
+`ignition` cores set the queue to four times the concurrency limit, one worker per
+concurrent request, and a body limit of the recipe's per-image byte allowance
+times its image limit plus 32 bytes per context token.
 An admission permit survives CPU preparation and the streamed response lifetime.
-Disconnects cancel model scheduling, and slow consumers still face the bounded
-per-request event queue. HTTP capacity and physical GPU slots are independent.
+Disconnects cancel model scheduling. A paused reader keeps its response: each
+event queue holds the request's complete output budget, allocated as events
+arrive. Finished, unread responses release their model slot and live KV cache
+but still count toward the admission limit. HTTP capacity and physical GPU slots
+are independent.
 Tool-call history accepts OpenAI JSON-string arguments and object arguments;
 strings must parse as JSON objects before checkpoint-template rendering.
 
@@ -125,15 +162,25 @@ cargo test --manifest-path helios/Cargo.toml --offline
 cargo build --manifest-path heliopause/Cargo.toml --features extension-module
 ```
 
-The `images` and `server` features require native **libturbojpeg >= 3.0** and
-`pkg-config` at build time. Install the development package that provides
-`libturbojpeg.pc`; `pkg-config --atleast-version=3.0 libturbojpeg` must succeed.
-The Cargo dependency enables only system `pkg-config` discovery, with no bundled
-codec or decoder fallback. A missing or older library fails the build. Default
-system linking is dynamic, so the matching `libturbojpeg.so.0` must also be
-available to the runtime loader.
+Some tests built with the `frontend` feature, which `images`, `grammar`, and
+`server` enable, read chat templates from the directory named by
+`FLARE_TEST_TEMPLATE_DIR`; they panic when it is unset. Create that directory
+with `python tests/frontend/prepare_templates.py --output DIR`, which downloads
+the pinned upstream templates through `huggingface_hub`. The `runtime-core`
+feature requires `protoc`. The `Native serving` workflow in
+`.github/workflows/native-serving.yml` raises the locked-memory limit to 64 MiB
+on Linux and runs
+`cargo test --locked --release --manifest-path helios/Cargo.toml --features runtime-core,server`.
 
-Image admission accepts base64 `image/png` and `image/jpeg` data URLs. JPEG uses
+The `images` and `server` features decode JPEG through the `turbojpeg` crate,
+pinned to 1.5.1 with only its `cmake` feature. The build compiles the crate's
+bundled libjpeg-turbo source with CMake and a C compiler and links it
+statically. It performs no `pkg-config` discovery and uses no system
+`libturbojpeg` at build time or run time. Without NASM on `PATH`, libjpeg-turbo
+builds without SIMD extensions.
+
+Image admission accepts base64 `image/png`, `image/jpeg`, and `image/webp` data
+URLs. JPEG uses
 accurate IDCT, smooth chroma upsampling, and at most 100 progressive scans.
 Baseline/progressive Huffman JPEG is supported; lossless and arithmetic JPEG
 are rejected. Encoded byte and decoded pixel limits apply before pixel allocation.
@@ -143,12 +190,12 @@ RGB conversion discards alpha and does not apply embedded color profiles.
 Pillow is used only to generate test fixtures, never by native image admission.
 
 Heliopause builds the internal Python extension named `flare_heliopause`. It requires the NVIDIA driver at runtime
-and dynamically loads `libcuda.so.1`; building and running native unit tests does
+and dynamically loads `libcuda.so.1` (`nvcuda.dll` on Windows); building and running native unit tests does
 not require CUDA libraries. Tests exercise queueing and teardown using explicit
 Rust test functions. Production always calls the CUDA driver.
 
 The `GraphReplayWorker` and `ReplayCompletion` Python bindings require the
-`qualification` Cargo feature. Production package builds omit them. The server
+`qualification` Cargo feature. Production core builds omit them. The server
 uses its native execution transport directly.
 
 Raw replay qualification entrypoints:
@@ -253,7 +300,7 @@ channel for bootstrap and interoperability tests. The optional Python binding
 uses that worker and releases the GIL around native operations:
 
 ```text
-GraphExecutor(owner, manifest)
+GraphExecutor(owner, manifest, *, peer_fds=None)
 executor.submit(graph_index, [(buffer_name, byte_offset, bytes), ...],
                 grammar_constrained=False) -> fence | None
 executor.poll() -> ExecutionCompletion | None
@@ -262,8 +309,12 @@ executor.drained -> whether close confirmed both streams drained
 executor.close()
 ```
 
-`ExecutionCompletion.records` contains one 24-field ABI5 record per captured
-physical request slot. `consumed_tokens` and `generated_tokens` are cumulative.
+`peer_fds` supplies connected rank sockets for tensor-parallel execution; it is
+supported only on Linux.
+`ExecutionCompletion.records` contains one ABI6 record per captured physical
+request slot, with 16 metadata fields followed by the core-defined number of
+token fields. An omitted or zero `completion_token_capacity` resolves to eight.
+`consumed_tokens` and `generated_tokens` are cumulative.
 Submission failure poisons the executor. `close` drains both streams before
 releasing pinned memory or the Python owner; failed drain retains both. Owner
 release happens outside the ownership mutex, permitting a Python finalizer to
@@ -277,7 +328,7 @@ timeout 60s env CUDA_VISIBLE_DEVICES=GPU-UUID /path/to/python \
   helios/tests/test_execution.py --extension heliopause/target/debug/libflare_heliopause.so
 ```
 
-The four CUDA integration cases cover physical-slot scatter, different graph
+The five CUDA integration cases cover physical-slot scatter, different graph
 capacities, partial uploads, two occupied frames, grammar serialization, changed
 resident inputs, rejected uploads, asynchronous owner retention, reentrant
 finalizers and destructor draining. They use real PyTorch-captured executables.
@@ -294,21 +345,39 @@ Resource pressure evicts unpinned cache leaves; retirement fences determine
 when their page and snapshot IDs become reusable.
 
 `RequestScheduler::plan` returns an immutable `ScheduledPlan` for initialize,
-restore, snapshot, vision, prefill, resume-sampling, decode or speculative work.
+restore, snapshot, vision, prefill, scored-prefill, resume-sampling, decode,
+speculative, or mixed prefill/generation work.
 The plan retains its scheduler identity and each participating request's state
 epoch. Admissions of unrelated requests and timing observations preserve its
 validity; mutation or retirement of a selected request invalidates it.
-Prefill selects among loaded capacities up to `prefill_chunk_size`, using graph
-duration, request age, and useful-progress deficit. Admission budgets cache
-captures from snapshot capacity divided by configured maximum concurrency,
-reserves prompt and terminal endpoints, and selects remaining message checkpoints
-at approximately equal token distances through the uncached suffix. Only selected
-boundaries interrupt prefill. Logical lengths pad to the
-smallest loaded capacity that covers them. The limit must be 64-aligned, at least 64, and within the context capacity. Decode batches use
-power-of-two capacities through the selected concurrency.
-Prefill, decode cohorts, speculative widths, and mandatory stages compete in
-one duration-aware selection policy. Full prompt cache hits restore state and
-resume sampling from saved hidden state without replaying prompt tokens.
+Selection ranks every candidate graph and cohort by expected useful value per
+estimated graph duration, less a duration-proportional waiting cost for requests
+that are decoding or awaiting terminal retirement. Each loaded
+prefill capacity up to `prefill_chunk_size` competes on the prompt tokens it can
+actually consume, which the next selected message boundary, atomic image spans,
+and the prompt end limit. No rule pads a logical length to the smallest covering
+capacity. Among candidates of one graph kind and cohort that perform the same
+logical work, selection first discards any shape whose capacities are all at
+least as large as another candidate's and larger in at least one. An unmeasured
+prefill graph is not explored when a smaller loaded capacity consumes the same
+tokens. Checkpoint selection prioritizes the last eligible message boundary,
+using the prompt end when no message boundary is eligible. Earlier messages and
+a distinct prompt end compete within a work allowance of
+`scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill work,
+defaulting to 0.05. Extra captures charge snapshot-copy cost and additional prefill
+caused by splitting chunks. Productive completed decode earns the same fraction
+of measured time for a distinct terminal capture. Unknown costs exclude extras
+while preserving best-effort anchor retention. There is no capture-count cap or
+per-request share of snapshot rows. The global allocator accounts for snapshot
+aliases, guards a later anchor against earlier optional captures, and reclaims
+unused guards for mandatory execution. Only obtainable capture destinations
+introduce prefill cuts. See [checkpoint ownership](../docs/core-design.md#exact-endpoint-capture). `prefill_chunk_size` must be 64-aligned, at least 64, and within the
+context capacity. Batched graphs use power-of-two capacities up to the selected
+concurrency rounded up to a power of two.
+Prefill, decode cohorts, speculative widths, mixed graphs, and prerequisite
+stages compete in that one selection. Full prompt cache hits restore state and
+resume sampling from saved hidden state without replaying prompt tokens. See
+[useful service and selection](../docs/scheduling-runtime-design.md#useful-service-and-selection).
 
 Before CUDA enqueue, callers check `GraphExecutor::can_submit`, obtain its
 `next_fence`, and call `RequestScheduler::commit` with the plan to reserve pages
@@ -332,14 +401,16 @@ proposals. A fixed captured width may therefore contain fewer active tokens.
 Acceptance learning and accepted-draft metrics exclude proposals beyond the
 lane's logical token limit even when the completion reports physical padding.
 
-`estimated_duration_ns` returns one estimate per captured graph, initially zero
+`RequestScheduler::estimated_duration_ns` returns the estimate for a step's
+captured graph shape. Every estimate starts at zero
 (unmeasured). A valid completion sets its cost directly; further fresh observations
 update it with the median of up to nine replay observations. After 30 seconds without a valid observation,
 the cost becomes stale but remains available for selection. The next valid
 observation replaces the stale estimate. Tensor-parallel observations use the
-maximum positive rank interval. Isolated executions also measure host handoff;
-queued executions exclude queue wait from the timing updates. Unmeasured
-candidates compete by useful work and can beat measured candidates. Both
+maximum positive rank interval, with measured embedding-readiness waits subtracted
+when available. Host delays and queue wait do not enter graph estimates. An
+unmeasured candidate ranks ahead of every measured candidate; unmeasured
+candidates compete among themselves by expected useful value. Both
 unmeasured and stale physical dispatches require an empty queue and completion
 before another submission.
 
@@ -359,24 +430,41 @@ historical means, while a separate 1% raw-time budget funds optimistic
 acceptance probes. Observational weight ages without changing unobserved means;
 width-one rounds still measure cost. See
 [funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
-Each request accrues equal entitlement while GPU work is outstanding;
-completion earns useful-progress credit at frozen reference rates. Unknown
-reference rates initialize from runtime observations and credit accumulated
-progress once. Timing freshness does not alter those accounting units.
-The latency filter includes queued work and prerequisite stages, preserving
-separate clocks for prompt progress and published output.
 
-`PolicyConfig` defaults to a 20 ms graph slice, 20 ms submission window, 40 ms
-service-gap target, and 20 ms deficit scale. An overdue graph stops further queueing
-until completion. Unavoidable atomic singleton work may exceed a duration target
-with an empty queue. These are estimated-time preferences, not hard latency
-bounds. Residency rotation and mixed captures require further implementation;
-see [the native scheduling design](../docs/scheduling-runtime-design.md).
+Fairness enters selection through per-request service prices. Each resident
+runnable request carries a token-service price, and a request that can deliver
+output also carries a delivery-service price. A price grows with elapsed
+execution time while the request is unserved and decays as it receives service,
+normalized by its individually feasible service rate. `commit` records the
+participating requests with rate normalizers from measured graph costs;
+unmeasured graphs contribute none. `complete` updates each
+participant's prices from the frame's measured interval and the tokens that
+request committed, so a participant the frame did not serve observes zero
+service. A delivery is credited when `published_output` reports visible output
+for that completion, once per completion regardless of token count. Selection
+projects the expected service of queued submissions into copies of the prices
+without changing observed history. A missing token price initializes from the
+request's feasible token rate divided by the participant count; a missing
+delivery price initializes from its reference delivery interval. See
+[service accounting and publication](../docs/scheduling-runtime-design.md#service-accounting-and-publication).
 
-Admission reserves checkpoints for unreused system, prompt and terminal endpoints.
-Prefill stops at the exact rendered system boundary and prompt end. Snapshot graphs
+`PolicyConfig` holds value coefficients, not time limits. Its defaults are an
+output-token value of 64 prompt-token units, token fairness 16, delivery
+fairness 4, decode-age price 0.1, terminal value 256, terminal-age price 1, a
+100 ms service-price adaptation time, a 30-second timing freshness interval, and
+adaptive-verification exponent 1. No millisecond cap applies to a frame or to
+the queued frames together. When the oldest queued graph runs past its expected
+finish, further queueing stops until its completion arrives. The coefficients
+are preferences, not latency bounds. Mixed prefill/generation graphs are
+scheduled when the core supplies them; Ignition captures them only with
+`--mixed-prefill`. See
+[the native scheduling design](../docs/scheduling-runtime-design.md#policy-preferences).
+
+Admission reserves checkpoints for the selected message boundaries, the prompt
+end, and the terminal endpoint beyond the reused prefix.
+Prefill stops at each selected message boundary and at the prompt end. Snapshot graphs
 copy live state and partial cache tails to immutable snapshot rows after the
-selected requests' model submissions complete. System and prompt publication retain the live physical
+selected requests' model submissions complete. Message and prompt publication retain the live physical
 page sequence while transferring complete pages to the cache. Admission reuse
 counts stay fixed. Duplicate publication never remaps the live request.
 
@@ -384,8 +472,8 @@ counts stay fixed. Duplicate publication never remaps the live request.
 copy, excluding the final pending sampled token. Terminal retirement competes by
 its own intrinsic value and waiting-age cost under both scheduler policies.
 A winning feedback operation drains queued work before submission; terminal
-snapshots have no unconditional priority. A child at T after parent S owns
-`floor(T/64)-floor(S/64)` complete pages. Partial payloads restore from the snapshot
+snapshots have no unconditional priority. With P the contract's `page_tokens`,
+a child at T after parent S owns `floor(T/P)-floor(S/P)` complete pages. Partial payloads restore from the snapshot
 into private pages. Failed copies prevent publication. `cancel` stops scheduling
 immediately and retains slot/page/snapshot ownership through final GPU use.
 Generation reuse waits for that retirement.
@@ -398,7 +486,7 @@ owns the scheduler and executor on one native model thread. Its private `Worker`
 owns ingress, pending and active requests, model admissions, and reusable input
 storage. Admission precedes ordered completion processing, terminal publication,
 copy-proposal planning, and submission. Completion-triggered retirement runs
-before polling another completion; exact system and prompt publication remains
+before polling another completion; exact message and prompt publication remains
 atomic inside `RequestScheduler::complete`.
 
 The model thread retains the executor outside the `catch_unwind` closure that
@@ -442,22 +530,24 @@ follow the checkpoint template's identity tests and local-calendar formatting.
 Literal replacement filters carry advisory block endpoints through mapped
 substitutions and omit endpoints inside replaced spans.
 
-The exact deployed Qwen3.8, inference-transformed Step, and segmented Kimi K3
-templates are replaced in memory with their annotated recipe assets. Kimi K3
+The exact deployed Qwen3.8 and inference-transformed Step templates are upgraded
+in memory using bundled insertion offsets, guarded by source and result SHA-256
+hashes. Their upstream text is supplied by the core and is not embedded in
+Helios. The segmented Kimi K3 template uses its custom project renderer. Kimi K3
 uses segment-count marks at the preamble and complete-message endpoints.
 Other unannotated templates fail to load. Checkpoint-derived annotations must
 reproduce the source bytes when removed. Gemma 4 selects one of two annotated
 Google canonical templates by model size across all supported quantization
 publishers; see
 [recipe frontend metadata](../docs/model-development.md#sampling-and-frontend-metadata).
-Package files and metadata formats remain unchanged.
+In-memory template upgrades modify neither core files nor metadata formats.
 
 DeepSeek V4 and V4.1 use the canonical native encoder, patched to record byte
 positions in its normalized-message append loop. Adjacent users share a merged
 message endpoint, and reordered tool results receive endpoints in output order.
 Continuation truncates the rendered text before tokenization and clips later
-positions. Existing text, ordinary-token, and image-placeholder encoding divisions
-are preserved. The single encoding supplies original byte offsets; a cut is
+positions. Recording positions does not change the encoder's division into text,
+ordinary-token, and image-placeholder segments. The single encoding supplies original byte offsets; a cut is
 retained only if every preceding token ends at or before it and every following
 token starts at or after it. Overlapping Unicode spans and BPE tokens crossing a mark cannot
 create partial-token cuts. Token endpoints are sorted, unique, and strictly
@@ -511,8 +601,8 @@ Disk-backed embedding tables use a bounded host-RAM row cache, defaulting to
 `flare run --embedding-table-cache-size SIZE` overrides the budget; `0` disables
 caching. RAM table storage allocates no separate row cache. The loader accounts
 for its host storage before sizing KV pages and continuation snapshots. Entries hold immutable
-table rows shared across requests; they copy into existing pinned row staging,
-whose consumer fences remain unchanged. Approximate usage counts protect frequently
+table rows shared across requests; they copy into the pinned row staging, and
+the cache does not alter that staging's consumer fences. Approximate usage counts protect frequently
 requested rows; recency breaks ties, and periodic count decay adapts to workload
 changes. Each server start creates an empty row cache; request gathers populate
 it without persistent cache files. `/metrics` exposes `flare_engram_` gather
@@ -522,7 +612,7 @@ time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes
 
 `cache::PrefixHistory` incrementally hashes 64-token blocks with BLAKE2b-128.
 Exact partial endpoints hash the aligned parent plus the remaining tokens and
-conditioning, preserving the existing complete-block identity.
+conditioning; complete-block keys do not depend on them.
 The root and each block include a 32-byte model/recipe identity. Conditioning
 events carry absolute token positions and 32-byte identities, retaining their
 order even at the same position. An event at position N first affects prefixes
@@ -563,9 +653,10 @@ the prepared graph contract maps them to backing storage and padding sentinels.
 ## Native image preparation
 
 The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
-and static WebP decoding; it also enables `frontend`. Typed package metadata
+and static WebP decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
-Qwen, MiMo, DeepSeek, DeepSeek row-major, Moonvit, Step, and RADIO inputs.
+Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
+and GLM inputs.
 The Qwen processor uses an RGB8, bicubic-antialias profile with
 16×16 patches, temporal duplication by two, spatial merge by two, a 48×48
 learned position table, and fused normalization `(pixel - 127.5) / 127.5`.

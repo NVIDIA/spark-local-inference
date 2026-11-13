@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Isolate vision attention rounding on exact checkpoint tensors, using only CPU.
 
 The online-softmax calculation reproduces the stored precision boundaries and

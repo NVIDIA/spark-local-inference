@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Exact little-endian CPU tensor records for bounded prepared-input storage.
 
 use super::{ImageGeometry, ProcessedImages};

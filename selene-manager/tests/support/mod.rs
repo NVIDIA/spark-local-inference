@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![allow(dead_code, unused_imports)]
 use flare_selene::shared::record::{Header, RankSizes};
 use selene_manager::{

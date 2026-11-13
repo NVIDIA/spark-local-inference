@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! What a host tier pins for an export: a chain of records that fills windows.
 
 use crate::{PrefixKey, Result};

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Conservative retention of graph-reachable allocations with typed numeric leaves.
 
 use std::collections::{HashMap, HashSet, VecDeque};

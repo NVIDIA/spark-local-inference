@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The announcement index: what this instance holds, in every tier, and the
 //! ordered notices that tell the manager about changes.
 //!

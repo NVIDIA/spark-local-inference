@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Lookup (PROTOCOL.md section 4): candidates from the index, never from a source.
 
 use flare_selene::shared::Tier;

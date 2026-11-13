@@ -1,4 +1,13 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Hardware revision selection through NVML without initializing CUDA.
+
+#[path = "hardware_monitor.rs"]
+mod monitor;
+pub use monitor::{HardwareMonitor, HardwareSnapshot};
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 
@@ -7,24 +16,8 @@ use libloading::Library;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn platform(pci_id: u32) -> Option<&'static str> {
-    // Single mapping table shared with package export naming.
-    flare_helios::package::naming::platform_from_pci(pci_id)
-}
-
-/// Keep NVML's background threads out of the process that sets CUDA visibility.
-pub fn detect_isolated(count: usize) -> Result<String> {
-    let output = std::process::Command::new(std::env::current_exe()?)
-        .arg("hardware-revision")
-        .arg(count.to_string())
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "hardware detection failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    // Single mapping table shared with core export naming.
+    flare_helios::core::naming::platform_from_pci(pci_id)
 }
 
 pub fn detect(count: usize) -> Result<&'static str> {
@@ -107,7 +100,7 @@ pub fn detect(count: usize) -> Result<&'static str> {
                 })?;
                 if selected.is_some_and(|value| value != detected) {
                     return Err(
-                        "selected GPUs span gb10 and gb202; select one platform or specify --revision"
+                        "selected GPUs span multiple platforms; select one platform or specify --revision"
                             .into(),
                     );
                 }
@@ -118,6 +111,184 @@ pub fn detect(count: usize) -> Result<&'static str> {
         let closed = check("nvmlShutdown", shutdown());
         result.and_then(|revision| closed.map(|()| revision))
     }
+}
+
+/// Driver-reported GPU metadata; querying NVML creates no CUDA context.
+#[derive(Clone, Debug, Default)]
+pub struct GpuInfo {
+    pub ordinal: u32,
+    pub visible_ordinal: Option<u32>,
+    pub name: String,
+    pub uuid: String,
+    pub total_memory_bytes: Option<u64>,
+    pub free_memory_bytes: Option<u64>,
+    pub architecture: Option<[u32; 2]>,
+    pub platform: Option<String>,
+}
+
+#[repr(C)]
+struct NvmlMemory {
+    total: u64,
+    free: u64,
+    used: u64,
+}
+
+/// Enumerate actual NVIDIA devices and their inherited visibility without changing process policy.
+pub fn inventory() -> Result<Vec<GpuInfo>> {
+    #[cfg(unix)]
+    let library = unsafe { Library::new("libnvidia-ml.so.1") };
+    #[cfg(windows)]
+    let library = unsafe {
+        libloading::os::windows::Library::load_with_flags(
+            "nvml.dll",
+            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+        .map(Library::from)
+    };
+    let library =
+        library.map_err(|error| format!("NVIDIA device information is unavailable: {error}"))?;
+    // SAFETY: These NVML signatures match the system driver. Every output buffer is live and
+    // the library remains loaded until the initialized NVML reference has been released.
+    unsafe {
+        let init = library.get::<unsafe extern "C" fn() -> c_int>(b"nvmlInit_v2\0")?;
+        let shutdown = library.get::<unsafe extern "C" fn() -> c_int>(b"nvmlShutdown\0")?;
+        let initialized = init();
+        if initialized != 0 {
+            return Err(format!("NVIDIA device query failed with NVML error {initialized}").into());
+        }
+        let result = (|| -> Result<Vec<GpuInfo>> {
+            let count_fn = library
+                .get::<unsafe extern "C" fn(*mut c_uint) -> c_int>(b"nvmlDeviceGetCount_v2\0")?;
+            let get = library.get::<unsafe extern "C" fn(c_uint, *mut Device) -> c_int>(
+                b"nvmlDeviceGetHandleByIndex_v2\0",
+            )?;
+            let name_fn = library
+                .get::<unsafe extern "C" fn(Device, *mut c_char, c_uint) -> c_int>(
+                    b"nvmlDeviceGetName\0",
+                )?;
+            let uuid_fn = library
+                .get::<unsafe extern "C" fn(Device, *mut c_char, c_uint) -> c_int>(
+                    b"nvmlDeviceGetUUID\0",
+                )?;
+            let memory_fn = library.get::<unsafe extern "C" fn(Device, *mut NvmlMemory) -> c_int>(
+                b"nvmlDeviceGetMemoryInfo\0",
+            )?;
+            let architecture_fn = library
+                .get::<unsafe extern "C" fn(Device, *mut c_int, *mut c_int) -> c_int>(
+                    b"nvmlDeviceGetCudaComputeCapability\0",
+                )
+                .ok();
+            let pci_fn = library.get::<unsafe extern "C" fn(Device, *mut PciInfo) -> c_int>(
+                b"nvmlDeviceGetPciInfo_v3\0",
+            )?;
+            let mut count = 0;
+            let code = count_fn(&mut count);
+            if code != 0 {
+                return Err(
+                    format!("NVIDIA device enumeration failed with NVML error {code}").into(),
+                );
+            }
+            let mut devices = Vec::new();
+            for ordinal in 0..count {
+                let mut device = std::ptr::null_mut();
+                let code = get(ordinal, &mut device);
+                if code != 0 {
+                    return Err(
+                        format!("Cannot query NVIDIA GPU {ordinal}: NVML error {code}").into(),
+                    );
+                }
+                let mut name = [0 as c_char; 256];
+                let mut uuid = [0 as c_char; 96];
+                let name = if name_fn(device, name.as_mut_ptr(), name.len() as u32) == 0 {
+                    CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned()
+                } else {
+                    format!("NVIDIA GPU {ordinal}")
+                };
+                let uuid = if uuid_fn(device, uuid.as_mut_ptr(), uuid.len() as u32) == 0 {
+                    CStr::from_ptr(uuid.as_ptr()).to_string_lossy().into_owned()
+                } else {
+                    String::new()
+                };
+                let mut memory: NvmlMemory = std::mem::zeroed();
+                let memory_known = memory_fn(device, &mut memory) == 0
+                    && memory.total > 0
+                    && memory.total != u64::MAX;
+                let mut major = 0;
+                let mut minor = 0;
+                let architecture = architecture_fn.as_ref().and_then(|query| {
+                    (query(device, &mut major, &mut minor) == 0 && major > 0 && minor >= 0)
+                        .then_some([major as u32, minor as u32])
+                });
+                let mut pci: PciInfo = std::mem::zeroed();
+                let platform = (pci_fn(device, &mut pci) == 0)
+                    .then(|| platform(pci.device_id))
+                    .flatten()
+                    .map(str::to_owned);
+                // NVML also enumerates accelerators without CUDA capability or a supported GPU identity.
+                if architecture.is_none() && platform.is_none() {
+                    continue;
+                }
+                devices.push(GpuInfo {
+                    ordinal,
+                    visible_ordinal: None,
+                    name,
+                    uuid,
+                    total_memory_bytes: memory_known.then_some(memory.total),
+                    free_memory_bytes: (memory_known && memory.free <= memory.total)
+                        .then_some(memory.free),
+                    architecture,
+                    platform,
+                });
+            }
+            assign_visibility(
+                &mut devices,
+                std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref(),
+            )?;
+            Ok(devices)
+        })();
+        let released = shutdown();
+        if released != 0 {
+            return Err(
+                format!("NVIDIA device query shutdown failed with NVML error {released}").into(),
+            );
+        }
+        result
+    }
+}
+
+fn assign_visibility(devices: &mut [GpuInfo], inherited: Option<&str>) -> Result<()> {
+    let Some(inherited) = inherited else {
+        for (visible, device) in devices.iter_mut().enumerate() {
+            device.visible_ordinal = Some(visible as u32);
+        }
+        return Ok(());
+    };
+    let inherited = inherited.trim();
+    if inherited.is_empty() || inherited == "-1" {
+        return Ok(());
+    }
+    crate::environment::visibility(&[0], Some(inherited))?;
+    for (visible, identifier) in inherited.split(',').map(str::trim).enumerate() {
+        let matches = devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                let matches = identifier.parse::<u32>().map_or_else(
+                    |_| !device.uuid.is_empty() && device.uuid.starts_with(identifier),
+                    |ordinal| index == ordinal as usize,
+                );
+                matches.then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [index] = matches.as_slice() else {
+            return Err(format!("CUDA_VISIBLE_DEVICES entry {identifier:?} does not identify one detected NVIDIA GPU").into());
+        };
+        if devices[*index].visible_ordinal.is_some() {
+            return Err("CUDA_VISIBLE_DEVICES lists a GPU more than once".into());
+        }
+        devices[*index].visible_ordinal = Some(visible as u32);
+    }
+    Ok(())
 }
 
 type Device = *mut c_void;
@@ -162,6 +333,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpu_inventory_visibility_preserves_indices_and_requires_unique_uuid_prefixes() {
+        let mut devices = vec![
+            GpuInfo {
+                ordinal: 0,
+                uuid: "GPU-aaaa".into(),
+                ..Default::default()
+            },
+            GpuInfo {
+                ordinal: 1,
+                uuid: "GPU-bbbb".into(),
+                ..Default::default()
+            },
+        ];
+        assign_visibility(&mut devices, Some("1,0")).unwrap();
+        assert_eq!(devices[1].visible_ordinal, Some(0));
+        assert_eq!(devices[0].visible_ordinal, Some(1));
+        for device in &mut devices {
+            device.visible_ordinal = None;
+        }
+        assign_visibility(&mut devices, Some("GPU-bb")).unwrap();
+        assert_eq!(devices[1].visible_ordinal, Some(0));
+        assert_eq!(devices[0].visible_ordinal, None);
+        for device in &mut devices {
+            device.visible_ordinal = None;
+        }
+        assert!(assign_visibility(&mut devices, Some("GPU-")).is_err());
+        assign_visibility(&mut devices, Some("")).unwrap();
+        assert!(
+            devices
+                .iter()
+                .all(|device| device.visible_ordinal.is_none())
+        );
+        assign_visibility(&mut devices, Some("-1")).unwrap();
+        assert!(
+            devices
+                .iter()
+                .all(|device| device.visible_ordinal.is_none())
+        );
+    }
+
+    #[test]
     fn uuid_selection_requires_an_unambiguous_prefix() {
         let candidates = vec![
             ("GPU-abcdef01".into(), std::ptr::null_mut()),
@@ -177,10 +389,12 @@ mod tests {
     #[test]
     fn pci_ids_select_the_chip_without_matching_marketing_names() {
         assert_eq!(platform(0x2e1210de), Some("gb10"));
+        assert_eq!(platform(0x2e0610de), Some("gb10"));
         assert_eq!(platform(0x2bb410de), Some("gb202"));
         assert_eq!(platform(0x2bb110de), Some("gb202"));
         assert_eq!(platform(0x2bb510de), Some("gb202"));
         assert_eq!(platform(0x2b8510de), Some("gb202"));
+        assert_eq!(platform(0x31c310de), Some("gb300"));
         assert_eq!(platform(0x26b110de), None);
         assert_eq!(platform(0x2bb41234), None);
     }

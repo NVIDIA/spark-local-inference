@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Host retention of published prefix checkpoints in registered memory and on disk.
 //!
 //! A GPU prefix checkpoint owns its tail pages, the complete cache pages since its
@@ -8,9 +14,9 @@
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
 //! produced by prefill and one restored from the host.
 //!
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod gpu_tests;
-#[cfg(feature = "runtime-package")]
+#[cfg(feature = "runtime-core")]
 pub(crate) mod pool;
 mod registrar;
 pub mod shard;
@@ -23,34 +29,36 @@ use crate::Result;
 
 pub use flare_selene::offload::{
     Binding, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared, input_memory_bytes,
-    parse_drain_on_shutdown, parse_size,
+    parse_drain_on_shutdown, parse_max_age, parse_size,
 };
 
 pub fn prepare(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, package, identity, geometry, contexts, 0, None)
+    prepare_with_inputs(options, core, identity, geometry, contexts, 1, 0, None)
 }
 
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
+    max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
 ) -> Result<Preparation> {
     Ok(flare_selene::offload::prepare_with_inputs(
         options,
-        package,
+        core,
         identity,
         geometry,
         contexts,
+        max_active,
         input_staging,
         shard,
         &registrar::CudaRegistrar,

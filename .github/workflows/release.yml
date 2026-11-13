@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.94.1
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require the tagged commit on the default branch
+        if: github.event_name == 'push'
+        run: git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}"
+      - name: Resolve the release version
+        id: version
+        run: |
+          crate_version() {
+            cargo metadata --no-deps --format-version 1 --manifest-path "$1" |
+              jq -er --arg name "$2" '.packages[] | select(.name == $name) | .version'
+          }
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$(crate_version flare-cli/Cargo.toml flare-cli)
+          fi
+          for crate in flare-cli/Cargo.toml:flare-cli flare-winui/bridge/Cargo.toml:flare-winui-bridge \
+            flare-winui/launcher/Cargo.toml:flare-launcher; do
+            found=$(crate_version "${crate%%:*}" "${crate##*:}")
+            if [[ "$found" != "$version" ]]; then
+              echo "::error::${crate%%:*} has version $found; the release version is $version."
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            build-packages: libibverbs-dev
+            runtime-packages: libibverbs1 ibverbs-providers
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: flare-linux-${{ matrix.arch }}.tgz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake nasm pkg-config protobuf-compiler ${{ matrix.build-packages }}
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rust-docs
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build the CLI
+        run: cargo build --locked --release --manifest-path flare-cli/Cargo.toml --bin flare
+      - name: Package the CLI and license notices
+        run: python3 packaging/archive.py --binary flare-cli/target/release/flare --target ${{ matrix.target }} --output "$ARCHIVE"
+      - name: Check the archive in a clean Ubuntu 24.04 container
+        run: |
+          mkdir check
+          tar -xzf "$ARCHIVE" -C check
+          for file in LICENSE NOTICE THIRD_PARTY_NOTICES.md licenses/FlashInfer.txt licenses/libibverbs.txt \
+            licenses/PyTorch.txt third_party/rust/README.md third_party/rust-standard-library/version.txt; do
+            if [[ ! -s "check/flare/$file" ]]; then
+              echo "::error::$ARCHIVE lacks flare/$file."
+              exit 1
+            fi
+          done
+          # The container has only Ubuntu 24.04's libraries, so libraries
+          # installed on the runner cannot satisfy the executable.
+          docker run --rm --volume "$PWD/check/flare:/opt/flare:ro" \
+            --env VERSION --env RUNTIME_PACKAGES="${{ matrix.runtime-packages }}" ubuntu:24.04 bash -euc '
+              if [[ -n "$RUNTIME_PACKAGES" ]]; then
+                apt-get update
+                apt-get install -y --no-install-recommends $RUNTIME_PACKAGES
+              fi
+              reported=$(/opt/flare/flare --version)
+              if [[ "$reported" != "flare $VERSION" ]]; then
+                echo "::error::flare --version printed \"$reported\"; expected \"flare $VERSION\"."
+                exit 1
+              fi
+              for command in run agent orbit; do
+                /opt/flare/flare "$command" --help > /dev/null
+              done'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flare-linux-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            arch: amd64
+            platform: x64
+            machine: AMD64
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            arch: arm64
+            platform: ARM64
+            machine: ARM64
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    # The setup and build scripts choose the host architecture from the shell's
+    # process environment. Windows PowerShell is native on both architectures.
+    defaults:
+      run:
+        shell: powershell
+    env:
+      ARCHIVE: flare-windows-${{ matrix.arch }}.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne '${{ matrix.machine }}') {
+              throw "The shell runs as $env:PROCESSOR_ARCHITECTURE; this job builds on ${{ matrix.machine }}."
+          }
+          ./scripts/setup_windows.ps1 -RustToolchain $env:RUST_TOOLCHAIN -BuildToolsOnly
+      - name: Build the desktop client
+        run: ./scripts/build_winui.ps1 -Platform ${{ matrix.platform }} -SingleFile
+      - name: Package the desktop client and license notices
+        run: |
+          . ./scripts/dev_windows.ps1
+          rustup component add rust-docs
+          if ($LASTEXITCODE -ne 0) { throw 'Rust documentation component installation failed.' }
+          python packaging/archive.py --binary .local-dev/winui/${{ matrix.platform }}/SingleFile/Flare.exe --target ${{ matrix.target }} --winui-packages .local-dev/native-packages --output $env:ARCHIVE
+          if ($LASTEXITCODE -ne 0) { throw 'Archive packaging failed.' }
+      - name: Start the packaged desktop client
+        run: |
+          $extract = Join-Path $env:RUNNER_TEMP 'flare-archive'
+          Expand-Archive -LiteralPath $env:ARCHIVE -DestinationPath $extract
+          foreach ($file in @('Flare.exe', 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'licenses\PyTorch.txt',
+                  'third_party\rust\README.md', 'third_party\rust-standard-library\version.txt', 'third_party\nuget\README.md')) {
+              $path = Join-Path $extract "flare\$file"
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+                  throw "$env:ARCHIVE lacks flare\$file."
+              }
+          }
+          # Launch from a directory that holds only the executable.
+          $launch = Join-Path $env:RUNNER_TEMP 'flare-launch'
+          New-Item -ItemType Directory -Path $launch | Out-Null
+          Copy-Item -LiteralPath (Join-Path $extract 'flare\Flare.exe') -Destination $launch
+          $launcher = Start-Process -FilePath (Join-Path $launch 'Flare.exe') -WorkingDirectory $launch -PassThru
+          # Windows PowerShell reports no exit code unless the handle is opened before the process exits.
+          $null = $launcher.Handle
+          if (-not $launcher.WaitForExit(120000)) {
+              $launcher.Kill()
+              throw 'The launcher did not exit within 120 seconds.'
+          }
+          if ($launcher.ExitCode -ne 0) { throw "The launcher exited with code $($launcher.ExitCode)." }
+          $runtime = Join-Path $env:LOCALAPPDATA 'Flare\Desktop\${{ matrix.platform }}'
+          $desktop = $null
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not $desktop -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 1
+              $desktop = Get-Process -Name flare-winui -ErrorAction SilentlyContinue | Where-Object {
+                  $_.Path -and $_.Path.StartsWith($runtime, [StringComparison]::OrdinalIgnoreCase) -and $_.MainWindowHandle -ne 0
+              } | Select-Object -First 1
+          }
+          if (-not $desktop) { throw "flare-winui.exe did not open a window from $runtime within 60 seconds." }
+          Start-Sleep -Seconds 15
+          if ($desktop.HasExited) { throw 'flare-winui.exe exited within 15 seconds of opening its window.' }
+          Stop-Process -Id $desktop.Id -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flare-windows-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      # The release stays a draft until every asset is attached.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes \
+            assets/flare-linux-amd64.tgz assets/flare-linux-arm64.tgz \
+            assets/flare-windows-amd64.zip assets/flare-windows-arm64.zip
+          gh release edit "$GITHUB_REF_NAME" --draft=false

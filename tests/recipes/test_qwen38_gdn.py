@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Actual-checkpoint Qwen GDN components through prepared CUDA graphs."""
 
 from __future__ import annotations

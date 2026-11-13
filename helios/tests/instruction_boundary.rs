@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
 
 use flare_helios::frontend;
@@ -58,6 +64,7 @@ impl Fixture {
         )
         .unwrap();
         let config = ModelConfig {
+            completion_token_capacity: 8,
             max_top_logprobs: 0,
             logprob_token_id_capacity: 0,
             prepared_sequence_tokens: 262144,

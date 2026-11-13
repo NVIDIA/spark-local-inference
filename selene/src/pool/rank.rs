@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Rank protocol messages carried by the shared shard link.
 pub use crate::shard::Link as RankLink;
 use crate::{

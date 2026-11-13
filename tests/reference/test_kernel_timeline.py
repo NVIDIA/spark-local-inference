@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Synthetic CPU checks for mapping and interval accounting; no GPU evidence."""
 import copy
 import sqlite3

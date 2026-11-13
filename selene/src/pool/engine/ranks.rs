@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Rank 0's side of a multi-process instance: the links to the peer ranks' agents and the
 //! transfers it fans out over them.
 //!
@@ -451,6 +456,9 @@ impl Ranks {
                     events.push(RankEvent::Detached);
                 }
             }
+            // A peer's close is final: the link ends right after it. Record
+            // the rank as lost without the warning a lost link would raise.
+            Msg::Close => self.peers[index].state = State::Lost,
             Msg::WindowDone {
                 xfer,
                 index,

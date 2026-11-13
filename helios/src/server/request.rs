@@ -1,4 +1,10 @@
-use super::runtime::Prompt;
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use super::runtime::{Prompt, ReasoningCut};
 use crate::{
     AdmissionError, Error, Failure, FrontendError, Result,
     frontend::{Frontend, images::ImageProcessor},
@@ -93,16 +99,16 @@ pub(super) fn prepare_inference_cached(
     let opts = &request.options;
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
-            return Err("prompt logprobs are not available in this model package; export with --prompt-logprobs".into());
+            return Err("prompt logprobs are not available in this model core; export with --prompt-logprobs".into());
         }
         if top > crate::execution::MAX_TOP_LOGPROBS { return Err("prompt_logprobs exceeds 20".into()); }
     }
     if let Some(logprobs) = &opts.logprobs {
         if !logprobs.ids.is_empty() && config.logprob_token_id_capacity == 0 {
-            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+            return Err("logprob_token_ids are not available in this model core; re-export to enable them".into());
         }
         if config.max_top_logprobs == 0 {
-            return Err("logprobs are not available in this model package".into());
+            return Err("logprobs are not available in this model core".into());
         }
         if logprobs
             .ids
@@ -112,7 +118,7 @@ pub(super) fn prepare_inference_cached(
             return Err("logprob_token_ids contains an ID outside the model vocabulary".into());
         }
         if logprobs.top > config.max_top_logprobs {
-            return Err(format!("top_logprobs exceeds this package's maximum of {}", config.max_top_logprobs).into());
+            return Err(format!("top_logprobs exceeds this core's maximum of {}", config.max_top_logprobs).into());
         }
     }
     let mut object = serde_json::to_value(&opts.sampling)
@@ -228,7 +234,7 @@ pub(super) fn prepare_inference_cached(
             token_ids.push(
                 frontend
                     .bos_token_id()
-                    .ok_or("empty prompt requires a packaged BOS token")?,
+                    .ok_or("empty prompt requires a BOS token declared by the core")?,
             );
         }
         (
@@ -323,7 +329,7 @@ pub(super) fn prepare_inference_cached(
     {
         return Err("structured output cannot continue an existing assistant message".into());
     }
-    let max_new_tokens = if count_only || (raw.is_some() && opts.output_limit == Some(0)) {
+    let mut max_new_tokens = if count_only || (raw.is_some() && opts.output_limit == Some(0)) {
         if tokens.len() > config.limits.max_sequence_tokens {
             return Err(Error::admission(
                 AdmissionError::Context,
@@ -339,6 +345,35 @@ pub(super) fn prepare_inference_cached(
             config.limits.max_sequence_tokens,
         )?
     };
+    let reasoning_cut = if let Some(budget) = opts.thinking_budget {
+        let unsupported = "thinking_token_budget is not supported by this model's reasoning format";
+        let output = output.as_ref().ok_or(unsupported)?;
+        let close = if output.content.start == crate::output::tagged::OutputStart::Content {
+            None
+        } else {
+            let close = thinking_budget_close(frontend, config, output.content.start)?;
+            if close.is_none() && matches!(budget, super::inference::ThinkingBudget::Required(_)) {
+                return Err(unsupported.into());
+            }
+            close
+        };
+        if let Some(close) = close {
+            (budget.tokens() < u64::from(max_new_tokens)).then(|| {
+                let budget = budget.tokens() as u32;
+                let after = max_new_tokens - budget;
+                max_new_tokens = budget;
+                ReasoningCut {
+                    close,
+                    after,
+                    output: Some(output.clone()),
+                }
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let ignore_eos = opts.ignore_eos;
     if ignore_eos && grammar.is_some() {
         return Err("structured output cannot ignore end-of-sequence tokens".into());
@@ -352,6 +387,7 @@ pub(super) fn prepare_inference_cached(
             conditioning,
             sampling,
             max_new_tokens,
+            reasoning_cut,
             stop_sequences,
             stop_strings,
             grammar,
@@ -366,6 +402,25 @@ pub(super) fn prepare_inference_cached(
         output,
         rendered_prompt: rendered.text,
         echo,
+    })
+}
+
+pub(super) fn thinking_budget_close(
+    frontend: &Frontend,
+    config: &ModelConfig,
+    start: crate::output::tagged::OutputStart,
+) -> Result<Option<u32>> {
+    use crate::output::tagged::OutputStart;
+    if !matches!(start, OutputStart::Reasoning | OutputStart::Content) {
+        return Ok(None);
+    }
+    let Some(syntax) = &config.contract.frontend.reasoning else {
+        return Ok(None);
+    };
+    let close = frontend.encode(&syntax.close, false)?;
+    Ok(match close.as_slice() {
+        [close] => Some(*close),
+        _ => None,
     })
 }
 

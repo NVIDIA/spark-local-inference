@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::{marker::PhantomData, rc::Rc, time::Instant};
 
 use crate::{
@@ -6,7 +12,76 @@ use crate::{
     cuda::{BATCH_BYTES, BATCH_ENTRIES, Event, PinnedHost, Stream},
 };
 
-use super::{ExecutionManifest, GraphKind, MAX_OUTPUT_TOKENS, REQUEST_LANES, VECTOR_RECORD_FIELDS, ReadinessIntervals};
+use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
+
+/// Frame-completion wake for threads that would otherwise poll a running frame in a
+/// `sched_yield` loop. On aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
+/// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
+/// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
+/// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
+/// completion signal; the word can only end a park early, best effort (it relies on the GPU's
+/// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
+/// intentional wait per park; scheduling can add to it.
+struct CompletionWake {
+    word: PinnedHost,
+    device: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+mod host_wait {
+    use std::sync::OnceLock;
+
+    const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
+
+    pub(super) fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
+        *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT != 0)
+    }
+
+    pub(super) fn ticks() -> u64 {
+        let ticks: u64;
+        // SAFETY: CNTVCT_EL0 is readable at EL0 on Linux; the ISB orders the read after earlier loads.
+        unsafe { std::arch::asm!("isb", "mrs {t}, cntvct_el0", t = out(reg) ticks, options(nostack)) };
+        ticks
+    }
+
+    pub(super) fn frequency() -> u64 {
+        let hz: u64;
+        // SAFETY: CNTFRQ_EL0 is readable at EL0 on Linux.
+        unsafe { std::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) hz, options(nomem, nostack)) };
+        hz
+    }
+
+    /// Park until `word` may differ from `old` or CNTVCT reaches `deadline`, whichever is first.
+    /// Same sequence as Linux `__cmpwait_case_32`, with WFET bounded by an absolute deadline.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory, and WFxT must be available.
+    pub(super) unsafe fn wait_change(word: *const u32, old: u32, deadline: u64) {
+        unsafe {
+            std::arch::asm!(
+                "sevl",
+                "wfe",
+                "ldxr {tmp:w}, [{word}]",
+                "eor {tmp:w}, {tmp:w}, {old:w}",
+                "cbnz {tmp:w}, 2f",
+                ".inst 0xd5031009", // wfet x9
+                "2:",
+                word = in(reg) word,
+                old = in(reg) old,
+                tmp = out(reg) _,
+                in("x9") deadline,
+                options(nostack),
+            );
+        }
+    }
+}
+
+/// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
+/// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
+/// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+const PARK_LIMIT_US: u64 = 100;
 
 pub struct Upload<'a> {
     pub buffer: &'a str,
@@ -14,7 +89,10 @@ pub struct Upload<'a> {
     pub bytes: &'a [u8],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(kani)]
+mod kani_proofs;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenVector {
     pub emitted_count: i64,
     pub offered_drafts: i64,
@@ -23,7 +101,7 @@ pub struct TokenVector {
     pub model_reserved: i64,
     pub draft_cache_consumed: i64,
     pub verification_width: i64,
-    pub tokens: [i64; MAX_OUTPUT_TOKENS],
+    pub tokens: Vec<i64>,
 }
 impl Default for TokenVector {
     fn default() -> Self {
@@ -35,11 +113,11 @@ impl Default for TokenVector {
             model_reserved: -1,
             draft_cache_consumed: 0,
             verification_width: 1,
-            tokens: [-1; MAX_OUTPUT_TOKENS],
+            tokens: vec![-1; DEFAULT_COMPLETION_TOKEN_CAPACITY],
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionRecord {
     pub generation: i64,
     pub submission_sequence: i64,
@@ -55,15 +133,15 @@ pub struct CompletionRecord {
 impl CompletionRecord {
     pub(crate) fn validate_vector(&self) -> Result<()> {
         if self.status != 0 {
-            if let Some(v) = self.vector {
-                if !(1..=8).contains(&v.verification_width)
+            if let Some(v) = &self.vector {
+                if !(1..=v.tokens.len() as i64).contains(&v.verification_width)
                     || !(0..=v.verification_width).contains(&v.emitted_count)
                     || !(0..v.verification_width).contains(&v.offered_drafts)
                     || v.accepted_drafts < v.emitted_count.saturating_sub(1).max(0)
                     || v.accepted_drafts > v.emitted_count
                     || v.accepted_drafts > v.offered_drafts
                     || v.copy_offered_mask < 0
-                    || v.copy_offered_mask >= (1 << v.offered_drafts)
+                    || (v.offered_drafts < 63 && (v.copy_offered_mask as u64) >= (1u64 << v.offered_drafts))
                     || v.draft_cache_consumed < -1
                     || v.tokens[..v.emitted_count as usize]
                         .iter()
@@ -100,7 +178,7 @@ impl CompletionRecord {
             self.error_code,
             self.reserved,
         ];
-        let v = self.vector.expect("completion serialization requires a token vector");
+        let v = self.vector.as_ref().expect("completion serialization requires a token vector");
         values.extend([
             v.emitted_count,
             v.offered_drafts,
@@ -111,34 +189,38 @@ impl CompletionRecord {
             0,
             v.verification_width,
         ]);
-        values.extend(v.tokens);
+        values.extend_from_slice(&v.tokens);
         values
     }
 }
-/// Inline completion storage bounded by the largest supported request capacity.
-#[derive(Debug, Clone, Copy)]
+/// Completion storage sized to the prepared request and token capacities.
+#[derive(Debug, Clone)]
 pub struct CompletionRecords {
-    records: [CompletionRecord; REQUEST_LANES],
-    len: usize,
+    records: Vec<CompletionRecord>,
 }
 
 impl std::ops::Deref for CompletionRecords {
     type Target = [CompletionRecord];
     fn deref(&self) -> &Self::Target {
-        &self.records[..self.len]
+        &self.records
     }
 }
 impl std::ops::DerefMut for CompletionRecords {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.records[..self.len]
+        &mut self.records
     }
 }
 impl<const N: usize> From<[CompletionRecord; N]> for CompletionRecords {
     fn from(values: [CompletionRecord; N]) -> Self {
         assert!(N <= REQUEST_LANES);
-        let mut records = [CompletionRecord::default(); REQUEST_LANES];
-        records[..N].copy_from_slice(&values);
-        Self { records, len: N }
+        Self { records: Vec::from(values) }
+    }
+}
+
+impl From<Vec<CompletionRecord>> for CompletionRecords {
+    fn from(records: Vec<CompletionRecord>) -> Self {
+        assert!(records.len() <= REQUEST_LANES);
+        Self { records }
     }
 }
 
@@ -161,24 +243,28 @@ pub struct FrameCompletion {
     pub graph_index: usize,
     pub timing: ExecutionTiming,
     pub records: CompletionRecords,
-    pub logprobs: Option<Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]>>,
+    pub logprobs: Option<Vec<Vec<Option<TokenLogprobs>>>>,
     pub prompt_logprobs: Option<Vec<Option<PromptLogprobs>>>,
     /// Confidence by proposal batch row; rows and columns outside the graph shape are zero.
-    pub proposal_confidence: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+    pub proposal_confidence: Option<Vec<Vec<f32>>>,
     /// Verification prefix survival by physical slot; -1 marks an unobserved prefix.
-    pub speculative_survival: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+    pub speculative_survival: Option<Vec<Vec<f32>>>,
 }
 
-pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[CompletionRecord]) -> Result<()> {
-    if rows.len() < records.len() || rows.len() > REQUEST_LANES {
+pub(crate) fn validate_speculative_survival(rows: &[Vec<f32>], records: &[CompletionRecord]) -> Result<()> {
+    if rows.len() != records.len() || rows.len() > REQUEST_LANES {
         return Err("speculative survival does not cover completion slots".into());
     }
     for (slot, row) in rows.iter().enumerate() {
+        if records.get(slot).and_then(|record| record.vector.as_ref())
+            .is_some_and(|vector| row.len() + 1 != vector.tokens.len()) {
+            return Err("speculative survival width differs from completion capacity".into());
+        }
         let offered = records.get(slot).filter(|record| matches!(record.status, 1 | 2))
-            .and_then(|record| record.vector).map_or(0, |vector| {
+            .and_then(|record| record.vector.as_ref()).map_or(0, |vector| {
                 if vector.emitted_count > vector.accepted_drafts { vector.offered_drafts }
                 else { vector.accepted_drafts.min(vector.offered_drafts) }
-            }).clamp(0, 7) as usize;
+            }).clamp(0, row.len() as i64) as usize;
         let mut bound = 1.0;
         let mut missing = false;
         for (depth, &value) in row.iter().enumerate() {
@@ -354,70 +440,13 @@ impl InputCopyBatches {
     }
 }
 
-pub(super) fn collective_choices_overview(
-    manifest: &ExecutionManifest,
-    choices: &[Vec<(String, Vec<u8>)>],
-) -> String {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::fmt::Write;
-
-    // Only this decoder assumes the b12x packed mode/CTA encoding.
-    fn decode(bytes: &[u8]) -> (String, Option<u32>) {
-        let Ok(word) = <[u8; 4]>::try_from(bytes) else {
-            return (format!("raw={bytes:02x?}"), None);
-        };
-        let value = u32::from_ne_bytes(word);
-        let name = match value >> 16 {
-            0 => "Full".into(), 1 => "Payload RSAG".into(), 2 => "Bulk Push".into(),
-            3 => "Bulk Pull".into(), 4 => "Pull".into(), id => format!("Mode {id}"),
-        };
-        (name, Some(value & 0xffff))
-    }
-    fn describe<'a>(values: impl Iterator<Item = &'a [u8]>) -> String {
-        let mut modes: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-        for bytes in values {
-            let (name, ctas) = decode(bytes);
-            modes.entry(name).or_default().extend(ctas);
-        }
-        modes.into_iter().map(|(name, ctas)| {
-            if ctas.is_empty() { return name; }
-            let counts = ctas.into_iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-            format!("{name} ({counts} CTAs)")
-        }).collect::<Vec<_>>().join(", ")
-    }
-    let mut totals = BTreeMap::new();
-    let mut outputs = BTreeMap::new();
-    for group in choices {
-        let modes = group.iter().map(|(_, bytes)| decode(bytes).0).collect::<BTreeSet<_>>();
-        let name = if modes.len() == 1 { modes.into_iter().next().unwrap() } else { "Mixed/unknown".into() };
-        *totals.entry(name).or_insert(0usize) += 1;
-        outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
-    }
-    let mut text = format!("  Collective choices · device {} · diagnostic\n", manifest.device);
-    let counts = totals.iter().map(|(name, count)| {
-        format!("{name}: {count} group{}", if *count == 1 { "" } else { "s" })
-    }).collect::<Vec<_>>().join(" · ");
-    writeln!(text, "  {counts}").unwrap();
-    let mut graphs = manifest.graphs.iter().filter(|graph| !graph.tuned_bindings.is_empty()).collect::<Vec<_>>();
-    graphs.sort_by_key(|graph| (graph.kind as u8, graph.batch_capacity, graph.token_capacity,
-        graph.packed_tokens(), graph.prefill_capacity, graph.draft_tokens, graph.name.as_str()));
-    for graph in graphs {
-        let values = graph.tuned_bindings.iter().filter_map(|binding| outputs.get(binding.buffer.as_str()).copied());
-        let selected = describe(values);
-        writeln!(text, "  {} · {:?} b={} t={} rows={} drafts={} prefill={} · {}",
-            graph.name, graph.kind, graph.batch_capacity, graph.token_capacity,
-            graph.packed_tokens(), graph.draft_tokens, graph.prefill_capacity,
-            if selected.is_empty() { "unavailable" } else { &selected }).unwrap();
-    }
-    text
-}
-
 struct Resources {
     model: Stream,
     copy: Stream,
     frames: [Frame; 2],
     engram: Option<crate::engram::Transfers>,
     input_copies: InputCopyBatches,
+    wake: Option<CompletionWake>,
 }
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
@@ -428,7 +457,6 @@ pub struct GraphExecutor {
     resolved_uploads: Vec<ResolvedUpload>,
     startup_next: usize,
     startup_ready: bool,
-    diagnostic_choices: Vec<Vec<(String, Vec<u8>)>>,
     next_sequence: u64,
     completed: Fence,
     poison: Option<Error>,
@@ -444,12 +472,10 @@ impl GraphExecutor {
     /// these inputs, graph executables, scratch or completion rows concurrently.
     pub unsafe fn new(manifest: ExecutionManifest) -> Result<Self> {
         let mut executor = unsafe { Self::new_unstarted(manifest)? };
-        let started = Instant::now();
         for index in executor.manifest.referenced_tuning_graphs() {
             executor.run_tuning_graph(index)?;
         }
         executor.finish_startup()?;
-        executor.report_startup(started);
         Ok(executor)
     }
 
@@ -510,6 +536,18 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
+        #[cfg(target_arch = "aarch64")]
+        let wake = if host_wait::available() {
+            let word = copy.mapped_host_buffer(64)?;
+            let device = copy.mapped_address(&word)?;
+            static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+            ANNOUNCED.call_once(|| eprintln!("[flare] frame completion wait: WFET"));
+            Some(CompletionWake { word, device })
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let wake = None;
         let engram = manifest
             .engram
             .clone()
@@ -524,11 +562,11 @@ impl GraphExecutor {
                 frames,
                 engram,
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
+                wake,
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
             startup_next: 0,
             startup_ready: false,
-            diagnostic_choices: Vec::new(),
             next_sequence: 1,
             completed: Fence(0),
             poison: None,
@@ -548,10 +586,6 @@ impl GraphExecutor {
         let mut reset = resources.model.host_buffer(4)?;
         reset.bytes_mut().copy_from_slice(&(-1i32).to_ne_bytes());
         let readback = resources.model.host_buffer(4)?;
-        let outputs = graph.outputs.iter().map(|name| {
-            let buffer = self.manifest.buffer(name)?;
-            Ok((buffer, resources.model.host_buffer(buffer.nbytes.min(64))?))
-        }).collect::<Result<Vec<_>>>()?;
         let completed = resources.model.event()?;
         let started = Instant::now();
         let result = (|| -> Result<()> {
@@ -559,9 +593,6 @@ impl GraphExecutor {
             unsafe { resources.model.upload(status.address, &reset, 0, 4)?; }
             resources.model.launch(graph.handle)?;
             unsafe { resources.model.download(&readback, status.address, 4)?; }
-            for (buffer, host) in &outputs {
-                unsafe { resources.model.download(host, buffer.address, buffer.nbytes.min(64))?; }
-            }
             resources.model.record(&completed)?;
             while !completed.completed()? {
                 if started.elapsed() > std::time::Duration::from_secs(120) {
@@ -594,22 +625,8 @@ impl GraphExecutor {
         if status != 0 {
             return Err(format!("startup tuning graph {:?} failed with status {status}", graph.name).into());
         }
-        self.diagnostic_choices.push(outputs.iter().map(|(buffer, host)| {
-            (buffer.name.clone(), host.bytes().to_vec())
-        }).collect());
         self.startup_next += 1;
         Ok(())
-    }
-
-    pub(super) fn report_startup(&self, started: Instant) {
-        if self.startup_next != 0 {
-            eprintln!("Startup tuning: {} graphs completed in {:.2}s", self.startup_next, started.elapsed().as_secs_f64());
-            self.report_collective_choices();
-        }
-    }
-
-    fn report_collective_choices(&self) {
-        eprint!("{}", collective_choices_overview(&self.manifest, &self.diagnostic_choices));
     }
 
     pub(super) fn finish_startup(&mut self) -> Result<()> {
@@ -664,6 +681,39 @@ impl GraphExecutor {
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
     }
+    /// Wait briefly for the oldest pending frame instead of yielding the CPU. Returns false,
+    /// without waiting, when no frame is pending, the wake word already reached the frame, or
+    /// this CPU has no WFxT; the caller then keeps its own polling step.
+    pub fn park(&self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let Some(resources) = self.resources.as_ref() else { return false };
+            let Some(wake) = resources.wake.as_ref() else { return false };
+            let Some(target) = resources
+                .frames
+                .iter()
+                .filter_map(|frame| frame.pending.as_ref())
+                .map(|pending| pending.fence.0)
+                .min()
+            else {
+                return false;
+            };
+            let word = wake.word.address() as *const u32;
+            // SAFETY: The mapped word is live, aligned and written only by the copy stream.
+            let seen = unsafe { std::sync::atomic::AtomicU32::from_ptr(word as *mut u32) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            if (seen.wrapping_sub(target as u32) as i32) >= 0 {
+                return false;
+            }
+            let deadline = host_wait::ticks() + host_wait::frequency() * PARK_LIMIT_US / 1_000_000;
+            // SAFETY: As above; `available` gated the creation of `wake`.
+            unsafe { host_wait::wait_change(word, seen, deadline) };
+            true
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        false
+    }
+
     pub fn outstanding(&self) -> usize {
         self.resources.as_ref().map_or(0, |resources| {
             resources
@@ -830,7 +880,7 @@ impl GraphExecutor {
                     frame.logprobs.as_ref().unwrap().enqueue_pitched_copy(
                         &resources.copy, b.address + index * b.nbytes / 2,
                         b.shape[3] * 4, (2 + 2 * logprob_width) * 4,
-                        self.manifest.request_capacity() * MAX_OUTPUT_TOKENS,
+                        self.manifest.request_capacity() * self.manifest.completion_token_capacity,
                     )?;
                 }
                 if prompt_rows != 0 {
@@ -859,7 +909,12 @@ impl GraphExecutor {
                     }
                 }
             }
-            resources.copy.record(&frame.transferred)
+            resources.copy.record(&frame.transferred)?;
+            if let Some(wake) = &resources.wake {
+                // SAFETY: Resources retain the mapped word until close drains both streams.
+                unsafe { resources.copy.write_value(wake.device, fence.0 as u32) }?;
+            }
+            Ok(())
         };
         if let Err(error) = operation() {
             self.poison = Some(error.clone());
@@ -933,7 +988,7 @@ impl GraphExecutor {
                 Readback::DeviceCopy(_) => 2 + 2 * pending.logprob_width,
             };
             let bytes = unsafe { readback.bytes() };
-            let nbytes = records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<f32>();
+            let nbytes = records.len() * self.manifest.completion_token_capacity * fields * size_of::<f32>();
             match decode_logprobs(
                 &bytes[..nbytes],
                 &records,
@@ -983,9 +1038,9 @@ impl GraphExecutor {
         };
         let speculative_survival = if reads_speculative_survival(&self.manifest.graphs[pending.graph_index]) {
             frame.survival.as_ref().map(|readback| {
-                let mut rows = [[-1.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
+                let mut rows = vec![vec![-1.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 // SAFETY: The completion transfer protects this frame's retained feedback bytes.
-                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact(7 * 4)) {
+                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact((self.manifest.completion_token_capacity - 1) * 4)) {
                     for (value, bytes) in row.iter_mut().zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
@@ -1035,7 +1090,7 @@ impl GraphExecutor {
             speculative_survival,
             proposal_confidence: if self.manifest.graphs[pending.graph_index].confidence_width > 0
             {
-                let mut confidence = [[0.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
+                let mut confidence = vec![vec![0.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 let graph = &self.manifest.graphs[pending.graph_index];
                 for (row, bytes) in confidence
                     .iter_mut()
@@ -1310,8 +1365,8 @@ pub(super) fn decode_records(
     fields: usize,
 ) -> Result<CompletionRecords> {
     if !(1..=REQUEST_LANES).contains(&capacity)
-        || fields != VECTOR_RECORD_FIELDS
-        || bytes.len() != capacity * fields * 8
+        || fields <= COMPLETION_METADATA_FIELDS
+        || capacity.checked_mul(fields).and_then(|n| n.checked_mul(8)) != Some(bytes.len())
     {
         return Err(Error::execution(
             ExecutionError::Completion,
@@ -1319,11 +1374,10 @@ pub(super) fn decode_records(
         ));
     }
     let mut records = CompletionRecords {
-        records: [CompletionRecord::default(); REQUEST_LANES],
-        len: capacity,
+        records: vec![CompletionRecord::default(); capacity],
     };
-    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(VECTOR_RECORD_FIELDS * 8)) {
-        let mut fields = [0i64; VECTOR_RECORD_FIELDS];
+    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(fields * 8)) {
+        let mut fields = vec![0i64; fields];
         for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(8)) {
             *field = i64::from_le_bytes(bytes.try_into().unwrap());
         }
@@ -1344,7 +1398,7 @@ pub(super) fn decode_records(
                 model_reserved: fields[12],
                 draft_cache_consumed: fields[13],
                 verification_width: fields[15],
-                tokens: fields[16..24].try_into().unwrap(),
+                tokens: fields[COMPLETION_METADATA_FIELDS..].to_vec(),
             }),
         };
         if record.status != 0 && fields[14] != 0 {
@@ -1380,20 +1434,21 @@ pub(super) fn decode_logprobs(
     fields: usize,
     requested: u64,
     selections: &[Vec<u32>],
-) -> Result<Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]>> {
+) -> Result<Vec<Vec<Option<TokenLogprobs>>>> {
+    let token_capacity = records.first().and_then(|r| r.vector.as_ref()).map_or(DEFAULT_COMPLETION_TOKEN_CAPACITY, |v| v.tokens.len());
     if !(1..=super::MAX_TOP_LOGPROBS).contains(&k)
         || fields < 2 + 2 * k
         || fields > super::LOGPROB_FIELDS
         || fields % 2 != 0
-        || bytes.len() != records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<i32>()
+        || bytes.len() != records.len() * token_capacity * fields * size_of::<i32>()
     {
         return Err(Error::execution(
             ExecutionError::Completion,
             "generation logprob frame extent mismatch",
         ));
     }
-    let mut result: Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]> = (0..records.len())
-        .map(|_| std::array::from_fn(|_| None))
+    let mut result: Vec<Vec<Option<TokenLogprobs>>> = (0..records.len())
+        .map(|_| vec![None; token_capacity])
         .collect();
     for (slot, record) in records
         .iter()
@@ -1401,22 +1456,22 @@ pub(super) fn decode_logprobs(
         .filter(|(slot, r)| matches!(r.status, 1 | 2) && requested & (1 << slot) != 0)
     {
         let count = record
-            .vector
+            .vector.as_ref()
             .map_or(usize::from(record.token_id >= 0), |v| {
                 v.emitted_count as usize
             });
-        if count > MAX_OUTPUT_TOKENS {
+        if count > token_capacity {
             return Err("generation logprob emitted count exceeds the frame".into());
         }
         for position in 0..count {
-            let start = (slot * MAX_OUTPUT_TOKENS + position) * fields * size_of::<i32>();
+            let start = (slot * token_capacity + position) * fields * size_of::<i32>();
             let int = |at: usize| {
                 let offset = start + at * size_of::<i32>();
                 i32::from_ne_bytes(bytes[offset..offset + size_of::<i32>()].try_into().unwrap())
             };
             let float = |at| f32::from_bits(int(at) as u32);
             let expected = record
-                .vector
+                .vector.as_ref()
                 .map_or(record.token_id, |v| v.tokens[position]);
             if int(0) < 0 || i64::from(int(0)) != expected || float(1).is_nan() {
                 return Err("generated token is missing its raw logprob record".into());
@@ -1569,10 +1624,10 @@ mod input_copy_tests {
     }
 }
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod confidence_tests {
     use super::*;
-    use crate::runtime_package::driver::{CopyEndpoint, CopyParams, Driver};
+    use crate::runtime_core::driver::{CopyEndpoint, CopyParams, Driver};
 
     #[test]
     #[ignore = "requires a CUDA device selected through CUDA_VISIBLE_DEVICES"]

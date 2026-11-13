@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """V4.1 registers packed rounds while retaining target-only DSpark continuations."""
 
 from collections import defaultdict
@@ -7,7 +10,6 @@ import pytest
 import torch
 
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig, _prepare_speculation_catalog
 
 
@@ -21,7 +23,6 @@ def register_catalog(monkeypatch):
         def __init__(self, owner, batch, width, name, **options):
             self.owner, self.batch, self.width, self.name = owner, batch, width, name
             self.options, self.prepared = options, False
-            self.buffers = options.get("buffers")
             constructed.append(self)
 
         def prepare(self):
@@ -53,7 +54,7 @@ def register_catalog(monkeypatch):
                 confidence_width=draft_tokens if "speculative_prefix_limits" in fields else 0)))
 
         confidence = _prepare_speculation_catalog(config, SimpleNamespace() if config.dspark else None,
-            add=add, buffers=buffers, graph_buffers=GraphBufferPool("cpu"),
+            add=add, buffers=buffers,
             forward_inputs=("row_slot_ids", "query_lengths", "request_state_rows"),
             host_allocate=host_allocate, device="cpu")
         if confidence is not None:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """A grouped AOT artifact preserves distinct prepared BF16 kernel launches."""
 
 import os

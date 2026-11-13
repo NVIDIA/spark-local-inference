@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared layer variants retain catalog storage and isolate candidate plans."""
 
 from dataclasses import replace
@@ -84,6 +88,7 @@ class Plan:
         self.size = size
         self.selection = object()
         self.prepared = object()
+        self.handle = id(self)
 
     def same_declaration_except_override(self, other):
         return isinstance(other, Plan)
@@ -93,46 +98,56 @@ class Plan:
 
 
 def catalog_layer():
-    output = torch.empty(8, 16, dtype=torch.bfloat16)
-    qkv = SimpleNamespace(plan=Plan(), output=output)
-    norm = SimpleNamespace(plan=Plan(), output=output)
-    query = SimpleNamespace(plan=Plan(), output=output)
-    chain = SimpleNamespace(encoded_projection=query, projections=(query,),
-                            workspace=torch.empty(32, dtype=torch.uint8))
-    attention = SimpleNamespace(projections={"qkv_a": qkv, "q_b": query},
-                                norm_quant=norm, concurrent_query=chain)
-    return SimpleNamespace(attention=attention, output=output)
+    from ignition.components.linear import QuantizedProjection
+    from ignition.components.projection_overlap import ConcurrentProjectionChain
+
+    class Projection(SimpleNamespace):
+        _finalize_functional = QuantizedProjection._finalize_functional
+
+    class Chain(SimpleNamespace):
+        _finalize_functional = ConcurrentProjectionChain._finalize_functional
+
+    qkv, query = [Projection(plan=Plan(), output=None, weight=object(), quantizer_plan=None) for _ in range(2)]
+    norm = SimpleNamespace(plan=Plan())
+    chain = Chain(plan_owners=(query,), encoded_layouts=(((8, 16), torch.float8_e4m3fn),),
+        encoded_projection=None, projections=None, parallel_plans=None, arena=None, workspace=None,
+        outputs=None)
+    chain._finalize_functional()
+    attention = SimpleNamespace(projections={"qkv_a": qkv, "q_b": query}, norm_quant=norm, concurrent_query=chain)
+    return SimpleNamespace(attention=attention, cache=torch.empty(8, 16, dtype=torch.bfloat16))
 
 
-def test_variant_rebinds_only_dispatch_owners_and_shares_catalog_storage():
+def test_variant_rebinds_functional_plan_owners_and_preserves_cache_and_weights():
     layer = catalog_layer()
     alternatives = (Plan(), Plan(), Plan(64))
-    side = torch.empty(64, dtype=torch.uint8)
     variant = prepared_layer_variant(layer, qkv_plan=alternatives[0], norm_plan=alternatives[1],
-                                     query_plan=alternatives[2], side_workspace=side)
+                                     query_plan=alternatives[2])
     assert variant is not layer and variant.attention is not layer.attention
     assert variant.attention.projections is not layer.attention.projections
     assert variant.attention.projections["qkv_a"].plan is alternatives[0]
     assert variant.attention.norm_quant.plan is alternatives[1]
     assert variant.attention.projections["q_b"].plan is alternatives[2]
-    assert variant.attention.concurrent_query.encoded_projection is variant.attention.projections["q_b"]
-    assert variant.attention.concurrent_query.workspace is side
-    assert variant.output is layer.output
-    assert variant.attention.projections["q_b"].output is layer.attention.projections["q_b"].output
+    chain = variant.attention.concurrent_query
+    assert chain.plan_owners == (variant.attention.projections["q_b"],)
+    assert chain.dense_handle == alternatives[2].handle and chain.workspace_nbytes == 64
+    assert chain.side_plans == (alternatives[2],)
+    assert chain.workspace is None
+    assert variant.cache is layer.cache
+    assert variant.attention.projections["q_b"].weight is layer.attention.projections["q_b"].weight
     assert layer.attention.projections["q_b"].plan is not alternatives[2]
+    assert layer.attention.concurrent_query.workspace_nbytes == 0
 
 
-def test_variant_rejects_unprepared_plan_and_undersized_overlap_storage():
+def test_variant_rejects_unprepared_plan_and_bound_overlap_storage():
     layer = catalog_layer()
     qkv, norm, query = Plan(), Plan(), Plan(64)
     query.prepared = None
     with pytest.raises(ValueError, match="prepared operator"):
-        prepared_layer_variant(layer, qkv_plan=qkv, norm_plan=norm, query_plan=query,
-                               side_workspace=torch.empty(64, dtype=torch.uint8))
+        prepared_layer_variant(layer, qkv_plan=qkv, norm_plan=norm, query_plan=query)
     query.prepared = object()
-    with pytest.raises(ValueError, match="caller-owned scratch"):
-        prepared_layer_variant(layer, qkv_plan=qkv, norm_plan=norm, query_plan=query,
-                               side_workspace=torch.empty(32, dtype=torch.uint8))
+    layer.attention.concurrent_query.encoded_layouts = None
+    with pytest.raises(ValueError, match="functional encoded projection"):
+        prepared_layer_variant(layer, qkv_plan=qkv, norm_plan=norm, query_plan=query)
 
 
 def test_tuple_identity_serializes_nested_b12x_query_metadata():
@@ -146,8 +161,8 @@ def test_tuple_identity_serializes_nested_b12x_query_metadata():
                                               "q_b": SimpleNamespace(plan=plans[2])},
                                 norm_quant=SimpleNamespace(plan=plans[1]))
     selector.layers = (SimpleNamespace(attention=attention, metadata=SimpleNamespace(positions=torch.empty(8))),)
-    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0"),
-                         SimpleNamespace(layer_index=37, label="packed.layer37"))
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0", tokens=8),
+                         SimpleNamespace(layer_index=37, label="packed.layer37", tokens=8))
     configs = {"qkv_a": (1,), "norm": (2,), "q_b": (3,)}
     identity = selector._tuple_name(0, configs, (0, 0, 0))
     assert identity == selector._tuple_name(0, configs, (0, 0, 0))
@@ -186,8 +201,8 @@ def test_public_b12x_declarations_supply_selector_families_and_override_requests
             call = lambda state: PreparedCall(run=lambda: None)
             requests[name] = plan.request(name=name, prepare_call=call, benchmark_call=call)
     selector.layers = tuple(layers)
-    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0"),
-                         SimpleNamespace(layer_index=37, label="packed.layer37"))
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0", tokens=8),
+                         SimpleNamespace(layer_index=37, label="packed.layer37", tokens=8))
     names = selector._names(requests)
     policies = selector.finalist_policies(requests)
     assert set(policies) == set(requests)
@@ -284,8 +299,9 @@ def test_context_race_captures_every_tuple_with_optional_compilation(monkeypatch
     fixture = SimpleNamespace(layer_index=0, label="packed.layer0",
         trial_signature=GraphSignature("speculative", 1, 8),
         trial_forward=lambda layer: lambda: None,
+        observation_forward=lambda layer: lambda: None,
         restore_tune=lambda layer: restored.append(layer),
-        prepared_call=lambda name, graph, compiled, layer: PreparedCall(
+        prepared_call=lambda name, graph, compiled, layer, observation_graph, observation_compiled: PreparedCall(
             run=lambda: None, produce=lambda: None))
     calls = []
     session = SimpleNamespace(headroom_bytes=0, rounds=3,
@@ -294,9 +310,30 @@ def test_context_race_captures_every_tuple_with_optional_compilation(monkeypatch
                 winner=candidates[0].name, latencies_us={}))
     plans = {(0, "qkv_a"): (object(), object()), (0, "norm"): (object(),),
              (0, "q_b"): (object(),)}
-    selector._race_layer(session, fixture, 0, {}, plans, None,
+    selector._race_layer(session, fixture, 0, {}, plans,
                          ((0, 0, 0), (1, 0, 0)))
     assert captured == [(("tuple-0-context0", "tuple-1-context0"),
-                         "packed.layer0-plan-family" if compile_decoder else None)]
-    assert len(restored) == 2 and len(reset) == 2
+                         "packed.layer0-plan-family" if compile_decoder else None),
+                        (("tuple-0-context0-observe", "tuple-1-context0-observe"),
+                         "packed.layer0-observation-family" if compile_decoder else None)]
+    assert len(restored) == 4 and len(reset) == 4
     assert calls == [(2, 2)]
+
+
+def test_attention_release_preserves_contextual_projection_plan_owners():
+    from ignition.recipes.deepseek41.attention import PreparedAttention
+    from ignition.recipes.deepseek41.contextual_selection import _role_plans
+
+    layer = catalog_layer()
+    attention = object.__new__(PreparedAttention)
+    attention.__dict__.update(vars(layer.attention))
+    layer.attention = attention
+    original = _role_plans(layer)
+    attention.release_examples()
+    assert _role_plans(layer) == original
+    assert attention.concurrent_query.plan_owners == (attention.projections["q_b"],)
+    alternatives = (Plan(), Plan(), Plan(64))
+    variant = prepared_layer_variant(layer, qkv_plan=alternatives[0], norm_plan=alternatives[1],
+                                     query_plan=alternatives[2])
+    assert _role_plans(variant) == alternatives
+    assert _role_plans(layer) == original

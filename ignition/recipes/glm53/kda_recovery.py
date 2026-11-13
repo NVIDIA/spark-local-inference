@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Triton KDA verification records and accepted-prefix replay with b12x's record layout.
 
 Verification reads each request's live FP32 state once and, per verified token,
@@ -25,6 +28,7 @@ import triton
 import triton.language as tl
 
 from ignition.preparation.triton import launch_triton, warmup_triton
+from ignition.preparation.persistent import persistent_copy
 
 ROWS = 16
 # The launch configuration rides on the kernels so whole-forward compilation, which drops
@@ -156,8 +160,21 @@ class PreparedKDAVerification:
         self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
 
-    def __call__(self):
-        launch_triton(_verify, self.compiled, self.args, self.grid, **self.options)
+    def functional(self):
+        self.args = None
+        return self
+
+    def __call__(self, *, mixed_qkv=None, raw_g=None, raw_beta=None, A_log=None, dt_bias=None,
+                 state=None, metadata=None, output=None, records=None):
+        args = self.args
+        if args is None:
+            corrections, keys_gates = records
+            gate = raw_g.reshape(raw_g.shape[0], -1)
+            args = (mixed_qkv, gate, raw_beta, A_log, dt_bias, state, metadata.query_start_loc,
+                    metadata.state_indices[:, 0], metadata.num_seqs, output, corrections, keys_gates,
+                    mixed_qkv.stride(0), gate.stride(0), raw_beta.stride(0), state.stride(0),
+                    metadata.state_indices.stride(0), corrections.stride(0), keys_gates.stride(0))
+        launch_triton(_verify, self.compiled, args, self.grid, **self.options)
 
 
 class PreparedKDAReplay:
@@ -180,8 +197,8 @@ class PreparedKDAReplay:
                 or not records.keys_and_gates.is_contiguous() or corrections.shape[1] != rows:
             raise ValueError("KDA replay requires contiguous records for every layer and state row")
         layers, _, heads, window, _ = corrections.shape
-        offsets = torch.tensor([state.storage_offset() - floats.storage_offset() for state in states],
-                               dtype=torch.int64, device=backing.device)
+        offsets = persistent_copy(torch.tensor([state.storage_offset() - floats.storage_offset() for state in states],
+                               dtype=torch.int64, device=backing.device))
         self.args = (floats, offsets, corrections, records.keys_and_gates, records.A_log, records.dt_bias,
                      slots, counts, num_seqs, floats.stride(0), slots.stride(0))
         self.options = {"SLOTS": rows, "HEADS": heads, "LOWER": float(lower_bound), "WINDOW": window,
@@ -190,5 +207,15 @@ class PreparedKDAReplay:
         self.compiled = warmup_triton(_commit.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
 
-    def __call__(self):
-        launch_triton(_commit, self.compiled, self.args, self.grid, **self.options)
+    def functional(self):
+        self.args = tuple(None if index in (2, 3, 6, 7, 8) else value
+                          for index, value in enumerate(self.args))
+        return self
+
+    def __call__(self, counts, records, metadata):
+        args = list(self.args)
+        slots = metadata.state_indices[:, 0]
+        args[2], args[3], args[6], args[7], args[8] = (
+            records.corrections, records.keys_and_gates, slots, counts, metadata.num_seqs)
+        args[-1] = slots.stride(0)
+        launch_triton(_commit, self.compiled, tuple(args), self.grid, **self.options)

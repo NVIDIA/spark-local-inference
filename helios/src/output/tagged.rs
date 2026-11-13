@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Incremental think/tool envelopes with statically selected model payload syntax.
 
 use super::{Event, Input, ModelOutput, Progress, ReasoningParser, Termination, ToolCallParser};
@@ -46,6 +52,7 @@ pub struct ThinkReasoning<D: ToolDialect> {
     tools: bool,
     trim_wrap: bool,
     tool_ends_reasoning: bool,
+    tool_undecided: bool,
     finishing: bool,
     /// Delimiters with a token count only at `offsets`; other spellings are text.
     open_token: bool,
@@ -140,6 +147,7 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 break;
             }
         }
+        self.tool_undecided = undecided.is_some();
         if let Some((end, consumed)) = boundary {
             let text = &self.buffer[..end];
             let text = if self.trim_wrap {
@@ -292,6 +300,10 @@ pub struct TaggedOutput<D: ToolDialect> {
     pending_text: String,
 }
 impl<D: ToolDialect> TaggedOutput<D> {
+    pub fn reasoning_open(&self) -> bool {
+        matches!(self.mode, Mode::Reasoning) && !self.reasoning.tool_undecided
+    }
+
     /// `control_tokens` lists delimiters that occupy one tokenizer token; those
     /// count only where generated as that token.
     pub fn with_reasoning(
@@ -351,6 +363,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 tools,
                 trim_wrap: D::TRIM_NEWLINES,
                 tool_ends_reasoning: D::TOOL_ENDS_REASONING,
+                tool_undecided: false,
                 finishing: false,
                 dialect: std::marker::PhantomData,
                 open_token: false,
@@ -380,6 +393,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             function: D::FUNCTION,
             tool_ends_reasoning: D::TOOL_ENDS_REASONING,
             response: None,
+            message_close: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })
     }
@@ -582,27 +596,32 @@ impl<D: ToolDialect> TaggedOutput<D> {
                             continue;
                         }
                     }
-                    if self.reasoning.tool_ends_reasoning {
-                        if let Some(at) = self.reasoning.find_delimiter(&self.buffer, start, true) {
-                            let earlier = self
-                                .reasoning
-                                .find_delimiter(&self.buffer, start, false)
-                                .into_iter()
-                                .chain(
-                                    [D::OPEN, D::FUNCTION.map_or(D::OPEN, |(open, _)| open)]
-                                        .iter()
-                                        .filter_map(|marker| self.buffer.find(marker)),
-                                )
-                                .any(|opener| opener < at);
-                            if !earlier {
-                                let prefix: String = self.buffer.drain(..at).collect();
-                                self.buffer.drain(..self.reasoning.close.len());
-                                if !prefix.is_empty() {
-                                    self.spans.push(Some(start..start + prefix.len()));
-                                    output.push(Event::Content(prefix));
-                                }
-                                continue;
+                    // Reasoning consumes the first close delimiter. A later one that
+                    // arrives as its delimiter token is protocol markup as well, so it
+                    // is dropped instead of becoming answer text. An opener before it
+                    // takes precedence because that envelope owns the delimiter.
+                    if (self.reasoning.tool_ends_reasoning || self.reasoning.close_token)
+                        && let Some(at) = self.reasoning.find_delimiter(&self.buffer, start, true)
+                    {
+                        let earlier = self
+                            .reasoning
+                            .find_delimiter(&self.buffer, start, false)
+                            .is_some_and(|opener| opener < at)
+                            || (!self.tools.is_empty()
+                                && [D::OPEN, D::FUNCTION.map_or(D::OPEN, |(open, _)| open)]
+                                    .iter()
+                                    .flat_map(|marker| self.buffer[..at].match_indices(marker))
+                                    .any(|(open, _)| {
+                                        D::starts_call(&self.buffer[open..]) != Some(false)
+                                    }));
+                        if !earlier {
+                            let prefix: String = self.buffer.drain(..at).collect();
+                            self.buffer.drain(..self.reasoning.close.len());
+                            if !prefix.is_empty() {
+                                self.spans.push(Some(start..start + prefix.len()));
+                                output.push(Event::Content(prefix));
                             }
+                            continue;
                         }
                     }
                     let mut marker = self
@@ -680,6 +699,7 @@ impl<D: ToolDialect> TaggedOutput<D> {
                                 trim_newlines: u8::from(self.reasoning.trim_wrap) as usize,
                                 trim_wrap: self.reasoning.trim_wrap,
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
+                                tool_undecided: false,
                                 tools: !self.tools.is_empty(),
                                 finishing: self.finishing,
                                 open_token: self.reasoning.open_token,
@@ -746,25 +766,36 @@ fn partial_marker(text: &str, markers: &[&str]) -> usize {
 }
 
 pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
+    // Tool schemas guide tag-to-JSON conversion; non-strict calls retain invalid values.
+    Ok(match declared_value(raw, schema)? {
+        Some(value) => value,
+        None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into())),
+    })
+}
+
+fn declared_value(raw: &str, schema: Option<&Value>) -> Result<Option<Value>> {
     let Some(schema) = schema else {
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     };
     let types = schema.get("type");
     if types == Some(&Value::String("string".into())) {
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     }
     if types.is_none() {
         for key in ["anyOf", "oneOf"] {
             if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+                let mut invalid = None;
                 for branch in branches {
-                    if let Ok(value) = parameter_value(raw, Some(branch)) {
-                        return Ok(value);
+                    match declared_value(raw, Some(branch)) {
+                        Ok(Some(value)) => return Ok(Some(value)),
+                        Ok(None) => {}
+                        Err(error) => invalid = invalid.or(Some(error)),
                     }
                 }
-                return Err("tool parameter does not match any declared type".into());
+                return invalid.map_or(Ok(None), Err);
             }
         }
-        return Ok(Value::String(raw.into()));
+        return Ok(Some(Value::String(raw.into())));
     }
     let kinds: Vec<_> = match types {
         Some(Value::String(kind)) => vec![kind.as_str()],
@@ -774,7 +805,7 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
     let parsed: std::result::Result<Value, _> = serde_json::from_str(raw);
     for kind in kinds {
         if kind == "string" {
-            return Ok(Value::String(raw.into()));
+            return Ok(Some(Value::String(raw.into())));
         }
         if let Ok(value) = &parsed {
             let valid = match kind {
@@ -787,9 +818,9 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
                 _ => false,
             };
             if valid {
-                return Ok(value.clone());
+                return Ok(Some(value.clone()));
             }
         }
     }
-    Err("tool parameter value does not match its declared JSON type".into())
+    Ok(None)
 }

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """QSA stream ordering across compiled graphs, KV rebinding, and scratch reuse."""
 
 import json
@@ -99,6 +103,7 @@ def test_selector_qkv_fork_join_and_rebound_cache(weights, rows, compiled, overl
     arena = ScratchArena(device, overlap=overlap)
     source = torch.randn(rows, 2560, dtype=torch.bfloat16, device=device) * .1
     input_copy, output_copy = torch.zeros_like(source), torch.empty_like(source)
+    interval_start = torch.zeros(1, dtype=torch.int64, device=device)
     scratch = QSAScratch.allocate(rows, device)
     state = QSAState.allocate(pages=1, slots=1, device=device)
     metadata = QSAMetadata.allocate(tokens=rows, batch=1, context=128, device=device)
@@ -124,6 +129,11 @@ def test_selector_qkv_fork_join_and_rebound_cache(weights, rows, compiled, overl
 
         def forward():
             input_copy.copy_(source)
+            positions = interval_start + torch.arange(rows, device=device)
+            metadata.query_positions.copy_(positions)
+            metadata.rope_positions.copy_(positions[:, None].expand(-1, 3))
+            metadata.sequence_lengths.copy_((interval_start + rows).to(torch.int32))
+            metadata.slot_mapping.copy_(metadata.main_block_table[0, positions // 64] * 64 + positions % 64)
             attention(input_copy)
             output_copy.copy_(scratch.output)
             arena.tensor.fill_(255)
@@ -155,6 +165,7 @@ def test_selector_qkv_fork_join_and_rebound_cache(weights, rows, compiled, overl
         metadata.is_prefilling.fill_(rows > 1)
         for start in (0, 3, 63):
             source.normal_(std=.1)
+            interval_start.fill_(start)
             positions = torch.arange(start, start + rows, device=device)
             metadata.query_positions.copy_(positions)
             metadata.rope_positions.copy_(positions[:, None].expand(-1, 3))

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Freeze Pillow JPEG/EXIF RGB and exact Qwen preprocessing fixtures."""
 import hashlib
 import json

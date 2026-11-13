@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """FP32 vocabulary words retain their bits through BF16 transport lanes."""
 
 from types import SimpleNamespace

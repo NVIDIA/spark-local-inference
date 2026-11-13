@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 """Prepared full-vocabulary DSpark proposals with FP32 transition scores.
 
 The sequential vocabulary-block schedule is adapted from vLLM's DS41 fused
@@ -21,9 +22,10 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import bind_scratch
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
 from ignition.preparation.tuning import register_finalizer
 from .draft_sampling import _selected_row
 from .speculation import _geometry, _metadata, _tensor
@@ -65,8 +67,8 @@ def fp8_markov_head(weight: torch.Tensor, *, rows_per_chunk=4096) -> RowScaledFP
         raise ValueError("FP8 Markov conversion requires contiguous BF16 [vocabulary, rank] weights")
     if not bool(torch.isfinite(weight).all()):
         raise ValueError("FP8 Markov conversion requires finite checkpoint weights")
-    values = torch.empty(weight.shape, dtype=torch.float8_e4m3fn, device=weight.device)
-    scales = torch.empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
+    values = persistent_empty(weight.shape, dtype=torch.float8_e4m3fn, device=weight.device)
+    scales = persistent_empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
     for start in range(0, weight.shape[0], rows_per_chunk):
         block = weight[start:start + rows_per_chunk].float()
         scale = block.abs().amax(dim=1).clamp_min(1e-12) / 448.0
@@ -182,11 +184,24 @@ class PreparedRowScaledFP8MarkovProjection:
             V=weight.out_features, RANK=weight.in_features, BLOCK=256, CHUNK=64,
             num_warps=4, enable_fp_fusion=False)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.output_layout = (tuple(self.output.shape), self.output.dtype)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.kernel.args = (None, self.weight.values, self.weight.scale, None)
+        self.source = self.output = None
+
+    def __call__(self, source):
         if self.kernel is None:
             raise RuntimeError("row-scaled FP8 Markov projection requires preparation")
-        self.kernel()
-        return self.output
+        shape, dtype = self.output_layout
+        output = torch.empty(shape, dtype=dtype, device=source.device)
+        operation = self.kernel
+        launch_triton(operation.kernel, operation.compiled,
+            (source, self.weight.values, self.weight.scale, output), operation.grid, **operation.options)
+        return output
 
 
 @triton.jit
@@ -399,7 +414,7 @@ class PreparedMarkovProposals:
         if (
             base.dtype not in (torch.bfloat16, torch.float32)
             or base.stride(-1) != 1
-            or not 1 <= depth <= 7
+            or not 1 <= depth < (1 << 31) - 1
             or not isinstance(values, torch.Tensor)
             or embedding.shape != values.shape
             or values.shape[0] != vocab
@@ -537,6 +552,38 @@ class PreparedMarkovProposals:
         self.kernels = tuple(kernels)
         self()
 
+    def functional(self, *, session):
+        if self.kernels is None:
+            raise RuntimeError("fused Markov preparation must finish before functional conversion")
+        self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in self.scratch.items()}
+        # Kernel operand positions preserve the prepared tensor layouts and schedule.
+        for kernel in self.kernels[:-1]:
+            kernel.args = tuple(None if index in (0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+                                else value for index, value in enumerate(kernel.args))
+        kernel = self.kernels[-1]
+        kernel.args = tuple(None if index < 8 else value for index, value in enumerate(kernel.args))
+        self.base = self.pending = self.tokens = self.probabilities = self.valid = self.seeds = self.offsets = None
+        self.scratch = None
+        return self
+
+    def run(self, base, pending, tokens, probabilities, valid, seeds, offsets):
+        scratch = {name: torch.empty(shape, dtype=dtype, device=base.device)
+                   for name, (shape, dtype) in self.local_layout.items()}
+        for step, operation in enumerate(self.kernels[:-1]):
+            args = list(operation.args)
+            before, after = (step - 1) % 2, step % 2
+            args[0], args[4], args[5], args[6] = base, pending, tokens, probabilities
+            args[7:16] = (scratch["lse_max"], scratch["lse_sum"], scratch["bad"],
+                scratch["maxima"][before], scratch["arguments"][before],
+                scratch["maxima"][after], scratch["arguments"][after], seeds, offsets)
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        operation = self.kernels[-1]
+        args = list(operation.args)
+        args[:8] = (probabilities, scratch["lse_max"], scratch["lse_sum"], scratch["bad"],
+            scratch["maxima"][(self.depth - 1) % 2], scratch["arguments"][(self.depth - 1) % 2], tokens, valid)
+        launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        return tokens, probabilities, valid
+
     def __call__(self):
         if self.kernels is None:
             raise RuntimeError("fused Markov proposals require preparation before capture")
@@ -545,22 +592,16 @@ class PreparedMarkovProposals:
 
 
 class PreparedDraftTokenBroadcast:
-    """Canonicalize proposal IDs and validity while retaining rank-local full q.
+    """Broadcast proposal IDs and validity while preserving rank-local full q."""
 
-    Stochastic verification must broadcast all acceptance fields, including
-    survival. Only root probabilities influence the committed target sample.
-    """
-
-    def __init__(self, tokens, valid, sampled, *, runtime, session, coordinator, name, buffers=None):
+    def __init__(self, tokens, valid, sampled, *, runtime, session, coordinator, name):
         from .collectives import PreparedBroadcast
 
-        self.tokens, self.valid, self.sampled = tokens, valid, sampled
-        self.positions = torch.arange(tokens.shape[1], device=tokens.device)
-        self.broadcast = PreparedBroadcast(
-            (tokens, valid), runtime=runtime, session=session, coordinator=coordinator, name=name, buffers=buffers
-        )
+        self.broadcast = PreparedBroadcast((tokens, valid), runtime=runtime, session=session,
+            coordinator=coordinator, name=name).functional(session=session)
 
-    def finish(self, active, limits):
-        self.broadcast()
-        self.sampled.copy_(self.tokens[:, -1])
-        self.valid.logical_and_(active[:, None] & (self.positions[None, :] < limits[:, None] - 1))
+    def finish(self, tokens, valid, active, limits):
+        self.broadcast((tokens, valid))
+        positions = torch.arange(tokens.shape[1], device=tokens.device)
+        valid = valid & active[:, None] & (positions[None, :] < limits[:, None] - 1)
+        return tokens, valid, tokens[:, -1]

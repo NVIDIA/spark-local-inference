@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A scripted instance on the RDMA carrier: it registers staging, makes a queue pair for
 //! each transfer and lends private slots to a claim, as the client does.
 

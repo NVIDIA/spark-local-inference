@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Arithmetic metadata reaches prepared MLA without changing its cache ABI."""
 
 from types import SimpleNamespace

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native prompt metadata exported from the cached checkpoint tokenizer."""
 
 import json
@@ -6,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from ignition.preparation.frontend import PromptEncoder, prepare_frontend
-from ignition.preparation.package_proto import serving
-from ignition.preparation.runtime_package_pb2 import ModelIndex
+from ignition.preparation.core_proto import serving
+from ignition.preparation.runtime_core_pb2 import ModelIndex
 from ignition.recipes.deepseek41.recipe import RECIPE
 
 

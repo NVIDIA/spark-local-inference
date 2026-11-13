@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Host-only fixtures for transport, scheduling, and contract validation.
 
 use super::{ModelConfig, VisionCapabilities, contract::*};
@@ -245,8 +251,8 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 PromptHistogram => config.contract.vocabulary,
                 GrammarMask => config.contract.vocabulary.div_ceil(32),
                 PageTable => config.prepared_sequence_tokens / config.contract.cache.page_tokens,
-                CopyTokenIds => 7,
-                CopyGrammarMask => 8 * config.contract.vocabulary.div_ceil(32),
+                CopyTokenIds => config.speculative_widths.iter().copied().max().unwrap_or(8).saturating_sub(1).max(1),
+                CopyGrammarMask => config.speculative_widths.iter().copied().max().unwrap_or(8) * config.contract.vocabulary.div_ceil(32),
                 PromptPosition => 3,
                 _ => 1,
             };
@@ -293,7 +299,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         ("submission_sequence".into(), (Dtype::Int64, vec![1])),
         (
             "completion_records".into(),
-            (Dtype::Int64, vec![2, slots, 24]),
+            (Dtype::Int64, vec![2, slots, 16 + config.completion_token_capacity]),
         ),
         ("state_pool".into(), (Dtype::Uint8, vec![1024, 32])),
         ("pending".into(), (Dtype::Int64, vec![slots])),
@@ -372,8 +378,9 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         })
         .collect();
     ExecutionManifest {
+        completion_token_capacity: config.completion_token_capacity,
         tuning_graphs: vec![],
-        abi_version: 5,
+        abi_version: 6,
         context: 1,
         device: 0,
         max_active: slots,

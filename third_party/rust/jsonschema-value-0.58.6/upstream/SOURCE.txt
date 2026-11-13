@@ -1,0 +1,2 @@
+License text omitted from the published crate; copied verbatim from its recorded upstream revision.
+https://github.com/Stranger6667/jsonschema/blob/55ac1664384793c5d3b20745d3f9c169dfe2c06f/LICENSE

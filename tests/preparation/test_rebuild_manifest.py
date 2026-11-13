@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Signed preparation metadata names stored layouts without changing serving payloads."""
 
 from dataclasses import dataclass
@@ -5,11 +9,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from ignition.preparation import runtime_package_pb2 as proto
+from ignition.preparation import runtime_core_pb2 as proto
 from ignition.preparation.rebuild_manifest import rebuild_weights_metadata, validate_weights, weight_views
 from helios.tests.signing import publisher
-from tests.preparation.test_package_snapshot import native, assert_native
-from tests.preparation import test_package_protection as fixtures
+from tests.preparation.test_core_snapshot import native, assert_native
+from tests.preparation import test_core_protection as fixtures
 
 
 @dataclass

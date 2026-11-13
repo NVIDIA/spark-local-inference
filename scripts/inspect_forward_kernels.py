@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Inspect generated kernels in explicit ForwardCache artifacts without model weights.
 
 The default reads serialized source and static-autotuner bindings on the CPU.

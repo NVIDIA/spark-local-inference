@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Allocate a fixed token budget among causal speculative prefixes.
 
 Each submitted row starts with its pending token. Further tokens are admitted
@@ -77,8 +80,8 @@ class PreparedCausalPrefixAllocation:
         if confidence.ndim != 2 or confidence.dtype != torch.float32:
             raise ValueError("prefix confidence requires a two-dimensional FP32 tensor")
         batch, depth = confidence.shape
-        if not 1 <= batch <= request_capacity <= 64 or not 1 <= depth <= 7:
-            raise ValueError("prefix allocation requires 1 <= batch <= request_capacity <= 64 and 1 <= depth <= 7")
+        if not 1 <= batch <= request_capacity <= 64 or not 1 <= depth < (1 << 31) - 1:
+            raise ValueError("prefix allocation requires 1 <= batch <= request_capacity <= 64 and positive depth within Int32 token lengths")
         if not isinstance(token_capacity, int) or not 0 <= token_capacity <= 2147483647:
             raise ValueError("prefix token capacity must be a nonnegative Int32 value")
         if confidence.stride(0) <= 0 or confidence.stride(1) <= 0:
@@ -93,5 +96,13 @@ class PreparedCausalPrefixAllocation:
                      confidence.stride(0), confidence.stride(1), batch, depth, token_capacity,
                      request_capacity, triton.next_power_of_2(batch))
 
-    def __call__(self):
-        torch.library.wrap_triton(_allocate)[(1,)](*self.args, num_warps=4, enable_fp_fusion=False)
+    def functional(self):
+        self.geometry = self.args[7:]
+        self.args = None
+        return self
+
+    def __call__(self, confidence, slots, submitted, source_valid, prefix_limits, output_lengths):
+        valid = torch.empty_like(submitted)
+        torch.library.wrap_triton(_allocate)[(1,)](confidence, slots, submitted, source_valid,
+            prefix_limits, output_lengths, valid, *self.geometry, num_warps=4, enable_fp_fusion=False)
+        return valid

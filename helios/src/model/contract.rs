@@ -1,10 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Prepared storage, value sources, and frontend syntax independent of model identity.
 
 use super::VisionCapabilities;
 use crate::{
     Result,
-    execution::{ExecutionManifest, GraphKind, TunedBinding},
+    execution::{BufferDescriptor, ExecutionManifest, GraphKind, TunedBinding},
 };
+
+#[cfg(kani)]
+mod kani_proofs;
 
 macro_rules! contract_enum {
     ($name:ident { $($variant:ident = $value:literal),+ $(,)? }) => {
@@ -20,13 +29,13 @@ macro_rules! contract_enum {
                 }
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
                 serializer.serialize_i32(*self as i32)
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
                 let value = <i32 as serde::Deserialize>::deserialize(deserializer)?;
@@ -81,11 +90,11 @@ impl TryFrom<GraphKind> for GraphOperation {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PreparedContract {
@@ -100,11 +109,11 @@ pub struct PreparedContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CacheContract {
@@ -115,11 +124,11 @@ pub struct CacheContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct HistoryRegion {
@@ -131,11 +140,11 @@ pub struct HistoryRegion {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PageTableView {
@@ -145,11 +154,11 @@ pub struct PageTableView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ValueBinding {
@@ -163,11 +172,11 @@ pub struct ValueBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateView {
@@ -179,11 +188,11 @@ pub struct StateView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateAccess {
@@ -193,11 +202,11 @@ pub struct StateAccess {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CompletionCursor {
@@ -207,11 +216,11 @@ pub struct CompletionCursor {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct GraphContract {
@@ -228,11 +237,11 @@ pub struct GraphContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ToolParser {
@@ -243,11 +252,11 @@ pub struct ToolParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ReasoningParser {
@@ -260,11 +269,11 @@ pub struct ReasoningParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PrefixBoundary {
@@ -279,11 +288,11 @@ pub struct PrefixBoundary {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct FrontendContract {
@@ -301,11 +310,11 @@ pub struct FrontendContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageTokenLayout {
@@ -315,11 +324,11 @@ pub struct ImageTokenLayout {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageSpan {
@@ -339,8 +348,8 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if self.version != 3 {
-            return Err("unsupported prepared model contract version; re-export the model package".into());
+        if !(1..=3).contains(&self.version) {
+            return Err("unsupported prepared model contract version; re-export the model core".into());
         }
         if self.vocabulary == 0
             || self.input_vocabulary < self.vocabulary
@@ -413,7 +422,7 @@ impl PreparedContract {
         }
         let mut names = std::collections::HashSet::new();
         for graph in &self.graphs {
-            if !names.insert(&graph.graph) || !(1..=8).contains(&graph.state_rows_per_request) {
+            if !names.insert(&graph.graph) || graph.state_rows_per_request == 0 {
                 return Err(
                     "duplicate graph contract or invalid continuation-row requirement".into(),
                 );
@@ -581,24 +590,27 @@ impl StateView {
 
     fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
         let buffer = manifest.buffer(&self.buffer)?;
-        if self.nbytes == 0
-            || buffer.shape.is_empty()
-            || buffer
-                .strides
-                .first()
-                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
-                != Some(self.stride)
-            || self
-                .offset
-                .checked_add(self.nbytes)
-                .is_none_or(|end| end > self.stride)
-            || buffer.shape[0]
-                .checked_mul(self.stride)
-                .is_none_or(|end| end > buffer.nbytes)
-        {
+        if !self.fits_storage(buffer) {
             return Err("persistent state view exceeds its prepared storage".into());
         }
         Ok(())
+    }
+
+    fn fits_storage(&self, buffer: &BufferDescriptor) -> bool {
+        self.nbytes != 0
+            && !buffer.shape.is_empty()
+            && buffer
+                .strides
+                .first()
+                .and_then(|stride| stride.checked_mul(buffer.dtype.size()))
+                == Some(self.stride)
+            && self
+                .offset
+                .checked_add(self.nbytes)
+                .is_some_and(|end| end <= self.stride)
+            && buffer.shape[0]
+                .checked_mul(self.stride)
+                .is_some_and(|end| end <= buffer.nbytes)
     }
 }
 
@@ -669,6 +681,81 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_contract_versions_validate_declared_state_storage() {
+        let config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+        for version in [1, 2, 3] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            contract.validate(&manifest).unwrap();
+            contract.graphs[0].state[0].view.buffer = "missing_state".into();
+            assert!(contract.validate(&manifest).is_err());
+        }
+        for version in [0, 4, u32::MAX] {
+            let mut contract = config.contract.clone();
+            contract.version = version;
+            assert!(contract.validate(&manifest).is_err());
+        }
+    }
+
+    #[test]
+    fn state_view_validation_resolves_buffers_and_preserves_storage_errors() {
+        use crate::{Error, ExecutionError, execution::Dtype};
+        let view = StateView { buffer: "state".into(), offset: 4, stride: 16, nbytes: 12 };
+        let buffer = BufferDescriptor {
+            name: "state".into(), address: 4096, nbytes: 32,
+            dtype: Dtype::Int32, shape: vec![2], strides: vec![4],
+        };
+        let mut manifest = ExecutionManifest {
+            engram: None, collectives: None, cache: None, offload: None,
+            abi_version: crate::execution::ABI_VERSION, context: 0, device: 0,
+            completion_token_capacity: 8,
+            max_active: 1, input_frame_bytes: 8,
+            buffers: vec![BufferDescriptor {
+                name: "other".into(), shape: vec![], ..buffer.clone()
+            }, buffer],
+            graphs: vec![], tuning_graphs: vec![],
+        };
+        view.validate(&manifest).unwrap();
+        let mut missing = view.clone();
+        missing.buffer = "missing".into();
+        missing.nbytes = 0;
+        let error = missing.validate(&manifest).unwrap_err();
+        assert!(matches!(&error, Error::Execution(ExecutionError::Manifest(_))));
+        assert_eq!(error.to_string(), "unknown buffer \"missing\"");
+
+        type Invalid = (&'static str, fn(&mut StateView, &mut BufferDescriptor));
+        let cases: [Invalid; 9] = [
+            ("zero extent", |v, _| v.nbytes = 0),
+            ("empty shape", |_, b| b.shape.clear()),
+            ("missing element stride", |_, b| b.strides.clear()),
+            ("mismatched byte stride", |_, b| b.strides[0] = 5),
+            ("element stride overflow", |_, b| b.strides[0] = usize::MAX),
+            ("view extent overflow", |v, _| v.offset = usize::MAX),
+            ("view extends past its row", |v, _| v.offset = 5),
+            ("row extent overflow", |_, b| b.shape[0] = usize::MAX),
+            ("rows extend past storage", |_, b| b.nbytes = 31),
+        ];
+        for (name, invalidate) in cases {
+            let mut invalid_view = view.clone();
+            let saved = manifest.buffers[1].clone();
+            invalidate(&mut invalid_view, &mut manifest.buffers[1]);
+            let error = invalid_view.validate(&manifest).unwrap_err();
+            assert!(matches!(&error, Error::Execution(ExecutionError::State(_))), "{name}");
+            assert_eq!(error.to_string(), "persistent state view exceeds its prepared storage", "{name}");
+            manifest.buffers[1] = saved;
+        }
+        let exact = StateView {
+            buffer: "state".into(), offset: usize::MAX - 1, stride: usize::MAX, nbytes: 1,
+        };
+        manifest.buffers[1].dtype = Dtype::Uint8;
+        manifest.buffers[1].shape = vec![1];
+        manifest.buffers[1].strides = vec![usize::MAX];
+        manifest.buffers[1].nbytes = usize::MAX;
+        exact.validate(&manifest).unwrap();
+    }
 
     #[test]
     fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {

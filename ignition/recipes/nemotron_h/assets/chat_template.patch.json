@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+    "revision": "c6cc2e8ffa353403213d6b9b18aaf8eb684d705a",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "6521afc75afb0661e3558e7e6dee5f2d15de8be1c4dece8171935e778ea283f4",
+  "result_sha256": "5d13bf8a3dc849db55f0c925999eaabdedb83dd173096021506cc711d40dd48c",
+  "insertions": [
+    7641,
+    12286
+  ]
+}

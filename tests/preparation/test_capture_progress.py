@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Persistent graph-catalog output through the shared capture boundary."""
 
 from contextlib import nullcontext
@@ -36,8 +39,11 @@ def test_capture_reports_catalog_once_before_compilation_and_on_recapture(captur
         calls.append("forward")
     class Cached:
         cache_hit = True
+        capture_allocation_sizes = ()
         def prepare_capture(self):
             return 0
+        def retire_after_capture(self):
+            pass
         def __call__(self):
             calls.append("cached")
     class Cache:

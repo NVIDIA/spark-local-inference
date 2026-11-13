@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Convert K3's byte-ranked vocabulary to the native Hugging Face tokenizer."""
 
 import base64
@@ -53,7 +56,7 @@ def convert(snapshot):
     return tokenizer
 
 
-def runtime_assets(tokenizer):
+def runtime_assets(tokenizer, *, template=None):
     """Describe the converted vocabulary and bundled template without creating files."""
     return {"tokenizer": {"text": tokenizer.to_str(pretty=True)},
-            "chat_template": {"path": str(Path(__file__).with_name("assets") / "chat_template.jinja")}}
+            "chat_template": {"path": str(Path(__file__).with_name("assets") / "chat_template.jinja" if template is None else template)}}

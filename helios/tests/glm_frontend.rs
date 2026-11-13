@@ -1,4 +1,13 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
+
+#[path = "support/templates.rs"]
+mod template_fixtures;
 
 use flare_helios::frontend;
 use flare_helios::{model, scheduler};
@@ -34,7 +43,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
             tokenizer: asset("tokenizer.json"),
             tokens: support::tokens(&asset("tokenizer_config.json")).unwrap(),
             chat_template: Some({
-                let path=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ignition/recipes/glm53/assets/chat_template.jinja");
+                let path=template_fixtures::path("glm53", "chat_template");
                 let contents=fs::read_to_string(&path).unwrap();
                 assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap());
                 Asset {range:None,sha256:format!("{:x}",Sha256::digest(contents.as_bytes())),path}
@@ -47,6 +56,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
     )
     .unwrap();
     let config = ModelConfig {
+        completion_token_capacity: 8,
         max_top_logprobs: 0,
         logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 1048576,

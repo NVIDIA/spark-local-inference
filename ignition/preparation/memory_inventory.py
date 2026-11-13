@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Attribute physical export storage to live prepared owners without counting aliases twice."""
 
 from collections import defaultdict, deque
@@ -11,6 +14,7 @@ from pathlib import Path
 import re
 from types import FunctionType, MethodType, ModuleType
 
+from .host_memory import device_memory_info
 from .tensor_metadata import merge_ranges, subtract_ranges, tensor_ranges
 
 
@@ -43,8 +47,8 @@ def _source(cls):
 def owner_claims(prepared):
     """Walk retained fields and function closures, never properties or module globals.
 
-    Tensor claims cover elements rather than entire backing storages. Pool claims
-    cover their full allocations, including unused chunk capacity. Object identity
+    Tensor claims cover elements rather than entire backing storages. Arena claims
+    cover their full allocations, including unused capacity. Object identity
     bounds traversal; overlapping tensor elements use their first owning field.
     """
     import torch
@@ -95,7 +99,6 @@ def owner_claims(prepared):
             result.extend(Claim(t.data_ptr(), t.data_ptr() + t.nbytes, category,
                                 f"{path}<{type(value).__name__}>", _source(type(value)), 80)
                           for t in tensors if t.nbytes)
-            # Chunk tensors would hide the fields using their individual views.
             continue
         if isinstance(value, Mapping):
             enqueue((child, f"{path}[{key!r}]", source) for key, child in value.items())
@@ -172,12 +175,13 @@ def _size(ranges):
     return sum(end - start for start, end in merge_ranges(ranges))
 
 
-def collect_inventory(prepared, storage, package, *, external=()):
-    """Join Heliopause's physical snapshot to the graph-reachable package and its owners.
+def collect_inventory(prepared, storage, core, *, external=()):
+    """Join Heliopause's physical snapshot to the graph-reachable core and its owners.
 
     This is a preparation snapshot, not a prediction of serving cache size or
-    driver overhead after loading. All byte counts exclude imported peer mappings
-    and mapped host storage. Dynamic caches count only their backed prefixes.
+    driver overhead after loading. Tracked physical storage excludes imported peer
+    mappings and mapped host storage. Dynamic caches count only their backed prefixes.
+    Usage covers the whole device or, on integrated GPUs, the shared system.
     """
     import flare_heliopause
     import torch
@@ -191,7 +195,7 @@ def collect_inventory(prepared, storage, package, *, external=()):
     for name, tensor in prepared.buffers.items():
         claims.extend(Claim(start, end, "Graph I/O / persistent state", f"buffers[{name!r}]", priority=40)
                       for start, end in tensor_ranges(tensor))
-    segments = [s for s in torch.cuda.memory_snapshot() if s["device"] == storage.device]
+    segments = [s for s in torch.cuda.memory_snapshot(include_traces=False) if s["device"] == storage.device]
     for segment in segments:
         graph_pool = tuple(segment["segment_pool_id"]) == tuple(storage.graph_pool.id)
         for block in segment["blocks"]:
@@ -205,47 +209,56 @@ def collect_inventory(prepared, storage, package, *, external=()):
             if live < size:
                 claims.append(Claim(start + live, start + size, "Allocator slack", "inactive blocks / alignment", priority=100))
     dynamic = {region.address: region for region in storage.dynamic_regions}
+    persistent = tuple(getattr(storage, "persistent_regions", ()))
+    arena = getattr(storage, "_persistent_arena", None)
+    if arena is not None:
+        claims.extend(Claim(start, end, "Allocator slack", "persistent tensor alignment / mapping tail", priority=100)
+                      for start, end in arena.unused_ranges())
     for region in dynamic.values():
         claims.append(Claim(region.address, region.address + region.nbytes,
                             "Preparation cache backing", region.name,
-                            "ignition/preparation/package_storage.py:PackageStorage.device_allocate", 110))
+                            "ignition/preparation/core_storage.py:CoreStorage.device_allocate", 110))
     peers = {} if storage.peer_storage is None else storage.peer_storage.owned
     for address, size in peers.items():
         if address not in dynamic:
             claims.append(Claim(address, address + size, "TP communication", "PeerStorage.owned",
                                 "ignition/preparation/peer_storage.py", 110))
-    for address, size, owner in package.module_globals:
+    for address, size, owner in core.module_globals:
         claims.append(Claim(address, address + size, "Kernel globals", owner, priority=110))
-    fixed = [(a.address, a.address + a.nbytes) for a in package.allocations
+    fixed = [(a.address, a.address + a.nbytes) for a in core.allocations
              if a.memory == "device" and a.sizing is None]
     cache = [(r.address, r.address + r.nbytes) for r in dynamic.values()]
-    globals = [(address, address + size) for address, size, _ in package.module_globals]
+    globals = [(address, address + size) for address, size, _ in core.module_globals]
     physical = merge_ranges([
         *((address, address + size) for address, size in native["mappings"]),
         *((address, address + size) for address, size in external),
         *((s["address"], s["address"] + s["total_size"]) for s in segments),
         *cache, *globals,
+        *((region.address, region.address + region.nbytes) for region in persistent if region.nbytes),
     ])
     exported = merge_ranges([*fixed, *globals])
-    package_padding = subtract_ranges(exported, physical)
-    retained = subtract_ranges(exported, package_padding)
+    core_padding = subtract_ranges(exported, physical)
+    retained = subtract_ranges(exported, core_padding)
     preparation_only = subtract_ranges(physical, retained)
-    used = native["total_bytes"] - native["free_bytes"]
+    shared_system_memory = torch.cuda.get_device_properties(storage.device).is_integrated
+    free, total = (device_memory_info(storage.device) if shared_system_memory else
+                   (native["free_bytes"], native["total_bytes"]))
+    used = total - free
     known = _size(physical)
     return dict(rank=storage.rank, device=storage.device,
-                total_bytes=native["total_bytes"], free_bytes=native["free_bytes"],
+                total_bytes=total, free_bytes=free, shared_system_memory=shared_system_memory,
                 device_used_bytes=used, tracked_physical_bytes=known,
                 device_unattributed_bytes=used - known,
                 torch_allocated_bytes=torch.cuda.memory_allocated(storage.device),
                 torch_reserved_bytes=torch.cuda.memory_reserved(storage.device),
-                fixed_package_bytes=_size(fixed), kernel_global_bytes=_size(globals),
-                package_padding_bytes=_size(package_padding),
+                fixed_core_bytes=_size(fixed), kernel_global_bytes=_size(globals),
+                core_padding_bytes=_size(core_padding),
                 cache_backing_bytes=_size(cache),
                 mapped_host_bytes=sum(r.extent for r in storage.host_regions if not r.closed),
                 imported_peer_bytes=(0 if storage.peer_storage is None else sum(
                     size for parts in storage.peer_storage.imported_mappings.values() for _, size in parts)),
                 entries=attribute(retained, claims), preparation_entries=attribute(preparation_only, claims),
-                graphs=len(prepared.graphs), **package.export_counts)
+                graphs=len(prepared.graphs), **core.export_counts)
 
 
 def format_inventory(reports):
@@ -257,14 +270,18 @@ def format_inventory(reports):
             return f"{size / 1024:,.2f} KiB"
         return f"{size / (1 << 20):,.2f} MiB"
 
-    lines = ["VRAM inventory at export (physical bytes; aliased storage counted once)"]
+    lines = ["GPU memory inventory at export (physical bytes; aliased storage counted once)"]
     for report in reports:
+        shared = report.get('shared_system_memory', False)
+        scope = "shared system memory: " if shared else ""
+        availability = "available" if shared else "free"
         lines.append(f"Rank {report['rank']} / CUDA {report['device']}: "
-                     f"{display_size(report['device_used_bytes'])} used, {display_size(report['free_bytes'])} free")
-        lines.append(f"  Package fixed mappings: {display_size(report['fixed_package_bytes'])}; "
+                     f"{scope}{display_size(report['device_used_bytes'])} used, "
+                     f"{display_size(report['free_bytes'])} {availability}")
+        lines.append(f"  Core fixed mappings: {display_size(report['fixed_core_bytes'])}; "
                      f"kernel globals: {display_size(report['kernel_global_bytes'])}")
-        if report['package_padding_bytes']:
-            lines.append(f"  Additional mapping alignment at load: {display_size(report['package_padding_bytes'])}")
+        if report['core_padding_bytes']:
+            lines.append(f"  Additional mapping alignment at load: {display_size(report['core_padding_bytes'])}")
         for title, field in (("Retained storage", "entries"), ("Preparation-only storage", "preparation_entries")):
             categories = defaultdict(list)
             for row in report[field]:
@@ -292,11 +309,14 @@ def format_inventory(reports):
                      f"imported peers: {display_size(report['imported_peer_bytes'])} (excluded from local VRAM)")
         lines.append(f"  Graphs: {report['graphs']}; kernels: {report['kernels']} in {report['modules']} modules "
                      f"({display_size(report['cubin_bytes'])} cubin data, not resident VRAM)")
-        lines.append(f"  Device usage minus tracked physical storage: {display_size(report['device_unattributed_bytes'])}")
+        remainder = "Shared system usage minus tracked GPU storage" if shared else "Device usage minus tracked physical storage"
+        lines.append(f"  {remainder}: {display_size(report['device_unattributed_bytes'])}")
+    if any(report.get('shared_system_memory', False) for report in reports):
+        lines.append("Shared system usage includes host allocations and other processes; it is not process VRAM usage.")
     lines.append("Graph executable overhead, resident kernel code, untracked driver/library allocations, and other "
                  "processes are included in device usage but cannot be separated by this snapshot.")
-    lines.append("Shared scratch lists representative tensor owners; source lines identify owning classes or closures.")
-    lines.append("Scratch totals count reserved storage, including chunk padding; they do not measure a peak of live values.")
+    lines.append("Shared storage lists representative tensor owners; source lines identify owning classes or closures.")
+    lines.append("Temporary storage totals include allocator alignment and reservation; they do not measure the exact live-memory peak.")
     return "\n".join(lines)
 
 

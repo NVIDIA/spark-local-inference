@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared MiMo image encoder with row/column windows and spatial patch merging."""
 
 from dataclasses import dataclass
@@ -13,7 +16,8 @@ from ignition.components.varlen_attention import PreparedVarlenAttention
 
 PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 FEATURES = 16384
-HIDDEN = 6144
+# Encoder block width, reduced across ranks after every attention and MLP block.
+VISION_WIDTH = 1280
 
 
 @dataclass(frozen=True)
@@ -60,13 +64,14 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, shard, device, *, buffers=None):
+    def allocate(cls, patches, shard, device, *, hidden, buffers=None):
+        """Allocate encoder scratch; `hidden` is the text model width the merged features project into."""
         heads, kv_heads = 32 // shard.world_size, 8 // shard.world_size
         def zeros(cursor, *shape):
             return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if cursor is None
                     else cursor.zeros(shape, torch.bfloat16))
         pixels = zeros(buffers, patches, 1536)
-        residual, normalized, projected, reduced = (zeros(buffers, patches, 1280) for _ in range(4))
+        residual, normalized, projected, reduced = (zeros(buffers, patches, VISION_WIDTH) for _ in range(4))
         stages = [buffers.fork() for _ in range(3)] if buffers is not None else [None] * 3
         attention, feedforward, merger = stages
         mlp = MLPScratch.allocate(patches, 1280, 4608 // shard.world_size, device, buffers=feedforward)
@@ -76,7 +81,7 @@ class VisionScratch:
         attended = zeros(attention, patches, heads * 64)
         merged = zeros(merger, patches // 4, 5120)
         activated = zeros(merger, patches // 4, 5120 // shard.world_size)
-        partial, output = (zeros(merger, patches // 4, HIDDEN) for _ in range(2))
+        partial, output = (zeros(merger, patches // 4, hidden) for _ in range(2))
         if buffers is not None:
             buffers.join(*stages)
         return cls(pixels, residual, normalized, qkv, query, key, value, attended, projected,

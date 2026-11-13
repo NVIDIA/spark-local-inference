@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Native rank fanout, b12x agreement, and coordinated completion without Python peer steps."""
 
 import os
@@ -207,7 +211,7 @@ def _rank(rank, world, rendezvous, sockets, fields, compilation):
                 connection.close()
 
 
-@pytest.mark.parametrize("world,fields", [(2, 8), (4, 24)])
+@pytest.mark.parametrize("world,fields", [(2, 32), (4, 32)])
 @pytest.mark.parametrize("compilation", ["lowered", "aot", "parallel"])
 def test_native_rank_coordination(world, fields, compilation, tmp_path, monkeypatch):
     assert os.environ.get("CUDA_VISIBLE_DEVICES") and torch.cuda.device_count() == 4
@@ -256,7 +260,7 @@ def _startup_rank(rank, world, rendezvous, sockets, fail_peer):
             buffers["startup_failure"].fill_(17)
         buffers.update(frame_index=torch.zeros(1, dtype=torch.int32, device=device),
                        submission_sequence=torch.zeros(1, dtype=torch.int64, device=device),
-                       completion_records=torch.zeros((2, 1, 24), dtype=torch.int64, device=device))
+                       completion_records=torch.zeros((2, 1, 32), dtype=torch.int64, device=device))
         with RecordedPreparationSession(device=device, checkpoint="process-startup-tuning",
                 workload_schema="shared-selector", numerical_policy="exact-integer-sum",
                 coordinator=coordinator) as session:

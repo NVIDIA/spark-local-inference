@@ -1,4 +1,8 @@
-"""Package export and development serving with injected preparation resources."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Core export and development serving with injected preparation resources."""
 
 import json
 import os
@@ -13,6 +17,7 @@ import pytest
 from ignition import planning
 from ignition.cli import environment, main, serve
 from ignition.cli.config import Configuration
+from ignition.preparation.model import PreparedModel
 from ignition.recipes import ResolvedModel, recipes, resolve
 from ignition.recipes.declaration import RankUsage
 
@@ -49,7 +54,7 @@ class Prepared:
 
 @pytest.fixture
 def host(monkeypatch, tmp_path):
-    from ignition.preparation import module_images, package_storage, model_package
+    from ignition.preparation import module_images, core_storage, model_core
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("COLUMNS", "200")
@@ -87,12 +92,12 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
         cuda=types.SimpleNamespace(set_device=lambda _: None), OutOfMemoryError=OutOfMemoryError))
     monkeypatch.setattr(module_images, "ModuleImages", Scope)
-    monkeypatch.setattr(package_storage, "PackageStorage", Scope)
+    monkeypatch.setattr(core_storage, "CoreStorage", Scope)
 
-    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage):
-        assert isinstance(package_storage, Scope)
+    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage):
+        assert isinstance(core_storage, Scope)
         calls.update(snapshot=snapshot, plan=plan, compile_forwards=compile_forwards,
-                     kernel_cache=kernel_cache, storage=package_storage, retain_graphs=retain_graphs)
+                     kernel_cache=kernel_cache, storage=core_storage, retain_graphs=retain_graphs)
         behavior = dict(calls["behavior"])
         if "raises" in behavior:
             raise behavior["raises"]
@@ -117,12 +122,12 @@ def host(monkeypatch, tmp_path):
         calls["publisher"] = publisher
         calls["options"] = options
         calls["exports"] += 1
-        from ignition.preparation.package_snapshot import _OPTIONS
+        from ignition.preparation.core_snapshot import _OPTIONS
         assert path is None
         calls["cache"] = _OPTIONS.get().cache
         calls["entry_path"] = calls["cache"] / "models" / "qwen38" / f"gb202-tp1-test-{calls['exports']}"
         return types.SimpleNamespace(entry_path=calls["entry_path"])
-    monkeypatch.setattr(model_package, "export_package", export_model)
+    monkeypatch.setattr(model_core, "export_core", export_model)
 
     return calls
 
@@ -154,7 +159,7 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert 'history_drafts' not in host['options']
     assert 'history_drafts' not in rebuild.speculation
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation.runtime_package_pb2 import RebuildManifest
+    from ignition.preparation.runtime_core_pb2 import RebuildManifest
     encoded = ParseDict(host['options']['rebuild_manifest'], RebuildManifest()).SerializeToString()
     decoded = RebuildManifest.FromString(encoded)
     assert 'history_drafts' not in {field.name for field, _ in decoded.speculation.ListFields()}
@@ -165,6 +170,21 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert local_manifest.local_checkpoint and not local_manifest.checkpoint_revision
 
 
+@pytest.mark.parametrize("budget", [None, 1536])
+def test_export_server_options_match_core_contract(tmp_path, budget):
+    from google.protobuf.json_format import ParseDict
+    from ignition.preparation.runtime_core_pb2 import ServingContract
+
+    model = resolve("qwen3.8-flash")
+    plan = types.SimpleNamespace(recipe=model.recipe, checkpoint=model.checkpoint, reserve_bytes=0,
+                                 concurrency=model.recipe.concurrency, max_images=model.recipe.max_images)
+    config = tmp_path / "config.toml"
+    config.write_text("" if budget is None else f"[server]\nthinking_token_budget = {budget}\n")
+    options = serve._server_options(Configuration.load(config), model, plan)
+    options.pop("api_key")
+    ParseDict(options, ServingContract())
+
+
 @pytest.mark.parametrize(("alias", "served_name"), [
     ("qwen3.8-flash", "Qwen3.8-Flash-Next"),
     ("qwen3.8-27b", "Qwen3.8-27B"),
@@ -172,6 +192,7 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
     ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
     ("deepseek-v4-flash", "DeepSeek-V4-Flash-Vision-Exp"),
     ("mimo-v2.6-pro-mopd", "MiMo-V2.6-Pro-MOPD"),
+    ("mimo-v2.6-flash-rl", "MiMo-V2.6-Flash-RL"),
     ("kimi-k3-mxfp4-csf", "Kimi-K3"),
     ("kimi-k3", "Kimi-K3"),
     ("kimi-k3-dspark", "Kimi-K3"),
@@ -240,8 +261,6 @@ def test_diagnostic_serving_retains_storage_until_native_shutdown(host, monkeypa
 
 
 def test_diagnostic_startup_failure_retains_undrained_host_storage(host, monkeypatch):
-    from ignition.preparation.model import PreparedModel
-
     original = RuntimeError("native startup retained resources")
     original.resources_retained = True
     released = []
@@ -379,18 +398,24 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["options"]["reserve_bytes"] == reserve
     assert "headroom_bytes" not in host["options"]
     assert host["prepared"].closed
-    assert host["cache"] == Configuration.load(config).directory("package_cache")
+    assert host["cache"] == Configuration.load(config).directory("core_cache")
 
 
-def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch):
+@pytest.mark.parametrize("fraction", [None, 0.0, 0.25])
+@pytest.mark.parametrize("budget", [None, 1536])
+def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch, budget, fraction):
     port = free_port()
     config = tmp_path / "config.toml"
-    config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n')
+    config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n'
+                      + ("" if budget is None else f"thinking_token_budget = {budget}\n")
+                      + ("" if fraction is None else f"scheduler_checkpoint_extra_work_fraction = {fraction}\n"))
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
     assert calls[0][0] == f"127.0.0.1:{port}"
     assert calls[0][1]["api_key"] == "secret"
+    assert calls[0][1]["thinking_token_budget"] == budget
+    assert calls[0][1]["scheduler_checkpoint_extra_work_fraction"] == (0.05 if fraction is None else fraction)
     assert host["exports"] == 0
 
 
@@ -451,15 +476,22 @@ def test_uncached_checkpoint_downloads_before_export(host, monkeypatch):
 def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_path):
     from ignition.cli.config import Configuration
 
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    installed = []
+    def install():
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
+        assert os.environ["CUDA_HOME"] == f"{tmp_path}/cuda"
+        installed.append(True)
+    monkeypatch.setattr(environment.runtime_patches, "apply", install)
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
-                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
+                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     path = tmp_path / "config.toml"
     path.write_text(f'[paths]\ncuda = "{tmp_path}/cuda"\nkernel_cache = "{tmp_path}/kernels"\n')
     gpus = (types.SimpleNamespace(uuid="GPU-b"), types.SimpleNamespace(uuid="GPU-a"))
     environment.apply(Configuration.load(path), gpus)
+    assert installed == [True]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
     assert os.environ["B12X_COMPILE_CACHE_DIR"] == f"{tmp_path}/kernels/b12x"
     assert Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).is_relative_to(tmp_path / "kernels" / "flashinfer")
@@ -467,12 +499,15 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
     assert os.environ["HF_HUB_CACHE"] == f"{tmp_path}/.cache/huggingface/hub"
     assert os.environ["CUDA_HOME"] == f"{tmp_path}/cuda"
+    from torch._inductor.utils import python_subprocess_env
+
+    assert python_subprocess_env()["PYTHONPATH"].split(os.pathsep) == sys.path
 
 
 @pytest.mark.parametrize("configured", (False, True))
 @pytest.mark.parametrize("inherited_cuda", (None, "/system/cuda"))
 def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, tmp_path, configured, inherited_cuda):
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    monkeypatch.setattr(environment.runtime_patches, "apply", lambda: ())
     package = tmp_path / "site-packages" / "nvidia"
     compiler = package / "cu13" / "bin" / "nvcc"
     compiler.parent.mkdir(parents=True)
@@ -483,7 +518,7 @@ def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, 
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "TRITON_PTXAS.EXE_PATH",
                  "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
-                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
+                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", "TORCH_CUSTOM_PYTHONPATH"):
         monkeypatch.setenv(name, "previous")
     if inherited_cuda is None:
         monkeypatch.delenv("CUDA_HOME", raising=False)
@@ -503,7 +538,7 @@ def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeyp
     from ignition.cli.config import Configuration
     from ignition.recipes.kimi3.recipe import RECIPE
 
-    monkeypatch.setattr(environment.patches, "apply", lambda: ())
+    monkeypatch.setattr(environment.runtime_patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", *RECIPE.b12x_environment):
@@ -550,11 +585,11 @@ def test_tensor_parallel_export_preserves_rank_selection(host):
 
 
 def test_multihost_export_dispatches_with_configured_cache(host, tmp_path, monkeypatch, capsys):
-    from ignition.preparation.package_snapshot import _OPTIONS
+    from ignition.preparation.core_snapshot import _OPTIONS
 
     config = tmp_path / 'export.toml'
     cache = tmp_path / 'prepared-models'
-    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    config.write_text(f'[paths]\ncore_cache = "{cache.as_posix()}"\n')
     entry = cache / 'models' / 'qwen38' / 'gb202-tp2-test'
     calls = []
 
@@ -588,7 +623,7 @@ def test_export_rejects_size_sharding(host):
 def test_export_reports_cache_entry_and_repository(host, tmp_path, capsys):
     config = tmp_path / 'export.toml'
     cache = tmp_path / 'prepared-models'
-    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    config.write_text(f'[paths]\ncore_cache = "{cache.as_posix()}"\n')
     assert main(['export', 'qwen3.8-flash', '--config', str(config)]) == 0
     assert host['cache'] == cache
     output = capsys.readouterr().out
@@ -614,7 +649,7 @@ def test_reuse_weights_requires_cached_version_before_preparation(host, capsys):
 
 def test_reuse_weights_passes_cached_metadata_through_export(host, monkeypatch, tmp_path):
     import flare_heliopause
-    from ignition.preparation.package_snapshot import _OPTIONS
+    from ignition.preparation.core_snapshot import _OPTIONS
 
     source = {'envelope': [1, 2, 3], 'publishers': []}
     requests = []
@@ -669,3 +704,26 @@ def test_runtime_collective_policy_requires_ladder_before_preparation(host, caps
     assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
     assert "requires --collective-ladder PATH" in capsys.readouterr().err
     assert "prepared" not in host and host["exports"] == 0
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+@pytest.mark.parametrize("configured,flag,expected", [
+    (False, [], False), (False, ["--force-moe-decode-a16"], True),
+    (True, [], True), (True, ["--no-force-moe-decode-a16"], False),
+])
+def test_moe_decode_a16_configuration_and_flag_reach_preparation(host, tmp_path, monkeypatch,
+                                                               command, configured, flag, expected):
+    config = tmp_path / "config.toml"
+    config.write_text(f"[preparation]\nforce_moe_decode_a16 = {str(configured).lower()}\n")
+    monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
+    assert main([command, "qwen3.8-flash", "--config", str(config), *flag]) == 0
+    assert host["plan"].force_moe_decode_a16 is expected
+    assert host["plan"].to_dict()["force_moe_decode_a16"] is expected
+    if command == "export":
+        assert host["options"]["rebuild_manifest"].get("force_moe_decode_a16", False) is expected
+
+
+def test_moe_decode_a16_rejects_mixed_before_preparation(host, capsys):
+    assert export("qwen3.8-flash", "--force-moe-decode-a16", "--mixed-prefill") == 2
+    assert "cannot accompany --mixed-prefill" in capsys.readouterr().err
+    assert "prepared" not in host

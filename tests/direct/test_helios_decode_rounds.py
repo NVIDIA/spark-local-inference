@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Direct execution chooses decode rounds exactly as Helios does, on Helios's own recorded choices.
 
 `helios_decode_rounds.txt` holds the rounds Helios's `RequestScheduler` chose for
@@ -82,7 +86,7 @@ def layout(scenario):
     return Layout(bindings={}, buffer_specs={}, page_views={}, capacity=capacity, max_active=active, context=131072, page_tokens=64, table_width=2048,
                   pages=1 << 16, snapshots=64, prefill_chunk=4096, vocabulary=1024, eos=(7,), graphs=graphs,
                   widths=scenario["widths"], fixed_width=scenario["fixed"], state_rows_per_request=1,
-                  draft_pages=0, record_fields=24)
+                  draft_pages=0, record_fields=32)
 
 
 def rounds(scenario):
@@ -102,7 +106,7 @@ def rounds(scenario):
         assert step.sequence == round_ and step.kind == ("speculative" if scenario["widths"] else "decode")
         nanos = duration(scenario, step.batch, step.width, round_)
         scheduler.advance_to(scheduler.now_ns + nanos)
-        records = np.zeros((scheduler.layout.capacity, 24), dtype=np.int64)
+        records = np.zeros((scheduler.layout.capacity, 32), dtype=np.int64)
         records[:, 4] = -1
         records[:, 16:] = -1
         mask = 0

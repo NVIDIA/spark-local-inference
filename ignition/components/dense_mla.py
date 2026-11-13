@@ -1,9 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepared dense attention over paged compressed latent records."""
 
 import torch
 from b12x.attention import dense_mla
 from b12x.preparation import PreparedCall, plan_from_handle
 
+from ignition.preparation.persistent import persistent_empty
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
@@ -36,14 +41,16 @@ class PreparedDenseMLA:
                  lse=None, kv_scale=None, q_scale=None):
         if cache.dtype == torch.float8_e4m3fn:
             if kv_scale is None:
-                kv_scale = torch.ones(1, dtype=torch.float32, device=cache.device)
+                kv_scale = persistent_empty((1,), torch.float32, cache.device).fill_(1)
             if q_scale is None:
-                q_scale = torch.ones(1, dtype=torch.float32, device=query.device)
+                q_scale = persistent_empty((1,), torch.float32, query.device).fill_(1)
         self.arguments = dict(q=query, kv_cache=cache, output=output, page_table=page_table,
                               cache_seqlens=lengths, cu_seqlens_q=starts, kv_scale=kv_scale, q_scale=q_scale)
         self.plan = dense_mla.plan(caps, invocation=dense_mla.invocation_from_tensors(caps, **self.arguments))
         self.output, self.scale = output, float(scale)
         self.lse = lse
+
+        declaration = self.arguments
 
         def prepare(state, arguments):
             scratch = planned_scratch(state.scratch_specs(), workspace)
@@ -53,7 +60,7 @@ class PreparedDenseMLA:
 
         def benchmark(state):
             def inputs():
-                arguments = dict(self.arguments)
+                arguments = dict(declaration)
                 for field in ("q", "output", "page_table", "cache_seqlens", "cu_seqlens_q"):
                     value = arguments[field]
                     arguments[field] = torch.empty_strided(value.shape, value.stride(),
@@ -82,19 +89,52 @@ class PreparedDenseMLA:
             return PreparedCall(run=call.run, produce=produce, output=arguments["output"],
                 owners=(*call.owners, arguments, query_seed, cache_seed))
 
-        declare(session, (self.plan.request(name=name, prepare_call=lambda state: prepare(state, self.arguments),
+        declare(session, (self.plan.request(name=name, prepare_call=lambda state: prepare(state, declaration),
                                            benchmark_call=benchmark),))
 
         def finalize():
+            if self.output is None:
+                return
             scratch = planned_scratch(self.plan.scratch_specs(), workspace)
             self.scratch = list(scratch) if isinstance(scratch, tuple) else [scratch]
-            dense_mla.bind(self.plan, **self.arguments, sm_scale=scale, scratch=self.scratch)
+            dense_mla.bind(self.plan, **declaration, sm_scale=scale, scratch=self.scratch)
 
         register_finalizer(session, finalize, workspace=workspace)
 
-    def __call__(self):
+    def functional(self, *, session, cache=...):
+        if cache is not ...:
+            self.arguments = {**self.arguments, "kv_cache": cache}
+        self.page_table_stride = self.arguments["page_table"].stride()
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.return_lse = self.lse is not None
+        self.lse_layout = None if self.lse is None else (tuple(self.lse.shape), tuple(self.lse.stride()))
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.arguments = {key: value for key, value in self.arguments.items()
+                          if key in ("kv_cache", "kv_scale", "q_scale")}
+        self.output = self.lse = self.scratch = None
+
+    def __call__(self, query=None, output=None, *, page_table=None, lengths=None, starts=None,
+                 cache=None, kv_scale=None, q_scale=None):
         a = self.arguments
-        _attend(a["q"], a["kv_cache"], a["output"], a["page_table"], a["cache_seqlens"],
-                a["cu_seqlens_q"], self.scratch, self.plan.handle, self.scale, self.lse,
-                a["kv_scale"], a["q_scale"])
-        return self.output
+        if self.output is not None:
+            output = self.output if output is None else output
+            query = a["q"] if query is None else query
+            _attend(query, a["kv_cache"], output, a["page_table"], a["cache_seqlens"],
+                    a["cu_seqlens_q"], self.scratch, self.plan.handle, self.scale, self.lse,
+                    a["kv_scale"], a["q_scale"])
+            return output
+        shape, stride, dtype = self.output_layout
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+        lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device).zero_() if self.return_lse else None
+        scratch = [torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout]
+        if page_table.stride() != self.page_table_stride:
+            page_table = torch.empty_strided(page_table.shape, self.page_table_stride,
+                dtype=page_table.dtype, device=page_table.device).copy_(page_table)
+        _attend(query, a["kv_cache"] if cache is None else cache, output, page_table, lengths, starts,
+                scratch, self.plan.handle, self.scale, lse,
+                a["kv_scale"] if kv_scale is None else kv_scale, a["q_scale"] if q_scale is None else q_scale)
+        return (output, lse) if self.return_lse else output

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Completion bundles for tests that keep direct assertions on record tensors."""
 
 from dataclasses import replace

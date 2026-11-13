@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use std::{fs, path::PathBuf};
 
 use flare_helios::frontend::images::{ImageLimits, ImageProcessor, RgbImage};

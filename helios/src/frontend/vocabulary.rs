@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Token bytes before UTF-8 replacement and stream-boundary whitespace cleanup.
 
 use crate::Result;

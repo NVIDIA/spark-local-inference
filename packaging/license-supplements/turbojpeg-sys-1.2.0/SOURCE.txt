@@ -1,0 +1,2 @@
+License text for the Rust wrapper, copied verbatim from its recorded upstream revision.
+https://github.com/honzasp/rust-turbojpeg/blob/05da705c6b6147baec1834a4c1f0de5e1df2614b/LICENSE

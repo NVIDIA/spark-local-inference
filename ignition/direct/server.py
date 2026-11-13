@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """A minimal non-streaming OpenAI-compatible endpoint over Ignition's direct diagnostic execution.
 
 HTTP handler threads render and tokenize chat requests with the checkpoint's

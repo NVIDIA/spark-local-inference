@@ -1,4 +1,13 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![cfg(feature = "server")]
+
+#[path = "support/templates.rs"]
+mod template_fixtures;
 
 use flare_helios::{
     frontend::{Asset, Frontend, FrontendAssets, TemplateEncoding},
@@ -151,8 +160,8 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
 fn gemma_templates_preserve_size_specific_thinking_prefixes() {
     let messages = [json!({"role":"user","content":"Hi"})];
     for (template, empty_thought) in [
-        (include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"), true),
-        (include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"), false),
+        (&template_fixtures::template("gemma4", "chat_template.google")[..], true),
+        (&template_fixtures::template("gemma4", "chat_template.google-e2b-e4b")[..], false),
     ] {
         let frontend = frontend(template, TemplateEncoding::Text);
         for thinking in [false, true] {
@@ -182,8 +191,8 @@ fn gemma_templates_preserve_reasoning_and_assistant_continuations() {
         {"role":"assistant","content":"B"}
     ]);
     for template in [
-        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
-        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"),
+        &template_fixtures::template("gemma4", "chat_template.google")[..],
+        &template_fixtures::template("gemma4", "chat_template.google-e2b-e4b")[..],
     ] {
         let frontend = frontend(template, TemplateEncoding::Text);
         let rendered = frontend.render_chat(messages.as_array().unwrap(), &Map::new()).unwrap();
@@ -220,8 +229,8 @@ fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
         .clone()
     };
     for template in [
-        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
-        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"),
+        &template_fixtures::template("gemma4", "chat_template.google")[..],
+        &template_fixtures::template("gemma4", "chat_template.google-e2b-e4b")[..],
     ] {
         let frontend = frontend(template, TemplateEncoding::Text);
         for thinking in [false, true] {
@@ -302,4 +311,32 @@ fn segmented_xtml_preserves_block_hints_through_json_escaping() {
     let changed = render(&messages);
     assert!(changed.token_ids.starts_with(&marked.token_ids[..cut]));
     assert!(changed.message_boundaries.contains(&cut));
+}
+
+#[test]
+fn segmented_tool_results_keep_images_and_checkpoints_in_rendered_order() {
+    let frontend = frontend(
+        include_str!("../../ignition/recipes/kimi31/assets/chat_template.jinja"),
+        TemplateEncoding::TokenSegments,
+    );
+    let messages = json!([
+        {"role":"assistant","tool_calls":[
+            {"id":"a","function":{"name":"first","arguments":{}}},
+            {"id":"b","function":{"name":"second","arguments":{}}}]},
+        {"role":"tool","tool_call_id":"b","_checkpoint_hints":[1],"content":[
+            {"type":"image_url","image_url":{"url":"second-image"}},
+            {"type":"text","text":"Second result"}]},
+        {"role":"tool","tool_call_id":"a","content":[
+            {"type":"text","text":"First result"},
+            {"type":"image_url","image_url":{"url":"first-image"}}]}
+    ]);
+    let rendered = frontend.render_chat(messages.as_array().unwrap(), &json!({"add_generation_prompt":true}).as_object().unwrap()).unwrap();
+    assert_eq!(rendered.image_sources, ["first-image", "second-image"]);
+    assert_eq!(rendered.image_checkpoint_hints, [1]);
+    assert!(rendered.text.find("First result").unwrap() < rendered.text.find("Second result").unwrap());
+    assert_eq!(rendered.message_boundaries.len(), 4);
+    let marker = "<|close|>message<|sep|><|end_of_msg|>";
+    for &boundary in &rendered.message_boundaries {
+        assert!(frontend.decode(&rendered.token_ids[..boundary], false).unwrap().ends_with(marker));
+    }
 }

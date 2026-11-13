@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure complete GPU graph envelopes from Flare Nsight captures.
 
 CUDA API correlation IDs associate GPU activities with NVTX submission ranges.

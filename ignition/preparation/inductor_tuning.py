@@ -1,8 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Agree and retain compiled Inductor kernel selections before graph capture."""
 
 import ast
 import copy
 import inspect
+import hashlib
 import pickle
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -92,13 +97,23 @@ def _kernel_globals(graph):
     return next(iter(matches.values()))
 
 
+def _execution_identity(source_identity, source, device, kernels, bindings=()):
+    """Identify executable code without device ordinals or process-local bindings."""
+    normalized = _device_source(source, device, 0)
+    programs = tuple(sorted((name, pickle.dumps(config, protocol=5),
+                             hashlib.sha256(cubin).digest()) for name, config, cubin in kernels))
+    return hashlib.sha256(pickle.dumps(("prepared-forward-v2", source_identity, normalized, programs, bindings),
+                                      protocol=5)).hexdigest()
+
+
 class InductorSelections:
     """One canonical winner per exact generated kernel across a preparation catalog."""
 
-    def __init__(self, device, *, coordinator=None, lock_gpu_clocks=False):
+    def __init__(self, device, *, coordinator=None, lock_gpu_clocks=False, source_identity=None):
         self.device = torch.device(device)
         self.coordinator = coordinator
         self.lock_gpu_clocks = lock_gpu_clocks
+        self.source_identity = source_identity
         self.winners = {}
         self.instances = {}
         self.forwards = {}
@@ -121,7 +136,7 @@ class InductorSelections:
         from torch._inductor.async_compile import CompiledTritonKernels
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
-        backend = bound.artifact._artifacts.compiled_fn
+        backend = bound.backend
         graph = backend.artifact._flare_graph
         original, = graph.device_idxs
         entries = ({} if graph._triton_bundle is None else
@@ -151,7 +166,8 @@ class InductorSelections:
                 instances[id(tuner)] = tuner
                 if identity in self.winners:
                     _install(tuner, self.winners[identity])
-        if set(bindings) != set(entries):
+        # Epilogue-fusion benchmarking bundles template candidates that final code never names.
+        if any(entries[key].kernel_name in graph.source_code for key in set(entries) - set(bindings)):
             raise ValueError("compiled forward has unbound static Inductor kernels")
         self.forwards[id(bound)] = backend, graph, bindings
 
@@ -309,3 +325,22 @@ class InductorSelections:
         entry.compiled_fw.result._triton_bundle = bundle
         backend._serialized_artifact = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
         backend._tuning_frozen = True
+        if self.source_identity is not None:
+            from torch.utils._pytree import tree_map
+            from .aot import _serialized_invocations
+
+            device, = graph.device_idxs
+            selected = [(identity, _selected(tuner)) for identity, _, tuner in bindings.values()]
+            description = (backend.signature,
+                tuple((item.index, item.view, item.region) for item in backend.inputs),
+                _serialized_invocations(backend.invocations))
+            description = tree_map(lambda value: torch.device(value.type)
+                                   if isinstance(value, torch.device) else value, description)
+            bound.execution_identity = _execution_identity(self.source_identity, graph.source_code, device,
+                ((identity, vars(result.config), result.kernel.cubin_raw) for identity, result in selected),
+                description)
+
+    def release(self, bound):
+        self.forwards.pop(id(bound))
+        if not self.forwards:
+            self.instances.clear()

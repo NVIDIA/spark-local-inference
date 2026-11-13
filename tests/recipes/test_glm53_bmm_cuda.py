@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Stored GLM KV projection partitions execute in prepared native BMM graphs."""
 
 import os
@@ -48,12 +51,14 @@ def test_checkpoint_absorbed_projections_native_replay(world_size, rows):
             projections = [BatchedQuantizedProjection(source, weight, output, major=major,
                 session=session, name=name) for source, weight, output, major, name in
                 zip(inputs, rhs, outputs, ("n", "k"), ("absorb-query", "expand-value"), strict=True)]
+            for projection in projections:
+                projection.functional(session=session)
             session.tune()
             assert all(projection.plan.memory_requirements().scratch_nbytes == 0 for projection in projections)
 
             def forward():
-                for projection, source in zip(projections, inputs, strict=True):
-                    projection(source)
+                for projection, source, output in zip(projections, inputs, outputs, strict=True):
+                    output.copy_(projection(source))
 
             compiled = compile_forward(forward)
             compiled()

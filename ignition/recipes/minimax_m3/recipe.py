@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MiniMax M3 mixed MXFP8/NVFP4 preparation on four SM120/SM121 GPUs."""
 
 from types import MappingProxyType
@@ -6,7 +9,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
 
     from .bootstrap import PreparationConfig, prepare_rank
@@ -16,7 +19,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         speculative_fixed_width=speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
         speculative_graph_budget=speculation.graph_budget, packed_verification=speculation.packed_verification,
         draft_prefix_selection=speculation.draft_prefix_selection)
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency if not plan.language_model_only else None,
@@ -28,7 +32,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, stream_overlap=plan.stream_overlap,
         expert_scale_compression=plan.expert_scale_compression, dspark=speculation is not None,
         vision=not plan.language_model_only, **drafting)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 

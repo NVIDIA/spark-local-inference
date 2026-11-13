@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The byte framing of the pool's data channel.
 //!
 //! The wire contract fixes only what a data channel must guarantee (see

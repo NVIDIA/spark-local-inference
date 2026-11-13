@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Expand image envelopes and attach linear feature indices to image tokens.
 
 use crate::{
@@ -118,8 +123,7 @@ mod tests {
                 tokens: crate::frontend::test_support::tokens(&asset("tokenizer_config.json"))
                     .unwrap(),
                 chat_template: Some({
-                    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../ignition/recipes/minimax_m3/assets/chat_template.jinja");
+                    let path = crate::template_fixtures::path("minimax_m3", "chat_template");
                     Asset { sha256: format!("{:x}", Sha256::digest(fs::read(&path).unwrap())), path, range: None }
                 }),
             },

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Benchmark CLI workload selection and GPU latency presentation."""
 
 import json
@@ -45,23 +48,92 @@ def test_explicit_draft_count_and_unordered_selections():
     assert value.contexts == (512, 2048)
 
 
+def test_kimi_eight_request_round_with_autotuning():
+    args = _parser().parse_args(["bench", "kimi-k3.1-pro", "--gpus", "0-15",
+        "--batches", "8", "--max-concurrency", "8", "--verify-width", "8",
+        "--speculative-token-capacity", "64", "--online-mxfp8", "--autotune-effort", "default"])
+    value = Settings.from_args(args)
+    assert (value.batches, value.width) == ((8,), 8)
+    assert args.autotune_effort == "default" and not args.no_compile
+    assert args.max_concurrency == 8 and args.speculative_token_capacity == 64
+
+
+def test_verification_matrix_keeps_the_full_draft_block():
+    value = settings("--verify-prefixes", "8,1,6,4", "--mtp-draft-tokens", "7")
+    assert value.verification_prefixes == (1, 4, 6, 8)
+    assert value.width == 8
+    assert value.batches == (1,)
+    assert settings("--verify-prefixes", "4,6").width == 8
+
+
+@pytest.mark.parametrize("flags", [
+    ("--verify-prefixes", "0,8"), ("--verify-prefixes", "4,9"),
+    ("--verify-prefixes", "1,8", "--batches", "2"),
+    ("--verify-prefixes", "1,8", "--prefill"),
+    ("--verify-prefixes", "1,8", "--speculation-study"),
+    ("--verify-prefixes", "1,8", "--mtp-draft-tokens", "3"),
+])
+def test_invalid_verification_matrix(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)
+
+
+def test_kimi_rejects_private_dflash_studies_before_preparation(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    assert main(["bench", "kimi-k3.1-pro", "--speculation-study", "--config", str(config)]) == 2
+    assert "--speculation-study requires Qwen3.8-27B DFlash2" in capsys.readouterr().err
+
+
+def test_prefill_defaults_and_target_only_selection():
+    value = settings("--prefill")
+    assert value.prefill and value.batches == (1,) and value.contexts == (0,)
+    args = _parser().parse_args(["bench", "--prefill", "--prefill-chunk-size", "2048",
+                                "--contexts", "4096,0", "--no-mtp"])
+    assert Settings.from_args(args).contexts == (0, 4096)
+    assert args.prefill_chunk_size == 2048 and args.no_mtp
+
+
+@pytest.mark.parametrize("flags,message", [
+    (("--batches", "2"), "requires --batches 1"),
+    (("--verify-width", "8"), "does not apply"),
+    (("--contexts", "-128"), "multiples of 128"),
+    (("--contexts", "129"), "multiples of 128"),
+])
+def test_prefill_rejects_unsupported_geometry(flags, message):
+    with pytest.raises(UsageError, match=message):
+        settings("--prefill", *flags)
+
+
+def test_prefill_report_names_chunk_and_prefix():
+    from ignition.bench.runner import PrefillCase, measurement_result
+
+    result = measurement_result((PrefillCase(2048, 4096),), [[dict(seed=0, times_ms=[2., 4.])]],
+                                warmup=1, repetitions=2, seeds=(0,), status="complete")
+    result["device"] = dict(name="NVIDIA GB10", capability=[12, 1])
+    rendered = table(result)
+    assert "GPU graph prefill latency" in rendered and "Chunk" in rendered
+    assert "2048" in rendered and "4096" in rendered and "3.0000" in rendered
+    assert result["metric"] == "cuda_graph_prefill_latency_ms"
+
+
 @pytest.mark.parametrize("flags,message", [
     (("--verify-width", "4", "--mtp-draft-tokens", "7"), "must equal"),
     (("--verify-width", "9"), "requires --verify-width 8"),
     (("--verify-width", "4"), "requires --verify-width 8"),
     (("--mtp-draft-tokens", "3"), "requires --verify-width 8"),
     (("--batches", "0"), "from 1,2,4"),
-    (("--batches", "8"), "from 1,2,4"),
+    (("--batches", "16"), "from 1,2,4,8"),
     (("--contexts", "0"), "positive multiples"),
     (("--contexts", "513"), "positive multiples"),
     (("--warmup", "-1"), "positive"),
     (("--warmup", "0"), "positive"),
     (("--repetitions", "0"), "positive"),
     (("--seeds", "-1"), "0 through"),
-    (("--no-mtp",), "requires DFlash2 state"),
+    (("--no-mtp",), "requires draft state"),
     (("--mixed-prefill",), "speculative rounds"),
     (("--prompt-logprobs",), "speculative rounds"),
-    (("--official-source", "https://example.com/model"), "package publishing"),
+    (("--official-source", "https://example.com/model"), "core publishing"),
 ])
 def test_invalid_measurement_settings(flags, message):
     with pytest.raises(UsageError, match=message):
@@ -80,7 +152,7 @@ def test_bench_help_describes_measured_boundary(capsys):
         main(["bench", "--help"])
     assert error.value.code == 0
     output = capsys.readouterr().out
-    assert "Qwen3.8-27B DFlash2 only" in output
+    assert "Kimi K3.1 Pro DSpark" in output
     assert "excludes preparation" in output
     assert "not serving throughput" in output
     assert "--repetitions" in output
@@ -90,7 +162,7 @@ def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text("")
     assert main(["bench", "qwen3.8-flash", "--config", str(config)]) == 2
-    assert "supports only the Qwen3.8-27B DFlash2 recipe" in capsys.readouterr().err
+    assert "supports Qwen3.8-27B DFlash2, Kimi K3.1 Pro DSpark, and Nemotron Bolt LiLiCorr" in capsys.readouterr().err
 
 
 def test_report_keeps_case_latency_and_equal_weight_score_separate(tmp_path, capsys):
@@ -132,3 +204,54 @@ def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys
     assert json.loads(output.read_text()) == result
     assert "aggregate_ms" not in json.loads(output.read_text())
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("width", [8, 13, 16])
+def test_speculation_study_selects_private_mode(width):
+    value = settings("--speculation-study", "--verify-width", str(width),
+                     "--mtp-draft-tokens", str(width - 1), "--contexts", "8192")
+    assert value.speculation_study and value.batches == (1,) and value.width == width
+    if width == 13:
+        with pytest.raises(UsageError):
+            settings("--verify-width", str(width))
+
+
+@pytest.mark.parametrize("flags", [
+    ("--mtp-draft-tokens", "15"),
+    ("--verify-width", "16"),
+    ("--mtp-draft-tokens", "15", "--verify-width", "16"),
+])
+def test_fifteen_drafts_select_native_rounds(flags):
+    value = settings("--batches", "1", "--contexts", "4096", *flags)
+    assert (value.batches, value.contexts, value.width) == ((1,), (4096,), 16)
+    assert not value.speculation_study and not value.study_widths
+
+
+def test_fifteen_drafts_reject_mismatched_verification_width():
+    with pytest.raises(UsageError, match="must equal"):
+        settings("--mtp-draft-tokens", "15", "--verify-width", "8")
+
+
+@pytest.mark.parametrize("flags", [("--batches", "2"), ("--prefill",), ("--verify-width", "9")])
+def test_speculation_study_rejects_other_regimes(flags):
+    with pytest.raises(UsageError):
+        settings("--speculation-study", *flags)
+
+
+def test_study_width_catalog_uses_one_maximum_capacity():
+    value = settings("--speculation-study", "--study-widths", "16,8,13")
+    assert value.study_widths == (8, 13, 16)
+    assert value.width == 16
+    assert value.contexts == (8192,)
+    assert value.batches == (1,)
+
+
+@pytest.mark.parametrize("flags", [
+    ("--study-widths", "8,13"),
+    ("--speculation-study", "--study-widths", "8,9"),
+    ("--speculation-study", "--study-widths", "8,16", "--verify-width", "16"),
+    ("--speculation-study", "--study-widths", "8,16", "--mtp-draft-tokens", "15"),
+])
+def test_study_width_catalog_rejects_ambiguous_or_unsupported_selection(flags):
+    with pytest.raises(UsageError):
+        settings(*flags)

@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Per-rank threads that move checkpoint bytes between GPU ids and host slabs.
 //!
 //! Each thread makes its rank's context current, owns one stream at the lowest
@@ -108,6 +114,13 @@ pub(crate) fn expand(
             "record layout and cache geometry disagree on the plane count",
         ));
     }
+    if (job.replication.pages || job.replication.row)
+        && (job.direction != Direction::In || part.is_none())
+    {
+        return Err(invalid(
+            "replicated shares require a registered pool and an inbound job",
+        ));
+    }
     reject_repeats(job)?;
     for (page, slab) in &job.pages {
         let id = u64::from(page.0);
@@ -118,6 +131,7 @@ pub(crate) fn expand(
             )));
         }
         let record = match part {
+            Some(part) if job.replication.pages => part.replicated_page(*slab, rank.page_offset)?,
             Some(part) => part
                 .page(*slab)?
                 .ok_or_else(|| invalid("page slab is outside the transfer pool"))?,
@@ -133,7 +147,7 @@ pub(crate) fn expand(
             );
         }
     }
-    if let Some((slot, slab)) = job.row {
+    if let Some((slot, slots)) = &job.row {
         let index = u64::from(slot.0);
         if index >= geometry.row_capacity {
             return Err(invalid(format!(
@@ -141,19 +155,44 @@ pub(crate) fn expand(
                 geometry.row_capacity
             )));
         }
-        let row = match part {
-            Some(part) => part
-                .row(slab)?
-                .ok_or_else(|| invalid("row slab is outside the transfer pool"))?,
-            None => slab_address(slab)? + rank.row_offset,
-        };
-        push_unit(
-            job.direction,
-            geometry.row.unit_address(index),
-            row,
-            geometry.row.unit_bytes,
-            descriptors,
-        );
+        if let Some(part) = part {
+            let share = if job.replication.row {
+                part.record_bytes()
+            } else {
+                geometry.page_record_bytes()
+            };
+            let pieces = geometry.row.unit_bytes.div_ceil(share) as usize;
+            if slots.len() < pieces {
+                return Err(invalid("row slots do not cover the row"));
+            }
+            for (piece, &slot) in slots.iter().take(pieces).enumerate() {
+                let row = if job.replication.row {
+                    part.replicated_page(slot, rank.page_offset)?
+                } else {
+                    part.page(slot)?
+                        .ok_or_else(|| invalid("row slot is outside the transfer pool"))?
+                };
+                let offset = piece as u64 * share;
+                push_unit(
+                    job.direction,
+                    geometry.row.unit_address(index) + offset,
+                    row,
+                    (geometry.row.unit_bytes - offset).min(share),
+                    descriptors,
+                );
+            }
+        } else {
+            if slots.len() != 1 {
+                return Err(invalid("an unmapped row needs one contiguous address"));
+            }
+            push_unit(
+                job.direction,
+                geometry.row.unit_address(index),
+                slab_address(slots[0])? + rank.row_offset,
+                geometry.row.unit_bytes,
+                descriptors,
+            );
+        }
     }
     Ok(())
 }
@@ -161,7 +200,7 @@ pub(crate) fn expand(
 /// A page id or a slab address named twice would place two copies of one
 /// range in a batch whose entries execute in no defined order.
 fn reject_repeats(job: &Job) -> Result<()> {
-    for (index, (page, slab)) in job.pages.iter().enumerate() {
+    for (index, (page, _)) in job.pages.iter().enumerate() {
         if job.pages[..index]
             .iter()
             .any(|(earlier, _)| earlier == page)
@@ -171,25 +210,21 @@ fn reject_repeats(job: &Job) -> Result<()> {
                 job.id.0, job.window, page.0
             )));
         }
-        if job.pages[..index]
-            .iter()
-            .any(|(_, earlier)| earlier == slab)
-        {
+    }
+    let slots = job
+        .pages
+        .iter()
+        .map(|(_, slot)| slot)
+        .chain(job.row.iter().flat_map(|(_, slots)| slots));
+    for (index, slot) in slots.clone().enumerate() {
+        if slots.clone().take(index).any(|earlier| earlier == slot) {
             return Err(invalid(format!(
-                "transfer job {} window {} names slab {slab:#x} twice",
+                "transfer job {} window {} names slot {slot:#x} twice",
                 job.id.0, job.window
             )));
         }
     }
-    match job.row {
-        Some((_, row_slab)) if job.pages.iter().any(|(_, slab)| *slab == row_slab) => {
-            Err(invalid(format!(
-                "transfer job {} window {} names slab {row_slab:#x} for both a page and the row",
-                job.id.0, job.window
-            )))
-        }
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 fn slab_address(slab: usize) -> Result<u64> {
@@ -646,11 +681,14 @@ impl Drop for Transfers {
 }
 
 #[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     use flare_selene::testing::pattern as fill;
     use flare_selene::{
         PageId, StateSlotId,
@@ -659,12 +697,81 @@ mod tests {
 
     fn job(direction: Direction) -> Job {
         Job {
+            replication: Default::default(),
             id: JobId(9),
             window: 2,
             direction,
             pages: vec![(PageId(5), 0x10000), (PageId(7), 0x20000)],
-            row: Some((StateSlotId(3), 0x30000)),
+            row: Some((StateSlotId(3), vec![0x30000])),
         }
+    }
+
+    #[test]
+    fn replicated_restores_fan_out_packed_pages_and_rows_through_device_aliases() {
+        let geometry = vec![geometry(64, &[("kv", 4096)], 24576); 2];
+        let layout = Layout::new(&geometry).unwrap();
+        let device = 0x200000;
+        let pool = flare_selene::slab::SlabPool::new(layout.page_record_bytes, 8, 0).unwrap();
+        let host = pool.slot_address(flare_selene::slab::Slot(0));
+        let parts = pool.registered_parts(&layout, device);
+        let mut job = Job {
+            id: JobId(1),
+            window: 0,
+            direction: Direction::In,
+            replication: Default::default(),
+            pages: vec![(PageId(5), host)],
+            row: Some((StateSlotId(3), (1..=6).map(|i| host + i * 8192).collect())),
+        };
+        for pages in [false, true] {
+            for row in [false, true] {
+                job.replication = flare_selene::record::Replication { pages, row };
+                for rank in 0..2 {
+                    let mut descriptors = Vec::new();
+                    expand(
+                        &geometry[rank],
+                        &layout.ranks[rank],
+                        Some(&parts[rank]),
+                        &job,
+                        &mut descriptors,
+                    )
+                    .unwrap();
+                    let offset = layout.ranks[rank].page_offset;
+                    assert_eq!(
+                        descriptors[0].source,
+                        device + if pages { 0 } else { offset }
+                    );
+                    assert_eq!(
+                        descriptors[0].destination,
+                        geometry[rank].planes[0].unit_address(5)
+                    );
+                    let stride = if row { 8192 } else { 4096 };
+                    assert_eq!(descriptors.len() as u64, 1 + 24576 / stride);
+                    for (piece, descriptor) in descriptors[1..].iter().enumerate() {
+                        assert_eq!(
+                            descriptor.source,
+                            device + 8192 * (piece as u64 + 1) + if row { 0 } else { offset }
+                        );
+                        assert_eq!(
+                            descriptor.destination,
+                            geometry[rank].row.unit_address(3) + stride * piece as u64
+                        );
+                        assert_eq!(descriptor.bytes, stride as usize);
+                    }
+                }
+            }
+        }
+        assert!(expand(&geometry[0], &layout.ranks[0], None, &job, &mut Vec::new()).is_err());
+        job.direction = Direction::Out;
+        assert!(
+            expand(
+                &geometry[0],
+                &layout.ranks[0],
+                Some(&parts[0]),
+                &job,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -674,26 +781,21 @@ mod tests {
             geometry(64, &[("kv", 4096), ("selector", 200)], 5000),
         ];
         let layout = Layout::new(&ranks).unwrap();
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            3,
-            layout.row_record_bytes,
-            2,
-            false,
-        )
-        .unwrap();
+        let mut pool =
+            SlabPool::new(layout.page_record_bytes, layout.record_slots(3, true) + layout.row_slots(), 0).unwrap();
         assert!(pool.device_parts(&layout).is_err());
         let device = 0x2_0420_0000;
         let parts = pool.registered_parts(&layout, device);
         let pages: Vec<_> = (0..3).map(|_| pool.allocate_page().unwrap()).collect();
-        let rows: Vec<_> = (0..2).map(|_| pool.allocate_row().unwrap()).collect();
+        let rows: Vec<_> = (0..2).map(|_| pool.allocate_page().unwrap()).collect();
         for (rank, part) in parts.iter().enumerate() {
             let mut job = Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
-                pages: vec![(PageId(5), pool.page_address(pages[2]))],
-                row: Some((StateSlotId(3), pool.row_address(rows[1]))),
+                pages: vec![(PageId(5), pool.slot_address(pages[2]))],
+                row: Some((StateSlotId(3), vec![pool.slot_address(rows[1])])),
             };
             let mut outbound = Vec::new();
             expand(
@@ -705,10 +807,7 @@ mod tests {
             )
             .unwrap();
             let page = device + 2 * layout.page_record_bytes + layout.ranks[rank].page_offset;
-            let row = device
-                + 3 * layout.page_record_bytes
-                + layout.row_record_bytes
-                + layout.ranks[rank].row_offset;
+            let row = device + 4 * layout.page_record_bytes + layout.ranks[rank].page_offset;
             assert_eq!(
                 outbound.iter().map(|d| d.destination).collect::<Vec<_>>(),
                 vec![page, page + ranks[rank].planes[0].padded_bytes(), row]
@@ -796,20 +895,17 @@ mod tests {
         ];
         let layout = Layout::new(&ranks).unwrap();
         let rank = &layout.ranks[1];
-        let (page_part, row_part) = (20480usize, 12288usize);
-        let (page_record, row_record) = (
-            layout.page_record_bytes as usize,
-            layout.row_record_bytes as usize,
-        );
+        let page_part = 20480usize;
+        let page_record = layout.page_record_bytes as usize;
         let start = 0x7e00_0000_0000usize;
-        let (page_base, row_base) = (0x7e00_0100_0000usize, 0x7e00_0200_0000usize);
+        let page_base = 0x7e00_0100_0000usize;
         let part = rank_part(
             start..start + (8 << 20),
-            (page_record, 8, page_base, page_part),
-            (row_record, 2, row_base, row_part),
+            (page_record, 10, page_base, page_part),
         );
         let rows = start + 8 * page_record;
         let job = Job {
+            replication: Default::default(),
             id: JobId(4),
             window: 0,
             direction: Direction::Out,
@@ -817,7 +913,7 @@ mod tests {
                 (PageId(5), start + 3 * page_record),
                 (PageId(7), start + 4 * page_record),
             ],
-            row: Some((StateSlotId(3), rows + row_record)),
+            row: Some((StateSlotId(3), vec![rows + page_record])),
         };
         let mut descriptors = Vec::new();
         expand(&ranks[1], rank, Some(&part), &job, &mut descriptors).unwrap();
@@ -841,7 +937,7 @@ mod tests {
         assert_eq!(
             descriptors[6],
             Descriptor {
-                destination: (row_base + row_part) as u64,
+                destination: (page_base + 9 * page_part) as u64,
                 source: ranks[1].row.unit_address(3),
                 bytes: 10_000,
             }
@@ -851,18 +947,18 @@ mod tests {
         let error = expand(&ranks[1], rank, Some(&part), &inside, &mut descriptors)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("page slabs"), "{error}");
+        assert!(error.contains("not a slot"), "{error}");
         let mut crossed = job.clone();
-        crossed.row = Some((StateSlotId(3), start));
+        crossed.row = Some((StateSlotId(3), vec![start + 3 * page_record]));
         let error = expand(&ranks[1], rank, Some(&part), &crossed, &mut descriptors)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("row slabs"), "{error}");
+        assert!(error.contains("twice"), "{error}");
         let mut outside = job.clone();
         outside.pages[1].1 = 0x10000;
         assert!(expand(&ranks[1], rank, Some(&part), &outside, &mut descriptors).is_err());
         outside = job;
-        outside.row = Some((StateSlotId(3), 0x10000));
+        outside.row = Some((StateSlotId(3), vec![0x10000]));
         assert!(expand(&ranks[1], rank, Some(&part), &outside, &mut descriptors).is_err());
     }
 
@@ -884,7 +980,7 @@ mod tests {
             .is_err()
         );
         let mut bad_slot = job(Direction::Out);
-        bad_slot.row = Some((StateSlotId(ranks[0].row_capacity as u32), 0x30000));
+        bad_slot.row = Some((StateSlotId(ranks[0].row_capacity as u32), vec![0x30000]));
         assert!(
             expand(
                 &ranks[0],
@@ -939,11 +1035,11 @@ mod tests {
             let mut repeated_slab = job(direction);
             repeated_slab.pages[1].1 = repeated_slab.pages[0].1;
             let error = check(&repeated_slab).unwrap_err();
-            assert!(error.contains("slab 0x10000 twice"), "{error}");
+            assert!(error.contains("transfer job 9 window 2 names slot 0x10000 twice"), "{error}");
             let mut row_on_page_slab = job(direction);
-            row_on_page_slab.row = Some((StateSlotId(3), 0x20000));
+            row_on_page_slab.row = Some((StateSlotId(3), vec![0x20000]));
             let error = check(&row_on_page_slab).unwrap_err();
-            assert!(error.contains("both a page and the row"), "{error}");
+            assert!(error.contains("transfer job 9 window 2 names slot 0x20000 twice"), "{error}");
             check(&job(direction)).unwrap();
         }
     }
@@ -1188,22 +1284,22 @@ mod tests {
         sender
     }
 
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn transfers_round_trip_pages_and_a_row_through_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn transfers_round_trip_pages_and_a_row_through_a_loaded_core() {
         use crate::{
             cuda::Stream,
-            runtime_package::{LoadOptions, NativeModel},
+            runtime_core::{LoadOptions, NativeModel},
             startup::StartupProgress,
         };
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let model = unsafe {
             NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
+                crate::runtime_core::test_support::authorize(std::path::Path::new(&core)),
                 &[0],
                 &LoadOptions::default(),
                 &StartupProgress::silent(),
@@ -1269,10 +1365,8 @@ mod tests {
         let bytes = (pages * layout.page_record_bytes + layout.row_record_bytes) as usize;
         let mut pool = SlabPool::new(
             layout.page_record_bytes,
-            pages as usize,
-            layout.row_record_bytes,
-            1,
-            false,
+            layout.record_slots(pages as usize, true),
+            0,
         )
         .unwrap();
         pool.register(&crate::offload::registrar::CudaRegistrar, context)
@@ -1280,11 +1374,11 @@ mod tests {
         let page_slabs: Vec<usize> = (0..pages)
             .map(|_| {
                 let slab = pool.allocate_page().unwrap();
-                pool.page_address(slab)
+                pool.slot_address(slab)
             })
             .collect();
-        let row = pool.allocate_row().unwrap();
-        let row_slab = pool.row_address(row);
+        let row = pool.allocate_page().unwrap();
+        let row_slab = pool.slot_address(row);
         let host = page_slabs[0];
 
         let mut transfers =
@@ -1302,6 +1396,7 @@ mod tests {
         };
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
@@ -1310,7 +1405,7 @@ mod tests {
                     .zip(&page_slabs)
                     .map(|(id, slab)| (PageId(*id), *slab))
                     .collect(),
-                row: Some((StateSlotId(source_slot), row_slab)),
+                row: Some((StateSlotId(source_slot), vec![row_slab])),
             })
             .unwrap();
         assert_eq!(transfers.in_flight(), 1);
@@ -1361,6 +1456,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(2),
                 window: 0,
                 direction: Direction::In,
@@ -1369,7 +1465,7 @@ mod tests {
                     .zip(&page_slabs)
                     .map(|(id, slab)| (PageId(*id), *slab))
                     .collect(),
-                row: Some((StateSlotId(target_slot), row_slab)),
+                row: Some((StateSlotId(target_slot), vec![row_slab])),
             })
             .unwrap();
         let reply = wait(&mut transfers);
@@ -1411,11 +1507,12 @@ mod tests {
         for (id, slot) in [(capacity, 0), (0, rank.row_capacity as u32)] {
             transfers
                 .submit(Job {
+                    replication: Default::default(),
                     id: JobId(3 + u64::from(slot != 0)),
                     window: 0,
                     direction: Direction::Out,
                     pages: vec![(PageId(id), page_slabs[0])],
-                    row: Some((StateSlotId(slot), row_slab)),
+                    row: Some((StateSlotId(slot), vec![row_slab])),
                 })
                 .unwrap();
             let reply = wait(&mut transfers);
@@ -1435,12 +1532,12 @@ mod tests {
     /// Two contexts on the first two devices, each with `k` and `v` page planes
     /// and a row plane; a split pool must cost each device only its part and
     /// carry each rank's units in that rank's part.
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     #[test]
     #[ignore = "requires two CUDA devices"]
     fn split_pools_cost_each_device_its_part_and_round_trip_units() {
+        use crate::runtime_core::driver::Driver as Loader;
         use flare_selene::{Plane, slab::SlabPool};
-        use crate::runtime_package::driver::Driver as Loader;
         const PAGES: u64 = 80;
         const ROWS: u64 = 4;
         const ROW_BYTES: u64 = 10_000;
@@ -1521,7 +1618,7 @@ mod tests {
         };
         let layout = Layout::new(&geometry).unwrap();
         let before = free();
-        let mut registered = SlabPool::sized(&layout, POOL_BYTES).unwrap();
+        let mut registered = SlabPool::sized(&layout, POOL_BYTES, 0).unwrap();
         registered
             .register(&crate::offload::registrar::CudaRegistrar, contexts[0].0)
             .unwrap();
@@ -1531,6 +1628,7 @@ mod tests {
         let pool = SlabPool::sized_by_rank(
             &layout,
             POOL_BYTES,
+            0,
             &contexts,
             &crate::offload::registrar::CudaRegistrar,
         )
@@ -1610,16 +1708,16 @@ mod tests {
             fill(&mut bytes, seed(rank, row_plane, 1));
             write(context, rank_geometry.row.unit_address(1), &bytes);
         }
-        let mut pool = pool;
+        let pool = pool;
         let slabs: Vec<usize> = sources
             .iter()
             .map(|_| {
                 let slab = pool.allocate_page().unwrap();
-                pool.page_address(slab)
+                pool.slot_address(slab)
             })
             .collect();
-        let row = pool.allocate_row().unwrap();
-        let row_slab = pool.row_address(row);
+        let row = pool.allocate_page().unwrap();
+        let row_slab = pool.slot_address(row);
         let mut transfers = Transfers::start(&contexts, geometry.clone(), &pool).unwrap();
         let wait = |transfers: &mut Transfers| -> Reply {
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -1637,6 +1735,7 @@ mod tests {
             .sum();
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(1),
                 window: 0,
                 direction: Direction::Out,
@@ -1645,7 +1744,7 @@ mod tests {
                     .zip(&slabs)
                     .map(|(id, slab)| (PageId(*id), *slab))
                     .collect(),
-                row: Some((StateSlotId(1), row_slab)),
+                row: Some((StateSlotId(1), vec![row_slab])),
             })
             .unwrap();
         let reply = wait(&mut transfers);
@@ -1673,7 +1772,7 @@ mod tests {
                     );
                 }
             }
-            let row = part.row(row_slab).unwrap().unwrap() as usize;
+            let row = part.page(row_slab).unwrap().unwrap() as usize;
             let mut wanted = vec![0u8; ROW_BYTES as usize];
             fill(&mut wanted, seed(rank, row_plane, 1));
             // SAFETY: As above.
@@ -1687,6 +1786,7 @@ mod tests {
 
         transfers
             .submit(Job {
+                replication: Default::default(),
                 id: JobId(2),
                 window: 0,
                 direction: Direction::In,
@@ -1695,7 +1795,7 @@ mod tests {
                     .zip(&slabs)
                     .map(|(id, slab)| (PageId(*id), *slab))
                     .collect(),
-                row: Some((StateSlotId(2), row_slab)),
+                row: Some((StateSlotId(2), vec![row_slab])),
             })
             .unwrap();
         let reply = wait(&mut transfers);
@@ -1751,6 +1851,83 @@ mod tests {
                 loader
                     .check("cuCtxDestroy_v2", (loader.context_destroy)(context as _))
                     .unwrap();
+            }
+        }
+    }
+    #[test]
+    fn multi_piece_rows_expand_for_unequal_registered_and_split_ranks() {
+        let ranks = [
+            geometry(64, &[("kv", 4096)], 5 * 4096 - 17),
+            geometry(64, &[("kv", 8192)], 3 * 4096 - 3),
+        ];
+        let layout = Layout::new(&ranks).unwrap();
+        let pool = SlabPool::new(layout.page_record_bytes, 7, 0).unwrap();
+        let slots: Vec<_> = (0..layout.row_slots())
+            .map(|_| {
+                let slot = pool.allocate_page().unwrap();
+                pool.slot_address(slot)
+            })
+            .collect();
+        let registered = pool.registered_parts(&layout, 0x2000_0000);
+        let split: Vec<_> = (0..ranks.len())
+            .map(|rank| {
+                rank_part(
+                    slots[0]..slots[0] + 7 * layout.page_record_bytes as usize,
+                    (
+                        layout.page_record_bytes as usize,
+                        7,
+                        0x3000_0000 + rank * 0x1000_0000,
+                        layout.page_share(rank) as usize,
+                    ),
+                )
+            })
+            .collect();
+        for parts in [&registered, &split] {
+            for (rank, geometry) in ranks.iter().enumerate() {
+                let mut job = Job {
+                    replication: Default::default(),
+                    id: JobId(1),
+                    window: 0,
+                    direction: Direction::Out,
+                    pages: vec![],
+                    row: Some((StateSlotId(1), slots.clone())),
+                };
+                let mut copies = Vec::new();
+                expand(
+                    geometry,
+                    &layout.ranks[rank],
+                    Some(&parts[rank]),
+                    &job,
+                    &mut copies,
+                )
+                .unwrap();
+                let share = layout.page_share(rank);
+                assert_eq!(
+                    copies.len(),
+                    geometry.row.unit_bytes.div_ceil(share) as usize
+                );
+                for (piece, copy) in copies.iter().enumerate() {
+                    let offset = piece as u64 * share;
+                    assert_eq!(
+                        *copy,
+                        Descriptor {
+                            destination: parts[rank].page(slots[piece]).unwrap().unwrap(),
+                            source: geometry.row.unit_address(1) + offset,
+                            bytes: (geometry.row.unit_bytes - offset).min(share) as usize,
+                        }
+                    );
+                }
+                job.row.as_mut().unwrap().1[1] = slots[0];
+                assert!(
+                    expand(
+                        geometry,
+                        &layout.ranks[rank],
+                        Some(&parts[rank]),
+                        &job,
+                        &mut copies
+                    )
+                    .is_err()
+                );
             }
         }
     }

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import hashlib
 
 import pytest
@@ -55,7 +58,7 @@ def test_init_stages_exact_empty_endpoint_before_first_replay(batch):
     runner.admission = admission
     runner.requests = DeviceRequestState.allocate('cpu')
     runner.state = SimpleNamespace(reset_for_preparation=lambda: None)
-    runner.model = SimpleNamespace(buffers={'completion_records': torch.zeros((2, 4, 24))},
+    runner.model = SimpleNamespace(buffers={'completion_records': torch.zeros((2, 4, 32))},
                                    memory_report={'pages': 32})
     runner.touched_pages, runner.cache = 0, {}
 

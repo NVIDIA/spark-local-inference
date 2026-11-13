@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Window planning: how a claim's records are cut into windows.
 
 /// One record of a claim, as the source pinned it.

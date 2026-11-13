@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Coding-client acceptance against an actual Flare endpoint and temporary projects.
 
 Set FLARE_API_TEST_URL and FLARE_RUN_CLIENT_TESTS=1. Client settings are isolated

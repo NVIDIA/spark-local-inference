@@ -1,5 +1,10 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 use super::*;
-use crate::runtime_package::{NativeResources, driver::Driver, test_support};
+use crate::runtime_core::{NativeResources, driver::Driver, test_support};
 
 fn uploads(limits: [i32; 4], confidence: f32, reset: bool, terminal: bool, slots: [i32; 4]) -> Vec<OwnedUpload> {
     let mut values = vec![
@@ -19,16 +24,17 @@ fn borrowed(owned: &[OwnedUpload]) -> Vec<Upload<'_>> {
 }
 
 #[test]
-#[ignore = "requires four assigned CUDA devices and FLARE_THREADED_TEST_PACKAGE"]
+#[ignore = "requires four assigned CUDA devices and FLARE_THREADED_TEST_CORE"]
 fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
-    let root = std::path::PathBuf::from(std::env::var_os("FLARE_THREADED_TEST_PACKAGE").expect("fixture directory"));
+    let root = std::path::PathBuf::from(std::env::var_os("FLARE_THREADED_TEST_CORE").expect("fixture directory"));
     let owners: Vec<_> = (0..4).map(|rank| unsafe {
-        NativeResources::load(test_support::authorize(root.join(format!("rank-{rank}/package"))), rank).unwrap()
+        NativeResources::load(test_support::authorize(root.join(format!("rank-{rank}/core"))), rank).unwrap()
     }).collect();
     let mut manifests: Vec<_> = owners.iter().map(|owner| owner.execution_manifest().unwrap()).collect();
     let root_manifest = manifests.remove(0);
     let pending_buffer = root_manifest.buffer("pending_inputs").unwrap().clone();
     let context = root_manifest.context;
+    let completion_capacity = root_manifest.completion_token_capacity;
     let mut executor = unsafe { ThreadedExecutor::new(root_manifest, manifests).unwrap() };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for (same_requests, terminal) in [(true, false), (false, false), (true, true)] {
@@ -65,16 +71,17 @@ fn four_cuda_rank_threads_preserve_two_frames_and_device_continuations() {
                 for row in 0..4 {
                     let expected = if row < 2 && !(terminal && round == 1) { confidence[round] } else { 0.0 };
                     assert_eq!(&reported[row][..3], &[expected; 3]);
-                    assert_eq!(&reported[row][3..], &[0.0; 4]);
+                    assert_eq!(reported[row].len(), completion_capacity - 1);
+                    assert!(reported[row][3..].iter().all(|value| *value == 0.0));
                 }
                 for row in 0..2 {
-                    let record = completion.records[slots[round][row] as usize];
+                    let record = &completion.records[slots[round][row] as usize];
                     let emitted = if terminal { usize::from(round == 0) } else { limits[round][row] as usize };
                     let predecessor = if round == 1 && same_requests { if terminal { 1 } else { limits[0][row] as usize } } else { 0 };
                     assert_eq!(record.submission_sequence, fence.0 as i64);
                     assert_eq!(record.consumed_tokens, (10 + predecessor + emitted) as i64);
                     assert_eq!(record.generated_tokens, (3 + predecessor + emitted) as i64);
-                    assert_eq!(record.vector.unwrap().emitted_count, emitted as i64);
+                    assert_eq!(record.vector.as_ref().unwrap().emitted_count, emitted as i64);
                     if terminal { assert_eq!(record.status, 2); }
                 }
                 for slot in &slots[round][2..] { assert_eq!(completion.records[*slot as usize].status, 0); }

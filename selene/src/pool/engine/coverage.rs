@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Exact coverage of a claim or export by its windows.
 
 use super::{super::wire, requester::ExpectedRecord};

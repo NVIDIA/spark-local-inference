@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Stored BF16 and NVFP4 W4A16 weights for the checkpoint's single MTP layer."""
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import nvfp4_draft_head
 from ignition.preparation.checkpoint import CheckpointError, CheckpointManifest
 from ignition.preparation.qwen38 import TRANSFORMERS_REVISION
+from ignition.preparation.persistent import persistent_cat, allocated_tensor_bytes
 
 from .moe import QwenMoeWeights, SharedExpertWeights
 from .hyperconnection import packed_down_projection, hyperconnection_extents
@@ -69,8 +74,8 @@ class MTPWeightLoader(QwenWeightLoader):
     def load_shared(self):
         prefix = "mtp.layers.0.mlp"
         first, last = self.shard.partition(640, alignment=16)
-        gate_up = torch.cat(self.load_tensors(tuple(f"{prefix}.shared_expert.{p}.weight"
-            for p in ("gate_proj", "up_proj")), extents=(slice(first, last),) * 2))
+        gate_up = persistent_cat(self.load_tensors(tuple(f"{prefix}.shared_expert.{p}.weight"
+            for p in ("gate_proj", "up_proj")), extents=(slice(first, last),) * 2, temporary=True))
         return SharedExpertWeights(gate_up,
             self.load_tensor(f"{prefix}.shared_expert.down_proj.weight", extent=(slice(None), slice(first, last))),
             self.load_tensor(f"{prefix}.shared_expert_gate.weight"))
@@ -137,7 +142,7 @@ class MTPWeights:
                 raise ValueError(f"shared MTP {label} must be contiguous BF16 [{rows},2560] on {device}")
         stored = sum(t.nbytes for t in manifest.tensors.values() if t.component == "mtp")
         module = create_mtp_modules(manifest)
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with MTPWeightLoader(manifest, device, progress=progress, progress_label="Load MTP weights", shard=shard) as loader:
             names = tuple(name for name, _ in module.named_parameters())
             kv = tuple(head * 256 for head in shard.replicated_partition(2))
@@ -150,19 +155,27 @@ class MTPWeights:
             for prefix in ("layers.0.attn_hyper_connection", "layers.0.mlp_hyper_connection", "hyper_connection_mixer"):
                 extents.update({f"{prefix}.{name}": extent
                                 for name, extent in hyperconnection_extents(shard, shard_hyperconnections).items()})
-            values = loader.load_tensors(tuple(f"mtp.{name}" for name in names),
-                                        extents=tuple(extents.get(name) for name in names))
-            for name, value in zip(names, values, strict=True):
-                parent, _, attribute = name.rpartition(".")
-                setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))
-            del values
+            temporary_names = {f"layers.0.self_attn.{name}.weight" for name in ("q_proj", "k_proj", "v_proj")}
+            temporary_names.update(f"layers.0.{mixer}.{name}.weight"
+                for mixer in ("attn_hyper_connection", "mlp_hyper_connection")
+                for name in ("input_mix_weight_down", "block_inject_weight"))
+            for temporary in (False, True):
+                selected = tuple(name for name in names if (name in temporary_names) == temporary)
+                if not selected:
+                    continue
+                values = loader.load_tensors(tuple(f"mtp.{name}" for name in selected),
+                    extents=tuple(extents.get(name) for name in selected), temporary=temporary)
+                for name, value in zip(selected, values, strict=True):
+                    parent, _, attribute = name.rpartition(".")
+                    setattr(module.get_submodule(parent), attribute, torch.nn.Parameter(value, requires_grad=False))
+                del values
             for mixer in (module.layers[0].attn_hyper_connection, module.layers[0].mlp_hyper_connection):
                 packed_down_projection(mixer)
             shared = loader.load_shared()
             moe = QwenMoeWeights(loader.load_tensor("mtp.layers.0.mlp.gate.weight"),
                                 loader.load_experts(), shared)
         attention_module = module.layers[0].self_attn
-        qkv = torch.cat([attention_module.get_submodule(name).weight.detach()
+        qkv = persistent_cat([attention_module.get_submodule(name).weight.detach()
                          for name in ("q_proj", "k_proj", "v_proj")])
         for name, value in zip(("q_proj", "k_proj", "v_proj"), qkv.split((12288 // shard.world_size, max(1, 2 // shard.world_size) * 256, max(1, 2 // shard.world_size) * 256)), strict=True):
             attention_module.get_submodule(name).weight = torch.nn.Parameter(value, requires_grad=False)
@@ -174,4 +187,4 @@ class MTPWeights:
         draft_head = nvfp4_draft_head(lm_head_weight)
         torch.cuda.synchronize(device)
         return cls(module, attention, moe, embedding_weight, lm_head_weight,
-                   stored, torch.cuda.memory_allocated(device) - before, shard, draft_head)
+                   stored, allocated_tensor_bytes(device) - before, shard, draft_head)

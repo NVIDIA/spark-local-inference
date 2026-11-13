@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Shared arena and staging files; owners and clients keep their own mapping lifetimes.
 
 /// The two shared region files.

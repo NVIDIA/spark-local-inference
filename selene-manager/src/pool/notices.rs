@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Live index hints over one ordered control stream.
 use super::{Checked, Notice, Violation, core::Core, entry_from, index::SourceId, notice_from};
 use crate::proto::v2::{self, server_message::M};

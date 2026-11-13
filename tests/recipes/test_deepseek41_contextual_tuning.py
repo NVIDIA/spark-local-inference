@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Joint tuning restores catalog-shaped inputs without rewinding TP state."""
 
 from types import SimpleNamespace
@@ -29,7 +33,10 @@ def catalog_layer(batch, tokens, width, mode, *, carry=False):
             post=torch.zeros((tokens, 4)), comb=torch.zeros((tokens, 4, 4))),
         attention=SimpleNamespace(query=torch.zeros((tokens, 2, 8), dtype=torch.bfloat16),
             output=torch.zeros((tokens, 16), dtype=torch.bfloat16),
-            window_values=torch.zeros((tokens, 512), dtype=torch.bfloat16)),
+            window_values=torch.zeros((tokens, 512), dtype=torch.bfloat16),
+            selected=torch.full((tokens, 512), -1, dtype=torch.int32),
+            candidates=torch.full((tokens, 512), -1, dtype=torch.int32),
+            candidate_counts=torch.zeros(tokens, dtype=torch.int32)),
         routed=torch.zeros((tokens, 16), dtype=torch.bfloat16),
         router=SimpleNamespace(ids=torch.zeros((tokens, 6), dtype=torch.int32)))
     layer = SimpleNamespace(metadata=metadata, attention=attention, scratch=scratch,
@@ -45,6 +52,15 @@ def catalog_layer(batch, tokens, width, mode, *, carry=False):
     return decoder, signature, runtime
 
 
+def initialize(fixture):
+    fixture.initialize()
+    fixture.output.zero_()
+    scratch = fixture.scratch
+    fixture.observations = {"attention.output": scratch.attention.output,
+        "attention.window_values": scratch.attention.window_values,
+        "attention.selected": scratch.attention.selected, "router.ids": scratch.router.ids}
+
+
 @pytest.mark.parametrize("batch,tokens,width,mode", [
     (1, 1, 1, "decode"), (32, 32, 1, "decode"),
     (1, 3, 3, "verify"), (4, 9, 8, "verify"), (32, 128, 8, "verify"),
@@ -57,7 +73,7 @@ def test_context_uses_actual_packed_geometry_and_restores_inactive_rows(batch, t
     assert fixture.trial_signature.token_capacity == width
     if mode in ("verify", "draft"):
         assert fixture.trial_signature.packed_token_capacity == tokens
-    fixture.initialize()
+    initialize(fixture)
     layer = decoder.layers[0]
     fixture.restore_tune(layer)
     metadata = layer.metadata
@@ -91,7 +107,7 @@ def test_carry_inputs_and_vision_token_boundary_are_restored():
     decoder, signature, runtime = catalog_layer(4, 16, 8, "verify", carry=True)
     decoder.vision = SimpleNamespace(token_base=16)
     fixture = CatalogLayerFixture("packed", signature, decoder, 0)
-    fixture.initialize()
+    initialize(fixture)
     layer = decoder.layers[0]
     fixture.restore_tune(layer)
     assert layer.metadata.token_ids.max().item() < 16
@@ -105,16 +121,18 @@ def test_carry_inputs_and_vision_token_boundary_are_restored():
 def test_verify_history_validation_detects_mutation_and_replay_restores_it():
     decoder, signature, runtime = catalog_layer(4, 9, 8, "verify")
     fixture = CatalogLayerFixture("packed", signature, decoder, 0)
-    fixture.initialize()
+    initialize(fixture)
     layer = decoder.layers[0]
     fixture.restore_tune(layer)
     layer.scratch.attention.output.zero_()
+    fixture.output.zero_()
     fixture.validate_result(layer)
     fixture.window[2, 0] ^= 1
     with pytest.raises(AssertionError, match="cache history"):
         fixture.validate_result(layer)
     fixture.restore_tune(layer)
     layer.scratch.attention.output.zero_()
+    fixture.output.zero_()
     fixture.validate_result(layer)
     assert runtime.sequence.item() == 17
 
@@ -133,13 +151,15 @@ def test_context_rejects_unbacked_rows_and_external_layer_inputs():
 def test_compressed_validation_checks_readonly_history_and_live_selected_bounds():
     decoder, signature, _ = catalog_layer(4, 9, 8, "verify")
     fixture = CatalogLayerFixture("packed", signature, decoder, 0)
-    fixture.initialize()
+    initialize(fixture)
     layer = decoder.layers[0]
     fixture.restore_tune(layer, case_index=1)
     layer.scratch.attention.output.zero_()
+    fixture.output.zero_()
     layer.attention.ratio = 2
     selected = torch.full((9, 512), -1, dtype=torch.int32)
     layer.scratch.attention.selected = selected
+    fixture.observations["attention.selected"] = selected
     selected[:, 0] = fixture.start // 2 - 1
     fixture.validate_result(layer)
     selected[0, 0] = (layer.metadata.positions[0] + 1) // 2
@@ -155,3 +175,39 @@ def test_compressed_validation_checks_readonly_history_and_live_selected_bounds(
     history[0] = 0
     with pytest.raises(AssertionError, match="read-only compressed history"):
         fixture.validate_result(layer)
+
+
+def test_preparation_inputs_survive_serving_example_release():
+    decoder, signature, _ = catalog_layer(4, 9, 8, "verify")
+    fixture = CatalogLayerFixture("packed", signature, decoder, 0)
+    initialize(fixture)
+    layer = decoder.layers[0]
+    layer.metadata = layer.scratch = None
+    fixture.restore_tune(layer)
+    assert fixture.metadata.lengths.sum().item() == 9
+    assert fixture.incoming[0].shape == (9, 4, 16)
+    fixture.release_examples()
+    assert fixture.metadata is None and fixture.scratch is None and fixture.output is None
+
+
+def test_trial_passes_explicit_inputs_after_serving_example_release():
+    decoder, signature, _ = catalog_layer(4, 9, 8, "verify")
+    fixture = CatalogLayerFixture("packed", signature, decoder, 0)
+    initialize(fixture)
+    fixture.restore_tune(fixture.layer)
+    observed = []
+
+    class Layer(SimpleNamespace):
+        def __call__(self, incoming, pre_mix, metadata, indices, selection):
+            observed.append((incoming, pre_mix, metadata, indices, selection))
+            return (incoming[0] + 1,), pre_mix, None, selection
+
+    layer = Layer(**vars(fixture.layer))
+    layer.metadata = layer.scratch = None
+    fixture.layer.metadata = fixture.layer.scratch = None
+    fixture.trial_forward(layer)()
+    torch.testing.assert_close(fixture.output, fixture.incoming[0] + 1, rtol=0, atol=0)
+    incoming, pre_mix, metadata, indices, selection = observed[0]
+    assert incoming is fixture.incoming and pre_mix is fixture.pre_mix
+    assert metadata is fixture.metadata and selection is fixture.selection
+    assert indices.window_lengths.eq(128).all()

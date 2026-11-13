@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Direct scheduler execution on one CUDA rank or a coordinated rank group.
 
 use super::{
@@ -56,6 +62,15 @@ impl RankExecutor {
             Self::Local(executor) => executor.poll(),
             Self::Parallel(executor) => executor.poll(),
             Self::Threaded(executor) => executor.poll(),
+        }
+    }
+
+    /// Wait briefly for this rank's running frame; false when the caller should keep polling.
+    pub(crate) fn park(&self) -> bool {
+        match self {
+            Self::Local(executor) => executor.park(),
+            Self::Parallel(executor) => executor.park(),
+            Self::Threaded(_) => false,
         }
     }
 

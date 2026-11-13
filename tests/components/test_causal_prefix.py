@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact scalar cases for budget, total ordering, and invalid cohorts."""
 
 import random
@@ -72,7 +75,7 @@ def test_constructor_cuda_depth_bounds_accept_fake_cuda():
         build("cpu", 1)
     with FakeTensorMode():
         build("cuda", 1)
-        build("cuda", 7)
-        for depth in (0, 8):
+        build("cuda", 32)
+        for depth in (0, (1 << 31) - 1):
             with pytest.raises(ValueError, match="depth"):
                 build("cuda", depth)

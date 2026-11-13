@@ -1,0 +1,17 @@
+{
+  "source": {
+    "repository": "MiniMaxAI/MiniMax-M3.1-Flash",
+    "revision": "2f33a8b9ae49ce7b51c994df97166a7fd059bc2e",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431",
+  "result_sha256": "b8ff5e354f48acd575ed8ae7d6a7423fb0739bb48c9f82f9757d9620ff2828a1",
+  "insertions": [
+    6153,
+    7520,
+    9740,
+    10943,
+    11289,
+    11448
+  ]
+}

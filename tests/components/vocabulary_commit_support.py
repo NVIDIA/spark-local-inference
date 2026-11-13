@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """A finite conditional language model composed with prepared request machinery.
 
 The model has 32 vocabulary IDs and assigns positive mass to IDs 0, 1 and 2.
@@ -12,7 +15,7 @@ import torch
 
 from ignition.components.causal_prefix import PreparedCausalPrefixAllocation
 from ignition.components.completion import CompletionOutputs
-from ignition.components.parallel_draft import PreparedParallelDraftRound
+from ignition.components.parallel_draft import DraftProposalState, PreparedParallelDraftRound
 from ignition.components.sampling import (
     AdmissionBuffers, DeviceRequestState, FINISHED, PreparedAdmission, PreparedSampling, RequestAdmission,
 )
@@ -22,7 +25,6 @@ from ignition.components.vocabulary_logprobs import PreparedVocabularyParallelLo
 from ignition.components.vocabulary_sampling import PreparedVocabularyBlockVerification, PreparedVocabularySoftmax
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.scratch import GraphBufferPool
 
 TARGET = ((.70, .20, .10), (.10, .25, .65), (.35, .60, .05))
 PROPOSAL = ((.05, .85, .10), (.75, .15, .10), (.10, .15, .75))
@@ -36,7 +38,7 @@ class ToyCommittedModel:
         b, w, v, device = batch, self.width, self.vocabulary, torch.device("cuda", 0)
         self.requests = DeviceRequestState.allocate(device, vocab_size=v, capacity=b)
         self.requests.ple_history = torch.zeros(b, 2, device=device, dtype=torch.int64)
-        self.completion = CompletionOutputs.allocate((2, b, 24), device=device)
+        self.completion = CompletionOutputs.allocate((2, b, 32), device=device)
         self.frame = torch.zeros(1, device=device, dtype=torch.int32)
         self.sequence = torch.ones(1, device=device, dtype=torch.int64)
         self.slots = torch.arange(b, device=device, dtype=torch.int32).roll(1)
@@ -55,6 +57,7 @@ class ToyCommittedModel:
         self.token_state.prepare()
         initial = torch.full((b, v), -float("inf"), device=device)
         initial[:, 0] = 0.
+        self.initial = initial
         self.prefill_sampler = PreparedSampling(initial, self.requests, self.slots, self.epochs,
             self.live_rows, self.completion, self.frame, self.sequence)
         self.prefill_sampler.prepare()
@@ -70,12 +73,11 @@ class ToyCommittedModel:
         self.candidates = torch.zeros(b, w, device=device, dtype=torch.int64)
         self.valid = torch.zeros(b, w - 1, device=device, dtype=torch.bool)
         self.target_valid = torch.zeros(b, w, device=device, dtype=torch.bool)
-        self.storage = GraphBufferPool(device, chunk_bytes=1 << 20)
-        cursor = self.storage.cursor()
-        self.q = cursor.zeros((b, w - 1, v), torch.float32)
-        self.p = cursor.zeros((b, w, v), torch.float32)
+        self.q = torch.zeros((b, w - 1, v), dtype=torch.float32, device=device)
+        self.p = torch.zeros((b, w, v), dtype=torch.float32, device=device)
         base = torch.full((b, w - 1, v), -float("inf"), device=device, dtype=torch.bfloat16)
         base[:, :, :3] = 0.
+        self.proposal_base = base
         self.embedding = torch.zeros(v, 64, device=device, dtype=torch.bfloat16)
         self.embedding[:, :v] = torch.eye(v, device=device, dtype=torch.bfloat16)
         self.head = torch.zeros_like(self.embedding)
@@ -88,9 +90,9 @@ class ToyCommittedModel:
         options = dict(start=0, runtime=None, session=None, coordinator=None)
         self.proposal = PreparedVocabularySoftmax(base, self.q, self.valid, *args, self.drafts,
             **options, name="toy.proposal", embedding=self.embedding, head=self.head,
-            pending=self.pending, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts, workspace=cursor)
+            pending=self.pending, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts)
         self.target = PreparedVocabularySoftmax(self.logits, self.p, self.target_valid, *args, self.drafts,
-            **options, name="toy.target", workspace=cursor)
+            **options, name="toy.target")
         self.confidence = torch.full((b, w - 1), .75, device=device)
         self.submitted = torch.zeros(b, device=device, dtype=torch.bool)
         self.source_valid = torch.zeros_like(self.submitted)
@@ -102,7 +104,7 @@ class ToyCommittedModel:
             token_capacity=b * w if token_capacity is None else token_capacity, request_capacity=b)
         self.verify = PreparedVocabularyBlockVerification(self.q, self.drafts, self.p, *args,
             **options, name="toy.verify", rng=self.rng, draft_valid=self.valid,
-            target_valid=self.target_valid, token_limits=self.limits, workspace=cursor)
+            target_valid=self.target_valid, token_limits=self.limits)
         self.logprobs = PreparedVocabularyParallelLogprobs(self.logits, self.completion,
             self.slots, self.epochs, self.live_rows, self.frame, vocabulary=v, offset=0,
             runtime=None, session=None, coordinator=None, name="toy.logprobs")
@@ -111,6 +113,13 @@ class ToyCommittedModel:
             logprobs=self.logprobs, rng=self.rng, token_limits=self.limits, draft_context_lag=0)
         for operation in (self.proposal, self.target, self.verify, self.commit):
             operation.prepare()
+        self.committed = SimpleNamespace(**{name: torch.empty_like(getattr(self.commit, name))
+                                            for name in self.commit._output_names})
+        self.token_state.functional()
+        self.prefill_sampler.functional(session=None)
+        self.allocator.functional()
+        for operation in (self.proposal, self.target, self.verify, self.commit):
+            operation.functional(session=None)
         self.worker = None
         self.graphs, self.compiled = {}, {}
 
@@ -129,32 +138,42 @@ class ToyCommittedModel:
         self.admission.apply()
 
     def prefill(self):
-        self.token_state.consume()
-        self.prefill_sampler()
+        self.token_state.consume(self.prompt, self.prompt_starts)
+        self.prefill_sampler.run(self.initial)
 
     def __call__(self):
-        self.token_state.gather()
-        self.slot64.copy_(self.slots)
+        pending, before, _, active = self.token_state.gather()
+        pending = pending.clamp_min(0)
         safe = self.slots.long().clamp(0, self.batch - 1)
-        self.active.copy_(self.token_state.active.bool())
-        self.pending.copy_(self.token_state.pending_tokens.clamp_min(0))
-        self.base_offset.copy_(torch.where(self.owner.generation[safe] == self.requests.generation[safe],
-                                          self.owner.offset[safe], 0))
-        self.seed.copy_(self.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN)
-        self.proposal()
-        self.commit_draft_rng()
+        active = active.bool()
+        base_offset = torch.where(self.owner.generation[safe] == self.requests.generation[safe],
+                                  self.owner.offset[safe], 0)
+        seed = self.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN
+        drafts = torch.zeros((self.batch, self.width - 1), dtype=torch.int64, device=pending.device)
+        q, valid, _ = self.proposal.run(self.proposal_base, drafts, pending=pending,
+                                      seeds=seed, offsets=base_offset, tokens=drafts)
+        candidates = torch.cat((pending[:, None], drafts), 1)
+        proposal = DraftProposalState(before, active, candidates, drafts, valid, base_offset, None)
+        self.commit_draft_rng(proposal=proposal)
         finished = ((self.epochs == self.requests.generation[safe])
                     & (self.requests.status[safe] == FINISHED))
-        self.submitted.copy_((self.rows < self.live_rows) & ~finished)
-        self.source_valid.copy_(self.active & self.valid.all(-1))
-        self.allocator()
-        self.candidates[:, 0].copy_(self.pending)
-        self.candidates[:, 1:].copy_(self.drafts)
-        self.logits.copy_(self.target_table[self.candidates])
-        self.target()
-        self.verify()
-        self.verify.output.valid.logical_and_(self.admitted)
-        self.commit()
+        submitted = (torch.arange(self.batch, device=pending.device) < self.live_rows) & ~finished
+        source_valid = active & valid.all(-1)
+        limits = torch.empty_like(self.prefix_limits)
+        admitted = self.allocator(self.confidence, self.slots.long(), submitted, source_valid,
+                                  self.prefix_limits, limits)
+        logits = self.target_table[candidates]
+        p, target_valid, _ = self.target.run(logits, drafts)
+        acceptance = self.verify.run(q, drafts, p, valid, target_valid, token_limits=limits)
+        acceptance.valid.logical_and_(admitted)
+        committed = self.commit(logits, acceptance=acceptance, inputs=candidates, token_limits=limits)
+        for name, value in dict(active=active, pending=pending, base_offset=base_offset, seed=seed,
+                drafts=drafts, candidates=candidates, valid=valid, target_valid=target_valid,
+                q=q, p=p, logits=logits, submitted=submitted, source_valid=source_valid,
+                limits=limits, admitted=admitted).items():
+            getattr(self, name).copy_(value)
+        for name, destination in vars(self.committed).items():
+            destination.copy_(getattr(committed, name))
 
     def stage(self, *, generation, seed=8751, max_new_tokens=20, eos=(), rows=None):
         rows = list(range(self.batch)) if rows is None else list(rows)
@@ -178,7 +197,7 @@ class ToyCommittedModel:
                 call()
             self.compiled[name], self.graphs[name] = call, graph
         self.bundle = PreparedGraphBundle(device=0, graphs=self.graphs, buffers={},
-            resources=(self, self.compiled, self.storage, self.completion))
+            resources=(self, self.compiled, self.completion))
         self.worker = self.bundle.start_worker()
 
     def replay(self, name):

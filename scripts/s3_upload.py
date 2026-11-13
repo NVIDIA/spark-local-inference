@@ -1,4 +1,7 @@
 #!/usr/bin/env -S uv run --script
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["boto3>=1.40,<2", "rich>=13,<15"]

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Disk records of a model whose ranks run as separate processes on separate hosts.
 //!
 //! Each host keeps the record files of its own rank in its own record directory. A file holds
@@ -134,9 +139,9 @@ fn retain(prepared: &mut Prepared, agreed: &HashMap<PrefixKey, bool>) -> Result<
 /// Whether this rank serves a disk store its peers can mirror; a memory tier keeps records in
 /// one process's memory, which other hosts cannot reach.
 fn mirrored(prepared: &Prepared) -> Result<bool> {
-    if prepared.memory_pool.is_some() {
+    if prepared.warm_bytes != 0 {
         return Err(invalid(
-            "a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0",
+            "a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0",
         ));
     }
     Ok(prepared.directory_lock.is_some())
@@ -222,7 +227,7 @@ pub fn join_rank_zero(
                 && peer_layout != layout
             {
                 return Err(invalid(format!(
-                    "rank {} describes a different cache layout than rank zero; every rank of a multi-host package must have the same plane and row sizes",
+                    "rank {} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes",
                     index + 1
                 )));
             }
@@ -368,7 +373,7 @@ pub fn join_peer(
     reader.end()?;
     if zero_layout != layout {
         return Err(invalid(format!(
-            "rank {rank} describes a different cache layout than rank zero; every rank of a multi-host package must have the same plane and row sizes"
+            "rank {rank} describes a different cache layout than rank zero; every rank of a multi-host core must have the same plane and row sizes"
         )));
     }
     let limit = zero_limit.min(limit);
@@ -402,12 +407,12 @@ pub fn join_peer(
     // then fails the join instead of interrupting serving, when rank zero has
     // already treated this rank as joined.
     let pool = prepared
-        .staging_pool
+        .memory_pool
         .as_ref()
-        .ok_or_else(|| invalid("a peer's prefix record service needs a staging pool"))?;
+        .ok_or_else(|| invalid("a peer's prefix record service needs an intake pool"))?;
     let transfers = factory.mapped(&prepared.contexts, prepared.geometry.clone(), pool)?;
     let staged = Staged::new(
-        prepared.staging_pool.take(),
+        prepared.memory_pool.take(),
         transfers,
         DiskThread::start("flare-offload-disk")?,
     );

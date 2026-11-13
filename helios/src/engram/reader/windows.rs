@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Windows disk readers share a fixed staging and queue budget across workers.
 
 use super::{Aligned, CHUNK, DEPTH, DiskTimings, Fragment, Read, Stats};

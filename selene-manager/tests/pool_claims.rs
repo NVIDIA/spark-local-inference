@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! Pool protocol, claims: a requester, a source and the manager between them.
 //! Both ends are scripted over the wire; the manager is real.
 

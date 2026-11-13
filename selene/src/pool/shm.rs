@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The manager's shared-memory regions, mapped and registered by the client.
 //!
 //! Windows are slices of these regions. The protocol, not the type system,

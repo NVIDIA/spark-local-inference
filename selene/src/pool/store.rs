@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A host store attached to a pool.
 //!
 //! [`PooledStore`] wraps the local host store and a [`PoolClient`]. Local
@@ -177,7 +182,6 @@ impl<S: crate::store::TierStore> PooledStore<S, PoolClient> {
 impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
         inner.announce_to(pool.announcer());
-        inner.cascade();
         Self {
             inner,
             pool,
@@ -419,6 +423,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let level = planned.plan.part.level;
         let bytes = hit.bytes;
         let started = Instant::now();
+        self.rates.started(level);
         let id = self.pool.fetch(PoolFetch {
             id: 0,
             page_tokens: self.page_tokens,

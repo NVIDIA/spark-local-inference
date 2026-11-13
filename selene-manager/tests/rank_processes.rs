@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! A multi-process instance as real processes on one host: a source, rank 0 and the agents of
 //! the peer ranks are separate OS processes (the `rank_node` example), the manager runs in
 //! this one. Ranks are killed in the middle of a restore.

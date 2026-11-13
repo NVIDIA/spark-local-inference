@@ -1,9 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 **
 !flare/
 !flare/Cargo.toml
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!flare-cli/
+!flare-cli/Cargo.toml
+!flare-cli/Cargo.lock
+!flare-cli/src/
+!flare-cli/src/**
 !selene/
 !selene/Cargo.toml
 !selene/Cargo.lock
@@ -42,6 +51,12 @@
 !ignition/recipes/kimi3/assets/**
 !LICENSE
 !NOTICE
+!THIRD_PARTY_NOTICES.md
+!helios/licenses/
+!helios/licenses/PyTorch.txt
 !packaging/
+!packaging/licenses.py
+!packaging/license-supplements/
+!packaging/license-supplements/**
 !packaging/debian/
 !packaging/debian/**

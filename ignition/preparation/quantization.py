@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Supported ModelOpt projection storage declarations."""
 
 from collections.abc import Mapping
@@ -52,9 +56,6 @@ def projection_group_format(layers, prefixes):
     formats = [linear_format(layers, prefix) for prefix in prefixes]
     if "tensor_fp8" in formats and len(prefixes) > 1:
         raise ValueError("tensor-FP8 projections retain separate checkpoint activation and weight scales")
-    if "nvfp4" in formats and len(prefixes) > 1:
-        names = ", ".join(prefixes)
-        raise ValueError(f"cannot fuse NVFP4 projections ({names}); only MoE expert w1/w3 fusion is supported")
     if len(set(formats)) != 1:
         raise ValueError("fused projections must use the same quantization format")
     return formats[0]

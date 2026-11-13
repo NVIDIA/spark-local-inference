@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """DeepSeek target heads retain BF16 weights and FP32 logits under capture."""
 
 from functools import lru_cache

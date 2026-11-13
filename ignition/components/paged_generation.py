@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Collective text execution and request completion."""
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
-from ignition.preparation.scratch import bind_scratch
 
 
 class PreparedGeneration:
@@ -21,7 +24,6 @@ class PreparedGeneration:
         name,
         workspace,
         context_factory=None,
-        buffers=None,
     ):
         self.decoder, self.batch = decoder, batch
         self.validation = PreparedAllReduce(
@@ -42,13 +44,11 @@ class PreparedGeneration:
             frame,
             sequence,
         )
-        sampling_workspace = None if buffers is None else bind_scratch(
-            PreparedSampling.scratch_layout(rows, batch.requests.vocab_size),
-            device=decoder.scratch.logits.device, workspace=buffers)
-        self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows], workspace=sampling_workspace)
+        self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
         self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
-            coordinator=coordinator, name=name + ".sampling", buffers=buffers)
+            coordinator=coordinator, name=name + ".sampling")
+        self.completion.functional(session=session)
         self.compilation_variant = "sample"
         self.context = None
         if decoder.weights.draft is not None:
@@ -63,17 +63,34 @@ class PreparedGeneration:
                 name=name + ".context",
                 workspace=workspace,
             )
+        decoder.release_outputs()
+        self.validation.functional(session=session)
+        if self.context is not None:
+            self.context.functional()
+        self.batch.functional()
 
     def __call__(self):
-        self.batch.begin(self.validation(self.batch.validate()))
-        self.decoder()
-        if self.context is not None:
-            self.context(self.decoder.auxiliary, self.batch.metadata.lengths)
+        self._run()
+
+    def observe(self):
+        """Return forward-local outputs and packed metadata for diagnostic consumers."""
+        return self._run(observe=True)
+
+    def _run(self, *, observe=False):
+        validation, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation), present=present)
+        hidden, logits, auxiliary, _ = self.decoder(metadata)
         save_hidden(
-            self.decoder.scratch.hidden,
+            hidden,
             self.decoder.pool.last_hidden,
-            self.batch.metadata.state_rows,
-            self.batch.token_state.active,
+            metadata.state_rows,
+            metadata.lengths > 0,
         )
-        self.batch.finish()
-        self.completion()
+        self.batch.finish(metadata)
+        self.completion.run(logits)
+        if self.context is not None:
+            self.context(auxiliary, metadata.lengths, metadata)
+        if observe:
+            return {"target.hidden": hidden, "target.logits": logits,
+                    **{"target." + name: getattr(metadata, name) for name in
+                       ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}}

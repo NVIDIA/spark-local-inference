@@ -1,4 +1,8 @@
-"""Rank-local persistent GLM state and fixed-address text-forward metadata."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Rank-local persistent GLM state and invocation-local text metadata."""
 
 from dataclasses import dataclass
 
@@ -51,8 +55,9 @@ class DecoderMetadata:
     indexed: IndexMetadata
 
     @classmethod
-    def allocate(cls, tokens, sequences, blocks, device):
-        recurrent = DeltaMetadata.allocate(sequences, device)
+    def allocate(cls, tokens, sequences, blocks, device, *, samples=None, verification_columns=1):
+        recurrent = DeltaMetadata.allocate(sequences, device, verification_columns=verification_columns)
         indexed = IndexMetadata.allocate(tokens, sequences, blocks, device)
         return cls(torch.zeros(tokens, dtype=torch.int64, device=device),
-                   torch.zeros(sequences, dtype=torch.int64, device=device), recurrent, indexed)
+                   torch.zeros(sequences if samples is None else samples, dtype=torch.int64, device=device),
+                   recurrent, indexed)

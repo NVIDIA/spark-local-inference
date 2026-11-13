@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Qualified checkpoint, serving range, and memory costs of the Qwen 3.8 recipe."""
 
 from types import MappingProxyType
+from pathlib import Path
 
 from ignition.preparation.qwen38 import ARCHITECTURE, MODEL_ID, REVISION
-from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
+from .draft_config import WEIGHT_BYTES
+from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation, SpeculativeMethod
 
 # Twelve target sparse-attention layers each store one page; learned drafts add the draft layer's.
 _TARGET_PAGE_LAYERS = 12
@@ -18,7 +24,7 @@ def _costs(state_row_bytes, page_layer_bytes, graph_bytes, *, speculating):
     return RankCosts(state_row_bytes, layers * page_layer_bytes, graph_bytes)
 
 
-def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage=None,
+def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
             ranks=None):
     """Prepare the plan's catalog and speculation settings on process-local GPUs 0 through N-1.
 
@@ -28,12 +34,27 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     from .bootstrap import PreparationConfig, prepare_model, prepare_rank
 
     speculation = plan.speculation
-    drafting = {} if speculation is None else {
+    if (plan.online_mxfp8 or speculation is not None and speculation.draft_head_quantization is not None) and (
+            speculation is None or speculation.method != "dflash2"):
+        from ignition.errors import UsageError
+
+        raise UsageError("Flash Next online MXFP8 and draft head conversion require --speculative-method dflash2")
+    drafting = {} if speculation is None else {"speculative_method": speculation.method or "mtp",
+        "draft_head_quantization": speculation.draft_head_quantization,
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
         "speculative_fixed_width": speculation.fixed_width}
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
+    if speculation is not None and speculation.method == "dflash2":
+        from huggingface_hub import snapshot_download
+        from .draft_config import REPOSITORY, REVISION
+
+        drafting["draft_snapshot"] = Path(snapshot_download(REPOSITORY, revision=REVISION,
+            cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors")))
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
+        online_mxfp8=plan.online_mxfp8,
+        force_moe_decode_a16=plan.force_moe_decode_a16,
         shard_hyperconnections=plan.shard_hyperconnections,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
@@ -44,12 +65,12 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
         mtp=speculation is not None, **drafting)
     if plan.world_size == 1:
-        storage = {} if package_storage is None else {"package_storage": package_storage}
+        storage = {} if core_storage is None else {"core_storage": core_storage}
         return prepare_model(snapshot, config, progress=progress, compile_decoder=compile_forwards,
                              **storage)
     from ignition.preparation.rank_group import prepare_group
 
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
@@ -78,7 +99,7 @@ RECIPE = Recipe(
     # Rounds adapt among zero through five drafts, up to seven. Verification records
     # corrections and commits accepted tokens into the live state row, so it keeps
     # no extra rows.
-    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
+    speculation=Speculation(draft_tokens=5, token_capacity=128, method="mtp"), max_draft_tokens=7, verification_rows=0,
     # Shared experts, small-batch attention projections and selection, and GDN input projections run
     # on an auxiliary stream.
     stream_overlap=True,
@@ -92,5 +113,13 @@ RECIPE = Recipe(
         2: _costs(58_383_104, 36_864, _GRAPH_BYTES[2], speculating=False),
         4: _costs(29_518_592, 36_864, _GRAPH_BYTES[4], speculating=False),
     }),
+    speculative_methods=MappingProxyType({
+        "dflash2": SpeculativeMethod(MappingProxyType({
+            1: _costs(142_821_120, 69_632, _GRAPH_BYTES[1] + (1 << 30), speculating=False),
+            2: _costs(71_632_640, 36_864, _GRAPH_BYTES[2] + (1 << 30), speculating=False),
+            4: _costs(36_235_008, 36_864, _GRAPH_BYTES[4] + (1 << 30), speculating=False),
+        }), draft_bytes=WEIGHT_BYTES),
+    }),
+    online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
     max_images=4, image_bytes=32 << 20, mixed_prefill=True,
 )

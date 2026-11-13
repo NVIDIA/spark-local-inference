@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native chat rendering and tokenization against MiniMax M3 checkpoint assets."""
 
 import hashlib
@@ -32,7 +35,7 @@ def test_native_minimax_chat_matches_checkpoint(tmp_path):
     tokenizer = Tokenizer.from_file(str(snapshot / "tokenizer.json"))
     template = _compile_jinja_template((snapshot / "chat_template.jinja").read_text())
     assets = runtime_assets(snapshot)
-    annotated = Path(assets["chat_template"]["path"]).read_text()
+    annotated = assets["chat_template"]["text"]
     assert annotated.replace("{%- mark -%}", "") == (snapshot / "chat_template.jinja").read_text()
     marked_template = _compile_jinja_template(annotated.replace("{%- mark -%}", "{{- message_position() -}}"))
     special = prepare(snapshot)["tokenizer"]
@@ -97,7 +100,7 @@ def test_native_minimax_chat_matches_checkpoint(tmp_path):
     runtime_snapshot.mkdir()
     for name in ("tokenizer.json", "tokenizer_config.json"):
         (runtime_snapshot / name).symlink_to(snapshot / name)
-    (runtime_snapshot / "chat_template.jinja").symlink_to(assets["chat_template"]["path"])
+    (runtime_snapshot / "chat_template.jinja").write_text(assets["chat_template"]["text"])
     assets = {name: hashlib.sha256((runtime_snapshot / name).read_bytes()).hexdigest()
               for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")}
     fixture = tmp_path / "chat.json"

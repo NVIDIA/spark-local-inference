@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 //! The data channel instances on other hosts copy through.
 //!
 //! An instance without shared memory cannot map the manager's windows, so the

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure checkpoint loading and native preparation of compact CSF scales.
 
 Times one complete Qwen expert layer with the production b12x direct loader.
