@@ -54,8 +54,23 @@ class ResidualState:
     partial: torch.Tensor
 
 
+def packet_record(hidden, formats):
+    """Record bytes of an expert-input packet that holds a row's record in any of the expert `formats`.
+
+    One graph gathers every layer's packets through one shard gather, so its packets
+    reserve the largest record; a layer with a smaller record leaves the rest unused.
+    """
+    from b12x.moe import fused_moe as moe
+
+    quantization = {"nvfp4": "nvfp4_four_over_six", "mxfp8": "mxfp8"}
+    return max(moe.quantized_input_record_layout(hidden, quantization[fmt])[-1] for fmt in formats)
+
+
 def packet_layout(record, top_k):
-    """Byte offsets of a row's expert-input record, int32 route IDs and FP32 route weights, and the packet width."""
+    """Byte offsets of a row's expert-input record, int32 route IDs and FP32 route weights, and the packet width.
+
+    `record` is the packet's record bytes (`packet_record`), at least the layer's record.
+    """
     ids = record
     weights = ids + 4 * top_k
     width = weights + 4 * top_k
@@ -82,6 +97,8 @@ class Collectives:
     # This rank's index as a one-element int64 device tensor: compiled forwards read it as
     # data, so every rank binds the code one rank compiled.
     rank: torch.Tensor
+    # Record bytes of the expert-input packets the prefill gather carries (`packet_record`).
+    record: int
 
     @classmethod
     def prepare(cls, text, *, mode, tokens, record, runtime, coordinator, session, name, examples=None):
@@ -105,7 +122,7 @@ class Collectives:
             reduce = lambda role: PreparedAllReduce(  # noqa: E731
                 partial, buffer(f"inkling.collectives.{role}", (tokens, hidden)), runtime=runtime, session=session,
                 coordinator=coordinator, name=f"{name}.{role}").functional(session=session)
-            return cls(None, None, reduce("attention"), reduce("experts"), amax, world, rank)
+            return cls(None, None, reduce("attention"), reduce("experts"), amax, world, rank, record)
         if tokens % world:
             raise ValueError("token-sharded prefill requires rows divisible by the world size")
         owned = tokens // world
@@ -119,7 +136,7 @@ class Collectives:
         scatter = lambda role: PreparedReduceScatter(  # noqa: E731
             partial, buffer(f"inkling.collectives.{role}_owned", (owned, hidden)), runtime=runtime, session=session,
             coordinator=coordinator, name=f"{name}.{role}")
-        return cls(streams, packets, scatter("attention"), scatter("experts"), amax, world, rank)
+        return cls(streams, packets, scatter("attention"), scatter("experts"), amax, world, rank, record)
 
 
 class PreparedLayer(torch.nn.Module):
@@ -211,15 +228,15 @@ class PreparedLayer(torch.nn.Module):
         """Route and quantize the owned rows; gather every rank's records, IDs and weights."""
         experts, c = self.experts, self.collectives
         ids, weights = experts.route(mlp_input, self.owned_valid(m))
-        offset_ids, offset_weights, width = packet_layout(experts.record, ids.shape[1])
+        offset_ids, offset_weights, width = packet_layout(c.record, ids.shape[1])
         packets = torch.empty((self.owned, width), dtype=torch.uint8, device=mlp_input.device)
-        experts.quantize(mlp_input, packets[:, :offset_ids])
+        experts.quantize(mlp_input, packets[:, :experts.record])
         packets[:, offset_ids:offset_weights].view(torch.int32).copy_(ids)
         packets[:, offset_weights:].view(torch.float32).copy_(weights)
         gathered = c.packets(packets.view(torch.bfloat16)).view(torch.uint8)
         all_ids = gathered[:, offset_ids:offset_weights].view(torch.int32).contiguous()
         all_weights = gathered[:, offset_weights:].view(torch.float32).contiguous()
-        return all_ids, all_weights, gathered[:, :offset_ids]
+        return all_ids, all_weights, gathered[:, :experts.record]
 
 
 class PreparedDecoder:
@@ -237,8 +254,6 @@ class PreparedDecoder:
                  coordinator, session, workspace, name, examples=None):
         from types import SimpleNamespace
 
-        from b12x.moe import fused_moe as moe
-
         from ignition.preparation.examples import declaration_tensor
 
         from .vocabulary import PreparedLogits
@@ -248,9 +263,7 @@ class PreparedDecoder:
         self.text, self.vocabulary = text, vocabulary
         # Graphs that run serially may share declaration storage; the caller clears it after construction.
         examples = {} if examples is None else examples
-        formats = {layer.experts.format for layer in weights.layers}
-        record = max(moe.quantized_input_record_layout(text.hidden, {"nvfp4": "nvfp4_four_over_six",
-                                                                     "mxfp8": "mxfp8"}[fmt])[-1] for fmt in formats)
+        record = packet_record(text.hidden, {layer.experts.format for layer in weights.layers})
         self.collectives = Collectives.prepare(text, mode=mode, tokens=tokens, record=record, runtime=runtime,
                                                coordinator=coordinator, session=session, name=f"{name}.collectives",
                                                examples=examples)

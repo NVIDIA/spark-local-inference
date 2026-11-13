@@ -10,8 +10,11 @@ it may name a directory that holds only the snapshot's config.json and
 hf_quant_config.json. Rank 0 reads every rank's tensors and the canonical activations
 (tests/recipes/inkling2_checkpoint.py) and sends them over the process group.
 
-Each layer prefills one request in chunks of 1100 and 305 rows through a token-sharded
-1152-row graph (288 owned rows per rank), forks the request's continuation row after the
+Layers 0 and 5 hold NVFP4 experts and layers 40 and 47 MXFP8 experts; 5 and 47 attend
+globally. Expert-input packets reserve the MXFP8 record for every layer, as the full
+model's prefill graphs do. Each layer prefills one request in chunks of 1100 and 305 rows
+through a token-sharded 1152-row graph (288 owned rows per rank), forks the request's
+continuation row after the
 first chunk, and decodes three steps of both requests through a replicated three-row
 graph whose third row is inactive. Rank 0 then checks:
 
@@ -41,7 +44,7 @@ import torch.distributed as dist
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_ROCE_TESTS") != "1",
                                reason="requires four assigned Spark hosts")
 
-LAYERS = (0, 5, 40)
+LAYERS = (0, 5, 40, 47)
 PREFILL_ROWS, DECODE_ROWS, BLOCKS = 1152, 3, 12
 CHUNKS = ((0, 1100), (1100, 305))
 DECODE_STEPS = 3
@@ -153,10 +156,11 @@ class Run:
         rows = {"prefill": self.owned, "decode": DECODE_ROWS}
         self.inputs = {mode: [torch.zeros(count, text.hidden, dtype=torch.bfloat16, device=device)
                               for _ in range(sources + 1)] for mode, count in rows.items()}
-        from b12x.moe import fused_moe as moe
+        from ignition.recipes.inkling2.decoder import packet_record
 
-        record = moe.quantized_input_record_layout(text.hidden, {"nvfp4": "nvfp4_four_over_six",
-                                                                 "mxfp8": "mxfp8"}[weights.experts.format])[-1]
+        # The full model's prefill graphs carry NVFP4 and MXFP8 layers' expert inputs in packets
+        # that reserve the larger record; every layer runs with those packets.
+        record = packet_record(text.hidden, ("nvfp4", "mxfp8"))
         self.arena = ScratchArena(device)
         self.session = RecordedPreparationSession(device=device, checkpoint="inkling-2-small",
             workload_schema="inkling2-layer-tp4-v1", numerical_policy="default", coordinator=coordinator,
