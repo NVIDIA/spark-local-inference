@@ -989,7 +989,7 @@ impl PublishPayload {
     }
 
     fn digest(&self) -> Result<PayloadId, crate::Error> {
-        hash_reader(self.reader(), self.nbytes())
+        self.source.digest()
     }
 }
 
@@ -1041,8 +1041,8 @@ const MAX_PAYLOAD_INSTALL_WORKERS: usize = 8;
 /// Install or re-verify one data phase's payloads and record their locations
 /// in listed order. Returns the cached weight bytes linked without hashing.
 ///
-/// Cache payload checks and directory installations run concurrently. Cache
-/// object installation, staging links, and location publication remain serialized.
+/// Cache publication and directory installations run their payloads concurrently;
+/// locations are recorded in listed order.
 fn install_phase_payloads(
     payloads: &[PublishPayload],
     weights: Option<&[crate::core::cache::PayloadObject]>,
@@ -1139,53 +1139,19 @@ fn install_phase_payloads(
     Ok(0)
 }
 
-enum PreparedCachePayload {
-    Reused(crate::core::cache::PayloadObject),
-    Verified(Option<crate::core::cache::PayloadObject>),
-}
-
-fn prepare_cache_payload(
-    payload: &PublishPayload,
-    weights: Option<&[crate::core::cache::PayloadObject]>,
-    root: &crate::core::cache::Root,
-    install: bool,
-    no_weights: bool,
-) -> Result<PreparedCachePayload, crate::Error> {
-    if let Some(object) = reused_weight(payload, weights)? {
-        return Ok(PreparedCachePayload::Reused(object.clone()));
-    }
-    verify_payload_source(payload)?;
-    if !install {
-        return Ok(PreparedCachePayload::Verified(None));
-    }
-    let object = root.payload(payload.id)?;
-    if let Some(object) = &object {
-        if object.length() != payload.nbytes() {
-            return Err(invalid(format!(
-                "cached payload {} length differs from its declaration",
-                payload.id,
-            )));
-        }
-        if object.slice().digest()? != payload.id {
-            return Err(invalid(format!(
-                "cached payload {} bytes do not match their identity",
-                payload.id,
-            )));
-        }
-    } else if no_weights
-        && matches!(
-            payload.role,
-            wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
-        )
-    {
-        return Err(invalid(format!(
-            "no-weights export is missing cached payload {} (group {})",
-            payload.id, payload.relative,
-        )));
-    }
-    Ok(PreparedCachePayload::Verified(object))
-}
-
+/// Verify, insert and link one cache publication phase's payloads.
+///
+/// Up to `MAX_PAYLOAD_INSTALL_WORKERS` workers take the payloads largest first,
+/// so a long payload does not start after the short ones. A reused cached weight
+/// is linked without hashing. Any other payload's source is hashed; the first
+/// occurrence of an identity then resolves its cache object (checking an
+/// existing object, or inserting a missing one) and links it into staging, and
+/// later occurrences prove only their own source bytes. A worker drops each
+/// object once it is linked, so open object handles stay bounded by the worker
+/// count. Locations are recorded in listed order after every payload finishes.
+/// After the first error no new payload starts and that error is returned once
+/// running workers finish; objects already inserted stay in the cache as
+/// verified, unreferenced objects.
 fn install_cache_phase_payloads(
     payloads: &[PublishPayload],
     weights: Option<&[crate::core::cache::PayloadObject]>,
@@ -1196,82 +1162,159 @@ fn install_cache_phase_payloads(
     no_weights: bool,
     phase: &crate::startup::Phase,
 ) -> Result<u64, crate::Error> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
     let mut seen: std::collections::BTreeSet<_> = located.keys().copied().collect();
     let installs: Vec<_> = payloads
         .iter()
         .map(|payload| seen.insert(payload.id))
         .collect();
+    let mut order: Vec<usize> = (0..payloads.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(payloads[index].nbytes()));
     let workers = std::thread::available_parallelism()
         .map_or(1, |workers| workers.get())
         .min(MAX_PAYLOAD_INSTALL_WORKERS)
         .min(payloads.len())
         .max(1);
-    let mut reused_bytes = 0;
-    // Batching bounds the file handles retained by verified cache objects.
-    for (payloads, installs) in payloads.chunks(workers).zip(installs.chunks(workers)) {
-        let prepared = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(payloads.len());
-            for (payload, install) in payloads.iter().zip(installs.iter().copied()) {
-                handles.push(
-                    std::thread::Builder::new()
-                        .spawn_scoped(scope, move || {
-                            phase.detail(format!(
-                                "{} ({} bytes)",
-                                payload.relative,
-                                payload.nbytes()
-                            ));
-                            let result =
-                                prepare_cache_payload(payload, weights, root, install, no_weights);
-                            if result.is_ok() {
-                                phase.advance_bytes(payload.nbytes());
-                            }
-                            result
-                        })
-                        .map_err(|error| {
-                            invalid(format!("spawn cache payload verifier: {error}"))
-                        })?,
-                );
+    let staging = Mutex::new(staging);
+    let reused_bytes = AtomicU64::new(0);
+    let cursor = AtomicUsize::new(0);
+    let failure: Mutex<Option<crate::Error>> = Mutex::new(None);
+    let publish = |index: usize| -> Result<(), crate::Error> {
+        let payload = &payloads[index];
+        phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
+        let object = match reused_weight(payload, weights)? {
+            Some(object) => {
+                reused_bytes.fetch_add(payload.nbytes(), Ordering::Relaxed);
+                installs[index].then(|| object.clone())
             }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| invalid("cache payload verifier panicked"))?
-                })
-                .collect::<Result<Vec<_>, crate::Error>>()
-        })?;
-        for ((payload, install), prepared) in
-            payloads.iter().zip(installs.iter().copied()).zip(prepared)
-        {
-            let object = match prepared {
-                PreparedCachePayload::Reused(object) => {
-                    reused_bytes += payload.nbytes();
-                    Some(object)
+            None => {
+                verify_payload_source(payload)?;
+                if installs[index] {
+                    Some(resolve_cache_object(root, payload, no_weights && is_weight(payload))?)
+                } else {
+                    None
                 }
-                PreparedCachePayload::Verified(object) => object,
-            };
-            if install {
-                let object = match object {
-                    Some(object) => object,
-                    None => root.insert_payload(payload.id, payload.nbytes(), payload.reader())?,
+            }
+        };
+        if let Some(object) = object {
+            staging
+                .lock()
+                .map_err(|_| invalid("cache staging lock poisoned"))?
+                .link(&object, &payload.relative)?;
+        }
+        phase.advance_bytes(payload.nbytes());
+        Ok(())
+    };
+    let mut spawn_error = None;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
+                if failure.lock().expect("cache payload worker mutex").is_some() {
+                    break;
+                }
+                let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                    break;
                 };
-                if object.id() != payload.id {
-                    return Err(invalid(
-                        "cache payload identity differs from the signed identity",
-                    ));
+                // A panic stops new payloads like any other error.
+                let publish_one = std::panic::AssertUnwindSafe(|| publish(index));
+                let result = std::panic::catch_unwind(publish_one)
+                    .unwrap_or_else(|_| Err(invalid("cache payload worker panicked")));
+                if let Err(error) = result {
+                    failure.lock().expect("cache payload worker mutex").get_or_insert(error);
+                    break;
                 }
-                staging.link(&object, &payload.relative)?;
-                locations.push(wire::PayloadLocation {
-                    payload_id: payload.id.as_bytes().to_vec(),
-                    file: payload.relative.clone(),
-                    tensor: container::COMPANION_TENSOR.to_string(),
-                });
-                located.insert(payload.id, ());
+            });
+            if let Err(error) = worker {
+                failure
+                    .lock()
+                    .expect("cache payload worker mutex")
+                    .get_or_insert(invalid("cache payload worker stopped"));
+                spawn_error = Some(error);
+                break;
             }
         }
+    });
+    if let Some(error) = spawn_error {
+        return Err(invalid(format!("spawn cache payload worker: {error}")));
     }
-    Ok(reused_bytes)
+    if let Some(error) = failure.into_inner().expect("cache payload worker mutex") {
+        return Err(error);
+    }
+    for (payload, install) in payloads.iter().zip(installs) {
+        if install {
+            locations.push(wire::PayloadLocation {
+                payload_id: payload.id.as_bytes().to_vec(),
+                file: payload.relative.clone(),
+                tensor: container::COMPANION_TENSOR.to_string(),
+            });
+            located.insert(payload.id, ());
+        }
+    }
+    Ok(reused_bytes.into_inner())
+}
+
+fn is_weight(payload: &PublishPayload) -> bool {
+    matches!(payload.role, wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights)
+}
+
+/// The cache object for a payload whose source was already hashed: an existing
+/// object is checked against its identity, a missing one is inserted unless the
+/// export omits weights, which must already be cached.
+fn resolve_cache_object(
+    root: &crate::core::cache::Root,
+    payload: &PublishPayload,
+    cached_only: bool,
+) -> Result<crate::core::cache::PayloadObject, crate::Error> {
+    match root.payload(payload.id)? {
+        Some(object) => {
+            if object.length() != payload.nbytes() {
+                return Err(invalid(format!(
+                    "cached payload {} length differs from its declaration",
+                    payload.id,
+                )));
+            }
+            // The object name is not evidence: hash the cached bytes, unless
+            // they are the very source bytes just hashed against this identity.
+            if !same_bytes(object.slice(), &payload.source) && object.slice().digest()? != payload.id {
+                return Err(invalid(format!(
+                    "cached payload {} bytes do not match their identity",
+                    payload.id,
+                )));
+            }
+            Ok(object)
+        }
+        None if cached_only => Err(invalid(format!(
+            "no-weights export is missing cached payload {} (group {})",
+            payload.id, payload.relative,
+        ))),
+        None => {
+            let object = root.insert_payload(payload.id, payload.nbytes(), payload.reader())?;
+            if object.id() != payload.id {
+                return Err(invalid("cache payload identity differs from the signed identity"));
+            }
+            Ok(object)
+        }
+    }
+}
+
+/// Whether two slices name the same bytes of the same file, so one hash covers both.
+#[cfg(unix)]
+fn same_bytes(left: &Slice, right: &Slice) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if left.offset() != right.offset() || left.len() != right.len() {
+        return false;
+    }
+    match (left.file().metadata(), right.file().metadata()) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_bytes(_left: &Slice, _right: &Slice) -> bool {
+    false
 }
 
 fn reused_weight<'a>(
@@ -1701,6 +1744,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_bytes_requires_the_same_file_span() {
+        use crate::core::cache::Root;
+
+        let work = scratch("same-bytes");
+        let bytes: Vec<u8> = (0..8192u32).map(|index| (index % 251) as u8).collect();
+        let path = work.join("source.bin");
+        let copy = work.join("copy.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&copy, &bytes).unwrap();
+        let open = |path: &Path| std::sync::Arc::new(File::open(path).unwrap());
+        let span = Slice::new(open(&path), 0, 4096).unwrap();
+        // Another descriptor of the same file names the same bytes; equal bytes elsewhere do not.
+        assert!(same_bytes(&span, &Slice::new(open(&path), 0, 4096).unwrap()));
+        assert!(!same_bytes(&span, &Slice::new(open(&copy), 0, 4096).unwrap()));
+        assert!(!same_bytes(&span, &Slice::new(open(&path), 4096, 4096).unwrap()));
+        assert!(!same_bytes(&span, &Slice::new(open(&path), 0, 8192).unwrap()));
+
+        // A payload whose source is the cache object's own span resolves to that object.
+        let cache = work.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let root = Root::open(&cache).unwrap();
+        let id = PayloadId::of(&bytes);
+        let object = root.capture_payload(bytes.len() as u64, bytes.as_slice()).unwrap();
+        let payload = PublishPayload {
+            role: wire::PayloadRole::Weights,
+            relative: "deployments/sm120-tp1/shared/table.safetensors".into(),
+            source: object.slice().clone(),
+            id,
+            tensor: None,
+        };
+        assert!(same_bytes(root.payload(id).unwrap().unwrap().slice(), &payload.source));
+        let (resolved, read) = container::count_payload_reads(&[object.path().to_path_buf()], || {
+            resolve_cache_object(&root, &payload, false)
+        });
+        assert_eq!(resolved.unwrap().id(), id);
+        assert_eq!(read, 0, "the object is the source span already hashed");
     }
 
     fn write_source(directory: &Path, name: &str, bytes: &[u8]) -> CapturedSource {
