@@ -487,3 +487,188 @@ def canonical_experts(rank_weights, text, x, ids, gammas):
             output[tokens, slots] = ref._project(weights, "w2", expert, ref._quantize(activation, expert_format, amax))
     return [ref._combine(output) for output in routes], routes
 
+
+STACK_LAYERS = 6
+
+
+def distribute_stack(cluster, request, count):
+    """Every rank's placed tensors of the first `count` layers and its vocabulary shard, read on rank 0."""
+    from ignition.recipes.inkling2.config import TEXT_PREFIX
+    from tests.recipes.inkling2_checkpoint import Checkpoint, prompt_ids
+    from tests.recipes.test_inkling2_components_cuda import load_rank
+
+    rank, world, device, layout = cluster["rank"], cluster["world"], cluster["device"], cluster["layout"]
+    names = ("embed.weight", "embed_norm.weight", "norm.weight", "attn_res.output_query", "unembed.weight")
+    placements = [(layer, role, placement) for layer in range(count)
+                  for role, placement in sorted(layout.layer(layer).items())]
+    placements += [(None, name, layout.model[f"{TEXT_PREFIX}.{name}"]) for name in names]
+    checkpoint = Checkpoint(device) if rank == 0 else None
+    mine, everyone = {}, None
+    if rank == 0:
+        everyone = []
+        for peer in range(world):
+            values = {layer: load_rank(checkpoint, layer, peer, experts=True) for layer in range(count)}
+            with checkpoint.loader({f"{TEXT_PREFIX}.{name}" for name in names}) as loader:
+                values[None] = {name: loader.load(f"{TEXT_PREFIX}.{name}", rank=peer) for name in names}
+            if peer:
+                for layer, role, _ in placements:
+                    dist.send(values[layer][role].cpu(), dst=peer)
+                values = {key: {role: value.cpu() for role, value in group.items()} for key, group in values.items()}
+            everyone.append(values)
+        mine = everyone[0]
+    else:
+        for layer, role, placement in placements:
+            shape = placement.local_shape if placement.axis is not None else placement.shape
+            value = torch.empty(shape, dtype=_dtype(placement.dtype))
+            dist.recv(value, src=0)
+            mine.setdefault(layer, {})[role] = value.to(device)
+    ids = prompt_ids() if rank == 0 else torch.empty(1408, dtype=torch.long)
+    dist.broadcast(ids, src=0)
+    return mine, everyone, checkpoint, ids.to(device)
+
+
+@torch.no_grad()
+def test_tp4_stack_prefix_matches_the_canonical_four_rank_stack(cluster, request):
+    """Embedding, the first six layers, the output mixture, final norm and gathered logits at TP4.
+
+    The six layers include five local layers and global layer 5. Prefill samples each
+    chunk's last row and decode samples every live row; logits of the valid vocabulary
+    are compared with the canonical four-rank computation of the same six layers.
+    """
+    from ignition.components.paged_batch import Metadata
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.decoder import PreparedDecoder
+    from ignition.recipes.inkling2.layer import layer_weights, scaled_query
+    from ignition.recipes.inkling2.model import ModelWeights
+    from ignition.recipes.inkling2.pool import ContinuationPool, RankGeometry
+
+    config, world, rank, device = cluster["config"], cluster["world"], cluster["rank"], cluster["device"]
+    text = config.text
+    before = counters()
+    mine, everyone, checkpoint, ids = distribute_stack(cluster, request, STACK_LAYERS)
+    shared = mine[None]
+    weights = ModelWeights(config, tuple(layer_weights(mine[layer], config, layer, world) for layer in range(STACK_LAYERS)),
+                           shared["embed.weight"], shared["embed_norm.weight"], shared["norm.weight"],
+                           scaled_query(shared["attn_res.output_query"], text.hidden), shared["unembed.weight"],
+                           rank, world)
+    pool = ContinuationPool.allocate(text, RankGeometry.of(text, world), 4, 32, device)
+    shapes = {"prefill": (PREFILL_ROWS, 1, 1), "decode": (DECODE_ROWS, DECODE_ROWS, DECODE_ROWS)}
+    metadata = {mode: Metadata.allocate(tokens, requests, BLOCKS, device, samples=samples)
+                for mode, (tokens, requests, samples) in shapes.items()}
+    arena = ScratchArena(device)
+    session = RecordedPreparationSession(device=device, checkpoint="inkling-2-small",
+        workload_schema="inkling2-stack-tp4-v1", numerical_policy="default", coordinator=cluster["coordinator"],
+        compile_workers=2)
+    graphs, outputs = {}, {}
+    with session:
+        session.register_scratch(arena)
+        decoders = {mode: PreparedDecoder(weights, pool, metadata[mode], mode=mode, tokens=tokens, samples=samples,
+                                          vocabulary=text.valid_vocabulary, runtime=cluster["runtime"],
+                                          vocabulary_runtime=cluster["runtime"], coordinator=cluster["coordinator"],
+                                          session=session, workspace=arena, name=f"stack.{mode}")
+                    for mode, (tokens, _, samples) in shapes.items()}
+        for decoder in decoders.values():
+            decoder.release_outputs()
+        session.tune(show_progress=False)
+        arena.release_preparation()
+        graph_pool = torch.cuda.graph_pool_handle()
+        for mode in ("prefill", "decode"):
+            compiled = compile_forward(lambda mode=mode: decoders[mode](metadata[mode])[:2])
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            pool.backing.zero_()
+            for value in pool.pages.values():
+                value.zero_()
+            with torch.cuda.stream(stream):
+                compiled()
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with cluster["runtime"].capture(stream=stream), session.capture(), torch.cuda.graph(
+                    graph, pool=graph_pool, stream=stream):
+                outputs[mode] = compiled()
+            graphs[mode] = graph
+        session.freeze()
+        pool.backing.zero_()
+        for value in pool.pages.values():
+            value.zero_()
+        table_a = torch.full((BLOCKS,), -1, dtype=torch.int32, device=device)
+        table_a[:12] = torch.arange(12, dtype=torch.int32, device=device)
+        table_b = table_a.clone()
+        table_b[8:12] = torch.tensor([20, 21, 22, 23], dtype=torch.int32, device=device)
+        sampled = {}
+
+        def replay(mode):
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            graphs[mode].replay()
+            torch.cuda.synchronize(device)
+            return [value.clone().cpu() for value in outputs[mode]]
+
+        for start, length in CHUNKS:
+            tokens = torch.zeros(1, PREFILL_ROWS, dtype=torch.long, device=device)
+            tokens[0, :length] = ids[start:start + length]
+            metadata["prefill"].set(torch.tensor([start], device=device),
+                torch.tensor([length], dtype=torch.int32, device=device), torch.tensor([1], device=device),
+                table_a.view(1, -1), tokens, torch.tensor([1], device=device))
+            # Generation samples a prefill chunk's last row.
+            metadata["prefill"].sample_indices.fill_(length - 1)
+            hidden, logits = replay("prefill")
+            sampled[start + length - 1] = (hidden[0], logits[0])
+            if start == 0:
+                pool.backing[2].copy_(pool.backing[1])
+                for value in pool.pages.values():
+                    value[20].copy_(value[8])
+        for step in range(DECODE_STEPS):
+            positions = (1405 + step, 1100 + step, 0)
+            tokens = torch.zeros(DECODE_ROWS, 1, dtype=torch.long, device=device)
+            tokens[0, 0], tokens[1, 0] = ids[positions[0]], ids[positions[1]]
+            metadata["decode"].set(torch.tensor(positions, device=device),
+                torch.tensor([1, 1, 0], dtype=torch.int32, device=device), torch.tensor([1, 2, 0], device=device),
+                torch.stack([table_a, table_b, table_a]), tokens, torch.tensor([2], device=device))
+            hidden, logits = replay("decode")
+            for row in range(2):
+                sampled[positions[row]] = (hidden[row], logits[row])
+        for graph in graphs.values():
+            graph.reset()
+    gathered = [None] * world
+    dist.all_gather_object(gathered, sampled)
+    after = counters()
+    flags = [None] * world
+    dist.all_gather_object(flags, {port: (before[port], after[port]) for port in after if after[port] != before.get(port)})
+    assert not any(flags), f"RoCE error counters moved during the run: {flags}"
+    if rank == 0:
+        check_stack(cluster, everyone, ids, gathered)
+    dist.barrier()
+
+
+def check_stack(cluster, everyone, ids, gathered):
+    from ignition.reference import inkling2 as ref
+    from tests.recipes.test_inkling2_components_cuda import reference_weights, report
+
+    text, world, device = cluster["config"].text, cluster["world"], cluster["device"]
+    for position, (hidden, logits) in gathered[0].items():
+        for rank in range(1, world):
+            assert torch.equal(gathered[rank][position][0], hidden) and torch.equal(gathered[rank][position][1], logits)
+    globals_ = [ref.GlobalWeights(*(group[None][name].to(device) for name in (
+        "embed.weight", "embed_norm.weight", "norm.weight", "attn_res.output_query", "unembed.weight")))
+        for group in everyone]
+    positions = torch.arange(ids.numel(), device=device)
+    state = ref.ResidualState((), ref.embed_ranks(ids, globals_, text))
+    for layer in range(STACK_LAYERS):
+        ranks = [reference_weights({role: value.to(device) for role, value in group[layer].items()})
+                 for group in everyone]
+        caches = [ref.LayerCache.empty(weights, text.head_dim) for weights in ranks]
+        state, _, _ = ref.decoder_layer_ranks(ranks, text, layer, state, positions, caches)
+        del ranks, caches
+    hidden = ref.rms_norm(state.output(globals_[0].output_query), globals_[0].final_norm, text.eps)
+    rows = torch.tensor(sorted(gathered[0]), device=device)
+    expected = ref.logits_ranks(hidden[rows], globals_, text)[:, :text.valid_vocabulary]
+    actual_hidden = torch.stack([gathered[0][p][0] for p in rows.tolist()]).to(device)
+    actual = torch.stack([gathered[0][p][1] for p in rows.tolist()]).to(device)
+    report(f"six-layer stack final hidden at positions {rows.tolist()}", actual_hidden, hidden[rows])
+    report("six-layer stack logits", actual, expected)
+    agree = (actual.argmax(-1) == expected.argmax(-1)).float().mean()
+    print(f"six-layer stack greedy agreement {float(agree):.3f} over {rows.numel()} sampled rows")
+    assert bool(torch.isfinite(actual).all())

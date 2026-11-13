@@ -702,3 +702,23 @@ def test_vocabulary_parallel_embedding_and_softcapped_logits(checkpoint, activat
     assert bool((difference <= limit).all())
     agreement = (logits[:, valid].argmax(-1) == expected[:, valid].argmax(-1)).float().mean()
     print(f"greedy token agreement over {tokens} rows: {float(agreement):.4f}")
+
+
+@torch.no_grad()
+def test_model_weights_load_a_rank_layer_prefix_and_vocabulary_shard(checkpoint):
+    """`ModelWeights.load` places rank 2's first layer, embedding and unembedding rows as the layout reads them."""
+    from ignition.recipes.inkling2.attention import attention_weights
+    from ignition.recipes.inkling2.model import ModelWeights
+
+    text = checkpoint.config.text
+    weights = ModelWeights.load(checkpoint.manifest, checkpoint.device, config=checkpoint.config, rank=2, world=4,
+                                layers=1)
+    assert len(weights.layers) == 1 and weights.rank == 2
+    placed = load_rank(checkpoint, 0, 2, experts=False)
+    expected = attention_weights(placed, local=True, heads=12, kv_heads=2, dim=text.head_dim,
+                                 width=text.convolution_width)
+    for actual, reference in zip(weights.layers[0].attention.projections, expected.projections, strict=True):
+        assert torch.equal(actual, reference)
+    shard = checkpoint.global_weights(2)
+    assert torch.equal(weights.embedding, shard.embedding) and torch.equal(weights.unembedding, shard.unembedding)
+    assert torch.equal(weights.output_query, shard.output_query.float().reshape(1, -1) * text.hidden ** -0.5)

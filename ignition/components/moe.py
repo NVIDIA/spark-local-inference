@@ -342,13 +342,14 @@ class PreparedRoutedExperts:
 def record_views(records, width, format):
     """Views `(values, block_scales, row_amax)` into `[rows, record]` uint8 expert-input records.
 
-    The offsets are `fused_moe.quantized_input_record_layout`'s. The views are
-    taken without reading the storage address, which a traced forward does not
-    have; the operations that consume them validate alignment when they run.
+    The offsets are `fused_moe.quantized_input_record_layout`'s. The record rows
+    may lie inside wider rows of one buffer, such as packets that also carry the
+    rows' routes; the quantizer and both expert phases take any constant row
+    stride and validate 16-byte alignment when they run.
     """
     values, scales, amax, record = fused_moe.quantized_input_record_layout(width, format)
-    if records.ndim != 2 or records.shape[1] != record or records.dtype != torch.uint8:
-        raise ValueError(f"expert-input records must be uint8 [rows, {record}]")
+    if records.ndim != 2 or records.shape[1] != record or records.dtype != torch.uint8 or records.stride(1) != 1:
+        raise ValueError(f"expert-input records must be uint8 [rows, {record}] with dense rows")
     if format == "mxfp8":
         return records[:, values:values + width], records[:, scales:scales + width // 32], None
     return (records[:, values:values + width // 2], records[:, scales:scales + width // 16],

@@ -359,6 +359,8 @@ class PlacedWeightLoader(DirectWeightLoader):
     Within the loader's context, `load(name, rank=r)` copies rank `r`'s extent of a
     stored tensor to the device without converting its bytes, zero-filling the
     vocabulary tail past the table; `rank=None` copies the whole stored tensor.
+    `temporary=True` places the copy outside persistent model storage, for
+    tensors that a conversion replaces.
     """
 
     def __init__(self, manifest, device, *, layout: CheckpointLayout, names: Iterable[str], progress=None):
@@ -372,15 +374,18 @@ class PlacedWeightLoader(DirectWeightLoader):
     def _selected_names(self):
         return set(self.names)
 
-    def load(self, name: str, *, rank: int | None = None) -> torch.Tensor:
+    def load(self, name: str, *, rank: int | None = None, temporary: bool = False) -> torch.Tensor:
         self._require_open()
         placement, source = self.layout.model[name], self._sources[name]
         if tuple(source.shape) != placement.shape or source.dtype != _TORCH_DTYPES[placement.dtype]:
             raise ValueError(f"{name}: stored {source.dtype} {tuple(source.shape)} differs from the layout")
         if rank is None or placement.axis is None:
-            return self.load_tensor(name)
+            return self.load_tensor(name, temporary=temporary)
         first, last = placement.rows(rank)
-        allocate = persistent_empty if last - first == placement.width else persistent_zeros
+        if temporary:
+            allocate = torch.empty if last - first == placement.width else torch.zeros
+        else:
+            allocate = persistent_empty if last - first == placement.width else persistent_zeros
         target = allocate(placement.local_shape, dtype=source.dtype, device=self.device)
         if last > first:
             self._copy(target.narrow(placement.axis, 0, last - first), source[placement.extent(rank)])

@@ -12,7 +12,8 @@ keys in position order, which the relative-distance bias requires, and none of
 them has been overwritten. Each row also holds the raw `W - 1` most recent
 inputs of every layer's K/V short convolutions, the rank's own partial sums
 before the attention-output and expert-output convolutions, partial pages of
-the global layers for snapshots, and the consumed-token count.
+the global layers for snapshots, the last normalized hidden state from which
+a resumed request samples, and the consumed-token count.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def continuation_layout(text, geometry: RankGeometry):
                                ("attention_convolution", geometry.hidden), ("mlp_convolution", geometry.hidden)):
             regions.append((f"layer{layer}.{kind}", (history, channels), torch.bfloat16))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(text, geometry))
-    regions.append(("consumed_tokens", (1,), torch.int64))
+    regions.extend((("last_hidden", (geometry.hidden,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
     # Ring pages of adjacent rows share one page stride when rows hold whole pages.
     alignment = math.lcm(256, geometry.page_bytes)

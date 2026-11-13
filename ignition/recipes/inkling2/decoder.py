@@ -217,3 +217,80 @@ class PreparedLayer(torch.nn.Module):
         all_weights = gathered[:, offset_weights:].view(torch.float32).contiguous()
         return all_ids, all_weights, gathered[:, :offset_ids]
 
+
+class PreparedDecoder:
+    """A rank's text decoder for one graph: embedding, layers, output mixture and vocabulary logits.
+
+    Each rank embeds every row from its vocabulary shard; the reduction yields
+    the owned rows in prefill and every row in decode. After the last layer the
+    owner mixes its rows' residual sources with the output query and normalizes
+    them; prefill gathers all rows. The sampled rows' FP32 logits are computed
+    per vocabulary shard with the softcap and gathered, and the sampler reads the
+    valid vocabulary.
+    """
+
+    def __init__(self, weights, pool, metadata, *, mode, tokens, samples, vocabulary, runtime, vocabulary_runtime,
+                 coordinator, session, workspace, name):
+        from types import SimpleNamespace
+
+        from b12x.moe import fused_moe as moe
+
+        from ignition.preparation.examples import declaration_tensor
+
+        from .vocabulary import PreparedLogits
+
+        self.weights, self.pool, self.mode = weights, pool, mode
+        text = weights.config.text
+        self.text, self.vocabulary = text, vocabulary
+        examples = {}
+        formats = {layer.experts.format for layer in weights.layers}
+        record = max(moe.quantized_input_record_layout(text.hidden, {"nvfp4": "nvfp4_four_over_six",
+                                                                     "mxfp8": "mxfp8"}[fmt])[-1] for fmt in formats)
+        self.collectives = Collectives.prepare(text, mode=mode, tokens=tokens, record=record, runtime=runtime,
+                                               coordinator=coordinator, session=session, name=f"{name}.collectives",
+                                               examples=examples)
+        self.layers = [PreparedLayer(index, layer, text, pool, metadata, self.collectives, mode=mode, tokens=tokens,
+                                     session=session, workspace=workspace, name=f"{name}.layer{index}",
+                                     examples=examples)
+                       for index, layer in enumerate(weights.layers)]
+        self.logits = PreparedLogits(weights.unembedding, text, weights.rank, tokens=samples, session=session,
+                                     name=f"{name}.logits", examples=examples)
+        device = weights.unembedding.device
+        local = declaration_tensor(examples, "inkling.decoder.logits_local", (samples, weights.unembedding.shape[0]),
+                                   torch.float32, device)
+        gathered = declaration_tensor(examples, "inkling.decoder.logits_all",
+                                      (samples, weights.unembedding.shape[0] * self.collectives.world),
+                                      torch.float32, device)
+        self.gather = PreparedAllGather(local, gathered, runtime=vocabulary_runtime, session=session,
+                                        coordinator=coordinator, name=f"{name}.logit_gather").functional(session=session)
+        # Shared generation reads the sampler's logits geometry and the vocabulary channel.
+        self.scratch = SimpleNamespace(logits=torch.zeros((samples, vocabulary), dtype=torch.float32, device=device))
+        self.head = SimpleNamespace(gather=SimpleNamespace(runtime=vocabulary_runtime))
+        self.auxiliary = None
+        self.examples = examples
+
+    def release_outputs(self):
+        self.scratch = None
+        self.examples.clear()
+
+    def embed(self, metadata):
+        from .vocabulary import embedding_rows
+
+        w = self.weights
+        rows = embedding_rows(w.embedding, metadata.token_ids, w.rank)
+        rows = torch.where((metadata.positions >= 0)[:, None], rows, 0)
+        return rms_norm(self.collectives.attention(rows), w.embedding_norm, self.text.eps)
+
+    def __call__(self, metadata):
+        w, t = self.weights, self.text
+        state = ResidualState((), self.embed(metadata))
+        for layer in self.layers:
+            state, _ = layer(state, metadata)
+        mixed = residual_mix((*state.blocks, state.partial), w.output_query)[0]
+        hidden = rms_norm(mixed, w.final_norm, t.eps)
+        if self.mode == "prefill":
+            hidden = self.collectives.streams[0](hidden)
+        hidden = hidden[metadata.sample_indices]
+        gathered = self.gather(self.logits(hidden))
+        logits = gathered[:, :self.vocabulary].contiguous()
+        return hidden, logits, None, None
