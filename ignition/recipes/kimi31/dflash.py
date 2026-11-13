@@ -23,7 +23,7 @@ from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.recipes.kimi3.decoder import PreparedDecoder
 from ignition.recipes.kimi3.dcp import write_records
-from ignition.recipes.kimi3.pointwise import rms_norm_columns
+from ignition.recipes.kimi3.pointwise import rms_norm_columns, unpack_and_rms_norm_qkv
 
 
 @triton.jit
@@ -261,11 +261,10 @@ class DraftAttention:
         n = source.shape[0]
         gathered = self.gather(self.project(source)).view(n, self.world, -1)
         q = 1536//self.world
-        q_latent = gathered[:, :, :q].contiguous().view(n, 1536)
-        latent = gathered[:, :, q:q+576//self.world].contiguous().view(n, 576)
-        q_norm = torch.empty_like(q_latent)
-        rms_norm_columns(q_latent, w["query_norm"], q_norm, self.eps)
-        rms_norm_columns(latent[:, :512], w["kv_norm"], latent[:, :512], self.eps)
+        q_norm = torch.empty((n, 1536), dtype=source.dtype, device=source.device)
+        latent = torch.empty((n, 576), dtype=source.dtype, device=source.device)
+        unpack_and_rms_norm_qkv(gathered, q, 576//self.world,
+            w["query_norm"], w["kv_norm"], q_norm, latent, self.eps)
         query = self.query_project(q_norm).view(n, self.heads, 192)
         self.rotary.apply(query, m.positions)
         self.rotary.apply(latent, m.positions)

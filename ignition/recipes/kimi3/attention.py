@@ -20,13 +20,14 @@ from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.components.linear import BatchedUnquantizedProjection
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import register_finalizer
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES, ContextShards, pull_context, write_records
-from .pointwise import rms_norm_columns, sigmoid_gate
+from .pointwise import rms_norm_columns, sigmoid_gate, unpack_and_rms_norm_qkv
 from .projections import prepare_projection
 
 FP8 = torch.float8_e4m3fn
@@ -92,10 +93,18 @@ class PreparedMLAProjection:
             for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
                              ("output", self.expanded, buffer("output", hidden)))}
         self.buffer = buffer
+        self.absorb = BatchedUnquantizedProjection(
+            self.query[:, :, :128].transpose(0, 1), weights["key"],
+            self.absorbed[:, :, :512].transpose(0, 1), major="n", session=session, name=name + ".absorb")
+        self.expand = BatchedUnquantizedProjection(
+            self.attended.transpose(0, 1), weights["value"],
+            self.expanded.view(tokens, heads, 128).transpose(0, 1), major="n", session=session, name=name + ".expand")
 
     def functional(self, *, session):
         for projection in self.projections.values():
             projection.functional(session=session)
+        self.absorb.functional(session=session)
+        self.expand.functional(session=session)
         if self.latent_gather is not None:
             self.latent_gather.functional(session=session)
         register_finalizer(session, self._release_projection_examples)
@@ -110,30 +119,32 @@ class PreparedMLAProjection:
     def project(self, source, metadata=None):
         local = self.projections["latent_gate"](source)
         tokens = source.shape[0]
+        query_norm = torch.empty((tokens, self.latent_width - RECORD_BYTES), dtype=source.dtype, device=source.device)
+        latent = torch.empty((tokens, RECORD_BYTES), dtype=source.dtype, device=source.device)
         if self.latent_gather is None:
             inputs, gate = local[:, :self.latent_width], local[:, self.latent_width:]
+            rms_norm_columns(inputs[:, :-RECORD_BYTES], self.weights["query_norm"], query_norm, self.eps)
+            rms_norm_columns(inputs[:, -RECORD_BYTES:-64], self.weights["kv_norm"], latent[:, :512], self.eps)
+            latent[:, 512:].copy_(inputs[:, -64:])
         else:
             width, world = self.latent_columns, self.latent_world
             gate = local[:, width:]
             gathered = self.latent_gather(local[:, :width].contiguous()).view(tokens, world, width)
             query = self.latent_width - RECORD_BYTES
-            q, kv = query // world, RECORD_BYTES // world
-            inputs = torch.cat((gathered[:, :, :q].reshape(tokens, query),
-                                gathered[:, :, q:q + kv].reshape(tokens, RECORD_BYTES)), -1)
-        query_norm = torch.empty((tokens, self.latent_width - RECORD_BYTES), dtype=source.dtype, device=source.device)
-        latent = torch.empty((tokens, RECORD_BYTES), dtype=source.dtype, device=source.device)
-        rms_norm_columns(inputs[:, :-RECORD_BYTES], self.weights["query_norm"], query_norm, self.eps)
-        rms_norm_columns(inputs[:, -RECORD_BYTES:-64], self.weights["kv_norm"], latent[:, :512], self.eps)
-        latent[:, 512:].copy_(inputs[:, -64:])
+            unpack_and_rms_norm_qkv(gathered, query // world, RECORD_BYTES // world,
+                self.weights["query_norm"], self.weights["kv_norm"], query_norm, latent, self.eps)
         query = self.projections["q_b"](query_norm).view(tokens, self.heads, 192)
         if self.rotary is not None:
             self.rotary(query[:, :, 128:], latent[:, 512:], metadata.positions)
-        absorbed = torch.cat((torch.bmm(query[:, :, :128].transpose(0, 1),
-            self.weights["key"]).transpose(0, 1), query[:, :, 128:]), -1)
+        absorbed = torch.empty((tokens, self.heads, RECORD_BYTES), dtype=source.dtype, device=source.device)
+        self.absorb(query[:, :, :128].transpose(0, 1), absorbed[:, :, :512].transpose(0, 1))
+        absorbed[:, :, 512:].copy_(query[:, :, 128:])
         return MLAProjectionOutput(query_norm, latent, absorbed, gate)
 
     def finish(self, attended, projected):
-        expanded = torch.bmm(attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1).contiguous()
+        tokens = attended.shape[0]
+        expanded = torch.empty((tokens, self.heads * 128), dtype=attended.dtype, device=attended.device)
+        self.expand(attended.transpose(0, 1), expanded.view(tokens, self.heads, 128).transpose(0, 1))
         if self.gated:
             sigmoid_gate(expanded, projected.gate)
         return self.projections["output"](expanded)

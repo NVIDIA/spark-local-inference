@@ -4,12 +4,14 @@
 
 """Kimi K3 KDA with fused input projections and a full-rank output gate."""
 
+from types import SimpleNamespace
+
 import torch
 from b12x.sequence import gdn_decode, kda_prefill, short_conv
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.recurrent import prepare_sequence_binding
-from ignition.components.kda_speculation import _record, register_recording
+from ignition.components.kda_speculation import _record, _record_fused, register_recording
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tuning import register_finalizer
 from ignition.components.recurrent import run_short_conv
@@ -25,6 +27,7 @@ class PreparedKDA:
         self.recording, self.state, self.metadata = records is not None, state, metadata
         self.weights, self.eps = weights, eps
         tokens, hidden = source.shape
+        self.tokens, self.fused = tokens, None
         heads, width = state.recurrent.shape[1], state.recurrent.shape[1] * 128
         device = source.device
 
@@ -106,6 +109,14 @@ class PreparedKDA:
     def _finalize(self):
         self.conv_bytes = self.conv_plan.scratch_specs()[0].nbytes
         self.recurrence_bytes = sum(spec.nbytes for spec in self.plan.scratch_specs())
+        if self.recording and self.tokens <= 8:
+            try:
+                self.fused = gdn_decode.prepare_kda_fused_verify(
+                    self.recurrence, self.convolution, retain_examples=False)
+            except ValueError as error:
+                import warnings
+
+                warnings.warn(f"KDA fused verify disabled for this layer: {error}", stacklevel=2)
         self.input = self.forget = self.forget_source = self.metadata = None
 
     def _release_bindings(self):
@@ -123,6 +134,15 @@ class PreparedKDA:
         forget_input = torch.empty((tokens, 128), dtype=source.dtype, device=source.device)
         forget_input.copy_(forget)
         raw_g = self.projections["forget"](forget_input).view(tokens, heads, 128)
+        gate = gate.view(tokens, heads, 128)
+        if self.recording and self.fused is not None:
+            output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+            _record_fused([qkv, raw_g, beta, gate, self.weights["A_log"], self.weights["dt_bias"].view(heads, 128),
+                self.weights["norm"], self.weights["convolution"], metadata.query_start_loc,
+                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.state_indices,
+                metadata.num_seqs, metadata.num_tokens], self.recurrent_state, output, *records,
+                self.state.convolution, self.handle)
+            return self.projections["output"](output.reshape(tokens, -1))
         mixed = torch.empty((tokens, 3 * width), dtype=source.dtype, device=source.device)
         conv_scratch = torch.empty(self.conv_bytes, dtype=torch.uint8, device=source.device)
         run_short_conv(self.conv_plan, x=qkv, conv_weight=self.weights["convolution"],
@@ -154,6 +174,19 @@ class PreparedKDA:
                 self.plan.handle, -5.0, None, 1e-6, None, None)
             output = self.norm(output, gate, live=metadata.num_tokens)
         return self.projections["output"](output.reshape(tokens, -1))
+
+    def run_fused(self, reads, recurrent_state, output, corrections, keys_gates, convolution_state):
+        (qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, conv_weight, query_start_loc,
+         convolution_slots, fresh, accepted_tokens, state_indices, num_seqs, num_tokens) = reads
+        binding = SimpleNamespace(raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,
+            recurrent_state=recurrent_state, query_start_loc=query_start_loc, state_indices=state_indices,
+            num_accepted_tokens=accepted_tokens,
+            num_seqs=num_seqs, num_tokens=num_tokens, output=output, z=z, norm_weight=norm_weight,
+            correction_cache=corrections, kg_cache=keys_gates)
+        convolution = SimpleNamespace(x=qkv, conv_weight=conv_weight, state_slot_ids=convolution_slots,
+            state_is_fresh=fresh, num_accepted_tokens=accepted_tokens, conv_state=convolution_state,
+            query_start_loc=query_start_loc, num_seqs=num_seqs, num_tokens=num_tokens)
+        self.fused.run_dynamic(binding, convolution, scale=128 ** -.5, lower_bound=-5.0, eps=self.eps)
 
     def run_recorded(self, reads, recurrent_state, output, corrections, keys_gates, scratch):
         (mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, query_start_loc,
