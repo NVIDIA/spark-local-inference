@@ -243,6 +243,7 @@ fn unverified_payload(
         };
         deployment_values.push(json!({
             "id": body.deployment_id,
+            "rebuild": body.rebuild,
             "frontend": frontend_detail,
             "vision": vision_detail,
             "tensor_parallel": body.tensor_parallel,
@@ -377,6 +378,7 @@ fn unverified_payload(
                 "development": publisher.development,
             })),
         },
+        "rebuild": capacity("rebuild"),
         "model": {
             "model_id": core.model_identity,
             "identity": core.model_identity,

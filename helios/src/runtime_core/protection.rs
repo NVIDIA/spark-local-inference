@@ -2115,6 +2115,10 @@ impl PayloadVerifiedCore {
     /// not carry them, and a destination offset is never a payload source offset.
     fn inspection_descriptor(&self) -> Result<wire::ModelIndex> {
         let mut index = self.descriptor()?;
+        index.rebuild = self
+            .verified
+            .deployment()
+            .and_then(|body| body.rebuild.clone());
         for (bundle, (body, core)) in index
             .ranks
             .iter_mut()
@@ -3330,7 +3334,11 @@ mod payload_core_tests {
                     ..Default::default()
                 }),
                 cluster: None,
-                rebuild: None,
+                rebuild: (tp == 2).then(|| crate::runtime_core::wire::RebuildManifest {
+                    version: 99,
+                    source_identity: "tp2-source".into(),
+                    ..Default::default()
+                }),
                 engram: None,
                 payloads: vec![],
                 ranks: vec![],
@@ -3948,6 +3956,57 @@ mod payload_core_tests {
         assert!(!names.contains(&"weights/rank-0.safetensors"), "{names:?}");
         assert!(!names.contains(&"globals/rank-0.safetensors"), "{names:?}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn payload_inspection_reports_selected_deployment_rebuild_metadata() {
+        let (root, publishers, _) = two_deployment_core();
+        let packed = root.with_extension("safetensors");
+        crate::core::conversion::pack(&root, &packed).unwrap();
+        for path in [&root, &packed] {
+            for (tp, rank, expected_version, expected_source) in [
+                (1, None, None, None),
+                (2, None, Some(99), Some("tp2-source")),
+                (2, Some(1), Some(99), Some("tp2-source")),
+            ] {
+                let verified =
+                    VerifiedCore::open_tensor_parallel(path, &publishers, tp, rank).unwrap();
+                let description = verified
+                    .describe(crate::runtime_core::InspectionOptions::default())
+                    .unwrap();
+                assert_eq!(description["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    description["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
+                let unverified = crate::runtime_core::unverified_metadata_selected(
+                    path,
+                    crate::runtime_core::InspectionOptions::default(),
+                    rank.map(|value| value as usize),
+                    Some(tp),
+                )
+                .unwrap();
+                assert_eq!(unverified["core"]["signatures_verified"], false);
+                assert_eq!(unverified["rebuild"]["version"].as_u64(), expected_version);
+                assert_eq!(
+                    unverified["rebuild"]["source_identity"].as_str(),
+                    expected_source
+                );
+            }
+            let catalog = crate::runtime_core::unverified_metadata_selected(
+                path,
+                crate::runtime_core::InspectionOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(catalog["rebuild"].is_null());
+            let deployments = catalog["deployments"].as_array().unwrap();
+            let tp2 = deployments.iter().find(|d| d["tensor_parallel"] == 2).unwrap();
+            assert_eq!(tp2["rebuild"]["source_identity"], "tp2-source");
+        }
+        std::fs::remove_file(packed).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
