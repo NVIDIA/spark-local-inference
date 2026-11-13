@@ -401,7 +401,7 @@ impl Inputs {
                 if frame.step.lane_kind(row) == GraphKind::Speculative && live.copy_allowed() {
                     history_proposals[row] = Some(frame.scheduler.history_proposal(
                         live.tokens(),
-                        frame.step.token_capacity - 1,
+                        lane.tokens.saturating_sub(1),
                     ));
                 }
             }

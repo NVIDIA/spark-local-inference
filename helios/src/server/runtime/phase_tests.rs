@@ -1781,7 +1781,11 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
 fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion() {
     use crate::model::contract::{GraphOperation, InputIndexing, ValueSource};
     use crate::scheduler::speculation::ProposalSource;
-    for source in [ProposalSource::Copy, ProposalSource::Mtp] {
+    for (source, output_limit, expected_copies) in [
+        (ProposalSource::Copy, 16, 2),
+        (ProposalSource::Mtp, 16, 2),
+        (ProposalSource::Mtp, 3, 1),
+    ] {
         let mut fixture = Fixture::new();
         fixture.config.speculative_widths = vec![1, 8];
         fixture.config.speculative_fixed_width = Some(8);
@@ -1847,26 +1851,34 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         }
         worker.publish().unwrap();
         assert!(worker.active.iter().all(Option::is_none));
-        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
+        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], output_limit);
         sender.send(vec![incoming]).unwrap();
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         advance(&mut worker, GraphKind::Init, 10, None);
         advance(&mut worker, GraphKind::Prefill, 11, Some(3));
         advance(&mut worker, GraphKind::Snapshot, 12, None);
         let step = planned(&mut worker, GraphKind::Speculative, 13);
+        if output_limit == 3 {
+            assert_eq!(step.token_capacity, 8);
+            assert_eq!(step.lanes[0].tokens, 2);
+        }
         let live = worker.scheduler.request(step.lanes[0].request).unwrap();
         let uploads = worker.inputs.as_ref().unwrap().uploads();
         let bytes = |name| uploads.iter().find(|u| u.buffer == name).unwrap().bytes;
         assert_eq!(
             i32::from_le_bytes(bytes("copy_count").try_into().unwrap()),
-            2
+            expected_copies
         );
         assert_eq!(
             bytes("copy_ids")
                 .chunks_exact(8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .collect::<Vec<_>>(),
-            [4, 2, -1, -1, -1, -1, -1]
+            if expected_copies == 1 {
+                [4, -1, -1, -1, -1, -1, -1]
+            } else {
+                [4, 2, -1, -1, -1, -1, -1]
+            }
         );
         assert_eq!(
             i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()),
