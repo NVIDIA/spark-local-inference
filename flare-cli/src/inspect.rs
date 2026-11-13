@@ -1116,6 +1116,7 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
                 "PROMPT_JINJA" => "Jinja chat template",
                 "DEEPSEEK_V4" => "DeepSeek V4 native encoder",
                 "DEEPSEEK_V41" => "DeepSeek V4.1 native encoder",
+                "TML_V0" => "TMLv0 native encoder",
                 other => other,
             },
         );

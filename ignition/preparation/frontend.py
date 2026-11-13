@@ -14,6 +14,7 @@ class PromptEncoder(IntEnum):
     PROMPT_JINJA = 0
     DEEPSEEK_V4 = 1
     DEEPSEEK_V41 = 2
+    TML_V0 = 3
 
 
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")

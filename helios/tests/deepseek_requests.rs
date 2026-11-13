@@ -304,7 +304,7 @@ fn typed_native_settings_do_not_require_jinja_and_legacy_settings_do() {
     std::fs::remove_file(asset.path).unwrap();
     assert!(
         serde_json::from_value::<FrontendSettings>(
-            json!({"prompt_encoder":3,"tokenizer":{},"eos_token_ids":[257]})
+            json!({"prompt_encoder":4,"tokenizer":{},"eos_token_ids":[257]})
         )
         .is_err()
     );

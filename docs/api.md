@@ -693,6 +693,11 @@ the same neutral levels. They do not accept numeric scores. The frontend resolve
 those levels against the effort vocabulary accepted by the prepared template: for example Qwen uses
 `low/medium/xhigh`. Native DeepSeek V4 and V4.1 prompt encoders accept
 `low/high/xhigh/max` and default to thinking enabled and high effort.
+The native TMLv0 encoder accepts `none` (0), `minimal` (0.1), `low` (0.2),
+`medium` (0.7), `high` (0.9), `xhigh` and `max` (0.99), or a JSON number from
+0 through 0.99, and defaults to 0.9. Disabling thinking (`enable_thinking=false`,
+Responses `reasoning.effort` `none`, or Messages `thinking.type` `disabled`)
+selects effort 0 and takes precedence over any effort level.
 DeepSeek V4 rejects numeric effort. DeepSeek V4.1 additionally accepts a JSON
 integer from **1 through 100** in the native `reasoning_effort` option, either
 at the request's top level or in `chat_template_kwargs`. Its named levels map

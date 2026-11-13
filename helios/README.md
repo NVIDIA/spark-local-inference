@@ -553,6 +553,20 @@ token starts at or after it. Overlapping Unicode spans and BPE tokens crossing a
 create partial-token cuts. Token endpoints are sorted, unique, and strictly
 inside the prompt. Image expansion adjusts them with one ordered pass.
 
+The TMLv0 encoder renders Thinking Machines' message frames: a role header, an
+optional author or tool name, one content-kind token, an ordinary-text body, and
+`<|end_message|>`. Control tokens come from token IDs and every body is encoded
+without the added vocabulary, so control-token spellings in conversation text
+stay ordinary text. Tool declarations come first, then leading system messages,
+then a system frame stating the thinking effort, then the conversation. Each
+assistant message ends with `<|content_model_end_sampling|>`; there is no
+generation header. Tool results take the name of the most recent preceding call
+with their ID. Endpoints follow the declaration, the effort frame, and every
+completed message; a content-block hint ends at its frame. Continuation leaves
+the final assistant text or reasoning frame open. The encoder matches
+tml-renderers 0.4.1 token for token on the cases in
+`tests/frontend/inkling2_tml.json`.
+
 Advisory content-block hints travel separately from prompt text. Text hints keep
 their positions through captured strings and JSON serialization; segmented
 templates map JSON string positions back to decoded segment bytes before token

@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn prompt_encoder_round_trip_preserves_explicit_image_token_and_rejects_unknown_encoder() {
-        for encoder in [1, 2] {
+        for encoder in [1, 2, 3] {
             let value = wire::FrontendSettings {
                 tokenizer: Some(wire::TokenizerSettings::default()),
                 eos_token_ids: vec![1],

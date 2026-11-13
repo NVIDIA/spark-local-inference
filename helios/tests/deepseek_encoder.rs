@@ -486,7 +486,7 @@ fn legacy_settings_keep_jinja() {
     assert_eq!(settings.image_placeholder_token_id, None);
     assert!(
         serde_json::from_value::<FrontendSettings>(
-            json!({"tokenizer":{},"eos_token_ids":[],"prompt_encoder":3})
+            json!({"tokenizer":{},"eos_token_ids":[],"prompt_encoder":4})
         )
         .is_err()
     );

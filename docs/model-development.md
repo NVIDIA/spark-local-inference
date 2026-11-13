@@ -67,7 +67,10 @@ its insertion patch. Kimi K3 and K3.1 bundle their segmented XTML templates as
 project code in `ignition/recipes/kimi3/assets/chat_template.jinja` and
 `ignition/recipes/kimi31/assets/chat_template.jinja`;
 their upstream reference is a Python encoder, not a Jinja template. DeepSeek V4
-and V4.1 use programmatic Rust encoders and have no template asset.
+and V4.1 use programmatic Rust encoders and have no template asset. Inkling 2
+uses the TMLv0 programmatic encoder; its reference is Thinking Machines'
+tml-renderers 0.4.1, recorded by `tests/frontend/generate_inkling2_fixtures.py`
+in `tests/frontend/inkling2_tml.json`.
 
 Gemma 4 fetches Google's canonical chat templates for every supported publisher
 and quantization using the configured hub cache.

@@ -471,6 +471,8 @@ enum PromptEncoder {
   PROMPT_JINJA = 0;
   DEEPSEEK_V4 = 1;
   DEEPSEEK_V41 = 2;
+  // TMLv0 message frames: role and content-kind control tokens around ordinary text.
+  TML_V0 = 3;
 }
 enum TemplateEncoding {
   TEMPLATE_TEXT = 0;

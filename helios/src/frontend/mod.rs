@@ -8,6 +8,7 @@
 
 mod deepseek;
 mod boundaries;
+mod tml;
 mod templates;
 #[cfg(feature = "images")]
 pub mod images;
@@ -143,6 +144,16 @@ pub enum PromptEncoder {
     Jinja = 0,
     DeepseekV4 = 1,
     DeepseekV41 = 2,
+    /// TMLv0 message frames: role and content-kind control tokens around ordinary text.
+    TmlV0 = 3,
+}
+
+impl PromptEncoder {
+    /// Whether the encoder renders `tool_choice` and JSON response formats in its
+    /// own syntax. Other encoders receive the shared instruction messages instead.
+    pub fn renders_tool_choice(self) -> bool {
+        matches!(self, Self::DeepseekV4 | Self::DeepseekV41)
+    }
 }
 
 impl From<PromptEncoder> for i32 {
@@ -157,6 +168,7 @@ impl TryFrom<i32> for PromptEncoder {
             0 => Ok(Self::Jinja),
             1 => Ok(Self::DeepseekV4),
             2 => Ok(Self::DeepseekV41),
+            3 => Ok(Self::TmlV0),
             _ => Err("unsupported prompt encoder"),
         }
     }
@@ -294,14 +306,13 @@ impl Frontend {
         self.prompt_encoder
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
-        self.ordinary_tokenizer = match (self.prompt_encoder, encoding) {
-            (PromptEncoder::Jinja, TemplateEncoding::Text) => None,
-            _ => {
+        if self.prompt_encoder == PromptEncoder::Jinja {
+            self.ordinary_tokenizer = matches!(encoding, TemplateEncoding::TokenSegments).then(|| {
                 let mut tokenizer = self.tokenizer.clone();
                 tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-                Some(tokenizer)
-            }
-        };
+                tokenizer
+            });
+        }
         self
     }
     pub fn bos_token_id(&self) -> Option<u32> {
@@ -310,6 +321,13 @@ impl Frontend {
 
     /// Resolves advisory effort against the vocabulary accepted by the prepared template.
     pub fn resolve_effort<'a>(&self, candidates: &'a [&str]) -> Result<&'a str> {
+        if self.prompt_encoder == PromptEncoder::TmlV0 {
+            return candidates
+                .iter()
+                .copied()
+                .find(|level| tml::effort_level(level))
+                .ok_or_else(|| deepseek::invalid("unsupported reasoning effort"));
+        }
         if self.prompt_encoder != PromptEncoder::Jinja {
             return candidates
                 .iter()
@@ -527,6 +545,12 @@ impl Frontend {
         defaults.insert("tools".into(), Json::Null);
         defaults.insert("documents".into(), Json::Null);
         defaults.extend(template_defaults);
+        // Programmatic encoders tokenize message text without the added vocabulary.
+        let ordinary_tokenizer = (prompt_encoder != PromptEncoder::Jinja).then(|| {
+            let mut ordinary = tokenizer.clone();
+            ordinary.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+            ordinary
+        });
         let frontend = Self {
             prompt_encoder,
             image_placeholder_token_id,
@@ -535,13 +559,15 @@ impl Frontend {
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
             tokenizer,
-            ordinary_tokenizer: None,
+            ordinary_tokenizer,
             template,
             template_source,
             defaults,
         };
-        if prompt_encoder != PromptEncoder::Jinja {
-            deepseek::validate_defaults(&frontend)?;
+        match prompt_encoder {
+            PromptEncoder::Jinja => {}
+            PromptEncoder::TmlV0 => tml::validate_defaults(&frontend)?,
+            PromptEncoder::DeepseekV4 | PromptEncoder::DeepseekV41 => deepseek::validate_defaults(&frontend)?,
         }
         Ok(frontend)
     }
@@ -574,8 +600,12 @@ impl Frontend {
         messages: &[Json],
         options: &Map<String, Json>,
     ) -> Result<RenderedPrompt> {
-        if self.prompt_encoder != PromptEncoder::Jinja {
-            return deepseek::render(self, messages, options);
+        match self.prompt_encoder {
+            PromptEncoder::Jinja => {}
+            PromptEncoder::TmlV0 => return tml::render(self, messages, options),
+            PromptEncoder::DeepseekV4 | PromptEncoder::DeepseekV41 => {
+                return deepseek::render(self, messages, options);
+            }
         }
         if messages.is_empty() {
             return Err(Error::frontend(FrontendError::Input(Failure::new(

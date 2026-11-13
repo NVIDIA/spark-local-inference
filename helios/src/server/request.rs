@@ -95,7 +95,7 @@ pub(super) fn prepare_inference_cached(
     count_only: bool,
     input_store: Option<&flare_selene::input::InputStore>,
 ) -> Result<PreparedInference> {
-    use super::inference::{Constraint, Input, RawPrompt, ToolChoice};
+    use super::inference::{Constraint, RawPrompt};
     let opts = &request.options;
     if let Some(top) = opts.prompt_logprobs {
         if !config.contract.graphs.iter().any(|g| g.kind == crate::model::contract::GraphOperation::ScoredPrefill) {
@@ -131,91 +131,7 @@ pub(super) fn prepare_inference_cached(
     }
     let object = &object;
     let structured = opts.constraint.is_some();
-    let legacy_prompt = matches!(
-        frontend.prompt_encoder(),
-        crate::frontend::PromptEncoder::Jinja
-    );
-    let (mut normalized, raw) = match &request.input {
-        Input::Conversation(messages) => (
-            super::inference::template_messages(
-                messages,
-                if legacy_prompt {
-                    request.tool_choice.clone()
-                } else {
-                    ToolChoice::Auto
-                },
-                &request.checkpoint_hints,
-            )?,
-            None,
-        ),
-        Input::Raw(prompts) => (vec![], Some(&prompts[index / request.choices])),
-    };
-    frontend.normalize_inline_system_messages(&mut normalized)?;
-    if raw.is_none() {
-        let schema = match &opts.constraint {
-            Some(Constraint::Json(schema)) => Some(schema.clone()),
-            Some(Constraint::JsonObject) if legacy_prompt => {
-                Some(serde_json::json!({"type":"object"}))
-            }
-            _ => None,
-        };
-        if let Some(schema) = schema {
-            super::inference::append_system_instruction(
-                &mut normalized,
-                &format!(
-                    "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\nJSON schema:\n{schema}"
-                ),
-            )?;
-        }
-    }
-    let mut options = opts.template.clone();
-    if !legacy_prompt && matches!(opts.constraint, Some(Constraint::JsonObject)) {
-        options.insert("response_format".into(), "json_object".into());
-    }
-    let tool_choice = match request.tool_choice {
-        ToolChoice::Auto => None,
-        ToolChoice::None => Some("none"),
-        ToolChoice::Required => Some("required"),
-        ToolChoice::Named(_) => Some("auto"),
-    };
-    if let Some(choice) = tool_choice {
-        options.insert("tool_choice".into(), choice.into());
-    }
-    if !options.contains_key("reasoning_effort") {
-        if let Some(effort) = opts.effort {
-            use super::inference::Effort;
-            let candidates: &[&str] = match effort {
-                Effort::Low => &["low"],
-                Effort::High => &["high", "medium"],
-                Effort::Max => &["max", "xhigh", "high", "medium"],
-            };
-            options.insert(
-                "reasoning_effort".into(),
-                frontend.resolve_effort(candidates)?.into(),
-            );
-        }
-    }
-
-    if request.tool_choice == ToolChoice::None {
-        options.insert("tools".into(), Value::Array(vec![]));
-    } else if !request.tools.is_empty() {
-        options.insert("tools".into(), Value::Array(request.tools.iter().filter(|tool| {
-            match &request.tool_choice {
-                ToolChoice::Named(name) => tool.native_name() == *name,
-                _ => true,
-            }
-        }).map(|tool| {
-            let description = if let Some(grammar) = &tool.grammar {
-                format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
-            } else { tool.description.clone() };
-            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
-        }).collect()));
-    }
-    if !options.contains_key("add_generation_prompt")
-        && requests_continuation(options.get("continue_final_message"))
-    {
-        options.insert("add_generation_prompt".into(), Value::Bool(false));
-    }
+    let (normalized, raw, options) = template_inputs(frontend, request, index)?;
     let (rendered, echo) = if let Some(raw) = raw {
         let (mut token_ids, echo) = match raw {
             RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone()),
@@ -403,6 +319,102 @@ pub(super) fn prepare_inference_cached(
         rendered_prompt: rendered.text,
         echo,
     })
+}
+
+/// Lowers a request into the normalized messages and options its prompt encoder
+/// renders, or selects its raw prompt.
+pub(super) fn template_inputs<'a>(
+    frontend: &Frontend,
+    request: &'a super::inference::Request,
+    index: usize,
+) -> Result<(Vec<Value>, Option<&'a super::inference::RawPrompt>, serde_json::Map<String, Value>)> {
+    use super::inference::{Constraint, Input, ToolChoice};
+    let opts = &request.options;
+    // Encoders without their own tool-choice and response-format syntax receive
+    // shared instruction messages.
+    let shared_lowering = !frontend.prompt_encoder().renders_tool_choice();
+    let (mut normalized, raw) = match &request.input {
+        Input::Conversation(messages) => (
+            super::inference::template_messages(
+                messages,
+                if shared_lowering {
+                    request.tool_choice.clone()
+                } else {
+                    ToolChoice::Auto
+                },
+                &request.checkpoint_hints,
+            )?,
+            None,
+        ),
+        Input::Raw(prompts) => (vec![], Some(&prompts[index / request.choices])),
+    };
+    frontend.normalize_inline_system_messages(&mut normalized)?;
+    if raw.is_none() {
+        let schema = match &opts.constraint {
+            Some(Constraint::Json(schema)) => Some(schema.clone()),
+            Some(Constraint::JsonObject) if shared_lowering => {
+                Some(serde_json::json!({"type":"object"}))
+            }
+            _ => None,
+        };
+        if let Some(schema) = schema {
+            super::inference::append_system_instruction(
+                &mut normalized,
+                &format!(
+                    "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\nJSON schema:\n{schema}"
+                ),
+            )?;
+        }
+    }
+    let mut options = opts.template.clone();
+    if !shared_lowering && matches!(opts.constraint, Some(Constraint::JsonObject)) {
+        options.insert("response_format".into(), "json_object".into());
+    }
+    let tool_choice = match request.tool_choice {
+        ToolChoice::Auto => None,
+        ToolChoice::None => Some("none"),
+        ToolChoice::Required => Some("required"),
+        ToolChoice::Named(_) => Some("auto"),
+    };
+    if let Some(choice) = tool_choice {
+        options.insert("tool_choice".into(), choice.into());
+    }
+    if !options.contains_key("reasoning_effort") {
+        if let Some(effort) = opts.effort {
+            use super::inference::Effort;
+            let candidates: &[&str] = match effort {
+                Effort::Low => &["low"],
+                Effort::High => &["high", "medium"],
+                Effort::Max => &["max", "xhigh", "high", "medium"],
+            };
+            options.insert(
+                "reasoning_effort".into(),
+                frontend.resolve_effort(candidates)?.into(),
+            );
+        }
+    }
+
+    if request.tool_choice == ToolChoice::None {
+        options.insert("tools".into(), Value::Array(vec![]));
+    } else if !request.tools.is_empty() {
+        options.insert("tools".into(), Value::Array(request.tools.iter().filter(|tool| {
+            match &request.tool_choice {
+                ToolChoice::Named(name) => tool.native_name() == *name,
+                _ => true,
+            }
+        }).map(|tool| {
+            let description = if let Some(grammar) = &tool.grammar {
+                format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
+            } else { tool.description.clone() };
+            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
+        }).collect()));
+    }
+    if !options.contains_key("add_generation_prompt")
+        && requests_continuation(options.get("continue_final_message"))
+    {
+        options.insert("add_generation_prompt".into(), Value::Bool(false));
+    }
+    Ok((normalized, raw, options))
 }
 
 pub(super) fn thinking_budget_close(

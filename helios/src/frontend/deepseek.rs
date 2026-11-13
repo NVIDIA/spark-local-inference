@@ -411,7 +411,7 @@ fn official(
             }
             encoder.render_conversation(conversation)
         }
-        PromptEncoder::Jinja => unreachable!(),
+        PromptEncoder::Jinja | PromptEncoder::TmlV0 => unreachable!(),
     })
 }
 
