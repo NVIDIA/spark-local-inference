@@ -114,6 +114,8 @@ message RebuildManifest {
   string collective_ladder_json = 26;
   // Preparation-only routed W4A16 decode/verification with calibrated A4 prefill.
   bool force_moe_decode_a16 = 27;
+  // Preparation-only row-sharded prefill collectives; requires proxy ABI 11 or later.
+  bool row_shard_prefill = 28;
   // Preparation-only online conversion group; omitted means all eligible projections.
   string online_mxfp8_scope = 30;
 }

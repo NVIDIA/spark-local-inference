@@ -195,6 +195,48 @@ def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypat
         replace(joint, autotune_effort="off")
 
 
+def test_row_shard_prefill_requires_deepseek_tp_and_survives_rebuild_serialization(monkeypatch):
+    """The option travels through `plan` and `fit` beside an explicit MXFP8 scope."""
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    model = replace(SOLO, name="deepseek41")
+    gpus = (gpu(0, 95), gpu(1, 95))
+    settings = dict(selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                    online_mxfp8_scope="all")
+    ordinary = planning.plan(model, model.checkpoints[0], gpus, **settings)
+    sharded = planning.plan(model, model.checkpoints[0], gpus, row_shard_prefill=True, **settings)
+    assert not ordinary.row_shard_prefill and ordinary.online_mxfp8_scope == "all"
+    assert sharded.row_shard_prefill and sharded.online_mxfp8_scope == "all"
+    assert sharded.to_dict()["row_shard_prefill"] is True
+    # Turning the flag off restores the plan the same arguments produce without it.
+    assert replace(sharded, row_shard_prefill=False) == ordinary
+    fitted = planning.fit(model, model.checkpoints[0], gpus, concurrency=4, reserve_bytes=0,
+                          speculation=DRAFTING, online_mxfp8_scope="all", row_shard_prefill=True)
+    assert fitted.row_shard_prefill and fitted.online_mxfp8_scope == "all"
+    for plan in (ordinary, sharded, fitted):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).row_shard_prefill == plan.row_shard_prefill
+    with pytest.raises(UsageError, match="DeepSeek V4.1"):
+        planning.plan(SOLO, SOLO.checkpoints[0], gpus, row_shard_prefill=True, **settings)
+    with pytest.raises(UsageError, match="tensor parallelism"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95),), selected=(0,), concurrency=4,
+                      reserve_bytes=0, speculation=DRAFTING, row_shard_prefill=True)
+    # Three ranks have no per-rank block at the recipe's chunk, and no SM103 run exists.
+    three = recipe("deepseek41", 60, (3, 4), speculation=DRAFTING)
+    with pytest.raises(UsageError, match="TP3"):
+        planning.plan(three, three.checkpoints[0], (gpu(0, 95), gpu(1, 95), gpu(2, 95)),
+                      selected=(0, 1, 2), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True)
+    with pytest.raises(UsageError, match="SM103"):
+        planning.plan(model, model.checkpoints[0], (gpu(0, 95, (10, 3)), gpu(1, 95, (10, 3))),
+                      selected=(0, 1), concurrency=4, reserve_bytes=0, speculation=DRAFTING,
+                      row_shard_prefill=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)
