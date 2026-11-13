@@ -370,15 +370,17 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
             "only client function and text custom tools are supported",
         ));
     }
+    let declared = definition
+        .get(if protocol == Protocol::Messages {
+            "input_schema"
+        } else {
+            "parameters"
+        })
+        .filter(|v| !v.is_null());
     let parameters = if custom {
         json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]})
     } else {
-        definition
-            .get(if protocol == Protocol::Messages {
-                "input_schema"
-            } else {
-                "parameters"
-            })
+        declared
             .cloned()
             .unwrap_or_else(|| json!({"type":"object","properties":{}}))
     };
@@ -391,6 +393,7 @@ fn tool(v: &Value, protocol: Protocol, namespace: Option<&str>) -> Result<Tool> 
             .unwrap_or("")
             .into(),
         parameters,
+        declared_parameters: custom || declared.is_some(),
         custom,
         grammar,
     })
@@ -1775,6 +1778,31 @@ mod native_prompt_tests {
             );
             assert!(prepared.prompt.reasoning_cut.is_none());
             assert_eq!(prepared.prompt.max_new_tokens, 32);
+        }
+    }
+
+    #[test]
+    fn tools_without_parameters_keep_the_empty_object_schema_for_templates_and_deepseek() {
+        let template = "{% for m in messages %}{{ m.content }}{% mark %}{% endfor %}{{ tools | tojson }}";
+        for encoder in [PromptEncoder::Jinja, PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, compiler, mut config) = renderer(encoder, Some(template), TemplateEncoding::Text);
+            config.contract.frontend.rejected_tokens.clear();
+            let render = |parameters: Option<Value>| {
+                let mut function = json!({"name":"now","description":"Current time."});
+                if let Some(parameters) = parameters {
+                    function["parameters"] = parameters;
+                }
+                let decoded = decode(Protocol::Chat, json!({"messages":[{"role":"user","content":"Time?"}],
+                    "tools":[{"type":"function","function":function}]}), false).unwrap();
+                crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &decoded.request, 0, false,
+                )
+                .unwrap()
+                .rendered_prompt
+            };
+            let declared = render(Some(json!({"type":"object","properties":{}})));
+            assert_eq!(render(None), declared, "{encoder:?}");
+            assert_eq!(render(Some(Value::Null)), declared, "{encoder:?}");
         }
     }
 

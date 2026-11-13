@@ -20,6 +20,7 @@ fn tools() -> Vec<inference::Tool> {
         namespace: None,
         description: "Find a value".into(),
         parameters: json!({"type":"object"}),
+        declared_parameters: true,
         custom: false,
         grammar: None,
     }]

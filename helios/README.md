@@ -562,7 +562,9 @@ optional author or tool name, one content-kind token, an ordinary-text body, and
 without the added vocabulary, so control-token spellings in conversation text
 stay ordinary text. The leading system messages come first, so a shared system
 prompt remains a reusable prefix when the tools differ, then the tool
-declaration, a system frame stating the thinking effort, and the conversation. Each
+declaration, a system frame stating the thinking effort, and the conversation.
+A tool declared without parameters, or with null parameters, declares `{}`;
+chat templates and the DeepSeek encoders receive an empty object schema. Each
 assistant message ends with `<|content_model_end_sampling|>`; there is no
 generation header. Tool results take the name of the most recent preceding call
 with their ID. Endpoints follow the declaration, the effort frame, and every

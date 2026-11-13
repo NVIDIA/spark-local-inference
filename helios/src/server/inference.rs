@@ -60,6 +60,9 @@ pub struct Tool {
     pub namespace: Option<String>,
     pub description: String,
     pub parameters: Value,
+    /// Whether the client declared `parameters`; `parameters` holds an empty
+    /// object schema otherwise.
+    pub declared_parameters: bool,
     pub custom: bool,
     pub grammar: Option<ToolGrammar>,
 }

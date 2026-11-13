@@ -407,7 +407,13 @@ pub(super) fn template_inputs<'a>(
             let description = if let Some(grammar) = &tool.grammar {
                 format!("{}\nPut the complete tool input in the input string. It must match this {} grammar exactly:\n{}", tool.description, grammar.syntax, grammar.source)
             } else { tool.description.clone() };
-            serde_json::json!({"type":"function", "function":{"name":tool.native_name(), "description":description, "parameters":tool.parameters}})
+            let mut function = serde_json::json!({"name":tool.native_name(), "description":description, "parameters":tool.parameters});
+            // Programmatic encoders apply their own declaration to a tool without parameters;
+            // chat templates receive the empty object schema.
+            if !tool.declared_parameters && frontend.prompt_encoder() != crate::frontend::PromptEncoder::Jinja {
+                function.as_object_mut().unwrap().remove("parameters");
+            }
+            serde_json::json!({"type":"function", "function":function})
         }).collect()));
     }
     if !options.contains_key("add_generation_prompt")

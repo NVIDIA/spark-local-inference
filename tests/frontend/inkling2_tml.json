@@ -19,7 +19,6 @@
   "Flare orders a batch of tool results by the order of their calls.",
   "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
   "A JSON-schema response format appends Flare's schema instruction to the first system message.",
-  "A tool declared without parameters receives Flare's default schema {\"type\":\"object\",\"properties\":{}}.",
   "Continuing the final assistant message renders it without its end-of-turn token and leaves its last frame open by removing that frame's <|end_message|>.",
   "Each image renders as one <|content_image|> frame; input_ids hold one placeholder token per image."
  ],
@@ -1140,18 +1139,56 @@
       "type": "function",
       "function": {
        "name": "now",
-       "description": "Current time.",
-       "parameters": {
-        "type": "object",
-        "properties": {}
-       }
+       "description": "Current time."
       }
      }
     ],
     "effort": 0.9,
     "continuation": false
    },
-   "input_ids": [200002,2251,62,76529,200024,58,90,1,70469,1,25,1,36515,150038,13,1,11,1,930,1,25,1,978,1,11,1,71968,1,25,90,1,71961,1,25,70044,11,1,1008,1,25,1,3156,1,92,11,1,1008,1,25,1,36404,1,92,60,200010,200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,848,30,200010]
+   "input_ids": [200002,2251,62,76529,200024,58,90,1,70469,1,25,1,36515,150038,13,1,11,1,930,1,25,1,978,1,11,1,71968,1,25,70044,11,1,1008,1,25,1,36404,1,92,60,200010,200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,848,30,200010]
+  },
+  {
+   "name": "tool_with_null_parameters",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "time?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "now",
+       "description": "Current time.",
+       "parameters": null
+      }
+     }
+    ]
+   },
+   "reference": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "time?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "now",
+       "description": "Current time.",
+       "parameters": null
+      }
+     }
+    ],
+    "effort": 0.9,
+    "continuation": false
+   },
+   "input_ids": [200002,2251,62,76529,200024,58,90,1,70469,1,25,1,36515,150038,13,1,11,1,930,1,25,1,978,1,11,1,71968,1,25,70044,11,1,1008,1,25,1,36404,1,92,60,200010,200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,848,30,200010]
   },
   {
    "name": "tool_without_description",

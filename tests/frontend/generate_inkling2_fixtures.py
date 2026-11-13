@@ -70,7 +70,6 @@ CONVENTIONS = [
     "Flare orders a batch of tool results by the order of their calls.",
     "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
     "A JSON-schema response format appends Flare's schema instruction to the first system message.",
-    "A tool declared without parameters receives Flare's default schema {\"type\":\"object\",\"properties\":{}}.",
     "Continuing the final assistant message renders it without its end-of-turn token and leaves its last frame open "
     "by removing that frame's <|end_message|>.",
     "Each image renders as one <|content_image|> frame; input_ids hold one placeholder token per image.",
@@ -154,7 +153,6 @@ SEARCH = tool("search", "Web search 搜索 <|end_message|>", {
                                      "n": {"type": "number", "minimum": 1e-7, "maximum": 1e20, "default": 0.00001}},
     "required": ["q"]})
 NOW = tool("now", "Current time.")
-DEFAULT_PARAMETERS = {"type": "object", "properties": {}}
 
 prompts, errors, equivalents = [], [], []
 
@@ -163,9 +161,7 @@ def prompt(name, request, *, messages=None, tools=None, effort=DEFAULT_EFFORT, c
     """`messages` and `tools` give the tml-renderers input when Flare lowers the request."""
     messages = request["messages"] if messages is None else messages
     if tools is None:
-        tools = [copy.deepcopy(item) for item in request.get("tools", [])]
-        for item in tools:
-            item["function"].setdefault("parameters", DEFAULT_PARAMETERS)
+        tools = copy.deepcopy(request.get("tools", []))
     ids, images = render(messages, tools, effort, continuation)
     case = {"name": name, "request": request,
             "reference": {"messages": messages, "tools": tools, "effort": effort, "continuation": continuation},
@@ -240,6 +236,8 @@ prompt("tools_after_systems", {"messages": [system("First."), system("Second."),
                                            system("Mid-conversation rule."), user("And Paris?")], "tools": [WEATHER]})
 prompt("tools_with_systems_only", {"messages": [system("Only instructions.")], "tools": [WEATHER]})
 prompt("tool_without_parameters", {"messages": [user("time?")], "tools": [NOW]})
+prompt("tool_with_null_parameters", {"messages": [user("time?")], "tools": [
+    {"type": "function", "function": {"name": "now", "description": "Current time.", "parameters": None}}]})
 prompt("tool_without_description", {"messages": [user("time?")],
                                     "tools": [tool("now", parameters={"type": "object", "properties": {}})]})
 parallel = {"role": "assistant", "content": "Let me check.", "tool_calls": [
