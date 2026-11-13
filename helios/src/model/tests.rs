@@ -1274,6 +1274,64 @@ fn vision_upload_selects_source_image_independently_of_destination_feature_offse
     }
 }
 
+#[cfg(feature = "images")]
+#[test]
+fn class_token_layout_uploads_reference_vision_tensors() {
+    use crate::frontend::images::{packing, padded_grid_fixtures as fixtures};
+    use crate::model::contract::{ImageLayoutKind, ImagePreparationKind};
+    use crate::execution::Dtype;
+    assert_eq!(packing::tensor_layout(ImageLayoutKind::ClassToken, "vision_pixel_values", 100).unwrap(),
+        (Dtype::Float32, 120_000));
+    assert_eq!(packing::tensor_layout(ImageLayoutKind::ClassToken, "vision_position_ids", 100).unwrap(),
+        (Dtype::Int64, 202));
+    for name in ["vision_interpolation_indices", "vision_interpolation_weights"] {
+        assert_eq!(packing::tensor_layout(ImageLayoutKind::ClassToken, name, 100).unwrap().1, 400);
+    }
+    assert!(packing::tensor_layout(ImageLayoutKind::ClassToken, "vision_merge_indices", 100).is_err());
+    let mut config = config();
+    config.contract.frontend.image_preparation = Some(ImagePreparationKind::PaddedGrid);
+    config.contract.frontend.image_layout = Some(ImageLayoutKind::ClassToken);
+    config.contract.vision = crate::model::VisionCapabilities {
+        feature_slots: 1, features_per_request: 16384, max_images: 4,
+        patches_per_feature: 4, patch_capacities: vec![42436],
+    };
+    let fixture = fixtures::fixture();
+    let processor = fixtures::processor();
+    let handle = crate::scheduler::RequestHandle { slot: 1, generation: 7 };
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let processed = processor.process(&fixtures::inputs(&processor, case)).unwrap();
+        let mut tensors = std::collections::BTreeMap::<String, Vec<u8>>::new();
+        let cu_seqlens = case["cu_seqlens"].as_array().unwrap();
+        for (image, geometry) in processed.geometry.iter().enumerate() {
+            let staging = packing::prepare(&config, handle, &processed, image, 0).unwrap();
+            for upload in staging.uploads() {
+                assert_eq!(upload.offset, 0);
+                tensors.entry(upload.buffer.into()).or_default().extend_from_slice(upload.bytes);
+            }
+            let sequence = cu_seqlens[image + 1].as_i64().unwrap() - cu_seqlens[image].as_i64().unwrap();
+            assert_eq!(sequence, geometry.patches as i64 + 1, "{name}");
+        }
+        let int32 = |name: &str| tensors[name].chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+        let expected_sequences: Vec<_> = processed.geometry.iter()
+            .flat_map(|geometry| [0, geometry.patches as i32 + 1]).collect();
+        assert_eq!(int32("vision_cu_seqlens"), expected_sequences, "{name}");
+        assert_eq!(int32("vision_num_features"),
+            processed.geometry.iter().map(|g| g.tokens as i32).collect::<Vec<_>>(), "{name}");
+        let hashes = &case["hashes"];
+        for (tensor, reference) in [("vision_pixel_values", "native_patches"),
+            ("vision_position_ids", "rotary_positions"),
+            ("vision_interpolation_indices", "interpolation_indices"),
+            ("vision_interpolation_weights", "interpolation_weights")] {
+            assert_eq!(fixtures::hash(tensors[tensor].iter().copied()), hashes[reference], "{name} {tensor}");
+        }
+    }
+    let mut odd = processor.process(&[crate::frontend::images::RgbImage::new(40, 40, vec![0; 4800]).unwrap()]).unwrap();
+    odd.geometry[0].tokens = 2;
+    assert!(packing::prepare(&config, handle, &odd, 0, 0).is_err());
+}
+
 fn grammar_packing_fixture() -> (
     ModelConfig,
     crate::execution::ExecutionManifest,

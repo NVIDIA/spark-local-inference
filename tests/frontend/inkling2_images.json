@@ -1,0 +1,1122 @@
+{
+  "model_id": "thinkingmachines/Inkling-2-Small",
+  "revision": "b0e7afb8892a07897c78ce1c5b801a0d9cbd5e7b",
+  "transformers_commit": "1b2f625956be1416816447eba32447a1d268d095",
+  "torch_commit": "cf30153c4c131c8164ee7798e5022d810682e2cb",
+  "versions": {
+    "torch": "2.13.0+cpu",
+    "torchvision": "0.28.0+cpu",
+    "Pillow": "12.3.0",
+    "transformers": "5.23.0.dev0",
+    "numpy": "2.5.4"
+  },
+  "pillow_libjpeg_turbo": "3.1.4.1",
+  "pillow_webp": "1.6.0",
+  "assets": {
+    "processor_config.json": "b326f9a5d49c037c463045bec4d80229f5463048df7d6de95b597667888228ae",
+    "config.json": "95bd7a6ad4f63011c068fcdc2243d7e2323b2e22329d34707687deccdf6f5a00"
+  },
+  "image_processor_class": "transformers.models.inkling2.image_processing_inkling2.Inkling2ImageProcessor",
+  "processor": {
+    "image_processor": {
+      "do_convert_rgb": true,
+      "do_normalize": true,
+      "do_rescale": true,
+      "image_mean": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "image_processor_type": "Inkling2ImageProcessor",
+      "image_std": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "rescale_factor": 0.00392156862745098,
+      "size": {
+        "height": 40,
+        "width": 40
+      }
+    },
+    "image_token": "<|unused_200054|>",
+    "processor_class": "Inkling2Processor"
+  },
+  "model": {
+    "model_type": "inkling2",
+    "vision_config": {
+      "temporal_patch_size": 2,
+      "native_patch_size": 20,
+      "adapter_merge_size": 2,
+      "projection_hidden_dim": 4096,
+      "projector_bias": false,
+      "hidden_size": 1024,
+      "num_hidden_layers": 23,
+      "num_attention_heads": 16,
+      "mlp_ratio": 4.0,
+      "posemb_grid_size": 32,
+      "layer_norm_eps": 1e-05
+    }
+  },
+  "cases": [
+    {
+      "name": "one_pixel",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 1,
+            "height": 1,
+            "seed": 1
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "tokens": [
+        1
+      ],
+      "cu_seqlens": [
+        0,
+        5
+      ],
+      "composited_rgb_sha256": [
+        "d69bb214675bd1cd467c8509b234089700b5becc30de8049cbc4ffa16ec8a371"
+      ],
+      "hashes": {
+        "pixel_values": "51554666d250b4c8876b7ab1049642509b6f6b8a03aaa69f7c688d80dde0373d",
+        "native_patches": "51554666d250b4c8876b7ab1049642509b6f6b8a03aaa69f7c688d80dde0373d",
+        "native_positions": "613c6b81c1661dc6e028293a87b29d8adb38a5d16db1e5633cec6f201ba6c880",
+        "rotary_positions": "dfb05bb225c59549e94a2fc2e61148d03f7c0e211e0da9220c0a9de66beb9e04",
+        "interpolation_indices": "56158fc610f7e949d8262c07140f218b4636e3fa39575898936f4bf29f30fea9",
+        "interpolation_weights": "313bc52b9cc6be460b48c75c785203b699a3d6ec9369e7e329c49b56ae24d26f"
+      }
+    },
+    {
+      "name": "one_cell",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 40,
+            "height": 40,
+            "seed": 2
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "tokens": [
+        1
+      ],
+      "cu_seqlens": [
+        0,
+        5
+      ],
+      "composited_rgb_sha256": [
+        "1ae3ab25651a658ece3a2e6c63b63139d2b05ae51e9a3f1cbbb44a6a3de6fdf8"
+      ],
+      "hashes": {
+        "pixel_values": "12ae5ffaa6898f5bf664f392dd412ce83415a94c25592f417b61342881b6d513",
+        "native_patches": "5c71843d4c3dbdb75388c80a03eb53bc7f17cee8b20038e16664575638236786",
+        "native_positions": "613c6b81c1661dc6e028293a87b29d8adb38a5d16db1e5633cec6f201ba6c880",
+        "rotary_positions": "dfb05bb225c59549e94a2fc2e61148d03f7c0e211e0da9220c0a9de66beb9e04",
+        "interpolation_indices": "56158fc610f7e949d8262c07140f218b4636e3fa39575898936f4bf29f30fea9",
+        "interpolation_weights": "313bc52b9cc6be460b48c75c785203b699a3d6ec9369e7e329c49b56ae24d26f"
+      }
+    },
+    {
+      "name": "cell_plus_one",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 41,
+            "height": 41,
+            "seed": 3
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "12fd8dfef7af9c91e58281d4ad5c6345283fe3d751fb56ab45e0686467d164ec"
+      ],
+      "hashes": {
+        "pixel_values": "e7cb5525115dd89469b928f2a417f4eee10f0aa4f5824999b1640908423302e6",
+        "native_patches": "7500c32de4b44c9a4d6163db47321607686ec3e2f1171313a49b5da9e100412e",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "below_cell",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 39,
+            "height": 17,
+            "seed": 4
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "tokens": [
+        1
+      ],
+      "cu_seqlens": [
+        0,
+        5
+      ],
+      "composited_rgb_sha256": [
+        "7be3728a86b153864a4ad8e4aa9dcbab0e913adfa408920f79dbc86c323c02cf"
+      ],
+      "hashes": {
+        "pixel_values": "67d2027608ce42a9124526f5712b0934d8a06329da58c68aeedb631d7190b196",
+        "native_patches": "e566cd3b7b2dd1cf5671568cce6ca75f73a0b34fd65e752b5bff1bf2abf60bf5",
+        "native_positions": "613c6b81c1661dc6e028293a87b29d8adb38a5d16db1e5633cec6f201ba6c880",
+        "rotary_positions": "dfb05bb225c59549e94a2fc2e61148d03f7c0e211e0da9220c0a9de66beb9e04",
+        "interpolation_indices": "56158fc610f7e949d8262c07140f218b4636e3fa39575898936f4bf29f30fea9",
+        "interpolation_weights": "313bc52b9cc6be460b48c75c785203b699a3d6ec9369e7e329c49b56ae24d26f"
+      }
+    },
+    {
+      "name": "non_multiple",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 53,
+            "height": 71,
+            "seed": 5
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "1157faacaa5f7149dc60794e1f6b002cfc01e31283f635c1de78e568d5de7309"
+      ],
+      "hashes": {
+        "pixel_values": "3211590e320706a5f03b89213eb9262a512d351a082dbe219dff83579c57cd62",
+        "native_patches": "83526cf6a3ab1ec7819bcaf6a022696d103163d8ef25729cb75c43567408c52d",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "landscape",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 333,
+            "height": 217,
+            "seed": 6
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          6,
+          9
+        ]
+      ],
+      "tokens": [
+        54
+      ],
+      "cu_seqlens": [
+        0,
+        217
+      ],
+      "composited_rgb_sha256": [
+        "b37282e7b146ebbe30acc186bfb03c587cc1b4e49d01c9e2206221be79813ad2"
+      ],
+      "hashes": {
+        "pixel_values": "24c3e982967dff82e90b4fb93642348f7ecabf49140aee07bd6a276fb0f00063",
+        "native_patches": "0d2d89cca53c419889899e81b545a3edab3f0f71bab0bd1ca749521ecb8b453f",
+        "native_positions": "22de0fdd6b649286c51a616d44e2b46383684a073fecf25029bfd4e4f9344e8d",
+        "rotary_positions": "d4447e45943a29cfc3dbf7cc6d5e1d5b6bea634ae7709eb8236235d207ba65ed",
+        "interpolation_indices": "d12a0c8ca9e74e5e1745559dd8866de4dea9934bf99afd15448a9447375ed01c",
+        "interpolation_weights": "b112b4f7874cbc7850884f982d6adc3870d56de45b4d8166b01d3bae29500c16"
+      }
+    },
+    {
+      "name": "wide",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 1000,
+            "height": 3,
+            "seed": 7
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          25
+        ]
+      ],
+      "tokens": [
+        25
+      ],
+      "cu_seqlens": [
+        0,
+        101
+      ],
+      "composited_rgb_sha256": [
+        "64a38791c58f82ff00ae9f0b7a80dfd39e6f5b1f4798e0b3758ec412d2a69bce"
+      ],
+      "hashes": {
+        "pixel_values": "8d154234e94c81f9d3cede31802d5c70e5e26c81be5b1bdf77b07c80ca3dbc65",
+        "native_patches": "b1b1650cd5cd5bed965a05f5cfd09bc6dc8f854d5e37cd1984d5b37f1806b826",
+        "native_positions": "faad7d3887b19d1648c23bc6d782d7e2b57525c80134ccec35efaf26581d0642",
+        "rotary_positions": "b3f26e3a4f28ff8fff2dcea360f46107efdefbf383cb4ba582715829c79f70d6",
+        "interpolation_indices": "8645c9463d3631461976151bf56ab6a4c36d1ad3aade778483a47a93cf0289b2",
+        "interpolation_weights": "d0fec601f204f6b54edff04ee8dff764ca226f4535195183a28ab5cf1ff77403"
+      }
+    },
+    {
+      "name": "tall",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 2,
+            "height": 777,
+            "seed": 8
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          20,
+          1
+        ]
+      ],
+      "tokens": [
+        20
+      ],
+      "cu_seqlens": [
+        0,
+        81
+      ],
+      "composited_rgb_sha256": [
+        "7d1123242bfd453951a45600f8e06d62b3efeb908b29b49bfe774a9f989698c8"
+      ],
+      "hashes": {
+        "pixel_values": "f195ca932bfcb8d8ffcedd4adaea7f7a9b28ea9dc5917d45dd433333c90d3ca8",
+        "native_patches": "24894cadb2c3b8b4fd29d2ff4f80d3c4075aa65f4b0b719005494a3f20224924",
+        "native_positions": "3d26f6ce826a3675ec4e8423a59656d92d3b19c9cf3220ab268d09d0fb48463e",
+        "rotary_positions": "d7063ade532301a9fc6350795c44b2c3730f81f89d19973b312a013028e0c4c5",
+        "interpolation_indices": "ffc04bbca3bdd8d31b8b015401a6db360b4eb19225412a8f7351b131addc17f8",
+        "interpolation_weights": "e1b97499511cb3fb83e1816db7cbfd2ec9cce4380dcd79d792bcddf892420919"
+      }
+    },
+    {
+      "name": "one_row",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 4096,
+            "height": 1,
+            "seed": 9
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          103
+        ]
+      ],
+      "tokens": [
+        103
+      ],
+      "cu_seqlens": [
+        0,
+        413
+      ],
+      "composited_rgb_sha256": [
+        "cfadbf7fab56fa64232f92f6e14e2c983f092251b71e07cbd060b31b7cc06333"
+      ],
+      "hashes": {
+        "pixel_values": "c9fecac0880bd8d9157003698b6569087598717840ec0b2d0e8e5b56cfa13885",
+        "native_patches": "7b9575cf11cad3c038b5cc175b59f8de2244690cd10b73b566fca130eba44a3a",
+        "native_positions": "4d423d7114843d0edb61de037cb8a3d3a067f7fc45a31043556c1a385da9ba00",
+        "rotary_positions": "eb63ad3dd7e6db0a1ea1960e0a9eb9d7af0e51bc70dca671fa2fea5ef4df4c0c",
+        "interpolation_indices": "306c4c27cdd089cad7e05aca94f4d923580017f7d095db3a8bd808c0c121848f",
+        "interpolation_weights": "e0a4b058e89d50428a3702dba43359337ca0aa0378e188f1950eb8b7d4ad03f6"
+      }
+    },
+    {
+      "name": "model_card_maximum",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 4096,
+            "height": 4096,
+            "seed": 10
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          103,
+          103
+        ]
+      ],
+      "tokens": [
+        10609
+      ],
+      "cu_seqlens": [
+        0,
+        42437
+      ],
+      "composited_rgb_sha256": [
+        "5bb5883f85d4d2f7f15826e630f4623ca6c48aaff55a1b6f5e9096137bd64047"
+      ],
+      "hashes": {
+        "pixel_values": "d7230450b45512f4f5e9d84ca81e5ebc53c604db25464998002de719b2758330",
+        "native_patches": "0c635f2f824c5156ba4ee6275716f2cce4a63b80178dabb753b73da0660fa859",
+        "native_positions": "992b2e732d5abba8d1baa51762bd41037267c2e197ef4f4a30432b1ba9d02e28",
+        "rotary_positions": "f813ea42479f9e1453dbf733ca65e47439262526660bc05963b69d49fe616d38",
+        "interpolation_indices": "4e85f1858940e08a4c46dd15c839d6fc74d787213d76f885b5d4a277de72f09b",
+        "interpolation_weights": "01d375d0ca5d8dede2450e85b4e69fea34984b4a5eea0d45748cec88b770a818"
+      }
+    },
+    {
+      "name": "png_RGB",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGB.png",
+          "format": "PNG",
+          "sha256": "f962f98bf95f1bbd413ce0db3c4d90abfef812258b0e80f4c823e91f529c6e08",
+          "width": 53,
+          "height": 47,
+          "mode": "RGB"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "a9ac29b8ec46452577d1ba54a1defe65016d8cbf4cb5cd23f92b05786450f0bb"
+      ],
+      "hashes": {
+        "pixel_values": "07c7c988453dcbb997b6b55dd4596ae2b4ab9588950f3f8add79575fb36260c4",
+        "native_patches": "55cb7087d19e264ec618df41eb9c41e9fe927429c6842d40162efcf4a292767f",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_L",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/L.png",
+          "format": "PNG",
+          "sha256": "46f6833c1caa26298513f8814dc7e37a2b49131c45f7a343f631c63bafc1db9b",
+          "width": 53,
+          "height": 47,
+          "mode": "L"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "1fb59ad047f06fbe04015f31dfd32ffb4fe873b9c4dd5422bc8debfaf4d6a546"
+      ],
+      "hashes": {
+        "pixel_values": "6de882d75b8b250002e4713b071a3001860b32facdc975cc5d72ed98565e1912",
+        "native_patches": "1ce9130a6d29894c5f9d76cf0d7742caa17cafb5e972d7c8deb69061f5b3acec",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_RGBA",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGBA.png",
+          "format": "PNG",
+          "sha256": "794062b914db1e7a15d1c1d804f596c478a2b32216012dab2c20307e2d0c9f11",
+          "width": 53,
+          "height": 47,
+          "mode": "RGBA"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "bd739a35cc150770ee462c8c3912169265825478116e1b01149094fa4380952a"
+      ],
+      "hashes": {
+        "pixel_values": "05f22249c72650c8f640562db28dd33a491bd314bee2d9e8dc23a8b31731c849",
+        "native_patches": "69809672354ebe3b70130eca88cd1186c9470fef8032e382609346740b582bad",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_LA",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/LA.png",
+          "format": "PNG",
+          "sha256": "e65bef6780d9818f369e255e06ff34986cea106f68eb599858d2c2a0fddc99b4",
+          "width": 53,
+          "height": 47,
+          "mode": "LA"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "463cb2d0e8d265796b4215a47c9c29dc9b5eb7e34cf05afa5f96961dc8f33184"
+      ],
+      "hashes": {
+        "pixel_values": "7d488b986487c18e28eb0f514f17530599fbedae2f16a58016b6b57b319e6f14",
+        "native_patches": "842279e9d1be4e8250c5a78bfc46213ef3282401cca7e9ef33c70b665b979dca",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_P",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/P.png",
+          "format": "PNG",
+          "sha256": "b66e62e4e4e0cfdf279e24bbdba95a3bb2363d1f2f4d894647d81485cdd94521",
+          "width": 53,
+          "height": 47,
+          "mode": "P"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "87e75ba58a7f9c9559d238ecf65e20198e5ce95e3aa1b6563b7741187c78e833"
+      ],
+      "hashes": {
+        "pixel_values": "5b422219b16a909b8afbbd6e23f5edbdca69a2549aaeefcf2fda221a84ba013b",
+        "native_patches": "299a2d57da6149a6b7c7a228f2208d7c99504faabbdb70e026f064401072e662",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_P-tRNS",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/P-tRNS.png",
+          "format": "PNG",
+          "sha256": "19712ef8b9f1eb54112e0d2048438f7a9a8b10cba3e037d921465390b07e21f7",
+          "width": 53,
+          "height": 47,
+          "mode": "P"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "ac54fb0b8764777799e7abc5dfdb16eab9b8d810c891d2d06002655c6ffcc5cb"
+      ],
+      "hashes": {
+        "pixel_values": "6072fb26a42cf4dc7a0415eaa39d2b797c99e627a8ba724bca34c16ef0eef56c",
+        "native_patches": "7323efad415e8fddd2932dea2b1e72a587326386fe6e93dbc1a6bbe9f4806405",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_RGB-tRNS",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGB-tRNS.png",
+          "format": "PNG",
+          "sha256": "da1332388865d92b85584b05d8977260d03447cccf80d7228ff7920742893518",
+          "width": 53,
+          "height": 47,
+          "mode": "RGB"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "e762f657b5c5ba5f7395fb42f684151199e4549c6b0fb4b04a5ad08e8a50925d"
+      ],
+      "hashes": {
+        "pixel_values": "c7fcd80c889c54d1372c049d509e08f4dc6481d5357afd68ea213899ff6553a4",
+        "native_patches": "f9f98894c2e1f5e49c14756d118bd2445c848578718e181b18caa296b9a4574b",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_L-tRNS",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/L-tRNS.png",
+          "format": "PNG",
+          "sha256": "4db9e410b02e9cd6b2f507e2fcfddfef13c70d1ad56f12addf52b06fbc818e46",
+          "width": 53,
+          "height": 47,
+          "mode": "L"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "b9171a382b327937c934b33334cc7d057cc826016fae6363aecbb96290a01a67"
+      ],
+      "hashes": {
+        "pixel_values": "f34c5b4ebb20bf79bb4a6f82e8795d948a9a3f45ac253d211cb20446164cac95",
+        "native_patches": "ebeaf55ad3410bfe065e3bf96854d608f6ff11f071cd6a1cfc4fa24ae14ac71e",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "png_RGBA-orientation-6",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGBA-orientation-6.png",
+          "format": "PNG",
+          "sha256": "b26294635047c6a0d45c4743f2d6f82499e716ae4342ce99d75a87af2c963d97",
+          "width": 53,
+          "height": 47,
+          "mode": "RGBA"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "tokens": [
+        4
+      ],
+      "cu_seqlens": [
+        0,
+        17
+      ],
+      "composited_rgb_sha256": [
+        "bd739a35cc150770ee462c8c3912169265825478116e1b01149094fa4380952a"
+      ],
+      "hashes": {
+        "pixel_values": "05f22249c72650c8f640562db28dd33a491bd314bee2d9e8dc23a8b31731c849",
+        "native_patches": "69809672354ebe3b70130eca88cd1186c9470fef8032e382609346740b582bad",
+        "native_positions": "f08cf19bfe721973b19ee8e09943bafebab5d061d56510b6d8f82b2f3eaf37ac",
+        "rotary_positions": "1a6a14772457f02b5d98479fbb224bc9043b893fa932e09e29b163e4a03af1c0",
+        "interpolation_indices": "c5bcffe4ac60a18eea4282a7327917d480d241a2a559777f149ef216c2f3f39b",
+        "interpolation_weights": "3afc4fbc010479ae0531a90bf4c473ddfe72fcccce7645874ccd36720947c336"
+      }
+    },
+    {
+      "name": "jpeg_RGB-orientation-6",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGB-orientation-6.jpg",
+          "format": "JPEG",
+          "sha256": "f9c1dfa65e3e9d2115a38a40475ab6917dba6410848019017a748c5a6edc7ae4",
+          "width": 61,
+          "height": 29,
+          "mode": "RGB",
+          "rgb": "inkling2_images-inputs/RGB-orientation-6.rgb",
+          "max_channel_error": 2
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          2
+        ]
+      ],
+      "tokens": [
+        2
+      ],
+      "cu_seqlens": [
+        0,
+        9
+      ],
+      "composited_rgb_sha256": [
+        "bc0cfc477961822b1c47c99c92573f40a33ba36ee5359942e1e90f07e815fedd"
+      ],
+      "hashes": {
+        "pixel_values": "3f6a817f6035679311355212b1dbc308cfdcd518afddd9b424f7cf27efd71b84",
+        "native_patches": "c2fb95a3eb063cca8073886adb602b923cdbbc53b72d67060862fe2339450542",
+        "native_positions": "3a1499aca884a22cd52cbca0339cfedcc15229bdf56cf4681e548476c0f0eaef",
+        "rotary_positions": "d37b4e2a124ae375bc6a39a326da600e0f36127975626c83f392382e09d1031e",
+        "interpolation_indices": "182689511134b6c721c5a2a4054a81bde699b261e15debe89bae730088f3926e",
+        "interpolation_weights": "6bf20fd476dd17a332a34ad23245f22eb0b0e1ea1d1ab3142993709f8d362e0c"
+      }
+    },
+    {
+      "name": "jpeg_CMYK",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/CMYK.jpg",
+          "format": "JPEG",
+          "sha256": "b8237954926c4c3f4c0cf23342d4cd19aba59252b1a053d8e73aa59717008ff5",
+          "width": 61,
+          "height": 29,
+          "mode": "CMYK",
+          "rgb": "inkling2_images-inputs/CMYK.rgb",
+          "max_channel_error": 2
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          2
+        ]
+      ],
+      "tokens": [
+        2
+      ],
+      "cu_seqlens": [
+        0,
+        9
+      ],
+      "composited_rgb_sha256": [
+        "ee153aa6645fef4c000a85d084c0e13420b3a7fffb6693599704944672c1d688"
+      ],
+      "hashes": {
+        "pixel_values": "31f43674eeb1916ae1f0796105267f2a41f9388002c279c40d0543b827be7998",
+        "native_patches": "445ec24164cc94292edf86773feadf14a7fea6a14a5e65c24ae1d017db2f8f3d",
+        "native_positions": "3a1499aca884a22cd52cbca0339cfedcc15229bdf56cf4681e548476c0f0eaef",
+        "rotary_positions": "d37b4e2a124ae375bc6a39a326da600e0f36127975626c83f392382e09d1031e",
+        "interpolation_indices": "182689511134b6c721c5a2a4054a81bde699b261e15debe89bae730088f3926e",
+        "interpolation_weights": "6bf20fd476dd17a332a34ad23245f22eb0b0e1ea1d1ab3142993709f8d362e0c"
+      }
+    },
+    {
+      "name": "webp_RGBA-lossless",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGBA-lossless.webp",
+          "format": "WEBP",
+          "sha256": "347b2a98066e441554c4946de04b058bfc157d9feb29fbf8fab8220ef648b9af",
+          "width": 43,
+          "height": 31,
+          "mode": "RGBA"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          2
+        ]
+      ],
+      "tokens": [
+        2
+      ],
+      "cu_seqlens": [
+        0,
+        9
+      ],
+      "composited_rgb_sha256": [
+        "0e0ad7a533e9459defb1f2aa4a3183a04ce8a145d75f044dfe6bee6493cab078"
+      ],
+      "hashes": {
+        "pixel_values": "3bec9ebc93c9a45762190bbd50b724c5b0e8a7372136a9210d005fbc2c6afdde",
+        "native_patches": "70fe69cdc55a9e21e2e6d02c63059293717e155f4fe0858c11ab43d7cf32a607",
+        "native_positions": "3a1499aca884a22cd52cbca0339cfedcc15229bdf56cf4681e548476c0f0eaef",
+        "rotary_positions": "d37b4e2a124ae375bc6a39a326da600e0f36127975626c83f392382e09d1031e",
+        "interpolation_indices": "182689511134b6c721c5a2a4054a81bde699b261e15debe89bae730088f3926e",
+        "interpolation_weights": "6bf20fd476dd17a332a34ad23245f22eb0b0e1ea1d1ab3142993709f8d362e0c"
+      }
+    },
+    {
+      "name": "webp_RGB-lossless",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGB-lossless.webp",
+          "format": "WEBP",
+          "sha256": "3191254a854a457d8ec148381f88bd7f7133e1746fa6d10cdd89ed028898d675",
+          "width": 43,
+          "height": 31,
+          "mode": "RGB"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          2
+        ]
+      ],
+      "tokens": [
+        2
+      ],
+      "cu_seqlens": [
+        0,
+        9
+      ],
+      "composited_rgb_sha256": [
+        "4417aa6672fd9b15cc19d105030c8007a06f190ced818d21ebe9f0d77d0741d1"
+      ],
+      "hashes": {
+        "pixel_values": "7340c23ca7c6b6f925f80b2d262770d1f7aa1d0b7ee939bbd3fea00b3276c8ab",
+        "native_patches": "c34d5b074beb9940ca9b7f2b125a1991d378fb116dfec33616d35b35ae08ccf1",
+        "native_positions": "3a1499aca884a22cd52cbca0339cfedcc15229bdf56cf4681e548476c0f0eaef",
+        "rotary_positions": "d37b4e2a124ae375bc6a39a326da600e0f36127975626c83f392382e09d1031e",
+        "interpolation_indices": "182689511134b6c721c5a2a4054a81bde699b261e15debe89bae730088f3926e",
+        "interpolation_weights": "6bf20fd476dd17a332a34ad23245f22eb0b0e1ea1d1ab3142993709f8d362e0c"
+      }
+    },
+    {
+      "name": "non_multiple__one_pixel__wide",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 53,
+            "height": 71,
+            "seed": 5
+          }
+        },
+        {
+          "pattern": {
+            "width": 1,
+            "height": 1,
+            "seed": 1
+          }
+        },
+        {
+          "pattern": {
+            "width": 1000,
+            "height": 3,
+            "seed": 7
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          25
+        ]
+      ],
+      "tokens": [
+        4,
+        1,
+        25
+      ],
+      "cu_seqlens": [
+        0,
+        17,
+        22,
+        123
+      ],
+      "composited_rgb_sha256": [
+        "1157faacaa5f7149dc60794e1f6b002cfc01e31283f635c1de78e568d5de7309",
+        "d69bb214675bd1cd467c8509b234089700b5becc30de8049cbc4ffa16ec8a371",
+        "64a38791c58f82ff00ae9f0b7a80dfd39e6f5b1f4798e0b3758ec412d2a69bce"
+      ],
+      "hashes": {
+        "pixel_values": "b5291d0f06127ff932dfa3ce7abf9d513566e986d029135ff6883d01333ddd49",
+        "native_patches": "74bb75429d3f089e166c364a90c48259d1a62973f059bc1caa45cd6868209161",
+        "native_positions": "236b9d7dc7bfcff4adadc8bc16a640f1fd077e6d5115d16f7ddc3e9b380de692",
+        "rotary_positions": "455fdca469f5c8a443a7cb9c1344f9d7e08bd719ae9ab08aacbce66081c65eb9",
+        "interpolation_indices": "64bcfed9e4f27306b5873d8550334ce128b893835ef78cd63e2f5667538a5a2e",
+        "interpolation_weights": "4ac734974c8c00f0a6d61909f8b2ff962ee049e4ac1dc854198adf1ff5f42ef2"
+      }
+    },
+    {
+      "name": "one_cell__one_cell",
+      "inputs": [
+        {
+          "pattern": {
+            "width": 40,
+            "height": 40,
+            "seed": 2
+          }
+        },
+        {
+          "pattern": {
+            "width": 40,
+            "height": 40,
+            "seed": 2
+          }
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1
+        ]
+      ],
+      "tokens": [
+        1,
+        1
+      ],
+      "cu_seqlens": [
+        0,
+        5,
+        10
+      ],
+      "composited_rgb_sha256": [
+        "1ae3ab25651a658ece3a2e6c63b63139d2b05ae51e9a3f1cbbb44a6a3de6fdf8",
+        "1ae3ab25651a658ece3a2e6c63b63139d2b05ae51e9a3f1cbbb44a6a3de6fdf8"
+      ],
+      "hashes": {
+        "pixel_values": "94c8304ebf366bbb4737b2bfd5982ed0edce554d32b90be65f170c822c089305",
+        "native_patches": "680b3b96e9a45ea856ea39c12108139ca7c09fcdaf47ffeea89d0235a97dc3e8",
+        "native_positions": "949f12f31a6cfa6b7425a3a667ed46eae3033910efc2a0be0b30fdc28153981c",
+        "rotary_positions": "7c20fae9c7ad9a87e4c66b9ec3c720853346254ce21c8c48d49874ceff85cf9a",
+        "interpolation_indices": "3f3222bc472caf2b407099e2bdeee3a10ac0727d3e5e490d0cb88e1bcc114b44",
+        "interpolation_weights": "6bf20fd476dd17a332a34ad23245f22eb0b0e1ea1d1ab3142993709f8d362e0c"
+      }
+    },
+    {
+      "name": "png_RGBA__jpeg_CMYK__webp_RGBA-lossless",
+      "inputs": [
+        {
+          "file": "inkling2_images-inputs/RGBA.png",
+          "format": "PNG",
+          "sha256": "794062b914db1e7a15d1c1d804f596c478a2b32216012dab2c20307e2d0c9f11",
+          "width": 53,
+          "height": 47,
+          "mode": "RGBA"
+        },
+        {
+          "file": "inkling2_images-inputs/CMYK.jpg",
+          "format": "JPEG",
+          "sha256": "b8237954926c4c3f4c0cf23342d4cd19aba59252b1a053d8e73aa59717008ff5",
+          "width": 61,
+          "height": 29,
+          "mode": "CMYK",
+          "rgb": "inkling2_images-inputs/CMYK.rgb",
+          "max_channel_error": 2
+        },
+        {
+          "file": "inkling2_images-inputs/RGBA-lossless.webp",
+          "format": "WEBP",
+          "sha256": "347b2a98066e441554c4946de04b058bfc157d9feb29fbf8fab8220ef648b9af",
+          "width": 43,
+          "height": 31,
+          "mode": "RGBA"
+        }
+      ],
+      "grid_thw": [
+        [
+          1,
+          2,
+          2
+        ],
+        [
+          1,
+          1,
+          2
+        ],
+        [
+          1,
+          1,
+          2
+        ]
+      ],
+      "tokens": [
+        4,
+        2,
+        2
+      ],
+      "cu_seqlens": [
+        0,
+        17,
+        26,
+        35
+      ],
+      "composited_rgb_sha256": [
+        "bd739a35cc150770ee462c8c3912169265825478116e1b01149094fa4380952a",
+        "ee153aa6645fef4c000a85d084c0e13420b3a7fffb6693599704944672c1d688",
+        "0e0ad7a533e9459defb1f2aa4a3183a04ce8a145d75f044dfe6bee6493cab078"
+      ],
+      "hashes": {
+        "pixel_values": "acc4e7e1d9dfd819d880ab4dbe4b6bbf0c572e6b0726979a762f4ca37dde8ff9",
+        "native_patches": "78a28edcb9ebb7e943921643674745d5c1be4e9fcc4394ded23a706c82c727ab",
+        "native_positions": "56fd773ab2a3c0948124c0a60e637876288ef04460224281ae3974ef9f72e836",
+        "rotary_positions": "3a17a4a389edb8a6f8e9e921c8fbddf3300edcdb809f06c9a6439b89539193f0",
+        "interpolation_indices": "55df1985fb6cb260d52481990284b43f5ff094ab8dcf3fd4457cc2caeb3ac06a",
+        "interpolation_weights": "8f202ec46b2e40090182a91212c0a9f90b7d3f1da3d8e8cc6d1b5cec1c0bb910"
+      }
+    }
+  ]
+}

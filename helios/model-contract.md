@@ -247,6 +247,39 @@ declares feature IDs and atomic spans; custom image layout code produces token
 positions, feature mappings, and vision tensors. The generic graph packer binds
 those tensors to declared destinations.
 
+Padded-grid image preparation keeps each decoded image at its own size and does
+not apply EXIF orientation. It composites alpha, including PNG tRNS keys and
+WebP alpha, onto an 8-pixel checkerboard of 204 and 153 anchored at the top-left
+pixel, as `(rgb·a + background·(255 − a) + 127) / 255`. It pads the bottom and
+right edges to whole 40-pixel token cells with −1 on the 0–255 scale and
+normalizes every value as `(v − 127.5) / 127.5`. Each cell holds 2×2 native
+20-pixel patches; each patch has 1,200 features in pixel row, pixel column,
+channel order. Image size is bounded by the decoded-pixel limit and by the
+prepared per-image and per-request image-token capacities, with no per-side
+limit; inputs outside them are rejected rather than resized. Semantic image
+identity includes the alpha plane, so images that differ only in alpha have
+distinct prefix-cache keys.
+
+The class-token image layout expands each rendered feature token into the
+image's token count and keeps text positions one-dimensional. Each image's
+vision sequence is one class token followed by its N native patches in token
+raster order and, within a token, 2×2 merge-block row-major order. One vision
+replay receives one image:
+
+| Tensor | Type and extent | Contents |
+|---|---|---|
+| `vision_pixel_values` | float32 `[N, 1200]` | Normalized native patches |
+| `vision_position_ids` | int64 `[N + 1, 2]` | Rotary (row, column) positions: the class token at (0, 0), then one-based native-grid coordinates |
+| `vision_interpolation_indices` | int64 `[N, 4]` | Flattened taps into a 32×32 learned position table, bilinear with half-pixel centres (`align_corners=False`) and edge clamping |
+| `vision_interpolation_weights` | float32 `[N, 4]` | Weights of those taps |
+| `vision_cu_seqlens` | int32 `[2]` | `[0, N + 1]`, counting the class token |
+| `vision_num_patches` | int32 `[1]` | N |
+| `vision_num_features` | int32 `[1]` | N / 4 image tokens |
+| `vision_feature_offset` | int32 `[1]` | Destination offset in the request feature window |
+
+A vision graph's token capacity counts native patches; its position tensor holds
+one more row for the class token.
+
 Recipient-header reasoning uses `<|start|>assistant to=RECIPIENT<|message|>`
 frames. The `self` recipient carries reasoning; `commentary` and `user` carry
 visible content. Tool recipients contain ATEM `<atem:function_calls>` blocks

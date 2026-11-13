@@ -30,6 +30,9 @@ pub(crate) fn tensor_layout(
         (ImageLayoutKind::Bracketed, "vision_pixel_values") => (Float32, patches * 1176),
         (ImageLayoutKind::Radio, "vision_pixel_values") => (Float32, patches * 768),
         (ImageLayoutKind::Glm, "vision_pixel_values") => (Float32, patches * 1176),
+        (ImageLayoutKind::ClassToken, "vision_pixel_values") => (Float32, patches * 1200),
+        // One class-token row precedes each image's patch positions.
+        (ImageLayoutKind::ClassToken, "vision_position_ids") => (Int64, (patches + 1) * 2),
         (_, "vision_position_ids") => (Int64, patches * 2),
         (ImageLayoutKind::Step, "vision_cu_seqlens") => (Int32, super::step::MAX_VIEWS + 1),
         (_, "vision_cu_seqlens") => (Int32, 2),
@@ -39,21 +42,24 @@ pub(crate) fn tensor_layout(
             | ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
-            | ImageLayoutKind::Radio,
+            | ImageLayoutKind::Radio
+            | ImageLayoutKind::ClassToken,
             "vision_num_features",
         ) => (Int32, 1),
         (
             ImageLayoutKind::Qwen
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
-            | ImageLayoutKind::Radio,
+            | ImageLayoutKind::Radio
+            | ImageLayoutKind::ClassToken,
             "vision_interpolation_indices",
         ) => (Int64, patches * 4),
         (
             ImageLayoutKind::Qwen
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
-            | ImageLayoutKind::Radio,
+            | ImageLayoutKind::Radio
+            | ImageLayoutKind::ClassToken,
             "vision_interpolation_weights",
         ) => (Float32, patches * 4),
         (ImageLayoutKind::Mimo, "vision_column_indices" | "vision_row_indices") => {
@@ -91,6 +97,7 @@ pub(crate) fn prepare(
         ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor => deepseek(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Moonvit | ImageLayoutKind::Radio => spatial_merge(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Step => step(config, handle, images, image, destination_feature_offset),
+        ImageLayoutKind::ClassToken => class_token(config, handle, images, image, destination_feature_offset),
     }
 }
 
@@ -473,6 +480,65 @@ fn bracketed(config: &ModelConfig, handle: RequestHandle, images: &ProcessedImag
     staging.put("vision_pixel_values", 0, images.pixel_values.get(start*1176..end*1176).ok_or("truncated vision pixels")?.iter().copied().flat_map(f32::to_le_bytes));
     staging.i64("vision_position_ids", 0, images.position_ids.get(start..end).ok_or("truncated vision positions")?.iter().flatten().copied());
     staging.i32("vision_cu_seqlens", 0, [0, geometry.patches as i32]);
+    staging.i32("vision_num_patches", 0, [geometry.patches as i32]);
+    staging.i32("vision_num_features", 0, [geometry.tokens as i32]);
+    staging.i32("vision_feature_offset", 0, [destination_feature_offset as i32]);
+    Ok(staging)
+}
+
+/// One image's sequence is a class token at rotary position (0, 0) followed by its native
+/// patches at one-based (row, column) positions; interpolation covers only the patches.
+fn class_token(
+    config: &ModelConfig,
+    handle: RequestHandle,
+    images: &ProcessedImages,
+    image: usize,
+    destination_feature_offset: usize,
+) -> Result<UploadBatch> {
+    let geometry = images.geometry.get(image).ok_or("missing scheduled image")?;
+    let start: usize = images.geometry[..image].iter().map(|g| g.patches).sum();
+    let end = start + geometry.patches;
+    let [t, h, w] = geometry.grid_thw;
+    if t != 1 || h <= 0 || w <= 0 || h % 2 != 0 || w % 2 != 0
+        || (h as usize).checked_mul(w as usize) != Some(geometry.patches)
+        || geometry.tokens.checked_mul(4) != Some(geometry.patches)
+        || config.contract.vision.patches_per_feature != 4
+        || geometry.patches
+            > *config.contract.vision.patch_capacities.last().ok_or("missing vision capacities")?
+        || geometry.patches >= i32::MAX as usize
+        || handle.slot as usize >= config.limits.max_active
+        || handle.generation == 0
+        || handle.generation > i64::MAX as u64
+    {
+        return Err("invalid class-token image extent".into());
+    }
+    let width = super::padded_grid::FEATURES;
+    let mut staging = UploadBatch::default();
+    staging.put(
+        "vision_pixel_values",
+        0,
+        images.pixel_values.get(start * width..end * width).ok_or("truncated vision pixels")?
+            .iter().copied().flat_map(f32::to_le_bytes),
+    );
+    let positions = images.position_ids.get(start..end).ok_or("truncated vision positions")?;
+    staging.i64(
+        "vision_position_ids",
+        0,
+        [0, 0].into_iter().chain(positions.iter().flat_map(|[row, col]| [row + 1, col + 1])),
+    );
+    staging.i64(
+        "vision_interpolation_indices",
+        0,
+        images.interpolation_indices.get(start..end).ok_or("truncated vision interpolation indices")?
+            .iter().flatten().copied(),
+    );
+    staging.put(
+        "vision_interpolation_weights",
+        0,
+        images.interpolation_weights.get(start..end).ok_or("truncated vision interpolation weights")?
+            .iter().flatten().copied().flat_map(f32::to_le_bytes),
+    );
+    staging.i32("vision_cu_seqlens", 0, [0, geometry.patches as i32 + 1]);
     staging.i32("vision_num_patches", 0, [geometry.patches as i32]);
     staging.i32("vision_num_features", 0, [geometry.tokens as i32]);
     staging.i32("vision_feature_offset", 0, [destination_feature_offset as i32]);

@@ -1,3 +1,15 @@
+[ ] Accept patch-merge images in conditioned-input validation.
+    PreparedImageInput::valid_processed (helios/src/frontend/images/conditioned.rs)
+    expects 588 features per patch for the patch-merge profile, which produces
+    1,176 at patch size 14, so materialize rejects every MiniMax M3 image that
+    needs vision computation with "image preprocessing differs from its prompt
+    geometry". Add the profile to that module's every-profile test settings.
+
+[ ] Capture an Inkling 2 vision graph that consumes the class-token image layout
+    and compare its features with Transformers Inkling2VisionModel. Native
+    padded-grid preparation and class-token packing match the reference tensors
+    in tests/frontend/inkling2_images.json; no captured graph consumes them yet.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.

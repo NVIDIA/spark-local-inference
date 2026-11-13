@@ -284,6 +284,7 @@ pub(super) fn vision_json(
             Profile::PatchMerge(c) => json!({"profile": "patch_merge", "patch_size": c.patch_size,
                 "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::Glm(_) => json!({"profile": "glm"}),
+            Profile::PaddedGrid(_) => json!({"profile": "padded_grid"}),
         }
     });
     json!({

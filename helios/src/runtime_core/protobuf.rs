@@ -158,6 +158,7 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
                 Profile::Glm(_) => serde_json::json!({"glm": {}}),
+                Profile::PaddedGrid(_) => serde_json::json!({"padded_grid": {}}),
             })
         })
         .transpose()?;
@@ -618,6 +619,28 @@ mod tests {
                 crate::frontend::images::ImageProcessor::load(settings, Default::default())
                     .unwrap();
             assert_eq!(processor.geometry(112, 112).unwrap().tokens, 16);
+        }
+    }
+
+    #[test]
+    fn serialized_padded_grid_profile_selects_only_image_preparation() {
+        // Field 10 adds the padded-grid profile without changing any preceding profile tag.
+        let bytes = &[0x0a, 0x00, 0x12, 0x02, 0x52, 0x00, 0x1a, 0x01, 0x01][..];
+        let decoded = wire::FrontendSettings::decode(bytes).unwrap();
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"], serde_json::json!({"padded_grid": {}}));
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
+            let settings = frontend.image.unwrap();
+            assert_eq!(
+                settings.preparation_kind(),
+                crate::model::contract::ImagePreparationKind::PaddedGrid
+            );
+            let processor =
+                crate::frontend::images::ImageProcessor::load(settings, Default::default())
+                    .unwrap();
+            assert_eq!(processor.geometry(81, 40).unwrap().tokens, 3);
         }
     }
 

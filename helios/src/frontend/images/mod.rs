@@ -17,6 +17,9 @@ mod glm;
 mod moonvit;
 mod orientation;
 mod conditioned;
+mod padded_grid;
+#[cfg(test)]
+pub(crate) use padded_grid::tests as padded_grid_fixtures;
 mod record;
 pub use conditioned::{ImageDescription, ImageEncoding, ImageInput, ImageSource, PreparedImageInput};
 pub(crate) mod packing;
@@ -255,6 +258,7 @@ pub enum ImageSettings {
     Step {},
     Radio {},
     Glm {},
+    PaddedGrid {},
 }
 
 impl ImageSettings {
@@ -270,6 +274,7 @@ impl ImageSettings {
             Self::Step {} => ImagePreparationKind::Step,
             Self::Radio {} => ImagePreparationKind::Radio,
             Self::Glm {} => ImagePreparationKind::Glm,
+            Self::PaddedGrid {} => ImagePreparationKind::PaddedGrid,
         }
     }
 }
@@ -325,6 +330,7 @@ enum Profile {
     Step,
     Radio,
     Glm,
+    PaddedGrid,
 }
 
 impl ImageProcessor {
@@ -357,6 +363,7 @@ impl ImageProcessor {
             ImageSettings::Step {} => Profile::Step,
             ImageSettings::Radio {} => Profile::Radio,
             ImageSettings::Glm {} => Profile::Glm,
+            ImageSettings::PaddedGrid {} => Profile::PaddedGrid,
             ImageSettings::Mimo(settings) => Profile::MiMo(mimo::load(&settings, limits)?),
             ImageSettings::PatchMerge(settings) => Profile::PatchMerge(patch_merge::Processor::load(settings, limits)?),
             ImageSettings::Qwen(settings) => {
@@ -375,7 +382,8 @@ impl ImageProcessor {
         hash.update((image.width as u64).to_le_bytes());
         hash.update((image.height as u64).to_le_bytes());
         hash.update(&image.pixels);
-        if matches!(self.profile, Profile::Moonvit) {
+        // MoonViT resizes retained alpha and CMYK planes; the padded grid composites alpha.
+        if matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid) {
             hash.update([u8::from(image.nearest_resize)]);
             for channel in [&image.alpha, &image.cmyk] {
                 hash.update([u8::from(channel.is_some())]);
@@ -464,7 +472,13 @@ impl ImageProcessor {
                 "PNG requires non-animated, at most 8-bit samples",
             ))));
         }
-        let retain_alpha = info.color_type != png::ColorType::Rgb;
+        // The padded grid composites every PNG transparency form that Pillow reports, including
+        // RGB and grayscale tRNS keys; MoonViT ignores RGB tRNS keys.
+        let retain_alpha = match self.profile {
+            Profile::Moonvit => info.color_type != png::ColorType::Rgb,
+            Profile::PaddedGrid => true,
+            _ => false,
+        };
         let nearest =
             info.color_type == png::ColorType::Indexed || info.bit_depth == png::BitDepth::One;
         let size = reader.output_buffer_size().ok_or_else(|| {
@@ -485,7 +499,7 @@ impl ImageProcessor {
                 e,
             )))
         })?;
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             reader
@@ -518,8 +532,8 @@ impl ImageProcessor {
             }
         }
         let mut image = RgbImage::new(output.width as usize, output.height as usize, rgb)?;
+        image.alpha = (retain_alpha && !alpha.is_empty()).then_some(alpha);
         if matches!(self.profile, Profile::Moonvit) {
-            image.alpha = (retain_alpha && !alpha.is_empty()).then_some(alpha);
             image.nearest_resize = nearest;
         }
         Ok(orientation::orient(image, orientation))
@@ -533,7 +547,7 @@ impl ImageProcessor {
                 "encoded image exceeds the configured byte limit",
             ))));
         }
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             orientation::jpeg_orientation(bytes)?
@@ -625,7 +639,7 @@ impl ImageProcessor {
                 "animated WebP is unsupported; provide a still image",
             ))));
         }
-        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_)) {
+        let orientation = if matches!(self.profile, Profile::Moonvit | Profile::DeepseekRowMajor(_) | Profile::PaddedGrid) {
             1
         } else {
             decoder
@@ -645,7 +659,7 @@ impl ImageProcessor {
         decoder.read_image(&mut decoded).map_err(error)?;
         let (rgb, alpha) = if decoder.has_alpha() {
             let rgb = decoded.chunks_exact(4).flat_map(|pixel| pixel[..3].iter().copied()).collect();
-            let alpha = matches!(self.profile, Profile::Moonvit)
+            let alpha = matches!(self.profile, Profile::Moonvit | Profile::PaddedGrid)
                 .then(|| decoded.chunks_exact(4).map(|pixel| pixel[3]).collect());
             (rgb, alpha)
         } else {
@@ -667,6 +681,7 @@ impl ImageProcessor {
             Profile::Step => step::geometry(self.limits, width, height),
             Profile::Radio => radio::geometry(self.limits, width, height),
             Profile::Glm => glm::geometry(self.limits, width, height),
+            Profile::PaddedGrid => padded_grid::geometry(self.limits, width, height),
         }
     }
     pub fn resized_rgb(&self, image: &RgbImage) -> Result<(ImageGeometry, Vec<u8>)> {
@@ -680,6 +695,7 @@ impl ImageProcessor {
             Profile::Step => step::resized_rgb(self.limits, image),
             Profile::Radio => Err("RADIO resizing produces float32 pixels; use process".into()),
             Profile::Glm => glm::resized_rgb(self.limits, image),
+            Profile::PaddedGrid => Err("padded-grid preparation pads with values outside RGB8; use process".into()),
         }
     }
     pub fn process(&self, images: &[RgbImage]) -> Result<ProcessedImages> {
@@ -698,6 +714,7 @@ impl ImageProcessor {
             Profile::Step => step::process(self.limits, images),
             Profile::Radio => radio::process(self.limits, images),
             Profile::Glm => glm::process(self.limits, images),
+            Profile::PaddedGrid => padded_grid::process(self.limits, images),
         }
     }
     pub fn expand_prompt(
@@ -715,6 +732,7 @@ impl ImageProcessor {
             Profile::Step => Err("Step image expansion requires its model contract".into()),
             Profile::Radio => Err("RADIO image expansion requires its model contract".into()),
             Profile::Glm => Err("GLM image expansion requires its prepared layout".into()),
+            Profile::PaddedGrid => Err("padded-grid image expansion requires its prepared layout".into()),
         }
     }
 }

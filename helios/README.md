@@ -184,9 +184,12 @@ URLs. JPEG uses
 accurate IDCT, smooth chroma upsampling, and at most 100 progressive scans.
 Baseline/progressive Huffman JPEG is supported; lossless and arithmetic JPEG
 are rejected. Encoded byte and decoded pixel limits apply before pixel allocation.
-PNG and JPEG EXIF orientation is applied before resize; orientations 1–8 include
-mirrored and axis-swapped images. Invalid orientation metadata is rejected.
-RGB conversion discards alpha and does not apply embedded color profiles.
+PNG, JPEG, and WebP EXIF orientation is applied before resize, except by the
+MoonViT, DeepSeek row-major, and padded-grid profiles, which keep the stored
+pixel order; orientations 1–8 include mirrored and axis-swapped images. Invalid
+orientation metadata is rejected. RGB conversion discards alpha except where the
+profile consumes it: MoonViT resizes it, and the padded grid composites it onto
+a checkerboard. Embedded color profiles are not applied.
 Pillow is used only to generate test fixtures, never by native image admission.
 
 Heliopause builds the internal Python extension named `flare_heliopause`. It requires the NVIDIA driver at runtime
@@ -670,7 +673,7 @@ The `images` feature adds `frontend::images::ImageProcessor` and PNG, JPEG,
 and static WebP decoding; it also enables `frontend`. Typed core metadata
 selects the preparation profile and token layout independently. Profiles cover
 Qwen, MiMo, patch-merge, DeepSeek, DeepSeek row-major, Moonvit, Step, RADIO,
-and GLM inputs.
+GLM, and padded-grid inputs.
 The Qwen processor uses an RGB8, bicubic-antialias profile with
 16×16 patches, temporal duplication by two, spatial merge by two, a 48×48
 learned position table, and fused normalization `(pixel - 127.5) / 127.5`.
@@ -750,3 +753,24 @@ native tensor bytes. Fixtures contain fingerprints rather than the full
 100 MiB largest patch tensor; the generator's `--binary-dir` records full
 reference tensors for diagnosis. These checks qualify CPU preparation; vision
 graph execution and decoder consumption require separate model integration.
+
+Padded-grid fixtures in `tests/frontend/inkling2_images.json` pin the Inkling 2
+image processor and vision tower of Transformers pull request 50682 at commit
+`1b2f625956be1416816447eba32447a1d268d095`, PyTorch `2.13.0+cpu`, Torchvision
+`0.28.0+cpu`, Pillow `12.3.0`, and the checkpoint's `processor_config.json` and
+`config.json` hashes. They record `Inkling2ImageProcessor` outputs and the
+tensors that `Inkling2VisionModel` passes to its patch embedding, rotary
+embedding, and first attention layer. Images open with `PIL.Image.open` without
+EXIF transposition. The 26 cases cover sizes from 1×1 to 4096×4096, extreme
+aspect ratios, mixed batches, PNG RGB, L, P, RGBA, LA, and tRNS inputs, EXIF
+orientation 6 in PNG and JPEG, CMYK JPEG, and lossless WebP with and without
+alpha. Library tests decode PNG and WebP natively, compare JPEG decoding with
+Pillow within two levels per channel, and then compare every native-patch,
+position, interpolation, and sequence-offset byte of preparation and
+class-token packing. Regenerate them in an environment that holds only those
+pinned packages:
+
+```bash
+python -I tests/frontend/generate_inkling2_image_fixtures.py \
+  "$SNAPSHOT" tests/frontend/inkling2_images.json --binary-dir /tmp/inkling2-image-reference
+```

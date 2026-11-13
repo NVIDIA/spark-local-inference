@@ -367,6 +367,7 @@ enum ImagePreparationKind {
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
   GLM_IMAGE_PREPARATION = 8;
   PATCH_MERGE_IMAGE_PREPARATION = 9;
+  PADDED_GRID_IMAGE_PREPARATION = 10;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -379,6 +380,7 @@ enum ImageLayoutKind {
   DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
   GLM_IMAGE_LAYOUT = 8;
   BRACKETED_IMAGE_LAYOUT = 9;
+  CLASS_TOKEN_IMAGE_LAYOUT = 10;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -500,6 +502,7 @@ message ImageSettings {
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
     Empty glm = 8;
     PatchMergeImageSettings patch_merge = 9;
+    Empty padded_grid = 10;
   }
 }
 message PatchMergeImageSettings {

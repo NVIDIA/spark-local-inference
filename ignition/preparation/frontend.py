@@ -77,6 +77,20 @@ def _expected(config, values, label):
 
 
 def image_settings(config, model, profile):
+    if profile == "padded_grid":
+        # Inkling 2 ships the processor in processor_config.json; `size` is the token cell, not a resize target.
+        _expected(config, {"processor_class": "Inkling2Processor"}, "padded-grid processor")
+        image = config.get("image_processor")
+        expected = {"image_processor_type": "Inkling2ImageProcessor", "size": {"height": 40, "width": 40},
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3, "rescale_factor": 1 / 255,
+            "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
+        if not isinstance(image, dict) or set(image) != set(expected):
+            raise ValueError("unsupported padded-grid image processor fields")
+        _expected(image, expected, "padded-grid image processor")
+        _expected(model, {"model_type": "inkling2"}, "padded-grid model configuration")
+        _expected(model["vision_config"], {"native_patch_size": 20, "adapter_merge_size": 2,
+            "posemb_grid_size": 32, "temporal_patch_size": 2}, "padded-grid vision configuration")
+        return {"padded_grid": {}}
     if profile == "glm":
         _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
         image = config["image_processor"]

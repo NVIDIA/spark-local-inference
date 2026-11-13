@@ -55,6 +55,11 @@ pub fn prepare_image_inputs(
         Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
             frontend, processor, rendered, &images,
         )?,
+        Some(ImageLayoutKind::ClassToken) => crate::frontend::images::layouts::class_token::prepare_input(
+            config.contract.frontend.image_tokens.as_ref()
+                .ok_or("class-token image layout requires a prepared feature token")?.feature_token,
+            processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -407,6 +412,7 @@ mod tests {
             (ImageLayoutKind::Moonvit, ImageSettings::Moonvit {}, "<|media_pad|>", 4),
             (ImageLayoutKind::Step, ImageSettings::Step {}, "<im_patch>", 16),
             (ImageLayoutKind::Radio, ImageSettings::Radio {}, "<image>", 4),
+            (ImageLayoutKind::ClassToken, ImageSettings::PaddedGrid {}, "<image>", 4),
         ];
         for (layout, settings, placeholder, merge) in profiles {
             let initial = ImageProcessor::load(settings.clone(), Default::default()).unwrap();
