@@ -5,7 +5,7 @@ its neighbors in rank order. A native CPU proxy forwards transfers addressed to
 other ranks through those neighbors. The transport supports 2 through 16 ranks;
 each model recipe determines which tensor-parallel sizes it can prepare,
 and the multi-host preparation rendezvous admits two, three, or four ranks.
-GLM-5.3 Flash, DeepSeek V4 Flash, and Qwen3.8 Flash prepare multi-host TP2 and TP4 cores.
+GLM-5.3 Flash, MiMo V2.6, DeepSeek V4 Flash, and Qwen3.8 Flash prepare multi-host TP2 and TP4 cores.
 
 Ring routing applies to RoCEnante's one-shot reductions, two-shot reductions,
 and variable-length gathers. The collective algorithms and arithmetic belong

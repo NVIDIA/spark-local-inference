@@ -875,6 +875,69 @@ token and seven proposals. Helios uses the shared speculative execution contract
 draft modeling and state updates are captured by Ignition. The vision encoder
 publishes compact image features for causal text prefill. Loading with
 `--mtp-draft-tokens 0` selects ordinary execution without draft-state updates.
+Image resize bounds and normalization come from the checkpoint's
+`preprocessor_config.json` and are packaged for the native frontend.
+
+## MiMo V2.6 Flash RL
+
+MiMo V2.6 Flash RL uses `XiaomiMiMo/MiMo-V2.6-Flash-RL` at revision
+`f657ba2f7d24c9adc5730675baaa2d34de878a49`, a 48-layer, 256-expert sibling of
+MiMo V2.6 Pro MOPD with the same checkpoint formats, chat template, tokenizer,
+and DFlash draft structure. Its global-attention layers store four KV heads and
+its sliding-window layers eight, and its fused-QKV projections are stored as four
+checkpoint shards, so the `mimo-v2.6-flash-rl` alias prepares two or four ranks.
+The alias prepares text, images, and seven DFlash draft tokens with adaptive
+verification; audio is not prepared. The API advertises the model as
+`MiMo-V2.6-Flash-RL`.
+
+The 173 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two hosts, one rank per host, reducing through RoCEnante
+over their ConnectX-7 ports. Multi-host export requires the checkpoint, including
+its `dflash/` directory, in rank zero's hub cache at the declared revision; it
+does not download. The example prepares sixteen concurrent requests with
+8192-token prefill chunks on two Sparks, following the
+[multi-host guide](multi-host.md) for preparation authentication and rank
+placement. `--lock-gpu-clocks` needs root or passwordless `sudo` for
+`nvidia-smi` on both hosts; omit it otherwise. On rank zero, whose preparation
+address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export mimo-v2.6-flash-rl --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16 \
+  --prefill-chunk-size 8192 --native-dense-activations \
+  --autotune-effort audit --lock-gpu-clocks
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+A `[models."mimo-v2.6-flash-rl"]` section with `max_concurrency = 16` in the
+[configuration file](cli-design.md#33-configuration-file) makes that capacity the
+host's default; the chunk size and tuning options are command-line flags.
+
+Serve the core through `flare orbit run` with a two-node cluster whose
+first node holds the core, or from both hosts directly:
+
+```sh
+flare orbit run spark1:/data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --cluster sparks --name mimo --host 0.0.0.0
+
+./flare/target/release/flare run /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --rank 0 --rendezvous maxwell:29800
+./flare/target/release/flare run --rank 1 --rendezvous maxwell:29800
+```
+
+Orbit sends the peer its rank's data once over the ConnectX-7 link, about
+88 GB, before loading starts.
+
+On one host with two or four GPUs, select them with `--gpus` as for the Pro
+checkpoint. On GB10, a TP2 core with sixteen concurrent requests and
+8192-token chunks loads 93.9 GiB per rank and, at the default 4 GiB reserve,
+9.9 GiB of KV cache. Image requests have not been qualified on GB10.
 
 ## Step-5 Preview
 

@@ -3,7 +3,8 @@
 
 """MiMo partial RoPE, paged global attention and circular sliding histories."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 
 import torch
 
@@ -29,11 +30,13 @@ class AttentionScratch:
 
     @classmethod
     def allocate(cls, config, shard, tokens, device, *, requests=1, buffers=None):
+        """Size the scratch for the widest layer; layers with fewer KV heads view its leading bytes."""
         geometries = [config.attention(i) for i in range(config.layers)]
-        if len({(a.heads, a.kv_heads, a.key_dim, a.value_dim) for a in geometries}) != 1:
-            raise ValueError("MiMo attention scratch requires matching global and sliding head geometry")
+        if len({(a.heads, a.key_dim, a.value_dim) for a in geometries}) != 1:
+            raise ValueError("MiMo attention scratch requires matching query head counts and head dimensions")
         geometry = geometries[0]
-        heads, kv_heads = geometry.local(shard)
+        heads = geometry.local(shard)[0]
+        kv_heads = max(a.local(shard)[1] for a in geometries)
         def zeros(*shape, dtype=torch.bfloat16):
             return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
                     else buffers.zeros(shape, dtype))
@@ -49,6 +52,22 @@ class AttentionScratch:
     def rows(self, tokens):
         return type(self)(*(getattr(self, name) if name.startswith("window_") else getattr(self, name)[:tokens]
                             for name in self.__dataclass_fields__))
+
+    def for_kv_heads(self, kv_heads):
+        """View the KV scratch at one layer's local head count over the leading bytes of each buffer.
+
+        Layers run serially on one stream, so a narrower layer reuses the wider layer's storage.
+        """
+        if not 0 < kv_heads <= self.key.shape[1]:
+            raise ValueError("a layer's KV heads must fit the allocated attention scratch")
+
+        def narrow(tensor, *leading):
+            count = math.prod(leading) * kv_heads * tensor.shape[-1]
+            return tensor.flatten()[:count].view(*leading, kv_heads, tensor.shape[-1])
+
+        return replace(self, key=narrow(self.key, self.key.shape[0]), value=narrow(self.value, self.value.shape[0]),
+                       window_key=narrow(self.window_key, *self.window_key.shape[:2]),
+                       window_value=narrow(self.window_value, *self.window_value.shape[:2]))
 
 
 def stage_window(history, values, output, row, start, length):
@@ -80,7 +99,8 @@ class PreparedAttention(torch.nn.Module):
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
                  runtime, coordinator, session, name, workspace):
         super().__init__()
-        self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
+        self.geometry, self.metadata = config.attention(layer), metadata
+        scratch = self.scratch = scratch.for_kv_heads(self.geometry.local(shard)[1])
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported MiMo attention mode: {mode}")
         self.mode, self.pool, self.layer = mode, pool, layer

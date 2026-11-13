@@ -624,7 +624,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `glm53` | 1 | 0.95 | Disabled | Temperature [0.95, 1]; top-p [0.95, 1] | [GLM-5.3-Flash evaluation presets](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes) |
 | `deepseek4` | 1 | 0.95 | Disabled | None | [DeepSeek-V4-Flash-Vision-Exp agent evaluations](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction) |
 | `deepseek41` | 1 | 1 | Disabled | Repetition penalty [1, 1.1] | [DeepSeek-V4.1-Flash-1017 recommendations](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference) |
-| `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment) |
+| `mimo_v2` | 1 | 0.95 | Disabled | None | [MiMo-V2.6-Pro-MOPD deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD#4-deployment); [MiMo-V2.6-Flash-RL deployment](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL#5-deployment) |
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
 | `nemotron_h` | 1 | 0.95 | Disabled | None | [Nemotron-3.5-Bolt text recommendations](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB#model-summary) |

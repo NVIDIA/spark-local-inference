@@ -17,7 +17,7 @@ def recipe_help(model=None):
         lines = ["Available model recipes:",
                  f"  {'MODEL':<26}{'GPUs':<14}Drafts (default/max)"]
         for recipe, checkpoint in catalog:
-            gpus = ",".join(map(str, recipe.tensor_parallel))
+            gpus = ",".join(map(str, recipe.checkpoint_tensor_parallel(checkpoint)))
             drafts = ("none" if recipe.speculation is None else
                       f"{recipe.speculation.draft_tokens}/{recipe.max_draft_tokens}")
             lines.append(f"  {checkpoint.alias:<26}{gpus:<14}{drafts}")
@@ -29,7 +29,7 @@ def recipe_help(model=None):
 
     recipe, checkpoint = selected
     lines = [f"Model recipe: {checkpoint.alias}", f"  Checkpoint: {checkpoint.repository}",
-             f"  --gpus: select {', '.join(map(str, recipe.tensor_parallel))} GPUs",
+             f"  --gpus: select {', '.join(map(str, recipe.checkpoint_tensor_parallel(checkpoint)))} GPUs",
              f"  --max-concurrency: 1..{recipe.max_concurrency}; recipe default {recipe.concurrency}",
              f"  --prefill-chunk-size: 64..{recipe.context}, multiple of 64; default {recipe.prefill_chunk}"]
     if recipe.max_images:
