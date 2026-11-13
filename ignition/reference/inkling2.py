@@ -261,7 +261,8 @@ def quantize_nvfp4(x, amax=None):
     if width % 16:
         raise ValueError("NVFP4 rows require a width divisible by 16")
     amax = values.abs().amax(-1) if amax is None else amax.float()
-    encoder = torch.clamp(1536.0 / amax, max=_FLOAT_MAX)[:, None]
+    # One correctly rounded division, as `div_rn`; `scalar / tensor` would multiply by a rounded reciprocal.
+    encoder = torch.clamp(torch.full_like(amax, NVFP4_OUTER) / amax, max=_FLOAT_MAX)[:, None]
     decoder = 1.0 / encoder
     outer = (amax * (1.0 / 1536.0))[:, None, None]
     blocks = values.reshape(rows, -1, 16)
