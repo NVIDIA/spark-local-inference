@@ -48,6 +48,8 @@ pub enum Part {
     },
     ToolResult {
         id: Option<String>,
+        /// The tool name a client gave the result, independent of its call.
+        name: Option<String>,
         content: Vec<Part>,
         is_error: bool,
     },
@@ -333,6 +335,7 @@ pub fn template_messages(
                 }
                 Part::ToolResult {
                     id,
+                    name,
                     content: parts,
                     is_error,
                 } => {
@@ -345,6 +348,9 @@ pub fn template_messages(
                         json!({"role":"tool","content":content(&parts)?,"is_error":is_error});
                     if let Some(id) = id {
                         result["tool_call_id"] = json!(id);
+                    }
+                    if let Some(name) = name {
+                        result["name"] = json!(name);
                     }
                     if hints.contains(&(message_index, part_index + 1)) {
                         // Zero denotes a complete tool result, including its wrapper.
@@ -465,6 +471,7 @@ mod tool_result_order_tests {
             role: Role::Tool,
             parts: vec![Part::ToolResult {
                 id: id.map(str::to_owned),
+                name: None,
                 content: vec![
                     Part::Text(label.into()),
                     Part::Image(format!("image:{label}:1")),

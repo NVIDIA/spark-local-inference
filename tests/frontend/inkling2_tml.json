@@ -15,7 +15,7 @@
   "Efforts above 0.99 are rejected, as SGLang's Inkling serving and the checkpoint template reject them; tml-renderers itself accepts efforts up to 1.",
   "Flare lowers developer instructions into one leading system message labeled 'System instructions:' and 'Developer instructions:' when any developer message is present.",
   "tool_choice=none removes the tool declaration; a named tool_choice declares only that tool; tool_choice=required appends Flare's required-tool instruction to the first system message, inserting one when absent.",
-  "Flare's tool results carry no name; tml-renderers resolves each result's name from the most recent preceding call with its tool_call_id, as it does for an unnamed OpenAI tool message.",
+  "A tool result's own name names its frames; tml-renderers names an unnamed result after the most recent preceding call with its tool_call_id.",
   "Flare orders a batch of tool results by the order of their calls.",
   "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
   "A JSON-schema response format appends Flare's schema instruction to the first system message.",
@@ -1811,6 +1811,119 @@
     "continuation": false
    },
    "input_ids": [200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,80,200010,200003,200004,87,200010]
+  },
+  {
+   "name": "named_results",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       },
+       {
+        "id": "b",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a",
+      "name": "browser",
+      "content": "renamed"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "b",
+      "name": "search",
+      "content": "same"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "zz",
+      "name": "lookup",
+      "content": "unmatched"
+     },
+     {
+      "role": "tool",
+      "name": "clock",
+      "content": "no id"
+     }
+    ]
+   },
+   "reference": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       },
+       {
+        "id": "b",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a",
+      "name": "browser",
+      "content": "renamed"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "b",
+      "name": "search",
+      "content": "same"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "zz",
+      "name": "lookup",
+      "content": "unmatched"
+     },
+     {
+      "role": "tool",
+      "name": "clock",
+      "content": "no id"
+     }
+    ],
+    "tools": [],
+    "effort": 0.9,
+    "continuation": false
+   },
+   "input_ids": [200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,80,200010,200001,1404,200049,90,1,930,1,25,1,1404,1,11,1,70747,1,25,70044,92,200010,200001,1404,200049,90,1,930,1,25,1,1404,1,11,1,70747,1,25,70044,92,200010,200006,200003,66457,200004,261,74282,200010,200003,1404,200004,1758,200010,200003,104024,200004,311,103065,200010,200003,4435,200004,316,150412,200010]
   },
   {
    "name": "failed_result",

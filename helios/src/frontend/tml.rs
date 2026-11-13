@@ -415,7 +415,7 @@ pub(super) fn render(
         prompt.boundary();
         Ok(())
     };
-    // Each tool result names the most recent preceding call with its ID.
+    // A tool result without a name takes the most recent preceding call with its ID.
     let mut calls: std::collections::HashMap<&str, &str> = Default::default();
     for (index, message) in messages.iter().enumerate() {
         if index == first_turn {
@@ -435,9 +435,13 @@ pub(super) fn render(
                 prompt.content(header, "", content, hints)?;
             }
             "tool" => {
-                let name = text_field(message, "tool_call_id")?
-                    .and_then(|id| calls.get(id).copied())
-                    .unwrap_or("");
+                // A result's own name wins over the name of its call, as in tml-renderers.
+                let name = match text_field(message, "name")?.filter(|name| !name.is_empty()) {
+                    Some(name) => name,
+                    None => text_field(message, "tool_call_id")?
+                        .and_then(|id| calls.get(id).copied())
+                        .unwrap_or(""),
+                };
                 prompt.content(prompt.tokens.tool, name, content, hints)?;
             }
             "assistant" => {

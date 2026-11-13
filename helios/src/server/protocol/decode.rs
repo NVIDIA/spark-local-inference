@@ -141,6 +141,7 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
             if role == Role::Tool {
                 parts.push(Part::ToolResult {
                     id: optional_id(v, "tool_call_id")?,
+                    name: optional_id(v, "name")?,
                     content: plain_parts(&v["content"], Protocol::Chat)?,
                     is_error: flag(v, "is_error", false)?,
                 });
@@ -197,6 +198,7 @@ fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<V
                     }],
                     "tool_result" => vec![Part::ToolResult {
                         id: Some(field(block, "tool_use_id")?.into()),
+                        name: None,
                         content: plain_parts(&block["content"], Protocol::Messages)?,
                         is_error: flag(block, "is_error", false)?,
                     }],
@@ -285,6 +287,7 @@ fn responses_messages(body: &Value) -> Result<Vec<Message>> {
                 Role::Tool,
                 vec![Part::ToolResult {
                     id: Some(field(&item, "call_id")?.into()),
+                    name: None,
                     content: plain_parts(&item["output"], Protocol::Responses)?,
                     is_error: false,
                 }],

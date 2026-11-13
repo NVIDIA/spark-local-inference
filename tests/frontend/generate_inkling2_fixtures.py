@@ -65,8 +65,8 @@ CONVENTIONS = [
     "'Developer instructions:' when any developer message is present.",
     "tool_choice=none removes the tool declaration; a named tool_choice declares only that tool; tool_choice=required "
     "appends Flare's required-tool instruction to the first system message, inserting one when absent.",
-    "Flare's tool results carry no name; tml-renderers resolves each result's name from the most recent preceding "
-    "call with its tool_call_id, as it does for an unnamed OpenAI tool message.",
+    "A tool result's own name names its frames; tml-renderers names an unnamed result after the most recent "
+    "preceding call with its tool_call_id.",
     "Flare orders a batch of tool results by the order of their calls.",
     "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
     "A JSON-schema response format appends Flare's schema instruction to the first system message.",
@@ -270,6 +270,12 @@ prompt("repeated_call_ids", {"messages": [
     {"role": "assistant", "content": None, "tool_calls": [call("c", "second", "{}")]},
     {"role": "tool", "tool_call_id": "c", "content": "r2"}]})
 prompt("unresolved_result", {"messages": [user("q"), {"role": "tool", "tool_call_id": "zz", "content": "x"}]})
+prompt("named_results", {"messages": [
+    user("q"), {"role": "assistant", "content": None, "tool_calls": [call("a", "search", "{}"), call("b", "search", "{}")]},
+    {"role": "tool", "tool_call_id": "a", "name": "browser", "content": "renamed"},
+    {"role": "tool", "tool_call_id": "b", "name": "search", "content": "same"},
+    {"role": "tool", "tool_call_id": "zz", "name": "lookup", "content": "unmatched"},
+    {"role": "tool", "name": "clock", "content": "no id"}]})
 prompt("failed_result", {"messages": [
     user("x"), {"role": "assistant", "content": None, "tool_calls": [call("c", "search", "{}")]},
     {"role": "tool", "tool_call_id": "c", "is_error": True, "content": "timeout"}]},
