@@ -7,7 +7,7 @@
 import json
 from dataclasses import replace
 import re
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -805,8 +805,10 @@ def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_p
         raise Captured
 
     monkeypatch.setattr(bootstrap, "PreparationConfig", config)
+    # Inkling 2 prepares one rank per host only.
+    hosts = dict(ranks=SimpleNamespace(hosts=tuple(f"host{i}" for i in range(world)))) if recipe.name == "inkling2" else {}
     with pytest.raises(Captured):
-        recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
+        recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None, **hosts)
 
 
 @pytest.mark.parametrize("configured,flag,expected", [(None, None, "runtime"), ("static", None, "static"),

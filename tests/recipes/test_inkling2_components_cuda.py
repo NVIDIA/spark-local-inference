@@ -668,7 +668,8 @@ def test_vocabulary_parallel_embedding_and_softcapped_logits(checkpoint, activat
     text = checkpoint.config.text
     ids = activations["ids"]
     shards = [checkpoint.global_weights(rank) for rank in range(4)]
-    rows = sum(embedding_rows(shard.embedding, ids, rank).float() for rank, shard in enumerate(shards))
+    rows = sum(embedding_rows(shard.embedding, ids, torch.full((1,), rank * shard.embedding.shape[0], device=device))
+               .float() for rank, shard in enumerate(shards))
     whole = checkpoint.global_weights()
     assert torch.equal(rows.to(torch.bfloat16), whole.embedding[ids])
     embedded = rms_norm(rows.to(torch.bfloat16), shards[0].embedding_norm, text.eps)

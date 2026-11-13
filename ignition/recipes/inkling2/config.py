@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -186,6 +186,12 @@ class TextConfig:
     @property
     def global_layers(self) -> tuple[int, ...]:
         return tuple(i for i in range(self.layers) if i not in self.local_layers)
+
+    def prefix(self, layers: int) -> "TextConfig":
+        """The geometry of the first `layers` decoder layers, which development preparation runs alone."""
+        if type(layers) is not int or not 1 <= layers <= self.layers:
+            raise ValueError(f"a decoder-layer prefix holds 1 through {self.layers} layers")
+        return replace(self, layers=layers, local_layers=frozenset(i for i in self.local_layers if i < layers))
 
 
 @dataclass(frozen=True)

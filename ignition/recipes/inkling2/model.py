@@ -31,6 +31,11 @@ class ModelWeights:
     rank: int
     world: int
 
+    @property
+    def draft(self):
+        """Prepared text graphs have no drafter; speculative decoding is unsupported."""
+        return None
+
     @classmethod
     def load(cls, manifest, device, *, config, rank, world, layers=None, progress=None):
         layout = checkpoint_layout(config, world)

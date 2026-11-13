@@ -18,10 +18,14 @@ import torch
 from ignition.components.linear import UnquantizedProjection
 
 
-def embedding_rows(table, ids, rank):
-    """This rank's embedding rows of `ids`, zero for IDs another rank holds and for padded rows (`ids < 0`)."""
+def embedding_rows(table, ids, first):
+    """This rank's embedding rows of `ids`, zero for IDs another rank holds and for padded rows (`ids < 0`).
+
+    `first` is the token ID of the rank's first table row, `rank * width`; compiled
+    forwards pass it as a device tensor so that every rank binds the same code.
+    """
     width = table.shape[0]
-    local = ids - rank * width
+    local = ids - first
     inside = (local >= 0) & (local < width)
     return torch.where(inside[:, None], table[local.clamp(0, width - 1)], 0)
 
@@ -38,11 +42,11 @@ class PreparedLogits:
         output = declaration_tensor(examples, "inkling.logits.local", (tokens, weight.shape[0]), torch.float32, device)
         self.projection = UnquantizedProjection(source, weight, output, session=session,
                                                 name=f"{name}.projection").functional(session=session)
-        self.softcap, self.valid = text.softcap, text.valid_vocabulary
-        self.first = rank * weight.shape[0]
+        self.softcap = text.softcap
+        # Rank-dependent values are device data, so every rank binds the same compiled code.
+        self.valid_columns = rank * weight.shape[0] + torch.arange(weight.shape[0], device=device) < text.valid_vocabulary
 
     def __call__(self, hidden):
         logits = self.projection(hidden)
         capped = self.softcap * torch.tanh(logits / self.softcap)
-        columns = self.first + torch.arange(logits.shape[1], device=logits.device)
-        return torch.where(columns < self.valid, capped, float("-inf"))
+        return torch.where(self.valid_columns, capped, float("-inf"))

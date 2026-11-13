@@ -79,7 +79,9 @@ class Collectives:
     experts: object
     amax: object | None
     world: int
-    rank: int
+    # This rank's index as a one-element int64 device tensor: compiled forwards read it as
+    # data, so every rank binds the code one rank compiled.
+    rank: torch.Tensor
 
     @classmethod
     def prepare(cls, text, *, mode, tokens, record, runtime, coordinator, session, name, examples=None):
@@ -87,8 +89,8 @@ class Collectives:
 
         examples = {} if examples is None else examples
         world = 1 if runtime is None else runtime.world_size
-        rank = 0 if runtime is None else runtime.rank
         device = torch.device("cuda", torch.cuda.current_device())
+        rank = torch.full((1,), 0 if runtime is None else runtime.rank, dtype=torch.int64, device=device)
 
         def buffer(role, shape, dtype=torch.bfloat16):
             return declaration_tensor(examples, role, shape, dtype, device)
@@ -230,7 +232,7 @@ class PreparedDecoder:
     """
 
     def __init__(self, weights, pool, metadata, *, mode, tokens, samples, vocabulary, runtime, vocabulary_runtime,
-                 coordinator, session, workspace, name):
+                 coordinator, session, workspace, name, examples=None):
         from types import SimpleNamespace
 
         from b12x.moe import fused_moe as moe
@@ -242,7 +244,8 @@ class PreparedDecoder:
         self.weights, self.pool, self.mode = weights, pool, mode
         text = weights.config.text
         self.text, self.vocabulary = text, vocabulary
-        examples = {}
+        # Graphs that run serially may share declaration storage; the caller clears it after construction.
+        examples = {} if examples is None else examples
         formats = {layer.experts.format for layer in weights.layers}
         record = max(moe.quantized_input_record_layout(text.hidden, {"nvfp4": "nvfp4_four_over_six",
                                                                      "mxfp8": "mxfp8"}[fmt])[-1] for fmt in formats)
@@ -267,17 +270,18 @@ class PreparedDecoder:
         self.scratch = SimpleNamespace(logits=torch.zeros((samples, vocabulary), dtype=torch.float32, device=device))
         self.head = SimpleNamespace(gather=SimpleNamespace(runtime=vocabulary_runtime))
         self.auxiliary = None
-        self.examples = examples
+        # The rank's first embedding row's token ID, as data for the same reason as `Collectives.rank`.
+        self.first_token = torch.full((1,), weights.rank * weights.embedding.shape[0], dtype=torch.int64,
+                                      device=device)
 
     def release_outputs(self):
         self.scratch = None
-        self.examples.clear()
 
     def embed(self, metadata):
         from .vocabulary import embedding_rows
 
         w = self.weights
-        rows = embedding_rows(w.embedding, metadata.token_ids, w.rank)
+        rows = embedding_rows(w.embedding, metadata.token_ids, self.first_token)
         rows = torch.where((metadata.positions >= 0)[:, None], rows, 0)
         return rms_norm(self.collectives.attention(rows), w.embedding_norm, self.text.eps)
 

@@ -75,7 +75,8 @@ def test_serving_modes_select_before_graph_construction(enabled, mtp_only, expec
         serving_modes(False, True)
 
 
-@pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
+@pytest.mark.parametrize("recipe", [recipe for recipe in recipes() if recipe.speculation is not None],
+                         ids=lambda recipe: recipe.name)
 @pytest.mark.parametrize("mtp_only", [False, True])
 def test_recipe_adapters_preserve_mtp_only_and_validate_direct_configs(monkeypatch, tmp_path, recipe, mtp_only):
     import huggingface_hub
