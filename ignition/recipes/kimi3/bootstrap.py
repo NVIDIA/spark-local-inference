@@ -105,6 +105,7 @@ class PreparationConfig:
     # Learned draft checkpoint selected by the recipe's speculation method.
     draft_checkpoint: Path | None = None
     draft_head_quantization: str | None = None
+    draft_body_quantization: str | None = None
     # Verification widths count the pending input and up to seven drafts.
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
@@ -133,6 +134,10 @@ class PreparationConfig:
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
             raise ValueError("Kimi draft head conversion requires draft weights")
+        if self.draft_body_quantization not in (None, "mxfp8"):
+            raise ValueError("Kimi draft body conversion must be omitted or mxfp8")
+        if self.draft_body_quantization is not None and not self.drafting:
+            raise ValueError("Kimi draft body conversion requires draft weights")
         if self.online_mxfp8_scope not in ("all", "kda-input"):
             raise ValueError("online MXFP8 scope must be all or kda-input")
         if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
@@ -270,7 +275,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8, online_mxfp8_scope=config.online_mxfp8_scope,
                                     draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision,
-                                    draft_head_quantization=config.draft_head_quantization)
+                                    draft_head_quantization=config.draft_head_quantization,
+                                    draft_body_quantization=config.draft_body_quantization)
         del manifest
         release_unused()
     transient = contextlib.ExitStack()

@@ -226,6 +226,20 @@ pub(crate) fn numeric_ranges(
     Ok(super::reachability::merge_ranges(ranges))
 }
 
+fn same_draft_body_quantization(
+    previous: &super::wire::RebuildManifest,
+    expected: &super::wire::RebuildManifest,
+) -> bool {
+    previous
+        .speculation
+        .as_ref()
+        .and_then(|s| s.draft_body_quantization.as_deref())
+        == expected
+            .speculation
+            .as_ref()
+            .and_then(|s| s.draft_body_quantization.as_deref())
+}
+
 impl Source {
     pub(crate) fn engram(
         &self,
@@ -311,9 +325,10 @@ impl Source {
                 || previous.online_mxfp8 != expected.online_mxfp8
                 || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
                     != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
+                || !same_draft_body_quantization(previous, &expected)
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and online MXFP8 conversion settings",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and draft conversion settings",
                 ));
             }
             return Ok(protection::verify(
@@ -584,7 +599,30 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Source;
+    use super::{Source, same_draft_body_quantization};
+    use helios_core::runtime_core::wire::{RebuildManifest, RebuildSpeculation};
+
+    #[test]
+    fn draft_body_quantization_must_match_for_weight_reuse() {
+        let manifest = |value: Option<&str>| RebuildManifest {
+            speculation: Some(RebuildSpeculation {
+                draft_body_quantization: value.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(same_draft_body_quantization(&manifest(None), &manifest(None)));
+        assert!(same_draft_body_quantization(
+            &manifest(Some("mxfp8")),
+            &manifest(Some("mxfp8"))
+        ));
+        for (previous, expected) in [(None, Some("mxfp8")), (Some("mxfp8"), None)] {
+            assert!(!same_draft_body_quantization(
+                &manifest(previous),
+                &manifest(expected)
+            ));
+        }
+    }
 
     #[test]
     fn source_metadata_preserves_envelope_bytes() {

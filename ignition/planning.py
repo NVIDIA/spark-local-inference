@@ -402,6 +402,8 @@ class Plan:
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
+                **({} if self.speculation.draft_body_quantization is None else {
+                    "draft_body_quantization": self.speculation.draft_body_quantization}),
                 "markov_head_quantization": self.speculation.markov_head_quantization,
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
                 **({"graph_budget": self.speculation.graph_budget}
@@ -465,6 +467,12 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
             if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):
                 raise UsageError(f"--{head}-head-quantization {value}: {checkpoint.alias}"
                                  " does not prepare this proposal head format")
+        body = speculation.draft_body_quantization
+        if body is not None and body not in recipe.draft_body_quantizations:
+            raise UsageError(f"--draft-body-quantization {body}: {checkpoint.alias}"
+                             " does not prepare this draft body format")
+        if body is not None and speculation.method != "dflash2":
+            raise UsageError("--draft-body-quantization requires --speculative-method dflash2")
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")

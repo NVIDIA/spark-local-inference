@@ -2719,6 +2719,7 @@ fn rebuild_compatible(
             (
                 s.proposal_source.clone(),
                 s.history_drafts,
+                s.draft_body_quantization.clone(),
                 s.draft_head_quantization.clone(),
                 s.markov_head_quantization.clone(),
                 s.vocabulary_parallel_sampling,
@@ -7117,7 +7118,7 @@ mod tests {
         explicit_scope.online_mxfp8_scope = "all".into();
         assert!(rebuild_compatible(&Some(omitted_scope), &Some(explicit_scope)));
 
-        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 9] = [
+        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 10] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),
             ("checkpoint-revision", |value| value.checkpoint_revision = "other".into()),
             ("local-checkpoint", |value| value.local_checkpoint = true),
@@ -7127,6 +7128,9 @@ mod tests {
             }),
             ("online-mxfp8", |value| value.online_mxfp8 = false),
             ("online-mxfp8-scope", |value| value.online_mxfp8_scope = "kda-input".into()),
+            ("draft-body-quantization", |value| {
+                value.speculation.as_mut().unwrap().draft_body_quantization = Some("mxfp8".into())
+            }),
             ("language-model-only", |value| value.language_model_only = true),
             ("mla-compute-mode", |value| value.mla_compute_mode = "sparse".into()),
         ];

@@ -1245,13 +1245,18 @@ taps and full-context BF16 cache; the two draft formats are not interchangeable.
 With seven drafts, each continuation row uses 35,450,112 bytes, including five
 1024-token latent rings. Target cache pages retain their 2,174,976-byte size.
 
-The body and shared target vocabulary head remain BF16 with the default KDA-input-only
-online conversion. `--online-mxfp8-scope all` converts the eligible DFlash2 body projections
-to MXFP8 together with the broader target conversion described above. An explicit
-`--draft-head-quantization mxfp8` or `nvfp4` prepares a separate proposal-head copy; it does
-not convert the target head. Preparation rejects the flag for the Inferact DSpark draft.
-Quantized draft weight storage and the effect on acceptance must be evaluated for the workload.
-The example keeps the BF16 body and head.
+The body and shared target vocabulary head remain BF16 with the default
+KDA-input-only online conversion. `--draft-body-quantization mxfp8` converts
+eligible DFlash2 body context, attention latent/query/output, and MLP projections
+independently of target conversion; it does not require `--online-mxfp8`.
+`--online-mxfp8-scope all` also converts these body projections together with the
+broader target conversion described above. Normalization, convolution,
+candidate-selector, and absorbed key/value weights retain their precision.
+An explicit `--draft-head-quantization mxfp8` or `nvfp4` prepares a separate
+proposal-head copy; it does not convert the target head. Preparation rejects
+body or head conversion for the Inferact DSpark draft. Quantized draft weight
+storage and the effect on acceptance must be evaluated for the workload. The
+example keeps the BF16 body and head.
 
 Qualified by checkpoint-backed numerical tests: MLA attention and
 accepted-context projection. To validate TP16 graph replay of the draft body and

@@ -38,7 +38,8 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
-             online_mxfp8_scope="all", peers=None, vision=True, draft_head_quantization=None):
+             online_mxfp8_scope="all", peers=None, vision=True, draft_head_quantization=None,
+             draft_body_quantization=None):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
         ``draft_checkpoint`` loads the declared DSpark or DFlash2 checkpoint.
@@ -63,11 +64,19 @@ class ModelWeights:
         else:
             vision = None
         draft = None
+        if draft_checkpoint is None and draft_body_quantization is not None:
+            raise ValueError("DFlash2 body conversion requires draft weights")
+        if draft_body_quantization not in (None, "mxfp8"):
+            raise ValueError("DFlash2 body conversion must be omitted or mxfp8")
         if draft_checkpoint is not None:
             raw_draft = json.loads((Path(draft_checkpoint) / "config.json").read_text())
+            draft_online_mxfp8 = online_mxfp8 and online_mxfp8_scope == "all"
             if raw_draft.get("architectures") == ["DFlash2DraftModel"]:
                 from ignition.recipes.kimi31.dflash_weights import DraftWeights
+                draft_online_mxfp8 = draft_online_mxfp8 or draft_body_quantization == "mxfp8"
                 draft_config, draft_args = DSparkConfig, dict(draft_head_quantization=draft_head_quantization)
+            elif draft_body_quantization is not None:
+                raise ValueError("DFlash2 body conversion requires DFlash2 draft weights")
             elif draft_head_quantization is not None:
                 raise ValueError("Kimi draft head conversion requires the MLA DFlash2 draft")
             elif config.dsa is None:
@@ -81,7 +90,7 @@ class ModelWeights:
                 draft_args = dict(target_embedding=embedding)
             config = replace(config, draft=draft_config.load(draft_checkpoint, config))
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8 and online_mxfp8_scope == "all", **draft_args)
+                                      online_mxfp8=draft_online_mxfp8, **draft_args)
         return cls(config, shard, embedding, norm, head, output_res_score, tuple(layers),
                    loader.scale_scratch, allocated_tensor_bytes(device) - before, vision=vision, draft=draft)
 

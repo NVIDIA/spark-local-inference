@@ -174,6 +174,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
+        ("--draft-body-quantization", getattr(args, "draft_body_quantization", None)),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
         ("--markov-head-quantization", getattr(args, "markov_head_quantization", None)),
         ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None)) if value is not None]
@@ -214,13 +215,17 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     if budget is not None and (type(budget) is not int or budget < 1):
         raise UsageError("--speculative-graph-budget must be a positive integer")
     draft_head = getattr(args, "draft_head_quantization", None)
+    draft_body = getattr(args, "draft_body_quantization", None)
     markov_head = getattr(args, "markov_head_quantization", None)
     if (draft_head or markov_head) and drafts < 1:
         raise UsageError("draft head quantization requires positive learned draft depth")
+    if draft_body and drafts < 1:
+        raise UsageError("draft body quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        mtp_only=args.mtp_only,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
-                       draft_head_quantization=draft_head, markov_head_quantization=markov_head,
+                       draft_head_quantization=draft_head, draft_body_quantization=draft_body,
+                       markov_head_quantization=markov_head,
                        vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)
 
 

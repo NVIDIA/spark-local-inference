@@ -198,6 +198,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
+    advanced.add_argument("--draft-body-quantization", choices=("mxfp8",),
+                          help="prepare eligible DFlash2 draft-body projections as MXFP8 independently of"
+                               " target and proposal-head precision (Kimi K3.1; default: checkpoint precision)")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"

@@ -250,7 +250,7 @@ def from_plan(model, plan, *, compiled_forwards):
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:
             result['speculation']['graph_budget'] = s.graph_budget
-        for field in ('draft_head_quantization', 'markov_head_quantization'):
+        for field in ('draft_body_quantization', 'draft_head_quantization', 'markov_head_quantization'):
             if (value := getattr(s, field)) is not None:
                 result['speculation'][field] = value
     return result
