@@ -575,7 +575,12 @@ sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requi
 compiled cubins; missing native GPU code fails instead of compiling PTX.
 
 `LoadOptions` selects runtime concurrency, maximum actual MTP draft count, and
-adaptive or fixed prefix selection before CUDA initialization. Every required
+adaptive or fixed prefix selection before CUDA initialization. It also selects
+whether captured mixed prefill/generation graphs are retained. The default
+retains eligible mixed graphs; explicit enable requires at least one eligible
+mixed graph on each rank, and explicit disable removes every mixed graph before
+graph bodies and kernels are loaded. Required separate graphs, captured storage
+layouts, and the signed core remain unchanged. Every required
 power-of-two request bucket has width-one execution. Wider programs fit the
 prepared aggregate target envelope. A core must include its configured
 maximum prefill chunk; intermediate prefill capacities are optional.

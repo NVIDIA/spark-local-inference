@@ -456,8 +456,9 @@ adaptive-verification exponent 1. No millisecond cap applies to a frame or to
 the queued frames together. When the oldest queued graph runs past its expected
 finish, further queueing stops until its completion arrives. The coefficients
 are preferences, not latency bounds. Mixed prefill/generation graphs are
-scheduled when the core supplies them; Ignition captures them only with
-`--mixed-prefill`. See
+scheduled when the selected catalog supplies them; Ignition captures them only
+with `--mixed-prefill`. Native `flare run --no-mixed-prefill` excludes them
+without changing the core. See
 [the native scheduling design](../docs/scheduling-runtime-design.md#policy-preferences).
 
 Admission reserves checkpoints for the selected message boundaries, the prompt

@@ -27,6 +27,8 @@ pub struct LoadOptions {
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
+    /// Retain eligible mixed graphs by default; explicit enable requires an eligible graph.
+    pub mixed_prefill: Option<bool>,
     pub mtp_draft_tokens: Option<usize>,
     pub history_drafts: Option<bool>,
     /// Select one exact packed verification capacity per batch before proposal sampling.
@@ -253,6 +255,7 @@ impl LoadOptions {
             }
             execution.graphs.retain(|graph| {
                 graph.batch_capacity <= active.next_power_of_two() as u64
+                    && (graph.kind != "mixed" || self.mixed_prefill != Some(false))
                     && graph.speculation_enabled.is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
                     && (!(graph.kind == "speculative" || graph.kind == "mixed" && enabled)
@@ -277,6 +280,13 @@ impl LoadOptions {
             execution.graphs.retain(|graph| graph.draft_tokens.is_none_or(|depth|
                 depths[&(graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
                     graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone())] == depth));
+            if self.mixed_prefill == Some(true)
+                && !execution.graphs.iter().any(|graph| graph.kind == "mixed")
+            {
+                return Err(invalid(format!(
+                    "rank {rank} has no mixed prefill graph within selected generation geometry"
+                )));
+            }
             for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
                 for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
                     if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == batch as u64
@@ -1260,6 +1270,37 @@ mod tests {
     fn mixed_core() -> Core {
         let mut p = core();
         for enabled in [false, true] {
+            let name = format!("prefill512-{enabled}");
+            p.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+                name: name.clone(),
+                kind: "prefill".into(),
+                sampling_mode: "general".into(),
+                batch_capacity: 1,
+                token_capacity: 512,
+                speculation_enabled: Some(enabled),
+                ..Default::default()
+            });
+            let function = p.functions.len();
+            p.functions.push(Function {
+                id: function,
+                module: name.clone(),
+                symbol: "kernel".into(),
+                parameter_sizes: vec![],
+                attributes: vec![],
+            });
+            p.modules.push(Module {
+                name: name.clone(),
+                file: format!("{name}.cubin"),
+                globals: vec![],
+            });
+            p.graphs.push(Graph {
+                resource: name.clone(),
+                name,
+                node_count: 1,
+                edge_count: 0,
+                flags: 0,
+                functions: vec![function],
+            });
             for prefill in [64, 512] {
                 for width in if enabled { vec![1, 3, 6] } else { vec![1] } {
                     let name = format!("mixed-4-{prefill}-{width}-{enabled}");
@@ -1280,13 +1321,26 @@ mod tests {
                             draft_source: if enabled { 1 } else { 0 },
                             ..Default::default()
                         });
+                    let function = p.functions.len();
+                    p.functions.push(Function {
+                        id: function,
+                        module: name.clone(),
+                        symbol: "kernel".into(),
+                        parameter_sizes: vec![],
+                        attributes: vec![],
+                    });
+                    p.modules.push(Module {
+                        name: name.clone(),
+                        file: format!("{name}.cubin"),
+                        globals: vec![],
+                    });
                     p.graphs.push(Graph {
+                        resource: name.clone(),
                         name,
-                        resource: "mixed".into(),
                         node_count: 1,
                         edge_count: 0,
                         flags: 0,
-                        functions: vec![0],
+                        functions: vec![function],
                     });
                 }
             }
@@ -1330,6 +1384,129 @@ mod tests {
                     assert_eq!(graph.packed_tokens(), prefill + 3 * width);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn mixed_prefill_override_retains_separate_graphs_and_prunes_resources() {
+        for (drafts, adaptive) in [(0, true), (2, true), (2, false)] {
+            let mut baseline = [mixed_core(), mixed_core()];
+            let mut c = config();
+            c["prefill_chunk_size"] = 512.into();
+            let options = LoadOptions {
+                mtp_draft_tokens: Some(drafts),
+                adaptive_verification: Some(adaptive),
+                ..Default::default()
+            };
+            let mut enabled = [mixed_core(), mixed_core()];
+            let mut disabled = [mixed_core(), mixed_core()];
+            let mut enabled_config = c.clone();
+            let mut disabled_config = c.clone();
+            assert_eq!(options.select(&mut baseline, &mut c).unwrap(), 4);
+            assert_eq!(
+                LoadOptions { mixed_prefill: Some(true), ..options.clone() }
+                    .select(&mut enabled, &mut enabled_config).unwrap(),
+                4
+            );
+            assert_eq!(
+                LoadOptions { mixed_prefill: Some(false), ..options }
+                    .select(&mut disabled, &mut disabled_config).unwrap(),
+                4
+            );
+            assert_eq!(enabled_config, c);
+            assert_eq!(disabled_config, c);
+            for ((baseline, enabled), disabled) in
+                baseline.iter().zip(&enabled).zip(&disabled)
+            {
+                let graphs = &baseline.execution.as_ref().unwrap().graphs;
+                assert!(graphs.iter().any(|g| g.kind == "mixed"));
+                assert!(graphs.iter().any(|g| g.kind == "prefill"));
+                assert_eq!(&enabled.execution.as_ref().unwrap().graphs, graphs);
+                let separate: Vec<_> = graphs.iter()
+                    .filter(|g| g.kind != "mixed").cloned().collect();
+                assert_eq!(&disabled.execution.as_ref().unwrap().graphs, &separate);
+                let names: HashSet<_> = separate.iter().map(|g| g.name.as_str()).collect();
+                assert_eq!(
+                    disabled.graphs.iter().map(|g| g.name.as_str()).collect::<HashSet<_>>(),
+                    names
+                );
+                assert_eq!(
+                    disabled.modules.iter().map(|m| m.name.as_str()).collect::<HashSet<_>>(),
+                    names
+                );
+                assert!(disabled.functions.iter().all(|f| names.contains(f.module.as_str())));
+                assert_eq!(disabled.functions.len(), separate.len());
+                assert_eq!(disabled.allocations.len(), baseline.allocations.len());
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_prefill_explicit_enable_requires_eligible_capture() {
+        for (make_core, concurrency) in [
+            (core as fn() -> Core, 4), (mixed_core, 1), (mixed_core, 2),
+        ] {
+            let mut c = config();
+            c["prefill_chunk_size"] = 512.into();
+            let options = LoadOptions {
+                max_concurrency: Some(concurrency),
+                ..Default::default()
+            };
+            for mixed_prefill in [None, Some(false)] {
+                LoadOptions { mixed_prefill, ..options.clone() }
+                    .select(&mut [make_core()], &mut c.clone()).unwrap();
+            }
+            let error = LoadOptions { mixed_prefill: Some(true), ..options }
+                .select(&mut [make_core()], &mut c).unwrap_err();
+            assert!(error.to_string().contains("no mixed prefill graph"));
+        }
+    }
+
+    #[test]
+    fn mixed_prefill_disable_preserves_capture_validation() {
+        let mut p = mixed_core();
+        p.execution.as_mut().unwrap().graphs.iter_mut()
+            .find(|g| g.kind == "mixed").unwrap().prefill_capacity = 65;
+        let mut c = config();
+        c["prefill_chunk_size"] = 512.into();
+        let error = LoadOptions { mixed_prefill: Some(false), ..Default::default() }
+            .select(&mut [p], &mut c).unwrap_err();
+        assert!(error.to_string().contains("invalid or duplicate serving graph variant"));
+    }
+
+    #[test]
+    fn mixed_prefill_disable_prunes_only_unreferenced_startup_producers() {
+        for mixed_prefill in [Some(true), Some(false)] {
+            let mut p = mixed_core();
+            let tuning = tuning_core();
+            let execution = p.execution.as_mut().unwrap();
+            let tuning_execution = tuning.execution.unwrap();
+            execution.buffers = tuning_execution.buffers;
+            execution.tuning_graphs = tuning_execution.tuning_graphs;
+            p.graphs.extend(tuning.graphs.into_iter().filter(|g| {
+                g.name == "tune" || g.name == "unused_tune"
+            }));
+            execution.graphs.iter_mut().find(|g| g.name == "decode1-no-mtp").unwrap()
+                .tuned_bindings.push(wire::TunedBinding {
+                    buffer: "winner".into(), tuning_graph: "tune".into(),
+                });
+            execution.graphs.iter_mut().find(|g| {
+                g.kind == "mixed" && g.speculation_enabled == Some(false)
+            }).unwrap().tuned_bindings.push(wire::TunedBinding {
+                buffer: "unused_winner".into(), tuning_graph: "unused_tune".into(),
+            });
+            let mut c = config();
+            c["prefill_chunk_size"] = 512.into();
+            LoadOptions {
+                mtp_draft_tokens: Some(0),
+                mixed_prefill,
+                ..Default::default()
+            }.select(std::slice::from_mut(&mut p), &mut c).unwrap();
+            let keep_mixed = mixed_prefill == Some(true);
+            assert_eq!(p.execution.as_ref().unwrap().tuning_graphs.len(),
+                if keep_mixed { 2 } else { 1 });
+            assert!(p.graphs.iter().any(|g| g.name == "tune"));
+            assert_eq!(p.graphs.iter().any(|g| g.name == "unused_tune"), keep_mixed);
         }
     }
 

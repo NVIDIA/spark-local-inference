@@ -1874,6 +1874,30 @@ fn mixed_value_selects_an_efficiency_knee_and_a_fitting_prompt_tail() {
 }
 
 #[test]
+fn empty_mixed_catalog_completes_overlapping_prompt_and_generation() {
+    for speculative in [false, true] {
+        let mut s = mixed_engine(2, speculative, &[]);
+        let decoder = add(&mut s, 1, 64, 128);
+        ready(&mut s, &[decoder]);
+        let prompt = add(&mut s, 2, 8192, 128);
+        initialize(&mut s, prompt);
+        let mut prefill = false;
+        let mut generation = false;
+        for _ in 0..1000 {
+            if s.slots.iter().all(|slot| slot.request.is_none()) {
+                break;
+            }
+            let plan = step(&mut s, if speculative { 3 } else { 0 });
+            assert_ne!(plan.kind, GraphKind::Mixed);
+            prefill |= plan.kind == GraphKind::Prefill;
+            generation |= matches!(plan.kind, GraphKind::Decode | GraphKind::Speculative);
+        }
+        assert!(prefill && generation);
+        assert!(s.slots.iter().all(|slot| slot.request.is_none()));
+    }
+}
+
+#[test]
 fn mixed_shapes_can_win_with_either_phase_unoccupied() {
     let mut s = mixed_engine(2, false, &[(2, 1, 4096, MS)]);
     throughput_only(&mut s);
