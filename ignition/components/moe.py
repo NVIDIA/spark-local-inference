@@ -17,7 +17,7 @@ from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 from ignition.preparation.fixtures import fused_moe as moe_fixtures
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
 
 def _prepare_scale_expansion(state, *, ids, experts, workspace):
@@ -337,3 +337,179 @@ class PreparedRoutedExperts:
         return self.output
 
 
+
+
+def record_views(records, width, format):
+    """Views `(values, block_scales, row_amax)` into `[rows, record]` uint8 expert-input records.
+
+    The offsets are `fused_moe.quantized_input_record_layout`'s. The views are
+    taken without reading the storage address, which a traced forward does not
+    have; the operations that consume them validate alignment when they run.
+    """
+    values, scales, amax, record = fused_moe.quantized_input_record_layout(width, format)
+    if records.ndim != 2 or records.shape[1] != record or records.dtype != torch.uint8:
+        raise ValueError(f"expert-input records must be uint8 [rows, {record}]")
+    if format == "mxfp8":
+        return records[:, values:values + width], records[:, scales:scales + width // 32], None
+    return (records[:, values:values + width // 2], records[:, scales:scales + width // 16],
+            records[:, amax:amax + 4].view(torch.float32)[:, 0])
+
+
+class PreparedRowQuantization:
+    """Prepared quantization of BF16 activation rows into packed expert-input records.
+
+    One `[rows, record]` byte buffer holds each row's packed values, block scales
+    and, for NVFP4, its FP32 amax (`fused_moe.quantized_input_record_layout`).
+    `nvfp4_four_over_six` encodes with outer scale `amax / 1536` and four-over-six
+    block scales; `mxfp8` with one UE8M0 scale per 32 values. A rank that owns
+    token rows quantizes them once, and the records move between ranks as bytes.
+    """
+
+    def __init__(self, source, records, *, format, session: PreparationSession, name: str):
+        rows, width = source.shape
+        *_, record = fused_moe.quantized_input_record_layout(width, format)
+        if source.dtype != torch.bfloat16 or not source.is_contiguous():
+            raise ValueError("row quantization reads contiguous BF16 rows")
+        if records.shape != (rows, record) or records.dtype != torch.uint8:
+            raise ValueError(f"quantized records must be uint8 [rows, {record}]")
+        self.width, self.format, self.record = width, format, record
+        self.source, self.records = source, records
+        self.plan = fused_moe.plan_row_quantization(fused_moe.RowQuantizationInvocation(
+            max_rows=rows, width=width, format=format))
+        views = fused_moe.quantized_input_record_views(records, width, format)
+        declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(source, *views), owners=(source, records))),))
+
+    def functional(self, *, session):
+        """Allocate records within the traced forward."""
+        del session
+        self.source = self.records = None
+        return self
+
+    def views(self, records):
+        return record_views(records, self.width, self.format)
+
+    def __call__(self, source, records=None):
+        if records is None:
+            records = torch.empty((source.shape[0], self.record), dtype=torch.uint8, device=source.device)
+        fused_moe.quantize_rows(self.plan, source, *self.views(records))
+        return records
+
+
+@dataclass(frozen=True)
+class PendingExperts:
+    """Phase-one results that phase two consumes: shared scratch and per-route activation amax."""
+
+    scratch: torch.Tensor
+    row_amax: torch.Tensor | None
+
+
+class PreparedTwoPhaseExperts:
+    """Experts on quantized input records whose FC1 and FC2 run as separate prepared phases.
+
+    Each route's activation is multiplied by its routing weight before the FC2
+    input is quantized, and routes sum with unit weights; inactive routes (IDs
+    outside the expert range) contribute zero. Under four-over-six NVFP4
+    activations, phase one also returns each route's activation amax and phase
+    two encodes the activation with a supplied amax. A rank that holds a slice of
+    every expert's intermediate channels supplies the maximum of all ranks' amax,
+    so its slice encodes exactly its columns of the unsliced activation. The FC
+    gains divide by the checkpoint's weight-scale `denominators`.
+
+    Phase one leaves packed routes and the activation in scratch that phase two
+    reads; no operation between the phases may reuse that scratch.
+    """
+
+    def __init__(self, experts, records, ids, weights, output, *, format, session: PreparationSession, name: str,
+                 denominators=None, workspace: ScratchArena | None = None):
+        from b12x.moe.fused_moe.workloads import make_tuning_routes
+
+        tokens, hidden = output.shape
+        if ids.shape != weights.shape or ids.shape[0] != tokens or ids.dtype != torch.int32 or weights.dtype != torch.float32:
+            raise ValueError("expert routes require int32 IDs and FP32 weights of matching [tokens, top_k] shape")
+        self.nvfp4 = format == "nvfp4_four_over_six"
+        if self.nvfp4 != (denominators is not None):
+            raise ValueError("four-over-six NVFP4 experts require their weight-scale denominators")
+        self.format, self.hidden, self.top_k = format, hidden, ids.shape[1]
+        self.experts = experts
+        self.plan = fused_moe.plan_execution(
+            experts=experts, capacity=fused_moe.ExecutionCapacity(max_tokens=tokens, top_k=ids.shape[1]),
+            routing=fused_moe.RoutingSpec(apply_router_weight_on_activation=True,
+                                          **({} if denominators is None else
+                                             {"weight_scale_denominators": tuple(denominators)})))
+        self.records, self.ids, self.weights, self.output = records, ids, weights, output
+
+        def bound(state, scratch, records, ids, weights, output):
+            values, scales, amax = fused_moe.quantized_input_record_views(records, hidden, format)
+            return state.bind(a=values, input_block_scales=scales, input_row_scale=amax, topk_ids=ids,
+                              topk_weights=weights, output=output, scratch=scratch)
+
+        def prepare_call(state):
+            scratch = planned_scratch(state.scratch_specs(), workspace)
+            binding = bound(state, scratch, records, torch.zeros_like(ids), torch.ones_like(weights), output)
+            return PreparedCall(run=binding.run, owners=prime_owners(workspace, scratch, binding))
+
+        def benchmark_call(state):
+            # Tile races time BF16 rows, which phase one quantizes, over the shared tuning route mix.
+            def inputs():
+                generator = torch.Generator(device="cpu").manual_seed(7919)
+                rows = torch.randn((tokens, hidden), generator=generator).to(device=output.device, dtype=torch.bfloat16)
+                routes = make_tuning_routes(tokens, ids.shape[1], experts.num_experts, device=output.device)
+                return dict(rows=rows, routes=routes.to(torch.int32), weights=torch.ones_like(weights),
+                            output=torch.empty_like(output))
+
+            operands = benchmark_resource(session, ("two_phase_experts", name), inputs)
+            scratch = planned_scratch(state.scratch_specs(), workspace)
+            bindings = [state.bind(a=operands["rows"], topk_ids=route, topk_weights=operands["weights"],
+                                   output=operands["output"], scratch=scratch) for route in operands["routes"]]
+            index = [0]
+
+            def run():
+                bindings[index[0] % len(bindings)].run()
+                index[0] += 1
+
+            # Phase one reads the routes and rows without mutating them, so trials need no fresh inputs.
+            return PreparedCall(run=run, produce=lambda: None,
+                                owners=(*prime_owners(workspace, scratch, bindings), operands),
+                                output=operands["output"])
+
+        declare(session, (self.plan.request(name=name, prepare_call=prepare_call, benchmark_call=benchmark_call),))
+
+        def finalize():
+            specs = self.plan.scratch_specs()
+            if len(specs) != 1 or specs[0].dtype != torch.uint8:
+                raise ValueError("two-phase experts require one prepared byte workspace")
+            self.workspace_nbytes = specs[0].nbytes
+
+        register_finalizer(session, finalize, workspace=workspace)
+
+    def functional(self, *, session):
+        """Allocate scratch, amax and outputs within the traced forward."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.dtype)
+            self.records = self.ids = self.weights = self.output = None
+        return self
+
+    def views(self, records):
+        return record_views(records, self.hidden, self.format)
+
+    def phase1(self, records, ids, weights) -> PendingExperts:
+        """Pack routes, project and activate them; return the scratch and each route's activation amax."""
+        from b12x.moe.fused_moe._binding_ops import prepared_moe_phase1_out
+
+        scratch = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=records.device)
+        row_amax = (torch.empty(ids.numel(), dtype=torch.float32, device=records.device) if self.nvfp4 else None)
+        prepared_moe_phase1_out(*self.views(records), weights, ids, row_amax, scratch, self.plan.handle)
+        return PendingExperts(scratch, row_amax)
+
+    def phase2(self, pending: PendingExperts, ids, weights, row_amax=None):
+        """Quantize the activation with `row_amax` (every rank's maximum), project it and sum routes."""
+        from b12x.moe.fused_moe._binding_ops import prepared_moe_phase2_out
+
+        if self.nvfp4 != (row_amax is not None) or row_amax is not None and row_amax.shape != (ids.numel(),):
+            raise ValueError("four-over-six experts require one FP32 amax per route; MXFP8 experts take none")
+        shape, dtype = self.output_layout
+        output = torch.empty((ids.shape[0], shape[1]), dtype=dtype, device=ids.device)
+        prepared_moe_phase2_out(weights, ids, row_amax, output, pending.scratch, self.plan.handle)
+        return output

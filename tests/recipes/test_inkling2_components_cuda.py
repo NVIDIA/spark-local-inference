@@ -236,3 +236,231 @@ def test_prepared_attention_matches_the_canonical_rank_attention(checkpoint, act
     gated8 = ref.gate_sink(output8, lse8, parts.gate, parts.sink)
     report(f"{label} canonical attention with E4M3 K/V against BF16 K/V", gated8[:1405], parts.gated[:1405])
     report(f"{label} prefill against canonical attention with E4M3 K/V", gated[:1405], gated8[:1405])
+
+
+def _spacing(value):
+    """Distance from |x| to the next BF16 value: at most `2^-7 |x|`."""
+    return torch.exp2(torch.floor(torch.log2(value.abs().clamp_min(2.0 ** -126))) - 7)
+
+
+def situ_error(gate, up, gamma, gate_error, up_error, activation):
+    """Bound of |SiTU(g', u') gamma - SiTU(g, u) gamma| rounded to BF16 on both sides.
+
+    `|d/dg 4 tanh(g / 4) sigmoid(g)| <= 2`, `|4 tanh(g / 4) sigmoid(g)| <= min(|g|, 4)`,
+    `|d/du 25 tanh(u / 25)| <= 1` and `|25 tanh(u / 25)| <= min(|u|, 25)`. The
+    approximate `tanh`, `ex2` and reciprocal instructions of the kernel add at most
+    `2^-9` of the value; each BF16 rounding at most one BF16 step.
+    """
+    g, u, w = gate.double().abs(), up.double().abs(), gamma.double().abs()[:, None]
+    propagated = w * (2 * gate_error * torch.clamp(u + up_error, max=25.0)
+                      + up_error * torch.clamp(g + gate_error, max=4.0))
+    return propagated + 2.0 ** -9 * activation.double().abs() + 2 * _spacing(activation.double().abs() + propagated)
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+@torch.no_grad()
+def test_prepared_experts_match_the_canonical_four_rank_experts(checkpoint, activations, layer):
+    """Router, records, both phases and the cross-rank amax of four rank slices on one GPU.
+
+    The canonical four-rank experts (`ref.routed_experts_ranks`) run on the layer's
+    real MLP input. The prepared ranks run with the canonical routes. Each stage is
+    checked on its own inputs: FC1 activations within the propagated projection and
+    SiTU bound, FC2 inputs bit-equal to the canonical quantizer applied to the
+    prepared activation and the every-rank amax, FC2 route rows within one
+    projection's rounding, and token sums equal to the FP32 route-order sum.
+    """
+    from b12x.moe import fused_moe as moe
+
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.experts import ExpertWeights, PreparedExperts, prepare_experts
+    from ignition.reference import inkling2 as ref
+    from tests.recipes.inkling2_bounds import FP32
+
+    device = checkpoint.device
+    text = checkpoint.config.text
+    expert_format = checkpoint.config.expert_format(layer)
+    nvfp4 = expert_format == "nvfp4"
+    source = activations[layer]["mlp_input"]
+    tokens, hidden = source.shape
+    width, top_k = text.intermediate // 4, text.experts_per_token
+    placed = [load_rank(checkpoint, layer, rank, experts=True) for rank in range(4)]
+    canonical = [reference_weights(values) for values in placed]
+    ids_ref, gamma_ref = ref.route(source, canonical[0].router, canonical[0].router_bias, top_k=top_k,
+                                   route_scale=text.route_scale)
+    partials_ref, records_ref = ref.routed_experts_ranks(canonical, text, source)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="inkling-2-small", workload_schema="inkling2-components-v1",
+                                    numerical_policy="default") as session:
+        session.register_scratch(arena)
+        modules = []
+        for rank, values in enumerate(placed):
+            experts, denominators = prepare_experts({role: value.clone() for role, value in values.items()},
+                                                    format=expert_format, hidden=hidden, intermediate=width)
+            modules.append(PreparedExperts(ExpertWeights(values["router"], values["router_bias"], experts,
+                                                         expert_format, denominators),
+                                           text, tokens=tokens, session=session, workspace=arena,
+                                           name=f"layer{layer}.rank{rank}"))
+        session.tune()
+        arena.release_preparation()
+        valid = torch.tensor([tokens], dtype=torch.int32, device=device)
+
+        # Router: FP32 logits within accumulation error; equal selections away from ties.
+        logits = modules[0].router_projection(source)
+        logits_ref = ref.matmul(source, canonical[0].router)
+        limit = 2 * hidden * FP32 * (source.double().abs() @ canonical[0].router.double().abs().t())
+        report(f"layer {layer} router logits", logits, logits_ref, limit)
+        assert bool(((logits.double() - logits_ref.double()).abs() <= limit).all())
+        ids, gamma = modules[0].route(source, valid)
+        selection = torch.sigmoid(logits_ref.double()) + canonical[0].router_bias.double()
+        ranked = selection.sort(-1, descending=True).values
+        margin = ranked[:, top_k - 1] - ranked[:, top_k]
+        same = (ids.long().sort(-1).values == ids_ref.sort(-1).values).all(-1)
+        # sigmoid is 1/4-Lipschitz: selections can change only where the margin is within the logit error.
+        assert bool((same | (margin <= 0.5 * limit.amax(-1))).all())
+        matched = (ids.long() == ids_ref).all(-1)
+        print(f"layer {layer} routing: {int(same.sum())}/{tokens} rows select the canonical experts, "
+              f"{int(matched.sum())} in the canonical order")
+        # |d log w_k| <= |d log sigmoid(l_k)| + |d log sum_j sigmoid(l_j)| <= 2 max_j |d l_j|, plus FP32 rounding.
+        relative = (2 * limit.amax(-1, keepdim=True) + 2.0 ** -20)[matched]
+        gamma_difference = (gamma[matched].double() - gamma_ref[matched].double()).abs()
+        assert bool((gamma_difference <= relative * gamma_ref[matched].double().abs()).all())
+
+        # Records: the owner-rank quantizer is the canonical quantizer, byte for byte.
+        records = modules[0].quantize(source)
+        values, scales, amax = modules[0].experts.views(records)
+        quantized = ref._quantize(source, expert_format)
+        if nvfp4:
+            codes = torch.stack((values & 15, values >> 4), -1).flatten(-2).long()
+            table = torch.tensor(ref._E2M1, dtype=torch.float32, device=device)
+            assert torch.equal(table[codes], quantized.values)
+            assert torch.equal(scales.view(torch.float8_e4m3fn).float(), quantized.scales.float())
+            assert torch.equal(amax, quantized.amax)
+        else:
+            assert torch.equal(values.view(torch.float8_e4m3fn).float(), quantized.values.float())
+            assert torch.equal(scales, quantized.exponents)
+
+        # Both phases of every rank with the canonical routes and the every-rank amax.
+        ids32, gamma32 = ids_ref.int().contiguous(), gamma_ref.float().contiguous()
+        bindings, outputs = [], []
+        global_amax = torch.zeros(tokens * top_k, dtype=torch.float32, device=device) if nvfp4 else None
+        for module in modules:
+            scratch = torch.empty(module.experts.workspace_nbytes, dtype=torch.uint8, device=device)
+            output = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=device)
+            extra = dict(local_row_amax=torch.empty(tokens * top_k, device=device),
+                         intermediate_row_amax=global_amax) if nvfp4 else {}
+            bindings.append(moe.bind(module.experts.plan, a=values, input_block_scales=scales,
+                                     input_row_scale=amax, topk_ids=ids32, topk_weights=gamma32, output=output,
+                                     scratch=scratch, **extra))
+            outputs.append(output)
+        for binding in bindings:
+            moe.run_phase1(binding=binding)
+        if nvfp4:
+            global_amax.copy_(torch.stack([binding.local_row_amax for binding in bindings]).amax(0))
+        for binding in bindings:
+            moe.run_phase2(binding=binding)
+        torch.cuda.synchronize(device)
+
+        live = ((ids_ref >= 0) & (ids_ref < text.experts)).flatten()
+        assert bool(live.all())
+        worst = {"activation": 0.0, "routes": 0.0}
+        for rank, (binding, record, weights) in enumerate(zip(bindings, records_ref, canonical, strict=True)):
+            activation = binding.views["intermediate"][:tokens * top_k]
+            reference_activation = torch.zeros_like(activation)
+            gate_bound = torch.zeros(tokens * top_k, width, dtype=torch.float64, device=device)
+            situ_bound = torch.zeros_like(gate_bound)
+            for expert, (rows, slots, canonical_activation, _) in record.down_inputs.items():
+                route = rows * top_k + slots
+                reference_activation[route] = canonical_activation
+                rows_q = ref._rows(quantized, rows)
+                gate_up = ref._project(weights, "w13", expert, rows_q)
+                gain = 1.0
+                if nvfp4:
+                    blocks = rows_q.blocks().double()
+                    decoded = ref.decode_nvfp4_blocks(weights.w13[expert], weights.w13_scale[expert]).double()
+                    gain = ((rows_q.amax * weights.w13_amax[expert].float())
+                            * (1.0 / (ref.NVFP4_OUTER * weights.w13_denominator[0].float()))).double()[:, None]
+                else:
+                    from ignition.reference.qwen38_quant import decode_mxfp8
+
+                    blocks = rows_q.dequantized().double()
+                    decoded = decode_mxfp8(weights.w13[expert], weights.w13_scale[expert]).double()
+                accumulation = hidden * FP32 * (blocks.abs() @ decoded.abs().t()) * gain
+                projection_error = 2 * _spacing(gate_up.double().abs() + accumulation) + accumulation
+                gate_error, up_error = projection_error[:, 0::2], projection_error[:, 1::2]
+                situ_bound[route] = situ_error(gate_up[:, 0::2], gate_up[:, 1::2], gamma_ref[rows, slots],
+                                               gate_error, up_error, canonical_activation)
+            difference = (activation.double() - reference_activation.double()).abs()
+            worst["activation"] = max(worst["activation"], float((difference / situ_bound.clamp_min(1e-300)).max()))
+            assert bool((difference <= situ_bound).all()), (rank, float((difference - situ_bound).max()))
+            # FC2 input: the canonical quantizer applied to the prepared activation and the every-rank amax.
+            down = ref._quantize(activation, expert_format, global_amax if nvfp4 else None)
+            intermediate_q = binding.views["intermediate_q"][:tokens * top_k]
+            intermediate_sf = binding.views["intermediate_sf"][:tokens * top_k]
+            if nvfp4:
+                codes = torch.stack((intermediate_q & 15, intermediate_q >> 4), -1).flatten(-2).long()
+                assert torch.equal(table[codes], down.values)
+                assert torch.equal(intermediate_sf.float(), down.scales.float())
+            else:
+                assert torch.equal(intermediate_q.view(torch.float8_e4m3fn).float(), down.values.float())
+                assert torch.equal(intermediate_sf, down.exponents)
+            routes = binding.views["routes"][:tokens * top_k]
+            expected_routes = torch.zeros(tokens * top_k, hidden, dtype=torch.bfloat16, device=device)
+            route_bound = torch.zeros(tokens * top_k, hidden, dtype=torch.float64, device=device)
+            for expert, (rows, slots, _, _) in record.down_inputs.items():
+                route = rows * top_k + slots
+                rows_q = ref._rows(down, route)
+                projected = ref._project(weights, "w2", expert, rows_q)
+                expected_routes[route] = projected
+                if nvfp4:
+                    blocks = rows_q.blocks().double()
+                    decoded = ref.decode_nvfp4_blocks(weights.w2[expert], weights.w2_scale[expert]).double()
+                    gain = ((rows_q.amax * weights.w2_amax[expert].float())
+                            * (1.0 / (ref.NVFP4_OUTER * weights.w2_denominator[0].float()))).double()[:, None]
+                else:
+                    blocks = rows_q.dequantized().double()
+                    decoded = decode_mxfp8(weights.w2[expert], weights.w2_scale[expert]).double()
+                    gain = 1.0
+                accumulation = width * FP32 * (blocks.abs() @ decoded.abs().t()) * gain
+                route_bound[route] = 2 * _spacing(projected.double().abs() + accumulation) + accumulation
+            difference = (routes.double() - expected_routes.double()).abs()
+            worst["routes"] = max(worst["routes"], float((difference / route_bound.clamp_min(1e-300)).max()))
+            assert bool((difference <= route_bound).all()), rank
+            # Token sums: FP32 sums of the BF16 route rows in route order, rounded once.
+            assert torch.equal(outputs[rank], ref._combine(routes.view(tokens, top_k, hidden)))
+            report(f"layer {layer} rank {rank} partial expert output against the canonical four-rank experts",
+                   outputs[rank], partials_ref[rank])
+        print(f"layer {layer} {expert_format}: largest difference/bound, FC1 activation {worst['activation']:.3f}, "
+              f"FC2 routes {worst['routes']:.3f}")
+
+        # The compiled forward of one rank, captured, reproduces the eager phases on its own routes.
+        module = modules[0]
+        supplied = torch.zeros(tokens * top_k, dtype=torch.float32, device=device)
+        input_rows = source.clone()
+
+        def forward():
+            ids, gamma = module.route(input_rows, valid)
+            records = module.quantize(input_rows)
+            pending = module.phase1(records, ids, gamma)
+            output = module.phase2(pending, ids, gamma, supplied if module.supplies_amax else None)
+            return output, ids, gamma, pending.row_amax if module.supplies_amax else gamma
+
+        compiled = compile_forward(forward)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = compiled()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        ids_captured, gamma_captured = captured[1], captured[2]
+        if module.supplies_amax:
+            supplied.copy_(captured[3])
+        output = torch.empty_like(source)
+        scratch = torch.empty(module.experts.workspace_nbytes, dtype=torch.uint8, device=device)
+        eager = moe.bind(module.experts.plan, a=values, input_block_scales=scales, input_row_scale=amax,
+                         topk_ids=ids_captured.clone(), topk_weights=gamma_captured.clone(), output=output, scratch=scratch,
+                         **(dict(intermediate_row_amax=supplied) if nvfp4 else {}))
+        moe.run(binding=eager) if not nvfp4 else (moe.run_phase1(binding=eager), moe.run_phase2(binding=eager))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(captured[0], output)
