@@ -16,15 +16,25 @@ from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
 
+from ignition.recipes.mimo_v2.frontend import chat_template_asset
 from ignition.recipes.mimo_v2.recipe import RECIPE
 
 ROOT = Path(__file__).resolve().parents[2]
-SNAPSHOT = (Path.home() / '.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD'
-            / 'snapshots' / RECIPE.checkpoints[0].revision)
+HUB = Path.home() / '.cache/huggingface/hub'
 
 
-def test_native_mimo_chat_matches_transformers(tmp_path):
-    if not (SNAPSHOT / 'tokenizer_config.json').is_file():
+def snapshot(alias):
+    checkpoint = next(c for c in RECIPE.checkpoints if c.alias == alias)
+    return HUB / f"models--{checkpoint.repository.replace('/', '--')}" / 'snapshots' / checkpoint.revision
+
+
+CHECKPOINTS = pytest.mark.parametrize('alias', ['mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl'])
+
+
+@CHECKPOINTS
+def test_native_mimo_chat_matches_transformers(tmp_path, alias):
+    SNAPSHOT = snapshot(alias)
+    if not all((SNAPSHOT / name).is_file() for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')):
         pytest.skip('MiMo checkpoint frontend is not cached')
     subprocess.run(['cargo', 'build', '--quiet', '--manifest-path', str(ROOT / 'helios/Cargo.toml'),
                     '--features', 'frontend,test-tools', '--bin', 'test_frontend'], check=True)
@@ -49,9 +59,7 @@ def test_native_mimo_chat_matches_transformers(tmp_path):
     add('tool_history', [user, dict(role='assistant', content='', tool_calls=[dict(type='function',
         function=dict(name='lookup', arguments=dict(city='Paris', count=2)))]),
         dict(role='tool', content='Sunny.')], add_generation_prompt=True)
-    from ignition.preparation.frontend import annotated_template_asset
-    annotated = annotated_template_asset((SNAPSHOT / 'chat_template.jinja').read_bytes(),
-        ROOT / 'ignition/recipes/mimo_v2/assets/chat_template.patch.json')
+    annotated = chat_template_asset(SNAPSHOT)
     native_assets = tmp_path / 'assets'
     native_assets.mkdir()
     for name in ('tokenizer.json', 'tokenizer_config.json'):
@@ -65,17 +73,25 @@ def test_native_mimo_chat_matches_transformers(tmp_path):
 
 
 @pytest.fixture(scope='module')
-def processor():
-    if not (SNAPSHOT / 'preprocessor_config.json').is_file():
-        pytest.skip('MiMo checkpoint frontend is not cached')
+def image_tool():
     subprocess.run(['cargo', 'build', '--quiet', '--manifest-path', str(ROOT / 'helios/Cargo.toml'),
                     '--features', 'server,test-tools', '--bin', 'test_mimo_images'], check=True)
-    return Qwen2VLImageProcessorPil.from_pretrained(SNAPSHOT, local_files_only=True)
+    return ROOT / 'helios/target/debug/test_mimo_images'
 
 
+@CHECKPOINTS
 @pytest.mark.parametrize('sizes', [[(1, 1)], [(64, 64)], [(701, 503)], [(3000, 47)],
                                   [(17, 3000)], [(503, 701), (149, 31)]])
-def test_native_mimo_images_match_transformers(processor, tmp_path, sizes):
+def test_native_mimo_images_match_transformers(image_tool, tmp_path, alias, sizes):
+    SNAPSHOT = snapshot(alias)
+    if not all((SNAPSHOT / name).is_file() for name in ('preprocessor_config.json', 'tokenizer.json', 'chat_template.jinja')):
+        pytest.skip('MiMo checkpoint frontend is not cached')
+    processor = Qwen2VLImageProcessorPil.from_pretrained(SNAPSHOT, local_files_only=True)
+    # The native tool reads the preprocessor settings and the annotated chat template from one directory.
+    native_assets = tmp_path / 'assets'
+    native_assets.mkdir()
+    (native_assets / 'preprocessor_config.json').symlink_to(SNAPSHOT / 'preprocessor_config.json')
+    (native_assets / 'chat_template.jinja').write_text(chat_template_asset(SNAPSHOT)['text'])
     tokenizer = Tokenizer.from_file(str(SNAPSHOT / 'tokenizer.json'))
     prompt = 'Describe ' + '<|vision_start|><|image_pad|><|vision_end|>' * len(sizes)
     inputs, images = [], []
@@ -106,10 +122,15 @@ def test_native_mimo_images_match_transformers(processor, tmp_path, sizes):
             image += 1
     case = tmp_path / 'case.json'
     case.write_text(json.dumps(dict(images=inputs, prompt=prompt)))
-    subprocess.run([str(ROOT / 'helios/target/debug/test_mimo_images'), str(SNAPSHOT), str(ROOT / 'ignition/recipes/mimo_v2/assets'),
-                    str(case), str(tmp_path)], check=True)
+    subprocess.run([str(image_tool), str(SNAPSHOT), str(native_assets), str(case), str(tmp_path)], check=True)
     actual = json.loads((tmp_path / 'metadata.json').read_text())
     assert actual == dict(tokens=tokens, indices=indices, grids=grids, patches=counts,
                           positions=positions, cu_seqlens=cu)
     pixels = torch.from_numpy(np.fromfile(tmp_path / 'pixels.f32', dtype=np.float32))
-    torch.testing.assert_close(pixels, expected['pixel_values'].flatten(), rtol=0, atol=5e-7)
+    reference = expected['pixel_values'].flatten()
+    # The native frontend scales each byte by a float32 reciprocal of 255; the reference divides in
+    # float64 and narrows to float32. The scaled values differ by at most one float32 ulp, which the
+    # channel's standard deviation amplifies, before each side rounds the normalized value once more.
+    eps = torch.finfo(torch.float32).eps
+    atol = eps / min(processor.image_std) + 2 * eps * float(reference.abs().max())
+    torch.testing.assert_close(pixels, reference, rtol=0, atol=atol)

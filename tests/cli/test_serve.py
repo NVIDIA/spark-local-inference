@@ -192,6 +192,7 @@ def test_export_server_options_match_core_contract(tmp_path, budget):
     ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
     ("deepseek-v4-flash", "DeepSeek-V4-Flash-Vision-Exp"),
     ("mimo-v2.6-pro-mopd", "MiMo-V2.6-Pro-MOPD"),
+    ("mimo-v2.6-flash-rl", "MiMo-V2.6-Flash-RL"),
     ("kimi-k3-mxfp4-csf", "Kimi-K3"),
     ("kimi-k3", "Kimi-K3"),
     ("kimi-k3-dspark", "Kimi-K3"),

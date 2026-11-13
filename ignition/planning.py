@@ -586,7 +586,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if chunk % 64 or not 64 <= chunk <= recipe.context:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
-    world_sizes = recipe.tensor_parallel
+    world_sizes = recipe.checkpoint_tensor_parallel(checkpoint)
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
