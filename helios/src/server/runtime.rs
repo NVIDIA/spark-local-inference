@@ -1104,7 +1104,10 @@ impl<'a> Worker<'a> {
             });
             if !progress {
                 if executor.outstanding() > 0 {
-                    std::hint::spin_loop();
+                    // A park is bounded; the yield keeps the old loop's cooperative handoff.
+                    if !executor.park() {
+                        std::hint::spin_loop();
+                    }
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
