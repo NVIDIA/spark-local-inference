@@ -26,6 +26,9 @@ and verification are internal stages, not independently scheduled operations.
 Ignition captures mixed graphs only when given `--mixed-prefill`, and only for
 recipes that declare mixed capture; the Qwen3.8 Flash recipe
 (`ignition/recipes/qwen38`, alias `qwen3.8-flash`) is the one that does.
+Native loading retains eligible mixed graphs by default; `--no-mixed-prefill`
+excludes them from the scheduling catalog, and `--mixed-prefill` requires an
+eligible captured mixed graph. Neither serving flag changes captured storage.
 
 ## Speculative graph coverage
 

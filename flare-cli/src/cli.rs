@@ -858,6 +858,14 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
+    /// Require captured mixed prefill/decode graphs within the selected serving geometry.
+    #[arg(long, overrides_with = "no_mixed_prefill", help_heading = "Serving options")]
+    pub mixed_prefill: bool,
+
+    /// Exclude captured mixed prefill/decode graphs at load time.
+    #[arg(long, overrides_with = "mixed_prefill", help_heading = "Serving options")]
+    pub no_mixed_prefill: bool,
+
     /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk].
     #[arg(long, value_name = "MODE", help_heading = "Serving options",
         value_parser = PossibleValuesParser::new(["disk", "ram"])
@@ -1069,6 +1077,12 @@ impl ServingOptions {
         if let Some(n) = self.max_concurrency {
             options.extend(["--max-concurrency".into(), n.to_string()]);
         }
+        if self.mixed_prefill {
+            options.push("--mixed-prefill".into());
+        }
+        if self.no_mixed_prefill {
+            options.push("--no-mixed-prefill".into());
+        }
         if let Some(n) = self.mtp_draft_tokens {
             options.extend(["--mtp-draft-tokens".into(), n.to_string()]);
         }
@@ -1172,6 +1186,13 @@ impl ServingOptions {
             },
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
+            mixed_prefill: if self.mixed_prefill {
+                Some(true)
+            } else if self.no_mixed_prefill {
+                Some(false)
+            } else {
+                None
+            },
             mtp_draft_tokens: self.mtp_draft_tokens,
             history_drafts: if self.history_drafts {
                 Some(true)
@@ -1490,11 +1511,36 @@ mod tests {
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
         assert_eq!(options.mtp_draft_tokens, None);
+        assert_eq!(options.mixed_prefill, None);
         assert_eq!(options.history_drafts, None);
         assert_eq!(options.mtp_verification_token_budget, None);
         assert_eq!(options.mtp_max_verification_token_budget, None);
         assert_eq!(options.adaptive_verification, None);
         assert_eq!(options.prefix_cache, PrefixCacheOffload::default());
+    }
+
+    #[test]
+    fn mixed_prefill_flags_override_and_reach_remote_ranks() {
+        for (flags, expected) in [
+            (vec![], None),
+            (vec!["--mixed-prefill"], Some(true)),
+            (vec!["--no-mixed-prefill"], Some(false)),
+            (vec!["--mixed-prefill", "--no-mixed-prefill"], Some(false)),
+            (vec!["--no-mixed-prefill", "--mixed-prefill"], Some(true)),
+        ] {
+            let mut command = vec!["flare", "run", "model.safetensors"];
+            command.extend(flags);
+            let args = run(&command);
+            assert_eq!(args.load_options().mixed_prefill, expected);
+            let forwarded = args.rank_options();
+            let expected_flags: Vec<String> = expected.into_iter().map(|enabled| {
+                (if enabled { "--mixed-prefill" } else { "--no-mixed-prefill" }).into()
+            }).collect();
+            assert_eq!(forwarded, expected_flags);
+            let mut peer = vec!["flare", "run", "model.safetensors"];
+            peer.extend(forwarded.iter().map(String::as_str));
+            assert_eq!(run(&peer).load_options().mixed_prefill, expected);
+        }
     }
 
     #[test]
