@@ -205,6 +205,8 @@ class Plan:
     online_mxfp8_scope: str | None = None
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+    # Development preparation of the first N decoder layers; None prepares every layer.
+    decoder_layers: int | None = None
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
@@ -264,6 +266,11 @@ class Plan:
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
             if self.world_size < 2:
                 raise UsageError("--shard-hyperconnections requires tensor parallelism")
+        if self.decoder_layers is not None:
+            if not self.recipe.layer_prefix:
+                raise UsageError(f"--decoder-layers: {self.checkpoint.alias} prepares every decoder layer")
+            if type(self.decoder_layers) is not int or self.decoder_layers < 1:
+                raise UsageError("--decoder-layers must be a positive integer")
         if self.joint_tuning:
             if self.recipe.name != "deepseek41":
                 raise UsageError("--joint-tuning requires DeepSeek V4.1")
@@ -386,6 +393,7 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "online_mxfp8_scope": self.online_mxfp8_scope, "language_model_only": self.language_model_only,
+            "decoder_layers": self.decoder_layers,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 "mtp_only": self.speculation.mtp_only,

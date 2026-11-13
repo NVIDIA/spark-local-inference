@@ -327,3 +327,10 @@ def test_collective_tuning_preparation_flag_is_explicit(command):
 def test_moe_decode_a16_parser(command, flag, expected):
     args = _parser().parse_args([command, "qwen3.8-flash", *flag])
     assert args.force_moe_decode_a16 is expected
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+def test_decoder_layers_flag(command):
+    parser = _parser()
+    assert parser.parse_args([command, "inkling-2-small"]).decoder_layers is None
+    assert parser.parse_args([command, "inkling-2-small", "--decoder-layers", "6"]).decoder_layers == 6

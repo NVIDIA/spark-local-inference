@@ -195,6 +195,16 @@ def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypat
         replace(joint, autotune_effort="off")
 
 
+def test_decoder_layer_prefix_requires_a_recipe_declaration_and_is_serialized():
+    prefix = replace(derive(model=replace(SOLO, layer_prefix=True)), decoder_layers=2)
+    assert prefix.to_dict()["decoder_layers"] == 2 and derive().to_dict()["decoder_layers"] is None
+    with pytest.raises(UsageError, match="--decoder-layers: solo prepares every decoder layer"):
+        replace(derive(), decoder_layers=2)
+    for invalid in (0, -1, 2.0):
+        with pytest.raises(UsageError, match="positive integer"):
+            replace(prefix, decoder_layers=invalid)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)

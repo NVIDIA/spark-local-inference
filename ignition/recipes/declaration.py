@@ -207,6 +207,8 @@ class Recipe:
     prepared metadata so an explicit precision choice retains its meaning.
     `language_model_only` states that a plan may prepare the recipe without its vision
     encoder, rejecting images and leaving the encoder's memory to KV pages.
+    `layer_prefix` states that a development plan may prepare only the first decoder
+    layers, whose outputs are not the model's.
     `mla_compute_modes` declares the attention arithmetic constraints a plan may select,
     independently of KV storage encoding and kernel tuning. `mla_compute_mode` and
     `expert_scale_compression` supply defaults when their preparation flags are omitted.
@@ -243,6 +245,7 @@ class Recipe:
     online_mxfp8_scope: str = "all"
     online_mxfp8_scopes: tuple[str, ...] = ("all",)
     language_model_only: bool = False
+    layer_prefix: bool = False
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"

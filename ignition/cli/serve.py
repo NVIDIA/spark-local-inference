@@ -208,7 +208,8 @@ def _export_hosts(args):
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
-                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
+                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+                   decoder_layers=args.decoder_layers)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -236,7 +237,9 @@ def _export_hosts(args):
             with phase(progress, "Export native cores", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
-                options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
+                # A layer-prefix core is not the model and records no rebuild description.
+                if plan.decoder_layers is None:
+                    options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
                                 staging=configuration.directory("export_staging"),
@@ -276,7 +279,7 @@ def _prepare(args):
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
-                      image_concurrency=args.image_concurrency,
+                      decoder_layers=args.decoder_layers, image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
                       roce_ring=args.roce_ring, roce_chain=args.roce_chain,
@@ -311,7 +314,8 @@ def _prepare(args):
                      f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
                      f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
-                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}")
+                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}"
+                     f"{f' · first {plan.decoder_layers} decoder layers' if plan.decoder_layers else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -367,7 +371,8 @@ def _prepare(args):
                     options.pop("api_key")
                     from ignition.preparation.rebuild_manifest import from_plan
 
-                    options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
+                    if plan.decoder_layers is None:
+                        options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
                     result = export_core(prepared, recorder, storage, None, options=options, publisher=publisher,
                                  progress=progress, console=progress.console,
                                  staging=configuration.directory("export_staging"))
@@ -472,7 +477,8 @@ def debug_serve(args) -> int:
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
                    lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                    force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
-                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
+                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+                   decoder_layers=args.decoder_layers)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus

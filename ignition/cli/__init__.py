@@ -250,6 +250,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " (default: overlap)")
     advanced.add_argument("--no-compile", action="store_true",
                           help="development: capture graphs without compiling forwards")
+    advanced.add_argument("--decoder-layers", type=int, metavar="N",
+                          help="development: prepare only the first N decoder layers; the core does not"
+                               " produce the model's outputs (Inkling 2 only; default: every layer)")
     advanced.add_argument("--online-mxfp8", action="store_true",
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading"
                                " (Kimi K3.1 target KDA inputs only; Kimi K3 KDA, MLA except batched key/value, shared"
