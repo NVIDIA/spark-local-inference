@@ -104,6 +104,7 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    speculative_graph_budget: int = 64
     # Run shared experts, small-batch attention projections and selection, and GDN input projections
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -178,6 +179,9 @@ class PreparationConfig:
         if self.speculative_fixed_width is not None and (
                 type(self.speculative_fixed_width) is not int or self.speculative_fixed_width not in widths):
             raise ValueError("fixed verification width must belong to the prepared catalog")
+        if self.mtp and self.speculative_method == "dflash2":
+            # Reject incomplete physical-capacity catalogs before loading weights.
+            self.speculative_round_shapes
 
     @property
     def preparation_pages(self):
@@ -200,7 +204,7 @@ class PreparationConfig:
     @property
     def token_capacity(self):
         return max(self.prefill_chunk_size,
-                   max((b * w for b, w in self.speculative_shapes), default=0) if self.mtp else self.request_capacity,
+                   max((p for _, _, p in self.speculative_round_shapes), default=0) if self.mtp else self.request_capacity,
                    max((p + (b - 1) * w for _, b, w, p in self.mixed_shapes), default=0))
 
     @property
@@ -217,9 +221,20 @@ class PreparationConfig:
 
     @property
     def speculative_shapes(self) -> tuple[tuple[int, int], ...]:
+        return tuple(dict.fromkeys((batch, width) for batch, width, _ in self.speculative_round_shapes))
+
+    @property
+    def speculative_round_shapes(self) -> tuple[tuple[int, int, int], ...]:
+        if self.mtp and self.speculative_method == "dflash2":
+            from ignition.components.capacity import parallel_speculative_shapes
+
+            return parallel_speculative_shapes(self.max_active, self.speculative_widths,
+                self.speculative_token_capacity, self.speculative_graph_budget,
+                fixed_width=self.speculative_fixed_width)
         from ignition.components.capacity import speculative_shapes
 
-        return speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
+        return tuple((batch, width, batch * width) for batch, width in
+            speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity))
 
     @property
     def prefill_capacities(self) -> tuple[int, ...]:
@@ -455,16 +470,16 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         graph_count = (4 + len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                                               + 4 * len(config.batch_capacities))
                        + (len(config.batch_capacities) if False in graph_modes else 0)
-                       + (len(config.speculative_shapes) if config.mtp else 0)
+                       + (len(config.speculative_round_shapes) if config.mtp else 0)
                        + len(config.mixed_shapes))
         with phase(progress, "Construct graph catalog", total=graph_count) as stage:
-            def add(name, function, kind, batch, tokens, fields, *, enabled=None, prefill_capacity=0):
+            def add(name, function, kind, batch, tokens, fields, *, enabled=None, prefill_capacity=0, packed=0):
                 if kind == "scored_prefill":
                     function = PreparedScoredPrefill(function, requests, inputs)
                     fields = (*fields, "prompt_target_tokens")
                 functions[name] = function
                 signatures[name] = GraphSignature(kind, batch, tokens, tuple(fields), speculation_enabled=enabled,
-                                                  prefill_capacity=prefill_capacity)
+                                                  prefill_capacity=prefill_capacity, packed_token_capacity=packed)
                 stage.update(advance=1)
 
             vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
@@ -526,13 +541,19 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 forward_fields = (*inputs.buffers(), "sampling_grammar_mask",
                                   *(("draft_page_tables",) if has_mtp else ()))
                 fields = (*forward_fields, *(name for name in speculation.buffers() if name != "draft_page_tables"))
-                for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
+                for batch, width, packed in sorted(config.speculative_round_shapes,
+                        key=lambda shape: shape[2], reverse=True):
                     name = f"speculative{batch}x{width}"
-                    operation = speculation.round(batch, width, name)
+                    if has_dflash:
+                        name += f"p{packed}"
+                        operation = speculation.round(batch, width, name, target_token_capacity=packed)
+                    else:
+                        operation = speculation.round(batch, width, name)
                     operation.prepare()
                     if not has_dflash:
                         operation.functional(session=session)
-                    add(name, operation, "speculative", batch, width, fields, enabled=True)
+                    add(name, operation, "speculative", batch, width, fields, enabled=True,
+                        packed=packed if has_dflash else 0)
                 decoders.extend(speculation.decoders)
                 owners.append(speculation)
 
@@ -678,6 +699,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_widths=config.speculative_widths,
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
                 speculative_shapes=config.speculative_shapes,
+                speculative_round_shapes=config.speculative_round_shapes,
                 speculative_method=config.speculative_method,
                 speculative_state_columns=8, draft_raw_ring_capacity=layout.draft_ring_capacity if has_mtp else 0,
                 speculative_fixed_width=config.speculative_fixed_width)

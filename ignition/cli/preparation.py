@@ -161,6 +161,9 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         method = configuration.model_setting(alias, "speculative_method", method, method_flag).value
     elif method_flag is not None:
         method = method_flag
+    alternative = recipe.speculative_methods.get(method)
+    if alternative is not None and alternative.speculation is not None:
+        default = alternative.speculation
     graph_budget = Setting(args.speculative_graph_budget, "flag")
     if configuration is not None:
         graph_budget = configuration.model_setting(alias, "speculative_graph_budget",
@@ -188,7 +191,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
             raise UsageError(f"--no-mtp disables speculation; {', '.join(given)} cannot accompany it")
         return None
 
-    if method is not None and method != default.method and method not in recipe.speculative_methods:
+    if method is not None and method != recipe.speculation.method and method not in recipe.speculative_methods:
         raise UsageError(f"--speculative-method {method}: {alias} does not prepare this proposal method")
     drafts = default.draft_tokens if args.mtp_draft_tokens is None else args.mtp_draft_tokens
     if not 0 <= drafts <= limit:

@@ -49,6 +49,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
 
         drafting["draft_snapshot"] = Path(snapshot_download(REPOSITORY, revision=REVISION,
             cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors")))
+        drafting["speculative_graph_budget"] = speculation.graph_budget or 64
     config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
         collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
@@ -118,7 +119,9 @@ RECIPE = Recipe(
             1: _costs(142_821_120, 69_632, _GRAPH_BYTES[1] + (1 << 30), speculating=False),
             2: _costs(71_632_640, 36_864, _GRAPH_BYTES[2] + (1 << 30), speculating=False),
             4: _costs(36_235_008, 36_864, _GRAPH_BYTES[4] + (1 << 30), speculating=False),
-        }), draft_bytes=WEIGHT_BYTES),
+        }), draft_bytes=WEIGHT_BYTES,
+            speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True,
+                                    graph_budget=64, method="dflash2")),
     }),
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
     max_images=4, image_bytes=32 << 20, mixed_prefill=True,

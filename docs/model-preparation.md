@@ -455,7 +455,7 @@ Export Qwen with up to five MTP draft tokens per round:
 ```
 
 Qwen defaults to 32 concurrent requests, five MTP draft tokens, and 128 target-token
-rows, with explicit flags and configuration taking precedence. Verification is
+rows, with explicit flags and configuration taking precedence. MTP verification is
 rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. A core's capacities are fixed at export.
 
@@ -463,7 +463,14 @@ and three drafts at batch 32. A core's capacities are fixed at export.
 [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
 at revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6` instead of the checkpoint's
 MTP module. Draft proposals use an eight-token block and up to seven verified
-drafts; the default is five drafts and 128 target-token rows. The target
+drafts; the default is five drafts and 128 target-token rows. The verification
+catalog shares those physical rows across request prefixes while retaining the
+configured per-request width. `--speculative-graph-budget` bounds the packed
+catalog to 64 graphs by default, excluding width-one rounds. Fixed and adaptive
+verification use the same physical catalog; width-one rounds retain draft
+context. The catalog captures the configured positive draft depth and width one;
+preparing another positive draft depth requires another export. Existing cores
+retain their captured catalogs. The target
 captures completed zero-based layers 5, 15, 25, 35, and 45 after averaging its four
 hyperconnection streams. Five independent draft attention layers retain the last
 2,048 accepted target positions. These rings are included in continuation
@@ -1389,9 +1396,9 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash (MTP), GLM 5.3 | 5 | Rectangular | 34 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
-| DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
+| DeepSeek V4, MiniMax M3.1, Qwen3.8 Flash (DFlash2) | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
 | Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
