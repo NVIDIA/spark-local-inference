@@ -191,9 +191,12 @@ impl RequestScheduler {
                 if work == 0 {
                     continue;
                 }
+                // Prefill dispatch retains measured costs after expiry; aging alone
+                // does not make its predicted work unknown.
                 let nanos = self
                     .costs
-                    .fresh_duration(request.prefill_kind(), capacity)?;
+                    .duration(request.prefill_kind(), 1, capacity)
+                    .filter(|&nanos| nanos != 0)?;
                 if best.is_none_or(|(old_work, old_ns)| {
                     u128::from(nanos) * (old_work as u128) < u128::from(old_ns) * work as u128
                         || (u128::from(nanos) * old_work as u128
@@ -700,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_stale_competing_shape_disables_extras() {
+    fn unknown_prefill_or_stale_snapshot_cost_disables_extras() {
         let mut scheduler = super::super::tests::scheduler(1, 128, 16);
         let mut spec = super::super::tests::spec(1024, 3);
         spec.message_boundaries = vec![128, 256, 512, 896];
@@ -715,8 +718,28 @@ mod tests {
             .advance_to(scheduler.policy.estimate_ttl_ns)
             .unwrap();
         let (stale, _, _) = scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
-        assert_eq!(stale.initial_prefill_ns, None);
+        assert_eq!(stale.initial_prefill_ns, Some(1_024_000));
         assert_eq!(stale.cuts.len(), 1);
+    }
+
+    #[test]
+    fn measured_prefill_costs_keep_extras_available_after_idle() {
+        let mut scheduler = super::super::tests::scheduler(1, 128, 16);
+        linear_costs(&mut scheduler);
+        scheduler.advance_to(scheduler.policy.estimate_ttl_ns).unwrap();
+        measure(&mut scheduler, GraphKind::Snapshot, 1, 1);
+        let mut spec = super::super::tests::spec(1024, 3);
+        spec.message_boundaries = vec![128, 256, 512, 896];
+        let handle = scheduler.admit(spec).unwrap();
+        let (selected, unknown, budget) =
+            scheduler.checkpoint_selection(scheduler.request(handle).unwrap());
+        assert!(!unknown);
+        assert!(!budget);
+        assert_eq!(selected.initial_prefill_ns, Some(1_024_000));
+        assert_eq!(
+            selected.cuts.iter().map(|cut| cut.endpoint).collect::<Vec<_>>(),
+            [128, 256, 512, 896, 1024]
+        );
     }
 
     #[test]

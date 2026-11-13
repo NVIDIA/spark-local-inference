@@ -426,9 +426,11 @@ anchor; the prompt end substitutes when there is no eligible message. Earlier
 messages are considered in reverse order, followed by a distinct prompt end.
 Additional prefill splits and snapshot copies must fit a request-local allowance
 of `scheduler_checkpoint_extra_work_fraction` times estimated uncached prefill
-work, defaulting to 0.05. Unknown costs disable extras while preserving anchor
-eligibility. Productive completed decode earns the same fraction of measured
-time for a distinct terminal capture. There is no fixed capture count or
+work, defaulting to 0.05. Prefill predictions use measured costs, including stale
+estimates retained for dispatch ranking. Unknown prefill costs and unknown or
+stale snapshot-copy costs disable extras while preserving anchor eligibility.
+Productive completed decode earns the same fraction of measured time for a
+distinct terminal capture. There is no fixed capture count or
 concurrency-based snapshot share.
 
 An extra prefill cut is selected only with an obtainable snapshot destination.
