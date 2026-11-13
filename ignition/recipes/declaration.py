@@ -179,10 +179,11 @@ class RankUsage:
 
 @dataclass(frozen=True)
 class SpeculativeMethod:
-    """Physical preparation costs for a recipe's learned proposal source."""
+    """Physical preparation costs and optional defaults for a learned proposal source."""
 
     ranks: Mapping[int, RankCosts]
     draft_bytes: int | None = None
+    speculation: Speculation | None = None
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,9 @@ class Recipe:
                 raise ValueError("speculative methods require known names and every declared tensor-parallel size")
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")
+            if method.speculation is not None and (
+                    self.speculation is None or method.speculation.method != name):
+                raise ValueError("proposal defaults require recipe speculation and a matching method")
         for checkpoint in self.checkpoints:
             if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):

@@ -29,8 +29,19 @@ def test_flash_default_mtp_and_explicit_dflash_preserve_requested_capacities():
                       "--speculative-token-capacity", "128")
     assert dflash.method == "dflash2"
     assert dflash.widths == tuple(range(1, 9)) and dflash.token_capacity == 128
+    assert dflash.packed_verification and dflash.graph_budget == 64
     assert selected("--speculative-method", "mtp") == default
-    assert selected("--speculative-method", "dflash2", "--mtp-draft-tokens", "0").widths == (1,)
+    narrow = selected("--speculative-method", "dflash2", "--mtp-draft-tokens", "0")
+    assert narrow.widths == (1,) and not narrow.packed_verification and narrow.graph_budget is None
+
+
+@pytest.mark.parametrize("flags", [(), ("--no-mtp-adaptive-verification",)])
+def test_flash_dflash_graph_budget_preserves_adaptive_and_fixed_selection(flags):
+    settings = selected("--speculative-method", "dflash2", "--speculative-graph-budget", "16", *flags)
+    assert settings.packed_verification and settings.graph_budget == 16
+    assert settings.adaptive == (not flags)
+    with pytest.raises(UsageError, match="packed target catalog"):
+        selected("--speculative-method", "mtp", "--speculative-graph-budget", "16")
 
 
 def test_method_configuration_and_explicit_flags(tmp_path):
@@ -67,6 +78,18 @@ def test_method_costs_and_rebuild_metadata(monkeypatch):
     decoded = proto.RebuildManifest.FromString(encoded.SerializeToString())
     assert decoded.speculation.method == "dflash2"
     assert decoded.speculation.draft_tokens == 5 and decoded.speculation.token_capacity == 128
+    assert decoded.speculation.packed_verification and decoded.speculation.graph_budget == 64
+    implicit = planning.plan(model.recipe, model.checkpoint, (gpu,), selected=(0,),
+        concurrency=4, reserve_bytes=0, speculation=replace(dflash.speculation, graph_budget=None))
+    assert implicit.speculation.graph_budget == 64
     with pytest.raises(UsageError, match="separate prefill"):
         planning.plan(model.recipe, model.checkpoint, (gpu,), selected=(0,), concurrency=4,
                       reserve_bytes=0, speculation=dflash.speculation, mixed_prefill=True)
+
+
+def test_flash_help_distinguishes_mtp_and_dflash_catalogs():
+    from ignition.cli.help import recipe_help
+
+    text = recipe_help("qwen3.8-flash")
+    assert "Prepared verification: rectangular" in text
+    assert "--speculative-method dflash2: shared target rows; --speculative-graph-budget defaults to 64" in text

@@ -189,7 +189,7 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " (default: see MODEL --help)")
     speculative.add_argument("--speculative-graph-budget", type=int, metavar="N",
                           help="maximum captured packed round graphs, independently of target-token rows;"
-                               " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
+                               " excludes mandatory width-one and ordinary graphs. Requires packed"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
     advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,

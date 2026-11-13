@@ -471,7 +471,9 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if (speculation is not None and speculation.packed_verification
             and speculation.draft_tokens > 0
             and speculation.graph_budget is None and recipe.speculation is not None):
-        speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)
+        method = recipe.speculative_methods.get(speculation.method)
+        default = recipe.speculation if method is None else method.speculation or recipe.speculation
+        speculation = replace(speculation, graph_budget=default.graph_budget)
     if speculation is not None and speculation.graph_budget is not None:
         from ignition.components.capacity import packed_speculative_shapes
 

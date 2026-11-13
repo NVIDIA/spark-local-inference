@@ -14,7 +14,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @torch.no_grad()
-def test_packed_target_metadata_capture_and_width_one_transition():
+@pytest.mark.parametrize("physical_tokens", [5, 9, 12])
+def test_packed_target_metadata_capture_and_width_one_transition(physical_tokens):
     from ignition.components.paged_batch import Metadata
     from ignition.recipes.qwen38.decoder_state import DecoderInputs
     from ignition.recipes.qwen38.dflash import PreparedTargetState
@@ -35,7 +36,7 @@ def test_packed_target_metadata_capture_and_width_one_transition():
     previous = torch.tensor([2, 4, 6, 7], device=device, dtype=torch.int32)
     owner = SimpleNamespace(inputs=inputs, requests=requests, pool=pool,
         previous_accepted=previous, context=256)
-    metadata = Metadata.allocate(12, 4, 4, device, samples=32, max_query_tokens=8)
+    metadata = Metadata.allocate(physical_tokens, 4, 4, device, samples=32, max_query_tokens=8)
     starts = torch.tensor([62, 70, 128, 0], device=device)
     lengths = torch.tensor([3, 0, 2, 0], device=device, dtype=torch.int32)
     rows = torch.tensor([3, 2, 1, 0], device=device)
@@ -44,14 +45,18 @@ def test_packed_target_metadata_capture_and_width_one_transition():
     tokens = torch.arange(32, device=device).reshape(4, 8) + 100
     metadata.set(starts, lengths, rows, pages, tokens, inputs.live_rows)
     state = PreparedTargetState(owner, metadata)
-    hidden = torch.arange(12, device=device, dtype=torch.bfloat16)[:, None].expand(12, 2560).contiguous()
+    hidden = torch.arange(physical_tokens, device=device, dtype=torch.bfloat16)[:, None].expand(physical_tokens, 2560).contiguous()
     sample = torch.empty((32, 2560), dtype=torch.bfloat16, device=device)
     state.prepare_hidden(hidden, sample)
+    state.functional()
     counts = torch.tensor([2, 0, 1, 0], device=device, dtype=torch.int32)
 
+    runtime = None
+
     def execute():
-        state.begin()
-        state.finish()
+        nonlocal runtime
+        runtime = state.begin_runtime(metadata)
+        sample.copy_(state.finish_runtime(runtime, hidden, None))
         state.retain_accepted(counts)
 
     execute()
@@ -62,16 +67,16 @@ def test_packed_target_metadata_capture_and_width_one_transition():
     previous.copy_(torch.tensor([2, 4, 6, 7], device=device, dtype=torch.int32))
     graph.replay()
     torch.cuda.synchronize()
-    assert state.gdn.query_start_loc.tolist() == [0, 3, 3, 5, 5]
-    assert state.gdn.convolution_slots.tolist() == [3, -1, 1, -1]
-    assert state.gdn.accepted_tokens.tolist() == [6, 1, 2, 1]
-    assert state.gdn.state_indices[:, 0].tolist() == [3, 0, 1, 0]
-    assert state.qsa.raw_state_slot_ids.tolist() == [3, -1, 1, -1]
-    assert state.qsa.request_ids.tolist() == [0, 0, 0, 2, 2, -1, -1, -1, -1, -1, -1, -1]
-    assert state.qsa.query_positions[:5].tolist() == [62, 63, 64, 128, 129]
-    assert state.qsa.rope_positions[:5, 0].tolist() == [92, 93, 94, 138, 139]
-    assert state.qsa.slot_mapping[:5].tolist() == [126, 127, 128, 704, 705]
-    assert state.qsa.sequence_lengths.tolist() == [65, 0, 130, 0]
+    assert runtime.gdn.query_start_loc.tolist() == [0, 3, 3, 5, 5]
+    assert runtime.gdn.convolution_slots.tolist() == [3, -1, 1, -1]
+    assert runtime.gdn.accepted_tokens.tolist() == [6, 1, 2, 1]
+    assert runtime.gdn.state_indices[:, 0].tolist() == [3, 0, 1, 0]
+    assert runtime.qsa.raw_state_slot_ids.tolist() == [3, -1, 1, -1]
+    assert runtime.qsa.request_ids.tolist() == [0, 0, 0, 2, 2] + [-1] * (physical_tokens - 5)
+    assert runtime.qsa.query_positions[:5].tolist() == [62, 63, 64, 128, 129]
+    assert runtime.qsa.rope_positions[:5, 0].tolist() == [92, 93, 94, 138, 139]
+    assert runtime.qsa.slot_mapping[:5].tolist() == [126, 127, 128, 704, 705]
+    assert runtime.qsa.sequence_lengths.tolist() == [65, 0, 130, 0]
     assert previous.tolist() == [1, 4, 2, 7]
     torch.testing.assert_close(sample, hidden[metadata.sample_indices], rtol=0, atol=0)
 
@@ -79,7 +84,7 @@ def test_packed_target_metadata_capture_and_width_one_transition():
     graph.replay()
     torch.cuda.synchronize()
     assert previous.tolist() == [2, 4, 1, 7]
-    assert state.gdn.accepted_tokens.tolist() == [2, 1, 1, 1]
+    assert runtime.gdn.accepted_tokens.tolist() == [2, 1, 1, 1]
     graph.reset()
 
     single = Metadata.allocate(4, 4, 4, device, max_query_tokens=1)
@@ -87,9 +92,10 @@ def test_packed_target_metadata_capture_and_width_one_transition():
         rows, pages, tokens[:, :1], inputs.live_rows)
     narrow = PreparedTargetState(owner, single)
     narrow.prepare_hidden(hidden[:4], sample[:4])
-    narrow.begin()
-    assert narrow.gdn.accepted_tokens.tolist() == [1, 1, 2, 1]
-    narrow.finish()
+    narrow.functional()
+    narrow_runtime = narrow.begin_runtime(single)
+    assert narrow_runtime.gdn.accepted_tokens.tolist() == [1, 1, 2, 1]
+    narrow.finish_runtime(narrow_runtime, hidden[:4], None)
     assert previous.tolist() == [1, 4, 1, 7]
 
 

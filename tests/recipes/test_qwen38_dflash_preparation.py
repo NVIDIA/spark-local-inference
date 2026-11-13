@@ -15,6 +15,34 @@ from ignition.recipes.qwen38.recipe import RECIPE
 from ignition.recipes.qwen38.state import HybridStateLayout, HybridStatePool, checkpoint_copy_layout
 
 
+@pytest.mark.parametrize("fixed", [False, True])
+def test_dflash_catalog_shares_physical_rows_without_shrinking_per_request_width(fixed):
+    from ignition.recipes.qwen38.decoder import DecoderScratch
+
+    config = PreparationConfig(mtp=True, speculative_method="dflash2", draft_snapshot=Path("draft"),
+        max_active=64, context=256, prefill_chunk_size=64, speculative_widths=tuple(range(1, 9)),
+        speculative_token_capacity=129, speculative_graph_budget=32,
+        speculative_fixed_width=8 if fixed else None)
+    shapes = config.speculative_round_shapes
+    assert len(shapes) == 32 + len(config.batch_capacities)
+    assert (64, 8, 65) in shapes and (64, 8, 129) in shapes
+    assert all((batch, 1, batch) in shapes for batch in config.batch_capacities)
+    assert all(batch <= packed <= min(129, batch * width) for batch, width, packed in shapes)
+    assert config.token_capacity == 129 and config.completion_token_capacity == 8
+    samples = max(batch * width for batch, width in config.speculative_shapes)
+    assert samples == 512
+    scratch = DecoderScratch.allocate(config.token_capacity, "meta", sample_rows=samples)
+    view = scratch.rows(65, 512)
+    assert view.hidden.shape == (65, 2560) and view.logits.shape == (512, 248320)
+
+
+def test_dflash_graph_budget_rejects_missing_capacity_endpoints_before_loading():
+    with pytest.raises(ValueError, match="capacity endpoints"):
+        PreparationConfig(mtp=True, speculative_method="dflash2", draft_snapshot=Path("draft"),
+            max_active=8, speculative_widths=tuple(range(1, 9)), speculative_token_capacity=64,
+            speculative_graph_budget=7)
+
+
 @pytest.mark.parametrize("world", [1, 2, 4])
 def test_dflash_rings_belong_to_complete_continuation_rows(world):
     config = SimpleNamespace(layers=5, attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000, 2048))

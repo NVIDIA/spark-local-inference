@@ -66,6 +66,11 @@ def recipe_help(model=None):
         lines.extend(("    Width one covers every batch.",
                       f"  Prepared verification: {layout} rows with {speculation.draft_prefix_selection.upper()}"
                       " prefix selection."))
+        for method, declaration in recipe.speculative_methods.items():
+            settings = declaration.speculation
+            if settings is not None and settings.packed_verification:
+                lines.append(f"  --speculative-method {method}: shared target rows;"
+                             f" --speculative-graph-budget defaults to {settings.graph_budget}.")
     else:
         lines.append("  Multi-token speculation: unavailable.")
     optional = []
