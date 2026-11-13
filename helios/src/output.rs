@@ -19,7 +19,7 @@ mod pipeline;
 #[cfg(feature = "server")]
 mod recipient;
 #[cfg(feature = "server")]
-mod tml;
+pub(crate) mod tml;
 pub mod tagged;
 #[cfg(feature = "server")]
 mod xtml;

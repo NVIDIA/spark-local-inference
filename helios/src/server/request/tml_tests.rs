@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Inkling 2 request preparation against tml-renderers references.
+//! Inkling 2 request preparation and output parsing against tml-renderers references.
 //!
 //! The checkpoint tests read `tokenizer.json` from FLARE_INKLING2_TEST_SNAPSHOT
 //! (thinkingmachines/Inkling-2-Small at the fixture revision) and compare Helios
@@ -13,6 +13,8 @@
 
 use super::*;
 use crate::frontend::{Asset, FrontendAssets, FrontendSettings};
+use crate::output::tagged::OutputStart;
+use crate::output::{Event, Termination};
 use crate::server::protocol::{Protocol, decode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -127,6 +129,15 @@ fn prompts_match_tml_renderers_token_for_token() {
         if rendered.image_sources.is_empty() {
             let prepared = inkling.prepare(case["request"].clone()).unwrap();
             assert_eq!(prepared.prompt.tokens, expected, "{name}");
+            let last = case["reference"]["messages"].as_array().unwrap().last().unwrap().clone();
+            let start = if case["reference"]["continuation"] != true {
+                OutputStart::RecipientFrame
+            } else if last.get("content").is_some_and(|content| content != "") {
+                OutputStart::Content
+            } else {
+                OutputStart::Reasoning
+            };
+            assert_eq!(prepared.output.unwrap().content.start, start, "{name}");
         }
     }
     let cases: std::collections::HashMap<_, _> = golden["prompts"]
@@ -188,4 +199,111 @@ fn message_endpoints_are_prefixes_of_longer_conversations() {
     let stable = effort + plain.token_ids[effort..].iter().position(|&id| id == END_MESSAGE).unwrap() + 1;
     assert!(hinted.message_boundaries.contains(&stable));
     assert!(!plain.message_boundaries.contains(&stable));
+}
+
+/// Parses generated tokens through the production decoder and output pipeline.
+fn parse(inkling: &Inkling, case: &Value) -> (String, String, Vec<(String, Value)>) {
+    let tools: Vec<_> = case["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| json!({"type":"function","function":{"name":name,"parameters":{"type":"object"}}}))
+        .collect();
+    let prepared = inkling
+        .prepare(json!({"messages":[{"role":"user","content":"Go"}],"tools":tools}))
+        .unwrap();
+    let output = prepared.output.unwrap();
+    assert_eq!(output.content.start, OutputStart::RecipientFrame);
+    let eos = inkling.config.eos_token_ids.clone();
+    let mut decoder =
+        super::super::output::Decoder::<crate::output::OutputPipeline>::new(&inkling.frontend, &eos, Some(output));
+    let mut events = vec![];
+    for id in case["output_ids"].as_array().unwrap() {
+        events.extend(decoder.push(id.as_u64().unwrap() as u32).unwrap());
+    }
+    events.extend(
+        decoder
+            .finish(match case["finish"].as_str().unwrap() {
+                "eos" => Termination::Eos,
+                "output_limit" => Termination::OutputLimit,
+                "cancelled" => Termination::Cancelled,
+                other => panic!("unknown finish {other}"),
+            })
+            .unwrap(),
+    );
+    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), vec![]);
+    for event in events {
+        match event {
+            Event::Reasoning(text) => reasoning.push_str(&text),
+            Event::Content(text) => content.push_str(&text),
+            Event::ToolBegin { name, .. } => calls.push((name, String::new())),
+            Event::ToolArguments { text, .. } => calls.last_mut().unwrap().1.push_str(&text),
+            _ => {}
+        }
+    }
+    let calls = calls
+        .into_iter()
+        .map(|(name, arguments)| (name, serde_json::from_str(&arguments).unwrap()))
+        .collect();
+    (reasoning, content, calls)
+}
+
+#[test]
+#[ignore = "requires FLARE_INKLING2_TEST_SNAPSHOT with the Inkling 2 tokenizer"]
+fn outputs_match_reference_parses() {
+    let golden = golden();
+    let inkling = Inkling::load(&golden);
+    for case in golden["outputs"].as_array().unwrap() {
+        let calls: Vec<(String, Value)> = case["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| (call["name"].as_str().unwrap().to_owned(), call["arguments"].clone()))
+            .collect();
+        let expected = (case["reasoning"].as_str().unwrap().to_owned(), case["content"].as_str().unwrap().to_owned(), calls);
+        assert_eq!(parse(&inkling, case), expected, "{}", case["name"]);
+    }
+}
+
+#[test]
+#[ignore = "requires FLARE_INKLING2_TEST_SNAPSHOT with the Inkling 2 tokenizer"]
+fn structured_output_grammars_constrain_frames() {
+    let inkling = Inkling::load(&golden());
+    let tools = json!([{"type":"function","function":{"name":"lookup",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]);
+    let schema = json!({"type":"json_schema","json_schema":{"name":"result","schema":{"const":{"ok":true}}}});
+    for choice in [json!("none"), json!("auto"), json!("required"), json!({"type":"function","function":{"name":"lookup"}})] {
+        let request = inkling
+            .prepare(json!({"messages":[{"role":"user","content":"Find"}],"tools":tools,"tool_choice":choice,
+                            "response_format":schema}))
+            .unwrap();
+        assert!(request.prompt.grammar.is_some());
+        assert_eq!(request.output.unwrap().content.tools.is_empty(), choice == "none");
+    }
+    let answer = "<|message_model|><|content_text|>{\"ok\":true}<|end_message|>";
+    let thinking = "<|message_model|><|content_thinking|>Plan 世界<|end_message|>";
+    let call = "<|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"query\":\"café\"}}<|end_message|>";
+    for (text, valid) in [
+        (answer.to_owned(), true),
+        (format!("{thinking}{answer}"), true),
+        (call.to_owned(), true),
+        (format!("{call}{thinking}{call}"), true),
+        (answer.replace("true", "false"), false),
+        (call.replace("lookup<|content", "other<|content"), false),
+        (call.replace("\"name\":\"lookup\"", "\"name\":\"other\""), false),
+        (call.replace("\"args\":{\"query\":\"café\"}", "\"args\":[]"), false),
+    ] {
+        let mut request = inkling
+            .prepare(json!({"messages":[{"role":"user","content":"Find"}],"tools":tools,"response_format":schema}))
+            .unwrap();
+        let grammar = request.prompt.grammar.as_mut().unwrap();
+        let accepted = inkling
+            .frontend
+            .encode(&text, false)
+            .unwrap()
+            .into_iter()
+            .all(|id| grammar.advance(id).is_ok())
+            && grammar.advance(200006).is_ok();
+        assert_eq!(accepted, valid, "{text}");
+    }
 }

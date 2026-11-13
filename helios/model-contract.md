@@ -263,15 +263,27 @@ continuation starts inside the prepared reasoning, content, or tool body.
 Structured-output grammars preserve recipient frames and constrain the user
 answer while allowing the registered tool recipients.
 
-Content-header reasoning pairs with TML JSON tool syntax. A model message begins
-with `<|message_model|>`, followed by `<|content_text|>` for visible text,
-`<|content_thinking|>` for reasoning, or a registered tool name followed by
-`<|content_invoke_tool_json|>`. Tool bodies contain exactly `name` and object-valued
-`args` fields; the name must match the header. `<|end_message|>` closes a frame
-without ending generation, and `<|content_model_end_sampling|>` ends the turn.
-Consecutive frames can carry parallel tool calls. Delimiters affect parsing only
-when generated as their control tokens; ordinary text spellings remain content.
-Structured-output grammars constrain the answer document within these frames.
+Content-header reasoning and TML JSON tool syntax are paired and together parse
+TMLv0 frames. A frame is an optional role header, an optional author or tool name, one
+content-kind token, a body, and `<|end_message|>`. `<|message_model|>` opens model
+output; user, system, and tool headers frame text that is dropped. A
+content-kind token without a header opens a model frame. `<|content_text|>`
+carries visible text and `<|content_thinking|>` reasoning. A
+`<|content_invoke_tool_json|>` body contains exactly `name` and object-valued
+`args`; the name must be registered and, when the header names a tool, equal it.
+Tool-error, text-invocation, XML, and image content kinds are visible text, as is
+a JSON body that fails those rules. Ordinary text generated between frames is
+model text until the next control token. A leading control token that frames
+nothing, such as `<|begin_of_text|>`, discards text until the next header.
+Inside a body, control tokens other than the frame and turn ends are literal
+text. `<|end_message|>` closes a frame without ending generation, and
+`<|content_model_end_sampling|>` ends the turn. An open call completes at EOS;
+output limits, stop strings, and cancellation withhold it. Consecutive frames can
+carry parallel tool calls. Delimiters affect parsing only when generated as their
+control tokens; ordinary text spellings remain content. The parser starts from
+the prompt's last framing control token: between frames, inside a model header,
+or inside a text, reasoning, or call body. Structured-output grammars constrain
+the answer document within these frames.
 
 `OutputPipeline` selects reusable parsers. The shared presentation layer emits
 JSON or SSE while preserving streamed tool IDs and argument fragments. The same

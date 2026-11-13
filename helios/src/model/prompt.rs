@@ -279,8 +279,7 @@ pub fn prepare_output(
     let markers: &[&str] = match syntax.tools.as_ref().map(|tool| tool.kind) {
         Some(super::contract::ToolParserKind::Xtml) => &["<|open|>", "<|close|>", "<|sep|>"],
         Some(super::contract::ToolParserKind::Atem) => &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"],
-        Some(super::contract::ToolParserKind::TmlJson) => &["<|message_model|>", "<|content_text|>", "<|content_thinking|>",
-            "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>"],
+        Some(super::contract::ToolParserKind::TmlJson) => &crate::output::tml::CONTROL_MARKERS,
         _ => &[],
     };
     let mut control_tokens = markers
@@ -311,12 +310,12 @@ pub fn prepare_output(
         reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
     }
     let content_headers = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::TmlJson);
-    let start = if (recipient || content_headers) && !open_assistant {
+    let start = if content_headers {
+        // The last framing token generated as a control token decides whether the
+        // prompt ends between frames, inside a header, or inside a frame body.
+        crate::output::tml::prompt_start(&rendered.token_ids, &control_tokens)
+    } else if recipient && !open_assistant {
         crate::output::tagged::OutputStart::RecipientFrame
-    } else if content_headers && prefix.is_some_and(|p| !["<|content_text|>", "<|content_thinking|>", "<|content_invoke_tool_json|>"].iter().any(|m| p.contains(m))) {
-        crate::output::tagged::OutputStart::RecipientHeader
-    } else if content_headers && prefix.is_some_and(|p| p.contains("<|content_invoke_tool_json|>")) {
-        crate::output::tagged::OutputStart::ToolBody
     } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
         crate::output::tagged::OutputStart::RecipientHeader
     } else if recipient && prefix.is_some_and(|p| {
