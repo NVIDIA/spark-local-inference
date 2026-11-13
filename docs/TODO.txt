@@ -10,6 +10,13 @@
     padded-grid preparation and class-token packing match the reference tensors
     in tests/frontend/inkling2_images.json; no captured graph consumes them yet.
 
+[ ] Validate the Inkling 2 frontend through an exported core once the recipe
+    serves: request preparation from the core's assets for Chat, Responses and
+    Messages, repeated-prompt and changed-suffix prefix reuse with consumed-prefix
+    accounting in ordinary and speculative decoding, and generated TMLv0 output.
+    CPU checks are in helios/src/server/request/tml_tests.rs and
+    tests/recipes/test_inkling2_frontend.py.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.

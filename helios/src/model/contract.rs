@@ -803,6 +803,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "frontend", feature = "runtime-core"))]
+    fn inkling2_recipe_frontend_declares_valid_content_header_syntax() {
+        // tests/recipes/test_inkling2_frontend.py checks that the recipe declares this fixture.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/support/contracts/inkling2_frontend.json");
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for (variant, preparation, layout) in [
+            ("text", None, None),
+            ("vision", Some(ImagePreparationKind::PaddedGrid), Some(ImageLayoutKind::ClassToken)),
+        ] {
+            let frontend: FrontendContract = serde_json::from_value(fixture[variant].clone()).unwrap();
+            frontend.validate().unwrap();
+            assert_eq!(frontend.tools.as_ref().unwrap().kind, ToolParserKind::TmlJson);
+            assert_eq!(frontend.reasoning.as_ref().unwrap().kind, ReasoningParserKind::ContentHeaders);
+            assert_eq!((frontend.image_preparation, frontend.image_layout), (preparation, layout));
+            assert_eq!(frontend.image_tokens.is_some(), layout.is_some());
+        }
+    }
+
+    #[test]
     fn startup_tuning_bindings_match_transport_and_exclude_request_state() {
         use crate::execution::{BufferDescriptor, Dtype, TuningGraphDescriptor};
         let config = crate::model::tests::config();

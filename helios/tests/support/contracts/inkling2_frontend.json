@@ -1,0 +1,77 @@
+{
+ "text": {
+  "tools": {
+   "kind": 8,
+   "wrapping_newlines": 0,
+   "tag_separator": ""
+  },
+  "reasoning": {
+   "kind": 6,
+   "open": "<|content_thinking|>",
+   "close": "<|end_message|>",
+   "wrapping_newlines": 0,
+   "terminal_markers": []
+  },
+  "image_preparation": null,
+  "image_layout": null,
+  "position_dimensions": 0,
+  "rejected_tokens": [
+   200054
+  ],
+  "assistant_marker": "<|message_model|>",
+  "message_end_markers": [
+   "<|end_message|>",
+   "<|content_model_end_sampling|>"
+  ],
+  "prefix_boundary": {
+   "roles": [
+    "system"
+   ],
+   "append_role": null,
+   "continue_final_message": false,
+   "minimum_messages": 1,
+   "required_start": "",
+   "required_end": "",
+   "required_marker": ""
+  },
+  "image_tokens": null
+ },
+ "vision": {
+  "tools": {
+   "kind": 8,
+   "wrapping_newlines": 0,
+   "tag_separator": ""
+  },
+  "reasoning": {
+   "kind": 6,
+   "open": "<|content_thinking|>",
+   "close": "<|end_message|>",
+   "wrapping_newlines": 0,
+   "terminal_markers": []
+  },
+  "image_preparation": 10,
+  "image_layout": 10,
+  "position_dimensions": 0,
+  "rejected_tokens": [],
+  "assistant_marker": "<|message_model|>",
+  "message_end_markers": [
+   "<|end_message|>",
+   "<|content_model_end_sampling|>"
+  ],
+  "prefix_boundary": {
+   "roles": [
+    "system"
+   ],
+   "append_role": null,
+   "continue_final_message": false,
+   "minimum_messages": 1,
+   "required_start": "",
+   "required_end": "",
+   "required_marker": ""
+  },
+  "image_tokens": {
+   "feature_token": 200054,
+   "span": null
+  }
+ }
+}

@@ -56,15 +56,11 @@ impl Inkling {
         config.contract.vocabulary = frontend.tokenizer().get_vocab_size(true);
         config.contract.input_vocabulary = config.contract.vocabulary;
         config.contract.vision.max_images = 0;
-        config.contract.frontend = serde_json::from_value(json!({
-            "tools":{"kind":8,"wrapping_newlines":0,"tag_separator":""},
-            "reasoning":{"kind":6,"open":"<|content_thinking|>","close":"<|end_message|>","wrapping_newlines":0,
-                         "terminal_markers":[]},
-            "assistant_marker":"<|message_model|>",
-            "message_end_markers":["<|end_message|>","<|content_model_end_sampling|>"],
-            "rejected_tokens":[], "position_dimensions":0
-        }))
-        .unwrap();
+        // The Inkling 2 recipe's text-only frontend contract.
+        let contracts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/contracts");
+        let frontend_contracts: Value =
+            serde_json::from_slice(&std::fs::read(contracts.join("inkling2_frontend.json")).unwrap()).unwrap();
+        config.contract.frontend = serde_json::from_value(frontend_contracts["text"].clone()).unwrap();
         config.eos_token_ids = vec![200006];
         let compiler = crate::grammar::GrammarCompiler::new(
             frontend.tokenizer(),
