@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.paged_batch import Metadata
 from ignition.recipes.inkling2.arithmetic import (commit_history, dynamic_short_convolution, l2_clip, log_scaling,
-                                                  residual_mix, short_convolution)
+                                                  residual_mix, short_convolution, stored_history)
 from ignition.reference import inkling2 as ref
 
 BF16 = torch.bfloat16
@@ -46,9 +46,10 @@ def test_packed_convolutions_read_and_commit_each_requests_history():
     dynamic = (0.3 * torch.randn(9, heads, width, generator=generator)).to(BF16)
     history = torch.randn(3, width - 1, channels, generator=generator).to(BF16)
     original = history.clone()
-    output = short_convolution(x, weight, history, metadata)
-    lagged = dynamic_short_convolution(x, static, dynamic, history, metadata)
-    commit_history(history, x, metadata)
+    previous = stored_history(history, metadata)
+    output = short_convolution(x, weight, previous, metadata)
+    lagged = dynamic_short_convolution(x, static, dynamic, previous, metadata)
+    commit_history(history, previous, x, metadata)
     offset = 0
     for start, length, row in zip(starts, lengths, rows, strict=True):
         if not length:

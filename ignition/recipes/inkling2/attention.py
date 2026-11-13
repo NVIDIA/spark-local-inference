@@ -31,8 +31,10 @@ import torch
 
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from ignition.components.state import gather_rows, scatter_rows
 
-from .arithmetic import commit_history, dynamic_short_convolution, l2_clip, log_scaling, rms_norm, short_convolution
+from .arithmetic import (commit_history, dynamic_short_convolution, l2_clip, log_scaling, rms_norm,
+                         short_convolution, stored_history)
 from .pool import KV_DTYPE, PAGE_TOKENS
 
 RELATIVE_RANK = 16
@@ -126,20 +128,27 @@ def attention_weights(placed, *, local, heads, kv_heads, dim, width):
 
 @dataclass(frozen=True)
 class LayerCache:
-    """A layer's rank-local storage: K/V (paged or ring pages) and K/V convolution histories."""
+    """A layer's rank-local storage: K/V (paged or ring pages) and K/V convolution histories.
+
+    Local layers also expose each continuation row's K and V rings as bytes
+    (`key_rings`, `value_rings`, `[rows, ring bytes]`), which prefill reads and
+    rewrites one request row at a time.
+    """
 
     key: torch.Tensor
     value: torch.Tensor
     key_history: torch.Tensor
     value_history: torch.Tensor
     ring_row_pages: int = 0
+    key_rings: torch.Tensor | None = None
+    value_rings: torch.Tensor | None = None
 
     @classmethod
     def of(cls, pool, layer):
         if pool.text.local(layer):
             return cls(pool.ring_pages(layer, "key"), pool.ring_pages(layer, "value"),
                        pool.history(layer, "key_convolution"), pool.history(layer, "value_convolution"),
-                       pool.ring_row_pages)
+                       pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"))
         return cls(pool.cache(layer, "key"), pool.cache(layer, "value"), pool.history(layer, "key_convolution"),
                    pool.history(layer, "value_convolution"))
 
@@ -266,20 +275,21 @@ class PreparedAttention(torch.nn.Module):
         tokens = m.positions.shape[0]
         heads, kv_heads, dim = self.heads, self.kv_heads, self.dim
         key_raw, value_raw = parts["key"], parts["value"]
+        key_previous = stored_history(self.cache.key_history, m)
+        value_previous = stored_history(self.cache.value_history, m)
         if self.local:
-            key = short_convolution(key_raw, self.weights.key_convolution, self.cache.key_history, m)
-            value = short_convolution(value_raw, self.weights.value_convolution, self.cache.value_history, m)
+            key = short_convolution(key_raw, self.weights.key_convolution, key_previous, m)
+            value = short_convolution(value_raw, self.weights.value_convolution, value_previous, m)
             tau = None
         else:
             width = t.convolution_width
             key = dynamic_short_convolution(key_raw, self.weights.key_convolution,
-                                            parts["key_lags"].reshape(tokens, kv_heads, width), self.cache.key_history, m)
+                                            parts["key_lags"].reshape(tokens, kv_heads, width), key_previous, m)
             value = dynamic_short_convolution(value_raw, self.weights.value_convolution,
-                                              parts["value_lags"].reshape(tokens, kv_heads, width),
-                                              self.cache.value_history, m)
+                                              parts["value_lags"].reshape(tokens, kv_heads, width), value_previous, m)
             tau = log_scaling(m.positions, t.log_scaling_floor, t.log_scaling_alpha)
-        commit_history(self.cache.key_history, key_raw, m)
-        commit_history(self.cache.value_history, value_raw, m)
+        commit_history(self.cache.key_history, key_previous, key_raw, m)
+        commit_history(self.cache.value_history, value_previous, value_raw, m)
         query = l2_clip(parts["query"].reshape(tokens, heads, dim), t.qk_clip, scale=self.weights.query_clip_scale,
                         tau=tau)
         key = l2_clip(key.reshape(tokens, kv_heads, dim), t.qk_clip)
@@ -306,12 +316,12 @@ class PreparedAttention(torch.nn.Module):
     def _prefill(self, v, m):
         key, value = v["key"], v["value"]
         if self.local:
-            staged_key, staged = _stage(self.cache.key, key, m, window=self.window, ring=self.ring,
-                                        row_pages=self.cache.ring_row_pages, pages=self.staged_pages)
-            staged_value, _ = _stage(self.cache.value, value, m, window=self.window, ring=self.ring,
-                                     row_pages=self.cache.ring_row_pages, pages=self.staged_pages)
-            _retain(self.cache.key, key, m, ring=self.ring, row_pages=self.cache.ring_row_pages)
-            _retain(self.cache.value, value, m, ring=self.ring, row_pages=self.cache.ring_row_pages)
+            key_ring = _request_ring(self.cache.key_rings, key, m)
+            value_ring = _request_ring(self.cache.value_rings, value, m)
+            staged_key, staged = _stage(key_ring, key, m, window=self.window, pages=self.staged_pages)
+            staged_value, _ = _stage(value_ring, value, m, window=self.window, pages=self.staged_pages)
+            _retain(self.cache.key_rings, key_ring, key, m)
+            _retain(self.cache.value_rings, value_ring, value, m)
             return self.attention(v["query"], output_gate=v["gate"], sink=v["sink"], relative_factor=v["relative"],
                                   k_cache=staged_key, v_cache=staged_value, cache_seqlens=staged.reshape(1),
                                   page_table=self.staged_table, cu_seqlens_q=m.query_start_loc)
@@ -341,22 +351,24 @@ def _page_slots(m):
     return torch.where((m.positions >= 0) & (page >= 0), page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1)
 
 
-def _ring_index(positions, row, ring, row_pages):
-    slot = positions.clamp_min(0).remainder(ring)
-    return row * row_pages + slot // PAGE_TOKENS, slot % PAGE_TOKENS
+def _request_ring(rings, values, m):
+    """The prefill request's ring `[ring, kv_heads, dim]` (FP8), read from its continuation row of `rings`."""
+    ring = torch.empty((1, rings.shape[1]), dtype=torch.uint8, device=rings.device)
+    gather_rows(rings, m.state_rows[:1], ring)
+    return ring.view(KV_DTYPE).view(-1, *values.shape[1:])
 
 
-def _stage(ring_pages, values, m, *, window, ring, row_pages, pages):
+def _stage(ring, values, m, *, window, pages):
     """One prefill request's preceding `window - 1` ring entries followed by its chunk, as FP8 pages.
 
-    Staged index `i` is position `max(start - window + 1, 0) + i`; returns the staged pages and
-    the staged key count.
+    `ring` is `_request_ring` of the request: position `p` occupies slot `p % ring`.
+    Staged index `i` is position `max(start - window + 1, 0) + i`; returns the staged
+    pages and the staged key count.
     """
-    start, length, row = m.starts[0], m.lengths[0].long(), m.state_rows[0]
+    start, length = m.starts[0], m.lengths[0].long()
     first = (start - window + 1).clamp_min(0)
     positions = first + torch.arange(pages * PAGE_TOKENS, device=values.device)
-    page, offset = _ring_index(positions, row, ring, row_pages)
-    previous = ring_pages[page, offset].to(values.dtype)
+    previous = ring[positions.remainder(ring.shape[0])].to(values.dtype)
     current = values[(positions - start).clamp(0, values.shape[0] - 1)]
     staged = torch.where((positions < start)[:, None, None], previous, current)
     staged = torch.where((positions < start + length)[:, None, None], staged, 0)
@@ -364,14 +376,19 @@ def _stage(ring_pages, values, m, *, window, ring, row_pages, pages):
     return staged, (start - first + length).int()
 
 
-def _retain(ring_pages, values, m, *, ring, row_pages):
-    """Write the chunk's positions among the request's last `ring` positions into its ring."""
-    start, length, row = m.starts[0], m.lengths[0].long(), m.state_rows[0]
-    end = start + length
-    positions = end - ring + torch.arange(ring, device=values.device)
-    page, offset = _ring_index(positions, row, ring, row_pages)
+def _retain(rings, ring, values, m):
+    """Store the request's ring with the chunk's positions among its last `ring` positions.
+
+    Slot `s` holds the position `p` in `[end - ring, end)` with `p % ring == s`; slots
+    of positions before the chunk or before the sequence keep their bytes, and a
+    request without query rows stores nothing.
+    """
+    count = ring.shape[0]
+    start, length = m.starts[0], m.lengths[0].long()
+    first = start + length - count
+    positions = first + (torch.arange(count, device=values.device) - first).remainder(count)
     current = values[(positions - start).clamp(0, values.shape[0] - 1)].clamp(-448, 448)
-    keep = ((positions < start) | (positions < 0) | (length <= 0))[:, None, None]
+    keep = ((positions < start) | (positions < 0))[:, None, None]
     # E4M3 values round-trip exactly through BF16.
-    retained = torch.where(keep, ring_pages[page, offset].to(values.dtype), current)
-    ring_pages[page, offset] = retained.to(KV_DTYPE)
+    retained = torch.where(keep, ring.to(values.dtype), current).to(KV_DTYPE)
+    scatter_rows(retained.view(torch.uint8).view(1, -1), m.state_rows[:1], rings, m.lengths[:1] > 0)

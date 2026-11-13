@@ -117,6 +117,13 @@ class ContinuationPool(PagedStateStorage):
             raise ValueError("continuation rows must hold whole KV pages")
         return self.layout.row_bytes // self.geometry.page_bytes
 
+    def ring_rows(self, layer, kind):
+        """A local layer's K or V ring in every reserved row, as bytes `[rows, ring * kv_heads * head_dim]`."""
+        if not self.text.local(layer):
+            raise ValueError(f"layer {layer} keeps its keys in paged regions")
+        region = self.layout.region(f"layer{layer}.{kind}")
+        return self.reserved_backing[:, region.offset:region.offset + region.nbytes]
+
     def ring_pages(self, layer, kind):
         """A local layer's K or V rings of every reserved row as pages.
 

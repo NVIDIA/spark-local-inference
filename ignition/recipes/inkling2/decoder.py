@@ -38,7 +38,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedReduceScatter, PreparedShardGather
 
-from .arithmetic import commit_history, residual_mix, rms_norm, short_convolution
+from .arithmetic import commit_history, residual_mix, rms_norm, short_convolution, stored_history
 from .attention import LayerCache, PreparedAttention
 from .experts import PreparedExperts
 from .layer import LayerWeights
@@ -180,8 +180,9 @@ class PreparedLayer(torch.nn.Module):
             streams = tuple(gather(stream) for gather, stream in zip(c.streams, streams, strict=False))
         attended, partial = self.attention.attend(streams, m)
         attention_history, mlp_history = self.histories
-        attention_partial = short_convolution(partial, self.weights.attention_convolution, attention_history, m)
-        commit_history(attention_history, partial, m)
+        previous = stored_history(attention_history, m)
+        attention_partial = short_convolution(partial, self.weights.attention_convolution, previous, m)
+        commit_history(attention_history, previous, partial, m)
         attention = c.attention(attention_partial)
         mlp_input = self.mlp_input(state, attention)
         if self.mode == "prefill":
@@ -196,8 +197,9 @@ class PreparedLayer(torch.nn.Module):
             gathered = c.amax(pending.row_amax.view(tokens, top_k))
             amax = gathered.view(tokens, c.world, top_k).amax(1).reshape(-1)
         expert_partial = self.experts.phase2(pending, ids, weights, amax)
-        mlp_partial = short_convolution(expert_partial, self.weights.mlp_convolution, mlp_history, m)
-        commit_history(mlp_history, expert_partial, m)
+        previous = stored_history(mlp_history, m)
+        mlp_partial = short_convolution(expert_partial, self.weights.mlp_convolution, previous, m)
+        commit_history(mlp_history, previous, expert_partial, m)
         mlp = c.experts(mlp_partial)
         intermediates = dict(attended=attended, attention_partial=attention_partial, attention=attention,
                              mlp_input=mlp_input, records=records, ids=ids, weights=weights,

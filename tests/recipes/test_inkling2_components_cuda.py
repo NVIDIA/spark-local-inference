@@ -572,7 +572,7 @@ def test_output_convolutions_continue_across_chunks_rows_and_decode(checkpoint, 
     """
     from ignition.components.paged_batch import Metadata
     from ignition.preparation.compilation import compile_forward
-    from ignition.recipes.inkling2.arithmetic import commit_history, short_convolution
+    from ignition.recipes.inkling2.arithmetic import commit_history, short_convolution, stored_history
     from ignition.recipes.inkling2.pool import ContinuationPool, RankGeometry
     from ignition.reference import inkling2 as ref
     from tests.recipes.inkling2_bounds import FP32
@@ -595,8 +595,9 @@ def test_output_convolutions_continue_across_chunks_rows_and_decode(checkpoint, 
             results = []
             for kind, history in histories.items():
                 x = sources[mode][kind]
-                results.append(short_convolution(x, placed[kind], history, m))
-                commit_history(history, x, m)
+                previous = stored_history(history, m)
+                results.append(short_convolution(x, placed[kind], previous, m))
+                commit_history(history, previous, x, m)
             return tuple(results)
 
         compiled = compile_forward(forward)

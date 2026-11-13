@@ -17,11 +17,18 @@ accumulation:
 - Causal depthwise short convolutions with a residual term over packed
   requests. Each row reads its request's earlier rows in the batch and, before
   the batch, the request's `W - 1` most recent raw inputs from its history row.
+
+Histories live in continuation rows of one shared pool. Forwards read them with
+the shared row gather and write them with the shared row store, so every layer's
+history reaches the compiled code as a kernel argument rather than as a storage
+offset baked into layer-specific generated kernels.
 """
 
 from __future__ import annotations
 
 import torch
+
+from ignition.components.state import gather_rows, save_hidden
 
 BF16 = torch.bfloat16
 
@@ -74,55 +81,67 @@ def l2_clip(x, threshold, *, scale=None, tau=None, eps=1e-6):
     return y.to(x.dtype)
 
 
-def _lagged(x, history, metadata, lag):
+def stored_history(history, metadata):
+    """Each request's stored `W - 1` raw inputs `[requests, W - 1, channels]` from its row of `history`."""
+    rows = metadata.state_rows
+    previous = torch.empty((rows.shape[0], *history.shape[1:]), dtype=history.dtype, device=history.device)
+    return gather_rows(history, rows, previous)
+
+
+def _lagged(x, previous, metadata, lag):
     """Each row's input `lag` positions earlier in its request, zero before the sequence start."""
     m = metadata
     tokens = x.shape[0]
     rows = torch.arange(tokens, device=x.device)
     offset = rows - m.query_start_loc[m.requests].long()
     earlier = offset - lag
-    width = history.shape[1]
+    width = previous.shape[1]
     current = x[(rows - lag).clamp_min(0)]
-    previous = history[m.state_rows[m.requests], (width + earlier).clamp(0, width - 1)].to(x.dtype)
-    value = torch.where((earlier >= 0)[:, None], current, previous)
+    stored = previous[m.requests, (width + earlier).clamp(0, width - 1)].to(x.dtype)
+    value = torch.where((earlier >= 0)[:, None], current, stored)
     return torch.where(((m.positions - lag >= 0) & (m.positions >= 0))[:, None], value, 0)
 
 
-def short_convolution(x, weight, history, metadata):
+def short_convolution(x, weight, previous, metadata):
     """`(sum_j w[c, j] x[t - W + 1 + j, c] + x[t, c]) / sqrt(W + 1)` with `weight` `[channels, 1, W]`.
 
-    `history` is `[state rows, W - 1, channels]`, oldest first. Rows without a
-    position (padding) produce zero.
+    `previous` is `stored_history` of the convolution's history, `[requests, W - 1,
+    channels]`, oldest first. Rows without a position (padding) produce zero.
     """
     taps = weight.reshape(weight.shape[0], -1).float()
     width = taps.shape[1]
     total = None
     for tap in range(width):
-        term = _lagged(x, history, metadata, width - 1 - tap).float() * taps[:, tap]
+        term = _lagged(x, previous, metadata, width - 1 - tap).float() * taps[:, tap]
         total = term if total is None else total + term
     output = (total + x.float()) * (width + 1) ** -0.5
     return torch.where((metadata.positions >= 0)[:, None], output, 0).to(x.dtype)
 
 
-def dynamic_short_convolution(x, static, dynamic, history, metadata):
+def dynamic_short_convolution(x, static, dynamic, previous, metadata):
     """Global layers' K/V convolution with per-token lag weights.
 
-    `static` is `[W, channels]` with lag 0 first; `dynamic` is BF16 `[tokens, heads, W]`.
-    The output is `(sum_lag (static[lag] + dynamic[t, head, lag]) x[t - lag] + x[t]) / sqrt(2W + 1)`.
+    `static` is `[W, channels]` with lag 0 first; `dynamic` is BF16 `[tokens, heads, W]`;
+    `previous` is `stored_history` of the convolution's history. The output is
+    `(sum_lag (static[lag] + dynamic[t, head, lag]) x[t - lag] + x[t]) / sqrt(2W + 1)`.
     """
     width, channels = static.shape
     heads = dynamic.shape[1]
     lags = dynamic.float().repeat_interleave(channels // heads, dim=1)
     total = None
     for lag in range(width):
-        term = _lagged(x, history, metadata, lag).float() * (static[lag].float() + lags[:, :, lag])
+        term = _lagged(x, previous, metadata, lag).float() * (static[lag].float() + lags[:, :, lag])
         total = term if total is None else total + term
     output = (total + x.float()) * (2 * width + 1) ** -0.5
     return torch.where((metadata.positions >= 0)[:, None], output, 0).to(x.dtype)
 
 
-def commit_history(history, x, metadata):
-    """Store each live request's `W - 1` most recent raw inputs, oldest first, in its history row."""
+def commit_history(history, previous, x, metadata):
+    """Store each live request's `W - 1` most recent raw inputs, oldest first, in its row of `history`.
+
+    `previous` is `stored_history(history, metadata)` read before this batch. Rows of
+    requests without query rows keep their bytes.
+    """
     m = metadata
     width = history.shape[1]
     offsets = torch.arange(width, device=x.device)
@@ -132,9 +151,7 @@ def commit_history(history, x, metadata):
     in_batch = positions >= starts
     rows = (m.query_start_loc[:-1, None].long() + positions - starts).clamp(0, x.shape[0] - 1)
     old = (positions - starts + width).clamp(0, width - 1)
-    state = m.state_rows
-    previous = history[state[:, None], old]
-    updated = torch.where(in_batch[:, :, None], x[rows].to(history.dtype), previous)
+    requests = torch.arange(previous.shape[0], device=x.device)[:, None]
+    updated = torch.where(in_batch[:, :, None], x[rows].to(history.dtype), previous[requests, old])
     updated = torch.where((positions >= 0)[:, :, None], updated, 0)
-    live = (m.lengths > 0)[:, None, None]
-    history[state] = torch.where(live, updated, history[state])
+    save_hidden(updated.flatten(1), history.flatten(1), m.state_rows, m.lengths > 0)
