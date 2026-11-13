@@ -1,12 +1,25 @@
 # Working on Flare
 
-Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. Ignition, the
+Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. The public
+README names the project Hyperflare; the code, the `flare` CLI, and the
+documentation name it Flare. Ignition, the
 Python package in `ignition/`, prepares models with PyTorch, Transformers, and
 FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
 `heliopause/` crate. The Rust CLI in `flare-cli/` uses the application library in
 `flare/`, which links the Helios runtime in `helios/` to serve requests through
 prepared CUDA graphs. Flare and Heliopause depend on Helios; Helios has no Python
 or preparation-tool dependency.
+
+Helios keeps prefix-cache checkpoints in host memory and record files through
+the Selene crate in `selene/`. The manager service in `selene-manager/`, whose
+binary is `selene`, lets Flare instances share those records. The `eos/` crate
+holds the host operating-system operations that Helios and Selene use. Orbit,
+in `flare-cli/src/orbit/`, pairs a controller with host agents and starts
+serving ranks on their hosts. `flare-winui/` is the Windows desktop client built
+on the `flare/` library. Python tests are in `tests/`, qualification and
+benchmark drivers in `qualify/` and `scripts/`, and the TLA+ lifecycle models
+in `verification/helios-lifecycle/`. Each Rust crate has its own `Cargo.lock`;
+the repository has no Cargo workspace.
 
 ## Required setup and commit review
 
@@ -30,6 +43,16 @@ documentation, code comments, docstrings, names, errors, commit messages, PR tit
 and descriptions, issue and review comments, plans, and technical reports. Code
 tasks are included whenever they produce prose, including progress messages and
 completion reports.
+
+Every repository document has one or both of two purposes: it specifies the
+architecture, or it instructs agents how to work in the repository. State
+designed behavior that the code does not implement as a specification marked
+designed, not implemented. State support as present qualification: what is
+implemented, the hardware and configurations on which it is qualified, and what
+is not qualified. Record unresolved defects, unrun checks, and pending
+measurements in [docs/TODO.txt](docs/TODO.txt), not in design documents. Do not
+add defect reports, investigation logs, run journals, or progress notes to the
+repository.
 
 Before committing or publishing, review the final text against the skill. Rewrite
 passages that require conversation history, introduce unexplained identifiers, or
@@ -115,8 +138,11 @@ and a fixed-length template are not.
 
 Flare prepares and serves supported model recipes on NVIDIA GPUs through
 FlashInfer/b12x and prepared CUDA graphs. Single-host execution and cross-node
-tensor parallelism are both in scope. Orbit manages the hosts, preparation,
-cores, and rank processes needed for those serving workflows.
+tensor parallelism are both in scope. Orbit pairs a controller with host
+agents, places cores on their hosts, and starts and supervises the rank
+processes for cross-node serving. Cross-node preparation runs through
+`ignition export --ranks` on rank zero and `ignition join` on each peer host,
+without Orbit.
 
 Every contribution must address an explicit maintainer request, a demonstrated
 defect, a measured performance or memory problem, or inaccurate documentation.
@@ -184,6 +210,14 @@ and hardware sections of the preparation guide.
 | Change Protobuf metadata or core loading/export | [Runtime core design](docs/runtime-core-design.md), [prepared model contract](helios/model-contract.md), and [core compatibility](#model-core-compatibility) |
 | Diagnose or optimize performance | [GPU performance work](docs/performance-work.md), plus model or preparation development guidance for affected code |
 | Change CLI, API, or configuration behavior | [CLI design](docs/cli-design.md) and the relevant [API](docs/api.md) sections |
+| Change graph selection, scheduling policy, or timing estimates | [Prepared-graph scheduling](docs/scheduling-runtime-design.md) and [scheduling utility](docs/scheduling-utility.md); [scheduling theory](docs/scheduling-theory.md) and [the scheduling oracle](docs/scheduling-oracle.md) for the simulator in `scripts/scheduling_sim/` |
+| Change speculative decoding, log probabilities, or prompt scoring | [Speculative decoding design](docs/mtp-design.md) and [the logprob contract](docs/logprobs-design.md), plus model development guidance |
+| Change prefix-cache offload, host cache tiers, Selene, or its manager | [Prefix-cache offload](docs/prefix-cache-offload.md), [the Selene manager](selene-manager/README.md), and [its protocol](selene-manager/PROTOCOL.md) |
+| Change Orbit, host agents, or multi-host preparation, serving, or transport | [Orbit](docs/orbit.md), [multi-host serving](docs/multi-host.md), and [the RoCE ring](docs/roce-ring.md) |
+| Change the core container format, conversion, signing, or publisher trust | [Core format](docs/core-format-design.md), [signing](docs/signing.md), and [core compatibility](#model-core-compatibility) |
+| Change Helios lifecycle, cancellation, or rank coordination order | [Verification guidance](docs/verification.md), [the lifecycle models](verification/helios-lifecycle/README.md), and [the lifecycle skill](.agents/skills/helios-lifecycle/SKILL.md) |
+| Build or change Windows serving or the desktop client | [Windows serving](docs/windows.md) and [the desktop client](flare-winui/README.md) |
+| Build containers, Debian packages, or release archives, or change the release workflow | [Container](docs/container.md), [Debian package](docs/debian.md), [binary releases](docs/release.md), and [third-party notices](THIRD_PARTY_NOTICES.md) |
 
 For sampling or frontend metadata changes, also read
 [sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).
@@ -238,6 +272,42 @@ For debugging without export, native `ignition debug-serve` requires Heliopause'
 Follow the
 [development launch instructions](docs/cli-design.md#development-without-core-export).
 
+## Run tests
+
+Run Python tests from the repository root in the synchronized environment:
+
+```sh
+.venv/bin/python -m pytest tests/cli -q
+```
+
+Tests that need a GPU skip unless `FLARE_RUN_CUDA_TESTS=1`. Tensor-parallel tests
+also require `FLARE_RUN_TP_CUDA_TESTS=1` and the assigned devices in
+`CUDA_VISIBLE_DEVICES`. Tests that need a checkpoint, an exported core, or a
+running service read a test-specific variable, such as `FLARE_QWEN38_SNAPSHOT`
+or `FLARE_API_TEST_URL`, and skip without it. Report a skipped test as an unrun
+check.
+
+Test each Rust crate through its own manifest. `.github/workflows/native-serving.yml`
+runs these commands on Linux; `--target-dir flare-cli/target` shares one build
+directory across the crates:
+
+```sh
+cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare-cli/target
+cargo test --locked --release --manifest-path selene/Cargo.toml --features test-support --target-dir flare-cli/target
+cargo test --locked --release --manifest-path selene-manager/Cargo.toml --features test-support --target-dir flare-cli/target
+cargo test --locked --release --manifest-path helios/Cargo.toml --features runtime-core,server --target-dir flare-cli/target
+cargo test --locked --release --manifest-path flare/Cargo.toml --target-dir flare-cli/target
+cargo test --locked --release --manifest-path flare-cli/Cargo.toml
+```
+
+Helios tests that render chat templates fail unless
+`FLARE_TEST_TEMPLATE_DIR` names templates fetched by
+`tests/frontend/prepare_templates.py`; see
+[sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).
+Helios tests lock host memory; the workflow raises the locked-memory limit to
+64 MiB before running them. [Verification guidance](docs/verification.md)
+gives the Kani and TLA+ commands.
+
 ## Architecture and ownership
 
 Helios's shared runtime policy and separation from model computation are
@@ -260,7 +330,8 @@ architectural boundary before committing the change.
   allowlists behind capability flags. A cache scheme may require different page
   geometry, state storage, or restore constraints; keep those differences in
   its storage contract and let shared policy consume that contract.
-- `PreparedContract` is validated Protobuf data, never a runtime policy extension
+- `PreparedContract`, which Helios decodes from the core's Protobuf
+  `ModelContract`, is validated data, never a runtime policy extension
   point. Declare concrete graph value sources, storage views, dependencies,
   frontend syntax, and capacities; shared code validates and binds them. Never
   add per-model boolean flags, including `supports_*`, `can_*`, or default-false
@@ -323,7 +394,7 @@ architectural boundary before committing the change.
   context alive for their full native use. Model state and metadata must be
   explicit storage that Helios can manage without Python execution.
 - `ignition debug-serve --direct [--eager]` is the one Python execution path, a
-  diagnostic and qualification tool requested by the project owner for
+  diagnostic and qualification tool authorized by the project owner for
   reproducing model faults without Helios ([direct execution](docs/direct-execution.md)).
   It is never production serving or a fallback, and only its explicit flags
   select it.
@@ -372,8 +443,8 @@ architectural boundary before committing the change.
 
 ## CUDA kernel and model optimization authorship
 
-Claude Opus 5.5 has repeatedly produced defective low-level kernel changes in
-this project. Do not use it to design or implement low-level CUDA kernels or
+Claude Opus 5.5 is not reliable for low-level kernel changes in this project.
+Do not use it to design or implement low-level CUDA kernels or
 changes to existing model fusion and GPU execution optimizations. This includes
 CUDA C++, PTX, CuTe DSL, and Triton kernels, and changes to projection packing,
 fused arithmetic, stream overlap, or scratch aliasing in optimized model paths.
@@ -403,6 +474,11 @@ conformance or CUDA correctness; validate those boundaries separately.
 - Validate the affected execution path and capacities. Model and preparation
   development guidance defines shape, graph-transition, state, and lifetime
   checks; GPU performance guidance defines measurement requirements.
+- For excess fixed device memory, follow the
+  [cross-model scratch workflow](docs/performance-work.md#cross-model-scratch-planning).
+  Make graph-local temporaries and their dependencies visible to Inductor before
+  adding manual shared pools. Keep weights, cache history, request state, and
+  other values that cross graph boundaries in explicit persistent storage.
 - Keep ordinary tests and raw benchmark measurements. Do not create development
   audit reports, receipts, provenance bundles, or hash inventories.
 

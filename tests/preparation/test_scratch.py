@@ -101,53 +101,6 @@ def test_named_operands_share_capacity_across_shapes_without_overlapping_within_
         bind_scratch(dict(scores=((1,), torch.int32)), device="cpu", workspace=workspace)
 
 
-def test_graph_cursor_reuses_space_skipped_by_larger_buffers_without_moving_live_views():
-    pool = GraphBufferPool("cpu", chunk_bytes=512)
-    first = pool.cursor()
-    small = first.zeros((129,), torch.uint8)
-    large = first.zeros((768,), torch.uint8)
-    tail = first.zeros((256,), torch.uint8)
-    assert pool.nbytes == 1280
-    assert tail.data_ptr() == small.data_ptr() + 256
-    for value, tensor in enumerate((small, large, tail), 1):
-        tensor.fill_(value)
-    for value, tensor in enumerate((small, large, tail), 1):
-        assert torch.all(tensor == value)
-    pointers = tuple(t.data_ptr() for t in (small, large, tail))
-    second = pool.cursor()
-    wide = second.zeros((768,), torch.uint8)
-    narrow = second.zeros((512,), torch.uint8)
-    assert pool.nbytes == 1280
-    assert wide.data_ptr() == large.data_ptr() and narrow.data_ptr() == small.data_ptr()
-    assert tuple(t.data_ptr() for t in (small, large, tail)) == pointers
-    wide.fill_(17)
-    narrow.fill_(23)
-    assert torch.all(large == 17) and torch.all(small == 23) and torch.all(tail == 23)
-
-
-def test_sequential_stage_cursors_preserve_live_values_and_concurrent_branches():
-    pool = GraphBufferPool("cpu", chunk_bytes=1024)
-    graph = pool.cursor()
-    live = graph.full(256, 7, torch.uint8)
-    attention, experts = graph.fork(), graph.fork()
-    attended = attention.zeros(512, torch.uint8)
-    shared = experts.zeros(256, torch.uint8)
-    routed = experts.zeros(512, torch.uint8)
-    assert attended.data_ptr() == shared.data_ptr()
-    assert routed.data_ptr() == shared.data_ptr() + 256
-    graph.join(attention, experts)
-    retained = graph.full(256, 11, torch.uint8)
-    attended.fill_(13)
-    assert torch.all(live == 7) and torch.all(retained == 11)
-    shared.fill_(17)
-    routed.fill_(19)
-    assert torch.all(shared == 17) and torch.all(routed == 19)
-    assert torch.all(live == 7) and torch.all(retained == 11)
-    assert pool.nbytes == 2048
-    with pytest.raises(ValueError, match="share a pool"):
-        graph.join(GraphBufferPool("cpu").cursor())
-
-
 def test_rank_scratch_finalization_preserves_shared_offsets(monkeypatch):
     import torch.distributed as dist
 
@@ -219,6 +172,106 @@ def test_arena_owns_one_aligned_highwater_storage_across_operator_specs():
         assert view.shape == (requirement,)
         assert scratch_tensor(view, (spec(requirement),), owner="test").data_ptr() == second.data_ptr()
     assert arena.nbytes == 512
+
+
+def test_preparation_release_drops_backing_after_binding_finalization():
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    backing = weakref.ref(arena.tensor)
+    bound_sizes = []
+    arena.register_finalizer(lambda: bound_sizes.append(arena.nbytes))
+    arena.freeze()
+    arena.finalize()
+    assert bound_sizes == [1024]
+    arena.release_preparation()
+    assert backing() is None
+    assert arena.nbytes == 0 and arena.device == torch.device("cpu")
+    empty = arena.tensor
+    arena.release_preparation()
+    assert arena.tensor is empty
+
+
+def test_preparation_release_rejects_unfinished_binding_without_dropping_storage():
+    arena = ScratchArena("cpu")
+    backing = arena.reserve(256)
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    arena.register_finalizer(lambda: None)
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    assert arena.tensor is backing and arena.nbytes == 256
+    arena.finalize()
+    arena.release_preparation()
+    assert arena.nbytes == 0
+
+
+def test_declaration_owners_release_after_all_bindings_with_backing_alive():
+    arena = ScratchArena("cpu")
+    arena.reserve(512)
+    events = []
+    arena.register_finalizer(lambda: events.append(("binding", arena.nbytes)))
+    arena.register_preparation_release(lambda: events.append(("owner", arena.nbytes)))
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="completed binding finalization"):
+        arena.release_preparation()
+    assert events == []
+    arena.finalize()
+    arena.release_preparation()
+    arena.release_preparation()
+    assert events == [("binding", 512), ("owner", 512)]
+    assert arena.nbytes == 0
+
+
+def test_failed_declaration_release_preserves_backing_and_can_retry():
+    arena = ScratchArena("cpu")
+    backing = arena.reserve(256)
+    attempts = []
+
+    def release():
+        attempts.append(arena.nbytes)
+        if len(attempts) == 1:
+            raise RuntimeError("declaration owner is still in use")
+
+    arena.register_preparation_release(release)
+    arena.freeze()
+    arena.finalize()
+    with pytest.raises(RuntimeError, match="owner is still in use"):
+        arena.release_preparation()
+    assert arena.tensor is backing
+    arena.release_preparation()
+    assert attempts == [256, 256]
+    assert arena.nbytes == 0
+
+
+def test_preparation_release_registration_rejects_invalid_and_retired_owners():
+    arena = ScratchArena("cpu")
+    with pytest.raises(TypeError, match="must be callable"):
+        arena.register_preparation_release(None)
+    arena.freeze()
+    arena.finalize()
+    arena.release_preparation()
+    with pytest.raises(RuntimeError, match="storage has been released"):
+        arena.register_preparation_release(lambda: None)
+
+
+@pytest.mark.parametrize("operation", [
+    lambda arena: arena.reserve(0),
+    lambda arena: arena.reserve(256),
+    lambda arena: arena.views(((0,), torch.uint8)),
+    lambda arena: arena.trim(0),
+    lambda arena: arena.finalize(),
+    lambda arena: arena.auxiliary_stream,
+])
+def test_released_arena_rejects_storage_and_binding_reuse(operation):
+    arena = ScratchArena("cpu")
+    arena.reserve(256)
+    arena.freeze()
+    arena.finalize()
+    arena.release_preparation()
+    with pytest.raises(RuntimeError, match="storage has been released"):
+        operation(arena)
+    assert arena.nbytes == 0
 
 
 def test_serial_arena_admits_no_auxiliary_stream_or_concurrent_plans():

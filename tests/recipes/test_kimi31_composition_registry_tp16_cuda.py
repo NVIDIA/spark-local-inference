@@ -63,11 +63,12 @@ def worker(rank, rendezvous, output):
                     ids = buffers.buffer("input", (rows, 2048), torch.int32)
                     scores = buffers.buffer("scores", (rows, 2048), torch.float32)
                     positions = buffers.buffer("positions", (rows,), torch.int64)
+                    counts = buffers.buffer("candidate_counts", (rows,), torch.int32)
                     selected = buffers.buffer("output", (rows, 2048), torch.int32)
                     operation = PreparedCandidateSelection(ids, scores, positions, shards.index, selected,
                         world=16, gather_runtime=gather, owner_runtime=owner, reduction_runtime=reduction,
                         session=session, coordinator=coordinator, name=f"model.rows{rows}",
-                        buffers=SharedBuffers(model_buffers, device, prefix="merge."))
+                        buffers=SharedBuffers(model_buffers, device, prefix="merge."), local_counts=counts)
                     cases[rows] = operation
                     registry.register(operation)
                     controls[rows] = MergePipeline(rows, rank, gather, session, coordinator, reference_buffers, ordered=True)
@@ -94,7 +95,7 @@ def worker(rank, rendezvous, output):
                 if rank == 0:
                     print(json.dumps(report), flush=True)
                 for rows, operation in cases.items():
-                    ids, scores, positions = _candidate_pattern(rows, 16, 2048, rank, 100, 4096)
+                    ids, scores, positions, _counts = _candidate_pattern(rows, 16, 2048, rank, 100, 4096)
                     operation.indices.copy_(ids)
                     operation.scores.copy_(scores)
                     operation.positions.copy_(positions)
@@ -113,7 +114,7 @@ def worker(rank, rendezvous, output):
                 for seed, count, partial in ((9001, 0, False), (9002, 256, True),
                                               (9003, 8192, False), (9004, 32768, True)):
                     for rows in reversed(rows_catalog):
-                        ids, scores, positions = _candidate_pattern(rows, 16, 2048, rank, seed, count, partial_rows=partial)
+                        ids, scores, positions, _counts = _candidate_pattern(rows, 16, 2048, rank, seed, count, partial_rows=partial)
                         operation, reference = cases[rows], controls[rows]
                         operation.indices.copy_(ids)
                         operation.scores.copy_(scores)

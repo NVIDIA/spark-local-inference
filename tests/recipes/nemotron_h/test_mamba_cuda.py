@@ -15,15 +15,18 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                 reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("tokens", [1, 129, 4096])
+@pytest.mark.parametrize("tokens,deferred", [
+    (1, False), (129, False), (4096, False),
+    pytest.param(1, True, id="decode-deferred"),
+])
 @torch.no_grad()
-def test_checkpoint_mamba_block(tokens):
+def test_checkpoint_mamba_block(tokens, deferred):
     from b12x.preparation import PreparationSession
     from ignition.components.parallel import TensorParallelShard
     from ignition.components.recurrent import DeltaMetadata
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.mamba import PreparedMamba
     from ignition.recipes.nemotron_h.weights import NemotronWeightLoader
     from ignition.reference.qwen38_quant import CheckpointTensors, decode_nvfp4, read_nvfp4_projection
@@ -60,13 +63,28 @@ def test_checkpoint_mamba_block(tokens):
     m.final_state_indices.fill_(2)
     m.num_seqs.fill_(1)
     m.num_tokens.fill_(tokens)
-    with PreparationSession(device="cuda:0", autotune=False) as session:
+    if deferred:
+        from ignition.preparation.tuning import RecordedPreparationSession
+
+        session = RecordedPreparationSession(device="cuda:0", checkpoint=str(path),
+            workload_schema="nemotron-mamba", numerical_policy="default", autotune_effort="off",
+            compile_workers=1)
+    else:
+        session = PreparationSession(device="cuda:0", autotune=False)
+    with session:
         arena = ScratchArena("cuda:0")
+        if deferred:
+            session.register_scratch(arena)
         block = PreparedMamba(weights, source, state, m, config,
             mode="decode" if tokens == 1 else "prefill", session=session, name="block",
-            workspace=arena, buffers=GraphBufferPool("cuda:0").cursor())
-        arena.finalize()
-        forward = compile_forward(lambda: block(source))
+            workspace=arena)
+        block.functional(session=session)
+        if deferred:
+            session.tune()
+            arena.release_preparation()
+        else:
+            arena.finalize()
+        forward = compile_forward(lambda: block(source, m, state))
         forward()
         session.freeze()
         graph = torch.cuda.CUDAGraph()
@@ -121,7 +139,7 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune, ca
     from ignition.components.recurrent import DeltaMetadata, _commit_convolution
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.draft_config import DraftConfig
     from ignition.recipes.nemotron_h.mamba import PreparedMamba
     from ignition.recipes.nemotron_h.pool import ContinuationPool, REPLAY_RING
@@ -155,28 +173,30 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune, ca
         m.num_seqs.fill_(1)
         m.num_tokens.fill_(tokens)
     with PreparationSession(device="cuda:0", autotune=autotune) as session:
-        arena, buffers = ScratchArena("cuda:0"), GraphBufferPool("cuda:0")
+        arena = ScratchArena("cuda:0")
         replay = PreparedMambaReplay(pool.backing, pool.layout,
             [tuple(pool.layout.region("layer0." + field) for field in ("recurrent", "replay_x", "replay_b", "replay_dt"))],
-            weights["A"][None], rows, lengths,
+            weights["A"][None],
             ring_region=pool.layout.region("mamba_ring_start"), count_region=pool.layout.region("mamba_pending_count"),
-            ring_length=REPLAY_RING, buffers=buffers.cursor())
+            ring_length=REPLAY_RING)
         decode = PreparedMamba(weights, source[:1], state, metadata[0], config,
-            mode="decode", session=session, name="decode", workspace=arena, buffers=buffers.cursor())
+            mode="decode", session=session, name="decode", workspace=arena)
         verify = PreparedMamba(weights, source, state, metadata[1], config,
-            mode="verify", session=session, name="verify", workspace=arena, buffers=buffers.cursor(),
+            mode="verify", session=session, name="verify", workspace=arena,
             replay=replay, records=pool.replay_records(0), verification_width=8)
+        decode.functional(session=session)
+        verify.functional(session=session)
         arena.finalize()
         expected_outputs, expected_states = [], []
         pool.backing.copy_(initial)
         for i in range(capacity):
-            expected_outputs.append(decode(source[i:i + 1]).clone())
+            expected_outputs.append(decode(source[i:i + 1], metadata[0], state).clone())
             expected_states.append((state.convolution[1, :, :3].clone(), state.recurrent[1].clone()))
 
         def forward():
-            replay.prepare(width=8)
-            output = verify(source)
-            replay.commit(counts, width=8)
+            replay_state = replay.prepare(rows, lengths, width=8)
+            output = verify(source, metadata[1], state, records=pool.replay_records(0), replay_state=replay_state)
+            replay.commit(counts, rows, lengths, *replay_state, width=8)
             torch.library.wrap_triton(_commit_convolution)[(1, 1, triton.cdiv(config.convolution_width, 128))](
                 pool.backing.view(torch.bfloat16), offsets, rows, counts, pool.layout.row_bytes // 2,
                 config.convolution_width, region.shape[1], 128)
@@ -187,7 +207,7 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune, ca
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = forward()
-        flush = compile_forward(lambda: replay.prepare(width=1))
+        flush = compile_forward(lambda: replay.prepare(rows, lengths, width=1))
         flush()
         session.freeze()
         for length, accepted in ((8, 1), (8, 3), (8, 8), (5, 2), (5, 5)):

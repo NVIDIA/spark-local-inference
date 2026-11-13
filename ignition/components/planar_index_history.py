@@ -124,14 +124,24 @@ class PreparedPlanarIndexHistory:
         self.consume = PreparedAllReduce(self.copied, self.completed, runtime=runtime, session=session,
             coordinator=coordinator, name=name + ".consumed")
 
-    def __call__(self):
+    def functional(self):
+        self.output_layout = tuple(self.output.shape), self.output.dtype
+        self.table = self.end = self.output = None
+        return self
+
+    def __call__(self, table=None, end=None):
+        if table is None:
+            table, end, output = self.table, self.end, self.output
+        else:
+            shape, dtype = self.output_layout
+            output = torch.empty(shape, dtype=dtype, device=self.cache.device)
         torch.library.wrap_triton(_pack)[(min(1024, self.stage.shape[0] * 16),)](
-            self.cache.view(torch.int32), self.table, self.end, self.rank, self.completed,
-            self.stage.view(torch.int32), self.packed, COLUMNS=self.table.numel(),
+            self.cache.view(torch.int32), table, end, self.rank, self.completed,
+            self.stage.view(torch.int32), self.packed, COLUMNS=table.numel(),
             CACHE_PAGES=self.cache.shape[0], WORLD=self.world, MAXIMUM=self.maximum, num_warps=4)
         self.publish(self.packed)
-        torch.library.wrap_triton(_unpack)[(min(1024, self.output.shape[0] * 8),)](
-            self.addresses, self.end, self.ready, self.output.view(torch.int32), self.copied,
+        torch.library.wrap_triton(_unpack)[(min(1024, output.shape[0] * 8),)](
+            self.addresses, end, self.ready, output.view(torch.int32), self.copied,
             WORLD=self.world, MAXIMUM=self.maximum, num_warps=4)
         self.consume(self.copied)
-        return self.output
+        return output

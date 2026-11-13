@@ -83,19 +83,32 @@ class PreparedProbabilityNormalization:
         self.masses = torch.empty_like(self.maxima)
         self.totals = torch.empty((self.rows,), device=output.device, dtype=torch.float32)
 
+    def functional(self):
+        self.output = self.valid = None
+        self.maxima = self.masses = self.totals = None
+        return self
+
     def __call__(self, probabilities, params):
+        return self.run(probabilities, params, self.output, self.valid)
+
+    def run(self, probabilities, params, output, valid):
+        maxima, masses, totals = self.maxima, self.masses, self.totals
+        if maxima is None:
+            maxima = torch.empty((self.rows, self.blocks), dtype=torch.float32, device=probabilities.device)
+            masses = torch.empty_like(maxima)
+            totals = torch.empty((self.rows,), dtype=torch.float32, device=probabilities.device)
         grid = (self.rows, self.blocks)
         reduce = triton.next_power_of_2(self.blocks)
         torch.library.wrap_triton(_maxima)[grid](
-            probabilities, params, self.maxima, self.vocabulary, self.width,
+            probabilities, params, maxima, self.vocabulary, self.width,
             params.stride(0), self.blocks, _BLOCK)
         torch.library.wrap_triton(_filter)[grid](
-            probabilities, params, self.maxima, self.masses, self.output,
+            probabilities, params, maxima, masses, output,
             self.vocabulary, self.width, params.stride(0), self.blocks, reduce, _BLOCK,
-            probabilities is self.output,
+            probabilities is output,
             enable_fp_fusion=False)
         torch.library.wrap_triton(_totals)[(self.rows,)](
-            self.masses, self.totals, self.valid, self.blocks, reduce)
+            masses, totals, valid, self.blocks, reduce)
         torch.library.wrap_triton(_apply)[grid](
-            self.output, self.valid, self.totals, self.vocabulary, _BLOCK)
-        return self.output
+            output, valid, totals, self.vocabulary, _BLOCK)
+        return output

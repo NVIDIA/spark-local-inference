@@ -39,6 +39,7 @@ def test_capture_reports_catalog_once_before_compilation_and_on_recapture(captur
         calls.append("forward")
     class Cached:
         cache_hit = True
+        capture_allocation_sizes = ()
         def prepare_capture(self):
             return 0
         def retire_after_capture(self):

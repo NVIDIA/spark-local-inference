@@ -38,13 +38,14 @@ class TensorFP8Projection:
                 raise ValueError("tensor-FP8 staging requires sufficient contiguous device bytes")
             self.quantized = staging.flatten()[:source.numel()].view(torch.float8_e4m3fn).view(source.shape)
         self.plan = blockscaled.plan(blockscaled.query_from_call(self.quantized, weight.packed))
+        quantized = self.quantized
 
         def prepare(state):
-            self.quantized.zero_()
+            quantized.zero_()
             w = weight.packed
             return PreparedCall(run=lambda: state.run_tensor_fp8(
-                self.quantized, w.values, w.scale_mma, w.block_scale, w.output_scale,
-                out_dtype=output.dtype, stream=None), owners=(self.quantized, weight))
+                quantized, w.values, w.scale_mma, w.block_scale, w.output_scale,
+                out_dtype=output.dtype, stream=None), owners=(weight,))
 
         def benchmark(state):
             inputs = benchmark_resource(session, ("tensor_fp8", name), lambda:
@@ -52,11 +53,26 @@ class TensorFP8Projection:
             w = weight.packed
             return PreparedCall(run=lambda: state.run_tensor_fp8(
                 inputs, w.values, w.scale_mma, w.block_scale, w.output_scale,
-                out_dtype=output.dtype, stream=None), owners=(inputs, weight))
+                out_dtype=output.dtype, stream=None), owners=(weight,))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare, benchmark_call=benchmark),))
 
+    def functional(self, *, session):
+        """Expose calibrated activation and output storage to forward compilation."""
+        del session
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.quantized_layout = (tuple(self.quantized.shape), self.quantized.stride(), self.quantized.dtype)
+            self.output = self.quantized = None
+        return self
+
     def __call__(self, source):
-        self.quantized.copy_((source.float() / self.weight.input_scale).clamp(-448, 448))
-        self.output.copy_(blockscaled.mm(self.quantized, self.weight.packed, plan=self.plan))
-        return self.output
+        output, quantized = self.output, self.quantized
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            shape, stride, dtype = self.quantized_layout
+            quantized = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        quantized.copy_((source.float() / self.weight.input_scale).clamp(-448, 448))
+        output.copy_(blockscaled.mm(quantized, self.weight.packed, plan=self.plan))
+        return output

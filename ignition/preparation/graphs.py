@@ -32,8 +32,8 @@ class PreparedGraphBundle:
     does not expose a graph's capture device, so capture on that device remains
     a preparation invariant. Registration checks its capability and context,
     every declared buffer's device and extent, and instantiated graph handles.
-    Export-only graphs retain native metadata and external pool owners after
-    releasing their CUDA handles. Native replay still requires executables.
+    Export accepts live CUDA graphs or recorded metadata with retained external
+    pool owners. Native replay requires instantiated executables.
 
     Graphs must not use PyTorch generator-backed random operations: raw native
     launch bypasses PyTorch RNG bookkeeping. After handoff, callers must not

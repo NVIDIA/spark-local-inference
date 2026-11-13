@@ -18,26 +18,25 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @pytest.mark.parametrize("batch", [1, 4, 8])
 @torch.no_grad()
-def test_selector_graph_reuses_pooled_storage(batch):
+def test_selector_returns_local_masked_logits(batch):
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.scratch import GraphBufferPool
     from ignition.recipes.nemotron_h.lilicorr import PreparedLatticeSelector
 
-    buffers = GraphBufferPool("cuda:0").cursor()
     selector = object.__new__(PreparedLatticeSelector)
-    selector.ids = buffers.zeros((batch, 7, 8), torch.int64)
-    selector.scores = buffers.zeros((batch, 7, 8, 8), torch.float32)
-    selector.rows = torch.arange(batch, device="cuda")
-    logits = buffers.zeros((batch, 131072), torch.float32)
-    retained = buffers.zeros((batch, 7, 131072), torch.float32)
-    sentinel = buffers.zeros((batch, 16), torch.float32).fill_(123)
+    selector.batch, selector.top_k, selector.slots = batch, 8, 7
+    logits = torch.randn((batch, 8, 131072), device="cuda", dtype=torch.float32)
+    features = torch.randn((batch, 7, 8, 8), device="cuda", dtype=torch.float32)
     predecessor = torch.zeros((batch, 7), device="cuda", dtype=torch.int64)
-    selector.ids.copy_(torch.arange(56, device="cuda").view(1, 7, 8).expand(batch, -1, -1) * 101)
+    ids = (torch.arange(56, device="cuda").view(1, 7, 8).expand(batch, -1, -1) * 101) % 131072
+    logits[:, 1:].scatter_(2, ids, 2.0)
+    unary, selected_ids = selector.prepare_shortlists(logits, features=features)
+    selected_ids[:, 1:].copy_(ids)
+    retained = torch.empty((batch, 7, 131072), device="cuda", dtype=torch.float32)
 
     def forward():
         for step in range(7):
-            selector(logits, predecessor[:, step], step + 1)
-            retained[:, step].copy_(logits)
+            retained[:, step].copy_(selector.apply_shortlist(logits[:, step + 1], predecessor[:, step],
+                step + 1, features, unary, selected_ids))
 
     compiled = compile_forward(forward)
     compiled()
@@ -45,8 +44,8 @@ def test_selector_graph_reuses_pooled_storage(batch):
     with torch.cuda.graph(graph):
         compiled()
     for candidate in (0, 5, None):
-        selector.scores.normal_()
-        predecessor.copy_(torch.roll(selector.ids[:, :, candidate or 0], 1, 1))
+        features.normal_()
+        predecessor.copy_(torch.roll(selected_ids[:, 1:, candidate or 0], 1, 1))
         if candidate is None:
             predecessor.fill_(-1)
         retained.fill_(torch.nan)
@@ -58,9 +57,8 @@ def test_selector_graph_reuses_pooled_storage(batch):
         expected = torch.full_like(retained, -torch.inf)
         for step in range(7):
             row = candidate if step and candidate is not None else 0
-            expected[:, step].scatter_(1, selector.ids[:, step], selector.scores[:, step, row])
+            expected[:, step].scatter_(1, selected_ids[:, step + 1], features[:, step, row])
         torch.testing.assert_close(retained, expected, rtol=0, atol=0)
-        assert (sentinel == 123).all()
 
 
 def reference(weights, config, tokens, logp, passed, anchor, valid):
@@ -124,7 +122,7 @@ def test_checkpoint_lattice_scores(batch, slots, tmp_path):
     from safetensors import safe_open
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
     from ignition.preparation.compile_pool import CompilePool
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.config import ModelConfig
     from ignition.recipes.nemotron_h.draft_config import DraftConfig
     from ignition.recipes.nemotron_h.draft_weights import DraftWeightLoader
@@ -161,10 +159,9 @@ def test_checkpoint_lattice_scores(batch, slots, tmp_path):
     valid = torch.arange(batch, device="cuda") % 2 == 0
     with PreparationSession(device="cuda:0", autotune=False) as session:
         arena = ScratchArena("cuda:0")
-        buffers = GraphBufferPool("cuda:0", chunk_bytes=2 << 20)
-        layers = GraphBufferPool("cuda:0", chunk_bytes=2 << 20)
         lattice = PreparedLattice(weights, config, tokens, logp, passed, anchor, session=session,
-            name="lilicorr", workspace=arena, buffers=buffers.cursor(), layer_buffers=layers)
+            name="lilicorr", workspace=arena)
+        lattice.functional(session=session)
         arena.finalize()
         operation = partial(lattice, tokens, logp, passed, anchor, valid)
         path = tmp_path / "lattice.bin"

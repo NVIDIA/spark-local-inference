@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
 
 
 @triton.jit
@@ -61,6 +61,21 @@ class PreparedRouteFinalizer:
             (routes, gain, weights, ids, valid_tokens, output, routes.shape[2], routes.shape[1],
              num_experts, eps, triton.next_power_of_2(routes.shape[2])), (routes.shape[0], 1, 1), num_warps=8,
             enable_fp_fusion=False)
+
+    def functional(self):
+        self.output_shape = tuple(self.output.shape)
+        self.output = None
+        self.kernel.args = tuple(None if index in (0, 2, 3, 4, 5) else value
+                                 for index, value in enumerate(self.kernel.args))
+        return self
+
+    def run(self, routes, weights, ids, num_valid_tokens):
+        output = torch.empty(self.output_shape, dtype=routes.dtype, device=routes.device)
+        args = list(self.kernel.args)
+        args[0], args[2], args[3], args[4], args[5] = routes, weights, ids, num_valid_tokens, output
+        operation = self.kernel
+        launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        return output
 
     def __call__(self):
         self.kernel()

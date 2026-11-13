@@ -238,3 +238,17 @@ def test_shutdown_drain_configuration(tmp_path, value):
 def test_invalid_shutdown_drain_configuration(tmp_path, value):
     with pytest.raises(UsageError, match="drain_on_shutdown"):
         load(tmp_path, f'[prefix_cache]\ndrain_on_shutdown = "{value}"\n')
+
+
+@pytest.mark.parametrize("value", [0, 0.05, 1])
+def test_checkpoint_extra_work_fraction_configuration(tmp_path, value):
+    key = "server.scheduler_checkpoint_extra_work_fraction"
+    configuration = load(tmp_path, f"[server]\nscheduler_checkpoint_extra_work_fraction = {value}\n")
+    assert configuration.get(key) == Setting(value, "[server]")
+    assert configuration.get(key, 0) == Setting(0, "flag")
+
+
+@pytest.mark.parametrize("value", ["-0.01", "1.01", "nan", "inf", "true", '\"0.05\"'])
+def test_checkpoint_extra_work_fraction_rejects_invalid_configuration(tmp_path, value):
+    with pytest.raises(UsageError, match="scheduler_checkpoint_extra_work_fraction"):
+        load(tmp_path, f"[server]\nscheduler_checkpoint_extra_work_fraction = {value}\n")

@@ -58,8 +58,6 @@ PARTIAL_ROWS = 512
 TRITON_ROWS = 4
 CAKE_DECODE_ROWS = 128
 CAKE_PREFILL_ROWS = 2048
-# Layers run serially, so every Triton launch on a device shares one set of partial softmaxes.
-_PARTIALS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
@@ -198,14 +196,18 @@ def _pull_context(Records, Scales, Table, End, Slab, table_width, DIM: tl.conste
 
 
 # ``reads`` lists every tensor the launches read besides the query and records, so compilation orders them.
-@torch.library.custom_op("flare::sm103_cake_mla", mutates_args=("output",))
+@torch.library.custom_op("flare::sm103_cake_mla", mutates_args=("output", "scratch"))
 def _cake(query: torch.Tensor, records: torch.Tensor, reads: list[torch.Tensor], output: torch.Tensor,
-          handle: int) -> None:
-    _OWNERS[handle].run_cake()
+          scratch: list[torch.Tensor], handle: int) -> None:
+    owner = _OWNERS[handle]
+    if owner.query is None:
+        owner.run_functional(query, records, reads, output, scratch)
+    else:
+        owner.run_cake()
 
 
 @_cake.register_fake
-def _fake_cake(query, records, reads, output, handle) -> None:
+def _fake_cake(query, records, reads, output, scratch, handle) -> None:
     pass
 
 
@@ -265,9 +267,12 @@ class _CakeAttention:
         raise NotImplementedError
 
     def bind(self):
+        if self.query is None:
+            return
         from flashinfer.experimental.cake_dsa_train.cake_backend import prepare_dsa_train
 
         self.latents, self.rope, lse, residual = self.views()
+        self.lse, self.residual = lse, residual
         self.runners = []
         for start, end in self.slices:
             count = end - start
@@ -275,6 +280,26 @@ class _CakeAttention:
                 self.latents[:, :_ROPE], self.slice_indices(start, end), topk_length=self.lengths[start:end],
                 softmax_scale=self.scale, out=self.output[start:end], lse=lse[:count], o_lo=residual[:count],
                 backward=False))
+
+    def functional(self, *, session):
+        self.output_shape = tuple(self.output.shape)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        if self.query is None:
+            return
+        self.runners = [runner.functional() for runner in self.runners]
+        self.query = self.lengths = self.output = self.workspace = None
+        self.latents = self.rope = self.lse = self.residual = None
+        self._private = None
+        if isinstance(self, _GatheredCake):
+            self.selected = self.local = None
+        else:
+            self.positions = self.table = self.end = None
+
+    def local_scratch(self, device):
+        return [torch.zeros(shape, dtype=dtype, device=device) for shape, dtype in self.specs]
 
     def attend(self, runner):
         # Other operators reuse the arena between calls, so the zero rope is rewritten every time.
@@ -317,6 +342,19 @@ class _GatheredCake(_CakeAttention):
                           **self.gather_options)
             self.attend(runner)
 
+    def run_functional(self, query, records, reads, output, scratch):
+        selected, lengths = reads
+        latents, rope, lse, residual, local = scratch
+        scales = records.view(torch.float32)
+        for (start, end), runner in zip(self.slices, self.runners, strict=True):
+            launch_triton(_gather_records, self.gather,
+                (records, scales, selected[start:end], lengths[start:end], latents, local, selected.stride(0)),
+                self._gather_grid(start, end), **self.gather_options)
+            rope.zero_()
+            count = end - start
+            runner.forward_out(query[start:end], rope[:count], latents, latents[:, :_ROPE], local[:count],
+                               lengths[start:end], out=output[start:end], lse=lse[:count], o_lo=residual[:count])
+
 
 class Sm103SparseMLA:
     """Drop-in for ``PreparedSparseMLA`` on SM103: BF16 [rows, heads, 512] attention over selected records.
@@ -347,11 +385,8 @@ class Sm103SparseMLA:
                         "WIDTH": selected.shape[1], "ROWS": rows, "DIM": _DIM, "RECORD_BYTES": _RECORD_BYTES,
                         "BLOCK_H": _BLOCK_H, "BLOCK_N": _BLOCK_N, "SPLITS": self.splits}
         self.grid = (rows, triton.cdiv(heads, _BLOCK_H), self.splits)
-        key = (query.device, heads)
-        if key not in _PARTIALS:
-            _PARTIALS[key] = (torch.zeros((PARTIAL_ROWS, heads, _DIM), dtype=torch.float32, device=query.device),
-                              torch.zeros((PARTIAL_ROWS, heads), dtype=torch.float32, device=query.device))
-        self.partial, self.partial_lse = _PARTIALS[key]
+        self.partial = torch.zeros((PARTIAL_ROWS, heads, _DIM), dtype=torch.float32, device=query.device)
+        self.partial_lse = torch.zeros((PARTIAL_ROWS, heads), dtype=torch.float32, device=query.device)
         if self.splits > 1 and self.splits * rows > PARTIAL_ROWS:
             raise ValueError("split sparse MLA needs more partial rows than the shared buffer holds")
         self._bind_triton()
@@ -376,16 +411,46 @@ class Sm103SparseMLA:
         self.records = _records(cache)
         if self.cake is not None:
             self.cake.rebind_records(self.records)
-        else:
+        elif self.query is not None:
             self._bind_triton()
 
     def attend_in_scratch(self):
         """Attend into the caller's output, which no other operator shares; no LSE is produced."""
         return self(), None
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.output_shape = tuple(self.output.shape)
         if self.cake is not None:
-            _cake(self.query, self.records[0], [self.selected, self.counts], self.output, self.cake.handle)
+            self.cake.functional(session=session)
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.query = self.selected = self.counts = self.output = None
+        self.args = self.partial = self.partial_lse = self.merge_args = None
+
+    def __call__(self, query=None, selected=None, cache_lengths=None, selected_lengths=None, *, cache=None):
+        if self.query is None:
+            records = self.records if cache is None else _records(cache)
+            output = torch.zeros(self.output_shape, dtype=torch.bfloat16, device=query.device)
+            if self.cake is not None:
+                scratch = self.cake.local_scratch(query.device)
+                scratch.append(torch.zeros((self.cake.slice_rows, self.cake.width), dtype=torch.int32, device=query.device))
+                _cake(query, records[0], [selected, selected_lengths], output, scratch, self.cake.handle)
+                return output
+            rows, heads, dim = self.output_shape
+            partial = torch.zeros((self.splits * rows, heads, dim), dtype=torch.float32, device=query.device)
+            lse = torch.zeros((self.splits * rows, heads), dtype=torch.float32, device=query.device)
+            args = (query, *records, selected, selected_lengths, output, partial, lse,
+                    query.stride(0), query.stride(1), selected.stride(0), output.stride(0), output.stride(1))
+            launch_triton(_sparse_mla, self.compiled, args, self.grid, **self.options)
+            if self.splits > 1:
+                launch_triton(_merge_splits, self.merge,
+                    (partial, lse, output, output.stride(0), output.stride(1)), self.merge_grid, **self.merge_options)
+            return output
+        if self.cake is not None:
+            _cake(self.query, self.records[0], [self.selected, self.counts], self.output,
+                  [self.cake.latents, self.cake.rope, self.cake.lse, self.cake.residual, self.cake.local], self.cake.handle)
             return self.output
         launch_triton(_sparse_mla, self.compiled, self.args, self.grid, **self.options)
         if self.splits > 1:
@@ -438,7 +503,26 @@ class Sm103PrefillSparseMLA(_CakeAttention):
         """Attend into the caller's output, which no other operator shares; no LSE is produced."""
         return self(), None
 
-    def __call__(self):
+    def run_functional(self, query, records, reads, output, scratch):
+        positions, lengths, table, end = reads
+        latents, rope, lse, residual = scratch
+        launch_triton(_pull_context, self.pull,
+            (records, records.view(torch.float32), table, end, latents, table.shape[0]),
+            self.pull_grid, **self.pull_options)
+        for (start, stop), runner in zip(self.slices, self.runners, strict=True):
+            rope.zero_()
+            count = stop - start
+            runner.forward_out(query[start:stop], rope[:count], latents, latents[:, :_ROPE],
+                               positions[start:stop], lengths[start:stop], out=output[start:stop],
+                               lse=lse[:count], o_lo=residual[:count])
+
+    def __call__(self, query=None, positions=None, selected_lengths=None, table=None, end=None, *, cache=None):
+        if self.query is None:
+            output = torch.zeros(self.output_shape, dtype=torch.bfloat16, device=query.device)
+            records = self.records if cache is None else _records(cache)
+            _cake(query, records[0], [positions, selected_lengths, table, end], output,
+                  self.local_scratch(query.device), self.handle)
+            return output
         _cake(self.query, self.records[0], [self.positions, self.lengths, self.table, self.end], self.output,
-              self.handle)
+              [self.latents, self.rope, self.lse, self.residual], self.handle)
         return self.output

@@ -5,7 +5,6 @@
 """Captured MoonViT projections and attention against the checkpoint forward."""
 
 import json
-from copy import deepcopy
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ import pytest
 import torch
 
 from tests.components.completion_support import completion_outputs
+from .kimi_vision_support import VisionCall
 
 pytestmark = pytest.mark.skipif(os.getenv('FLARE_RUN_CUDA_TESTS') != '1', reason='requires an assigned GPU')
 CHECKPOINT = Path('/data/models/Kimi-K3-MXFP4-CSF')
@@ -29,7 +29,7 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
     from transformers.utils.output_capturing import OutputRecorder
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena, scratch_views
+    from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.preparation.compilation import compile_forward
     from ignition.recipes.kimi3.vision import VisionWeights, VisionInputs, VisionScratch, PreparedVision
@@ -53,17 +53,14 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
     reference.load_state_dict({n.removeprefix('vision_tower.'): v for n,v in weights.tensors.items() if n.startswith('vision_tower.')}, assign=True)
     projector.load_state_dict({n.removeprefix('mm_projector.'): v for n,v in weights.tensors.items() if n.startswith('mm_projector.')}, assign=True)
     reference.eval(); projector.eval()
-    pool = GraphBufferPool(device, chunk_bytes=2 << 20)
-    buffers = pool.cursor()
-    shared = buffers.zeros((max(n * 4608, 5 * 4096 * 7168),), torch.bfloat16)
-    text_scratch = scratch_views(shared, ((4096, 7168),) * 5)
-    inputs, scratch = VisionInputs.allocate(device), VisionScratch.allocate(n, device, work=shared, buffers=buffers)
+    inputs, scratch = VisionInputs.allocate(device), VisionScratch.allocate(n, device)
     with RecordedPreparationSession(device=device, checkpoint=str(CHECKPOINT), workload_schema='kimi3-vision', numerical_policy='default') as session:
         arena = ScratchArena(device)
         session.register_scratch(arena)
-        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name='vision', buffers=buffers)
+        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name='vision')
+        call = VisionCall(encoder, device)
         session.tune(show_progress=False)
-        encoder.positions.copy_(torch.tensor([[y,x] for y in range(h) for x in range(w)], device=device))
+        call.positions.copy_(torch.tensor([[y,x] for y in range(h) for x in range(w)], device=device))
         indices, factors = [], []
         for y in range(h):
             for x in range(w):
@@ -71,33 +68,32 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
                 iy, ix = int(sy), int(sx); fy, fx = sy-iy, sx-ix
                 indices.append([iy*64+ix, iy*64+min(ix+1,63),min(iy+1,63)*64+ix,min(iy+1,63)*64+min(ix+1,63)])
                 factors.append([(1-fy)*(1-fx),(1-fy)*fx,fy*(1-fx),fy*fx])
-        encoder.interpolation_indices.copy_(torch.tensor(indices, device=device))
-        encoder.interpolation_weights.copy_(torch.tensor(factors, device=device))
-        encoder.merge_indices.copy_(torch.tensor([[(y+dy)*w+x+dx for dy in range(2) for dx in range(2)] for y in range(0,h,2) for x in range(0,w,2)], device=device))
-        encoder.cu.copy_(torch.tensor([0,n], dtype=torch.int32, device=device))
-        encoder.num_patches.fill_(n);encoder.num_features.fill_(n//4)
+        call.interpolation_indices.copy_(torch.tensor(indices, device=device))
+        call.interpolation_weights.copy_(torch.tensor(factors, device=device))
+        call.merge_indices.copy_(torch.tensor([[(y+dy)*w+x+dx for dy in range(2) for dx in range(2)] for y in range(0,h,2) for x in range(0,w,2)], device=device))
+        call.cu.copy_(torch.tensor([0,n], dtype=torch.int32, device=device))
         torch.manual_seed(41)
         source = torch.randn((n,3,14,14), dtype=torch.bfloat16, device=device)
         grid = torch.tensor([[1,h,w]], device=device)
         hidden = reference.patch_embed(source, grid)
         rope = reference.encoder.rope_2d.get_freqs_cis(grid, device)
-        embeddings = encoder.rotary_embeddings()
+        embeddings = encoder.rotary_embeddings(call.positions)
         for block, reference_block in zip(encoder.blocks, reference.encoder.blocks, strict=True):
-            expected_block = reference_block(hidden, encoder.cu, n, rope)
-            actual_block = block(hidden, encoder.cu, position_embeddings=embeddings)
+            expected_block = reference_block(hidden, call.cu, n, rope)
+            actual_block = block(hidden, call.cu, position_embeddings=embeddings)
             relative = ((actual_block.float()-expected_block.float()).square().mean()
                         / expected_block.float().square().mean()).sqrt()
             assert relative < .005
             hidden = expected_block
-        scratch.patches.copy_(source.flatten(1))
+        call.patches.copy_(source.flatten(1))
         expected = projector(reference(source, grid))[0]
-        actual = encoder().clone()
+        actual = call().clone()
         error = ((actual.float()-expected.float()).square().mean()/expected.float().square().mean()).sqrt()
         print('vision relative RMS', error.item())
         # BF16 attention differences propagate through all 27 residual blocks.
         assert error < .05
-        compiled = compile_forward(encoder)
-        scratch.patches.copy_(source.flatten(1))
+        compiled = compile_forward(call)
+        call.patches.copy_(source.flatten(1))
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
@@ -109,7 +105,7 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             output = compiled()
-        scratch.patches.copy_(source.flatten(1))
+        call.patches.copy_(source.flatten(1))
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(output, actual, atol=0, rtol=0)
@@ -126,16 +122,14 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
         records = torch.zeros((2,2, 32), dtype=torch.int64, device=device)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.ones(1, dtype=torch.int64, device=device)
-        # TP ranks bind publication scratch at identical offsets after encoder buffers.
-        publication_buffers = deepcopy(buffers, {id(pool): pool})
-        publication = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, feature_range=(448,896), buffers=buffers)
+        publication = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, feature_range=(448,896))
         inputs.vision_pixel_values[:n].copy_(source.flatten(1))
-        for target, value in ((inputs.vision_position_ids, encoder.positions),
-                              (inputs.vision_interpolation_indices, encoder.interpolation_indices),
-                              (inputs.vision_interpolation_weights, encoder.interpolation_weights),
-                              (inputs.vision_merge_indices, encoder.merge_indices)):
+        for target, value in ((inputs.vision_position_ids, call.positions),
+                              (inputs.vision_interpolation_indices, call.interpolation_indices),
+                              (inputs.vision_interpolation_weights, call.interpolation_weights),
+                              (inputs.vision_merge_indices, call.merge_indices)):
             target[:value.shape[0]].copy_(value)
-        inputs.vision_cu_seqlens.copy_(encoder.cu)
+        inputs.vision_cu_seqlens.copy_(call.cu)
         inputs.vision_num_patches.fill_(n)
         inputs.vision_num_features.fill_(n//4)
         state.feature_slot.fill_(1)
@@ -160,9 +154,8 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
         torch.testing.assert_close(state.arena[1,:n//4], actual[:,448:896], atol=0, rtol=0)
         assert state.count.tolist() == [0,n//4]
         assert state.generation.tolist() == [0,12]
-        for chunks in pool.chunks.values():
-            for tensor in chunks:
-                tensor.fill_(float('nan') if tensor.is_floating_point() else -37)
+        for name in scratch.__dataclass_fields__:
+            getattr(scratch, name).fill_(float('nan'))
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(state.arena[1,:n//4], actual[:,448:896], atol=0, rtol=0)
@@ -173,7 +166,7 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
             assert state.count.tolist() == [0,n//2]
             torch.testing.assert_close(state.arena[1,n//4:n//2], actual[:,448:896], atol=0, rtol=0)
         graph.reset()
-        publication = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, feature_range=(6720,7168), buffers=publication_buffers)
+        publication = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, feature_range=(6720,7168))
         with artifact.open('rb') as file:
             restored = torch.compiler.load_compiled_function(file)
         inputs.vision_feature_offset.zero_()

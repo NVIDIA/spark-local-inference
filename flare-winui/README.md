@@ -10,7 +10,8 @@ No webview or managed UI runtime is used.
 
 ## Build
 
-Run the repository's [Windows setup](../docs/windows.md) first. The desktop build
+Run the repository's
+[Windows setup](../docs/windows.md#build-and-test-on-windows) first. The desktop build
 uses Visual Studio 2022 C++ tools, Windows SDK 10.0.26100.0, Rust, and pinned
 Windows App SDK and C++/WinRT NuGet packages. It does not require the Visual
 Studio UWP workload or a separate XAML compiler. The installed SDK's MakePri
@@ -30,9 +31,10 @@ Rust standard library target. The native build restores dependencies beneath
 `.local-dev/winui/ARM64/SingleFile/Flare.exe` (or `x64/SingleFile/Flare.exe`).
 The Rust launcher embeds the native application and its runtime dependencies.
 The native application and Rust bridge use the static C runtime consistently,
-including tokenizer dependencies. Their Cargo output uses the short `winui-target`
-directory beneath the configured Flare development directory; the launcher uses
-`launcher-target` beneath the same directory.
+including tokenizer dependencies. The bridge's Cargo output uses the short
+`winui-target` directory beneath the Flare development directory
+(`%LOCALAPPDATA%\FlareDev`, or the `-DevRoot` directory chosen during setup); the
+launcher uses `launcher-target` beneath the same directory.
 
 To bundle an existing Release folder without rebuilding the C++ application:
 
@@ -54,7 +56,11 @@ Omit `-SingleFile` for the loose development workflow. The build copies the
 selected Windows App SDK components and Visual C++ runtime files beside
 `flare-winui.exe`; distribute that complete Release directory when using this
 form. Both distribution forms are unsigned build outputs, without an MSIX or
-installer.
+installer. Neither form contains license notices. `packaging/archive.py
+--winui-packages` packages the single-file `Flare.exe` with the notices of its
+Rust and NuGet dependencies, as
+[third-party notices](../THIRD_PARTY_NOTICES.md#updating-the-notices-and-creating-archives)
+describes; [binary releases](../docs/release.md) publish that archive.
 Windows App SDK's WebView metadata is required
 to generate the WinUI projection, but no WebView loader is linked or copied.
 
@@ -70,29 +76,32 @@ On first launch, the launcher silently extracts the embedded WinUI runtime to
 `Flare/Desktop/<ARM64|x64>/<archive-SHA256>` beneath the Windows Local App Data
 known folder, then starts `flare-winui.exe` from that directory. Later launches
 reuse that runtime version. Different embedded archives have separate cache
-versions; previous versions are retained without automatic startup cleanup.
+versions; the launcher does not remove versions extracted from other archives.
 Each launch checks the cached files against the embedded manifest. Missing or
 corrupt files trigger extraction into a staging directory; the application starts
 only after the complete replacement has passed verification. The launcher exits
 after starting the native application. Taskbar relaunch metadata points to the
-downloaded executable and preserves an explicitly selected configuration.
-The downloaded `Flare.exe` remains the entry point, so no adjacent DLL folder
+launcher executable and preserves an explicitly selected configuration.
+The launcher `Flare.exe` is the entry point, so no adjacent DLL folder
 is needed. This runtime cache is separate from model cores, configuration,
 publisher trust, and desktop state. Packaging and extraction do not move or copy
 model data.
 
-On Windows 11 ARM64, the standalone executable has been exercised from a folder
-containing no sidecar files, with spaces and Unicode in executable and configuration
-paths. First extraction, cache reuse, missing-resource repair, and taskbar relaunch
-properties passed. The bundled application loaded the existing Qwen3.8-27B core
-on an RTX Spark N1X and returned a chat completion. This does not establish clean
-machine or x64 runtime compatibility.
+The single-file `Flare.exe` is qualified on Windows 11 ARM64 when launched from
+a folder containing no sidecar files, with spaces and Unicode in the executable
+and configuration paths: first extraction, cache reuse, missing-resource repair,
+and taskbar relaunch properties. On an RTX Spark N1X, the bundled application is
+qualified to load a Qwen3.8-27B core and return a chat completion. Not
+qualified: a machine without the development environment installed, and the x64
+runtime.
 
 Pass `--config PATH` to select a configuration explicitly. The launcher forwards
 arguments and retains the caller's working directory for relative paths.
-The loose `Release/flare-winui.exe` accepts the same arguments. The shared library
-preserves an existing legacy `packages` cache directory; it does not copy or move
-downloaded cores. Fresh installations use `cores` unless configured otherwise.
+The loose `Release/flare-winui.exe` accepts the same arguments. Unless
+`paths.core_cache` is configured, the shared library stores cores in
+`~/.cache/flare/cores` beneath the user profile folder. When `cores` is absent
+and `~/.cache/flare/packages` exists, it uses `packages` in place without copying
+or moving downloaded cores.
 
 Cores can be discovered on Hugging Face, downloaded by repository ID, or opened
 from a prepared `.safetensors` file or core folder. Opening an external
@@ -109,7 +118,10 @@ Discovery cards show the repository author, published precision, task, license,
 context, and hardware builds when that metadata is available. Missing fields
 are omitted. Hub file sizes cover every file in one resolved revision, including
 documentation and other deployments; they are not an exact download size or a
-GPU memory requirement. Details identifies the revision and commit. Cached
+GPU memory requirement. Cards show the last update date of the resolved hardware
+branch when Hugging Face provides it. Details identifies the branch, commit, and
+last commit time in UTC. For downloaded discovery entries, this date describes
+the Hub branch; the installed core may be from an earlier commit. Cached
 cores show logical payload size as Core data, with context and hardware from
 installed deployments. Logical payload size can differ from storage usage.
 Discovery reads Hub metadata and small configuration files, without fetching
@@ -120,15 +132,18 @@ promotional subtitles; the empty Downloads view shows No downloads and Browse
 models alongside access to core storage.
 
 Home centers on running a local core and observing its runtime. Installed
-cores have a Run model action. Add model opens a single chooser for Hugging Face
-discovery, a repository link, or a local core file or folder. Model details are
-available in Models. Loading shows runtime progress. A running model exposes
-switch and stop controls alongside the serving address and its copy action.
+cores have a Run model action. Cached models with one recorded Hugging Face
+repository use its repository name on Home and in the library. Local exports
+use the model name recorded in their core metadata. Add model opens a single
+chooser for Hugging Face discovery, a repository link, or a local core file or
+folder. Model details are available in Models. Loading shows runtime progress.
+A running model exposes switch and stop controls alongside the serving address
+and its copy action.
 Chat remains available in the sidebar for testing the active session.
 The dashboard uses the CLI overview's two-second rate window and 120-second
 history for prefill, generation, verification, and draft acceptance/depth.
-Request counts, token totals, median first-response latency, KV-cache capacity,
-host prefix-cache activity, and driver-reported GPU memory remain visible.
+It also shows request counts, token totals, median first-response latency,
+KV-cache capacity, host prefix-cache activity, and driver-reported GPU memory.
 Accepted drafts and depth are counts per request round, not percentages.
 Weight bandwidth is an estimate from verification rate and declared decode
 weight bytes, not measured GPU throughput. A dash means a metric is unavailable;
@@ -143,10 +158,17 @@ transfers. Preparation reports completed metadata checks with at most eight
 requests in flight. Transfer speed uses the last two seconds of byte movement;
 speed and ETA are hidden during preparation, validation, and installation.
 Those phases use indeterminate progress, and only a completed install shows 100%.
+Clear failed removes failed entries from download history. Completed, active,
+paused, and cancelled entries remain, and downloaded data is kept for retries.
 
 Model details inspect signed metadata without granting publisher consent or
-loading the GPU. The PC filter hides cores whose inspected requirements are
-known to be incompatible; unknown candidates remain visible. Chat streams
+loading the GPU. For this PC hides undownloaded repositories whose published
+platform branches exclude the first visible GPU's platform, and local cores
+whose inspected requirements are known to be incompatible. Missing build metadata
+or an unknown GPU platform leaves a repository visible. Downloaded cores use
+their inspected requirements even if the repository no longer publishes a
+matching platform branch. A matching branch does not establish core compatibility
+or available memory; loading performs those checks. Chat streams
 multi-turn test conversations from the active Helios session.
 Enter sends a message; Shift+Enter adds a line.
 Stop preserves partial output, and New chat clears the conversation. Successful
@@ -175,9 +197,9 @@ Reload model finishes accepted requests before releasing and loading the core.
 | Embedding tables | Default/disk/RAM storage and row-cache budget apply to auxiliary PLE/Engram tables. |
 
 The default window is 1200 × 1000 logical pixels, constrained to the display’s
-working area. The dashboard retains four plots in a two-by-two layout.
+working area. The dashboard shows four plots in a two-by-two layout.
 
-The demo recommendation maps the exact prepared repository
+One built-in recommendation maps the exact prepared repository
 `local-inference-lab/Qwen3.8-27B-FLARE` to the display identity
 `nvidia/Qwen3.8-27B-NVFP4`. It is available offline on an empty Home screen and
 in Models. Cached cores acquire that identity only through recorded acquisition
@@ -194,10 +216,11 @@ of streamed output.
 Device memory is sampled through the Rust hardware monitor every two seconds
 and includes other processes. First response shows the rolling server-side
 median over 60 seconds, with its sample count; the retained window is capped at
-4,096 requests. Flare uses a dark appearance regardless of Windows or legacy
-theme preferences. Display settings offer comfortable or compact spacing, which
-survives application restarts. Windows HighContrast colors remain available for
-accessibility.
+4,096 requests. Flare uses a dark appearance regardless of the Windows theme or
+a System or Light theme value saved in `desktop-state.json`. Display settings
+offer comfortable or compact spacing, which
+survives application restarts. Windows HighContrast colors apply when
+HighContrast is enabled.
 
 Switching a running model requires confirmation and drains accepted work before
 releasing the active session. The endpoint is unavailable while a replacement

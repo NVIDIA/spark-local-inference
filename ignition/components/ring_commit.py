@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from ignition.preparation.tensor_metadata import record_numeric_tensor
+from ignition.preparation.persistent import persistent_copy
 
 
 @triton.jit
@@ -29,7 +30,7 @@ def _commit(Staged, Backing, Offsets, Rows, Starts, Lengths, ROW_STRIDE: tl.cons
 
 
 class PreparedRingCommit:
-    """Own staging whose per-region views feed producers before one accepted-prefix copy.
+    """Commit per-region staging produced inside a speculative forward.
 
     Admission validates distinct positive destination rows and bounds accepted
     counts by token_capacity. Row zero and unaccepted ring records are preserved.
@@ -52,22 +53,27 @@ class PreparedRingCommit:
                 or any(first + size > second for first, second in zip(sorted(offsets), sorted(offsets)[1:]))):
             raise ValueError("ring regions must be distinct non-overlapping fields within each backing row")
         self.backing, self.rows, self.starts = backing, rows, starts
-        self.offsets = torch.tensor(offsets, dtype=torch.int64, device=backing.device)
+        self.offsets = persistent_copy(torch.tensor(offsets, dtype=torch.int64, device=backing.device))
         record_numeric_tensor(self.offsets)
         from ignition.preparation.scratch import bind_scratch
 
         shape = (len(offsets), rows.numel(), (window_tokens + token_capacity) * record_bytes)
+        self.staging_shape, self.rows_shape = shape, tuple(rows.shape)
         self.staging = bind_scratch({"staging": (shape, torch.uint8)}, device=backing.device,
             workspace=None if staging is None else {"staging": staging})["staging"]
         self.staging.zero_()
         self.window_tokens, self.record_bytes = window_tokens, record_bytes
         self.grid = (min(token_capacity, window_tokens), rows.numel(), len(offsets))
 
-    def __call__(self, counts):
-        if counts.shape != self.rows.shape or counts.dtype not in (torch.int32, torch.int64) or counts.device != self.rows.device:
+    def functional(self):
+        self.staging = self.rows = self.starts = None
+        return self
+
+    def __call__(self, counts, *, staging, rows, starts):
+        if counts.shape != self.rows_shape or counts.dtype not in (torch.int32, torch.int64) or counts.device != self.backing.device:
             raise ValueError("accepted counts must match the ring commit's request rows")
         torch.library.wrap_triton(_commit)[self.grid](
-            self.staging, self.backing, self.offsets, self.rows, self.starts, counts,
-            self.backing.stride(0), self.staging.stride(1), self.staging.stride(0),
-            self.rows.stride(0), self.starts.stride(0), counts.stride(0),
+            staging, self.backing, self.offsets, rows, starts, counts,
+            self.backing.stride(0), staging.stride(1), staging.stride(0),
+            rows.stride(0), starts.stride(0), counts.stride(0),
             self.window_tokens, self.record_bytes, triton.next_power_of_2(self.record_bytes))

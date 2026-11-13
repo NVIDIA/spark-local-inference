@@ -24,6 +24,7 @@ from ignition.preparation.runtime_core import (
 class Graph:
     register_post_instantiate_hook = CUDAGraph.register_post_instantiate_hook
     register_destroy_callback = CUDAGraph.register_destroy_callback
+    retain_object = CUDAGraph.retain_object
 
     def __init__(self, keep_graph=False):
         self.keep_graph = keep_graph
@@ -187,7 +188,7 @@ def test_shared_capture_records_after_all_warmups_without_reinstantiation(monkey
     assert recorder.events == ["record", "record"]
 
 
-def test_export_metadata_outlives_template_and_retains_external_owners(monkeypatch, recorder):
+def test_export_instantiates_and_retains_executable(monkeypatch, recorder):
     import flare_heliopause
 
     monkeypatch.setattr(flare_heliopause, "current_context", lambda: (100, 0))
@@ -196,21 +197,75 @@ def test_export_metadata_outlives_template_and_retains_external_owners(monkeypat
     graph.pools = lambda: [(0, 2)]
     graph.capture_end()
     kernel_owner = SimpleNamespace()
-    owner = record_export_graph(graph, storage, owners=(kernel_owner,))
-    assert graph.template == graph.executable == graph.instantiations == 0
-    assert owner.pools == (storage.pool, storage.graph_pool)
-    assert owner.owners == (kernel_owner,)
-    assert _graphs({"decode": owner}, recorder=recorder) == [dict(name="decode", recorded=1)]
-    with pytest.raises(ValueError, match="another native module recorder"):
-        _graphs({"decode": owner}, recorder=Recorder())
-    assert recorder.templates == {1: 11}
-    owner.reset()
-    owner.reset()
-    assert owner.pools == owner.owners == ()
+    returned = record_export_graph(graph, storage, owners=(kernel_owner,))
+    assert returned is graph
+    assert graph.instantiations == 1
+    assert graph.template == 11
+    assert graph.executable == 12
+    assert _graphs({"decode": graph}) == [dict(name="decode", graph=11, executable=12)]
     assert not recorder.templates
-    assert recorder.events == ["record-template", "release-template"]
-    with pytest.raises(ValueError, match="released"):
-        _graphs({"decode": owner}, recorder=recorder)
+    assert recorder.events == []
+
+
+@pytest.mark.parametrize("release", ("reset", "collection"))
+def test_export_graph_retains_external_owners_until_release(recorder, release):
+    class Owner:
+        pass
+
+    first_pool, second_pool, kernel_owner = Owner(), Owner(), Owner()
+    first_pool.id, second_pool.id = (0, 1), (0, 2)
+    storage = SimpleNamespace(pool=first_pool, graph_pool=second_pool)
+    references = tuple(weakref.ref(owner) for owner in (first_pool, second_pool, kernel_owner))
+    graph = Graph(keep_graph=True)
+    graph.pools = lambda: [(0, 2)]
+    graph.capture_end()
+    returned = record_export_graph(graph, storage, owners=(kernel_owner,))
+    assert returned is graph
+    graph_reference = weakref.ref(graph)
+    del first_pool, second_pool, kernel_owner, storage
+    gc.collect()
+    assert all(reference() is not None for reference in references)
+
+    drained = []
+    class Stream:
+        def synchronize(self):
+            assert all(reference() is not None for reference in references)
+            drained.append(True)
+
+    graph._retained.replay_streams.add(Stream())
+    if release == "reset":
+        graph.reset()
+        assert all(reference() is None for reference in references)
+        assert graph_reference() is graph
+    del graph, returned
+    gc.collect()
+    assert graph_reference() is None
+    assert all(reference() is None for reference in references)
+    assert drained == [True]
+
+
+def test_export_instantiation_failure_retains_owners_until_reset(monkeypatch, recorder):
+    class Owner:
+        pass
+
+    owner = Owner()
+    reference = weakref.ref(owner)
+    storage = SimpleNamespace(pool=SimpleNamespace(id=(0, 1)), graph_pool=SimpleNamespace(id=(0, 2)))
+    graph = Graph(keep_graph=True)
+    graph.pools = lambda: [(0, 2)]
+    graph.capture_end()
+
+    def fail_instantiation():
+        raise RuntimeError("graph instantiation failed")
+
+    monkeypatch.setattr(graph, "instantiate", fail_instantiation)
+    with pytest.raises(RuntimeError, match="graph instantiation failed"):
+        record_export_graph(graph, storage, owners=(owner,))
+    del owner
+    gc.collect()
+    assert reference() is not None
+    graph.reset()
+    assert reference() is None
 
 
 def test_export_rejects_unowned_pool_without_destroying_template(monkeypatch, recorder):
@@ -221,6 +276,7 @@ def test_export_rejects_unowned_pool_without_destroying_template(monkeypatch, re
     with pytest.raises(ValueError, match="without an external owner"):
         record_export_graph(graph, storage)
     assert graph.template == 11
+    assert graph.instantiations == 0 and not graph._retained.objects
     assert not recorder.templates
 
 
@@ -258,7 +314,7 @@ def test_export_resources_accept_recorded_graphs_and_executable_tuners(monkeypat
         bundle._validate_resources(export_graphs=True)
 
 
-def test_export_preserves_collective_consumers_after_replacing_cuda_graph(monkeypatch, recorder):
+def test_export_preserves_collective_consumer_associations(monkeypatch, recorder):
     import flare_heliopause
     from ignition.preparation.startup_tuning import record_consumer
 
@@ -283,5 +339,6 @@ def test_export_preserves_collective_consumers_after_replacing_cuda_graph(monkey
         session=session, device="cpu", stream=stream, pool=storage.graph_pool.id, compile_decoder=False,
         retain_graphs=True, warmup_storage=storage)
     graph = graphs["decode"]
-    assert isinstance(graph, RecordedExportGraph)
+    assert isinstance(graph, Graph)
+    assert graph.instantiations == 1
     assert registry.captures == {id(graph): {id(collective)}}

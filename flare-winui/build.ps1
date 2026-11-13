@@ -59,11 +59,16 @@ try {
     & $msbuild (Join-Path $PSScriptRoot 'flare-winui.vcxproj') /m /nologo /v:minimal "/p:Platform=$Platform" "/p:Configuration=$Configuration" "/p:FlareBridgeLibrary=$bridge"
     if ($LASTEXITCODE -ne 0) { throw "WinUI build failed with exit code $LASTEXITCODE." }
     $output = Join-Path $repository ".local-dev/winui/$Platform/$Configuration"
-    $redist = Get-ChildItem -LiteralPath (Join-Path $installation 'VC/Redist/MSVC') -Directory |
-        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object Name -Descending | Select-Object -First 1
-    if (-not $redist) { throw 'The Visual C++ app-local runtime files were not found.' }
-    $runtime = Join-Path $redist.FullName "$($Platform.ToLowerInvariant())/Microsoft.VC143.CRT"
-    Get-ChildItem -LiteralPath $runtime -Filter '*.dll' | Copy-Item -Destination $output -Force
+    # The app-local runtime directory is named for the toolset that ships it,
+    # such as Microsoft.VC143.CRT. Use the newest one the installation provides.
+    $runtime = Get-ChildItem -LiteralPath (Join-Path $installation 'VC/Redist/MSVC') -Directory |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName "$($Platform.ToLowerInvariant())/Microsoft.VC*.CRT") -Directory -ErrorAction SilentlyContinue } |
+        Select-Object -First 1
+    if (-not $runtime) { throw "The Visual C++ app-local runtime files for $Platform were not found." }
+    $runtimeFiles = @(Get-ChildItem -LiteralPath $runtime.FullName -Filter '*.dll')
+    if (-not $runtimeFiles.Count) { throw "The Visual C++ app-local runtime directory is empty: $($runtime.FullName)" }
+    $runtimeFiles | Copy-Item -Destination $output -Force
     Write-Host "Flare desktop: $(Join-Path $output 'flare-winui.exe')"
     if ($SingleFile) {
         & (Join-Path $PSScriptRoot 'package-single-file.ps1') -Platform $Platform

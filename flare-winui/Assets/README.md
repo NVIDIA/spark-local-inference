@@ -5,7 +5,7 @@ The cream block `h` and ascending solar plume refer to the
 linked from the [repository README](https://github.com/NVIDIA/hyperflare-inference).
 The icon is a separate vector interpretation; it contains no banner pixels.
 The plume uses NVIDIA green `#76B900`. The tile, bevel, border, and letter shadow
-use neutral charcoal. Outer corners remain transparent.
+use neutral charcoal. Outer corners are transparent.
 
 - `flare-app.svg`: scalable artwork, including the large-size highlight and shadow.
 - `flare-app-small.svg`: simplified artwork for 16–32 px frames.
@@ -23,7 +23,11 @@ with Pillow installed to regenerate the PNGs and ICO from the SVG polygons.
 The renderer validates frame dimensions, bounds, and alpha after writing the ICO.
 Pillow is an asset-authoring dependency, not an application dependency.
 
-The executable embeds `flare-app.ico` as the Win32 `IDI_FLARE_APP` resource for
+`flare-winui.exe` embeds `flare-app.ico` as the Win32 `IDI_FLARE_APP` resource for
 Explorer. The window loads its small and large icons from that resource for the
-window and taskbar; no external icon file is required at runtime. Existing
-Flare executable and resource identifiers remain unchanged.
+window and taskbar; no external icon file is required at runtime.
+`flare-winui/flare-winui.rc` also embeds `flare-app-128.png` as the
+`IDB_FLARE_TITLE` resource, which supplies the title bar image.
+`flare-winui/resource.h` defines both identifiers. The single-file launcher
+`Flare.exe` embeds `flare-app.ico` as icon resource 1 through
+`flare-winui/launcher/build.rs`.

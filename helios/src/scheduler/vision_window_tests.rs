@@ -164,6 +164,7 @@ fn cold_history_exceeding_two_arenas_keeps_pages_state_and_user_reuse_across_win
         let mut renewals = 0;
         let mut vision_jobs = 0;
         let mut sampled = 0;
+        let mut published_prompt = false;
         for _ in 0..200 {
             let request = scheduler.request(handle).unwrap();
             if request.phase == RequestPhase::Finishing {
@@ -221,7 +222,16 @@ fn cold_history_exceeding_two_arenas_keeps_pages_state_and_user_reuse_across_win
             sampled += (scheduler.request(handle).unwrap().generated_tokens - before) as usize;
             assert_eq!(scheduler.stats().cache_lookups, initial_lookups);
             assert_eq!(scheduler.stats().reused_tokens, 0);
-            assert_eq!(scheduler.stats().snapshot_publications, 0);
+            let request = scheduler.request(handle).unwrap();
+            if executed.kind == GraphKind::Snapshot
+                && request.consumed_tokens == request.prompt_tokens as u64
+            {
+                published_prompt = true;
+            }
+            assert_eq!(
+                scheduler.stats().snapshot_publications,
+                u64::from(published_prompt)
+            );
         }
         assert_eq!(renewals, 2);
         assert_eq!(vision_jobs, images.len());
@@ -234,6 +244,8 @@ fn cold_history_exceeding_two_arenas_keeps_pages_state_and_user_reuse_across_win
             RequestPhase::Finishing
         );
         assert_eq!(scheduler.request(handle).unwrap().window_snapshot, None);
+        assert!(published_prompt);
+        assert_eq!(scheduler.stats().snapshot_publications, 1);
         assert!(scheduler.finish(handle).unwrap().is_some());
         assert_eq!(scheduler.stats().snapshot_publications, 1);
     }

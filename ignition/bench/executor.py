@@ -55,6 +55,15 @@ class _RankBenchmark:
             if torch.cuda.memory_allocated(runner.device) != allocated:
                 raise RuntimeError("captured benchmark replay changed allocated CUDA memory")
             return {"graph_ns": elapsed}
+        if operation == "observe":
+            from .runner import _observe
+
+            step = command["step"]
+            observers = getattr(runner.model, "benchmark_observers", None)
+            if observers is None or step["graph"] not in observers:
+                raise ValueError(f"benchmark observer is missing for {step['graph']!r}")
+            values = _observe(runner, observers[step["graph"]], step)
+            return {"observations": {name: value.cpu().tolist() for name, value in values.items()}}
         if operation == "snapshot":
             if self.snapshot is not None:
                 raise RuntimeError("benchmark rank already owns a state snapshot")
@@ -118,6 +127,12 @@ class BenchmarkExecutor:
 
     def records(self, frame):
         return self.local.runner.records(frame)
+
+    def observe(self, step):
+        import torch
+
+        results = self._exchange(dict(operation="observe", step=step))
+        return {name: torch.as_tensor(value) for name, value in results[0]["observations"].items()}
 
     def snapshot(self):
         self._exchange(dict(operation="snapshot"))

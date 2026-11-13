@@ -328,6 +328,11 @@ impl Bootstrap {
                     .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
             }
         }
+        if let Some(value) = object.get("scheduler_checkpoint_extra_work_fraction") {
+            scheduling_policy.checkpoint_extra_work_fraction = value.as_f64()
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .ok_or("scheduler_checkpoint_extra_work_fraction must be finite and between zero and one")?;
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
                 .filter(|v| v.is_finite() && *v > 0.0)
@@ -718,6 +723,18 @@ mod tests {
             let defaults = Bootstrap::load(&configured.to_string(), &manifest).unwrap();
             assert_eq!(defaults.server.scheduling_policy.terminal_value, 256.0);
             assert_eq!(defaults.server.scheduling_policy.terminal_age_price, 1.0);
+            assert_eq!(defaults.server.scheduling_policy.checkpoint_extra_work_fraction, 0.05);
+            for fraction in [0.0, 0.05, 1.0] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap();
+                assert_eq!(loaded.server.scheduling_policy.checkpoint_extra_work_fraction, fraction);
+            }
+            for invalid in [json!(-0.1), json!(1.1), json!("NaN"), json!(null)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_checkpoint_extra_work_fraction"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap().to_string().contains("scheduler_checkpoint_extra_work_fraction"));
+            }
             for key in ["scheduler_terminal_value", "scheduler_terminal_age_price"] {
                 for number in [0.0, 0.5, 512.0] {
                     let mut overrides = configured.clone();

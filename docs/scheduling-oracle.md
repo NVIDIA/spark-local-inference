@@ -4,7 +4,9 @@
 optimal conditional schedules for small finite workloads. It is a reference
 for testing scheduling objectives and approximations. Its policy-improvement
 prototype compares graph executions by expected useful value per millisecond,
-including a continuation value for the state after execution.
+including a continuation value for the state after execution. The oracle and
+its prototypes exist only in the Python simulator. Helios has no
+completion-episode solver and no output-length prior.
 
 ## Workload and information
 
@@ -34,7 +36,7 @@ share the same continuation calculation.
 The explicit state limit raises an error when exceeded. There is no approximate
 fallback. Long prompts with small available chunks or many request/acceptance
 combinations can exceed practical time, memory, or Python recursion limits.
-The event simulator remains the tool for workloads up to sixteen requests;
+The event simulator is the tool for workloads up to sixteen requests;
 the exact oracle targets small instances.
 
 ## Metrics and objective
@@ -65,7 +67,13 @@ R = W - c_first*F - c_finish*C - c_age*A.
 
 `beta` is output-token value. Waiting prices have units of useful-work units per
 millisecond, except `c_age`, which has units per millisecond squared. All prices
-are explicit experimental inputs, not production defaults.
+are explicit experimental inputs, not production defaults. In `oracle.py`,
+`Objective` holds `beta`, `c_first`, `c_finish`, and `c_age` as `decode_value`,
+`prefill_wait_price`, `unfinished_wait_price`, and `decode_age_price`.
+`Metrics` holds `P`, `D`, `T`, `F`, `C`, and `A` as `prefill_tokens`,
+`output_tokens`, `elapsed_ms`, `prefill_wait_ms`, `unfinished_wait_ms`, and
+`decode_age_ms2`. The time price `rho` defined below is the `time_value`
+argument.
 
 The priced oracle chooses the policy maximizing
 
@@ -94,7 +102,7 @@ fixed `rho`, the priced oracle therefore minimizes the priced time and waiting
 costs. Changing `beta` alone adds the same constant to every complete schedule.
 These episodes test completion and cadence; they cannot establish the desired
 intrinsic phase preference under continuing arrivals. That preference and
-sustained fairness remain part of the [rate-allocation model](scheduling-theory.md).
+sustained fairness belong to the [rate-allocation model](scheduling-theory.md).
 
 ## Why episode normalization is a separate experiment
 
@@ -163,7 +171,7 @@ successor state. An old stream becomes more valuable through its effect on
 future waiting, without multiplying a stall-clearing bonus by speculative
 burst size.
 
-Exact evaluation of the baseline policy is still expensive and requires finite
+Exact evaluation of the baseline policy is expensive and requires finite
 length priors. This prototype identifies the quantity an efficient scheduler
 would approximate. It does not supply a bounded-cost runtime implementation.
 
@@ -180,7 +188,8 @@ and the exact priced optimum.
 Run from the repository root:
 
 ```sh
-python -m pytest tests/test_scheduling_sim.py tests/test_scheduling_oracle.py -q
+python -m pytest tests/test_scheduling_sim.py tests/test_scheduling_oracle.py \
+  tests/test_scheduling_continuation.py -q
 python -m scripts.scheduling_sim.oracle_sweep \
   --decode-values 1,64 --time-values 0.1,1 --age-prices 0,0.01,0.1 \
   --output /tmp/flare-oracle-sweep.csv
@@ -193,27 +202,36 @@ tails, two 8192-token prefills, concurrent prefill/decode, heterogeneous
 acceptance, mixed captures, a stalled stream, and uncertain output length.
 Decode lengths are deliberately small enough for exact enumeration. The CLI
 prints each policy's first action and expected episode measurements, and writes
-ordinary CSV when requested.
+ordinary CSV when requested. `--decode-values`, `--time-values`, and
+`--age-prices` supply `beta`, `rho`, and `c_age`; `--prefill-wait-price` and
+`--unfinished-wait-price` supply `c_first` and `c_finish` and default to zero.
 
-For the command above, with zero first-token and completion waiting prices:
+The sweep labels its methods `oracle`, `value_rate`, `myopic_wait`, `rollout`,
+`rollout_twice`, and `serial_value`, plus `episode_ratio` with
+`--include-ratio`. `serial_value` comes from `SerialReference` in
+[`continuation.py`](../scripts/scheduling_sim/continuation.py). It applies the
+value-per-time score above with a cheaper baseline: finish the requests one at
+a time in input order, each by its isolated immediate useful-work rate. It
+composes that baseline's value from per-request tables over remaining prompt
+and attained output, without enumerating joint acceptance outcomes.
+[`tests/test_scheduling_continuation.py`](../tests/test_scheduling_continuation.py)
+compares the composition with complete conditional evaluation and checks, on
+small seeded instances, that the resulting policy's surplus lies between the
+serial baseline and the priced optimum. `helios/src/scheduler/valuation.rs`
+contains the same serial composition in Rust as `serial_metrics`. It is
+compiled only for tests, and the Helios selector does not call it.
 
-| Policy | Configurations matching the priced optimum |
-| --- | ---: |
-| Immediate useful work/time | 86 / 132 |
-| Immediate net work/time, subtracting graph waiting cost | 80 / 132 |
-| One continuation-value improvement | 130 / 132 |
-| Two continuation-value improvements | 132 / 132 |
+Each sweep row reports `surplus_gap`, the amount by which the method's expected
+surplus falls below the priced optimum for that configuration. A method matches
+the optimum when its gap is below `1e-7` useful-work units. The gap compares
+synthetic objectives; it measures neither inference performance nor fairness
+under ongoing arrivals. Repeated policy improvement has no general optimality
+guarantee.
 
-Matching means an absolute surplus difference below `1e-7` useful-work units.
-The combinations include repeated optima: output value does not affect the
-priced optimum at fixed `rho` for these complete episodes. Two improvement
-passes have no general optimality guarantee. These counts are synthetic
-objective comparisons, not inference performance measurements or evidence of
-fairness under ongoing arrivals.
-
-Two concrete cases isolate continuation effects. A 129-token prompt takes 5 ms
-under greedy chunking and 4 ms under the oracle and improvement prototype. For
-a 10-token prompt and two two-token decode streams in the `mixed_tail` catalog,
-`beta=4` gives 14 ms under immediate useful work/time and 11.5 ms with the small
-mixed capture followed by the remaining prefill. At positive stream-age price,
-serving the mixed graph first improves cadence without changing completion time.
+Continuation value corrects schedules that immediate useful work per time gets
+wrong. `test_completion_oracle_and_rollout_resolve_the_greedy_prefill_tail`
+asserts one case: over prefill graphs of 64, 128, and 256 tokens costing 2, 3,
+and 4 ms, a 129-token prompt finishes in 4 ms under the oracle and one
+improvement pass and in 5 ms under the immediate score.
+`test_mixed_completion_value_can_outweigh_lower_immediate_rate` asserts a
+second case with mixed graphs.

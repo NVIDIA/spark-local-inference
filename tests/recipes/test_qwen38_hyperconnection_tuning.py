@@ -15,7 +15,6 @@ from ignition.recipes.qwen38 import hyperconnection
 from ignition.recipes.qwen38.hyperconnection import HyperconnectionScratch
 from ignition.preparation.fixtures.hyperconnection import HyperconnectionBenchmarkInputs, benchmark_call
 from ignition.preparation.fixtures.hyperconnection_gate import HyperconnectionGateInputs
-from ignition.preparation.scratch import GraphBufferPool
 
 
 def test_packed_projection_preserves_canonical_weights_without_duplicate_storage():
@@ -185,10 +184,11 @@ def test_combine_priming_reuses_disjoint_existing_storage():
 
 
 def test_priming_accepts_disjoint_views_of_one_pool_chunk():
-    pool = GraphBufferPool("cpu", chunk_bytes=2 << 20)
-    buffers = pool.cursor()
-    source = buffers.zeros((4, 10240), torch.bfloat16)
-    scratch = HyperconnectionScratch.allocate(4, torch.device("cpu"), buffers=buffers)
+    from dataclasses import replace
+
+    backing = torch.zeros((2, 4, 10240), dtype=torch.bfloat16)
+    source = backing[0]
+    scratch = replace(HyperconnectionScratch.allocate(4, torch.device("cpu")), normalized=backing[1])
     assert source.untyped_storage().data_ptr() == scratch.normalized.untyped_storage().data_ptr()
     arguments = scratch.priming_arguments(source, torch.ones(10240))
     for operands in arguments.values():
@@ -221,7 +221,7 @@ def test_combine_norm_fixture_retains_fp32_gain_and_owns_both_outputs():
 def test_combine_uses_public_prepared_plan_and_residual_output(monkeypatch):
     operator = hyperconnection.PreparedHyperconnection.__new__(hyperconnection.PreparedHyperconnection)
     operator.scratch = HyperconnectionScratch.allocate(4, torch.device("cpu"))
-    operator.injection = object()
+    injection = torch.zeros((4, 4), dtype=torch.bfloat16)
     plan = SimpleNamespace(selection="default")
     operator.plans = {"combine": plan}
     residual = torch.zeros(4, 10240, dtype=torch.bfloat16)
@@ -236,15 +236,12 @@ def test_combine_uses_public_prepared_plan_and_residual_output(monkeypatch):
     monkeypatch.setattr(hyperconnection.hc, "run_combine", combine)
     for selection in ("default", "tuned"):
         plan.selection = selection
-        assert operator.combine(residual, block) is residual
+        assert operator.combine_runtime(residual, block, injection) is residual
         state, actual_block, logits, selected_plan, selected_config = calls[-1]
         assert state is residual and actual_block is block
-        assert logits is operator.scratch.injection_logits
+        assert logits is injection
         assert selected_plan is plan and selected_config == selection
         assert not residual.count_nonzero() and not block.count_nonzero()
-    operator.injection = None
-    with pytest.raises(ValueError, match="no residual injection"):
-        operator.combine(residual, block)
     assert len(calls) == 2
 
 

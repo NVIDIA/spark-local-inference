@@ -38,10 +38,16 @@ pub struct CatalogEntry {
     pub parameter_count: Option<u64>,
     #[serde(deserialize_with = "null_default")]
     pub hardware: String,
+    /// Published platform branches matching the requested hardware are a display
+    /// hint; they do not establish core compatibility or memory fit.
+    #[serde(skip_deserializing)]
+    pub build_target_match: Option<bool>,
     #[serde(deserialize_with = "null_default")]
     pub revision: String,
     #[serde(deserialize_with = "null_default")]
     pub revision_commit: String,
+    #[serde(deserialize_with = "null_default")]
+    pub revision_updated_at: String,
     /// Every file in one commit's inventory, including documentation. This is
     /// neither the selected deployment's transfer size nor its memory budget.
     pub revision_bytes: Option<u64>,
@@ -61,6 +67,8 @@ struct HubEntry {
     card: Value,
     #[serde(deserialize_with = "null_default")]
     sha: String,
+    #[serde(rename = "lastModified", deserialize_with = "null_default")]
+    last_modified: String,
 }
 #[derive(Clone, Deserialize)]
 struct Sibling {
@@ -286,8 +294,45 @@ fn select_revision<'a>(
     hardware: Option<&str>,
 ) -> Option<&'a String> {
     hardware
-        .and_then(|target| branches.get(target))
+        .and_then(|target| {
+            branches.get(target).or_else(|| {
+                branches.iter().find(|name| branch_platform(name) == Some(target))
+            })
+        })
         .or_else(|| branches.iter().next())
+}
+fn apply_refs(
+    entry: &mut CatalogEntry,
+    refs: Refs,
+    hardware: Option<&str>,
+) -> BTreeSet<String> {
+    let branches: BTreeSet<_> = refs
+        .branches
+        .into_iter()
+        .map(|branch| branch.name)
+        .filter(|name| name.len() <= 512 && branch_platform(name).is_some())
+        .collect();
+    let platforms: BTreeSet<_> = branches
+        .iter()
+        .filter_map(|name| branch_platform(name))
+        .collect();
+    entry.build_target_match = hardware
+        .filter(|target| flare_helios::core::naming::PLATFORMS.contains(target))
+        .filter(|_| !platforms.is_empty())
+        .map(|target| platforms.contains(target));
+    entry.hardware = platforms
+        .into_iter()
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    branches
+}
+fn apply_revision(entry: &mut CatalogEntry, revision: &str, remote: &HubEntry) {
+    entry.revision = revision.into();
+    entry.revision_bytes = revision_inventory(remote);
+    entry.revision_commit = remote.sha.clone();
+    entry.revision_updated_at = bounded(remote.last_modified.clone());
+    apply_config(entry, &remote.config);
 }
 fn enrich(
     mut item: HubEntry,
@@ -320,21 +365,7 @@ fn enrich(
         }
     }
     if let Some(refs) = optional::<Refs>(agent, &format!("{base}/refs"), 256 * 1024, deadline) {
-        let branches: BTreeSet<_> = refs
-            .branches
-            .into_iter()
-            .map(|branch| branch.name)
-            .filter(|name| name.len() <= 512 && branch_platform(name).is_some())
-            .collect();
-        let platforms: BTreeSet<_> = branches
-            .iter()
-            .filter_map(|name| branch_platform(name))
-            .collect();
-        item.entry.hardware = platforms
-            .into_iter()
-            .map(str::to_ascii_uppercase)
-            .collect::<Vec<_>>()
-            .join(" / ");
+        let branches = apply_refs(&mut item.entry, refs, hardware);
         let revision = select_revision(&branches, hardware);
         if let Some(revision) = revision {
             let encoded: String =
@@ -345,10 +376,7 @@ fn enrich(
                 2 * 1024 * 1024,
                 deadline,
             ) {
-                item.entry.revision = revision.clone();
-                item.entry.revision_bytes = revision_inventory(&remote);
-                item.entry.revision_commit = remote.sha.clone();
-                apply_config(&mut item.entry, &remote.config);
+                apply_revision(&mut item.entry, revision, &remote);
                 if remote
                     .siblings
                     .iter()
@@ -444,13 +472,14 @@ mod tests {
     #[test]
     fn null_optional_fields_preserve_valid_repository_metadata() {
         let mut value = item(
-            json!({"id":"author/core","author":null,"pipeline_tag":null,"downloads":null,"tags":null,"siblings":null,"sha":null,"cardData":null,"config":null}),
+            json!({"id":"author/core","author":null,"pipeline_tag":null,"downloads":null,"tags":null,"siblings":null,"sha":null,"lastModified":null,"cardData":null,"config":null}),
         );
         published_metadata(&mut value);
         assert_eq!(value.entry.author, "author");
         assert!(value.entry.task.is_empty());
         assert!(value.entry.tags.is_empty());
         assert_eq!(value.entry.downloads, 0);
+        assert!(value.last_modified.is_empty());
     }
     #[test]
     fn published_metadata_never_infers_context_parameters_or_precision_from_names() {
@@ -510,11 +539,82 @@ mod tests {
         assert_eq!(branch_platform("gb202-tp8"), Some("gb202"));
         assert_eq!(branch_platform("gb202unrelated"), None);
         assert_eq!(branch_platform("main"), None);
+        let suffixed = ["gb10", "gb202-tp8"].map(String::from).into_iter().collect();
+        assert_eq!(
+            select_revision(&suffixed, Some("gb202")).map(String::as_str),
+            Some("gb202-tp8")
+        );
+    }
+    #[test]
+    fn published_build_match_uses_all_platform_branches() {
+        for target in flare_helios::core::naming::PLATFORMS {
+            for published in flare_helios::core::naming::PLATFORMS {
+                for suffix in ["", "-tp8"] {
+                    let name = format!("{published}{suffix}");
+                    let refs = serde_json::from_value(json!({"branches": [{"name": name}]})).unwrap();
+                    let mut entry = CatalogEntry::default();
+                    apply_refs(&mut entry, refs, Some(target));
+                    assert_eq!(entry.hardware, published.to_ascii_uppercase());
+                    assert_eq!(entry.build_target_match, Some(target == published));
+                }
+            }
+            let refs = serde_json::from_value(json!({"branches": [
+                {"name": "gb10-tp1"}, {"name": "gb202"}, {"name": "gb300-tp8"}
+            ]})).unwrap();
+            let mut entry = CatalogEntry::default();
+            let branches = apply_refs(&mut entry, refs, Some(target));
+            assert_eq!(entry.build_target_match, Some(true));
+            assert_eq!(branch_platform(select_revision(&branches, Some(target)).unwrap()), Some(target));
+        }
+    }
+    #[test]
+    fn unknown_builds_or_hardware_do_not_hide_discovery_entries() {
+        for names in [vec![], vec!["main"], vec!["gb10unrelated", "custom-build"]] {
+            let refs = serde_json::from_value(json!({"branches": names.into_iter()
+                .map(|name| json!({"name": name})).collect::<Vec<_>>()})).unwrap();
+            let mut entry = CatalogEntry::default();
+            apply_refs(&mut entry, refs, Some("gb10"));
+            assert_eq!(entry.build_target_match, None);
+        }
+        for target in [None, Some("unknown")] {
+            let refs = serde_json::from_value(json!({"branches": [{"name": "gb202"}]})).unwrap();
+            let mut entry = CatalogEntry::default();
+            apply_refs(&mut entry, refs, target);
+            assert_eq!(entry.build_target_match, None);
+        }
+        let unverified = item(json!({"hardware": "GB202", "build_target_match": false}));
+        assert_eq!(unverified.entry.build_target_match, None);
+    }
+    #[test]
+    fn update_time_belongs_to_the_resolved_build_revision() {
+        let mut repository = item(json!({
+            "id": "author/core",
+            "lastModified": "2026-11-09T03:41:33.000Z"
+        }));
+        assert!(repository.entry.revision_updated_at.is_empty());
+        let remote = item(json!({
+            "sha": "1".repeat(40),
+            "lastModified": "2026-11-05T18:06:29.000Z",
+            "siblings": [{"rfilename": "model.safetensors", "size": 123}]
+        }));
+        apply_revision(&mut repository.entry, "gb10", &remote);
+        assert_eq!(repository.entry.revision, "gb10");
+        assert_eq!(repository.entry.revision_commit, "1".repeat(40));
+        assert_eq!(repository.entry.revision_bytes, Some(123));
+        assert_eq!(
+            repository.entry.revision_updated_at,
+            "2026-11-05T18:06:29.000Z"
+        );
+        for missing in [json!({}), json!({"lastModified": null})] {
+            apply_revision(&mut repository.entry, "gb202", &item(missing));
+            assert_eq!(repository.entry.revision, "gb202");
+            assert!(repository.entry.revision_updated_at.is_empty());
+        }
     }
     #[test]
     fn optional_enrichment_failure_preserves_legacy_candidates() {
         let values = vec![item(
-            json!({"id":"a/Qwen-FLARE","siblings":[{"rfilename":"publisher.json"}],"tags":["nvfp4"],"cardData":{"license":"mit"}}),
+            json!({"id":"a/Qwen-FLARE","siblings":[{"rfilename":"publisher.json"}],"tags":["nvfp4"],"lastModified":"2026-11-09T03:41:33.000Z","cardData":{"license":"mit"}}),
         )];
         let mut found = candidates(values, " QWEN ");
         assert_eq!(found.len(), 1);
@@ -530,6 +630,8 @@ mod tests {
         assert_eq!(result.license, "mit");
         assert_eq!(result.quantization, "NVFP4");
         assert_eq!(result.revision_bytes, None);
+        assert!(result.revision_updated_at.is_empty());
+        assert_eq!(result.build_target_match, None);
     }
     #[test]
     fn query_deduplicates_sorts_and_rejects_generic_tag_matches() {

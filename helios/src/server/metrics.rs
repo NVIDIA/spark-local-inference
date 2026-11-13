@@ -246,6 +246,11 @@ pub(super) struct Metrics {
     preemptions: AtomicU64,
     message_checkpoints: AtomicU64,
     prompt_checkpoints: AtomicU64,
+    checkpoint_captures: [AtomicU64; 3],
+    checkpoint_skips: [AtomicU64; 3],
+    checkpoint_extra_work_ns: AtomicU64,
+    checkpoint_anchor_guards: AtomicU64,
+    pub(super) copyout_headroom_deferrals: AtomicU64,
     active_requests: AtomicU64,
     free_slots: AtomicU64,
     retiring_slots: AtomicU64,
@@ -463,6 +468,14 @@ impl Metrics {
             (&self.preemptions, stats.preemptions),
             (&self.message_checkpoints, stats.message_checkpoints),
             (&self.prompt_checkpoints, stats.prompt_checkpoints),
+            (&self.checkpoint_captures[0], stats.checkpoint_anchor_captures),
+            (&self.checkpoint_captures[1], stats.checkpoint_message_captures),
+            (&self.checkpoint_captures[2], stats.checkpoint_endpoint_captures),
+            (&self.checkpoint_skips[0], stats.checkpoint_skip_unknown_cost),
+            (&self.checkpoint_skips[1], stats.checkpoint_skip_work_budget),
+            (&self.checkpoint_skips[2], stats.checkpoint_skip_storage),
+            (&self.checkpoint_extra_work_ns, stats.checkpoint_extra_work_ns),
+            (&self.checkpoint_anchor_guards, stats.checkpoint_anchor_guards as u64),
             (&self.active_requests, stats.active_requests as u64),
             (&self.free_slots, stats.free_slots as u64),
             (&self.retiring_slots, stats.retiring_slots as u64),
@@ -624,6 +637,22 @@ impl Metrics {
                     counter.load(Ordering::Relaxed)
                 );
             }
+        }
+        for (name, label, names, counters) in [
+            ("checkpoint_captures_total", "role", &["anchor", "message", "endpoint"][..], &self.checkpoint_captures[..]),
+            ("checkpoint_skips_total", "reason", &["unknown_cost", "work_budget", "storage"][..], &self.checkpoint_skips[..]),
+        ] {
+            let _ = writeln!(text, "# TYPE flare_{name} counter");
+            for (value, counter) in names.iter().zip(counters) {
+                let _ = writeln!(text, "flare_{name}{{{label}=\"{value}\"}} {}", counter.load(Ordering::Relaxed));
+            }
+        }
+        for (name, kind, counter) in [
+            ("checkpoint_extra_work_nanoseconds_total", "counter", &self.checkpoint_extra_work_ns),
+            ("checkpoint_anchor_reservations", "gauge", &self.checkpoint_anchor_guards),
+            ("host_cache_copyout_headroom_deferrals_total", "counter", &self.copyout_headroom_deferrals),
+        ] {
+            let _ = writeln!(text, "# TYPE flare_{name} {kind}\nflare_{name} {}", counter.load(Ordering::Relaxed));
         }
         for (name, labels, counters) in [
             (
@@ -1189,6 +1218,37 @@ pub(super) fn metric(text: &mut String, name: &str, kind: &str, help: &str, valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_metrics_report_capture_roles_rejection_reasons_work_and_reservations() {
+        let metrics = Metrics::new(0, 0, 0, 16);
+        metrics.scheduler(SchedulerStats {
+            checkpoint_anchor_captures: 2,
+            checkpoint_message_captures: 3,
+            checkpoint_endpoint_captures: 4,
+            checkpoint_skip_unknown_cost: 5,
+            checkpoint_skip_work_budget: 6,
+            checkpoint_skip_storage: 7,
+            checkpoint_extra_work_ns: 800,
+            checkpoint_anchor_guards: 1,
+            ..Default::default()
+        });
+        metrics.copyout_headroom_deferrals.fetch_add(9, Ordering::Relaxed);
+        let text = metrics.render();
+        for expected in [
+            "flare_checkpoint_captures_total{role=\"anchor\"} 2\n",
+            "flare_checkpoint_captures_total{role=\"message\"} 3\n",
+            "flare_checkpoint_captures_total{role=\"endpoint\"} 4\n",
+            "flare_checkpoint_skips_total{reason=\"unknown_cost\"} 5\n",
+            "flare_checkpoint_skips_total{reason=\"work_budget\"} 6\n",
+            "flare_checkpoint_skips_total{reason=\"storage\"} 7\n",
+            "flare_checkpoint_extra_work_nanoseconds_total 800\n",
+            "flare_checkpoint_anchor_reservations 1\n",
+            "flare_host_cache_copyout_headroom_deferrals_total 9\n",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+    }
 
     #[test]
     fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {

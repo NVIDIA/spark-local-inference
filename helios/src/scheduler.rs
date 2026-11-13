@@ -7,6 +7,8 @@
 //! Bounded live-request resources and scheduling with CUDA-fenced retirement.
 
 mod cost;
+mod checkpoints;
+pub use checkpoints::CheckpointAccounting;
 mod learning;
 mod policy;
 mod refresh;
@@ -30,7 +32,7 @@ use std::sync::Arc;
 use crate::cache::{
     CheckpointId, CompletionUpdate, ConditioningEvent, EvictionReport, EvictionTarget, Fence,
     Lookup, PageId, PrefixCheckpointCache, PrefixHistory, PrefixKey, Publication, PublishResult,
-    Reclaimable, SnapshotId, StateSnapshot,
+    Reclaimable, SnapshotId, StateSnapshot, RetentionRole, RetentionRank,
 };
 use crate::execution::{CompletionRecord, GraphKind, REQUEST_LANES};
 use flare_selene::{InboundTicket, PublishedCheckpoint};
@@ -90,40 +92,6 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
-fn checkpoint_boundaries(
-    mut boundaries: Vec<usize>,
-    consumed: usize,
-    prompt: usize,
-    budget: usize,
-) -> Vec<usize> {
-    boundaries.retain(|&position| consumed < position && position < prompt);
-    if budget == 0 {
-        return Vec::new();
-    }
-    if boundaries.len() <= budget {
-        return boundaries;
-    }
-    let mut selected = Vec::with_capacity(budget);
-    for index in 1..=budget {
-        let target = consumed
-            + ((prompt - consumed) as u128 * index as u128 / (budget as u128 + 1)) as usize;
-        let right = boundaries.partition_point(|&position| position < target);
-        let position = if right == 0 {
-            boundaries[0]
-        } else if right == boundaries.len()
-            || target - boundaries[right - 1] <= boundaries[right] - target
-        {
-            boundaries[right - 1]
-        } else {
-            boundaries[right]
-        };
-        if selected.last() != Some(&position) {
-            selected.push(position);
-        }
-    }
-    selected
-}
-
 #[derive(Clone, Debug)]
 pub struct SchedulerCapabilities {
     pub completion_token_capacity: usize,
@@ -166,6 +134,14 @@ pub struct SchedulerStats {
     pub inbound_waiting: usize,
     /// Growable requests finished early to free KV pages and requeued by the runtime.
     pub preemptions: u64,
+    pub checkpoint_anchor_captures: u64,
+    pub checkpoint_message_captures: u64,
+    pub checkpoint_endpoint_captures: u64,
+    pub checkpoint_skip_unknown_cost: u64,
+    pub checkpoint_skip_work_budget: u64,
+    pub checkpoint_skip_storage: u64,
+    pub checkpoint_extra_work_ns: u64,
+    pub checkpoint_anchor_guards: usize,
 }
 
 #[derive(Clone)]
@@ -197,7 +173,7 @@ pub enum RequestPhase {
     Finishing,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BoundaryKind {
     Message,
     Prompt,
@@ -209,6 +185,7 @@ struct BoundaryCapture {
     snapshot: SnapshotId,
     consumed_tokens: u64,
     resume: RequestPhase,
+    role: RetentionRole,
 }
 
 #[derive(Clone, Debug)]
@@ -260,7 +237,10 @@ pub struct LiveRequest {
     prefix_tokens: u64,
     admission_reused_tokens: u64,
     message_boundaries: Vec<usize>,
-    checkpoint_budget: usize,
+    checkpoints: CheckpointAccounting,
+    anchor_guard: Option<SnapshotId>,
+    checkpoint_capture: Option<checkpoints::ArmedCapture>,
+    checkpoint_copy_ns: u64,
     message_snapshot: Option<SnapshotId>,
     prompt_snapshot: Option<SnapshotId>,
     boundary_capture: Option<BoundaryCapture>,
@@ -284,8 +264,8 @@ pub struct LiveRequest {
 }
 
 impl LiveRequest {
-    fn plans_prompt_capture(&self) -> bool {
-        self.checkpoint_budget >= 2 && self.max_new_tokens > 1
+    pub fn checkpoint_accounting(&self) -> CheckpointAccounting {
+        self.checkpoints.clone()
     }
 
     fn prefill_kind(&self) -> GraphKind {
@@ -548,6 +528,7 @@ pub struct ScheduledPlan {
     selection_log_scale: f64,
     origin: PlanOrigin,
     selected_cost: SelectedCost,
+    checkpoint_plans: Vec<checkpoints::CapturePlan>,
 }
 
 impl ScheduledPlan {
@@ -596,7 +577,7 @@ pub struct GeneratedToken {
 struct RetiredRequest {
     image_slot: Option<usize>,
     pages: Vec<PageId>,
-    snapshots: [Option<SnapshotId>; 4],
+    snapshots: [Option<SnapshotId>; 5],
     slot: usize,
     through: Fence,
 }
@@ -650,6 +631,8 @@ struct Ticket {
     snapshot: SnapshotId,
     history: PrefixHistory,
     waiters: Vec<RequestHandle>,
+    demand_epoch: u64,
+    role: RetentionRole,
 }
 
 pub struct RequestScheduler {
@@ -671,6 +654,7 @@ pub struct RequestScheduler {
     now_ns: u64,
     policy: PolicyConfig,
     candidates: std::cell::RefCell<Vec<policy::Candidate>>,
+    checkpoint_selections: std::cell::RefCell<Option<checkpoints::SelectionCache>>,
     stats: SchedulerStats,
     speculative_widths: Vec<usize>,
     speculative_fixed_width: Option<usize>,
@@ -761,6 +745,7 @@ impl RequestScheduler {
             now_ns: 0,
             policy: PolicyConfig::default(),
             candidates: policy::scratch(),
+            checkpoint_selections: Default::default(),
             stats: SchedulerStats::default(),
             speculative_widths: Vec::new(),
             speculative_fixed_width: None,
@@ -1123,6 +1108,7 @@ impl RequestScheduler {
             retiring_slots: self.slots.iter().filter(|slot| slot.retiring).count(),
             free_pages: self.free_pages.len(),
             free_snapshots: self.free_snapshots.len(),
+            checkpoint_anchor_guards: self.slots.iter().filter_map(|slot| slot.request.as_ref()).filter(|request| request.anchor_guard.is_some()).count(),
             snapshot_capacity: self.limits.snapshots as usize,
             cached_checkpoints: cache.published_checkpoints,
             cached_pages: cache.cached_pages,
@@ -1191,6 +1177,7 @@ impl RequestScheduler {
             if need_pages == 0 && need_snapshots == 0 {
                 return Ok(());
             }
+            if self.revoke_unused_anchor_guards() { continue; }
             // Defer admission while enough backing is already fenced for reclamation.
             if self.pending_resources(pages, snapshots) {
                 return Err(crate::Error::admission(
@@ -1280,6 +1267,7 @@ impl RequestScheduler {
                 continue;
             }
             while self.free_pages.len() < want {
+                if self.revoke_unused_anchor_guards() { continue; }
                 if self.pending_page_count() >= want {
                     break;
                 }
@@ -1477,6 +1465,16 @@ impl RequestScheduler {
         plan: AdmissionPlan,
         inbound: Option<InboundRequest>,
     ) -> Result<Admitted> {
+        self.admit_planned_with_checkpoint_accounting(spec, plan, inbound, None)
+    }
+
+    pub fn admit_planned_with_checkpoint_accounting(
+        &mut self,
+        spec: RequestSpec,
+        plan: AdmissionPlan,
+        inbound: Option<InboundRequest>,
+        accounting: Option<CheckpointAccounting>,
+    ) -> Result<Admitted> {
         let AdmissionPlan { history, lookup } = plan;
         // Lookups count once per admitted request, not per attempt of a waiting one.
         let (hit, reused) = (lookup.checkpoint.is_some(), lookup.consumed_tokens);
@@ -1567,6 +1565,8 @@ impl RequestScheduler {
                         snapshot,
                         history: history.clone(),
                         waiters: vec![handle],
+                        demand_epoch: 0,
+                        role: RetentionRole::Endpoint,
                     },
                 );
                 ticket = Some(InboundTicket {
@@ -1600,18 +1600,14 @@ impl RequestScheduler {
         } else {
             (RequestPhase::Initialize, None, None, Vec::new())
         };
-        let checkpoint_budget = if self.limits.snapshots == 0 {
-            0
-        } else {
-            (self.limits.snapshots as usize / self.limits.max_active).clamp(1, 8)
+        let mut checkpoints = match accounting {
+            Some(accounting) => accounting,
+            None => CheckpointAccounting::for_epoch(self.cache.new_use_epoch()?, consumed as usize, spec.prompt.len()),
         };
-        let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
-        let message_boundaries = checkpoint_boundaries(
-            spec.message_boundaries,
-            consumed as usize,
-            spec.prompt.len(),
-            checkpoint_budget.saturating_sub(endpoints),
-        );
+        checkpoints.clear_reservations();
+        let demand_epoch = checkpoints.demand_epoch;
+        if let Some(id) = lookup.checkpoint { self.cache.touch(id, demand_epoch)?; }
+        let message_boundaries = spec.message_boundaries;
         self.slots[slot].generation = generation;
         self.slots[slot].request = Some(LiveRequest {
             image_slot: None,
@@ -1644,7 +1640,10 @@ impl RequestScheduler {
             prefix_tokens: consumed,
             admission_reused_tokens: consumed,
             message_boundaries,
-            checkpoint_budget,
+            checkpoints,
+            anchor_guard: None,
+            checkpoint_capture: None,
+            checkpoint_copy_ns: 0,
             message_snapshot: None,
             prompt_snapshot: None,
             boundary_capture: None,
@@ -1664,6 +1663,15 @@ impl RequestScheduler {
             admission_order: self.admissions,
         });
         self.admissions += 1;
+        if let Some(inbound) = &inbound {
+            let request = self.request(handle)?;
+            let role = if request.checkpoint_anchor() as u64 == inbound.consumed_tokens { RetentionRole::Anchor }
+                else if request.message_boundaries.binary_search(&(inbound.consumed_tokens as usize)).is_ok() { RetentionRole::Message }
+                else { RetentionRole::Endpoint };
+            let ticket = self.tickets.get_mut(&inbound.key).unwrap();
+            ticket.demand_epoch = ticket.demand_epoch.max(demand_epoch);
+            ticket.role = ticket.role.max(role);
+        }
         self.stats.cache_lookups += u64::from(!spec.prompt_logprobs);
         self.stats.cache_hits += u64::from(hit);
         self.stats.reused_tokens += reused;
@@ -1703,7 +1711,7 @@ impl RequestScheduler {
             },
             ready_after: self.completed,
         };
-        let result = match self.cache.publish(&ticket.history, &proposal) {
+        let result = match self.cache.publish_with_retention(&ticket.history, &proposal, ticket.role, ticket.demand_epoch) {
             Ok(result) => result,
             Err(error) => {
                 self.fail_ticket(ticket)?;
@@ -1855,9 +1863,7 @@ impl RequestScheduler {
                     || s.end - s.start > capacity
                     || (s.start < request.consumed_tokens as usize
                         && (request.consumed_tokens as usize) < s.end)
-                    || request
-                        .message_boundaries
-                        .iter().any(|&n| s.start < n && n < s.end)
+
             })
         {
             return Err("invalid atomic prefill spans or prefix boundary".into());
@@ -2026,6 +2032,7 @@ impl RequestScheduler {
                 .map_or_else(Vec::new, |window| window.features.clone()),
         );
         request.conditioned_inputs_ready = inputs.is_empty();
+        request.checkpoints.retain_window_ends(windows.iter().map(|window| window.prefill_end));
         request.conditioned_windows = windows;
         Ok(())
     }
@@ -2218,6 +2225,9 @@ impl RequestScheduler {
                 _ => None,
             },
         };
+        for lane in &step.lanes { self.promote_request_anchor(lane.request)?; }
+        self.commit_checkpoint_plans(&plan.checkpoint_plans)?;
+        self.commit_checkpoint_copies(step)?;
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
@@ -2497,6 +2507,7 @@ impl RequestScheduler {
                     } else {
                         request.terminal_snapshot_ready = true;
                         request.phase = RequestPhase::Finishing;
+                        self.stats.checkpoint_endpoint_captures += 1;
                     }
                 } else {
                     if kind == GraphKind::Vision {
@@ -2593,21 +2604,11 @@ impl RequestScheduler {
                 if !finished && request.consumed_tokens < request.prompt_tokens as u64 {
                     request.phase = request.prompt_phase();
                 }
-                let capture = if request.message_boundaries.binary_search(&(endpoint as usize)).is_ok()
-                    && endpoint > request.prefix_tokens
-                {
-                    Some(BoundaryKind::Message)
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    (endpoint == request.prompt_tokens as u64
-                        && endpoint > request.prefix_tokens
-                        && request.plans_prompt_capture())
-                    .then_some(BoundaryKind::Prompt)
-                });
-                if let Some(kind) = capture {
-                    captures.push((lane.request, Some(kind), endpoint, request.phase));
+                if let Some(capture) = request.checkpoint_capture {
+                    if capture.endpoint == endpoint {
+                        let kind = if endpoint == request.prompt_tokens as u64 { BoundaryKind::Prompt } else { BoundaryKind::Message };
+                        captures.push((lane.request, Some(kind), endpoint, request.phase));
+                    }
                 }
             }
             if request.phase == RequestPhase::Snapshot
@@ -2615,12 +2616,7 @@ impl RequestScheduler {
                 && request.terminal_snapshot.is_none()
                 && captures.last().is_none_or(|c| c.0 != lane.request)
             {
-                captures.push((
-                    lane.request,
-                    None,
-                    request.consumed_tokens,
-                    RequestPhase::Finishing,
-                ));
+                captures.push((lane.request, None, request.consumed_tokens, RequestPhase::Finishing));
             }
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
@@ -2648,6 +2644,7 @@ impl RequestScheduler {
         for handle in boundaries {
             self.publish_boundary(handle)?;
         }
+        self.credit_checkpoint_decode(&step, &useful_tokens, &generated, timing);
         for (handle, kind, endpoint, resume) in captures {
             if matches!(resume, RequestPhase::Snapshot | RequestPhase::Finishing) {
                 let request = self.request_mut(handle)?;
@@ -2656,17 +2653,20 @@ impl RequestScheduler {
                     self.free_pages.extend(unused);
                 }
             }
+            let armed = if matches!(kind, Some(BoundaryKind::ConditionedWindow)) { None }
+                else { self.request_mut(handle)?.checkpoint_capture.take() };
             let snapshot = if matches!(kind, Some(BoundaryKind::ConditionedWindow)) {
                 self.request(handle)?.window_snapshot
-            } else {
-                self.retain_snapshot()?
-            };
-            if snapshot.is_none()
-                && matches!(kind, Some(BoundaryKind::Prompt))
-                && let Some(prefix) = self.request(handle)?.prefix
-            {
-                self.record_publication(prefix);
-            }
+            } else if let Some(capture) = armed {
+                if self.checkpoint_copy_allowed(handle, capture)? {
+                    self.request_mut(handle)?.checkpoint_copy_ns = capture.copy_ns;
+                    Some(capture.snapshot)
+                } else {
+                    self.request_mut(handle)?.checkpoints.refund_copy(capture.copy_ns);
+                    self.release_snapshot(capture.snapshot);
+                    None
+                }
+            } else if kind.is_none() { self.allocate_terminal_capture(handle)? } else { None };
             let request = self.request_mut(handle)?;
             if let Some(snapshot) = snapshot {
                 if let Some(kind) = kind {
@@ -2680,6 +2680,7 @@ impl RequestScheduler {
                         snapshot,
                         consumed_tokens: endpoint,
                         resume,
+                        role: armed.map_or(RetentionRole::Endpoint, |capture| capture.role),
                     });
                 } else {
                     request.terminal_snapshot = Some(snapshot);
@@ -2688,6 +2689,10 @@ impl RequestScheduler {
             } else if request.phase == RequestPhase::Snapshot {
                 request.phase = RequestPhase::Finishing;
             }
+        }
+        for lane in &step.lanes {
+            let release = self.request_mut(lane.request).ok().and_then(|request| request.checkpoint_capture.take());
+            if let Some(capture) = release { self.release_snapshot(capture.snapshot); }
         }
         self.observe_service(fence, &submission.participants, &useful_tokens, timing);
         self.refill_reservations()?;
@@ -2717,20 +2722,12 @@ impl RequestScheduler {
             ready_after: request.last_use,
         };
         let history = request.history.clone();
-        // Only the last selected message can be the prompt's direct parent.
-        let defer = matches!(capture.kind, BoundaryKind::Message)
-            && request.message_boundaries.last() == Some(&(capture.consumed_tokens as usize))
-            && request.prompt_tokens - (capture.consumed_tokens as usize)
-                < self.capabilities.page_tokens
-            && request.plans_prompt_capture();
-        let result = self.cache.publish(&history, &proposal)?;
+        let result = self.cache.publish_with_retention(&history, &proposal, capture.role, request.checkpoints.demand_epoch)?;
         if let PublishResult::Created { id, ready } = result {
             if !ready {
                 return Err("completed boundary copy was not GPU-ready".into());
             }
-            if !defer {
-                self.record_publication(id);
-            }
+            self.record_publication(id);
             self.cache.pin(id)?;
             if let Some(parent) = self.request(handle)?.prefix {
                 self.cache.unpin(parent)?;
@@ -2745,6 +2742,24 @@ impl RequestScheduler {
             self.stats.snapshot_publications += 1;
         } else {
             self.release_snapshot(capture.snapshot);
+            if let PublishResult::Existing { id, ready: true } = result
+                && matches!(capture.resume, RequestPhase::Snapshot | RequestPhase::Finishing)
+            {
+                self.cache.pin(id)?;
+                if let Some(parent) = self.request(handle)?.prefix { self.cache.unpin(parent)?; }
+                let snapshot = self.cache.checkpoint(id)?.snapshot();
+                let shared_pages = self.cache.page_chain(id)?;
+                let request = self.request_mut(handle)?;
+                request.prefix = Some(id);
+                request.prefix_tokens = capture.consumed_tokens;
+                request.prefix_snapshot = Some(snapshot);
+                request.shared_pages = shared_pages;
+            }
+        }
+        match capture.role {
+            RetentionRole::Anchor => self.stats.checkpoint_anchor_captures += 1,
+            RetentionRole::Message => self.stats.checkpoint_message_captures += 1,
+            RetentionRole::Endpoint => self.stats.checkpoint_endpoint_captures += 1,
         }
         match capture.kind {
             BoundaryKind::Message => self.stats.message_checkpoints += 1,
@@ -2852,11 +2867,12 @@ impl RequestScheduler {
         let result = match &publication {
             Some(proposal) => {
                 let history = request.history.clone();
-                Some(self.cache.publish(&history, proposal)?)
+                Some(self.cache.publish_with_retention(&history, proposal, RetentionRole::Endpoint, request.checkpoints.demand_epoch)?)
             }
             None => None,
         };
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
+        if let Some(guard) = request.anchor_guard.take() { self.release_snapshot(guard); }
         let mut snapshot = request.terminal_snapshot;
         if matches!(result, Some(PublishResult::Created { .. })) {
             if let Some(PublishResult::Created { ready: true, .. }) = result {
@@ -2891,6 +2907,7 @@ impl RequestScheduler {
                 request.message_snapshot,
                 request.prompt_snapshot,
                 request.window_snapshot,
+                request.checkpoint_capture.map(|capture| capture.snapshot),
             ],
             slot: handle.slot as usize,
             through: request.last_use,
@@ -2905,6 +2922,8 @@ mod cache_memory;
 
 #[cfg(test)]
 mod boundary_tests;
+#[cfg(test)]
+mod checkpoint_lifecycle_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

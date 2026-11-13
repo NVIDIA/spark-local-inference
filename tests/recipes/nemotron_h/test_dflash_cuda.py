@@ -4,7 +4,6 @@
 """Checkpoint draft context and backbone against decoded PyTorch projections."""
 
 from dataclasses import replace
-from functools import partial
 import gc
 import os
 from pathlib import Path
@@ -90,13 +89,34 @@ def linear(weights, x, name):
     return F.linear(x, weight)
 
 
+class ContextReadback:
+    def __init__(self, context, auxiliary, counts, metadata, output):
+        self.context, self.auxiliary, self.counts = context, auxiliary, counts
+        self.metadata, self.output = metadata, output
+
+    def __call__(self):
+        self.output.copy_(self.context(self.auxiliary, self.counts, self.metadata))
+
+
+class DraftReadback:
+    def __init__(self, draft, metadata, hidden, logits, features):
+        self.draft, self.metadata = draft, metadata
+        self.hidden, self.logits, self.features = hidden, logits, features
+
+    def __call__(self):
+        hidden, logits, features = self.draft.forward(self.metadata)
+        self.hidden.copy_(hidden)
+        self.logits.copy_(logits)
+        self.features.copy_(features)
+
+
 @pytest.mark.parametrize("batch", [1, 3, 8])
 @torch.no_grad()
 def test_checkpoint_context_and_backbone(checkpoint_weights, batch, tmp_path):
     from b12x.preparation import PreparationSession
     from ignition.components.paged_batch import Metadata
     from ignition.preparation.compile_pool import CompilePool
-    from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+    from ignition.preparation.scratch import ScratchArena
     from ignition.recipes.nemotron_h.decoder import Scratch
     from ignition.recipes.nemotron_h.dflash import PreparedContext, PreparedDraft
     from ignition.recipes.nemotron_h.pool import ContinuationPool
@@ -121,21 +141,24 @@ def test_checkpoint_context_and_backbone(checkpoint_weights, batch, tmp_path):
             history = pool.reserved_region(f"draft{i}.{field}")
             history.copy_(torch.randn(history.shape, dtype=torch.bfloat16, device=history.device) * .1)
     initial = pool.backing.clone()
-    buffers, layers = GraphBufferPool("cuda:0"), GraphBufferPool("cuda:0")
-    cursor = buffers.cursor()
     with PreparationSession(device="cuda:0", autotune=False) as session:
         arena = ScratchArena("cuda:0")
         context = PreparedContext(weights, auxiliary, m, pool, session=session,
-            name="context", workspace=arena, buffers=cursor)
-        scratch = Scratch.allocate(tokens, tokens, c, cursor)
+            name="context", workspace=arena)
+        scratch = Scratch.allocate(tokens, tokens, c, "cuda:0")
         draft = PreparedDraft(weights, scratch, m, pool, vocabulary_runtime=None, coordinator=None,
-            session=session, name="draft", workspace=arena, buffers=cursor, layer_buffers=layers)
+            session=session, name="draft", workspace=arena)
+        context.functional()
+        draft.release_outputs()
         arena.finalize()
-        context_operation = partial(context, auxiliary, counts)
+        normalized = torch.empty_like(scratch.hidden)
+        selector_scores = torch.empty((batch, 7, 8, 8), device="cuda", dtype=torch.float32)
+        context_operation = ContextReadback(context, auxiliary, counts, m, normalized)
+        draft_operation = DraftReadback(draft, m, scratch.hidden, scratch.logits, selector_scores)
         paths = (tmp_path / "context.bin", tmp_path / "draft.bin")
         with CompilePool(auxiliary.device) as compiler:
             futures = [compiler.submit(operation, path)
-                       for operation, path in zip((context_operation, draft), paths, strict=True)]
+                       for operation, path in zip((context_operation, draft_operation), paths, strict=True)]
             for future in futures:
                 future.result()
         artifacts = []
@@ -143,7 +166,7 @@ def test_checkpoint_context_and_backbone(checkpoint_weights, batch, tmp_path):
             with path.open("rb") as file:
                 artifacts.append(torch.compiler.load_compiled_function(file))
         context_fn = lambda: artifacts[0](context_operation)
-        draft_fn = lambda: artifacts[1](draft)
+        draft_fn = lambda: artifacts[1](draft_operation)
         context_fn()
         draft_fn()
         session.freeze()
@@ -156,7 +179,7 @@ def test_checkpoint_context_and_backbone(checkpoint_weights, batch, tmp_path):
         context_graph.replay()
         torch.cuda.synchronize()
         projected = norm(linear(raw, auxiliary, "fc"), raw["hidden_norm.weight"])
-        delta = context.normalized.float() - projected.float()
+        delta = normalized.float() - projected.float()
         assert delta.norm() / projected.float().norm() < .002
         torch.testing.assert_close(pool.reserved_region("draft_anchor")[rows[counts > 0]],
             projected[(m.query_start_loc[:-1] + counts - 1)[counts > 0]], rtol=.03, atol=.03)
@@ -226,4 +249,4 @@ def test_checkpoint_context_and_backbone(checkpoint_weights, batch, tmp_path):
         error = (scratch.hidden[active].float() - expected[active].float()).norm() / expected[active].float().norm()
         assert error < .025, error.item()
         assert torch.isfinite(scratch.logits[active]).all()
-        assert torch.isfinite(draft.selector.scores).all()
+        assert torch.isfinite(selector_scores).all()

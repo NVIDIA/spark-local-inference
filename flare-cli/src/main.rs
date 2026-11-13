@@ -280,6 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(price) = args.scheduler_terminal_age_price {
         config["scheduler_terminal_age_price"] = price.into();
     }
+    if let Some(fraction) = args.scheduler_checkpoint_extra_work_fraction {
+        config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
+    }
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }

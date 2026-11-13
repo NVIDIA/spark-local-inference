@@ -19,6 +19,59 @@ def _ordered_key(bits):
 
 
 @triton.jit
+def _radix_cutoff_counts(Scores, Indices, Lengths, Cutoffs, Greater, Ties, OutScores, OutIndices,
+                         WIDTH: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr,
+                         BLOCK: tl.constexpr, ROW_BLOCK: tl.constexpr, BITS: tl.constexpr):
+    """Resolve the K-th ordered key and per-tile counts in one program per row."""
+    row = tl.program_id(0)
+    col = tl.arange(0, ROW_BLOCK)
+    value = tl.load(Scores + row * WIDTH + col, mask=col < WIDTH, other=0.0)
+    length = tl.load(Lengths + row)
+    kcol = tl.arange(0, K)
+    if length > K:
+        live = (col < length) & (col < WIDTH)
+        bits = value.to(tl.uint32, bitcast=True)
+        key = _ordered_key(bits)
+        bins = tl.arange(0, 1 << BITS).to(tl.int64)
+        remaining = length * 0 + K
+        prefix = (length * 0).to(tl.uint32)
+        resolved = length * 0
+        for p in tl.static_range(32 // BITS):
+            if resolved == 0:
+                if p == 0:
+                    match = live
+                else:
+                    match = live & ((key >> (32 - p * BITS)) == prefix)
+                digit = ((key >> (32 - (p + 1) * BITS)) & ((1 << BITS) - 1)).to(tl.int32)
+                hist = tl.histogram(digit, 1 << BITS, mask=match)
+                at_least = tl.cumsum(hist, 0, reverse=True)
+                packed = tl.max(tl.where(at_least >= remaining,
+                                         (bins << 40) | ((at_least - hist).to(tl.int64) << 20) | hist.to(tl.int64),
+                                         -1), 0)
+                above = ((packed >> 20) & 0xFFFFF).to(tl.int32)
+                remaining = remaining - above
+                prefix = (prefix << BITS) | (packed >> 40).to(tl.uint32)
+                if (packed & 0xFFFFF).to(tl.int32) == remaining:
+                    resolved = length * 0 + (p + 1) * BITS
+        if resolved == 0:
+            resolved = length * 0 + 32
+        lower = prefix << (32 - resolved).to(tl.uint32)
+        cutoff = tl.min(tl.where(live & (key >= lower), key, 0xffffffff), 0)
+        tl.store(Cutoffs + row, cutoff.to(tl.int32))
+        greater = tl.sum(tl.reshape((live & (key > cutoff)).to(tl.int32), (ROW_BLOCK // BLOCK, BLOCK)), 1)
+        ties = tl.sum(tl.reshape((live & (key == cutoff)).to(tl.int32), (ROW_BLOCK // BLOCK, BLOCK)), 1)
+        tiles = tl.arange(0, ROW_BLOCK // BLOCK)
+        tl.store(Greater + row * TILES + tiles, greater, mask=tiles < TILES)
+        tl.store(Ties + row * TILES + tiles, ties, mask=tiles < TILES)
+    else:
+        underfull = (kcol < length) & (kcol < WIDTH)
+        ids = tl.load(Indices + row * WIDTH + kcol, mask=underfull, other=-1)
+        values = tl.load(Scores + row * WIDTH + kcol, mask=underfull, other=-float('inf'))
+        tl.store(OutScores + row * K + kcol, values)
+        tl.store(OutIndices + row * K + kcol, tl.maximum(ids, -1))
+
+
+@triton.jit
 def _cutoff(Selected, Lengths, Cutoffs, K: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cutoff = tl.full((), 0, tl.uint32)
@@ -111,9 +164,12 @@ class PreparedOrderedRowTopK:
     reuse it; overlapping invocations require separate storage.
     """
 
-    def __init__(self, scores, lengths, indices, output_scores, output_indices, *, session, name, buffers):
+    def __init__(self, scores, lengths, indices, output_scores, output_indices, *, session, name, buffers, radix=None):
         rows, width = scores.shape
         self.rows, self.width, self.topk = rows, width, output_indices.shape[1]
+        self.radix = width <= 32768 if radix is None else radix
+        if type(self.radix) is not bool or self.radix and width > 32768:
+            raise ValueError("radix ordered top-k requires widths through 32768")
         self.tiles = triton.cdiv(width, _TILE)
         self.cutoffs = buffers.zeros((rows,), torch.int32)
         self.greater = buffers.zeros((rows, self.tiles), torch.int32)
@@ -126,16 +182,41 @@ class PreparedOrderedRowTopK:
                                          session=session, name=name)
         self.plan = self.selection.plan
 
-    def __call__(self):
-        self.selection()
-        torch.library.wrap_triton(_cutoff)[(self.rows,)](
-            self.output_scores.view(torch.int32), self.lengths, self.cutoffs,
-            K=self.topk, BLOCK=triton.next_power_of_2(self.topk), num_warps=4)
-        torch.library.wrap_triton(_counts)[(self.rows, self.tiles)](
-            self.scores.view(torch.int32), self.lengths, self.cutoffs, self.greater, self.ties,
-            WIDTH=self.width, K=self.topk, TILES=self.tiles, BLOCK=_TILE, num_warps=4)
+    def functional(self, *, session):
+        self.selection.functional(session=session)
+        self.scores = self.lengths = self.indices = self.output_scores = self.output = None
+        self.cutoffs = self.greater = self.ties = None
+        return self
+
+    def __call__(self, scores=None, lengths=None, indices=None):
+        return self._run(scores, lengths, indices)[0]
+
+    def _run(self, scores=None, lengths=None, indices=None):
+        if scores is None:
+            scores, lengths, indices = self.scores, self.lengths, self.indices
+            output_scores, output = self.output_scores, self.output
+            cutoffs, greater, ties = self.cutoffs, self.greater, self.ties
+        else:
+            output_scores = torch.empty((self.rows, self.topk), dtype=torch.float32, device=scores.device)
+            output = torch.empty_like(output_scores, dtype=torch.int32)
+            cutoffs = torch.empty((self.rows,), dtype=torch.int32, device=scores.device)
+            greater = torch.empty((self.rows, self.tiles), dtype=torch.int32, device=scores.device)
+            ties = torch.empty_like(greater)
+        if self.radix:
+            torch.library.wrap_triton(_radix_cutoff_counts)[(self.rows,)](
+                scores, indices, lengths, cutoffs, greater, ties, output_scores, output,
+                WIDTH=self.width, K=self.topk, TILES=self.tiles, BLOCK=_TILE,
+                ROW_BLOCK=max(_TILE, triton.next_power_of_2(self.width)), BITS=8, num_warps=16)
+        else:
+            self.selection(scores, lengths, indices, output_scores, output)
+            torch.library.wrap_triton(_cutoff)[(self.rows,)](
+                output_scores.view(torch.int32), lengths, cutoffs,
+                K=self.topk, BLOCK=triton.next_power_of_2(self.topk), num_warps=4)
+            torch.library.wrap_triton(_counts)[(self.rows, self.tiles)](
+                scores.view(torch.int32), lengths, cutoffs, greater, ties,
+                WIDTH=self.width, K=self.topk, TILES=self.tiles, BLOCK=_TILE, num_warps=4)
         torch.library.wrap_triton(_emit)[(self.rows, self.tiles)](
-            self.scores.view(torch.int32), self.indices, self.lengths, self.cutoffs, self.greater, self.ties,
-            self.output_scores.view(torch.int32), self.output, WIDTH=self.width, K=self.topk,
+            scores.view(torch.int32), indices, lengths, cutoffs, greater, ties,
+            output_scores.view(torch.int32), output, WIDTH=self.width, K=self.topk,
             TILES=self.tiles, BLOCK=_TILE, COUNT_BLOCK=triton.next_power_of_2(self.tiles), num_warps=4)
-        return self.output
+        return output, output_scores

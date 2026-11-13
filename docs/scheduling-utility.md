@@ -10,7 +10,11 @@ Native completion and publication update these service prices through
 [`helios/src/scheduler/service.rs`](../helios/src/scheduler/service.rs).
 Native dispatch uses these prices and the decode-age score in
 [`helios/src/scheduler/policy.rs`](../helios/src/scheduler/policy.rs).
-The prepared catalog supports separate prefill and decode execution.
+Helios implements the service-weighted price update; the exponential and
+cumulative rate histories below are simulator-only alternatives.
+The native catalog holds separate prefill and decode graphs and, in cores
+exported with mixed capture, mixed prefill/decode graphs;
+[the native design](scheduling-runtime-design.md) lists every graph family.
 
 The model has one nonpreemptible graph in flight. Prepared shape costs are fixed,
 positive, and supplied. Acceptance probabilities are conditional on accepting
@@ -278,8 +282,9 @@ not establish a latency bound for finite terminal events.
 
 Each committed submission records the resident runnable request handles,
 including their generations, and their individually feasible token and delivery
-rates at dispatch. Only positive, unexpired graph estimates supply rate
-normalizers. Rates include logical prompt lengths, remaining output budgets,
+rates at dispatch. Only measured graph estimates supply rate normalizers; a
+measured estimate still supplies them after it becomes stale. Rates include
+logical prompt lengths, remaining output budgets,
 conditional speculative acceptance, and physical graph padding. An unknown
 normalizer leaves that price coordinate uninitialized; it does not invent a
 duration. Token prices persist across the prefill/decode transition. The first
@@ -287,11 +292,16 @@ published burst initializes a missing delivery history from its measured frame;
 an already decoding request without that observation uses the feasible reference.
 
 `RequestScheduler::complete` validates all records before learning graph cost or
-updating service prices. It uses the maximum positive rank-local GPU interval
-and the change from committed request counters. Two queued decode frames each
-credit their own completion delta. Host polling, input staging, queue wait, and
-publication delay do not add service intervals. A missing or zero device interval
-leaves prices and graph costs unchanged.
+updating service prices. It uses the change from committed request counters
+and one service interval per frame. For a frame dispatched while another was
+outstanding, that interval is the maximum positive rank-local GPU interval, so
+queue wait adds nothing. For an isolated frame it is the larger of that GPU
+interval and the host wall interval from dispatch through observed completion,
+which includes input staging and completion delivery. Graph cost estimates use
+the GPU interval alone, less measured embedding-readiness delay. Two queued
+decode frames each credit their own completion delta. Publication delay does
+not add a service interval. A missing or zero device interval leaves prices and
+graph costs unchanged.
 
 An unselected participant receives zero service over the measured interval.
 Requests admitted after dispatch and requests waiting for an external restore
@@ -308,46 +318,18 @@ This permits an exact correction of the held-action price update without
 rewinding through subsequent frames. Output age uses the actual publication
 timestamp independently of GPU service time.
 
-## Measurements and limitations
+## Limitations and evaluation
 
-The tests compare three stationary service regions against the offline concave
-allocation solver: unequal CPU-like rates with weighted fairness, the same
-rates with intrinsic preferences, and a batched service region. With a 1000 ms
-history and action durations of 1–13 ms, the measured utility gaps after 25,000
-warmup rounds and 25,000 measurement rounds are below 0.0001.
+The stationary derivation determines neither fairness weight. Token fairness
+sets a startup/throughput preference: a smaller coefficient lets efficient
+decode batches delay other requests' first output longer. The policy provides no
+output-gap bound, and adding mixed graphs to a catalog does not create one.
 
-The finite serving sweep uses the synthetic catalog in
-`scripts/scheduling_sim/workloads.py`. With `beta=64`, token fairness 16,
-delivery fairness 4, `tau=100 ms`, service-weighted history, and age price 0.1,
-all requests in these finite workloads complete:
-
-| Workload | Separate graphs: elapsed / maximum gap, ms | Mixed catalog: elapsed / maximum gap, ms |
-|---|---:|---:|
-| Two 32,768-token prompts | 1568 / 98 | 1568 / 98 |
-| Sixteen 32,768-token prompts | 9966 / 440 | 9513.2 / 279.4 |
-| Long prefill plus low-acceptance decode | 2680.5 / 147 | 2351.8 / 32 |
-| Long prefill plus high-acceptance decode | 1208 / 162 | 1187.2 / 32 |
-| Long prefill plus four decodes | 1588 / 70 | 1461 / 44.2 |
-| Long prefill plus five decodes | 1716 / 78 | 1605.5 / 88.4 |
-
-Each request emits 128 tokens. Mixed graphs use the supplied synthetic durations;
-these values are not GPU measurements. The sixteen-prompt gap and the worse
-five-decoder gap with mixed graphs show that enabling more choices does not
-establish a latency bound for the combined online policy.
-
-For simultaneous 64-token prompts with long outputs, the same preferences give
-all five streams their first output by 15 ms and all sixteen by 48 ms. Testing
-zero, three, and seven accepted drafts gives maximum subsequent gaps below
-150 ms. With token fairness reduced to 4 and three accepted drafts, the last
-of sixteen streams receives its first output at about 2697 ms. Fairness weights
-specify a substantive startup/throughput preference; there is no universal
-weight implied by the stationary utility derivation.
-
-The dispatcher also retains the immediate-value baseline's finite-tail
-limitation: a 129-token prompt may use 128 plus 1 tokens when a padded 256-token
-graph would finish faster. The completion oracle remains the reference for
-testing that effect. Neither an EOS prior nor a finite-tail continuation is
-part of this ongoing-service policy.
+The dispatcher has the immediate-value baseline's finite-tail limitation: a
+129-token prompt may use 128 plus 1 tokens when a padded 256-token graph would
+finish faster. The [completion oracle](scheduling-oracle.md) is the reference
+for that effect. Neither an EOS prior nor a finite-tail continuation is part of
+this ongoing-service policy.
 
 Native dispatch compares unknown costs optimistically and projects queued work
 into service prices before selecting a second frame. For prerequisites that
@@ -360,12 +342,36 @@ For each pair of prerequisite and following inference shapes, native dispatch
 jointly selects both cohorts. It enumerates how many newly ready streams the
 following graph serves, then uses sorted prefix sums for those streams, already
 ready streams, and first-stage terminal completions. Exhaustive subset tests
-check the resulting maximum. Longer prerequisite chains retain an individual
+check the resulting maximum. Longer prerequisite chains use an individual
 continuation index. Exact fixed-pair cohort choice does not establish a globally
 optimal schedule over arbitrary future sequences. Native mixed inference also
 considers an absent, already ready, or newly enabled prompt row alongside the
-decode cohort. The native shape and row contract is implemented; Ignition mixed
-model captures and GPU replay validation remain outstanding.
+decode cohort. Helios implements the mixed shape and row contract, and the
+Qwen3.8 Flash recipe (`ignition/recipes/qwen38`) captures mixed graphs when
+Ignition is given `--mixed-prefill`; no other recipe declares mixed capture.
+
+[`tests/test_scheduling_utility.py`](../tests/test_scheduling_utility.py) holds
+the simulator checks for this policy:
+
+- `test_stationary_prices_match_offline_rate_allocation` runs the exponential
+  and service-weighted controllers on three stationary service regions: unequal
+  CPU-like rates with weighted fairness, the same rates with intrinsic
+  preferences, and a batched region. With a 1000 ms history, the utility gap
+  to `fair_allocation` after 25,000 warmup and 25,000 measurement rounds must
+  be below 0.0001.
+- `test_short_prompt_startup_and_subsequent_decode_gaps` runs five and sixteen
+  simultaneous 64-token prompts with zero, three, and seven accepted drafts on
+  the synthetic catalog with `beta=64`, token fairness 16, delivery fairness 4,
+  `tau=100 ms`, service-weighted history, and age price 0.1. Every first output
+  must arrive within 100 ms, every later gap must stay below 150 ms, and output
+  counts must differ by at most eight tokens.
+- `test_common_workloads_complete_or_make_progress_to_the_horizon` runs every
+  workload in `scripts/scheduling_sim/workloads.py` with each rate history,
+  with and without the synthetic mixed catalog. Every request must make
+  progress, and every workload except `continuous_decode` must complete within
+  the 15,000 ms horizon.
+
+Mixed durations in the synthetic catalog are not GPU measurements.
 
 Run the simulator with every preference supplied explicitly:
 
@@ -378,5 +384,5 @@ python -m pytest tests/test_scheduling_utility.py -q
 ```
 
 Add `--mixed` for the synthetic mixed catalog or `--catalog PATH` for supplied
-complete-graph durations. `summary.csv`, `requests.csv`, and `trace.jsonl` retain
+complete-graph durations. `summary.csv`, `requests.csv`, and `trace.jsonl` record
 the preference values needed to interpret each measurement.

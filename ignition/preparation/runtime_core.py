@@ -190,26 +190,20 @@ class RecordedExportGraph:
 
 
 def record_export_graph(graph, storage, *, owners=()):
-    """Copy an uninstantiated graph before releasing its CUDA template."""
-    import flare_heliopause
-    from .module_images import ModuleImages
+    """Retain a captured template, its executable and external export resources.
 
-    images = ModuleImages.current()
-    if images is None:
-        raise RuntimeError("graph metadata recording requires an active native module recorder")
+    Owners must not reference the graph: Torch's destruction finalizer retains
+    them independently. Native replay callers must drain before resetting graphs.
+    """
     pools = (storage.pool, storage.graph_pool)
     owned = {pool.id for pool in pools}
     if not set(graph.pools()) <= owned:
         raise ValueError("export graph uses a CUDA pool without an external owner")
-    context, _ = flare_heliopause.current_context()
-    recorded = images.native.record_template(int(graph.raw_cuda_graph()), 1)
-    owner = RecordedExportGraph(images.native, recorded, context, pools, owners)
-    try:
-        graph.reset()
-    except BaseException:
-        owner.reset()
-        raise
-    return owner
+    # Device pointers in captured nodes do not retain their Python resource owners.
+    # Release these references only when the graph is reset or collected.
+    graph.retain_object((pools, tuple(owners)), synchronize_before_release=True)
+    instantiate_graph(graph)
+    return graph
 
 
 def capture_graph(*, retain_graphs=False):

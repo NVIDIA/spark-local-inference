@@ -7,12 +7,32 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from ignition.preparation.persistent import allocated_tensor_bytes
+
 from ignition.components.model import canonical_tree
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.tensor_fp8 import TensorFP8Weight
 from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear_as_mxfp8
 
 from .config import ModelConfig, TEXT_PREFIX
+
+
+def _gdn_projection_groups(config, loader):
+    groups = {}
+    packed_inputs = config.pack_gdn_inputs
+    for index, kind in enumerate(config.layers):
+        if kind != "linear_attention":
+            continue
+        prefix = f"layers.{index}.linear_attn.in_proj_"
+        qkvz = tuple(TEXT_PREFIX + "." + prefix + field for field in ("qkv", "z"))
+        ba = tuple(TEXT_PREFIX + "." + prefix + field for field in ("b", "a"))
+        if packed_inputs:
+            groups[prefix + "qkvzba"] = (*qkvz, *ba)
+        else:
+            groups[prefix + "ba"] = ba
+            if all(loader.linear_format(part) == "mxfp8" for part in qkvz):
+                groups[prefix + "qkvz"] = qkvz
+    return groups
 
 
 @dataclass(frozen=True)
@@ -39,7 +59,7 @@ class ModelWeights:
             config = replace(config, draft=load_draft_config(draft_snapshot, config))
         tree = canonical_tree(Qwen3_5TextModel, Qwen3_5TextConfig.from_dict(config.text))
         projections = {}
-        before = torch.cuda.memory_allocated(device)
+        before = allocated_tensor_bytes(device)
         with DirectWeightLoader(manifest, device, prefixes=(TEXT_PREFIX + ".", "lm_head."),
                                 progress=progress) as loader:
             mlp_groups = {
@@ -68,7 +88,26 @@ class ModelWeights:
             }
             attention_names = {part.removeprefix(TEXT_PREFIX + ".") + ".weight"
                                for parts in attention_groups.values() for part in parts}
+            gdn_groups = _gdn_projection_groups(config, loader)
+            gdn_names = {part.removeprefix(TEXT_PREFIX + ".") + ".weight": part
+                         for parts in gdn_groups.values() for part in parts}
             for name, parameter in tree.named_parameters():
+                if name in gdn_names:
+                    part = gdn_names[name]
+                    stored = manifest.tensors[part + ".weight"].shape
+                    fmt = loader.linear_format(part)
+                    if fmt in ("iq2_xxs", "q8_0"):
+                        from b12x._lib.quant.block_codec import block_codec
+
+                        codec = block_codec(fmt)
+                        logical = ((stored[0], stored[1] * codec.block_weights)
+                                   if len(stored) == 3 and stored[2] == codec.block_bytes else None)
+                    else:
+                        logical = ((stored[0], stored[1] * (2 if fmt in ("nvfp4", "mxfp4") else 1))
+                                   if len(stored) == 2 else None)
+                    if logical != tuple(parameter.shape):
+                        raise ValueError(f"{part}: checkpoint projection shape differs from the model")
+                    continue
                 if name in attention_names:
                     if tuple(manifest.tensors[TEXT_PREFIX + "." + name].shape) != tuple(parameter.shape):
                         raise ValueError(f"{name}: checkpoint projection shape differs from the model")
@@ -86,10 +125,13 @@ class ModelWeights:
                         raise ValueError(f"{prefix}: checkpoint projection shape differs from the model")
                     projections[name.removesuffix(".weight")] = weight
                     continue
-                tensor = loader.load_tensor(TEXT_PREFIX + "." + name)
+                parent, _, field = name.rpartition(".")
+                convert = (online_mxfp8 and field == "weight"
+                           and isinstance(tree.get_submodule(parent), torch.nn.Linear)
+                           and manifest.tensors[TEXT_PREFIX + "." + name].dtype == "BF16")
+                tensor = loader.load_tensor(TEXT_PREFIX + "." + name, temporary=convert)
                 if tensor.shape != parameter.shape:
                     raise ValueError(f"{name}: checkpoint parameter shape differs from the model")
-                parent, _, field = name.rpartition(".")
                 if field == "weight" and isinstance(tree.get_submodule(parent), torch.nn.Linear):
                     convert = online_mxfp8 and tensor.dtype == torch.bfloat16
                     projections[parent] = quantize_bf16_linear_as_mxfp8(tensor) if convert else tensor
@@ -103,7 +145,7 @@ class ModelWeights:
                     raise ValueError(f"{prefix}gate_up: checkpoint projection shape differs from the model")
                 projections[prefix + "gate_up"] = combined
             for prefix, parts in attention_groups.items():
-                combined = loader.load_linear_group(parts)
+                combined = loader.load_linear_group(parts, temporary=True)
                 field = "kv_proj"
                 if len(parts) == 3:
                     heads, dim = config.text["num_attention_heads"], config.text["head_dim"]
@@ -118,26 +160,22 @@ class ModelWeights:
             head_shape = tuple(head.shape) if isinstance(head, torch.Tensor) else (head.out_features, head.in_features)
             if head_shape != (config.vocabulary, config.hidden):
                 raise ValueError("Qwen vocabulary projection shape differs from the model")
-            for index, layer in enumerate(tree.layers):
-                if layer.block_type == "linear_attention":
-                    prefix = f"layers.{index}.linear_attn."
-                    parts = tuple(TEXT_PREFIX + "." + prefix + "in_proj_" + field for field in ("b", "a"))
-                    qkvz = tuple(TEXT_PREFIX + "." + prefix + "in_proj_" + field for field in ("qkv", "z"))
-                    if config.pack_gdn_inputs:
-                        projections[prefix + "in_proj_qkvzba"] = loader.load_linear_group((*qkvz, *parts))
-                        for field in ("qkv", "z", "b", "a"):
-                            projections.pop(prefix + "in_proj_" + field)
-                        continue
-                    combined = loader.load_linear_group(parts)
-                    if online_mxfp8 and isinstance(combined, torch.Tensor):
+            for name, parts in gdn_groups.items():
+                modules = [tree.get_submodule(part.removeprefix(TEXT_PREFIX + ".")) for part in parts]
+                combined = loader.load_linear_group(parts,
+                    temporary=online_mxfp8 and loader.linear_format(parts[0]) == "bfloat16")
+                shape = tuple(combined.shape) if isinstance(combined, torch.Tensor) else (
+                    combined.out_features, combined.in_features)
+                if shape != (sum(module.out_features for module in modules), config.hidden):
+                    raise ValueError(f"{name}: checkpoint projection shape differs from the model")
+                if isinstance(combined, torch.Tensor):
+                    if online_mxfp8:
                         combined = quantize_bf16_linear_as_mxfp8(combined)
-                    projections[prefix + "in_proj_ba"] = combined
-                    for field in ("b", "a"):
-                        projections.pop(prefix + "in_proj_" + field, None)
-                    if all(loader.linear_format(part) == "mxfp8" for part in qkvz):
-                        projections[prefix + "in_proj_qkvz"] = loader.load_linear_group(qkvz)
-                        for field in ("qkv", "z"):
-                            projections.pop(prefix + "in_proj_" + field)
+                    else:
+                        for module, tensor in zip(modules, combined.split(
+                                [module.out_features for module in modules]), strict=True):
+                            module.weight = torch.nn.Parameter(tensor, requires_grad=False)
+                projections[name] = combined
         draft = None
         draft_head = None
         if mtp:
@@ -151,5 +189,5 @@ class ModelWeights:
                     raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
                 converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
                 draft_head = converters[draft_head_quantization](head)
-        return cls(config, tree, projections, head, torch.cuda.memory_allocated(device) - before,
+        return cls(config, tree, projections, head, allocated_tensor_bytes(device) - before,
                    draft=draft, draft_head=draft_head)

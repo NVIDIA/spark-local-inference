@@ -8,10 +8,14 @@ import weakref
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 from b12x.sequence import gdn_decode
 
-from ignition.preparation.scratch import planned_scratch
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import register_finalizer
+from b12x.preparation.types import plan_from_handle
+
 
 @dataclass(frozen=True)
 class KDARecords:
@@ -38,8 +42,8 @@ class KDARecords:
         return cls(layers,
             torch.zeros((count, slots, heads, window, 128), dtype=torch.float32, device=device),
             torch.zeros((count, slots, heads, window, 256), dtype=torch.bfloat16, device=device),
-            torch.stack([attention_weights[layer]["A_log"] for layer in layers]),
-            torch.stack([attention_weights[layer]["dt_bias"].view(heads, 128) for layer in layers]))
+            persistent_copy(torch.stack([attention_weights[layer]["A_log"] for layer in layers])),
+            persistent_copy(torch.stack([attention_weights[layer]["dt_bias"].view(heads, 128) for layer in layers])))
 
     def layer(self, index):
         position = self.layers.index(index)
@@ -51,14 +55,28 @@ _HANDLES = itertools.count()
 
 
 @torch.library.custom_op("flare::kda_record", mutates_args=("output", "corrections", "keys_gates"))
-def _record(reads: list[torch.Tensor], output: torch.Tensor, corrections: torch.Tensor,
-            keys_gates: torch.Tensor, handle: int) -> None:
+def _record(reads: list[torch.Tensor], recurrent_state: torch.Tensor, output: torch.Tensor,
+            corrections: torch.Tensor, keys_gates: torch.Tensor, scratch: torch.Tensor,
+            handle: int) -> None:
     owner = _OWNERS[handle]
-    gdn_decode.run_kda(owner.recurrence, **owner.options)
+    owner.run_recorded(reads, recurrent_state, output, corrections, keys_gates, scratch)
 
 
 @_record.register_fake
-def _fake_record(reads, output, corrections, keys_gates, handle):
+def _fake_record(reads, recurrent_state, output, corrections, keys_gates, scratch, handle):
+    pass
+
+
+@torch.library.custom_op("flare::kda_record_fused",
+                         mutates_args=("output", "corrections", "keys_gates", "convolution_state"))
+def _record_fused(reads: list[torch.Tensor], recurrent_state: torch.Tensor, output: torch.Tensor, corrections: torch.Tensor,
+                  keys_gates: torch.Tensor, convolution_state: torch.Tensor, handle: int) -> None:
+    """Run short convolution, recovery verification and output norm in one launch."""
+    _OWNERS[handle].run_fused(reads, recurrent_state, output, corrections, keys_gates, convolution_state)
+
+
+@_record_fused.register_fake
+def _fake_record_fused(reads, recurrent_state, output, corrections, keys_gates, convolution_state, handle):
     pass
 
 
@@ -68,45 +86,103 @@ def register_recording(owner):
     return handle
 
 
-@torch.library.custom_op("flare::kda_replay", mutates_args=("backing",))
-def _replay(backing: torch.Tensor, reads: list[torch.Tensor], handle: int) -> None:
-    gdn_decode.run_kda_commit(_OWNERS[handle].binding, lower_bound=-5.0)
+@triton.jit
+def _address_tables(Backing, Corrections, KeysGates, StateBase, StateStride,
+                    CorrectionBase, CorrectionStride, KeysGatesBase, KeysGatesStride,
+                    OFFSETS: tl.constexpr, STATE_STRIDES: tl.constexpr,
+                    CORRECTION_LAYER_STRIDE: tl.constexpr, CORRECTION_BLOCK_STRIDE: tl.constexpr,
+                    CORRECTION_ELEMENT_BYTES: tl.constexpr,
+                    KEYS_GATES_LAYER_STRIDE: tl.constexpr, KEYS_GATES_BLOCK_STRIDE: tl.constexpr,
+                    KEYS_GATES_ELEMENT_BYTES: tl.constexpr,
+                    LAYERS: tl.constexpr):
+    for layer in tl.static_range(LAYERS):
+        backing_address = tl.cast(Backing, tl.uint64)
+        correction_address = tl.cast(Corrections, tl.uint64)
+        keys_gates_address = tl.cast(KeysGates, tl.uint64)
+        tl.store(StateBase + layer, backing_address + OFFSETS[layer])
+        tl.store(StateStride + layer, STATE_STRIDES[layer])
+        tl.store(CorrectionBase + layer,
+                 correction_address + layer * CORRECTION_LAYER_STRIDE * CORRECTION_ELEMENT_BYTES)
+        tl.store(CorrectionStride + layer, CORRECTION_BLOCK_STRIDE)
+        tl.store(KeysGatesBase + layer,
+                 keys_gates_address + layer * KEYS_GATES_LAYER_STRIDE * KEYS_GATES_ELEMENT_BYTES)
+        tl.store(KeysGatesStride + layer, KEYS_GATES_BLOCK_STRIDE)
 
 
-@_replay.register_fake
-def _fake_replay(backing, reads, handle):
+@torch.library.custom_op("flare::kda_commit_addresses", mutates_args=("tables",))
+def _pack_kda_addresses(backing: torch.Tensor, corrections: torch.Tensor, keys_gates: torch.Tensor,
+                        tables: list[torch.Tensor], offsets: list[int], state_strides: list[int],
+                        correction_layer_stride: int, correction_block_stride: int,
+                        correction_element_bytes: int, keys_gates_layer_stride: int,
+                        keys_gates_block_stride: int, keys_gates_element_bytes: int) -> None:
+    _address_tables[(1,)](backing, corrections, keys_gates, *tables, tuple(offsets), tuple(state_strides),
+        correction_layer_stride, correction_block_stride, correction_element_bytes,
+        keys_gates_layer_stride, keys_gates_block_stride, keys_gates_element_bytes,
+        len(offsets), num_warps=1)
+
+
+@_pack_kda_addresses.register_fake
+def _pack_kda_addresses_fake(backing, corrections, keys_gates, tables, offsets, state_strides,
+                             correction_layer_stride, correction_block_stride, correction_element_bytes,
+                             keys_gates_layer_stride, keys_gates_block_stride, keys_gates_element_bytes):
+    pass
+
+
+@torch.library.custom_op("flare::kda_commit", mutates_args=("backing",))
+def _execute_kda_commit(backing: torch.Tensor, corrections: torch.Tensor, keys_gates: torch.Tensor,
+                        tables: list[torch.Tensor], A_log: torch.Tensor, dt_bias: torch.Tensor,
+                        state_indices: torch.Tensor, commit_lens: torch.Tensor,
+                        final_state_indices: torch.Tensor, boundary_state_indices: torch.Tensor,
+                        boundary_recovery_lens: torch.Tensor, scratch: torch.Tensor, handle: int) -> None:
+    binding = gdn_decode.bind_kda_commit(plan_from_handle(handle), scratch=scratch,
+        state_base_addrs=tables[0], state_block_strides=tables[1],
+        correction_cache_base_addrs=tables[2], correction_cache_block_strides=tables[3],
+        kg_cache_base_addrs=tables[4], kg_cache_block_strides=tables[5],
+        A_log=A_log, dt_bias=dt_bias, state_indices=state_indices, commit_lens=commit_lens,
+        final_state_indices=final_state_indices, boundary_state_indices=boundary_state_indices,
+        boundary_recovery_lens=boundary_recovery_lens)
+    gdn_decode.run_kda_commit(binding, lower_bound=-5.0)
+
+
+@_execute_kda_commit.register_fake
+def _execute_kda_commit_fake(backing, corrections, keys_gates, tables, A_log, dt_bias,
+                             state_indices, commit_lens, final_state_indices,
+                             boundary_state_indices, boundary_recovery_lens, scratch, handle):
     pass
 
 
 class PreparedKDAReplay:
-    def __init__(self, backing, states, records, plan, state_indices, *, session, workspace):
-        self.backing, self.sources, self.plan, self.workspace = backing, state_indices, plan, workspace
-        device = backing.device
-        self.lengths = torch.zeros_like(state_indices, dtype=torch.int32)
-        self.finals = torch.zeros_like(self.lengths)
-        self.boundaries = torch.zeros_like(self.lengths)
-        self.boundary_lengths = torch.zeros_like(self.lengths)
-        self.handle = register_recording(self)
+    def __init__(self, backing, states, records, plan, *, session):
+        self.backing, self.states, self.plan = backing, tuple(states), plan
+        self.layers = records.layers
+        self.state_offsets = tuple(state.data_ptr() - backing.data_ptr() for state in states)
+        self.state_strides = tuple(state.stride(0) for state in states)
+        self.scratch_bytes = None
+        self.session = session
+
+    def functional(self):
+        register_finalizer(self.session, self._finalize)
+        return self
+
+    def _finalize(self):
+        self.scratch_bytes = sum(spec.nbytes for spec in self.plan.scratch_specs())
+
+    def __call__(self, counts, records, metadata):
+        state_indices = metadata.state_indices
+        if state_indices.ndim == 2:
+            state_indices = state_indices[:, 0]
+        rows = state_indices.numel()
+        device = self.backing.device
         corrections, kg = records.corrections, records.keys_and_gates
-        def table(values):
-            return torch.tensor(values, dtype=torch.int64, device=device)
-        self.tables = dict(state_base_addrs=table([s.data_ptr() for s in states]),
-            state_block_strides=table([s.stride(0) for s in states]),
-            correction_cache_base_addrs=table([corrections[i].data_ptr() for i in range(len(states))]),
-            correction_cache_block_strides=table([corrections.stride(1)] * len(states)),
-            kg_cache_base_addrs=table([kg[i].data_ptr() for i in range(len(states))]),
-            kg_cache_block_strides=table([kg.stride(1)] * len(states)),
-            A_log=records.A_log, dt_bias=records.dt_bias)
-        self.reads = [corrections, kg, self.sources, self.lengths, self.finals]
-        register_finalizer(session, self.bind, workspace=workspace)
 
-    def bind(self):
-        self.binding = gdn_decode.bind_kda_commit(self.plan,
-            scratch=planned_scratch(self.plan.scratch_specs(), self.workspace), **self.tables,
-            state_indices=self.sources, commit_lens=self.lengths, final_state_indices=self.finals,
-            boundary_state_indices=self.boundaries, boundary_recovery_lens=self.boundary_lengths)
-
-    def __call__(self, counts):
-        self.lengths.copy_(counts)
-        self.finals.copy_(self.sources)
-        _replay(self.backing, self.reads, self.handle)
+        tables = [torch.empty((len(self.states),), dtype=torch.int64, device=device) for _ in range(6)]
+        _pack_kda_addresses(self.backing, corrections, kg, tables, list(self.state_offsets),
+            list(self.state_strides), corrections.stride(0), corrections.stride(1), corrections.element_size(),
+            kg.stride(0), kg.stride(1), kg.element_size())
+        commit_lens = counts.to(dtype=torch.int32)
+        final_state_indices = state_indices.to(dtype=torch.int32)
+        boundaries = torch.zeros((rows,), dtype=torch.int32, device=device)
+        boundary_lengths = torch.zeros_like(boundaries)
+        scratch = torch.empty((self.scratch_bytes,), dtype=torch.uint8, device=device)
+        _execute_kda_commit(self.backing, corrections, kg, tables, records.A_log, records.dt_bias,
+            state_indices, commit_lens, final_state_indices, boundaries, boundary_lengths, scratch, self.plan.handle)

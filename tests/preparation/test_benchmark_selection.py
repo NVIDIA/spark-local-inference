@@ -211,3 +211,20 @@ def test_shared_study_catalog_sizes_pool_without_widening_native_catalog():
 def test_invalid_shared_study_catalog(values):
     with pytest.raises(ValueError):
         BenchmarkSelection(batches=(1,), **values)
+
+
+@pytest.mark.parametrize("prefill,drafting", [(False, True), (True, True), (True, False)])
+def test_nemotron_single_gpu_benchmark_plan(prefill, drafting):
+    model = resolve("nemotron-bolt-24gb")
+    gpu = planning.Gpu(0, "NVIDIA GB10", "GPU-test", 128 << 30, 120 << 30, (12, 1))
+    plan = planning.plan(model.recipe, model.checkpoint, (gpu,), selected=(0,),
+        concurrency=1, reserve_bytes=0, speculation=model.recipe.speculation if drafting else None)
+    selection = BenchmarkSelection(batches=(1,), contexts=(8192 if prefill else 4096,),
+        prefill_chunk=4096 if prefill else 0)
+    selected = replace(plan, benchmark_selection=selection)
+    assert selected.world_size == selected.concurrency == 1
+    assert selected.benchmark_selection is selection
+    assert selected.benchmark_selection.speculative_round_shapes == (() if prefill else ((1, 8, 8),))
+    assert selected.to_dict()["benchmark_selection"] == selection.to_dict()
+    with pytest.raises(UsageError, match="speculation studies require"):
+        replace(plan, benchmark_selection=BenchmarkSelection(batches=(1,), speculation_study=True))

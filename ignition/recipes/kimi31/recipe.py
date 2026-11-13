@@ -14,6 +14,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             core_storage=None, ranks=None):
     if not plan.context_parallel:
         raise ValueError("Kimi K3.1 preparation requires context parallelism")
+    if (plan.context_parallel_size or plan.world_size) not in (8, 16):
+        raise ValueError("Kimi K3.1 TP16 supports DCP8 or DCP16")
     if plan.speculation is not None and plan.speculation.method == "dflash2":
         from .dflash_config import REPOSITORY, REVISION
         return prepare_kimi(snapshot, plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache,

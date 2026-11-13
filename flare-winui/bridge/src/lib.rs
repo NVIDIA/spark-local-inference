@@ -31,12 +31,36 @@ fn text(value: &str) -> FlareString {
 mod tests {
     use super::*;
     #[test]
+    fn published_build_mismatch_preserves_unknown_and_matching_targets() {
+        let mut view = Snapshot::default();
+        for target in [None, Some(true), Some(false)] {
+            view.models.push(flare::controller::ModelView {
+                flags: 16,
+                metadata: flare::controller::ModelMetadata {
+                    build_target_match: target,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let held = Box::into_raw(Box::new(FlareSnapshot { view }));
+        unsafe {
+            for (index, expected) in [0, 0, 1].into_iter().enumerate() {
+                let mut out = std::mem::MaybeUninit::<FlareModel>::uninit();
+                assert_eq!(flare_snapshot_model(held, index, out.as_mut_ptr()), 1);
+                assert_eq!(out.assume_init().published_build_mismatch, expected);
+            }
+            flare_snapshot_destroy(held);
+        }
+    }
+    #[test]
     fn model_metadata_preserves_optional_fields_and_utf8() {
         let mut view = Snapshot::default();
         view.models.push(flare::controller::ModelView {
             metadata: flare::controller::ModelMetadata {
                 author: "模型作者".into(),
                 hardware: "GB10".into(),
+                revision_updated_at: "2026-11-05T18:06:29.000Z".into(),
                 context_tokens: Some(262144),
                 revision_bytes: Some(25_528_087_320),
                 rank_count: Some(1),
@@ -55,12 +79,21 @@ mod tests {
             assert_eq!(found.revision_bytes, 25_528_087_320);
             assert_eq!(found.rank_count, 1);
             assert_eq!(
+                slice::from_raw_parts(
+                    found.revision_updated_at.data.cast::<u8>(),
+                    found.revision_updated_at.length,
+                ),
+                b"2026-11-05T18:06:29.000Z"
+            );
+            assert_eq!(
                 slice::from_raw_parts(found.author.data.cast::<u8>(), found.author.length),
                 "模型作者".as_bytes()
             );
             let mut out = std::mem::MaybeUninit::<FlareModel>::uninit();
             assert_eq!(flare_snapshot_model(held, 1, out.as_mut_ptr()), 1);
-            assert_eq!(out.assume_init().metadata_known, 0);
+            let missing = out.assume_init();
+            assert_eq!(missing.metadata_known, 0);
+            assert_eq!(missing.revision_updated_at.length, 0);
             assert_eq!(flare_snapshot_model(held, 2, ptr::null_mut()), 0);
             flare_snapshot_destroy(held);
         }
@@ -202,6 +235,7 @@ macro_rules! path_command {
 }
 no_argument_command!(flare_app_refresh, Command::Refresh);
 no_argument_command!(flare_app_stop, Command::Stop);
+no_argument_command!(flare_app_clear_failed_downloads, Command::ClearFailedDownloads);
 string_command!(flare_app_discover, Command::Discover);
 string_command!(flare_app_download, Command::Download);
 string_command!(flare_app_activate, Command::Activate);
@@ -503,6 +537,8 @@ pub struct FlareModel {
     revision_bytes: u64,
     rank_count: u32,
     metadata_known: u32,
+    revision_updated_at: FlareString,
+    published_build_mismatch: u32,
 }
 #[repr(C)]
 pub struct FlareDownload {
@@ -587,6 +623,8 @@ pub unsafe extern "C" fn flare_snapshot_model(
                         | (u32::from(s.metadata.parameter_count.is_some()) << 1)
                         | (u32::from(s.metadata.revision_bytes.is_some()) << 2)
                         | (u32::from(s.metadata.rank_count.is_some()) << 3),
+                    revision_updated_at: text(&s.metadata.revision_updated_at),
+                    published_build_mismatch: u32::from(s.metadata.build_target_match == Some(false)),
                 },
             )
         }

@@ -50,7 +50,7 @@ before committing; a design acknowledgment cannot authorize them.
 4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM103/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
    Retain internal paths required to load and serve previously supported models.
-   Core version validation is required by principle 13.
+   Model core compatibility is required by principle 13.
 5. **Finish preparation before capture.** Constructors declare operations; one
    preparation batch tunes the complete shape catalog. Size scratch from tuned
    plans, refresh bindings, compile complete forwards, and warm every variant
@@ -109,8 +109,8 @@ before committing; a design acknowledgment cannot authorize them.
     Reserve removed wire identifiers and retain readers and tests needed by
     existing cores. Validate previous cores through loading and serving.
 14. **Restrict Claude Opus 5.5 authorship of CUDA kernels and model optimizations.**
-    Claude Opus 5.5 has repeatedly produced defective low-level kernel changes
-    in this project. It must not design or implement low-level CUDA kernels
+    Claude Opus 5.5 is not reliable for low-level kernel changes in this
+    project. It must not design or implement low-level CUDA kernels
     (CUDA C++, PTX, CuTe DSL, or Triton) or changes to existing model fusion and
     GPU execution optimizations, including projection packing, fused arithmetic,
     stream overlap, and scratch aliasing in optimized model paths. Do not

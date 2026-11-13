@@ -40,18 +40,26 @@ def weights():
     return loaded,config
 
 class Forward:
-    def __init__(self, attention, commit, source, lengths):
-        self.attention,self.commit,self.source,self.lengths=attention,commit,source,lengths
+    def __init__(self, attention, commit, source, metadata, scratch):
+        self.attention, self.commit, self.source = attention, commit, source
+        self.metadata, self.scratch = metadata, scratch
+
     def __call__(self):
-        self.attention(self.source)
+        selected = torch.full_like(self.scratch.selected, -1)
+        output, records, _, observed = self.attention._run(
+            self.source, self.metadata, (selected, None, None))
+        for name in ("query", "attended", "window_values", "query_low"):
+            getattr(self.scratch, name).copy_(observed[name])
+        self.scratch.output.copy_(output)
         if self.commit is not None:
-            self.commit(self.lengths)
+            self.commit(self.metadata.lengths, staging=records[0].unsqueeze(0),
+                        rows=self.metadata.state_rows, starts=self.metadata.starts)
 
 
 class QueryReuseForward(Forward):
-    def __init__(self, attention, commit, source, lengths, scratch, arena):
-        super().__init__(attention, commit, source, lengths)
-        self.scratch, self.arena = scratch, arena
+    def __init__(self, attention, commit, source, metadata, scratch, arena):
+        super().__init__(attention, commit, source, metadata, scratch)
+        self.arena = arena
 
     def __call__(self):
         super().__call__()
@@ -85,7 +93,8 @@ def test_packed_attention_and_ring_commit_cross_window_boundary(weights,lengths,
         attention=PreparedAttention(0,data,source,scratch,metadata,pool,Rotary(config,device),mode='verify',world=4,
             session=session,name=f'window.{batch}.{tokens}',workspace=arena,window_staging=commit.staging[0])
         session.tune(show_progress=False)
-        forward=Forward(attention,commit,source,counts)
+        commit.functional()
+        forward=Forward(attention,commit,source,metadata,scratch)
         compiled=aot_forward(forward)
         compiled(forward);torch.cuda.synchronize()
         graph=torch.cuda.CUDAGraph()
@@ -177,10 +186,13 @@ def test_query_scheduling_preserves_native_attention_and_cache_bytes(
             window_staging=None if commit is None else commit.staging[0])
         assert (attention.concurrent_query is not None) is (mode != 'decode')
         serial = copy(attention)
+        serial.projections = dict(attention.projections)
         serial.concurrent_query = None
+        if commit is not None:
+            commit.functional()
         session.tune(show_progress=False)
         for name, operation in (('serial', serial), ('overlap', attention)):
-            forward = QueryReuseForward(operation, commit, source, metadata.lengths, scratch, arena)
+            forward = QueryReuseForward(operation, commit, source, metadata, scratch, arena)
             compiled = aot_forward(forward)
             compiled(forward)
             torch.cuda.synchronize()

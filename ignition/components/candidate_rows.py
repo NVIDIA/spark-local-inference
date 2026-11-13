@@ -119,10 +119,26 @@ class PreparedCandidateRows:
         self.values, self.indices, self.lengths = values, indices, lengths
         self.rows, self.width, self.tiles, self.topk = rows, width, tiles, topk
 
-    def __call__(self):
+    def functional(self):
+        self.packed = self.active = self.values = self.indices = self.lengths = None
+        self.counts = self.exceptional = None
+        return self
+
+    def __call__(self, packed=None, active=None):
+        if packed is None:
+            packed, active = self.packed, self.active
+            values, indices, lengths = self.values, self.indices, self.lengths
+            counts, exceptional = self.counts, self.exceptional
+        else:
+            values = torch.empty((self.rows, self.width), dtype=torch.float32, device=packed.device)
+            indices = torch.empty_like(values, dtype=torch.int32)
+            lengths = torch.empty((self.rows,), dtype=torch.int32, device=packed.device)
+            counts = torch.empty((self.rows, self.tiles), dtype=torch.int32, device=packed.device)
+            exceptional = torch.empty_like(counts)
         grid = (self.rows, self.tiles)
-        torch.library.wrap_triton(_count)[grid](self.packed, self.active, self.counts, self.exceptional,
+        torch.library.wrap_triton(_count)[grid](packed, active, counts, exceptional,
             WIDTH=self.width, TILES=self.tiles, BLOCK=_BLOCK, num_warps=4)
-        torch.library.wrap_triton(_unpack)[grid](self.packed, self.active, self.counts, self.exceptional,
-            self.values, self.indices, self.lengths, WIDTH=self.width, TILES=self.tiles,
+        torch.library.wrap_triton(_unpack)[grid](packed, active, counts, exceptional,
+            values, indices, lengths, WIDTH=self.width, TILES=self.tiles,
             TOPK=self.topk, BLOCK=_BLOCK, COUNT_BLOCK=triton.next_power_of_2(self.tiles), num_warps=4)
+        return values, indices, lengths

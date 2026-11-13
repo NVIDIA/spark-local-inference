@@ -52,7 +52,7 @@ from ignition.preparation.frontend import prepare_frontend
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
-from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
@@ -300,14 +300,9 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             storage=pool.reserved_backing,
             restore=pool.clear_for_preparation,
         )
+        examples = {}
         arena = ScratchArena(device)
         session.register_scratch(arena)
-        scratch_pool = contextlib.nullcontext() if core_storage is None else core_storage.scratch_pool()
-        scratch_buffers, graph_buffers, layer_buffers = (
-            GraphBufferPool(device),
-            GraphBufferPool(device),
-            GraphBufferPool(device),
-        )
         buffers = dict(
             inputs.buffers(),
             **commands.buffers(),
@@ -330,9 +325,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                 session=session,
                 workspace=arena,
                 collectives=collectives,
-                scratch_pool=scratch_pool,
-                scratch_buffers=scratch_buffers,
-                layer_buffers=layer_buffers,
+                examples=examples,
                 completion=completion,
                 frame=frame,
                 sequence=sequence,
@@ -350,7 +343,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         runtime=collective,
         coordinator=coordinator,
     )
-    forwards, signatures, metadata = {}, {}, {}
+    forwards, signatures = {}, {}
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     modes = serving_modes(drafting, config.mtp_only)
     count = (
@@ -377,12 +370,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                 for capacity in sizes:
                     rows = 1 if mode == "prefill" else capacity
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    cursor = graph_buffers.cursor()
-                    m = metadata[name] = Metadata.allocate(capacity, rows, blocks, device, buffers=cursor)
-                    with scratch_pool:
-                        scratch = Scratch.allocate(
-                            capacity, rows, weights.config, scratch_buffers.cursor(), shard=shard
-                        )
+                    m = Metadata.allocate(capacity, rows, blocks, device)
+                    scratch = Scratch.allocate(capacity, rows, weights.config, shard=shard, device=device, examples=examples)
                     decoder = PreparedDecoder(
                         mode_weights,
                         scratch,
@@ -390,16 +379,15 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                         pool,
                         mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
-                        buffers=cursor,
                         runtime=prefill_collective if mode == "prefill" and capacity >= 1024 else collective,
                         vocabulary_runtime=vocabulary_collective,
                         coordinator=coordinator,
                         session=session,
                         name=name,
                         workspace=arena,
-                        layer_buffers=layer_buffers,
+                        examples=examples,
                     )
-                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool, buffers=cursor)
+                    batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool)
                     forward = PreparedGeneration(
                         decoder,
                         batch,
@@ -411,7 +399,6 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                         session=session,
                         name=name + ".generation",
                         workspace=arena,
-                        buffers=cursor,
                         context_factory=PreparedContext if enabled else None,
                     )
                     add(
@@ -426,7 +413,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         if speculation is not None:
             for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
                 name = f"speculative{batch}x{width}"
-                forward = PreparedRound(speculation, batch, width, name, buffers=graph_buffers.cursor())
+                forward = PreparedRound(speculation, batch, width, name)
                 forward.prepare()
                 add(name, forward, "speculative", batch, width, forward_inputs, enabled=True)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
@@ -450,8 +437,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                     session=session,
                     name=name,
                     activation_mode="auto",
-                    buffers=graph_buffers.cursor(),
                     softcap=weights.config.final_logit_softcapping,
+                    workspace=arena,
                 )
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
@@ -472,46 +459,44 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
                         capacity=capacity,
                         admission_buffers=admission,
                         draft_state=enabled,
-                        buffers=graph_buffers.cursor(),
-                    )
+                        )
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
+    del m, scratch
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+    examples.clear()
+    if speculation is not None:
+        del speculation.examples
+    del examples
+    arena.release_preparation()
     stream = torch.cuda.Stream(device=device)
     graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
-    if config.compile_decoder and core_storage is not None:
-        scratch_pool.release_backing()
 
     def materialize():
         if core_storage is not None:
-            scratch_pool.materialize()
             if pages > initial_pages:
                 core_storage.grow("KV_PAGES", pages)
                 pool.memory_capacity[1] = pages
         pool.clear_for_preparation()
 
-    try:
-        graphs, compiled = capture_forwards(
-            forwards,
-            signatures,
-            session=session,
-            device=device,
-            stream=stream,
-            pool=graph_pool,
-            collective=collective,
-            coordinator=coordinator,
-            compile_decoder=config.compile_decoder,
-            progress=progress,
-            cache_root=config.kernel_cache,
-            retain_graphs=config.retain_graphs,
-            materialize=materialize,
-            warmup_storage=core_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative"),
-        )
-    finally:
-        if core_storage is not None:
-            scratch_pool.materialize()
+    graphs, compiled = capture_forwards(
+        forwards,
+        signatures,
+        session=session,
+        device=device,
+        stream=stream,
+        pool=graph_pool,
+        collective=collective,
+        coordinator=coordinator,
+        compile_decoder=config.compile_decoder,
+        progress=progress,
+        cache_root=config.kernel_cache,
+        retain_graphs=config.retain_graphs,
+        materialize=materialize,
+        warmup_storage=core_storage,
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "init", "restore", "snapshot"),
+    )
     session.freeze()
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
@@ -621,16 +606,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
         close_resources=tuple(close_resources),
         export_zero_ranges=(
             *(() if scoring is None else scoring.zero_ranges()),
-            *storage_ranges([
-                arena.tensor,
-                metadata,
-                *[
-                    chunk
-                    for p in (scratch_buffers, graph_buffers, layer_buffers)
-                    for chunks in p.chunks.values()
-                    for chunk in chunks
-                ],
-            ]),
+            *storage_ranges([arena.tensor]),
             *completion.zero_ranges(),
         ),
         resources=(
@@ -643,10 +619,6 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             commands,
             arena,
             forwards,
-            scratch_buffers,
-            graph_buffers,
-            layer_buffers,
-            metadata,
             compiled,
             stream,
             graph_pool,
@@ -656,7 +628,6 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             prefill_collective,
             vocabulary_collective,
             speculation,
-            scratch_pool,
         ),
     )
 

@@ -4,31 +4,38 @@
 
 """Kimi K3 KDA with fused input projections and a full-rank output gate."""
 
+from types import SimpleNamespace
+
 import torch
 from b12x.sequence import gdn_decode, kda_prefill, short_conv
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.recurrent import prepare_sequence_binding
-from ignition.components.kda_speculation import _record, register_recording
-from ignition.preparation.scratch import buffer_rows
+from ignition.components.kda_speculation import _record, _record_fused, register_recording
+from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tuning import register_finalizer
+from ignition.components.recurrent import run_short_conv
+from b12x.sequence.gdn_decode._kernels import _gdn_decode_op as kda_decode_out
+from b12x.sequence.kda_prefill._ops import _run as kda_prefill_out
 
 from .projections import prepare_projection
 
 
 class PreparedKDA:
-    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
-                 allocator=None):
+    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None):
         mode = "decode" if mode == "verify" else mode
-        self.records, self.state, self.metadata = records, state, metadata
+        self.recording, self.state, self.metadata = records is not None, state, metadata
+        self.weights, self.eps = weights, eps
         tokens, hidden = source.shape
+        self.tokens, self.fused = tokens, None
         heads, width = state.recurrent.shape[1], state.recurrent.shape[1] * 128
         device = source.device
 
         def buffer(key, channels):
-            if key not in buffers or buffers[key].shape[0] < tokens:
-                buffers[key] = (torch.zeros((tokens, channels), dtype=torch.bfloat16, device=device) if allocator is None
-                                else allocator.zeros((tokens, channels), torch.bfloat16))
-            return buffer_rows(buffers, key, tokens)
+            role = 'kimi.hidden_output' if key == 'output' else 'kda.' + key
+            return declaration_tensor(buffers, role, (tokens, channels), torch.bfloat16, device)
+
+        self.heads, self.width = heads, width
 
         self.forget = buffer("forget_input", 128)
         raw_g = buffer("raw_g", width)
@@ -51,10 +58,12 @@ class PreparedKDA:
             max_tokens=tokens, max_seqs=sequences, max_state_slots=state.convolution.shape[0],
             max_speculative_tokens=state.convolution.shape[-1] - 3)
         plan = short_conv.plan(caps, invocation=short_conv.invocation_from_tensors(**conv_args))
+        self.conv_plan = plan
         prepare_sequence_binding(plan, conv_args, session=session, name=name + ".conv", mode=mode,
             public_bind=short_conv.bind, bind_plan=True, workspace=workspace,
             set_binding=lambda binding: setattr(self, "convolution", binding))
         recurrent = state.recurrent if records is None else state.recurrent[:records[0].shape[0]]
+        self.recurrent_state = recurrent
         common = dict(raw_g=raw_g.view(tokens, heads, 128), raw_beta=beta, A_log=weights["A_log"],
             dt_bias=weights["dt_bias"].view(heads, 128), recurrent_state=recurrent,
             num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens,
@@ -72,8 +81,6 @@ class PreparedKDA:
             if records is not None:
                 args.update(correction_cache=records[0], kg_cache=records[1])
                 self.handle = register_recording(self)
-                self.reads = [mixed, raw_g, beta, gate, recurrent, metadata.query_start_loc,
-                              metadata.state_indices, metadata.num_seqs, metadata.num_tokens]
             plan = gdn_decode.plan(caps, invocation=gdn_decode.invocation_from_tensors(caps, **args))
             bind, method = gdn_decode.bind_kda, "bind_kda"
         else:
@@ -91,19 +98,103 @@ class PreparedKDA:
         prepare_sequence_binding(plan, args, session=session, name=name + ".recurrence", mode=mode,
             public_bind=bind, bind_method=method, workspace=workspace, run_options=self.options,
             set_binding=lambda binding: setattr(self, "recurrence", binding))
-        self.gated = gated
+        for projection in self.projections.values():
+            projection.functional(session=session)
+        if mode == "prefill":
+            self.norm.functional(session=session, dynamic_live=True)
+        register_finalizer(session, self._finalize)
+        if workspace is not None:
+            workspace.register_preparation_release(self._release_bindings)
 
-    def __call__(self, source):
-        p = self.projections
-        p["input"](source)
-        self.forget.copy_(self.forget_source)
-        p["forget"](self.forget)
-        short_conv.run(self.convolution)
-        if self.records is not None:
-            _record(self.reads, self.gated, *self.records, self.handle)
+    def _finalize(self):
+        self.conv_bytes = self.conv_plan.scratch_specs()[0].nbytes
+        self.recurrence_bytes = sum(spec.nbytes for spec in self.plan.scratch_specs())
+        if self.recording and self.tokens <= 8:
+            try:
+                self.fused = gdn_decode.prepare_kda_fused_verify(
+                    self.recurrence, self.convolution, retain_examples=False)
+            except ValueError as error:
+                import warnings
+
+                warnings.warn(f"KDA fused verify disabled for this layer: {error}", stacklevel=2)
+        self.input = self.forget = self.forget_source = self.metadata = None
+
+    def _release_bindings(self):
+        self.convolution = self.recurrence = None
+
+    def __call__(self, source, metadata=None, *, records=None):
+        if metadata is None:
+            raise ValueError("KDA execution requires invocation metadata")
+        if self.recording and records is None:
+            raise ValueError("KDA verification requires invocation records")
+        tokens, heads, width = source.shape[0], self.heads, self.width
+        projected = self.projections["input"](source)
+        qkv, forget, gate, beta, _ = projected.split(
+            (3 * width, 128, width, heads, projected.shape[1] - 4 * width - 128 - heads), dim=-1)
+        forget_input = torch.empty((tokens, 128), dtype=source.dtype, device=source.device)
+        forget_input.copy_(forget)
+        raw_g = self.projections["forget"](forget_input).view(tokens, heads, 128)
+        gate = gate.view(tokens, heads, 128)
+        if self.recording and self.fused is not None:
+            output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+            _record_fused([qkv, raw_g, beta, gate, self.weights["A_log"], self.weights["dt_bias"].view(heads, 128),
+                self.weights["norm"], self.weights["convolution"], metadata.query_start_loc,
+                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.state_indices,
+                metadata.num_seqs, metadata.num_tokens], self.recurrent_state, output, *records,
+                self.state.convolution, self.handle)
+            return self.projections["output"](output.reshape(tokens, -1))
+        mixed = torch.empty((tokens, 3 * width), dtype=source.dtype, device=source.device)
+        conv_scratch = torch.empty(self.conv_bytes, dtype=torch.uint8, device=source.device)
+        run_short_conv(self.conv_plan, x=qkv, conv_weight=self.weights["convolution"],
+            query_start_loc=metadata.query_start_loc, state_slot_ids=metadata.convolution_slots,
+            state_is_fresh=metadata.fresh, num_accepted_tokens=metadata.accepted_tokens,
+            num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens,
+            conv_state=self.state.convolution, out=mixed, scratch=conv_scratch)
+        gate = gate.view(tokens, heads, 128)
+        output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+        dt_bias = self.weights["dt_bias"].view(heads, 128)
+        if self.recording:
+            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=source.device)
+            _record([mixed, raw_g, beta, gate, self.weights["A_log"], dt_bias, self.weights["norm"],
+                metadata.query_start_loc, metadata.accepted_tokens, metadata.state_indices,
+                metadata.num_seqs, metadata.num_tokens], self.recurrent_state, output,
+                *records, scratch, self.handle)
         elif self.mode == "decode":
-            gdn_decode.run_kda(self.recurrence, **self.options)
+            kda_decode_out(mixed, raw_g, beta, gate, self.weights["A_log"], dt_bias,
+                self.weights["norm"], self.recurrent_state, metadata.query_start_loc,
+                metadata.accepted_tokens, metadata.state_indices, metadata.num_seqs,
+                metadata.num_tokens, output, self.eps, 128 ** -.5, -5.0, self.plan.handle)
         else:
-            kda_prefill.run(self.recurrence, **self.options)
-            self.norm()
-        return p["output"](self.gated)
+            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=source.device)
+            q, k, v = (value.view(tokens, heads, 128) for value in mixed.split(width, dim=-1))
+            kda_prefill_out([q, k, v, raw_g, beta, self.weights["A_log"], dt_bias,
+                metadata.query_start_loc, metadata.initial_state_indices, metadata.final_state_indices,
+                metadata.checkpoint_state_indices, metadata.checkpoint_offsets, metadata.num_seqs,
+                metadata.num_tokens], scratch, self.recurrent_state, output,
+                self.plan.handle, -5.0, None, 1e-6, None, None)
+            output = self.norm(output, gate, live=metadata.num_tokens)
+        return self.projections["output"](output.reshape(tokens, -1))
+
+    def run_fused(self, reads, recurrent_state, output, corrections, keys_gates, convolution_state):
+        (qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, conv_weight, query_start_loc,
+         convolution_slots, fresh, accepted_tokens, state_indices, num_seqs, num_tokens) = reads
+        binding = SimpleNamespace(raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,
+            recurrent_state=recurrent_state, query_start_loc=query_start_loc, state_indices=state_indices,
+            num_accepted_tokens=accepted_tokens,
+            num_seqs=num_seqs, num_tokens=num_tokens, output=output, z=z, norm_weight=norm_weight,
+            correction_cache=corrections, kg_cache=keys_gates)
+        convolution = SimpleNamespace(x=qkv, conv_weight=conv_weight, state_slot_ids=convolution_slots,
+            state_is_fresh=fresh, num_accepted_tokens=accepted_tokens, conv_state=convolution_state,
+            query_start_loc=query_start_loc, num_seqs=num_seqs, num_tokens=num_tokens)
+        self.fused.run_dynamic(binding, convolution, scale=128 ** -.5, lower_bound=-5.0, eps=self.eps)
+
+    def run_recorded(self, reads, recurrent_state, output, corrections, keys_gates, scratch):
+        (mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, query_start_loc,
+         num_accepted_tokens, state_indices, num_seqs, num_tokens) = reads
+        binding = gdn_decode.bind_kda(self.plan, scratch=scratch,
+            mixed_qkv=mixed_qkv, raw_g=raw_g, raw_beta=raw_beta, z=z, A_log=A_log,
+            dt_bias=dt_bias, norm_weight=norm_weight, recurrent_state=recurrent_state,
+            query_start_loc=query_start_loc, num_accepted_tokens=num_accepted_tokens,
+            state_indices=state_indices, num_seqs=num_seqs, num_tokens=num_tokens,
+            output=output, correction_cache=corrections, kg_cache=keys_gates)
+        gdn_decode.run_kda(binding, lower_bound=-5.0, eps=self.eps)

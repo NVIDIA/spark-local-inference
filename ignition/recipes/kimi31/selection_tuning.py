@@ -26,11 +26,14 @@ def _candidate_pattern(rows, world, topk, rank, seed, count, *, partial_rows=Fal
     scores = scores[:, rank*topk:(rank+1)*topk].contiguous()
     scores[local < 0] = -torch.inf
     positions = torch.arange(rows, dtype=torch.int64) + count
+    counts = ((torch.arange(topk) * world + rank < count).sum().clamp(max=topk)
+              .to(torch.int32).repeat(rows))
     if partial_rows and rows > 1:
         positions[-1] = -1
         local[-1].fill_(-1)
         scores[-1].fill_(-torch.inf)
-    return local, scores, positions
+        counts[-1] = 0
+    return local, scores, positions, counts
 
 
 class _Fixture:
@@ -42,23 +45,30 @@ class _Fixture:
         self.indices = buffers.buffer("input_ids", (rows, 2048), torch.int32)
         self.scores = buffers.buffer("input_scores", (rows, 2048), torch.float32)
         self.positions = buffers.buffer("positions", (rows,), torch.int64)
+        self.counts = buffers.buffer("candidate_counts", (rows,), torch.int32)
         self.output = buffers.buffer("output", (rows, 2048), torch.int32)
         self.selection = PreparedCandidateSelection(self.indices, self.scores, self.positions,
             context.shards.index, self.output, world=world, gather_runtime=context.candidates,
             owner_runtime=context.candidate_owners, reduction_runtime=reduction,
             session=session, coordinator=context.coordinator, name=f"selection_trial.rows{rows}",
-            buffers=SharedBuffers(self.values, device, prefix="merge."))
+            buffers=SharedBuffers(self.values, device, prefix="merge."), local_counts=self.counts)
         self.forwards = {kind: CandidateSelectionForward(self.selection, kind)
                          for kind in self.selection.alternatives}
         self.patterns = tuple(tuple(value.to(device) for value in _candidate_pattern(
             rows, world, 2048, context.shards.rank, seed, count, partial_rows=partial))
             for seed, count, partial in ((101,256,False), (102,8192,False),
                                          (103,32768,True), (207,4096,True)))
+        # A valid ID with nonfinite score in the final slot requires the full-width
+        # exceptional path; the counted transport must not hide it as a short tail.
+        holdout_ids, holdout_scores, _, _ = self.patterns[-1]
+        holdout_ids[:, -1] = 2047
+        holdout_scores[:, -1] = float("nan")
         self.expected = []
 
     def produce(self, index):
         self.step = index
-        for target, source in zip((self.indices, self.scores, self.positions), self.patterns[index], strict=True):
+        for target, source in zip((self.indices, self.scores, self.positions, self.counts),
+                                  self.patterns[index], strict=True):
             target.copy_(source)
 
     def validate(self):
@@ -145,7 +155,8 @@ class CandidateSelectionTuning:
                         chosen = race_compositions(candidates, operation="candidate-selection",
                             geometry=dict(rows=rows, world_size=self.context.shards.world, local_topk=2048, output_topk=2048),
                             numerics="exact-fp32-words-ordered-ties",
-                            workload=dict(version=2, seeds=(101,102,103), counts=(256,8192,32768), partial_last=True),
+                            workload=dict(version=3, seeds=(101,102,103), counts=(256,8192,32768),
+                                          partial_last=True, counted_owner=True),
                             default="replicated", session=trials, coordinator=coordinator,
                             cache_policy="warm", resident_bytes=fixture.nbytes)
                     fixture.produce(3)

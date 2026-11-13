@@ -4,7 +4,6 @@
 
 """Window address equality across packed capacities and decoder replay bounds."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +16,6 @@ from ignition.recipes.deepseek41.decoder import PreparedDecoderBoundary
 from ignition.recipes.deepseek41.decoder_prefill import PreparedDecoderSuffix
 from ignition.recipes.deepseek41.attention import PreparedAttention
 from ignition.recipes.deepseek41.attention import AttentionIndices as DeepSeek41Indices
-from ignition.preparation.scratch import GraphBufferPool
 from .window_indices_reference import LiteralDeepSeek4WindowIndices, LiteralDeepSeek41WindowIndices
 
 
@@ -66,6 +64,7 @@ def test_deepseek41_window_formula_full_buffers(mode, tokens, rows, query_capaci
                                    width=width, replay_start=replay_start)
     expected = LiteralDeepSeek41WindowIndices(metadata, mode=mode, tokens=tokens, page_size=page_size,
                                              width=width, replay_start=replay_start)
+    actual.functional()
     for start in (0, 127, 128, 4095):
         for partial in (False, True, None):
             per_row = min(query_capacity, tokens // rows)
@@ -78,11 +77,10 @@ def test_deepseek41_window_formula_full_buffers(mode, tokens, rows, query_capaci
             set_metadata(metadata, [start + i for i in range(rows)], lengths)
             if replay_start is not None:
                 replay_start.copy_(metadata.starts if partial is False else torch.zeros_like(replay_start))
-            poison(actual)
             poison(expected)
-            actual()
+            packet = actual(metadata, replay_start=replay_start)
             expected()
-            assert_metadata_equal(actual, expected)
+            assert_metadata_equal(packet, expected)
     if tokens == 24 and rows == 8:
         assert actual.window_page_size == 134
 
@@ -96,48 +94,52 @@ def test_deepseek4_wrapper_preserves_literal_window_formula(mode, visible):
     visibility = None
     if visible:
         visibility = (torch.arange(tokens) % 193, torch.arange(tokens).flip(0) % 193)
-    buffers = GraphBufferPool(torch.device("cpu"))
-    actual = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visibility, buffers=buffers.cursor())
+    actual = AttentionIndices(metadata, mode=mode, tokens=tokens, visible=visibility)
     expected = LiteralDeepSeek4WindowIndices(metadata, mode=mode, tokens=tokens,
-        page_size=actual.window_page_size, width=actual.offsets.numel(), visible=visibility)
-    compressed = actual.compressed(4)
+        page_size=actual.window_page_size, width=actual.width, visible=visibility)
+    actual.compressed(4)
+    actual.functional()
     for start in (0, 127, 128, 4095):
         for lengths in ([width] * rows, [width - 1] + [0] * (rows - 1), [0] * rows):
             set_metadata(metadata, [start] * rows, lengths)
-            poison(actual)
             poison(expected)
-            actual()
+            packet = actual(metadata, visible=visibility)
             expected()
-            assert_metadata_equal(actual, expected)
+            assert_metadata_equal(packet, expected)
             positions = metadata.positions.clamp_min(0)
-            assert torch.equal(compressed.lengths, torch.where(metadata.positions >= 0, (positions + 1) // 4, 0))
+            assert torch.equal(packet.ratios[4].lengths, torch.where(metadata.positions >= 0, (positions + 1) // 4, 0))
 
 
 @pytest.mark.parametrize("start", [0, 127, 128, 4095])
 def test_decoder_boundary_refreshes_suffix_after_packing(start):
     metadata = Metadata.allocate(4096, 1, 40, "cpu")
-    packing = PreparedDecoderSuffix(metadata)
-    suffix = packing.metadata
-    shared = PreparedWindowIndices(suffix, mode="prefill", tokens=128, page_size=256,
-        width=128, replay_start=packing.replay_start)
-    expected = LiteralDeepSeek41WindowIndices(suffix, mode="prefill", tokens=128, page_size=256,
-        width=128, replay_start=packing.replay_start)
+    packing = PreparedDecoderSuffix(metadata).functional()
     boundary = object.__new__(PreparedDecoderBoundary)
-    boundary.packing, boundary.window_metadata = packing, shared
-    boundary.incoming, boundary.rows, boundary.normalized = (), (), None
+    boundary.packing = packing
+    source = torch.arange(4096 * 2).view(4096, 2).float()
+    mix = torch.ones(4096, 4)
     observed = []
-    def consumer(*args):
-        expected()
-        assert_metadata_equal(shared, expected)
-        observed.append(shared.window_lengths.clone())
-    boundary.mhc = consumer
-    boundary.global_kv = consumer
+    boundary.mhc = lambda *args, **kwargs: (source, source + 1, source + 2, source + 3)
+    class GlobalKV:
+        ratio = 1
+        def __call__(self, normalized, indexer, full, geometry):
+            assert full is metadata
+            assert torch.equal(normalized, source + 3)
+            observed.append(full.lengths.clone())
+    boundary.global_kv = GlobalKV()
+    indices = SimpleNamespace(compressed=lambda ratio: None)
+    shared = PreparedWindowIndices(Metadata.allocate(128, 1, 40, "cpu"),
+        mode="prefill", tokens=128, page_size=256, width=128).functional()
     for count in (4096, 129, 128, 1, 127, 0, 4095):
         set_metadata(metadata, [start], [count])
-        poison(shared)
-        boundary(None)
-        assert packing.replay_start.item() == (start + max(0, count - 128) if count > 128 else 0)
-    assert len(observed) == 14
+        suffix, gathered, _ = boundary((source,), mix, metadata, indices, None)
+        expected = LiteralDeepSeek41WindowIndices(suffix.metadata, mode="prefill", tokens=128,
+            page_size=256, width=128, replay_start=suffix.replay_start)
+        expected()
+        assert_metadata_equal(shared(suffix.metadata, replay_start=suffix.replay_start), expected)
+        assert suffix.replay_start.item() == (start + max(0, count - 128) if count > 128 else 0)
+        assert torch.equal(gathered[0], suffix.gather(source))
+    assert len(observed) == 7
 
 
 def test_shared_window_buffers_survive_layer_consumption_and_capacity_switches():
@@ -146,7 +148,7 @@ def test_shared_window_buffers_survive_layer_consumption_and_capacity_switches()
         metadata = Metadata.allocate(tokens, 8, 40, "cpu", max_query_tokens=6)
         shared = PreparedWindowIndices(metadata, mode="verify", tokens=tokens, page_size=134, width=128)
         oracle = LiteralDeepSeek41WindowIndices(metadata, mode="verify", tokens=tokens, page_size=134, width=128)
-        groups.append((metadata, shared, oracle))
+        groups.append((metadata, shared.functional(), oracle))
     # Distinct prepared capacities can run sequentially without retaining stale addresses.
     for turn, index in enumerate((0, 1, 2, 1, 0, 2, 0)):
         metadata, shared, oracle = groups[index]
@@ -154,14 +156,13 @@ def test_shared_window_buffers_survive_layer_consumption_and_capacity_switches()
         if turn % 2:
             lengths[-1] = 0
         set_metadata(metadata, [4095 + turn] * 8, lengths)
-        poison(shared)
-        shared()
+        packet = shared(metadata)
         oracle()
-        before = tuple(getattr(shared, field).clone() for field in FIELDS)
+        before = tuple(getattr(packet, field).clone() for field in FIELDS)
         for _ in range(40):
-            assert_metadata_equal(shared, oracle)
+            assert_metadata_equal(packet, oracle)
         for field, snapshot in zip(FIELDS, before):
-            assert torch.equal(getattr(shared, field), snapshot)
+            assert torch.equal(getattr(packet, field), snapshot)
 
 
 @pytest.mark.parametrize("mismatch", ["metadata", "mode", "page_size", "width", "replay_start", "visible"])
@@ -182,7 +183,7 @@ def test_attention_rejects_incompatible_shared_window_indices(mismatch):
     else:
         arguments["visible"] = (torch.zeros(24), torch.zeros(24))
     helper = DeepSeek41Indices(**arguments)
-    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6}, source=lambda layer: None)
+    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6, "candidate_source_layer_id": 0}, source=lambda layer: None)
     pool = SimpleNamespace(config=config, window=lambda *args, **kwargs: torch.zeros((1, 128 * 528), dtype=torch.uint8))
     with pytest.raises(ValueError, match="shared window indices must match"):
         PreparedAttention(0, {}, torch.zeros((24, 1)), None, metadata, pool, None,
@@ -192,18 +193,30 @@ def test_attention_rejects_incompatible_shared_window_indices(mismatch):
 def test_standalone_attention_refreshes_its_own_window_metadata(monkeypatch):
     from ignition.recipes.deepseek41 import attention
     metadata = Metadata.allocate(24, 8, 1, "cpu", max_query_tokens=6)
-    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6}, source=lambda layer: None)
+    config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-6, "candidate_source_layer_id": 0}, source=lambda layer: None)
     pool = SimpleNamespace(config=config, window=lambda *args, **kwargs: torch.zeros((10, 128 * 528), dtype=torch.uint8))
     scratch = SimpleNamespace(projected=torch.zeros((24, 1792)),
         query_low=torch.zeros((24, 1280)), query=torch.zeros((24, 16, 512)),
         window_values=torch.zeros((24, 512)), attended=torch.zeros((24, 16, 512)),
         output=torch.zeros((24, 5120)))
-    for name in ("QuantizedProjection", "PreparedRMSNorm", "PreparedGroupedOutputProjection", "PreparedCompressedCacheWriter"):
-        monkeypatch.setattr(attention, name, lambda *args, **kwargs: lambda *args: None)
+    class Operation:
+        encoded_layout = None
+        def __init__(self, output):
+            self.output = output
+        def functional(self, **kwargs):
+            return self
+        def __call__(self, *args, **kwargs):
+            return self.output.clone()
+    monkeypatch.setattr(attention, "QuantizedProjection", lambda source, weight, out, **kwargs: Operation(out))
+    monkeypatch.setattr(attention, "PreparedRMSNorm", lambda source, weight, out, **kwargs: Operation(out))
+    monkeypatch.setattr(attention, "PreparedGroupedOutputProjection", lambda source, weight, out, **kwargs: Operation(out))
+    monkeypatch.setattr(attention, "PreparedCompressedCacheWriter", lambda source, *args, **kwargs: Operation(source))
     consumed = []
-    def prepare_consumer(query, cache, indices, lengths, *args, **kwargs):
-        return lambda: consumed.append((indices.clone(), lengths.clone()))
-    monkeypatch.setattr(attention, "PreparedCompressedMLA", prepare_consumer)
+    class Consumer(Operation):
+        def __call__(self, query, indices, lengths, **kwargs):
+            consumed.append((indices.clone(), lengths.clone()))
+            return query.clone()
+    monkeypatch.setattr(attention, "PreparedCompressedMLA", lambda query, *args, **kwargs: Consumer(query))
     weights = dict.fromkeys(("qkv_a", "q_b", "q_norm", "kv_norm", "output", "sink"))
     operation = PreparedAttention(0, weights, torch.zeros((24, 5120)), scratch, metadata, pool,
         SimpleNamespace(apply=lambda *args, **kwargs: None), mode="verify", world=4,
@@ -212,100 +225,40 @@ def test_standalone_attention_refreshes_its_own_window_metadata(monkeypatch):
     oracle = LiteralDeepSeek41WindowIndices(metadata, mode="verify", tokens=24, page_size=134, width=128)
     for start, lengths in ((127, [3] * 8), (4095, [2, 3, 3, 3, 3, 3, 3, 0])):
         set_metadata(metadata, [start] * 8, lengths)
-        poison(operation.window_metadata)
-        operation(torch.zeros((24, 5120)))
+        operation(torch.zeros((24, 5120)), metadata, (torch.full((24, 512), -1), None, None))
         oracle()
-        assert_metadata_equal(operation.window_metadata, oracle)
         assert torch.equal(consumed[-1][0], oracle.window_indices)
         assert torch.equal(consumed[-1][1], oracle.window_lengths)
 
 
-def test_decoder_window_groups_survive_reused_prefill_layer_buffers(monkeypatch):
-    from ignition.recipes.deepseek41 import decoder
-
-    metadata = Metadata.allocate(256, 1, 4, "cpu")
-    pool = GraphBufferPool("cpu", chunk_bytes=2 << 20)
-    buffers = pool.cursor()
-    scratch = SimpleNamespace(buffers=buffers, embedding=torch.zeros((256, 5120)),
-        hidden=torch.zeros((1, 5120)), local_logits=torch.zeros((1, 1)), logits=torch.zeros((1, 1)))
-    @dataclass
-    class Layer:
-        engram: object
-        attention: dict
-
-    layers = [Layer(engram=None, attention={}) for _ in range(3)]
-    weights = SimpleNamespace(config=SimpleNamespace(decoder_start=1, sources=(), text={"compress_ratios": [0, 0, 0]}),
-        layers=layers, draft=None, embedding=None, head=None, shard=SimpleNamespace(world_size=4))
-    private = []
-
-    def prepare_layer(*args, buffers, window_metadata, **kwargs):
-        private.append(tuple(buffers.zeros((256, 128), dtype)
-                             for dtype in (torch.int64, torch.int32)))
-        return SimpleNamespace(window_metadata=window_metadata)
-
-    monkeypatch.setattr(decoder, "PreparedLayer", prepare_layer)
-    monkeypatch.setattr(decoder, "PreparedDecoderBoundary", lambda *args, **kwargs: None)
-    for name in ("PreparedTableRequests", "PreparedEmbedding", "Rotary", "PreparedVocabularyProjection"):
-        monkeypatch.setattr(decoder, name, lambda *args, **kwargs: None)
-    operation = decoder.PreparedDecoder(weights, None, scratch, metadata, SimpleNamespace(),
-        mode="prefill", runtime=None, vocabulary_runtime=None, coordinator=None,
-        session=None, name="decoder", workspace=None, suffix_scratch=scratch)
-    original, suffix = operation.window_metadata, operation.suffix_window_metadata
-    assert operation.layers[0].window_metadata is original
-    assert all(layer.window_metadata is suffix for layer in operation.layers[1:])
-    assert private[0][0].data_ptr() == private[1][0].data_ptr() == private[2][0].data_ptr()
-    for index, group in enumerate((original, suffix)):
-        for field in FIELDS:
-            getattr(group, field).fill_(index + 11)
-    for layer_private in private:
-        for value in layer_private:
-            value.fill_(42)
-    for index, group in enumerate((original, suffix)):
-        for field in FIELDS:
-            assert getattr(group, field).eq(index + 11).all()
-
-
-def test_draft_window_group_survives_layer_buffers(monkeypatch):
-    from ignition.recipes.deepseek41 import dspark
-
-    metadata = Metadata.allocate(15, 3, 4, "cpu", max_query_tokens=5)
-    buffers = GraphBufferPool("cpu", chunk_bytes=2 << 20).cursor()
-    scratch = SimpleNamespace(buffers=buffers, embedding=torch.zeros((15, 5120)),
-        hidden=torch.zeros((3, 5120)), local_logits=torch.zeros((3, 1)), logits=torch.zeros((3, 1)))
-    weights = SimpleNamespace(config=None, embedding=None, head=None, shard=None,
-        draft=SimpleNamespace(layers=(None, None), draft_head=None))
-    private = []
-
-    def prepare_layer(*args, window_metadata, **kwargs):
-        private.append(tuple(buffers.zeros((15, 133), dtype)
-                             for dtype in (torch.int64, torch.int32)))
-        return SimpleNamespace(window_metadata=window_metadata)
-
-    monkeypatch.setattr(dspark, "PreparedLayer", prepare_layer)
-    for name in ("PreparedEmbedding", "Rotary", "PreparedVocabularyProjection"):
-        monkeypatch.setattr(dspark, name, lambda *args, **kwargs: None)
-    operation = dspark.PreparedDraft(weights, scratch, metadata, None, runtime=None,
-        vocabulary_runtime=None, coordinator=None, session=None, name="draft", workspace=None)
-    shared = operation.window_metadata
-    assert all(layer.window_metadata is shared for layer in operation.layers)
-    for field in FIELDS:
-        getattr(shared, field).fill_(17)
-    for layer_private in private:
-        for value in layer_private:
-            value.fill_(42)
-    for field in FIELDS:
-        assert getattr(shared, field).eq(17).all()
+def test_decoder_and_draft_window_packets_preserve_live_outputs():
+    groups = []
+    for tokens, mode, width in ((256, "prefill", 128), (128, "prefill", 128), (15, "draft", 133)):
+        rows = 3 if mode == "draft" else 1
+        metadata = Metadata.allocate(tokens, rows, 4, "cpu", max_query_tokens=5 if rows == 3 else tokens)
+        page_size = 133 if mode == "draft" else 128 + tokens
+        group = DeepSeek41Indices(metadata, mode=mode, tokens=tokens, page_size=page_size, width=width).functional()
+        set_metadata(metadata, [127] * rows, [5] * rows)
+        packet = group(metadata)
+        expected = tuple(getattr(packet, field).clone() for field in FIELDS)
+        groups.append((metadata, group, packet, expected))
+    for metadata, group, packet, expected in groups:
+        set_metadata(metadata, [4095] * metadata.starts.numel(), [1] * metadata.starts.numel())
+        following = group(metadata)
+        for field, value in zip(FIELDS, expected, strict=True):
+            getattr(following, field).fill_(42)
+            assert torch.equal(getattr(packet, field), value)
 
 
 def test_deepseek4_ragged_window_staging_uses_request_width():
     metadata = Metadata.allocate(5, 2, 4, "cpu", max_query_tokens=4)
     set_metadata(metadata, [127, 255], [4, 1])
-    buffers = GraphBufferPool(torch.device("cpu"))
-    actual = AttentionIndices(metadata, mode="verify", tokens=5, visible=None, buffers=buffers.cursor())
+    actual = AttentionIndices(metadata, mode="verify", tokens=5, visible=None)
     assert actual.window_page_size == 132
-    actual()
-    assert actual.window_slots.tolist() == [128, 129, 130, 131, 260]
+    actual.functional()
+    packet = actual(metadata)
+    assert packet.window_slots.tolist() == [128, 129, 130, 131, 260]
     expected = LiteralDeepSeek4WindowIndices(metadata, mode="verify", tokens=5,
         page_size=132, width=128, visible=None)
     expected()
-    assert_metadata_equal(actual, expected)
+    assert_metadata_equal(packet, expected)
