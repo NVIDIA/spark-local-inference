@@ -700,6 +700,7 @@ fn prepare_questions(
                 conversation,
                 decoded.request.tool_choice.clone(),
                 &decoded.request.checkpoint_hints,
+                !state.frontend.prompt_encoder().renders_tool_errors(),
             )?;
             state
                 .frontend

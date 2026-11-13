@@ -17,7 +17,7 @@
   "tool_choice=none removes the tool declaration; a named tool_choice declares only that tool; tool_choice=required appends Flare's required-tool instruction to the first system message, inserting one when absent.",
   "A tool result's own name names its frames; tml-renderers names an unnamed result after the most recent preceding call with its tool_call_id.",
   "Flare orders a batch of tool results by the order of their calls.",
-  "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
+  "A failed tool result, marked by Chat or Messages is_error or by tml-renderers' OpenAI tool_error parts, reaches tml-renderers as tool_error parts and renders <|content_tool_error|> frames.",
   "A JSON-schema response format appends Flare's schema instruction to the first system message.",
   "Continuing the final assistant message renders it without its end-of-turn token and leaves its last frame open by removing that frame's <|end_message|>.",
   "Each image renders as one <|content_image|> frame; input_ids hold one placeholder token per image."
@@ -2017,11 +2017,7 @@
       "tool_call_id": "c",
       "content": [
        {
-        "type": "text",
-        "text": "Tool execution failed:"
-       },
-       {
-        "type": "text",
+        "type": "tool_error",
         "text": "timeout"
        }
       ]
@@ -2031,7 +2027,94 @@
     "effort": 0.9,
     "continuation": false
    },
-   "input_ids": [200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,87,200010,200001,1404,200049,90,1,930,1,25,1,1404,1,11,1,70747,1,25,70044,92,200010,200006,200003,1404,200004,4547,161004,154885,25,200010,200003,1404,200004,78734,200010]
+   "input_ids": [200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,87,200010,200001,1404,200049,90,1,930,1,25,1,1404,1,11,1,70747,1,25,70044,92,200010,200006,200003,1404,200022,78734,200010]
+  },
+  {
+   "name": "tool_error_parts",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "c",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": [
+       {
+        "type": "tool_error",
+        "text": "timeout"
+       },
+       {
+        "type": "tool_error",
+        "text": "retry <|end_message|>"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "Try again."
+     }
+    ]
+   },
+   "reference": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "c",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": [
+       {
+        "type": "tool_error",
+        "text": "timeout"
+       },
+       {
+        "type": "tool_error",
+        "text": "retry <|end_message|>"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "Try again."
+     }
+    ],
+    "tools": [],
+    "effort": 0.9,
+    "continuation": false
+   },
+   "input_ids": [200002,200004,34182,279,154554,150628,25,220,15,13,24,200010,200000,200004,87,200010,200001,1404,200049,90,1,930,1,25,1,1404,1,11,1,70747,1,25,70044,92,200010,200006,200003,1404,200022,78734,200010,200003,1404,200022,82510,196982,91,406,62,65752,91,29,200010,200000,200004,32726,151433,13,200010]
   },
   {
    "name": "argument_canonicalization",
@@ -3251,6 +3334,41 @@
    "body": {
     "input": "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901 café\r\n end  "
    }
+  },
+  {
+   "name": "failed_result",
+   "protocol": "messages",
+   "body": {
+    "max_tokens": 16,
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "c",
+        "name": "search",
+        "input": {}
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "c",
+        "is_error": true,
+        "content": "timeout"
+       }
+      ]
+     }
+    ]
+   }
   }
  ],
  "errors": [
@@ -3380,6 +3498,32 @@
     ]
    },
    "message": "documents"
+  },
+  {
+   "name": "mixed_tool_error_parts",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": [
+       {
+        "type": "text",
+        "text": "partial"
+       },
+       {
+        "type": "tool_error",
+        "text": "failed"
+       }
+      ]
+     }
+    ]
+   },
+   "message": "tool_error"
   },
   {
    "name": "array_arguments",

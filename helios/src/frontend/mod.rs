@@ -154,6 +154,12 @@ impl PromptEncoder {
     pub fn renders_tool_choice(self) -> bool {
         matches!(self, Self::DeepseekV4 | Self::DeepseekV41)
     }
+
+    /// Whether the encoder renders failed tool results in its own syntax. Other
+    /// encoders receive them prefixed with a text part saying the tool failed.
+    pub fn renders_tool_errors(self) -> bool {
+        matches!(self, Self::TmlV0)
+    }
 }
 
 impl From<PromptEncoder> for i32 {

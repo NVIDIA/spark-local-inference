@@ -116,6 +116,29 @@ fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
         })
         .collect()
 }
+/// Reads tool-message `tool_error` parts, tml-renderers' OpenAI form of a
+/// failed result, as the text of a failed result.
+fn tool_error_parts(content: &Value) -> Result<(Value, bool)> {
+    let Some(parts) = content.as_array() else {
+        return Ok((content.clone(), false));
+    };
+    if !parts.iter().any(|part| part["type"] == "tool_error") {
+        return Ok((content.clone(), false));
+    }
+    if parts.iter().any(|part| part["type"] == "text") {
+        return Err("tool message content cannot mix text and tool_error parts".into());
+    }
+    let parts = parts
+        .iter()
+        .map(|part| {
+            if part["type"] != "tool_error" {
+                return Ok(part.clone());
+            }
+            Ok(json!({"type":"text","text":field(part, "text")?}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Value::Array(parts), true))
+}
 fn thinking(text: &str, signature: Option<&str>) -> Result<Part> {
     if let Some(signature) = signature.filter(|s| s.starts_with("flare-thinking-v1:")) {
         if signature != super::encode::thinking_signature(text) {
@@ -139,11 +162,12 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
                 ));
             }
             if role == Role::Tool {
+                let (content, failed) = tool_error_parts(&v["content"])?;
                 parts.push(Part::ToolResult {
                     id: optional_id(v, "tool_call_id")?,
                     name: optional_id(v, "name")?,
-                    content: plain_parts(&v["content"], Protocol::Chat)?,
-                    is_error: flag(v, "is_error", false)?,
+                    content: plain_parts(&content, Protocol::Chat)?,
+                    is_error: failed || flag(v, "is_error", false)?,
                 });
             } else {
                 parts.extend(plain_parts(&v["content"], Protocol::Chat)?);
@@ -875,7 +899,7 @@ mod tests {
     }
     fn normalize_tool_arguments(message: &mut Value) -> Result<()> {
         let decoded = chat_messages(&json!({"messages":[message]}))?;
-        *message = template_messages(&decoded, ToolChoice::Auto, &[])?.remove(0);
+        *message = template_messages(&decoded, ToolChoice::Auto, &[], true)?.remove(0);
         Ok(())
     }
     #[test]
@@ -1330,7 +1354,7 @@ mod native_prompt_tests {
             let render = |hints: &[(usize, usize)]| {
                 frontend
                     .render_chat(
-                        &template_messages(messages, ToolChoice::Auto, hints).unwrap(),
+                        &template_messages(messages, ToolChoice::Auto, hints, true).unwrap(),
                         &serde_json::Map::new(),
                     )
                     .unwrap()
@@ -1804,6 +1828,25 @@ mod native_prompt_tests {
             assert_eq!(render(None), declared, "{encoder:?}");
             assert_eq!(render(Some(Value::Null)), declared, "{encoder:?}");
         }
+    }
+
+    #[test]
+    fn templates_receive_failed_tool_results_with_failure_text() {
+        let (frontend, compiler, config) = renderer(PromptEncoder::Jinja, None, TemplateEncoding::Text);
+        let render = |result: Value| {
+            let decoded = decode(Protocol::Chat, json!({"messages":[{"role":"user","content":"Go"},
+                {"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                result]}), false).unwrap();
+            crate::server::request::prepare_inference(&frontend, None, &compiler, &config, &decoded.request, 0, false)
+                .unwrap()
+                .rendered_prompt
+        };
+        let flagged = render(json!({"role":"tool","tool_call_id":"c","is_error":true,"content":"timeout"}));
+        assert!(flagged.contains("<tool>Tool execution failed:\n\ntimeout</tool>"), "{flagged}");
+        assert_eq!(render(json!({"role":"tool","tool_call_id":"c",
+            "content":[{"type":"tool_error","text":"timeout"}]})), flagged);
+        assert!(decode(Protocol::Chat, json!({"messages":[{"role":"tool","tool_call_id":"c",
+            "content":[{"type":"text","text":"a"},{"type":"tool_error","text":"b"}]}]}), false).is_err());
     }
 
     #[test]

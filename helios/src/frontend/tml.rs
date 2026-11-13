@@ -187,6 +187,7 @@ struct Tokens {
     xml: u32,
     image: u32,
     invoke: u32,
+    tool_error: u32,
     end: u32,
     end_sampling: u32,
 }
@@ -210,6 +211,7 @@ impl Tokens {
             xml: id("<|content_xml|>")?,
             image: id("<|content_image|>")?,
             invoke: id("<|content_invoke_tool_json|>")?,
+            tool_error: id("<|content_tool_error|>")?,
             end: id("<|end_message|>")?,
             end_sampling: id("<|content_model_end_sampling|>")?,
         })
@@ -259,11 +261,12 @@ impl Prompt<'_> {
     }
 
     /// Frames for message content: text parts and image placeholders, one frame each.
-    fn content(&mut self, role: u32, name: &str, content: &Json, hints: &[Json]) -> Result<()> {
+    /// `text_kind` is the content-kind token of the text frames.
+    fn content(&mut self, role: u32, name: &str, text_kind: u32, content: &Json, hints: &[Json]) -> Result<()> {
         let parts = match content {
             Json::Null => return Ok(()),
             Json::String(text) => {
-                self.frame(role, name, self.tokens.text, text)?;
+                self.frame(role, name, text_kind, text)?;
                 if hints.contains(&Json::from(1)) {
                     self.boundary();
                 }
@@ -278,7 +281,7 @@ impl Prompt<'_> {
                     let text = part["text"]
                         .as_str()
                         .ok_or_else(|| invalid("text content must be a string"))?;
-                    self.frame(role, name, self.tokens.text, text)?;
+                    self.frame(role, name, text_kind, text)?;
                 }
                 Some("image_url") => {
                     let url = part["image_url"]["url"]
@@ -432,7 +435,7 @@ pub(super) fn render(
         match role {
             "system" | "user" => {
                 let header = if role == "system" { prompt.tokens.system } else { prompt.tokens.user };
-                prompt.content(header, "", content, hints)?;
+                prompt.content(header, "", prompt.tokens.text, content, hints)?;
             }
             "tool" => {
                 // A result's own name wins over the name of its call, as in tml-renderers.
@@ -442,7 +445,13 @@ pub(super) fn render(
                         .and_then(|id| calls.get(id).copied())
                         .unwrap_or(""),
                 };
-                prompt.content(prompt.tokens.tool, name, content, hints)?;
+                // A failed result's text frames carry the tool-error content kind.
+                let kind = match message.get("is_error").filter(|v| !v.is_null()) {
+                    None | Some(Json::Bool(false)) => prompt.tokens.text,
+                    Some(Json::Bool(true)) => prompt.tokens.tool_error,
+                    Some(_) => return Err(invalid("is_error must be a boolean")),
+                };
+                prompt.content(prompt.tokens.tool, name, kind, content, hints)?;
             }
             "assistant" => {
                 let last = index + 1 == messages.len();
@@ -486,7 +495,7 @@ pub(super) fn render(
                     {
                         return Err(invalid("continue_final_message requires the final assistant content to end in text"));
                     }
-                    prompt.content(prompt.tokens.model, "", content, hints)?;
+                    prompt.content(prompt.tokens.model, "", prompt.tokens.text, content, hints)?;
                 }
                 for call in tool_calls {
                     let function = &call["function"];

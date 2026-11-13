@@ -153,8 +153,8 @@ fn named_tool_choices_decode_validate_and_preserve_messages() {
             assert_eq!(auto.options, named.options);
             let Input::Conversation(messages) = &named.input else { panic!() };
             assert_eq!(
-                template_messages(messages, named.tool_choice.clone(), &[]).unwrap(),
-                template_messages(messages, ToolChoice::Auto, &[]).unwrap(),
+                template_messages(messages, named.tool_choice.clone(), &[], true).unwrap(),
+                template_messages(messages, ToolChoice::Auto, &[], true).unwrap(),
             );
             requests.push(named);
         }
@@ -300,8 +300,8 @@ fn required_tool_instruction_preserves_history_and_sampling() {
         let Input::Conversation(messages) = &required.input else {
             panic!()
         };
-        let baseline = template_messages(messages, ToolChoice::Auto, &[]).unwrap();
-        let native = template_messages(messages, ToolChoice::Required, &[]).unwrap();
+        let baseline = template_messages(messages, ToolChoice::Auto, &[], true).unwrap();
+        let native = template_messages(messages, ToolChoice::Required, &[], true).unwrap();
         assert_eq!(native[0]["role"], "system");
         assert!(
             native[0]["content"]
@@ -802,7 +802,7 @@ fn developer_and_system_instructions_lower_to_one_template_preamble() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 2);
     assert_eq!(
         native[0],
@@ -823,7 +823,7 @@ fn response_history_retains_reasoning_calls_results_and_namespaces() {
     assert!(
         matches!(&messages[0].parts[..],[Part::Reasoning(_),Part::ToolCall{name,..}] if name=="shell__run")
     );
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native[0]["reasoning_content"], "Think");
     assert_eq!(native[0]["tool_calls"][0]["id"], "c");
     assert_eq!(native[1]["tool_call_id"], "c");
@@ -838,7 +838,7 @@ fn messages_accept_webp_image_sources() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(
         native[0]["content"][0]["image_url"]["url"],
         "data:image/webp;base64,AA=="
@@ -854,7 +854,7 @@ fn messages_preserve_mixed_tool_results_and_images() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 3);
     assert_eq!(native[0]["content"], "before");
     assert_eq!(native[1]["is_error"], true);
@@ -884,7 +884,7 @@ fn messages_preserve_inline_system_text_and_discard_message_controls() {
             panic!()
         };
         assert_eq!(
-            template_messages(&messages, ToolChoice::Auto, &[]).unwrap(),
+            template_messages(&messages, ToolChoice::Auto, &[], true).unwrap(),
             vec![
                 json!({"role":"system","content":"Initial instructions"}),
                 json!({"role":"user","content":"Hello"}),
@@ -1567,7 +1567,7 @@ fn chat_history_without_call_ids_retains_template_semantics() {
     let Input::Conversation(messages) = req.input else {
         panic!()
     };
-    let native = template_messages(&messages, ToolChoice::Auto, &[]).unwrap();
+    let native = template_messages(&messages, ToolChoice::Auto, &[], true).unwrap();
     assert_eq!(native.len(), 3);
     assert!(native[1]["tool_calls"][0].get("id").is_none());
     assert!(native[2].get("tool_call_id").is_none());
@@ -1586,7 +1586,7 @@ fn empty_text_messages_preserve_conversation_roles() {
         panic!()
     };
     assert_eq!(
-        template_messages(&messages, ToolChoice::Auto, &[]).unwrap(),
+        template_messages(&messages, ToolChoice::Auto, &[], true).unwrap(),
         vec![
             json!({"role":"system","content":""}),
             json!({"role":"user","content":""}),

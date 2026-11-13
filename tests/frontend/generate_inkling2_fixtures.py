@@ -48,7 +48,6 @@ IMAGE_PLACEHOLDER = 200054
 DEFAULT_EFFORT = 0.9
 # Named efforts from the checkpoint chat template; TMLv0 itself takes only numbers.
 EFFORTS = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99}
-TOOL_FAILURE = "Tool execution failed:"
 REQUIRED_TOOL = ("You must call at least one of the provided tools in your next response. "
                  "Choose the appropriate tool and arguments.")
 CONVENTIONS = [
@@ -68,7 +67,8 @@ CONVENTIONS = [
     "A tool result's own name names its frames; tml-renderers names an unnamed result after the most recent "
     "preceding call with its tool_call_id.",
     "Flare orders a batch of tool results by the order of their calls.",
-    "A failed tool result renders the text part 'Tool execution failed:' before its content parts.",
+    "A failed tool result, marked by Chat or Messages is_error or by tml-renderers' OpenAI tool_error parts, "
+    "reaches tml-renderers as tool_error parts and renders <|content_tool_error|> frames.",
     "A JSON-schema response format appends Flare's schema instruction to the first system message.",
     "Continuing the final assistant message renders it without its end-of-turn token and leaves its last frame open "
     "by removing that frame's <|end_message|>.",
@@ -217,6 +217,10 @@ equivalents.extend([
     {"name": "effort_max", "protocol": "messages", "body": {"max_tokens": 16, "messages": HELLO,
                                                           "thinking": {"type": "enabled", "budget_tokens": 30000}}},
     {"name": "default_effort", "protocol": "responses", "body": {"input": TEXT}},
+    {"name": "failed_result", "protocol": "messages", "body": {"max_tokens": 16, "messages": [
+        user("x"), {"role": "assistant", "content": [{"type": "tool_use", "id": "c", "name": "search", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c", "is_error": True,
+                                      "content": "timeout"}]}]}},
 ])
 for value, message in [(1.0, "reasoning_effort"), (-0.01, "reasoning_effort"), ("extreme", "reasoning_effort"),
                        (True, "reasoning_effort"), ("0.5", "reasoning_effort")]:
@@ -274,12 +278,15 @@ prompt("named_results", {"messages": [
     {"role": "tool", "tool_call_id": "b", "name": "search", "content": "same"},
     {"role": "tool", "tool_call_id": "zz", "name": "lookup", "content": "unmatched"},
     {"role": "tool", "name": "clock", "content": "no id"}]})
+failed_call = {"role": "assistant", "content": None, "tool_calls": [call("c", "search", "{}")]}
 prompt("failed_result", {"messages": [
-    user("x"), {"role": "assistant", "content": None, "tool_calls": [call("c", "search", "{}")]},
-    {"role": "tool", "tool_call_id": "c", "is_error": True, "content": "timeout"}]},
-    messages=[user("x"), {"role": "assistant", "content": None, "tool_calls": [call("c", "search", "{}")]},
-              {"role": "tool", "tool_call_id": "c", "content": [{"type": "text", "text": TOOL_FAILURE},
-                                                                 {"type": "text", "text": "timeout"}]}])
+    user("x"), failed_call, {"role": "tool", "tool_call_id": "c", "is_error": True, "content": "timeout"}]},
+    messages=[user("x"), failed_call,
+              {"role": "tool", "tool_call_id": "c", "content": [{"type": "tool_error", "text": "timeout"}]}])
+prompt("tool_error_parts", {"messages": [
+    user("x"), failed_call, {"role": "tool", "tool_call_id": "c", "content": [
+        {"type": "tool_error", "text": "timeout"}, {"type": "tool_error", "text": "retry <|end_message|>"}]},
+    user("Try again.")]})
 raw_arguments = ('{"z":{"y":1,"b":[{"d":1,"c":2}]},"a":"q\\"uote\\n é </x> \\u2028\\u001f\\/",'
                  '"f1":1.0,"f2":1e20,"f3":1.5e-7,"f4":0.00001,"f5":1E+16,"f6":-0.0,"big":12345678901234567890,'
                  '"dup":1,"dup":2,"sp" : [ 1 , 2.50 ]}')
@@ -346,6 +353,9 @@ errors.extend([
      "message": "continue"},
     {"name": "documents", "request": {"messages": HELLO, "documents": [{"title": "t", "text": "x"}]},
      "message": "documents"},
+    {"name": "mixed_tool_error_parts", "request": {"messages": [user("x"), {"role": "tool", "tool_call_id": "c",
+        "content": [{"type": "text", "text": "partial"}, {"type": "tool_error", "text": "failed"}]}]},
+     "message": "tool_error"},
     {"name": "array_arguments", "request": {"messages": [user("x"), {"role": "assistant", "content": None,
         "tool_calls": [call("c", "f", "[]")]}]}, "message": "object"},
 ])

@@ -224,10 +224,14 @@ fn content(parts: &[Part]) -> Result<Value> {
 }
 
 /// Converts semantic parts to the message context consumed by prepared templates.
+/// `failure_text` begins each failed tool result with a text part saying it
+/// failed, for prompt formats that have no tool-error syntax; every result keeps
+/// its `is_error` flag.
 pub fn template_messages(
     messages: &[Message],
     tool_choice: ToolChoice,
     hints: &[(usize, usize)],
+    failure_text: bool,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     let lower_instructions = messages
@@ -344,7 +348,7 @@ pub fn template_messages(
                 } => {
                     flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     let mut parts = parts.clone();
-                    if *is_error {
+                    if *is_error && failure_text {
                         parts.insert(0, Part::Text("Tool execution failed:".into()));
                     }
                     let mut result =
@@ -495,7 +499,7 @@ mod tool_result_order_tests {
     }
 
     fn lower(messages: &[Message]) -> Vec<Value> {
-        template_messages(messages, ToolChoice::Auto, &[]).unwrap()
+        template_messages(messages, ToolChoice::Auto, &[], true).unwrap()
     }
 
     #[test]
