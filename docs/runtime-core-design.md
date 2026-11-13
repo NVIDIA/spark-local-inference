@@ -662,6 +662,40 @@ the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and
 requires at least 8,192 cached tokens per active request.
 
+The number of physical allocation handles and device mappings is also a driver
+resource constraint. Linux UVM duplicates external mappings into a shared RM
+client whose automatic handle range is 524,288 entries (`RS_UNIQUE_HANDLE_RANGE`
+in NVIDIA drivers
+[580.105.08](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.105.08/src/nvidia/inc/libraries/resserv/rs_client.h)
+and [615.71.10](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.10/src/nvidia/generated/g_rs_client_nvoc.h)).
+Exhaustion returns `NV_ERR_INSUFFICIENT_RESOURCES`, which CUDA can expose as
+`CUDA_ERROR_OUT_OF_MEMORY` despite free framebuffer memory. Combining access
+calls alone does not remove the underlying allocation and mapping objects.
+
+The native cache layout reduces those objects without reducing KV pages or
+snapshot rows. It first permutes the backing-plane assignment of chunks with
+identical bytes per page, byte offset within the plane, and mapped length. Their
+row positions and logical page coverage stay the same. It then reorders whole chunks inside an
+uninterrupted interval of one snapshot row, merging adjacent spans of the same
+KV plane into one backing allocation and one alias mapping. Only complete chunks
+wholly contained in one row are reordered or merged; spans crossing row boundaries
+and partial mappings keep their row positions and lengths.
+
+These transformations preserve every plane's byte coverage, physical byte
+count, snapshot address and stride, and the exact set of KV pages conflicting
+with each snapshot. The scheduler consumes the same exclusion ranges. Reader
+permissions remain allocation-specific. The layout uses ordinary CUDA VMM
+allocations at the recorded core addresses and requires no core re-export,
+additional framebuffer reserve, allocation retry, or reduced cache capacity.
+
+Native startup and C1/C4 generation with 32K prefill are qualified for Kimi K3.1
+Pro TP16 cores using DCP8 and DCP16 on sixteen RTX PRO 6000 Blackwell GPUs with
+NVIDIA driver 615.71.10, with default memory sizing and explicit reserves of
+zero and 1 GiB. KV and snapshot capacities match the physical-memory plan in
+all six configurations. CPU layout tests compare every row's exact conflict
+set and complete byte coverage; GPU tests preserve snapshot bytes while released
+KV pages are overwritten. These checks do not constitute model-quality evaluation.
+
 Immutable snapshot capacity is bounded by borrowable KV backing and the prepared
 virtual extent. At load, CUDA virtual mappings expose the same allocation chunks
 through the page planes and the snapshot part of the continuation range. Small
@@ -807,33 +841,13 @@ peaks inside a driver call or establish a safe planning reserve. Remote KV bytes
 not charged as duplicated physical storage. A failed grant reports the exact
 mapping range and readers while retaining the CUDA status.
 
-Single-host startup retries a cache `cuMemCreate`, `cuMemMap`, or `cuMemSetAccess`
-out-of-memory failure with a smaller cache budget. No retry allowance is charged
-when the first allocation succeeds. Before retrying, every local context must
-synchronize, then every cache mapping and continuation alias must unmap
-successfully. Static allocations, virtual reservations, and graph executables
-remain loaded. Capacities are published only after every rank's allocation and
-access grants succeed; metadata retains its sizing declarations until then.
-
-The retry budget accounts for any reduction in observed free memory retained
-after cleanup, including driver state or other processes' memory activity. It
-also withholds a search margin for allocation and access demands not visible in
-before/after free-memory samples. The first reduction is one allocation granule
-per owned KV plane: 48 planes aligned to 2 MiB give a 96 MiB step per GPU. Steps
-double after each reduction; this is a bounded capacity search, not a measured
-driver minimum or a fixed allowance charged to every startup. A retry must reduce
-the common page count. Execution rows and the existing minimum KV capacity remain
-required; if no smaller valid capacity exists, startup returns the driver error.
-Logs report the resulting cache budget and additional driver allowance separately
-from any manual reserve. `--memory-limit=-0G` and the default memory limit use the
-same retry mechanism. Remote KV is never charged as duplicated physical backing.
-
-Cross-host startup retains its existing one-shot allocation agreement; retrying
-it requires a coordinated allocation outcome protocol. Other CUDA errors and
-cleanup failures abort startup rather than authorize reuse. Zero-manual-reserve
-allocation is qualified for TP16 cores with 8-rank and 16-rank peer-import
-groups; cleanup and retry are qualified with 16-rank groups. Other geometries
-require hardware validation.
+Cache backing and access grants are attempted once. Allocation and access errors
+abort startup with their original CUDA status; the loader does not reduce cache
+capacity and retry. Capacities are published only after all ranks have mapped
+and granted their cache. The fixed model and communication buffers are allocated
+before cache sizing. Access to the runtime-sized cache itself follows its
+physical mapping, so its mapping resources must fit alongside the chosen backing.
+CUDA free bytes do not describe every driver resource limit.
 
 Address reservations are established before allocation. Allocation, payload
 loading, kernel loading, and execution preparation each run concurrently across

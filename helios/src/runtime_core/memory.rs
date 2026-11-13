@@ -491,85 +491,7 @@ fn capacities(
     Ok((execution + cached, low, cached))
 }
 
-// One physical allocation granule per KV plane is a search step, not a claim
-// about CUDA's driver overhead. Doubling it bounds repeated failed attempts.
-fn cache_retry_step(core: &Core) -> Result<u64> {
-    core.allocations
-        .iter()
-        .filter(|a| a.sizing.as_ref().is_some_and(|s| s.capacity == 1))
-        .try_fold(0u64, |sum, a| {
-            sum.checked_add(a.alignment as u64)
-                .ok_or_else(|| invalid("cache retry granularity overflow"))
-        })
-}
-
-fn cache_allocation_oom(error: &crate::Error) -> bool {
-    matches!(error, crate::Error::Execution(crate::ExecutionError::Driver(driver))
-        if driver.code == 2 && (driver.operation == "cuMemCreate"
-            || driver.operation == "cuMemMap"
-            || driver.operation.starts_with("cuMemSetAccess ")))
-}
-
-fn reduce_cache_budget(
-    available: &mut [u64],
-    ceilings: &[u64],
-    minimum: &[u64],
-    steps: &mut [u64],
-) -> bool {
-    if available
-        .iter()
-        .zip(minimum)
-        .any(|(budget, minimum)| budget < minimum)
-        || ceilings
-            .iter()
-            .zip(minimum)
-            .any(|(ceiling, minimum)| ceiling < minimum)
-    {
-        return false;
-    }
-    let mut changed = false;
-    for (((budget, &ceiling), &minimum), step) in
-        available.iter_mut().zip(ceilings).zip(minimum).zip(steps)
-    {
-        let reduced = (*budget).min(ceiling).saturating_sub(*step).max(minimum);
-        changed |= reduced < *budget;
-        *budget = reduced;
-        *step = step.saturating_mul(2);
-    }
-    changed
-}
-
 impl NativeModel {
-    /// All local cache use must drain before any owner releases backing or aliases.
-    unsafe fn release_cache_attempt(&mut self, cores: &[Core]) -> Result<()> {
-        unsafe {
-            for rank in &self.ranks {
-                rank.driver
-                    .check("cuCtxSetCurrent", (rank.driver.context_set)(rank.context))?;
-                rank.driver
-                    .check("cuCtxSynchronize", (rank.driver.context_sync)())?;
-            }
-            for (rank, core) in self.ranks.iter_mut().zip(cores) {
-                rank.driver
-                    .check("cuCtxSetCurrent", (rank.driver.context_set)(rank.context))?;
-                for allocation in core.allocations.iter().filter(|a| a.sizing.is_some()) {
-                    let Some(storage) = rank.allocations.get_mut(&allocation.name) else {
-                        continue;
-                    };
-                    while let Some(&(address, bytes)) = storage.mappings.last() {
-                        rank.driver.check(
-                            "cuMemUnmap(cache retry)",
-                            (rank.driver.unmap)(address, bytes),
-                        )?;
-                        storage.mappings.pop();
-                    }
-                    storage.nbytes = 0;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
     pub(super) unsafe fn check_memory_limit(
         &self,
@@ -882,172 +804,80 @@ impl NativeModel {
                 *available = available.saturating_sub(charge);
             }
         }
-        let original_available = available.clone();
-        let retry_baseline = self
-            .ranks
+        let (local_rows, local_pages, _) = capacities(
+            cores,
+            &available,
+            active as u64,
+            width,
+            page_tokens,
+            ceiling,
+        )?;
+        // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
+        // the smallest capacity any rank can back fits every rank. Snapshot rows need no
+        // dedicated backing; the alias layout below rejects rows the agreed pages cannot back.
+        let (rows, pages) = agree.caches((local_rows, local_pages))?;
+        let virtual_pages = cores
             .iter()
-            .map(|rank| unsafe { rank.memory_snapshot() })
-            .collect::<Result<Vec<_>>>()?;
-        if !(1..=64).contains(&active) || width == 0 || page_tokens == 0 {
-            return Err(invalid("invalid cache planning geometry"));
-        }
-        let minimum_pages = ceiling
-            .map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| {
-                limit.minimum
-            });
-        let execution = (active as u64)
-            .checked_mul(width)
-            .and_then(|rows| rows.checked_add(1))
-            .filter(|&rows| rows < u32::MAX as u64)
-            .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?;
-        let minimum_bytes = cores
-            .iter()
-            .map(|core| {
-                bytes(core, 0, execution)?
-                    .checked_add(bytes(core, 1, minimum_pages)?)
-                    .ok_or_else(|| invalid("minimum cache footprint overflow"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut retry_steps = cores
-            .iter()
-            .map(cache_retry_step)
-            .collect::<Result<Vec<_>>>()?;
-        loop {
-            let (local_rows, local_pages, _) = capacities(
-                cores,
-                &available,
-                active as u64,
-                width,
-                page_tokens,
-                ceiling,
-            )?;
-            // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
-            // the smallest capacity any rank can back fits every rank. Snapshot rows need no
-            // dedicated backing; the alias layout below rejects rows the agreed pages cannot back.
-            let (rows, pages) = agree.caches((local_rows, local_pages))?;
-            let virtual_pages = cores
-                .iter()
-                .flat_map(|p| &p.allocations)
-                .filter_map(|a| a.sizing.as_ref().filter(|s| s.capacity == 1))
-                .map(|s| s.maximum)
-                .min()
-                .unwrap();
-            let limiting = if ceiling.is_some_and(|limit| pages == limit.maximum) {
-                options.kv_cache_limit.to_string()
-            } else if pages == virtual_pages {
-                "prepared extent".into()
+            .flat_map(|p| &p.allocations)
+            .filter_map(|a| a.sizing.as_ref().filter(|s| s.capacity == 1))
+            .map(|s| s.maximum)
+            .min()
+            .unwrap();
+        let limiting = if ceiling.is_some_and(|limit| pages == limit.maximum) {
+            options.kv_cache_limit.to_string()
+        } else if pages == virtual_pages {
+            "prepared extent".into()
+        } else {
+            "memory".into()
+        };
+        let gib = |values: &[u64]| {
+            let format = |n: u64| format!("{:.2}", n as f64 / (1u64 << 30) as f64);
+            let low = format(*values.iter().min().unwrap());
+            let high = format(*values.iter().max().unwrap());
+            if low == high {
+                low
             } else {
-                "memory".into()
-            };
-            let gib = |values: &[u64]| {
-                let format = |n: u64| format!("{:.2}", n as f64 / (1u64 << 30) as f64);
-                let low = format(*values.iter().min().unwrap());
-                let high = format(*values.iter().max().unwrap());
-                if low == high {
-                    low
-                } else {
-                    format!("{low}–{high}")
-                }
-            };
-            let mut summary = format!(
-                "per GPU: {} GiB loaded · {} GiB cache budget",
-                gib(&loaded_bytes),
-                gib(&available),
-            );
-            match options
-                .memory_limit
-                .unwrap_or(MemoryLimit::Reserve(reserve - HEADROOM_BYTES))
-            {
-                MemoryLimit::Reserve(0) => {}
-                MemoryLimit::Reserve(bytes) => {
-                    summary.push_str(&format!(" · reserve {}", MemoryLimit::Bytes(bytes)));
-                }
-                MemoryLimit::Bytes(bytes) => {
-                    summary.push_str(&format!(" · limit {}", MemoryLimit::Bytes(bytes)));
-                }
-                MemoryLimit::Fraction(fraction) => {
-                    summary.push_str(&format!(" · limit {}% of GPU memory", fraction * 100.0));
-                }
+                format!("{low}–{high}")
             }
-            match options.kv_cache_limit {
-                KvCacheLimit::Memory => {}
-                KvCacheLimit::Context => summary.push_str(" · KV capped at 1 context"),
-                KvCacheLimit::Concurrency => {
-                    summary.push_str(&format!(" · KV capped at {active} contexts"));
-                }
+        };
+        let mut summary = format!(
+            "per GPU: {} GiB loaded · {} GiB cache budget",
+            gib(&loaded_bytes),
+            gib(&available),
+        );
+        match options
+            .memory_limit
+            .unwrap_or(MemoryLimit::Reserve(reserve - HEADROOM_BYTES))
+        {
+            MemoryLimit::Reserve(0) => {}
+            MemoryLimit::Reserve(bytes) => {
+                summary.push_str(&format!(" · reserve {}", MemoryLimit::Bytes(bytes)));
             }
-            let allowance: Vec<_> = original_available
-                .iter()
-                .zip(&available)
-                .map(|(original, available)| original - available)
-                .collect();
-            if allowance.iter().any(|&bytes| bytes != 0) {
-                summary.push_str(&format!(
-                    " · cache driver allowance {} GiB",
-                    gib(&allowance)
-                ));
+            MemoryLimit::Bytes(bytes) => {
+                summary.push_str(&format!(" · limit {}", MemoryLimit::Bytes(bytes)));
             }
-            progress.phase("Plan cache", None).finish(summary);
-            if rows > local_rows || pages > local_pages || rows < execution {
-                return Err(invalid(
-                    "ranks agreed on a cache capacity this rank cannot back",
-                ));
+            MemoryLimit::Fraction(fraction) => {
+                summary.push_str(&format!(" · limit {}% of GPU memory", fraction * 100.0));
             }
-            match unsafe {
-                self.allocate_cache_capacity(
-                    cores, progress, &contract, rows, pages, execution, &limiting,
-                )
-            } {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    // Cross-host allocation needs coordinated retry agreement. Same-process
-                    // ranks have no replay or published cache state at this boundary.
-                    if self.cluster().is_some() || !cache_allocation_oom(&error) {
-                        return Err(error);
-                    }
-                    unsafe {
-                        self.release_cache_attempt(cores)?;
-                    }
-                    let ceilings = self
-                        .ranks
-                        .iter()
-                        .zip(&retry_baseline)
-                        .zip(&original_available)
-                        .map(|((rank, baseline), &budget)| {
-                            let free = unsafe { rank.memory_snapshot()? }.free;
-                            let share = if rank.integrated { integrated } else { 1 };
-                            Ok(budget
-                                .saturating_sub(baseline.free.saturating_sub(free).div_ceil(share)))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut reduced = false;
-                    while reduce_cache_budget(
-                        &mut available,
-                        &ceilings,
-                        &minimum_bytes,
-                        &mut retry_steps,
-                    ) {
-                        let (_, candidate, _) = capacities(
-                            cores,
-                            &available,
-                            active as u64,
-                            width,
-                            page_tokens,
-                            ceiling,
-                        )?;
-                        if candidate < pages {
-                            reduced = true;
-                            break;
-                        }
-                    }
-                    if !reduced {
-                        return Err(error);
-                    }
-                    progress
-                        .phase("Adjust cache driver budget", None)
-                        .finish(format!("retry with less KV backing after {error}"));
-                }
+        }
+        match options.kv_cache_limit {
+            KvCacheLimit::Memory => {}
+            KvCacheLimit::Context => summary.push_str(" · KV capped at 1 context"),
+            KvCacheLimit::Concurrency => {
+                summary.push_str(&format!(" · KV capped at {active} contexts"));
             }
+        }
+        progress.phase("Plan cache", None).finish(summary);
+        let execution = 1 + active as u64 * width;
+        if rows > local_rows || pages > local_pages || rows < execution {
+            return Err(invalid(
+                "ranks agreed on a cache capacity this rank cannot back",
+            ));
+        }
+        unsafe {
+            self.allocate_cache_capacity(
+                cores, progress, &contract, rows, pages, execution, &limiting,
+            )
         }
     }
 
@@ -1636,159 +1466,6 @@ mod tests {
             }),
         });
         assert!(cache_geometry(&options, 64, 8, 16).is_err());
-    }
-
-    #[test]
-    fn zero_manual_reserve_retries_budget_local_cache_and_driver_room() {
-        // Synthetic TP16 geometry: 24 shared latent planes and 24 local indexer
-        // planes. Each latent plane occupies 79 two-MiB granules at 2240 pages.
-        let make_core = |readers: usize| {
-            let mut p = core(1 << 20, 72 << 10, 4096);
-            p.allocations.truncate(1);
-            for plane in 0..48 {
-                let mut allocation =
-                    core(1 << 20, if plane < 24 { 72 << 10 } else { 16 << 10 }, 4096)
-                        .allocations
-                        .pop()
-                        .unwrap();
-                allocation.name = format!("page-plane-{plane}");
-                allocation.address = Some(0x300000000000 + plane * (1 << 30));
-                p.allocations.push(allocation);
-            }
-            for allocation in &mut p.allocations {
-                allocation.alignment = 2 << 20;
-            }
-            for peer in 1..readers {
-                let mut allocation = core(1, 1, 4096).allocations.pop().unwrap();
-                allocation.name = format!("peer-{peer}");
-                allocation.memory = Memory::Peer;
-                allocation.sizing = None;
-                allocation.nbytes = 16 << 30;
-                p.allocations.push(allocation);
-            }
-            p
-        };
-        for readers in [8, 16] {
-            let cores: Vec<_> = (0..16).map(|_| make_core(readers)).collect();
-            let physical = bytes(&cores[0], 0, 2).unwrap() + bytes(&cores[0], 1, 2240).unwrap();
-            let memory = MemorySnapshot {
-                free: physical + HEADROOM_BYTES + (14 << 20),
-                total: 96 << 30,
-            };
-            for limit in [None, Some(MemoryLimit::Reserve(0))] {
-                let budget = limited_budget(memory, 0, limit, HEADROOM_BYTES, false, 0).unwrap();
-                let mut available = vec![budget; 16];
-                let initial = capacities(&cores, &available, 1, 1, 128, None).unwrap();
-                assert_eq!(
-                    bytes(&cores[0], 1, initial.1).unwrap(),
-                    bytes(&cores[0], 1, 2240).unwrap()
-                );
-                // No importer framebuffer copies or retry allowance are charged on success.
-                assert_eq!(budget, physical + (14 << 20));
-                let mut steps: Vec<_> =
-                    cores.iter().map(|p| cache_retry_step(p).unwrap()).collect();
-                assert_eq!(steps, vec![96 << 20; 16]);
-                let minimum: Vec<_> = cores
-                    .iter()
-                    .map(|p| bytes(p, 0, 2).unwrap() + bytes(p, 1, 64).unwrap())
-                    .collect();
-                assert!(reduce_cache_budget(
-                    &mut available,
-                    &vec![budget; 16],
-                    &minimum,
-                    &mut steps
-                ));
-                let reduced = capacities(&cores, &available, 1, 1, 128, None).unwrap();
-                assert!(reduced.1 < initial.1 && reduced.1 >= 64);
-                assert!(reduced.0 <= initial.0);
-                assert_eq!(budget - available[0], 96 << 20);
-                assert!(reduce_cache_budget(
-                    &mut available,
-                    &vec![budget; 16],
-                    &minimum,
-                    &mut steps
-                ));
-                assert_eq!(budget - available[0], 288 << 20);
-                assert!(capacities(&cores, &available, 1, 1, 128, None).unwrap().1 < reduced.1);
-            }
-        }
-    }
-
-    #[test]
-    fn cache_retry_accounts_for_retained_driver_memory_and_stops_at_minimum() {
-        let mut budget = [1000, 1000];
-        let minimum = [100, 200];
-        let mut steps = [100, 100];
-        // The first GPU retains 400 bytes after cleanup; the next attempt also
-        // leaves a 100-byte search margin. Retained bytes are not charged twice.
-        assert!(reduce_cache_budget(
-            &mut budget,
-            &[600, 1000],
-            &minimum,
-            &mut steps
-        ));
-        assert_eq!(budget, [500, 900]);
-        assert!(reduce_cache_budget(
-            &mut budget,
-            &[600, 1000],
-            &minimum,
-            &mut steps
-        ));
-        assert_eq!(budget, [300, 700]);
-        for _ in 0..3 {
-            reduce_cache_budget(&mut budget, &[600, 1000], &minimum, &mut steps);
-        }
-        assert_eq!(budget, minimum);
-        assert!(!reduce_cache_budget(
-            &mut budget,
-            &[600, 1000],
-            &minimum,
-            &mut steps
-        ));
-        let before = budget;
-        assert!(!reduce_cache_budget(
-            &mut budget,
-            &[99, 1000],
-            &minimum,
-            &mut steps
-        ));
-        assert_eq!(budget, before);
-        let mut steps = [u64::MAX; 2];
-        let mut budget = [u64::MAX; 2];
-        assert!(reduce_cache_budget(
-            &mut budget,
-            &[u64::MAX; 2],
-            &minimum,
-            &mut steps
-        ));
-        assert_eq!(budget, minimum);
-    }
-
-    #[test]
-    fn cache_retry_only_accepts_allocation_driver_out_of_memory() {
-        let error = |operation: &str, code| {
-            crate::ExecutionError::Driver(crate::error::CudaError {
-                operation: operation.into(),
-                code,
-                name: "test status".into(),
-                description: "test status".into(),
-            })
-            .into()
-        };
-        for operation in ["cuMemCreate", "cuMemMap", "cuMemSetAccess owner_rank=15"] {
-            assert!(cache_allocation_oom(&error(operation, 2)));
-            assert!(!cache_allocation_oom(&error(operation, 700)));
-        }
-        for operation in [
-            "cuMemcpyHtoD_v2",
-            "cuCtxSynchronize",
-            "cuMemUnmap(cache retry)",
-        ] {
-            assert!(!cache_allocation_oom(&error(operation, 2)));
-        }
-        assert!(!cache_allocation_oom(&invalid(
-            "allocation metadata is inconsistent"
-        )));
     }
 
     #[test]
