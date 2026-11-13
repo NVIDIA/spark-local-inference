@@ -103,8 +103,10 @@ def _publisher(configuration, args, model=None, hub_cache=None):
         return signer
     from ignition.preparation.model_card import model_license
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.trellismx_release import trellismx_assets_root
     try:
-        metadata = inspect_indexed_checkpoint(model.snapshot(hub_cache)).metadata_path
+        # A TrellisMX release overlays a carrier: its index and model card live under carrier/.
+        metadata = inspect_indexed_checkpoint(trellismx_assets_root(model.snapshot(hub_cache))).metadata_path
         license = model_license(metadata,
                                 None if model.directory is not None else model.checkpoint.repository,
                                 model.checkpoint.revision)

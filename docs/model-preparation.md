@@ -547,6 +547,25 @@ captured capacities from 64 through 32,768 patches. Each feature slot holds an
 advance. `--image-concurrency` defaults to the smaller of four and text
 concurrency. `--language-model-only` omits image weights and graphs.
 
+The `glm-5.3-flash-trellismx` alias selects `brandonmusic/glm-5.3-flash-tr3-fp8`,
+a TrellisMX release quantized from `zai-org/GLM-5.3-Flash-BF16`. It overlays
+per-layer, per-rank routed-expert sidecars on a `carrier/` directory that holds
+every other tensor as stored, BF16 projections and head included. The sidecars
+partition the experts for TP4, so only four GPUs can load it.
+Preparation reads each sidecar once, checks its size and SHA-256 against the
+release manifest, and builds its tensors from those bytes. Its routed experts
+run on b12x's in-tree P8 runtime, which preparation builds with b12x's declared
+GLM-5.3 Flash serving configuration (the runtime reads no environment variables)
+and attaches under b12x's in-tree backend declaration. The launch geometry is a
+prepared choice: each capacity's plan races the launch configurations b12x
+compiles and fixes the winner before capture, and the plan declares the arena
+every P8 call carves its buffers out of. Qualify a release with every GPU and
+release test run, none skipped:
+
+```sh
+CUDA_VISIBLE_DEVICES=<assigned GPU> .venv/bin/python scripts/qualify_glm53_trellismx.py --release <release root>
+```
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek-v4.1-flash` alias selects `deepseek-ai/DeepSeek-V4.1-Flash-1017`

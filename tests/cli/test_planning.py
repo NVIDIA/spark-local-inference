@@ -308,7 +308,7 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
 
 @pytest.mark.parametrize("model,world_size,packed", [
     pytest.param(ResolvedModel(recipe, checkpoint),
-                 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+                 8 if recipe.name == "mimo_v2" else recipe.checkpoint_tensor_parallel(checkpoint)[0],
                  recipe.speculation.packed_verification, id=checkpoint.alias)
     for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
 ])

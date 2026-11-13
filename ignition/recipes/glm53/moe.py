@@ -50,6 +50,13 @@ class PreparedGlmMoe:
         if (weights.experts.num_experts != 288 or weights.experts.hidden_size != 4096
                 or weights.experts.intermediate_size not in (512, 1024, 2048)):
             raise ValueError("GLM MoE requires all 288 experts with a TP1/TP2/TP4 intermediate partition")
+        if weights.trellismx_release is not None and (
+                weights.experts_a4_prefill
+                or weights.experts.intermediate_size != scratch.shared.intermediate.shape[1]):
+            # A TrellisMX sidecar is one rank's contiguous slice of the checkpoint-global
+            # intermediate axis, so it must cover this rank's whole routed slice in BF16.
+            raise ValueError("GLM TrellisMX experts must cover this rank's intermediate slice with BF16"
+                             " activations")
         if source.dtype != torch.bfloat16 or source.shape != scratch.output.shape or source.shape[1] != 4096:
             raise ValueError("GLM MoE input must match BF16 [tokens,4096] scratch")
         self.source, self.scratch, self.output = source, scratch, scratch.output
