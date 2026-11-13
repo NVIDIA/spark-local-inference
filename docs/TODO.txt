@@ -1,3 +1,16 @@
+[ ] Qualify DeepSeek V4.1 row-sharded prefill attention with compiled TP
+    execution and exported-core native replay. Compare against the partitioned
+    path with bounds justified by operator precision and measured reduction
+    repeatability, including sqrtsoftplus routing and native tie ordering.
+    Cover full and partial chunks, 768/1280/1792-row shard tails, the unbounded
+    mHC calls V4.1 prepares, full/sharded row transitions, gathered cache writes,
+    inactive-state preservation, prefix continuation, and decode/speculative
+    transitions. Check export/reload, previous-core serving, shared-pool graph
+    transitions and repeated native replay with disposable scratch zeroed.
+    Measure complete-catalog retained memory, physical backing, KV capacity,
+    allocation stability and complete GPU steps across all ranks; establish
+    service performance through flare run before claiming an improvement.
+
 [ ] Ensure Rust bridge updates relink the WinUI executable during incremental
     builds. MSBuild can retain flare-winui.exe after the bridge library changes;
     verify loose and single-file outputs without requiring /t:Rebuild.
@@ -461,3 +474,12 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
+
+[ ] Qualify row-sharded prefill at three ranks. The DeepSeek V4.1 recipe's
+    4,096-row chunk has no per-rank block at three ranks, though a 6,144-row
+    chunk would. Close when an export and native serve with --row-shard-prefill
+    complete at three ranks.
+
+[ ] Qualify row-sharded prefill on SM103, where its projections and experts run
+    a different kernel path from SM121. Close when an export and native serve
+    with --row-shard-prefill complete on SM103.

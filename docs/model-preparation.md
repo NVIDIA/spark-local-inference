@@ -599,6 +599,45 @@ seams determine the measured contexts. The option defaults to off and requires
 MXFP8 query normalization on the selected GPUs and `--autotune-effort default`
 or `audit`. It adds preparation time without changing the serving graph catalog.
 
+`ignition export deepseek-v4.1-flash --row-shard-prefill --row-shard-attention`
+computes prefill attention on the row shard the reduced prefill already leaves on
+each rank. A layer that a prepared prefill runs on the shard loads all 64
+attention heads and all 8 output groups of its query and output projections
+beside its own 16 heads and 2 groups, which decode, the 128-row suffix layers,
+and every layer no prefill shards keep reading. The packed prefill stops at the
+decoder boundary, so 17 of the 40 backbone layers replicate, which adds 2.06 GB
+of resident weights per rank: 1.54 GB of material no rank held before and 0.51 GB
+a second copy of the partition decode reads. Scored prefill replays no suffix and
+reaches every layer below the last, so `--prompt-logprobs` raises the totals to
+37 of the 40 layers and 4.48 GB, 3.36 GB of it new material and 1.12 GB of second
+copy. A draft-only plan builds no prefill graph without the draft, and those
+graphs are what keep a draft target layer on full rows, so the scored plan under
+`--mtp-only` replicates 35 layers and 4.24 GB. The plan's per-rank weight
+estimate charges the same layers, so the page budget it sizes leaves room for
+them instead of spending it on KV pages. Each rank gathers the 512-wide KV latent
+plus the two compressed-latent projection inputs before the full-row window,
+index, and compressed-latent cache writes. This preserves the intended cache
+coverage; numerical and complete-state equivalence are not qualified. The
+attention output of a rank's own query rows is complete once
+the grouped output projection has summed all eight groups, so no attention
+reduction runs at all. That sum happens in one kernel here, where the
+partitioned path sums four rank partials through an FP32 all-reduce, so prefill
+logits are expected to agree with the all-reduce path to BF16 rounding rather
+than exactly; this is unmeasured. The option requires `--row-shard-prefill`, is
+recorded in the plan and the core's rebuild metadata, and changes prepared weight
+layouts, so changing it requires a fresh export and `--reuse-weights` requires
+matching layouts; `--prompt-logprobs` and `--mtp-only` select the replicated
+layers too and carry the same requirements. A prefill capacity whose shard rows
+or gathers do not fit keeps the partitioned attention path for that graph and
+prints one preparation line naming the capacity. The replicated weights load for
+the layers a prefill kind reaches, not for the capacities that shard, so a
+capacity that keeps the partitioned path leaves them resident; disabling the
+option and re-exporting is the only way to recover that memory. Row-sharded
+attention is implemented but unqualified for compiled multi-rank prefill and
+exported-core serving on all GPU and TP configurations, including SM121 TP4.
+CPU wiring tests and isolated projection tests do not establish full-model
+numerical, cache-state, memory, or service-performance equivalence.
+
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
 For each power-of-two request bucket `B`, the catalog retains capacities

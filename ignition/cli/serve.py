@@ -199,7 +199,8 @@ def _export_hosts(args):
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                         mla_compute_mode=args.mla_compute_mode)
+                         mla_compute_mode=args.mla_compute_mode,
+                         row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
@@ -275,6 +276,7 @@ def _prepare(args):
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+                      row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -461,7 +463,8 @@ def debug_serve(args) -> int:
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
-                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
+                         row_shard_prefill=args.row_shard_prefill, row_shard_attention=args.row_shard_attention)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),

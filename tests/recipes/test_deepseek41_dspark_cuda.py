@@ -133,6 +133,7 @@ def test_ratio_two_pending_state_selects_the_last_accepted_target_token(compiled
     operator.pool, operator.metadata, operator.layer, operator.ratio = pool, metadata, 2, 2
     operator.values = torch.arange(12 * 512, dtype=torch.float32, device="cuda:0").view(12, 512)
     operator.gates = -operator.values
+    operator.total = operator.values.shape[0]
     counts = torch.tensor([2, 2, 0], dtype=torch.int32, device="cuda:0")
     for name in ("pending_values", "pending_gates", "pending_position"):
         pool.region("layer2." + name).fill_(42)

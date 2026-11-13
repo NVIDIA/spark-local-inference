@@ -229,6 +229,14 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--joint-tuning", action="store_true",
                           help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
                                " prefill, decode, and speculative shapes (default: off)")
+    advanced.add_argument("--row-shard-prefill", action="store_true",
+                          help="reduce DeepSeek V4.1 prefill into one contiguous row shard per rank, run the"
+                               " hyperconnection on that shard, and gather the branch input every row reads"
+                               " (default: tensor-parallel all-reduce)")
+    advanced.add_argument("--row-shard-attention", action="store_true",
+                          help="also run DeepSeek V4.1 prefill attention on that row shard, replicating every"
+                               " head and output group on every rank and gathering the KV latent instead of"
+                               " the attention output; requires --row-shard-prefill (default: off)")
     advanced.add_argument("--lock-gpu-clocks", action="store_true",
                           help="lock each tuning GPU to its maximum supported graphics clock during"
                                " autotuning; requires root or noninteractive sudo for nvidia-smi")
