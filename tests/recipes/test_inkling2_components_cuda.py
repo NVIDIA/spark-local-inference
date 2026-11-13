@@ -464,3 +464,241 @@ def test_prepared_experts_match_the_canonical_four_rank_experts(checkpoint, acti
         graph.replay()
         torch.cuda.synchronize(device)
         assert torch.equal(captured[0], output)
+
+
+def residual_bound(sources, queries, eps, mixtures, normalized, norm_weight):
+    """Bound of |prepared normalized mixture - canonical| for FP32 scores and mixtures over `sources`.
+
+    The FP32 dot products over `D` channels move each score by at most
+    `inv D 2^-24 sum |x q| + |score| (D 2^-24 + 2^-22)` (the last term covers
+    the FP32 sum of squares and rsqrt), each probability by twice the largest
+    score error, and the mixture by those probabilities plus the FP32 sum over
+    sources. The RMS normalization of a row moves by the row's relative error,
+    and both sides round once to BF16.
+    """
+    from tests.recipes.inkling2_bounds import FP32
+
+    values = torch.stack([source.double() for source in sources])
+    count, _, hidden = values.shape
+    relative = hidden * FP32 + 2.0 ** -22
+    inverse = torch.rsqrt(values.square().mean(-1) + eps)
+    bounds = []
+    for query, mixture, output in zip(queries.double().reshape(-1, hidden), mixtures, normalized, strict=True):
+        scaled = query * hidden ** -0.5
+        scores = (values @ scaled) * inverse
+        score_error = inverse * hidden * FP32 * (values.abs() @ scaled.abs()) + scores.abs() * relative
+        p = torch.softmax(scores, 0)
+        moved = 2 * score_error.amax(0)
+        weights = p * inverse
+        magnitude = torch.einsum("nt,ntd->td", weights, values.abs())
+        error = magnitude * (moved[:, None] + relative + count * FP32)
+        m = mixture.double()
+        rs = torch.rsqrt(m.square().mean(-1, keepdim=True) + eps)
+        row = error.norm(dim=-1, keepdim=True) / (m.norm(dim=-1, keepdim=True) - error.norm(dim=-1, keepdim=True)).clamp_min(1e-30)
+        weight = norm_weight.double().abs()
+        bounds.append(weight * rs * (error + m.abs() * row) + output.double().abs() * relative
+                      + 2 * _spacing(output.double().abs() + weight * rs * (error + m.abs() * row)))
+    return bounds
+
+
+@pytest.mark.parametrize("layer", LAYERS)
+@torch.no_grad()
+def test_residual_mixtures_and_norms_match_the_canonical_streams(checkpoint, activations, layer):
+    """Attention and MLP inputs from the layer's real residual state, compiled and captured."""
+    from ignition.preparation.compilation import compile_forward
+    from ignition.recipes.inkling2.arithmetic import residual_mix, rms_norm
+    from ignition.recipes.inkling2.layer import scaled_query
+    from ignition.reference import inkling2 as ref
+
+    text = checkpoint.config.text
+    placed = load_rank(checkpoint, layer, 0, experts=False)
+    weights = reference_weights(placed)
+    entry = activations[layer]
+    blocks, partial, attention = list(entry["blocks"]), entry["partial"], entry["attention_output"]
+    state = ref.ResidualState(tuple(blocks), partial)
+    expected_streams = ref.normalized_streams(weights, text, state)
+    expected_mlp = entry["mlp_input"]
+    norms = (weights.attention_norm,) if weights.local else (weights.query_norm, weights.key_norm, weights.value_norm)
+    mlp_query = scaled_query(weights.mlp_query, text.hidden)
+    attention_query = None if not layer else scaled_query(weights.attention_query, text.hidden)
+
+    def forward():
+        if layer:
+            streams = residual_mix((*blocks, partial), attention_query)
+        else:
+            streams = (partial,) * len(norms)
+        normalized = tuple(rms_norm(stream, norm, text.eps) for stream, norm in zip(streams, norms, strict=True))
+        if layer % text.residual_block == 0:
+            mixed = residual_mix((*blocks, partial, attention), mlp_query)[0]
+        else:
+            mixed = residual_mix((*blocks, partial), mlp_query, addend=attention)[0]
+        return (*normalized, rms_norm(mixed, weights.mlp_norm, text.eps))
+
+    compiled = compile_forward(forward)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = compiled()
+    graph.replay()
+    torch.cuda.synchronize()
+    if layer:
+        mixtures = ref.residual_mix((*blocks, partial), weights.attention_query)
+        limits = residual_bound((*blocks, partial), weights.attention_query, 1e-6, mixtures, expected_streams,
+                                norms[0]) if len(norms) == 1 else [
+            residual_bound((*blocks, partial), weights.attention_query[index], 1e-6, (mixtures[index],),
+                           (expected_streams[index],), norms[index])[0] for index in range(len(norms))]
+    else:
+        limits = [2 * _spacing(stream.double().abs()) + stream.double().abs() * 2.0 ** -20 for stream in expected_streams]
+    for index, (value, expected, limit) in enumerate(zip(outputs[:-1], expected_streams, limits, strict=True)):
+        difference = report(f"layer {layer} attention input stream {index}", value, expected, limit)
+        assert bool((difference <= limit).all())
+    if layer % text.residual_block == 0:
+        sources = (*blocks, partial, attention)
+    else:
+        sources = (*blocks, partial.float() + attention.float())
+    mixture = ref.residual_mix(sources, weights.mlp_query)
+    limit = residual_bound(sources, weights.mlp_query, 1e-6, mixture, (expected_mlp,), weights.mlp_norm)[0]
+    difference = report(f"layer {layer} MLP input", outputs[-1], expected_mlp, limit)
+    assert bool((difference <= limit).all())
+
+
+@pytest.mark.parametrize("layer", (0, 5))
+@torch.no_grad()
+def test_output_convolutions_continue_across_chunks_rows_and_decode(checkpoint, activations, layer):
+    """The attention-output and MLP-output convolutions with per-row history equal one canonical pass.
+
+    Inputs are the layer's real attention and MLP outputs. Request A runs chunks of
+    1100 and 305 rows and three decode steps; request B forks A's row after the first
+    chunk and decodes from position 1100. Both sides convolve identical BF16 inputs.
+    """
+    from ignition.components.paged_batch import Metadata
+    from ignition.preparation.compilation import compile_forward
+    from ignition.recipes.inkling2.arithmetic import commit_history, short_convolution
+    from ignition.recipes.inkling2.pool import ContinuationPool, RankGeometry
+    from ignition.reference import inkling2 as ref
+    from tests.recipes.inkling2_bounds import FP32
+
+    device = checkpoint.device
+    text = checkpoint.config.text
+    placed = load_rank(checkpoint, layer, 0, experts=False)
+    entry = activations[layer]
+    inputs = {"attention_convolution": entry["attention_output"], "mlp_convolution": entry["mlp_input"]}
+    pool = ContinuationPool.allocate(text, RankGeometry.of(text, 4), 4, 4, device)
+    pool.backing.zero_()
+    histories = {kind: pool.history(layer, kind) for kind in inputs}
+    shapes = {"prefill": (1152, 1), "decode": (3, 3)}
+    metadata = {mode: Metadata.allocate(rows, requests, 12, device) for mode, (rows, requests) in shapes.items()}
+    sources = {mode: {kind: torch.zeros(rows, text.hidden, dtype=torch.bfloat16, device=device) for kind in inputs}
+               for mode, (rows, _) in shapes.items()}
+    graphs, outputs = {}, {}
+    for mode, m in metadata.items():
+        def forward(mode=mode, m=m):
+            results = []
+            for kind, history in histories.items():
+                x = sources[mode][kind]
+                results.append(short_convolution(x, placed[kind], history, m))
+                commit_history(history, x, m)
+            return tuple(results)
+
+        compiled = compile_forward(forward)
+        pool.backing.zero_()
+        graphs[mode] = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graphs[mode]):
+            outputs[mode] = compiled()
+    pool.backing.zero_()
+    tokens = entry["mlp_input"].shape[0]
+    results = {kind: torch.zeros(tokens, text.hidden, dtype=torch.bfloat16, device=device) for kind in inputs}
+    table = torch.zeros(1, 12, dtype=torch.int32, device=device)
+    for start, length in ((0, 1100), (1100, 305)):
+        for kind, value in inputs.items():
+            sources["prefill"][kind].zero_()
+            sources["prefill"][kind][:length].copy_(value[start:start + length])
+        metadata["prefill"].set(torch.tensor([start], device=device),
+                                torch.tensor([length], dtype=torch.int32, device=device),
+                                torch.tensor([1], device=device), table,
+                                torch.zeros(1, 1152, dtype=torch.int64, device=device), torch.tensor([1], device=device))
+        graphs["prefill"].replay()
+        for index, kind in enumerate(inputs):
+            results[kind][start:start + length] = outputs["prefill"][index][:length]
+            assert not outputs["prefill"][index][length:].count_nonzero()
+        if start == 0:
+            pool.backing[2].copy_(pool.backing[1])
+    decoded = {kind: {} for kind in inputs}
+    for step in range(3):
+        positions = (1405 + step, 1100 + step, 0)
+        for kind, value in inputs.items():
+            for row, position in enumerate(positions):
+                sources["decode"][kind][row] = value[position] if row < 2 else 0
+        metadata["decode"].set(torch.tensor(positions, device=device),
+                               torch.tensor([1, 1, 0], dtype=torch.int32, device=device),
+                               torch.tensor([1, 2, 0], device=device), table.expand(3, -1).contiguous(),
+                               torch.zeros(3, 1, dtype=torch.int64, device=device), torch.tensor([2], device=device))
+        graphs["decode"].replay()
+        for index, kind in enumerate(inputs):
+            for row in range(2):
+                decoded[kind][positions[row]] = outputs["decode"][index][row].clone()
+            assert not outputs["decode"][index][2].count_nonzero()
+    torch.cuda.synchronize()
+    for kind, value in inputs.items():
+        weight = placed[kind]
+        expected, _ = ref.short_convolution(value, weight)
+        width = weight.shape[-1]
+        magnitude = ref.short_convolution(value.double().abs(), weight.double().abs())[0]
+        limit = 2 * _spacing(expected.double().abs()) + 2 * width * FP32 * magnitude
+        sequence = results[kind][:1405]
+        difference = report(f"layer {layer} {kind} over chunks", sequence, expected[:1405], limit[:1405])
+        assert bool((difference <= limit[:1405]).all())
+        rows = sorted(decoded[kind])
+        actual = torch.stack([decoded[kind][row] for row in rows])
+        difference = report(f"layer {layer} {kind} decode", actual, expected[rows], limit[rows])
+        assert bool((difference <= limit[rows]).all())
+
+
+@torch.no_grad()
+def test_vocabulary_parallel_embedding_and_softcapped_logits(checkpoint, activations):
+    """Four rank shards: exact embedding sums and FP32 logits within accumulation error, softcap and mask."""
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.recipes.inkling2.arithmetic import rms_norm
+    from ignition.recipes.inkling2.vocabulary import PreparedLogits, embedding_rows
+    from ignition.reference import inkling2 as ref
+    from tests.recipes.inkling2_bounds import FP32
+
+    device = checkpoint.device
+    text = checkpoint.config.text
+    ids = activations["ids"]
+    shards = [checkpoint.global_weights(rank) for rank in range(4)]
+    rows = sum(embedding_rows(shard.embedding, ids, rank).float() for rank, shard in enumerate(shards))
+    whole = checkpoint.global_weights()
+    assert torch.equal(rows.to(torch.bfloat16), whole.embedding[ids])
+    embedded = rms_norm(rows.to(torch.bfloat16), shards[0].embedding_norm, text.eps)
+    assert torch.equal(embedded, ref.embed(ids, whole, text))
+    hidden = activations[5]["partial"]
+    tokens = hidden.shape[0]
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(device=device, checkpoint="inkling-2-small", workload_schema="inkling2-components-v1",
+                                    numerical_policy="default") as session:
+        session.register_scratch(arena)
+        heads = [PreparedLogits(shard.unembedding, text, rank, tokens=tokens, session=session, name=f"logits{rank}")
+                 for rank, shard in enumerate(shards)]
+        session.tune()
+        arena.release_preparation()
+        logits = torch.cat([head(hidden) for head in heads], -1)[:, :text.vocabulary]
+        # The last rank's shard holds the masked columns and the zero rows past the table.
+        compiled = compile_forward(lambda: heads[3](hidden))
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = compiled()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(captured, heads[3](hidden))
+    expected = ref.logits_ranks(hidden, shards, text)
+    assert torch.equal(torch.isinf(logits), torch.isinf(expected))
+    assert bool(torch.isinf(logits[:, text.valid_vocabulary:]).all())
+    valid = slice(0, text.valid_vocabulary)
+    magnitude = hidden.double().abs() @ whole.unembedding[valid].double().abs().t()
+    limit = 2 * text.hidden * FP32 * magnitude + 2.0 ** -22 * text.softcap
+    difference = report("softcapped logits", logits[:, valid], expected[:, valid], limit)
+    assert bool((difference <= limit).all())
+    agreement = (logits[:, valid].argmax(-1) == expected[:, valid].argmax(-1)).float().mean()
+    print(f"greedy token agreement over {tokens} rows: {float(agreement):.4f}")
