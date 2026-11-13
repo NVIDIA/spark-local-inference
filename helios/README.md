@@ -560,8 +560,9 @@ The TMLv0 encoder renders Thinking Machines' message frames: a role header, an
 optional author or tool name, one content-kind token, an ordinary-text body, and
 `<|end_message|>`. Control tokens come from token IDs and every body is encoded
 without the added vocabulary, so control-token spellings in conversation text
-stay ordinary text. Tool declarations come first, then leading system messages,
-then a system frame stating the thinking effort, then the conversation. Each
+stay ordinary text. The leading system messages come first, so a shared system
+prompt remains a reusable prefix when the tools differ, then the tool
+declaration, a system frame stating the thinking effort, and the conversation. Each
 assistant message ends with `<|content_model_end_sampling|>`; there is no
 generation header. Tool results take the name of the most recent preceding call
 with their ID. Endpoints follow the declaration, the effort frame, and every

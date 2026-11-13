@@ -394,22 +394,28 @@ pub(super) fn render(
         boundaries: Vec::new(),
         image_sources: Vec::new(),
     };
-    if !tools.is_empty() {
-        let body = declarations(tools)?;
-        prompt.frame(prompt.tokens.system, "tool_declare", prompt.tokens.xml, &body)?;
-        prompt.boundary();
-    }
+    let declaration = (!tools.is_empty()).then(|| declarations(tools)).transpose()?;
     let first_turn = messages
         .iter()
         .position(|m| m["role"] != "system")
         .unwrap_or(messages.len());
     let thinking = format!("Thinking effort level: {}", effort_text(effort));
+    // The leading system messages come first so that a shared system prompt stays a
+    // reusable prefix when the tools differ; SGLang and tinker-cookbook use this order.
+    let preamble = |prompt: &mut Prompt| -> Result<()> {
+        if let Some(body) = &declaration {
+            prompt.frame(prompt.tokens.system, "tool_declare", prompt.tokens.xml, body)?;
+            prompt.boundary();
+        }
+        prompt.frame(prompt.tokens.system, "", prompt.tokens.text, &thinking)?;
+        prompt.boundary();
+        Ok(())
+    };
     // Each tool result names the most recent preceding call with its ID.
     let mut calls: std::collections::HashMap<&str, &str> = Default::default();
     for (index, message) in messages.iter().enumerate() {
         if index == first_turn {
-            prompt.frame(prompt.tokens.system, "", prompt.tokens.text, &thinking)?;
-            prompt.boundary();
+            preamble(&mut prompt)?;
         }
         let role = message["role"]
             .as_str()
@@ -499,7 +505,7 @@ pub(super) fn render(
         prompt.boundary();
     }
     if first_turn == messages.len() {
-        prompt.frame(prompt.tokens.system, "", prompt.tokens.text, &thinking)?;
+        preamble(&mut prompt)?;
     }
     let length = prompt.token_ids.len();
     let mut boundaries = std::mem::take(&mut prompt.boundaries);

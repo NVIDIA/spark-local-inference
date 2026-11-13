@@ -54,6 +54,8 @@ REQUIRED_TOOL = ("You must call at least one of the provided tools in your next 
 CONVENTIONS = [
     "tml-renderers receives OpenAI Chat messages through chat.OpenAIMessage.from_openai_chat_dicts(messages, tools=tools) "
     "and renders with renderers.Inkling2().render_for_completion_with_effort(messages, effort).",
+    "The tool declaration that the OpenAI bridge emits first is moved after the leading system messages, the order "
+    "SGLang and tinker-cookbook use.",
     "Every prompt carries the effort message; an absent effort is 0.9. Named efforts map through the checkpoint "
     "chat template's table; enable_thinking=false, Responses reasoning.effort=none and Messages thinking.type=disabled "
     "select effort 0. tml-renderers has no named efforts, thinking switch or tool_choice.",
@@ -100,6 +102,20 @@ def flatten(spans):
 
 def render(messages, tools, effort, continuation=False):
     converted = chat.OpenAIMessage.from_openai_chat_dicts(copy.deepcopy(messages), tools=copy.deepcopy(tools) or None)
+    if tools:
+        # The OpenAI bridge puts the tool declaration first. Flare declares tools after
+        # the leading system messages, as SGLang PR #50186 does (render_inkling_messages
+        # in python/sglang/srt/parser/inkling_renderer.py at 237ba6b, lines 105-108) and
+        # as tinker-cookbook's TmlV0Renderer.create_conversation_prefix_with_tools does
+        # (tinker_cookbook/renderers/tml_renderers_adapter.py at 8486b8df, lines 268-284),
+        # so a shared system prompt stays a reusable prefix when the tools differ.
+        declaration = converted.pop(0)
+        if len(converted) != len(messages) or not any(
+                type(part).__name__ == "ToolDeclareJson" for part in declaration.content):
+            raise ValueError("expected the OpenAI bridge to emit one declaration before the messages")
+        leading = next((index for index, message in enumerate(messages) if message["role"] != "system"),
+                       len(messages))
+        converted.insert(leading, declaration)
     if not continuation:
         spans, _ = RENDERER.render_for_completion_with_effort(converted, effort)
         return flatten(spans)
@@ -218,6 +234,9 @@ prompt("multi_turn_reasoning", {"messages": [
 ]})
 prompt("tools_with_system", {"messages": [system("Use tools when needed."), user("Weather in Tokyo?")],
                              "tools": [WEATHER, SEARCH]})
+prompt("tools_after_systems", {"messages": [system("First."), system("Second."), user("Weather?"),
+                                           system("Mid-conversation rule."), user("And Paris?")], "tools": [WEATHER]})
+prompt("tools_with_systems_only", {"messages": [system("Only instructions.")], "tools": [WEATHER]})
 prompt("tool_without_parameters", {"messages": [user("time?")], "tools": [NOW]})
 prompt("tool_without_description", {"messages": [user("time?")],
                                     "tools": [tool("now", parameters={"type": "object", "properties": {}})]})
