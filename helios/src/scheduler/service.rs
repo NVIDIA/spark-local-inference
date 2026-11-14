@@ -283,24 +283,31 @@ impl RequestScheduler {
     pub(super) fn service_participants(&mut self) -> [Option<ServiceParticipant>; REQUEST_LANES] {
         let mut participants = [None; REQUEST_LANES];
         let mut count = 0;
-        for (slot, entry) in self.slots.iter().enumerate() {
-            let Some(request) = entry
-                .request
-                .as_ref()
-                .filter(|r| !matches!(r.phase, RequestPhase::Inbound | RequestPhase::Finishing))
-            else {
-                continue;
-            };
-            count += 1;
-            let (token_rate, delivery_rate) = self.service_rates(request);
-            participants[slot] = Some(ServiceParticipant {
-                handle: request.handle,
-                token_rate,
-                delivery_rate,
-            });
-        }
-        let references = self
-            .delivery_reference_intervals(&participants.map(|p| p.and_then(|p| p.delivery_rate)));
+        let references = {
+            // Scheduler state is unchanged until the prices below are written, so each
+            // request's checkpoint selection is computed once rather than once per
+            // prefill capacity that `service_rates` evaluates.
+            let _checkpoint_selections = self.checkpoint_planning_scope();
+            for (slot, entry) in self.slots.iter().enumerate() {
+                let Some(request) = entry
+                    .request
+                    .as_ref()
+                    .filter(|r| !matches!(r.phase, RequestPhase::Inbound | RequestPhase::Finishing))
+                else {
+                    continue;
+                };
+                count += 1;
+                let (token_rate, delivery_rate) = self.service_rates(request);
+                participants[slot] = Some(ServiceParticipant {
+                    handle: request.handle,
+                    token_rate,
+                    delivery_rate,
+                });
+            }
+            self.delivery_reference_intervals(
+                &participants.map(|p| p.and_then(|p| p.delivery_rate)),
+            )
+        };
         for (slot, participant) in participants
             .iter()
             .enumerate()

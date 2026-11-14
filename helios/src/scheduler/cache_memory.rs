@@ -75,63 +75,54 @@ fn select_snapshots(
         }
         return Some(selected.into_iter().collect());
     }
-    fn choose(
-        candidates: &[(SnapshotId, Vec<usize>)],
-        start: usize,
-        count: usize,
-        selected: &mut Vec<SnapshotId>,
-        excluded: &BTreeSet<usize>,
-        budget: usize,
-        best: &mut Option<(usize, Vec<SnapshotId>)>,
-    ) {
-        if excluded.len() > budget {
-            return;
+    // One or two snapshots: choose the set with the fewest newly excluded pages,
+    // breaking ties by snapshot IDs in lexicographic order. Each cost list is
+    // ascending and duplicate-free because it follows one page range, so union
+    // sizes are counted by merging the lists rather than building page sets.
+    let budget = available - keep_pages;
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (first, (_, first_pages)) in candidates.iter().enumerate() {
+        if first_pages.len() > budget || best.is_some_and(|(size, ..)| first_pages.len() >= size) {
+            continue;
         }
-        // Combinations visit snapshot IDs in lexicographic order.
-        if best.as_ref().is_some_and(|best| best.0 == 0) {
-            return;
-        }
-        if count == 0 {
-            let candidate = (excluded.len(), selected.clone());
-            if best.as_ref().is_none_or(|best| candidate < *best) {
-                *best = Some(candidate);
+        if count == 1 {
+            best = Some((first_pages.len(), first, first));
+        } else {
+            for (second, (_, second_pages)) in candidates.iter().enumerate().skip(first + 1) {
+                let size = union_size(first_pages, second_pages);
+                if size <= budget && best.is_none_or(|(best_size, ..)| size < best_size) {
+                    best = Some((size, first, second));
+                }
             }
-            return;
         }
-        if candidates.len().saturating_sub(start) < count {
-            return;
-        }
-        for index in start..=candidates.len() - count {
-            let (id, pages) = &candidates[index];
-            let mut union = excluded.clone();
-            union.extend(pages);
-            if best.as_ref().is_some_and(|best| union.len() > best.0) {
-                continue;
-            }
-            selected.push(*id);
-            choose(
-                candidates,
-                index + 1,
-                count - 1,
-                selected,
-                &union,
-                budget,
-                best,
-            );
-            selected.pop();
+        if best.is_some_and(|(size, ..)| size == 0) {
+            break;
         }
     }
-    let mut best = None;
-    choose(
-        &candidates,
-        0,
-        count,
-        &mut Vec::new(),
-        &BTreeSet::new(),
-        available - keep_pages,
-        &mut best,
-    );
-    best.map(|(_, selected)| selected)
+    best.map(|(_, first, second)| {
+        let mut selected = vec![candidates[first].0];
+        if count == 2 {
+            selected.push(candidates[second].0);
+        }
+        selected
+    })
+}
+
+/// Number of distinct pages in two ascending, duplicate-free page lists.
+fn union_size(a: &[usize], b: &[usize]) -> usize {
+    let (mut i, mut j, mut shared) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    a.len() + b.len() - shared
 }
 
 impl RequestScheduler {
@@ -435,6 +426,68 @@ mod tests {
         s.share_snapshot_pages(&[0..3, 2..3]).unwrap();
         assert_eq!(s.reserve_snapshot(1), Some(SnapshotId(1)));
         assert_eq!(s.free_page_count(), 3);
+    }
+
+    #[test]
+    fn snapshot_selection_matches_exhaustive_minimum_union_for_one_or_two_snapshots() {
+        fn exhaustive(
+            backing: &[bool], protected: &[u32], ranges: &[std::ops::Range<u32>],
+            candidates: &BTreeSet<SnapshotId>, keep_pages: usize, count: usize,
+        ) -> Option<Vec<SnapshotId>> {
+            let available = backing.iter().filter(|free| **free).count();
+            if available < keep_pages {
+                return None;
+            }
+            let usable: Vec<(SnapshotId, BTreeSet<usize>)> = candidates.iter().filter_map(|&id| {
+                let range = ranges.get(id.0 as usize).cloned().unwrap_or(0..0);
+                range.clone().all(|p| backing[p as usize] || protected[p as usize] != 0).then(|| {
+                    (id, range.map(|p| p as usize).filter(|&p| backing[p]).collect())
+                })
+            }).collect();
+            let mut sets: Vec<Vec<usize>> = (0..usable.len()).map(|i| vec![i]).collect();
+            if count == 2 {
+                sets = (0..usable.len())
+                    .flat_map(|i| (i + 1..usable.len()).map(move |j| vec![i, j]))
+                    .collect();
+            }
+            sets.into_iter()
+                .map(|set| {
+                    let union: BTreeSet<usize> =
+                        set.iter().flat_map(|&i| usable[i].1.iter().copied()).collect();
+                    (union.len(), set.iter().map(|&i| usable[i].0).collect::<Vec<_>>())
+                })
+                .filter(|(size, _)| *size <= available - keep_pages)
+                .min()
+                .map(|(_, ids)| ids)
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for _ in 0..2000 {
+            let pages = 1 + next(24) as usize;
+            let backing: Vec<bool> = (0..pages).map(|_| next(4) != 0).collect();
+            let protected: Vec<u32> = (0..pages).map(|_| u32::from(next(3) == 0)).collect();
+            let ranges: Vec<std::ops::Range<u32>> = (0..next(12))
+                .map(|_| {
+                    let start = next(pages as u64) as u32;
+                    start..start + next(pages as u64 - u64::from(start) + 1) as u32
+                })
+                .collect();
+            let candidates: BTreeSet<SnapshotId> =
+                (0..ranges.len() as u32 + 1).filter(|_| next(5) != 0).map(SnapshotId).collect();
+            let keep_pages = next(pages as u64 + 1) as usize;
+            for count in [1, 2] {
+                assert_eq!(
+                    select_snapshots(&backing, &protected, &ranges, &candidates, keep_pages, count),
+                    exhaustive(&backing, &protected, &ranges, &candidates, keep_pages, count),
+                    "ranges {ranges:?} backing {backing:?} protected {protected:?} keep {keep_pages} count {count}",
+                );
+            }
+        }
     }
 
     #[test]
