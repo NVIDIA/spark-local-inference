@@ -15,6 +15,7 @@ pub fn plan(
     records: &[Vec<u8>],
     ring: bool,
     chain: bool,
+    switch_only: bool,
 ) -> Result<Topology, Failure> {
     let ports = nodes
         .iter()
@@ -27,7 +28,7 @@ pub fn plan(
                 .map_err(Into::into)
         })
         .collect::<Result<Vec<_>, Failure>>()?;
-    Topology::plan_shape(records, &ports, ring, chain)
+    Topology::plan_shape(records, &ports, ring, chain, switch_only)
 }
 
 pub fn topology(grant: &Grant) -> Result<&Topology, Failure> {
@@ -83,15 +84,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let records = [
-            "a 10.10.4.1/24\nb 10.10.0.2/24\nc 10.10.5.1/24\nd 10.10.1.2/24\n",
-            "a 10.10.6.1/24\nb 10.10.4.2/24\nc 10.10.7.1/24\nd 10.10.5.2/24\n",
-            "a 10.10.2.2/24\nb 10.10.6.2/24\nc 10.10.3.2/24\nd 10.10.7.2/24\n",
-            "a 10.10.0.1/24\nb 10.10.2.1/24\nc 10.10.1.1/24\nd 10.10.3.1/24\n",
+            "a 10.10.4.1/24 -\nb 10.10.0.2/24 -\nc 10.10.5.1/24 -\nd 10.10.1.2/24 -\n",
+            "a 10.10.6.1/24 -\nb 10.10.4.2/24 -\nc 10.10.7.1/24 -\nd 10.10.5.2/24 -\n",
+            "a 10.10.2.2/24 -\nb 10.10.6.2/24 -\nc 10.10.3.2/24 -\nd 10.10.7.2/24 -\n",
+            "a 10.10.0.1/24 -\nb 10.10.2.1/24 -\nc 10.10.1.1/24 -\nd 10.10.3.1/24 -\n",
         ]
         .iter()
         .map(|s| s.as_bytes().to_vec())
         .collect::<Vec<_>>();
-        let ring = plan(&nodes, &records, true, false).unwrap();
+        let ring = plan(&nodes, &records, true, false, false).unwrap();
         for (rank, subnets) in [[4, 5], [6, 7], [2, 3], [0, 1]].into_iter().enumerate() {
             let edge = &ring.links[rank][(rank + 1) % 4];
             assert_eq!(edge.len(), 2);
@@ -102,7 +103,7 @@ mod tests {
             }
         }
         let mut broken = records.clone();
-        broken[2] = b"a 192.168.0.1/24\n".to_vec();
-        assert!(plan(&nodes, &broken, true, false).is_err());
+        broken[2] = b"a 192.168.0.1/24 -\n".to_vec();
+        assert!(plan(&nodes, &broken, true, false, false).is_err());
     }
 }

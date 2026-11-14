@@ -1978,7 +1978,7 @@ pub mod tests {
         )
         .unwrap();
         agent.executable = temp.path().join("installed-flare");
-        agent.fabric_endpoints = Some(b"loopback 127.0.0.1/8\n".to_vec());
+        agent.fabric_endpoints = Some(b"loopback 127.0.0.1/8 -\n".to_vec());
         fs::write(&agent.executable, "#!/bin/sh\necho \"$0\"\necho \"$@\"\n").unwrap();
         fs::set_permissions(&agent.executable, fs::Permissions::from_mode(0o755)).unwrap();
         let agent = Arc::new(agent);
@@ -3233,7 +3233,7 @@ pub mod tests {
                 rank_zero: vec![],
                 roce_ring: ring,
                 roce_chain: false,
-                transfer_fabric: Some(fabric::plan(&nodes, &records, ring, false).unwrap()),
+                transfer_fabric: Some(fabric::plan(&nodes, &records, ring, false, false).unwrap()),
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -3337,7 +3337,8 @@ pub mod tests {
             );
 
             // A dead next hop never falls back to the management address. Cache hits need no hop.
-            grant.transfer_fabric = Some(fabric::plan(&nodes, &records, ring, false).unwrap());
+            grant.transfer_fabric =
+                Some(fabric::plan(&nodes, &records, ring, false, false).unwrap());
             let closed = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = closed.local_addr().unwrap().port();
             drop(closed);

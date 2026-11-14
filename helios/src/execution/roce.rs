@@ -384,7 +384,9 @@ mod tests {
             traffic_class: 0,
             rails: 2,
             routes: vec![vec![], vec![(0, 0), (1, 1)], vec![], vec![(0, 0), (1, 1)]],
+            direct: vec![false; 4],
             shape: Shape::Ring,
+            links: super::super::roce_fabric::Links::All,
         };
         (region, spec, topology)
     }

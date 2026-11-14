@@ -226,6 +226,7 @@ pub fn root(
         &endpoints.iter().map(|e| e.port).collect::<Vec<_>>(),
         args.roce_ring,
         args.roce_chain,
+        args.serving.roce_switch_only,
     )?;
     let relay = Relay::start(0, streams, topology.clone(), network, source.port)?;
     for rank in 1..world {
@@ -383,11 +384,15 @@ pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, 
     if args.roce_chain && !plan.topology.chain {
         return Err("rank zero did not select --roce-chain".into());
     }
+    if args.serving.roce_switch_only && !plan.topology.switch_only {
+        return Err("rank zero did not select --roce-switch-only".into());
+    }
     if args.stage_only && !plan.stage_only {
         return Err("rank zero did not select --stage-only".into());
     }
     args.roce_ring = plan.topology.ring;
     args.roce_chain = plan.topology.chain;
+    args.serving.roce_switch_only = plan.topology.switch_only;
     args.stage_only = plan.stage_only;
     select_plan_tensor_parallel(args, plan.tensor_parallel)?;
     let relay = Relay::start(rank, plan.streams, plan.topology.clone(), network, 0)?;
@@ -1427,7 +1432,7 @@ mod tests {
                 .map(|s| s.local_addr().unwrap().port())
                 .collect::<Vec<_>>();
             let topology =
-                Topology::plan(&vec![b"a 127.0.0.1/8\n".to_vec(); world], &ports, ring).unwrap();
+                Topology::plan(&vec![b"a 127.0.0.1/8 -\n".to_vec(); world], &ports, ring).unwrap();
             let relays = network
                 .into_iter()
                 .enumerate()

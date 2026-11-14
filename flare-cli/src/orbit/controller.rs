@@ -1322,11 +1322,17 @@ impl Controller {
                     .request(frame::FABRIC, &json!({}))
                     .map_err(|e| at(&nodes[rank].name, e))
             }))?;
+            // Every rank receives the serving options; the transfer links follow the same choice.
+            let switch_only = options
+                .serving
+                .iter()
+                .any(|option| option == crate::cli::ROCE_SWITCH_ONLY);
             Some(super::fabric::plan(
                 nodes,
                 &records,
                 options.roce_ring,
                 options.roce_chain,
+                switch_only,
             )?)
         } else {
             None

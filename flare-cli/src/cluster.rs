@@ -6,8 +6,15 @@
 
 //! Ranks of one model on separate hosts: rendezvous at rank zero and connect their RoCE transport.
 
-pub use flare_helios::execution::roce_fabric::Shape;
+pub use flare_helios::execution::roce_fabric::{Links, Shape};
 use std::sync::Arc;
+
+/// How a rank's transport links to its peers: the shape, and which links may carry rails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Routing {
+    pub shape: Shape,
+    pub links: Links,
+}
 
 use flare_helios::{
     execution::{CollectiveHealth, RankStream},
@@ -66,7 +73,7 @@ fn open(
     owner: &NativeModel,
     fabric: &flare_helios::execution::roce_fabric::Fabric,
     endpoints: &[Vec<u8>],
-    shape: Shape,
+    routing: Routing,
 ) -> Result<RoceTransport, Failure> {
     use flare_helios::execution::roce_fabric;
 
@@ -77,7 +84,7 @@ fn open(
         .iter()
         .map(|bytes| roce_fabric::decode(bytes))
         .collect::<flare_helios::Result<Vec<_>>>()?;
-    let topology = fabric.topology(&endpoints, spec.rank, shape)?;
+    let topology = fabric.topology(&endpoints, spec.rank, routing.shape, routing.links)?;
     // SAFETY: The core restored the region at its recorded address; owner outlives the
     // transport, and no graph runs before every rank connected.
     Ok(unsafe { RoceTransport::open(spec, &topology)? })
@@ -85,29 +92,41 @@ fn open(
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn connected(transport: &RoceTransport) -> String {
+    let topology = transport.topology();
     format!(
-        "{} rails per {} over {}",
-        transport.topology().rails,
-        match transport.topology().shape {
+        "{} rails per {}{}: {}",
+        topology.rails,
+        match topology.shape {
             Shape::Mesh => "peer",
             Shape::Ring => "neighbor (experimental CPU relay ring)",
             Shape::Chain => "neighbor (experimental CPU relay chain)",
         },
-        transport.topology().hcas.join(",")
+        match topology.links {
+            Links::All => "",
+            Links::Shared => ", switch only",
+        },
+        topology.peer_routes().join("; ")
     )
 }
 
-/// The transport shape a rank was started with, as the ranks exchange it before planning routes.
+/// The transport shape a rank was started with and the links it may route over, as the ranks
+/// exchange them before planning routes: `mesh`, `ring` or `chain`, followed by ` switch-only`
+/// when direct cables are excluded.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
-fn shape_record(shape: Shape) -> Vec<u8> {
-    shape.name().as_bytes().to_vec()
+fn shape_record(routing: Routing) -> Vec<u8> {
+    let links = match routing.links {
+        Links::All => "",
+        Links::Shared => " switch-only",
+    };
+    format!("{}{links}", routing.shape.name()).into_bytes()
 }
 
-/// Every rank must select the same shape: a chain rank plans no route to the far end that a ring
-/// rank would wait for.
+/// Every rank must select the same shape and links: a chain rank plans no route to the far end
+/// that a ring rank would wait for, and a switch-only rank routes a cabled partner over the switch
+/// while the partner would wait on the cable.
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
-fn agree_shape(records: &[Vec<u8>], shape: Shape) -> Result<(), Failure> {
-    let local = shape_record(shape);
+fn agree_shape(records: &[Vec<u8>], routing: Routing) -> Result<(), Failure> {
+    let local = shape_record(routing);
     if let Some(rank) = records.iter().position(|record| *record != local) {
         return Err(format!(
             "rank {rank} selected RoCE transport shape {} where this rank selected {}",
@@ -165,7 +184,7 @@ pub fn rank_zero(
     owner: &NativeModel,
     streams: Vec<RankStream>,
     progress: &StartupProgress,
-    shape: Shape,
+    routing: Routing,
 ) -> Result<Joined<Vec<RankStream>>, Failure> {
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
@@ -175,11 +194,11 @@ pub fn rank_zero(
         let phase = progress.phase("Connect RoCE transport", None);
         // Every rank learns every rank's devices and the shape, then plans the same routes from them.
         let fabric = roce_fabric::discover()?;
-        let shapes = rendezvous::share_records(&mut streams, shape_record(shape))?;
-        agree_shape(&shapes, shape)?;
+        let shapes = rendezvous::share_records(&mut streams, shape_record(routing))?;
+        agree_shape(&shapes, routing)?;
         let endpoints =
             rendezvous::share_records(&mut streams, roce_fabric::encode(&fabric.endpoints))?;
-        let mut transport = open(owner, &fabric, &endpoints, shape)?;
+        let mut transport = open(owner, &fabric, &endpoints, routing)?;
         let records = rendezvous::share_records(&mut streams, transport.local_record()?)?;
         transport.connect(&records)?;
         rendezvous::await_connected(&mut streams)?;
@@ -197,7 +216,7 @@ pub fn rank_zero(
     }
     #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
     {
-        let _ = (owner, streams, progress, shape);
+        let _ = (owner, streams, progress, routing);
         Err(NO_TRANSPORT.into())
     }
 }
@@ -208,7 +227,7 @@ pub fn peer(
     cluster: &ClusterRank,
     stream: RankStream,
     progress: &StartupProgress,
-    shape: Shape,
+    routing: Routing,
 ) -> Result<Joined<RankStream>, Failure> {
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
@@ -217,14 +236,15 @@ pub fn peer(
 
         let phase = progress.phase("Connect RoCE transport", None);
         let fabric = roce_fabric::discover()?;
-        let shapes = rendezvous::exchange_record(&mut stream, &shape_record(shape), cluster.world)?;
-        agree_shape(&shapes, shape)?;
+        let shapes =
+            rendezvous::exchange_record(&mut stream, &shape_record(routing), cluster.world)?;
+        agree_shape(&shapes, routing)?;
         let endpoints = rendezvous::exchange_record(
             &mut stream,
             &roce_fabric::encode(&fabric.endpoints),
             cluster.world,
         )?;
-        let mut transport = open(owner, &fabric, &endpoints, shape)?;
+        let mut transport = open(owner, &fabric, &endpoints, routing)?;
         let records =
             rendezvous::exchange_record(&mut stream, &transport.local_record()?, cluster.world)?;
         transport.connect(&records)?;
@@ -249,7 +269,7 @@ pub fn peer(
     }
     #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
     {
-        let _ = (owner, cluster, stream, progress, shape);
+        let _ = (owner, cluster, stream, progress, routing);
         Err(NO_TRANSPORT.into())
     }
 }
@@ -286,6 +306,37 @@ mod pool_tests {
             assert_eq!(started.recv().unwrap(), peer_approved);
             assert_eq!(zero.join().unwrap(), peer_approved);
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "aarch64", feature = "roce")
+))]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn ranks_agree_on_switch_only_links_and_mesh_keeps_its_record() {
+        let mesh = Routing {
+            shape: Shape::Mesh,
+            links: Links::All,
+        };
+        let switched = Routing {
+            shape: Shape::Mesh,
+            links: Links::Shared,
+        };
+        assert_eq!(shape_record(mesh), b"mesh");
+        assert_eq!(shape_record(switched), b"mesh switch-only");
+        assert!(agree_shape(&vec![shape_record(switched); 2], switched).is_ok());
+        let error = agree_shape(&[shape_record(mesh), shape_record(switched)], mesh)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("rank 1 selected RoCE transport shape mesh switch-only where this rank selected mesh"),
+            "{error}"
+        );
     }
 }
 
