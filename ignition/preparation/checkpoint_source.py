@@ -97,11 +97,12 @@ class Channel:
             raise ValueError("checkpoint message authentication failed")
         if message.get("sequence") != self.received:
             raise ValueError("checkpoint message sequence differs")
+        if message.get("kind") == "error":
+            self.received += 1
+            raise RuntimeError(f"checkpoint source rejected access: {message.get('error')}")
         if expected is not None and message.get("kind") != expected:
             raise ValueError(f"expected checkpoint {expected}, received {message.get('kind')}")
         self.received += 1
-        if message.get("kind") == "error":
-            raise RuntimeError(f"checkpoint source rejected access: {message.get('error')}")
         return message, payload
 
 
@@ -262,6 +263,7 @@ class SourceServer:
         self.thread = threading.Thread(target=self.run, name=f"flare-checkpoint-rank{rank}", daemon=True)
 
     def run(self):
+        channel = None
         try:
             channel, _ = authenticate(self.connection, self.key, rank=self.rank, identity=self.identity,
                                       catalog=self.source.catalog)
@@ -295,6 +297,11 @@ class SourceServer:
                     raise ValueError(f"unknown checkpoint source operation {kind}")
         except BaseException as error:
             self.error = error
+            if channel is not None:
+                try:
+                    channel.send("error", error=str(error)[:4096])
+                except (OSError, ValueError):
+                    pass
             try:
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:

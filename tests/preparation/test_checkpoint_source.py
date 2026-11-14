@@ -243,7 +243,7 @@ def test_source_mutation_aborts_the_same_reader(tmp_path):
         with path.open("r+b") as stream:
             stream.seek(start)
             stream.write(b"!")
-        with pytest.raises(ConnectionError):
+        with pytest.raises(RuntimeError, match="checkpoint source changed after admission"):
             client.read("weights.safetensors", start, 1)
         server.thread.join(5)
         assert isinstance(server.error, RuntimeError)
@@ -283,10 +283,48 @@ def test_channel_rejects_tamper_and_replay():
 def test_end_marker_byte_accounting_is_authenticated(tmp_path):
     with connected(tmp_path) as (client, server, _):
         client.stats["payload_bytes"] += 1
-        with pytest.raises(ConnectionError):
+        with pytest.raises(RuntimeError, match="checkpoint source completion byte accounting differs"):
             client.finish()
         server.thread.join(5)
         assert "accounting" in str(server.error)
+
+
+def test_finish_reports_checkpoint_identity_change(tmp_path):
+    with connected(tmp_path) as (client, server, _):
+        source = server.source.snapshot / "weights.safetensors"
+        link = server.source.snapshot / "temporary-link"
+        os.link(source, link)
+        os.unlink(link)
+        with pytest.raises(RuntimeError, match="checkpoint source changed after admission"):
+            client.finish()
+        server.thread.join(5)
+        assert isinstance(server.error, RuntimeError)
+
+
+def test_channel_delivers_authenticated_error_when_expecting_data():
+    sender, receiver = socket.socketpair()
+    try:
+        root = transport.Channel(sender, b"k" * 32, server=True)
+        peer = transport.Channel(receiver, b"k" * 32, server=False)
+        root.send("error", error="source changed")
+        with pytest.raises(RuntimeError, match="source changed"):
+            peer.receive("data")
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_channel_rejects_unauthenticated_error():
+    sender, receiver = socket.socketpair()
+    try:
+        root = transport.Channel(sender, b"x" * 32, server=True)
+        peer = transport.Channel(receiver, b"k" * 32, server=False)
+        root.send("error", error="forged")
+        with pytest.raises(ValueError, match="authentication"):
+            peer.receive("data")
+    finally:
+        sender.close()
+        receiver.close()
 
 
 @pytest.mark.parametrize("streams", [1, 4, 8])
