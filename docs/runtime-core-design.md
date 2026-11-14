@@ -358,6 +358,16 @@ values retain their meanings. Weight reuse and core combination reject
 different conversion groups; changing a recipe default never changes stored
 weights or the serving behavior of an exported core.
 
+For DFlash2, an omitted `RebuildSpeculation.draft_body_quantization` inherits
+MXFP8 body conversion when `online_mxfp8` is true and the stored scope is `all`
+(including an absent or empty scope). Otherwise omission retains checkpoint
+precision. Core combination and cached-weight reuse compare this effective
+format, so an explicit `mxfp8` override remains compatible with inherited MXFP8.
+They still reject checkpoint-precision versus MXFP8 body mismatches. With
+`--reuse-weights --no-mtp`, only target views are consumed, so draft-body settings
+do not constrain reuse. Normalizing a comparison does not rewrite the recorded
+metadata or change stored weight bytes.
+
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:
 owner paths, packing-owner types, dtypes, shapes, element strides, and

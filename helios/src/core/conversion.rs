@@ -2719,7 +2719,6 @@ fn rebuild_compatible(
             (
                 s.proposal_source.clone(),
                 s.history_drafts,
-                s.draft_body_quantization.clone(),
                 s.draft_head_quantization.clone(),
                 s.markov_head_quantization.clone(),
                 s.vocabulary_parallel_sampling,
@@ -2736,6 +2735,7 @@ fn rebuild_compatible(
             == (if b.online_mxfp8_scope.is_empty() { "all" } else { &b.online_mxfp8_scope })
         && a.language_model_only == b.language_model_only
         && a.mla_compute_mode == b.mla_compute_mode
+        && a.effective_draft_body_quantization() == b.effective_draft_body_quantization()
         && speculation(&a.speculation) == speculation(&b.speculation)
 }
 
@@ -7117,6 +7117,59 @@ mod tests {
         let mut explicit_scope = omitted_scope.clone();
         explicit_scope.online_mxfp8_scope = "all".into();
         assert!(rebuild_compatible(&Some(omitted_scope), &Some(explicit_scope)));
+
+        for (label, online, scope, compatible) in [
+            ("dflash-inherited-all", true, "all", true),
+            ("dflash-inherited-empty-scope", true, "", true),
+            ("dflash-checkpoint-body", false, "all", false),
+            ("dflash-target-kda-only", true, "kda-input", false),
+        ] {
+            let mut implicit = rebuild("same-code");
+            implicit.online_mxfp8 = online;
+            implicit.online_mxfp8_scope = scope.into();
+            implicit.speculation.as_mut().unwrap().method = "dflash2".into();
+            let mut explicit = implicit.clone();
+            explicit
+                .speculation
+                .as_mut()
+                .unwrap()
+                .draft_body_quantization = Some("mxfp8".into());
+            let (tp1, tp2) = publish_pair(label, implicit, explicit);
+            let output = scratch.join(&format!("{label}-combined"));
+            let result = combine(&CombineRequest {
+                sources: &[tp1, tp2],
+                output: &output,
+                publishers: std::slice::from_ref(&publisher),
+                accepted: "example",
+                target_accepted: "example",
+                target_publisher: None,
+                key: &key,
+            });
+            if compatible {
+                result.unwrap();
+                let metadata = Metadata::open(&output).unwrap();
+                let envelope = protect::envelope(&metadata.envelope).unwrap();
+                let recorded: BTreeSet<_> = envelope
+                    .deployments
+                    .iter()
+                    .map(|deployment| {
+                        wire::DeploymentBody::decode(deployment.body.as_slice())
+                            .unwrap()
+                            .rebuild
+                            .unwrap()
+                            .speculation
+                            .unwrap()
+                            .draft_body_quantization
+                    })
+                    .collect();
+                assert_eq!(recorded, BTreeSet::from([None, Some("mxfp8".into())]));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "source deployments disagree on checkpoint or preparation semantics"
+                );
+            }
+        }
 
         let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 10] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),

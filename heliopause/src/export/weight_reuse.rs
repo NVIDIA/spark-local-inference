@@ -230,14 +230,9 @@ fn same_draft_body_quantization(
     previous: &super::wire::RebuildManifest,
     expected: &super::wire::RebuildManifest,
 ) -> bool {
-    previous
-        .speculation
-        .as_ref()
-        .and_then(|s| s.draft_body_quantization.as_deref())
-        == expected
-            .speculation
-            .as_ref()
-            .and_then(|s| s.draft_body_quantization.as_deref())
+    // An export without a draft only reuses target views, checked separately.
+    expected.speculation.is_none()
+        || previous.effective_draft_body_quantization() == expected.effective_draft_body_quantization()
 }
 
 impl Source {
@@ -621,6 +616,48 @@ mod tests {
                 &manifest(previous),
                 &manifest(expected)
             ));
+        }
+    }
+
+    #[test]
+    fn weight_reuse_resolves_inherited_dflash_body_precision() {
+        for (online, scope, equivalent) in [
+            (true, "all", true),
+            (true, "", true),
+            (false, "all", false),
+            (false, "", false),
+            (true, "kda-input", false),
+        ] {
+            let implicit = RebuildManifest {
+                online_mxfp8: online,
+                online_mxfp8_scope: scope.into(),
+                speculation: Some(RebuildSpeculation {
+                    method: "dflash2".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut explicit = implicit.clone();
+            explicit
+                .speculation
+                .as_mut()
+                .unwrap()
+                .draft_body_quantization = Some("mxfp8".into());
+            assert_eq!(
+                same_draft_body_quantization(&implicit, &explicit),
+                equivalent
+            );
+            assert_eq!(
+                same_draft_body_quantization(&explicit, &implicit),
+                equivalent
+            );
+            // Disabling drafts reuses only target views, whose compatibility is
+            // validated independently of the unconsumed draft-body setting.
+            let mut target_only = implicit.clone();
+            target_only.speculation = None;
+            assert!(same_draft_body_quantization(&implicit, &target_only));
+            assert!(same_draft_body_quantization(&explicit, &target_only));
+            assert!(!same_draft_body_quantization(&target_only, &explicit));
         }
     }
 
