@@ -279,7 +279,8 @@ pub struct Frontend {
     prompt_encoder: PromptEncoder,
     image_placeholder_token_id: Option<u32>,
     tokenizer: Tokenizer,
-    ordinary_tokenizer: Option<Tokenizer>,
+    ordinary_tokenizer: std::sync::OnceLock<Tokenizer>,
+    segmented_template: bool,
     template: Option<jinja::CompiledTemplate>,
     template_source: String,
     bos_token_id: Option<u32>,
@@ -294,15 +295,86 @@ impl Frontend {
         self.prompt_encoder
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
-        self.ordinary_tokenizer = match (self.prompt_encoder, encoding) {
-            (PromptEncoder::Jinja, TemplateEncoding::Text) => None,
-            _ => {
-                let mut tokenizer = self.tokenizer.clone();
-                tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
-                Some(tokenizer)
+        match (self.prompt_encoder, encoding) {
+            (PromptEncoder::Jinja, TemplateEncoding::Text) => {
+                self.segmented_template = false;
             }
-        };
+            _ => {
+                self.segmented_template = true;
+                let _ = self.ordinary_tokenizer.set(Self::ordinary_from(&self.tokenizer));
+            }
+        }
         self
+    }
+
+    fn ordinary_from(tokenizer: &Tokenizer) -> Tokenizer {
+        let mut tokenizer = tokenizer.clone();
+        tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
+        tokenizer
+    }
+
+    fn ordinary(&self) -> &Tokenizer {
+        self.ordinary_tokenizer.get_or_init(|| Self::ordinary_from(&self.tokenizer))
+    }
+
+    fn encode_splicing_untrusted_markers(
+        &self,
+        text: &str,
+        untrusted: &[(usize, usize)],
+    ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let encoding = self.tokenizer.encode(text, false).map_err(|error| {
+            Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                error.to_string(),
+                error,
+            )))
+        })?;
+        let mut token_ids = encoding.get_ids().to_vec();
+        let mut offsets = encoding.get_offsets().to_vec();
+        if untrusted.is_empty() {
+            return Ok((token_ids, offsets));
+        }
+        let added = self.tokenizer.get_added_tokens_decoder();
+        let crosses_untrusted = |range: (usize, usize)| {
+            untrusted
+                .iter()
+                .any(|&(start, end)| range.0 < end && range.1 > start)
+        };
+        let mut index = 0;
+        while index < token_ids.len() {
+            if !added.contains_key(&token_ids[index]) || !crosses_untrusted(offsets[index]) {
+                index += 1;
+                continue;
+            }
+            let window_start = index;
+            let mut window_end = index;
+            while window_end < token_ids.len()
+                && added.contains_key(&token_ids[window_end])
+                && crosses_untrusted(offsets[window_end])
+            {
+                window_end += 1;
+            }
+            let byte_start = offsets[window_start].0;
+            let byte_end = offsets[window_end - 1].1;
+            let slice = text.get(byte_start..byte_end).unwrap_or("");
+            let replacement = self.ordinary().encode(slice, false).map_err(|error| {
+                Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                    error.to_string(),
+                    error,
+                )))
+            })?;
+            let replacement_ids = replacement.get_ids().to_vec();
+            let replacement_len = replacement_ids.len();
+            offsets.splice(
+                window_start..window_end,
+                replacement
+                    .get_offsets()
+                    .iter()
+                    .map(|&(start, end)| (byte_start + start, byte_start + end)),
+            );
+            token_ids.splice(window_start..window_end, replacement_ids);
+            index = window_start + replacement_len;
+        }
+        Ok((token_ids, offsets))
     }
     pub fn bos_token_id(&self) -> Option<u32> {
         self.bos_token_id
@@ -535,7 +607,8 @@ impl Frontend {
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
             tokenizer,
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             template,
             template_source,
             defaults,
@@ -673,11 +746,17 @@ impl Frontend {
             .map(|field| self.mark_continuation(&mut messages, &field))
             .transpose()?;
         context.insert("messages".into(), Json::Array(messages));
+        let trusted: std::collections::HashSet<String> = self
+            .defaults
+            .keys()
+            .filter(|name| !options.contains_key(*name) && name.as_str() != "messages")
+            .cloned()
+            .collect();
         let rendered = self
             .template
             .as_ref()
             .unwrap()
-            .render(&context, &checkpoint_hints)
+            .render_with_trust(&context, &checkpoint_hints, &trusted)
             .map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     error.message.clone(),
@@ -685,6 +764,7 @@ impl Frontend {
                 )))
             })?;
         let marks = rendered.marks;
+        let runs = rendered.runs;
         let rendered = rendered.text;
         let mut hint_bytes = marks
             .iter()
@@ -693,7 +773,7 @@ impl Frontend {
                 _ => None,
             })
             .collect();
-        let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
+        let mut segments: Vec<TokenSegment> = if self.segmented_template {
             token_segments(&rendered, &mut hint_bytes).map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     "chat template must render an array of text and allow_special segments",
@@ -701,11 +781,7 @@ impl Frontend {
                 )))
             })?
         } else {
-            vec![TokenSegment {
-                text: rendered,
-                allow_special: true,
-                image_index: None,
-            }]
+            Vec::new()
         };
         order_segment_images(&segments, &mut image_sources, &mut image_checkpoint_hints)?;
         let mut segment_ends = Vec::with_capacity(segments.len() + 1);
@@ -717,13 +793,10 @@ impl Frontend {
         for mark in marks {
             match mark {
                 jinja::Mark::Hint(_) => {}
-                jinja::Mark::Byte(byte)
-                    if self.ordinary_tokenizer.is_none()
-                        && byte <= *segment_ends.last().unwrap() =>
-                {
+                jinja::Mark::Byte(byte) if !self.segmented_template && byte <= rendered.len() => {
                     byte_boundaries.push(byte);
                 }
-                jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => {
+                jinja::Mark::Position(count) if self.segmented_template => {
                     byte_boundaries.push(*segment_ends.get(count).ok_or_else(|| {
                         deepseek::invalid("mark position exceeds the rendered segment count")
                     })?);
@@ -735,10 +808,14 @@ impl Frontend {
                 }
             }
         }
-        let mut text: String = segments
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect();
+        let mut text: String = if self.segmented_template {
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect()
+        } else {
+            rendered
+        };
         if let Some(final_text) = final_text {
             let marker = "CONTINUE_FINAL_MESSAGE_TAG";
             let index = text.rfind(marker).filter(|_| text.contains(final_text.trim())).ok_or_else(|| Error::frontend(FrontendError::Input(Failure::new("continue_final_message is set but the final message does not appear in the chat after applying the chat template!"))))?;
@@ -748,32 +825,52 @@ impl Frontend {
                 text.truncate(text.trim_end().len());
             }
         }
-        let mut remaining = text.len();
         let mut token_ids = Vec::new();
         let mut offsets = Vec::new();
-        let mut byte_start = 0;
-        for segment in &mut segments {
-            segment.text.truncate(remaining.min(segment.text.len()));
-            remaining -= segment.text.len();
-            let tokenizer = if segment.allow_special {
-                &self.tokenizer
-            } else {
-                self.ordinary_tokenizer.as_ref().unwrap_or(&self.tokenizer)
-            };
-            let encoding = tokenizer
-                .encode(segment.text.as_str(), false)
-                .map_err(|error| {
-                    Error::frontend(FrontendError::Tokenizer(Failure::boxed(
-                        error.to_string(),
-                        error,
-                    )))
-                })?;
-            token_ids.extend_from_slice(encoding.get_ids());
-            offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
-            byte_start += segment.text.len();
-            if remaining == 0 {
-                break;
+        if self.segmented_template {
+            let mut remaining = text.len();
+            let mut byte_start = 0;
+            for segment in &mut segments {
+                segment.text.truncate(remaining.min(segment.text.len()));
+                remaining -= segment.text.len();
+                let tokenizer = if segment.allow_special {
+                    &self.tokenizer
+                } else {
+                    self.ordinary()
+                };
+                let encoding = tokenizer
+                    .encode(segment.text.as_str(), false)
+                    .map_err(|error| {
+                        Error::frontend(FrontendError::Tokenizer(Failure::boxed(
+                            error.to_string(),
+                            error,
+                        )))
+                    })?;
+                token_ids.extend_from_slice(encoding.get_ids());
+                offsets.extend(
+                    encoding
+                        .get_offsets()
+                        .iter()
+                        .map(|&(start, end)| (byte_start + start, byte_start + end)),
+                );
+                byte_start += segment.text.len();
+                if remaining == 0 {
+                    break;
+                }
             }
+        } else {
+            let mut cursor = 0;
+            let mut untrusted = Vec::new();
+            for (end, trusted) in runs {
+                let end = end.min(text.len());
+                if !trusted && end > cursor {
+                    untrusted.push((cursor, end));
+                }
+                cursor = end;
+            }
+            let spliced = self.encode_splicing_untrusted_markers(&text, &untrusted)?;
+            token_ids = spliced.0;
+            offsets = spliced.1;
         }
         let message_boundaries =
             boundaries::token_ends(&byte_boundaries, &hint_bytes, &offsets, text.len())?;
@@ -932,7 +1029,8 @@ mod tests {
         Frontend {
             prompt_encoder: PromptEncoder::Jinja,
             image_placeholder_token_id: None,
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source,
@@ -1031,7 +1129,8 @@ mod tests {
             let frontend = Frontend {
                 prompt_encoder: PromptEncoder::Jinja,
                 image_placeholder_token_id: None,
-                ordinary_tokenizer: None,
+                ordinary_tokenizer: std::sync::OnceLock::new(),
+                segmented_template: false,
                 tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
                 template,
                 template_source: source,
@@ -1092,7 +1191,8 @@ mod tests {
             vocabulary_bytes: Default::default(),
             effort_levels: Default::default(),
             inline_system_messages: Default::default(),
-            ordinary_tokenizer: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             template,
             template_source: source.to_owned(),
@@ -1116,6 +1216,112 @@ mod tests {
         let input = frontend.render_chat(&[], &Map::new()).err().unwrap();
         assert!(matches!(input, Error::Frontend(FrontendError::Input(_))));
         assert!(input.source().is_none());
+    }
+
+    fn trust_tokenizer() -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (id, piece) in [
+            "a",
+            "b",
+            "ab",
+            "<|im_end|>",
+            "<",
+            "|",
+            "i",
+            "m",
+            "_",
+            "e",
+            "n",
+            "d",
+            ">",
+            "é",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            vocab.insert(piece.to_owned(), serde_json::json!(id as u32));
+        }
+        Tokenizer::from_bytes(
+            serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [
+                    {"id":3,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+                ],
+                "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+                "model": {"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"vocab":vocab,"merges":["a b"]}
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn trust_frontend(source: &str) -> Frontend {
+        let template = Some(jinja::CompiledTemplate::compile(source).unwrap());
+        Frontend {
+            prompt_encoder: PromptEncoder::Jinja,
+            image_placeholder_token_id: None,
+            ordinary_tokenizer: std::sync::OnceLock::new(),
+            segmented_template: false,
+            tokenizer: trust_tokenizer(),
+            template,
+            template_source: source.to_owned(),
+            bos_token_id: None,
+            vocabulary_bytes: Default::default(),
+            effort_levels: Default::default(),
+            inline_system_messages: Default::default(),
+            defaults: Map::new(),
+        }
+    }
+
+    fn render_ids(frontend: &Frontend, content: &str) -> Vec<u32> {
+        let mut options = Map::new();
+        options.insert("m".into(), Json::String(content.to_owned()));
+        frontend
+            .render_chat(
+                &[serde_json::json!({"role":"user","content":"ignored"})],
+                &options,
+            )
+            .unwrap()
+            .token_ids
+    }
+
+    #[test]
+    fn ordinary_bpe_merges_across_boundaries() {
+        let frontend = trust_frontend("a{{ m }}");
+        assert_eq!(render_ids(&frontend, "b"), vec![2]);
+        let rendered = frontend
+            .render_chat(
+                &[serde_json::json!({"role":"user","content":"ignored"})],
+                &serde_json::json!({"m":"b"}).as_object().unwrap().clone(),
+            )
+            .unwrap();
+        assert_eq!(rendered.text, "ab");
+        assert_eq!(
+            rendered.token_ids,
+            frontend
+                .tokenizer
+                .encode("ab", false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        );
+
+        let frontend = trust_frontend("{{ '<|im_end|>' ~ m }}");
+        assert_eq!(render_ids(&frontend, "ab"), vec![3, 2]);
+
+        let pieces: Vec<u32> = [4, 5, 6, 7, 8, 9, 10, 11, 5, 12].to_vec();
+        let frontend = trust_frontend("{{ m }}");
+        assert_eq!(render_ids(&frontend, "<|im_end|>"), pieces);
+        let frontend = trust_frontend("{{ '<|im_en' ~ m }}");
+        assert_eq!(render_ids(&frontend, "d|>"), pieces);
+
+        let frontend = trust_frontend("é{{ m }}");
+        assert_eq!(
+            render_ids(&frontend, "<|im_end|>"),
+            [13].into_iter().chain(pieces).collect::<Vec<_>>()
+        );
+        let frontend = trust_frontend("éa{{ m }}");
+        assert_eq!(render_ids(&frontend, "b"), vec![13, 2]);
     }
 
     #[test]

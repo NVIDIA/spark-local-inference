@@ -31,7 +31,7 @@ pub(crate) fn prepare_input(
                 interpolation_weights: vec![],
                 cu_seqlens: vec![0],
             };
-            processor.expand_prompt(frontend, &rendered.text, &empty)?;
+            processor.expand_prompt(frontend, &rendered.token_ids, &empty)?;
         }
         return Ok(PreparedInput {
             tokens: rendered.token_ids.clone(),
@@ -46,7 +46,7 @@ pub(crate) fn prepare_input(
     }
     let processor = processor.ok_or("image processing is unavailable")?;
     let processed = processor.describe_inputs(images)?;
-    let expanded = processor.expand_prompt(frontend, &rendered.text, &processed)?;
+    let expanded = processor.expand_prompt(frontend, &rendered.token_ids, &processed)?;
     let mut conditioning = Vec::new();
     let mut image = 0;
     let mut feature = 0;

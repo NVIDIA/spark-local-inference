@@ -21,7 +21,7 @@ struct Scope {
 struct Closure<'a> {
     definition: u32,
     scope: usize,
-    captured: Option<Vec<Value<'a>>>,
+    captured: Option<(Vec<Value<'a>>, Vec<bool>)>,
 }
 struct Vm<'a> {
     template: &'a CompiledTemplate,
@@ -31,11 +31,14 @@ struct Vm<'a> {
     serial: usize,
     scopes: Vec<Scope>,
     closures: Vec<Closure<'a>>,
-    undo: Vec<(u32, Value<'a>, usize)>,
+    undo: Vec<(u32, Value<'a>, usize, bool)>,
     stack: Vec<Value<'a>>,
+    stack_trust: Vec<bool>,
+    slots_trust: Vec<bool>,
     loops: Vec<Rc<LoopValue<'a>>>,
     output: String,
-    captures: Vec<(String, Vec<usize>)>,
+    output_runs: Vec<(usize, bool)>,
+    captures: Vec<(String, Vec<usize>, Vec<(usize, bool)>)>,
     hint_positions: Vec<usize>,
     marks: Vec<Mark>,
     depth: usize,
@@ -46,6 +49,7 @@ pub(super) fn render(
     template: &CompiledTemplate,
     context: &Map<String, Json>,
     hints: &[(usize, usize)],
+    trusted: &std::collections::HashSet<String>,
 ) -> Result<RenderedTemplate> {
     let mut hint_texts = Vec::new();
     for &(message, count) in hints {
@@ -85,8 +89,11 @@ pub(super) fn render(
         closures: Vec::new(),
         undo: Vec::new(),
         stack: Vec::with_capacity(16),
+        stack_trust: Vec::with_capacity(16),
+        slots_trust: template.names.iter().map(|s| trusted.contains(s)).collect(),
         loops: Vec::new(),
         output: String::new(),
+        output_runs: Vec::new(),
         captures: Vec::new(),
         hint_positions: Vec::new(),
         marks: Vec::new(),
@@ -98,6 +105,7 @@ pub(super) fn render(
     Ok(RenderedTemplate {
         text: vm.output,
         marks: vm.marks,
+        runs: vm.output_runs,
     })
 }
 
@@ -106,6 +114,22 @@ impl<'a> Vm<'a> {
         self.stack
             .pop()
             .expect("compiler balances the operand stack")
+    }
+    fn pop_trust(&mut self) -> bool {
+        self.stack_trust
+            .pop()
+            .expect("compiler balances the operand stack")
+    }
+    fn pop_trusted(&mut self) -> (Value<'a>, bool) {
+        let trust = self.pop_trust();
+        (self.pop(), trust)
+    }
+    fn force_trust(value: Value<'a>, trusted: bool) -> Value<'a> {
+        if trusted {
+            value
+        } else {
+            Value::baked_untrusted(value)
+        }
     }
     fn enter(&mut self) {
         self.scopes.push(Scope {
@@ -123,15 +147,20 @@ impl<'a> Vm<'a> {
                 let values = self.template.macros[closure.definition as usize]
                     .captures
                     .iter()
-                    .map(|&s| self.slots[s as usize].clone())
-                    .collect();
-                self.closures[i].captured = Some(values);
+                    .map(|&s| (self.lexical(s, self.scope), self.lexical_trust(s, self.scope)))
+                    .collect::<Vec<_>>();
+                let (values, trusts): (Vec<_>, Vec<_>) = values
+                    .into_iter()
+                    .map(|(value, trust)| (Value::baked_untrusted(value), trust))
+                    .unzip();
+                self.closures[i].captured = Some((values, trusts));
             }
         }
         let scope = self.scopes.pop().unwrap();
-        for (slot, value, stamp) in self.undo.drain(scope.undo..).rev() {
+        for (slot, value, stamp, trust) in self.undo.drain(scope.undo..).rev() {
             self.slots[slot as usize] = value;
             self.stamps[slot as usize] = stamp;
+            self.slots_trust[slot as usize] = trust;
         }
         self.scope = scope.id;
     }
@@ -139,7 +168,7 @@ impl<'a> Vm<'a> {
         let mut value = &self.slots[slot as usize];
         let mut stamp = self.stamps[slot as usize];
         if stamp > scope {
-            for (s, previous, previous_stamp) in self.undo.iter().rev() {
+            for (s, previous, previous_stamp, _) in self.undo.iter().rev() {
                 if *s == slot {
                     value = previous;
                     stamp = *previous_stamp;
@@ -151,7 +180,23 @@ impl<'a> Vm<'a> {
         }
         value.clone()
     }
-    fn store(&mut self, slot: u32, value: Value<'a>) {
+    fn lexical_trust(&self, slot: u32, scope: usize) -> bool {
+        let mut trust = self.slots_trust[slot as usize];
+        let mut stamp = self.stamps[slot as usize];
+        if stamp > scope {
+            for (s, _, previous_stamp, previous_trust) in self.undo.iter().rev() {
+                if *s == slot {
+                    trust = *previous_trust;
+                    stamp = *previous_stamp;
+                    if stamp <= scope {
+                        break;
+                    }
+                }
+            }
+        }
+        trust
+    }
+    fn store(&mut self, slot: u32, value: Value<'a>, trust: bool) {
         let value = self.hinted(value);
         let index = slot as usize;
         if self.scope != 0 && self.stamps[index] != self.scope {
@@ -159,28 +204,31 @@ impl<'a> Vm<'a> {
                 slot,
                 std::mem::take(&mut self.slots[index]),
                 self.stamps[index],
+                self.slots_trust[index],
             ));
             self.stamps[index] = self.scope;
         }
         self.slots[index] = value;
+        self.slots_trust[index] = trust;
     }
     fn iteration(&mut self, id: u32) -> Result<()> {
         let value = self.loops.last().unwrap().clone();
         let item = value.items[value.index.get()].clone();
-        self.store(self.template.loop_symbol, Value::Loop(value));
-        self.loop_variables(id, item)
+        let trust = value.trust;
+        self.store(self.template.loop_symbol, Value::Loop(value), trust);
+        self.loop_variables(id, item, trust)
     }
-    fn loop_variables(&mut self, id: u32, item: Value<'a>) -> Result<()> {
+    fn loop_variables(&mut self, id: u32, item: Value<'a>, trust: bool) -> Result<()> {
         let vars = &self.template.loops[id as usize].variables;
         if vars.len() == 1 {
-            self.store(vars[0], item);
+            self.store(vars[0], item, trust);
         } else {
             let items = item.iter()?;
             if items.len() != vars.len() {
                 return Err(Error::new("cannot unpack sequence of different length"));
             }
             for (&slot, value) in vars.iter().zip(items) {
-                self.store(slot, value);
+                self.store(slot, value, trust);
             }
         }
         Ok(())
@@ -196,21 +244,27 @@ impl<'a> Vm<'a> {
         }
         value
     }
-    fn emit(&mut self, value: Value<'a>) {
-        self.hinted(value)
-            .append(&mut self.output, &mut self.hint_positions);
+    fn emit(&mut self, value: Value<'a>, trust: bool) {
+        self.hinted(value).append_annotated(
+            &mut self.output,
+            &mut self.hint_positions,
+            &mut self.output_runs,
+            trust,
+        );
     }
     fn capture(&mut self) {
         self.captures.push((
             std::mem::take(&mut self.output),
             std::mem::take(&mut self.hint_positions),
+            std::mem::take(&mut self.output_runs),
         ));
     }
     fn end_capture(&mut self) -> Value<'a> {
-        let (output, hints) = self.captures.pop().unwrap();
+        let (output, hints, runs) = self.captures.pop().unwrap();
         let text = std::mem::replace(&mut self.output, output);
         let positions = std::mem::replace(&mut self.hint_positions, hints);
-        Value::marked(text, positions)
+        let runs = std::mem::replace(&mut self.output_runs, runs);
+        Value::marked_runs(text, positions, runs)
     }
     fn run(&mut self, start: u32) -> Result<()> {
         self.depth += 1;
@@ -223,19 +277,33 @@ impl<'a> Vm<'a> {
                 let op = self.template.code[pc];
                 pc += 1;
                 match op {
-                    I::Text(id) => self
-                        .output
-                        .push_str(self.template.constants[id as usize].as_str().unwrap()),
-                    I::Constant(id) => self
-                        .stack
-                        .push(Value::json(&self.template.constants[id as usize])),
-                    I::Load(id) => self.stack.push(self.slots[id as usize].clone()),
+                    I::Text(id) => {
+                        self.output
+                            .push_str(self.template.constants[id as usize].as_str().unwrap());
+                        self.output_runs.push((self.output.len(), true));
+                    }
+                    I::Constant(id) => {
+                        self.stack
+                            .push(Value::json(&self.template.constants[id as usize]));
+                        self.stack_trust.push(true);
+                    }
+                    I::Load(id) => {
+                        self.stack.push(self.slots[id as usize].clone());
+                        self.stack_trust.push(self.slots_trust[id as usize]);
+                    }
                     I::Store(id) => {
+                        let trust = self.pop_trust();
                         let v = self.pop();
-                        self.store(id, v);
+                        self.store(id, v, trust);
                     }
                     I::StoreAttr(slot, name) | I::AppendAttr(slot, name) => {
+                        let trust = self.pop_trust();
                         let value = self.pop();
+                        let value = if trust {
+                            value
+                        } else {
+                            Value::baked_untrusted(value)
+                        };
                         let Value::Namespace(ns) = &self.slots[slot as usize] else {
                             return Err(Error::new(
                                 "cannot assign attribute of non-namespace object",
@@ -251,6 +319,20 @@ impl<'a> Vm<'a> {
                                     {
                                         Rc::make_mut(items).extend(value.iter()?)
                                     }
+                                    (old, value)
+                                        if old.as_str().is_some() && value.as_str().is_some() =>
+                                    {
+                                        let mut text = String::new();
+                                        let mut hints = Vec::new();
+                                        let mut runs = Vec::new();
+                                        old.append_annotated(
+                                            &mut text, &mut hints, &mut runs, true,
+                                        );
+                                        value.append_annotated(
+                                            &mut text, &mut hints, &mut runs, true,
+                                        );
+                                        *old = Value::marked_runs(text, hints, runs);
+                                    }
                                     (old, value) => {
                                         *old = binary(Binary::Add, std::mem::take(old), value)?
                                     }
@@ -265,114 +347,216 @@ impl<'a> Vm<'a> {
                         }
                     }
                     I::Attr(name) => {
+                        let trust = self.pop_trust();
                         let v = self.pop();
                         if matches!(v, Value::Undefined) {
                             return Err(Error::new("undefined value"));
                         }
                         let value = self.hinted(v.attr(&self.template.names[name as usize]));
                         self.stack.push(value);
+                        self.stack_trust.push(trust);
                     }
                     I::Index => {
+                        let _ = self.pop_trust();
                         let key = self.pop();
+                        let trust = self.pop_trust();
                         let v = self.pop();
                         if matches!(v, Value::Undefined) {
                             return Err(Error::new("undefined value"));
                         }
                         let value = self.hinted(v.index(&key));
                         self.stack.push(value);
+                        self.stack_trust.push(trust);
                     }
                     I::Slice => {
+                        let _ = self.pop_trust();
                         let step = self.pop();
+                        let _ = self.pop_trust();
                         let end = self.pop();
+                        let _ = self.pop_trust();
                         let begin = self.pop();
+                        let trust = self.pop_trust();
                         let v = self.pop();
-                        self.stack.push(slice(v, begin, end, step)?);
+                        let sliced = slice(v, begin, end, step)?;
+                        self.stack.push(Self::force_trust(sliced, trust));
+                        self.stack_trust.push(trust);
                     }
                     I::List(n) => {
+                        let trusts = self.stack_trust.split_off(self.stack_trust.len() - n as usize);
                         let items = self.stack.split_off(self.stack.len() - n as usize);
+                        let trusted = trusts.iter().all(|trusted| *trusted);
+                        let items = items
+                            .into_iter()
+                            .zip(trusts)
+                            .map(|(value, trust)| if trust { value } else { Value::baked_untrusted(value) })
+                            .collect();
                         self.stack.push(Value::list(items));
+                        self.stack_trust.push(trusted);
                     }
                     I::Map(n) => {
+                        let trusts = self.stack_trust.split_off(self.stack_trust.len() - 2 * n as usize);
                         let values = self.stack.split_off(self.stack.len() - 2 * n as usize);
                         let mut pairs = Vec::with_capacity(n as usize);
-                        let mut values = values.into_iter();
-                        while let Some(key) = values.next() {
-                            pairs.push((key.text(), values.next().unwrap()));
+                        let mut trusted = true;
+                        let mut entries = values.into_iter().zip(trusts);
+                        while let Some((key, key_trust)) = entries.next() {
+                            let (value, value_trust) = entries.next().unwrap();
+                            trusted &= key_trust & value_trust;
+                            let value = if value_trust {
+                                value
+                            } else {
+                                Value::baked_untrusted(value)
+                            };
+                            pairs.push((key.text(), value));
                         }
                         self.stack.push(Value::Map(Rc::new(pairs)));
+                        self.stack_trust.push(trusted);
                     }
                     I::Unary(op) => {
+                        let trust = self.pop_trust();
                         let v = self.pop();
-                        self.stack.push(match op {
-                            Unary::Not => Value::Bool(!v.truthy()),
-                            Unary::Pos => v,
+                        let (value, trusted) = match op {
+                            Unary::Not => (Value::Bool(!v.truthy()), true),
+                            Unary::Pos => (v, trust),
                             Unary::Neg => match v {
-                                Value::Int(v) => Value::Int(
+                                Value::Int(v) => (Value::Int(
                                     v.checked_neg()
                                         .ok_or_else(|| Error::new("integer overflow"))?,
-                                ),
-                                _ => Value::Float(
+                                ), true),
+                                _ => (Value::Float(
                                     -v.number()
                                         .ok_or_else(|| Error::new("cannot negate non-number"))?,
-                                ),
+                                ), true),
                             },
-                        });
+                        };
+                        self.stack.push(value);
+                        self.stack_trust.push(trusted);
                     }
                     I::Binary(op) => {
+                        let b_trust = self.pop_trust();
                         let b = self.pop();
+                        let a_trust = self.pop_trust();
                         let a = self.pop();
-                        self.stack.push(binary(op, a, b)?);
+                        let mut annotated = false;
+                        let result = if matches!(op, Binary::Concat | Binary::Add)
+                            && a.as_str().is_some()
+                            && b.as_str().is_some()
+                        {
+                            annotated = true;
+                            let mut text = String::new();
+                            let mut hints = Vec::new();
+                            let mut runs = Vec::new();
+                            a.append_annotated(&mut text, &mut hints, &mut runs, a_trust);
+                            b.append_annotated(&mut text, &mut hints, &mut runs, b_trust);
+                            Value::marked_runs(text, hints, runs)
+                        } else {
+                            binary(op, a, b)?
+                        };
+                        let trusted = match op {
+                            Binary::Eq
+                            | Binary::Ne
+                            | Binary::In
+                            | Binary::NotIn
+                            | Binary::Lt
+                            | Binary::Le
+                            | Binary::Gt
+                            | Binary::Ge => true,
+                            Binary::Concat | Binary::Add if annotated => {
+                                !result.carries_untrusted()
+                            }
+                            _ => a_trust && b_trust,
+                        };
+                        let result = Self::force_trust(result, trusted);
+                        self.stack.push(result);
+                        self.stack_trust.push(trusted);
                     }
                     I::Test(id) | I::Filter(id) | I::Method(id) | I::Call(id) => {
                         let call = &self.template.calls[id as usize];
                         let count = call.positional + call.keywords.len();
+                        let arg_trusts = self.stack_trust.split_off(self.stack_trust.len() - count);
                         let arguments = self.stack.split_off(self.stack.len() - count);
                         let name = self.template.names[call.name as usize].as_str();
                         let (args, kw) = arguments.split_at(call.positional);
+                        let (arg_trusts, kw_trusts) = arg_trusts.split_at(call.positional);
                         let kwargs: Vec<_> = call
                             .keywords
                             .iter()
                             .zip(kw)
-                            .map(|(key, v)| {
-                                (self.template.names[*key as usize].as_str(), v.clone())
+                            .zip(kw_trusts)
+                            .map(|((key, v), trust)| {
+                                (self.template.names[*key as usize].as_str(), v.clone(), *trust)
                             })
                             .collect();
+                        let kw_named: Vec<(&str, Value<'a>)> = kwargs
+                            .iter()
+                            .map(|(name, value, _)| (*name, value.clone()))
+                            .collect();
+                        let arguments_trusted = arg_trusts.iter().chain(kw_trusts.iter()).all(|trusted| *trusted);
+                        let mut input_trust = true;
+                        let mut input_untrusted = false;
+                        let mut macro_result = false;
                         let result = match op {
                             I::Call(_) => {
                                 if let Value::Macro(id) = self.slots[call.name as usize] {
                                     let direct =
                                         matches!(self.template.code.get(pc), Some(I::Emit));
-                                    let value = self.macro_call(id, args, &kwargs, direct)?;
+                                    let value = self.macro_call(
+                                        id,
+                                        args,
+                                        &kwargs,
+                                        arg_trusts,
+                                        direct,
+                                    )?;
                                     if direct {
                                         pc += 1;
                                         continue;
                                     }
+                                    macro_result = true;
                                     value
                                 } else {
-                                    function(name, args, &kwargs)?
+                                    function(name, args, &kw_named)?
                                 }
                             }
                             I::Test(_) => {
-                                let v = self.pop();
+                                let (v, _) = self.pop_trusted();
                                 Value::Bool(test(name, &v, args)?)
                             }
                             I::Filter(_) => {
-                                let v = self.pop();
-                                filter(name, v, args, &kwargs, !self.hint_texts.is_empty())?
+                                let (v, trust) = self.pop_trusted();
+                                input_trust = trust;
+                                input_untrusted = v.carries_untrusted();
+                                filter(name, v, args, &kw_named, !self.hint_texts.is_empty())?
                             }
                             _ => {
-                                let v = self.pop();
-                                method(name, v, args, &kwargs)?
+                                let (v, trust) = self.pop_trusted();
+                                input_trust = trust;
+                                input_untrusted = v.carries_untrusted();
+                                method(name, v, args, &kw_named)?
                             }
                         };
+                        let trusted = match op {
+                            I::Test(_) => true,
+                            I::Call(_) if macro_result => !result.carries_untrusted(),
+                            I::Call(_) => arguments_trusted && !result.carries_untrusted(),
+                            _ => {
+                                arguments_trusted
+                                    && input_trust
+                                    && !input_untrusted
+                                    && !result.carries_untrusted()
+                            }
+                        };
+                        let result = Self::force_trust(result, trusted);
                         self.stack.push(result);
+                        self.stack_trust.push(trusted);
                     }
                     I::Emit => {
+                        let trust = self.pop_trust();
                         let v = self.pop();
-                        self.emit(v);
+                        self.emit(v, trust);
                     }
                     I::Join(count, strict) | I::EmitJoined(count, strict) => {
                         let start = self.stack.len() - count as usize;
+                        let trusts = self.stack_trust.split_off(start);
                         let values = &self.stack[start..];
                         if strict && values.iter().any(|v| v.as_str().is_none()) {
                             return Err(Error::new("string addition requires strings"));
@@ -380,24 +564,30 @@ impl<'a> Vm<'a> {
                         let size = values.iter().map(|v| v.as_str().map_or(0, str::len)).sum();
                         if matches!(op, I::EmitJoined(..)) {
                             self.output.reserve(size);
-                            for index in start..self.stack.len() {
-                                self.emit(self.stack[index].clone());
+                            for (index, trust) in (start..self.stack.len()).zip(trusts) {
+                                let value = self.stack[index].clone();
+                                self.emit(value, trust);
                             }
                             self.stack.truncate(start);
                         } else {
                             let mut text = String::with_capacity(size);
                             let mut hints = Vec::new();
-                            for v in self.stack.drain(start..) {
-                                v.append(&mut text, &mut hints);
+                            let mut runs = Vec::new();
+                            for (v, trust) in self.stack.drain(start..).zip(trusts) {
+                                v.append_annotated(&mut text, &mut hints, &mut runs, trust);
                             }
-                            self.stack.push(Value::marked(text, hints));
+                            let trusted = runs.iter().all(|(_, trusted)| *trusted);
+                            self.stack.push(Value::marked_runs(text, hints, runs));
+                            self.stack_trust.push(trusted);
                         }
                     }
                     I::Drop => {
+                        let _ = self.pop_trust();
                         self.pop();
                     }
                     I::Jump(target) => pc = target as usize,
                     I::JumpFalse(target) => {
+                        let _ = self.pop_trust();
                         if !self.pop().truthy() {
                             pc = target as usize;
                         }
@@ -406,6 +596,7 @@ impl<'a> Vm<'a> {
                         if !self.stack.last().unwrap().truthy() {
                             pc = target as usize;
                         } else {
+                            let _ = self.pop_trust();
                             self.pop();
                         }
                     }
@@ -413,17 +604,20 @@ impl<'a> Vm<'a> {
                         if self.stack.last().unwrap().truthy() {
                             pc = target as usize;
                         } else {
+                            let _ = self.pop_trust();
                             self.pop();
                         }
                     }
                     I::For(id) => {
+                        let trust = self.pop_trust();
                         let mut items = self.pop().iter()?;
                         if let Some(filter) = self.template.loops[id as usize].filter {
                             self.enter();
                             let mut selected = Vec::new();
                             for item in items {
-                                self.loop_variables(id, item.clone())?;
+                                self.loop_variables(id, item.clone(), trust)?;
                                 self.run(filter)?;
+                                let _ = self.pop_trust();
                                 if self.pop().truthy() {
                                     selected.push(item);
                                 }
@@ -435,6 +629,7 @@ impl<'a> Vm<'a> {
                         self.loops.push(Rc::new(LoopValue {
                             items,
                             index: Cell::new(0),
+                            trust,
                         }));
                         self.enter();
                         if empty {
@@ -469,16 +664,19 @@ impl<'a> Vm<'a> {
                             scope: self.scope,
                             captured: None,
                         });
-                        self.store(slot, Value::Macro(closure));
+                        self.store(slot, Value::Macro(closure), true);
                     }
                     I::Return => break,
                     I::Capture => self.capture(),
                     I::EndCapture => {
                         let value = self.end_capture();
+                        let trusted = !value.carries_untrusted();
                         self.stack.push(value);
+                        self.stack_trust.push(trusted);
                     }
                     I::Mark => self.marks.push(Mark::Byte(self.output.len())),
                     I::MarkPosition => {
+                        let _ = self.pop_trust();
                         let Value::Int(v) = self.pop() else {
                             return Err(Error::new("mark position must be a nonnegative integer"));
                         };
@@ -503,7 +701,8 @@ impl<'a> Vm<'a> {
         &mut self,
         id: u32,
         args: &[Value<'a>],
-        kwargs: &[(&str, Value<'a>)],
+        kwargs: &[(&str, Value<'a>, bool)],
+        arg_trusts: &[bool],
         direct: bool,
     ) -> Result<Value<'a>> {
         let closure = &self.closures[id as usize];
@@ -514,28 +713,31 @@ impl<'a> Vm<'a> {
         }
         self.enter();
         for (i, &slot) in mac.captures.iter().enumerate() {
-            let value = if let Some(captured) = &self.closures[id as usize].captured {
-                captured[i].clone()
+            let (value, trust) = if let Some((captured, trusts)) = &self.closures[id as usize].captured
+            {
+                (captured[i].clone(), trusts[i])
             } else {
-                self.lexical(slot, scope)
+                let trust = self.lexical_trust(slot, scope);
+                (self.lexical(slot, scope), trust)
             };
-            self.store(slot, value);
+            self.store(slot, value, trust);
         }
         for (i, &slot) in mac.parameters.iter().enumerate() {
             let name = self.template.names[slot as usize].as_str();
             let value = if let Some(value) = args.get(i) {
-                value.clone()
-            } else if let Some((_, value)) = kwargs.iter().find(|(k, _)| *k == name) {
-                value.clone()
+                let trust = arg_trusts.get(i).copied().unwrap_or(true);
+                (value.clone(), trust)
+            } else if let Some((_, value, trust)) = kwargs.iter().find(|(k, _, _)| *k == name) {
+                (value.clone(), *trust)
             } else if let Some((_, pc)) = mac.defaults.iter().find(|(s, _)| *s == slot) {
                 self.run(*pc)?;
-                self.pop()
+                self.pop_trusted()
             } else {
-                Value::Undefined
+                (Value::Undefined, true)
             };
-            self.store(slot, value);
+            self.store(slot, value.0, value.1);
         }
-        for (name, _) in kwargs {
+        for (name, _, _) in kwargs {
             if !mac
                 .parameters
                 .iter()
@@ -687,21 +889,50 @@ fn slice<'a>(
     };
     let mut i = bound(&begin, if step < 0 { n - 1 } else { 0 })?;
     let end = bound(&end, if step < 0 { -1 } else { n })?;
-    let mut items = Vec::new();
+    let mut indices = Vec::new();
     while if step < 0 { i > end } else { i < end } {
-        items.push(value.index(&Value::Int(i)));
+        indices.push(i);
         i = i
             .checked_add(step)
             .ok_or_else(|| Error::new("slice index overflow"))?;
     }
-    if value.as_str().is_some() {
-        let mut s = String::new();
-        for v in items {
-            v.write(&mut s);
+    if let Some(text) = value.as_str() {
+        let mut output = String::new();
+        let mut hints = Vec::new();
+        let mut runs: Vec<(usize, bool)> = Vec::new();
+        for index in indices {
+            let Ok(index) = usize::try_from(index) else {
+                continue;
+            };
+            let Some((byte, character)) = text.char_indices().nth(index) else {
+                continue;
+            };
+            output.push(character);
+            let output_end = output.len();
+            if let Value::String(source) = &value {
+                if source
+                    .1
+                    .iter()
+                    .any(|hint| *hint == byte + character.len_utf8())
+                {
+                    hints.push(output_end);
+                }
+                if let Some(trusted) = value.trust_at_byte(byte) {
+                    match runs.last_mut() {
+                        Some(last) if last.1 == trusted => last.0 = output_end,
+                        _ => runs.push((output_end, trusted)),
+                    }
+                }
+            }
         }
-        Ok(Value::string(s))
+        Ok(Value::marked_runs(output, hints, runs))
     } else {
-        Ok(Value::list(items))
+        Ok(Value::list(
+            indices
+                .into_iter()
+                .map(|index| value.index(&Value::Int(index)))
+                .collect(),
+        ))
     }
 }
 
@@ -879,17 +1110,15 @@ fn filter<'a>(
             };
             let trimmed = text.trim_matches(pred);
             if trimmed.len() == text.len() {
-                Ok(v)
-            } else {
-                let start = trimmed.as_ptr() as usize - text.as_ptr() as usize;
-                let hints = v
-                    .hints()
-                    .iter()
-                    .filter(|end| **end > start && !trimmed.is_empty())
-                    .map(|end| (end - start).min(trimmed.len()))
-                    .collect();
-                Ok(Value::marked(trimmed.into(), hints))
+                return Ok(v);
             }
+            let start = trimmed.as_ptr() as usize - text.as_ptr() as usize;
+            let end = start + trimmed.len();
+            let (mut hints, runs) = v.sliced_annotations(start, end);
+            if trimmed.is_empty() {
+                hints.clear();
+            }
+            Ok(Value::marked_runs(trimmed.into(), hints, runs))
         }
         "capitalize" => {
             let text = v.text().to_lowercase();
@@ -1096,14 +1325,18 @@ fn method<'a>(
         "strip" | "lstrip" | "rstrip" => {
             let chars = args.first().and_then(Value::as_str);
             let pred = |c: char| chars.map_or_else(|| c.is_whitespace(), |s| s.contains(c));
-            Ok(Value::string(
-                match name {
-                    "lstrip" => text.trim_start_matches(pred),
-                    "rstrip" => text.trim_end_matches(pred),
-                    _ => text.trim_matches(pred),
-                }
-                .into(),
-            ))
+            let trimmed = match name {
+                "lstrip" => text.trim_start_matches(pred),
+                "rstrip" => text.trim_end_matches(pred),
+                _ => text.trim_matches(pred),
+            };
+            let start = trimmed.as_ptr() as usize - text.as_ptr() as usize;
+            let end = start + trimmed.len();
+            let (mut hints, runs) = v.sliced_annotations(start, end);
+            if trimmed.is_empty() {
+                hints.clear();
+            }
+            Ok(Value::marked_runs(trimmed.into(), hints, runs))
         }
         "split" | "rsplit" => {
             let limit = args

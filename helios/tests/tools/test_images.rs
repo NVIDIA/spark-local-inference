@@ -141,9 +141,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             case["messages"].as_array().unwrap(),
             json!({"add_generation_prompt": true}).as_object().unwrap(),
         )?;
-        let prompt = processor.expand_prompt(&frontend, &rendered.text, &processed)?;
+        let prompt = processor.expand_prompt(&frontend, &rendered.token_ids, &processed)?;
         if rendered.text != case["rendered"]
-            || prompt.text != case["expanded"]
             || json!(prompt.token_ids) != case["token_ids"]
             || json!(prompt.mm_token_type_ids) != case["mm_token_type_ids"]
             || json!(prompt.rope_delta) != case["rope_delta"]

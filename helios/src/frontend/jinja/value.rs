@@ -22,7 +22,7 @@ pub(super) enum Value<'a> {
     UInt(u64),
     Float(f64),
     Str(&'a str),
-    String(Rc<(String, Vec<usize>)>),
+    String(Rc<(String, Vec<usize>, Vec<(usize, bool)>)>),
     Array(&'a [Json]),
     Object(&'a serde_json::Map<String, Json>),
     List(Rc<Vec<Value<'a>>>),
@@ -37,6 +37,7 @@ pub(super) enum Value<'a> {
 pub(super) struct LoopValue<'a> {
     pub items: Vec<Value<'a>>,
     pub index: Cell<usize>,
+    pub trust: bool,
 }
 
 impl<'a> Value<'a> {
@@ -76,7 +77,70 @@ impl<'a> Value<'a> {
         Self::marked(value, Vec::new())
     }
     pub fn marked(value: String, hints: Vec<usize>) -> Self {
-        Self::String(Rc::new((value, hints)))
+        Self::String(Rc::new((value, hints, Vec::new())))
+    }
+    pub fn marked_runs(value: String, hints: Vec<usize>, runs: Vec<(usize, bool)>) -> Self {
+        Self::String(Rc::new((value, hints, runs)))
+    }
+    pub fn carries_untrusted(&self) -> bool {
+        match self {
+            Self::String(s) => s.2.iter().any(|(_, trusted)| !trusted),
+            Self::List(items) => items.iter().any(Self::carries_untrusted),
+            Self::Map(pairs) => pairs.iter().any(|(_, value)| value.carries_untrusted()),
+            Self::Namespace(pairs) => pairs
+                .borrow()
+                .iter()
+                .any(|(_, value)| value.carries_untrusted()),
+            _ => false,
+        }
+    }
+    pub fn baked_untrusted(value: Self) -> Self {
+        match value {
+            Self::Str(s) => {
+                let runs = vec![(s.len(), false)];
+                Self::marked_runs(s.to_owned(), Vec::new(), runs)
+            }
+            Self::String(s) => {
+                if s.2.is_empty() {
+                    Self::String(Rc::new((
+                        s.0.clone(),
+                        s.1.clone(),
+                        vec![(s.0.len(), false)],
+                    )))
+                } else {
+                    Self::String(s)
+                }
+            }
+            Self::Array(items) => Self::list(
+                items
+                    .iter()
+                    .map(|item| Self::baked_untrusted(Self::json(item)))
+                    .collect(),
+            ),
+            Self::Object(members) => Self::Map(Rc::new(
+                members
+                    .iter()
+                    .map(|(key, item)| (key.clone(), Self::baked_untrusted(Self::json(item))))
+                    .collect(),
+            )),
+            Self::List(items) => {
+                Self::list(items.iter().cloned().map(Self::baked_untrusted).collect())
+            }
+            Self::Map(pairs) => Self::Map(Rc::new(
+                pairs
+                    .iter()
+                    .map(|(key, item)| (key.clone(), Self::baked_untrusted(item.clone())))
+                    .collect(),
+            )),
+            Self::Namespace(pairs) => Self::Namespace(Rc::new(RefCell::new(
+                pairs
+                    .borrow()
+                    .iter()
+                    .map(|(key, item)| (key.clone(), Self::baked_untrusted(item.clone())))
+                    .collect(),
+            ))),
+            other => other,
+        }
     }
     pub fn hints(&self) -> &[usize] {
         match self {
@@ -88,6 +152,79 @@ impl<'a> Value<'a> {
         let start = output.len();
         hints.extend(self.hints().iter().map(|end| start + end));
         self.write(output);
+    }
+    pub fn append_annotated(
+        &self,
+        output: &mut String,
+        hints: &mut Vec<usize>,
+        runs: &mut Vec<(usize, bool)>,
+        trust: bool,
+    ) {
+        let start = output.len();
+        hints.extend(self.hints().iter().map(|end| start + end));
+        if let Self::String(s) = self {
+            if !s.2.is_empty() {
+                output.push_str(&s.0);
+                for (end, trusted) in &s.2 {
+                    let end = start + end;
+                    match runs.last_mut() {
+                        Some(last) if last.1 == *trusted => last.0 = end,
+                        _ => runs.push((end, *trusted)),
+                    }
+                }
+                return;
+            }
+        }
+        self.write(output);
+        let end = output.len();
+        match runs.last_mut() {
+            Some(last) if last.1 == trust => last.0 = end,
+            _ => runs.push((end, trust)),
+        }
+    }
+    pub fn sliced_annotations(&self, start: usize, end: usize) -> (Vec<usize>, Vec<(usize, bool)>) {
+        let mut hints = Vec::new();
+        let mut runs: Vec<(usize, bool)> = Vec::new();
+        if let Self::String(s) = self {
+            for hint in &s.1 {
+                if *hint > start {
+                    hints.push((*hint - start).min(end - start));
+                }
+            }
+            let mut cursor = 0;
+            for (run_end, trusted) in &s.2 {
+                let run_start = cursor;
+                cursor = *run_end;
+                let low = run_start.max(start);
+                let high = (*run_end).min(end);
+                if high > low {
+                    match runs.last_mut() {
+                        Some(last) if last.1 == *trusted => last.0 = high - start,
+                        _ => runs.push((high - start, *trusted)),
+                    }
+                }
+            }
+        }
+        (hints, runs)
+    }
+    pub(super) fn trust_at_byte(&self, byte: usize) -> Option<bool> {
+        let Self::String(s) = self else {
+            return None;
+        };
+        s.2.iter()
+            .find(|(end, _)| byte < *end)
+            .map(|(_, trusted)| *trusted)
+    }
+    fn annotated_char(&self, text: &str, byte: usize) -> Self {
+        let character = text[byte..].chars().next().unwrap();
+        match self.trust_at_byte(byte) {
+            Some(trusted) => Self::marked_runs(
+                character.to_string(),
+                Vec::new(),
+                vec![(character.len_utf8(), trusted)],
+            ),
+            None => Self::string(character.to_string()),
+        }
     }
     pub fn list(value: Vec<Self>) -> Self {
         Self::List(Rc::new(value))
@@ -202,8 +339,11 @@ impl<'a> Value<'a> {
             Self::List(v) => v.get(index).cloned().unwrap_or_default(),
             _ => self
                 .as_str()
-                .and_then(|s| s.chars().nth(index))
-                .map(|c| Self::string(c.to_string()))
+                .and_then(|s| {
+                    s.char_indices()
+                        .nth(index)
+                        .map(|(byte, _)| self.annotated_char(s, byte))
+                })
                 .unwrap_or_default(),
         }
     }
@@ -218,8 +358,8 @@ impl<'a> Value<'a> {
             _ if self.as_str().is_some() => Ok(self
                 .as_str()
                 .unwrap()
-                .chars()
-                .map(|c| Self::string(c.to_string()))
+                .char_indices()
+                .map(|(byte, _)| self.annotated_char(self.as_str().unwrap(), byte))
                 .collect()),
             _ => Err(Error::new("value is not iterable")),
         }

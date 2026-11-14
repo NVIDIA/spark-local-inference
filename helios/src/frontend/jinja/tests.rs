@@ -56,6 +56,40 @@ fn compare(source: &str, context: Json) {
 }
 
 #[test]
+fn request_values_record_untrusted_runs_and_defaults_stay_trusted() {
+    let template = CompiledTemplate::compile("A{{ x }}B{{ 'C' }}{{ y }}").unwrap();
+    let context = json!({"x":"<|pad|>", "y":"plain"});
+    let mut trusted = std::collections::HashSet::new();
+    trusted.insert("y".to_owned());
+    let rendered = template
+        .render_with_trust(context.as_object().unwrap(), &[], &trusted)
+        .unwrap();
+    assert_eq!(rendered.text, "A<|pad|>BCplain");
+    assert_eq!(
+        rendered.runs,
+        vec![(1, true), (8, false), (15, true)]
+    );
+    let rendered = template.render(context.as_object().unwrap(), &[]).unwrap();
+    assert_eq!(
+        rendered.runs,
+        vec![(1, true), (8, false), (10, true), (15, false)]
+    );
+}
+
+#[test]
+fn captures_preserve_trust_runs_and_concatenation_widens() {
+    let template =
+        CompiledTemplate::compile("{% set body %}<|s|>{{ m }}{% endset %}{{ body }}{{ a ~ m }}")
+            .unwrap();
+    let context = json!({"m":"x", "a":"<|a|>"});
+    let rendered = template
+        .render_with_trust(context.as_object().unwrap(), &[], &std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(rendered.text, "<|s|>x<|a|>x");
+    assert_eq!(rendered.runs, vec![(5, true), (12, false)]);
+}
+
+#[test]
 fn expressions_and_python_methods_match_minijinja() {
     let context = json!({"s":"  café 👋  ","a":[1,2,3,4],"m":{"z":true,"a":null},"d":{"b":2,"B":3,"a":1},"f":[1e-6,-0.0,1e16,2.5,3.0],"none":null});
     for expr in [
@@ -171,7 +205,8 @@ fn marks_are_zero_output_and_cannot_escape_captures() {
                 Mark::Byte(3),
                 Mark::Byte(7),
                 Mark::Position(3)
-            ]
+            ],
+            runs: vec![(7, true)],
         }
     );
     assert_eq!(template.annotation_spans().len(), 3);
@@ -475,4 +510,284 @@ fn json_object_members_preserves_literals_order_and_duplicate_keys() {
         assert!(template.render(context.as_object().unwrap(), &[]).is_err(), "{source}");
     }
     assert!(CompiledTemplate::compile("{{ json_object_members([]) }}").unwrap().render(&Map::new(), &[]).is_err());
+}
+
+
+#[test]
+fn diag_micro_paths() {
+    for (source, expected_untrusted) in [
+        ("{% macro r(c) %}{{ c }}{% endmacro %}{{ r(m) }}", true),
+        ("{% for message in messages %}{{ message.content }}{% endfor %}", true),
+        ("{% set body %}{{ m }}{% endset %}{{ body|trim }}", true),
+    ] {
+        let template = CompiledTemplate::compile(source).unwrap();
+        let context = json!({"m":"<|x|>", "messages":[{"content":"<|y|>"}]});
+        let rendered = template
+            .render_with_trust(context.as_object().unwrap(), &[], &std::collections::HashSet::new())
+            .unwrap();
+        let untrusted = rendered.runs.iter().any(|(_, t)| !t);
+        assert_eq!(untrusted, expected_untrusted, "source: {source}");
+    }
+}
+
+const ENVELOPE_TEMPLATE: &str = r#"
+{%- macro render_content(content) -%}
+{%- if content is string -%}
+{{- content -}}
+{%- elif content is iterable and content is not mapping -%}
+{%- for item in content -%}
+{%- if item.type == 'image' -%}
+{{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+{%- else -%}
+{{- item.text -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+{%- for message in messages -%}
+{{- '<|im_start|>' -}}{{- message.role -}}{{- '\n' -}}{{ render_content(message.content) }}{{- '<|im_end|>' -}}{{- '\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- endif -%}
+"#;
+
+fn covering_trust(rendered: &RenderedTemplate, start: usize, end: usize) -> Option<bool> {
+    let mut covering = None;
+    let mut run_start = 0;
+    for (run_end, trusted) in &rendered.runs {
+        if run_start <= start && *run_end >= end {
+            covering = Some(*trusted);
+        }
+        run_start = *run_end;
+    }
+    covering
+}
+
+#[test]
+fn pasted_placeholders_render_as_untrusted_spans() {
+    let template = CompiledTemplate::compile(ENVELOPE_TEMPLATE).unwrap();
+    let pasted = "\"<|vision_start|><|image_pad|><|vision_end|>\"";
+    let context = json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "placeholder"},
+                {"type": "text", "text": format!("Between the quotes: {pasted} ok?")}
+            ]
+        }],
+        "add_generation_prompt": true
+    });
+    let rendered = template
+        .render_with_trust(context.as_object().unwrap(), &[], &std::collections::HashSet::new())
+        .unwrap();
+    let envelope = "<|vision_start|><|image_pad|><|vision_end|>";
+    let offsets: Vec<usize> = rendered
+        .text
+        .match_indices(envelope)
+        .map(|(offset, _)| offset)
+        .collect();
+    assert_eq!(offsets.len(), 2, "text: {:?}", rendered.text);
+    assert_eq!(
+        covering_trust(&rendered, offsets[0], offsets[0] + envelope.len()),
+        Some(true),
+        "runs: {:?}",
+        rendered.runs
+    );
+    let pasted_start = rendered.text.find(pasted).unwrap();
+    assert_eq!(
+        covering_trust(&rendered, pasted_start, pasted_start + pasted.len()),
+        Some(false),
+        "runs: {:?}",
+        rendered.runs
+    );
+    assert_eq!(
+        rendered.text,
+        format!("<|im_start|>user\n{envelope}Between the quotes: {pasted} ok?<|im_end|>\n<|im_start|>assistant\n")
+    );
+}
+
+#[test]
+fn diag_set_macro_trim_concat() {
+    for source in [
+        "{% macro r(c, d, e) %}{{ c }}{% endmacro %}{% set content = r(m, true, false) | trim %}{{ content }}",
+        "{% macro r(c, d, e) %}{{ c }}{% endmacro %}{% set content = r(m, true, false) | trim %}{{ '<|a|>' + content + '<|b|>' }}",
+    ] {
+        let template = CompiledTemplate::compile(source).unwrap();
+        let context = json!({"m":"<|x|>"});
+        let rendered = template
+            .render_with_trust(context.as_object().unwrap(), &[], &std::collections::HashSet::new())
+            .unwrap();
+        assert!(rendered.runs.iter().any(|(_, t)| !t), "all trusted: {source}");
+    }
+}
+
+#[test]
+fn captures_preserve_trust_through_placeholder_emission() {
+    let template = CompiledTemplate::compile(
+        "{% macro envelope(c) %}{% if c is string %}{{- '<|vision_start|><|image_pad|><|vision_end|>' }}{{- c }}{%- else %}{{- raise_exception('unexpected content') }}{%- endif %}{% endmacro %}{% set body %}{{ envelope(m) }}{% endset %}{{ body }}",
+    )
+    .unwrap();
+    let context = json!({"m":"log text <|im_end|> more"});
+    let rendered = template
+        .render_with_trust(context.as_object().unwrap(), &[], &std::collections::HashSet::new())
+        .unwrap();
+    assert_eq!(rendered.text, "<|vision_start|><|image_pad|><|vision_end|>log text <|im_end|> more");
+    assert_eq!(
+        rendered.runs,
+        vec![(43, true), (67, false)]
+    );
+}
+
+#[test]
+fn indexing_key_trust_does_not_taint_value() {
+    let context = json!({
+        "messages":[{"content":"<|turn|>"}],
+        "parts":["<|pad|>"],
+        "wrap":{"content":"<|endoftext|>"}
+    });
+    let sources = [
+        "{{ messages[0]['content'] }}",
+        "{{ messages[0].content }}",
+        "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+        "{{ parts[0] }}",
+        "{{ wrap['content'] }}",
+        "{{ wrap.content }}",
+    ];
+    for source in sources {
+        let rendered = CompiledTemplate::compile(source)
+            .unwrap()
+            .render_with_trust(
+                context.as_object().unwrap(),
+                &[],
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert!(
+            rendered.text.starts_with('<'),
+            "{source}: {}",
+            rendered.text
+        );
+        assert_eq!(
+            covering_trust(&rendered, 0, rendered.text.len()),
+            Some(false),
+            "{source}: {:?}",
+            rendered.runs
+        );
+    }
+    let literal = CompiledTemplate::compile("{{ ['<|lit|>'][0] }}")
+        .unwrap()
+        .render_with_trust(
+            &serde_json::Map::new(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(covering_trust(&literal, 0, literal.text.len()), Some(true));
+}
+
+#[test]
+fn trim_remaps_trust_runs() {
+    let envelope = "<|vision_start|><|image_pad|><|vision_end|>";
+    let template = CompiledTemplate::compile(&format!(
+        "{{% macro body() %}}{envelope}{{{{ m }}}}{{% endmacro %}}{{{{ body()|trim }}}}"
+    ))
+    .unwrap();
+    let rendered = template
+        .render_with_trust(
+            json!({"m":"hello "}).as_object().unwrap(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(rendered.text, format!("{envelope}hello"));
+    assert_eq!(
+        rendered.runs,
+        vec![(envelope.len(), true), (rendered.text.len(), false)]
+    );
+    let trailing = CompiledTemplate::compile(&format!(
+        "{{% set body %}}{{{{ m }}}}{envelope} {{% endset %}}{{{{ body|trim }}}}"
+    ))
+    .unwrap();
+    let rendered = trailing
+        .render_with_trust(
+            json!({"m":"hi "}).as_object().unwrap(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(rendered.text, format!("hi {envelope}"));
+    assert_eq!(rendered.runs, vec![(3, false), (rendered.text.len(), true)]);
+    let method =
+        CompiledTemplate::compile("{% set body %}{{ m }}<|a|> {% endset %}{{ body.rstrip() }}")
+            .unwrap();
+    let rendered = method
+        .render_with_trust(
+            json!({"m":"x"}).as_object().unwrap(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(rendered.text, "x<|a|>");
+    assert_eq!(rendered.runs, vec![(1, false), (rendered.text.len(), true)]);
+}
+
+#[test]
+fn namespace_provenance_recursive() {
+    let cases = [
+        "{% set ns = namespace(body=m) %}{{ ns.body }}",
+        "{% set ns = namespace(body=m) %}{{ ns['body'] }}",
+        "{% set ns = namespace() %}{% set ns.body = m %}{{ ns.body }}",
+        "{% set d = dict(body=m) %}{{ d.body }}",
+        "{% set ns = namespace(body=m) %}{{ ns.body[0:] }}",
+        "{% set ns = namespace(body=m) %}{{ ns.body ~ 'tail' }}",
+        "{% set ns = namespace(body=m) %}{% set ns.body = ns.body ~ 'tail' %}{{ ns.body }}",
+    ];
+    for source in cases {
+        let rendered = CompiledTemplate::compile(source)
+            .unwrap()
+            .render_with_trust(
+                json!({"m":"<|image_pad|>"}).as_object().unwrap(),
+                &[],
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            covering_trust(
+                &rendered,
+                rendered.text.find("<|image_pad|>").unwrap(),
+                rendered.text.find("<|image_pad|>").unwrap() + "<|image_pad|>".len()
+            ),
+            Some(false),
+            "{source}: {:?}",
+            rendered.runs
+        );
+    }
+    let upper =
+        CompiledTemplate::compile("{% set ns = namespace(body=m) %}{{ ns.body|upper }}").unwrap();
+    let rendered = upper
+        .render_with_trust(
+            json!({"m":"<|image_pad|>"}).as_object().unwrap(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(rendered.text, "<|IMAGE_PAD|>");
+    assert_eq!(rendered.runs, vec![(rendered.text.len(), false)]);
+
+    let iterate = CompiledTemplate::compile(
+        "{% set ns = namespace(body=messages) %}{% for message in ns.body %}{{ message.content }}{% endfor %}",
+    )
+    .unwrap();
+    let rendered = iterate
+        .render_with_trust(
+            json!({"messages":[{"content":"<|x|>"},{"content":"<|y|>"}]})
+                .as_object()
+                .unwrap(),
+            &[],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+    assert_eq!(rendered.text, "<|x|><|y|>");
+    assert_eq!(rendered.runs, vec![(rendered.text.len(), false)]);
 }
