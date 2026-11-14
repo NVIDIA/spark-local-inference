@@ -780,8 +780,10 @@ fn direct_reopen(file: &File, write: bool) -> Result<File> {
 fn direct_reopen(file: &File, write: bool) -> Result<File> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::*};
+    // An unbuffered reopen whose access includes FILE_APPEND_DATA fails with ERROR_INVALID_PARAMETER
+    // (Windows 11, NTFS). Direct writes address explicit offsets and never append.
     let access = if write {
-        FILE_GENERIC_WRITE
+        FILE_GENERIC_WRITE & !FILE_APPEND_DATA
     } else {
         FILE_GENERIC_READ
     };
