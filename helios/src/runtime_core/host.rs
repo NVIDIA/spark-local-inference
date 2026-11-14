@@ -42,7 +42,8 @@ fn ranges(
 #[cfg(windows)]
 impl super::NativeResources {
     pub(super) unsafe fn allocate_host(&mut self, core: &super::Core) -> Result<()> {
-        use super::{Access, AllocationProperties, Location, Memory};
+        use super::driver::Access;
+        use super::{AllocationProperties, Location, Memory};
 
         if !core
             .allocations
