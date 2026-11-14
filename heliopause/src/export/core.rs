@@ -502,6 +502,11 @@ pub(crate) fn combine(
 }
 
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
+
+/// Signed hardware identity and deployment label of a core exported without a
+/// device identity; it names no platform.
+const UNKNOWN_DEVICE: &str = "unknown-device";
+
 fn py_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -716,17 +721,18 @@ pub(crate) fn publish_payload(
         let (index, payload) = combine(ranks, peer_memory, cluster.clone())?;
         let rank_count = u32::try_from(index.ranks.len()).map_err(|_| invalid("too many ranks"))?;
         let architecture = index.ranks[0].architecture.clone();
-        let platform = ranks
-            .iter()
-            .find_map(|rank| rank.hardware.clone())
-            .ok_or_else(|| {
-                invalid("export naming requires the capture device identity")
-            })?;
+        // Capture records a platform unless the request asked for no device
+        // identity (`device_identity: "none"`). Such a core claims no platform:
+        // its signed hardware identity and deployment use the unknown-device label.
+        let platform = ranks.iter().find_map(|rank| rank.hardware.clone());
+        let hardware_identity = platform
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_DEVICE.to_string());
         let deployment_id = cluster
             .as_ref()
             .map(|c| c.export_id.clone())
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| format!("{platform}-tp{rank_count}"));
+            .unwrap_or_else(|| format!("{hardware_identity}-tp{rank_count}"));
         let mut core_payloads = Vec::new();
         let mut assets = Vec::new();
         for (position, asset) in index.assets.iter().enumerate() {
@@ -778,7 +784,7 @@ pub(crate) fn publish_payload(
                 .map(|c| c.model_id.clone())
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| "model".into()),
-            hardware_identity: platform.clone(),
+            hardware_identity: hardware_identity.clone(),
             publisher: Some(pwire::PublisherMetadata {
                 namespace: publisher.namespace.clone(),
                 official_source: publisher.official_source.clone(),
@@ -913,7 +919,7 @@ pub(crate) fn publish_payload(
             // error, never a lossy rewrite that could merge two models.
             let model = helios_core::core::cache::model_key(&request.core.model_identity)?;
             let candidate = helios_core::core::naming::deployment_candidate(
-                Some(&platform),
+                platform.as_deref(),
                 &[rank_count],
                 SystemTime::now(),
             )

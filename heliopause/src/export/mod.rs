@@ -138,6 +138,19 @@ pub(crate) struct ExportOptions {
     pub reuse_weights: Option<weight_reuse::Source>,
 }
 
+/// Whether a capture export records the device's platform identity.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceIdentity {
+    /// Record the platform named by the device's PCI id; a device outside the
+    /// platform table fails the export.
+    #[default]
+    Required,
+    /// Record no platform identity. The core's entry uses the `unknown-device`
+    /// label, and no platform is claimed for it.
+    None,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct CaptureRequest {
     pub path: PathBuf,
@@ -183,6 +196,8 @@ pub(crate) struct CaptureRequest {
     pub zero_ranges: Vec<(u64, u64)>,
     #[serde(default)]
     pub device_address_floor: u64,
+    #[serde(default)]
+    pub device_identity: DeviceIdentity,
     pub execution: Option<serde_json::Value>,
     pub server: Option<serde_json::Value>,
     #[serde(default)]
@@ -196,6 +211,34 @@ pub(crate) struct CaptureRequest {
     pub options: ExportOptions,
     #[serde(default)]
     pub sources: bool,
+}
+
+#[cfg(test)]
+mod device_identity_tests {
+    use super::*;
+
+    fn request(extra: &str) -> serde_json::Result<CaptureRequest> {
+        serde_json::from_str(&format!(
+            r#"{{"path": "core", "context": 0, "graphs": [], "allocations": []{extra}}}"#
+        ))
+    }
+
+    #[test]
+    fn device_identity_defaults_to_required_and_accepts_none() {
+        assert_eq!(
+            request("").unwrap().device_identity,
+            DeviceIdentity::Required
+        );
+        assert_eq!(
+            request(r#", "device_identity": "required""#).unwrap().device_identity,
+            DeviceIdentity::Required
+        );
+        assert_eq!(
+            request(r#", "device_identity": "none""#).unwrap().device_identity,
+            DeviceIdentity::None
+        );
+        assert!(request(r#", "device_identity": "gb202""#).is_err());
+    }
 }
 
 impl CaptureRequest {
