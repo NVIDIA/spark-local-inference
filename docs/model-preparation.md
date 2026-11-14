@@ -1101,9 +1101,11 @@ The checkpoint's native MXFP4 expert weights use losslessly compressed block
 scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
 `--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
-`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
-DSpark and DFlash2 draft weights retain checkpoint precision. Omit the flag to retain
-checkpoint precision for every projection.
+`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`) by default. Other target projections and
+DSpark and DFlash2 draft weights retain checkpoint precision. With DFlash2,
+`--online-mxfp8-scope all` converts every eligible target and draft projection, including
+attention output/latent projections, shared experts, and MoE latent projections. Omit the
+flag to retain checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
 of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
@@ -1243,12 +1245,18 @@ taps and full-context BF16 cache; the two draft formats are not interchangeable.
 With seven drafts, each continuation row uses 35,450,112 bytes, including five
 1024-token latent rings. Target cache pages retain their 2,174,976-byte size.
 
-The body and shared target vocabulary head remain BF16 with the KDA-input-only
-online conversion. An explicit `--draft-head-quantization mxfp8` or `nvfp4`
-prepares a separate proposal-head copy; it does not convert the target head.
-Preparation rejects the flag for the Inferact DSpark draft.
-Its additional weight storage and effect on acceptance must be evaluated for
-the workload. The example keeps the BF16 head.
+The body and shared target vocabulary head remain BF16 with the default
+KDA-input-only online conversion. `--draft-body-quantization mxfp8` converts
+eligible DFlash2 body context, attention latent/query/output, and MLP projections
+independently of target conversion; it does not require `--online-mxfp8`.
+`--online-mxfp8-scope all` also converts these body projections together with the
+broader target conversion described above. Normalization, convolution,
+candidate-selector, and absorbed key/value weights retain their precision.
+An explicit `--draft-head-quantization mxfp8` or `nvfp4` prepares a separate
+proposal-head copy; it does not convert the target head. Preparation rejects
+body or head conversion for the Inferact DSpark draft. Quantized draft weight
+storage and the effect on acceptance must be evaluated for the workload. The
+example keeps the BF16 body and head.
 
 Qualified by checkpoint-backed numerical tests: MLA attention and
 accepted-context projection. To validate TP16 graph replay of the draft body and

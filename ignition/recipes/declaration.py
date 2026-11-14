@@ -121,6 +121,7 @@ class Speculation:
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
     mtp_only: bool = False
+    draft_body_quantization: str | None = None
 
     def __post_init__(self):
         if self.mtp_only and self.draft_tokens < 1:
@@ -137,6 +138,10 @@ class Speculation:
                 raise ValueError(f"{head} head quantization must be omitted or one of: {', '.join(choices)}")
             if value is not None and self.draft_tokens < 1:
                 raise ValueError("draft head quantization requires positive learned draft depth")
+        if self.draft_body_quantization not in (None, "mxfp8"):
+            raise ValueError("draft body quantization must be omitted or mxfp8")
+        if self.draft_body_quantization is not None and self.draft_tokens < 1:
+            raise ValueError("draft body quantization requires positive learned draft depth")
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
@@ -253,6 +258,7 @@ class Recipe:
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
+    draft_body_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
